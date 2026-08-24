@@ -148,8 +148,10 @@ word that consumes the whole stack. A typed definition may not omit, duplicate, 
 
 Type names may be parameterized in a signature, including nested forms such as `list<int>`,
 `map<string,int>`, `option<list<string>>`, `result<T,E>`, `task<T>`, `resource<kind>`, and
-`capability<kind>`. A fixed product type is `record{name:string,age:int}`; it is distinct from
-an open `map<string,T>` and may be the input or output of a typed word.
+`capability<kind>`. A pure closure taking `A,B` and returning `R` is `fn<A,B,R>`; a pure
+zero-argument closure returning `R` is `fn<R>`. A fixed product type is
+`record{name:string,age:int}`; it is distinct from an open `map<string,T>` and may be the input or
+output of a typed word.
 
 Name inputs directly in the typed signature when the body needs them. Names are in bottom-to-top
 stack order and lower directly to frame locals; there is no separate locals declaration:
@@ -424,10 +426,26 @@ Quotations are typed executable values. A quotation is code; an escaping quotati
 environment is a closure. Runtime quotations are not macros. Macro/immediate expansion occurs in a
 separate bounded compile-time phase and the expanded program is reverified.
 
-The current surface form for a quotation reference is `['] word execute`; `word` must be a
-persistent typed definition and its declared stack signature supplies the quotation type. For
-example, `9 ['] square execute` applies `square` to `9`. Anonymous quotations and captured Co-Forth
-environments remain a later revision; Lisp lambdas already provide typed lexical closures.
+The quotation reference `['] word` closes over no values; `word` must be a persistent typed
+definition and its declared stack signature supplies the quotation type. For example,
+`9 ['] square execute` applies `square` to `9`.
+
+An anonymous quotation is `[ inputs -- result ! pure | body ]` (or `! infer`). It lowers to the same hidden
+typed function, `MakeClosure`, and immutable capture vector as a Lisp `lambda`; it is not a list
+literal because its top-level header contains both `--` and `|`. All visible named signature locals
+are captured in deterministic lexical order, and local names shadow an enclosing capture. For
+example:
+
+```forth
+: add-offset ( S offset:int value:int -- S int ! pure )
+  value [ int -- int ! pure | offset + ] execute
+;
+3 39 add-offset
+```
+
+This leaves `42`. A quotation declares exactly one result; package multiple results in a record or
+list. `! pure` rejects a capability-bearing body, while `! infer` records the verified transitive
+effect row. Captures are immutable values, never aliases to the caller stack or ambient authority.
 
 Use only words advertised by `get_vm_state`. Treat any other word as unavailable regardless of
 examples or prior sessions. Capability-bearing words contribute their structured requirement to the

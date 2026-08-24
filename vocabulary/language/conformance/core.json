@@ -216,6 +216,13 @@
       "expected_output": ""
     },
     {
+      "name": "captured-anonymous-closure",
+      "forth": ": add-offset ( S offset:int value:int -- S int ! pure ) value [ int -- int ! pure | offset + ] execute ; 3 39 add-offset",
+      "lisp": "(let ((offset 3)) ((lambda ((value : int)) (+ value offset)) 39))",
+      "expected_values": [{ "type": "int", "value": 42 }],
+      "expected_output": ""
+    },
+    {
       "name": "raw-prose-output",
       "forth": "s\"\"\"The user said \"hello\".\nSecond line.\"\"\" say",
       "lisp": "(say \"The user said \\\"hello\\\".\\nSecond line.\")",

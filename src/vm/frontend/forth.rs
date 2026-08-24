@@ -10,6 +10,7 @@ use crate::vm::verifier::{
     apply_signature_types, instantiate_signature_types, VerifiedModule, Verifier, Vocabulary,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 #[derive(Debug, Clone)]
 struct LocalBinding {
@@ -116,6 +117,103 @@ enum ControlKind {
     Case,
 }
 
+/// Distinguish `[ signature | body ]` from the ordinary `[ values ]` list
+/// literal without introducing a second lexer mode. Only a top-level `|`
+/// following a top-level `--` selects quotation syntax.
+fn anonymous_quotation_bounds(tokens: &[Token], start: usize) -> Option<(usize, usize)> {
+    let mut depth = 0usize;
+    let mut separator = None;
+    let mut has_stack_arrow = false;
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        let TokenValue::Word(word) = &token.value else {
+            continue;
+        };
+        match word.as_str() {
+            "[" => depth += 1,
+            "]" => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return (has_stack_arrow && separator.is_some())
+                        .then(|| (separator.unwrap(), index));
+                }
+            }
+            "--" if depth == 1 => has_stack_arrow = true,
+            "|" if depth == 1 && separator.is_none() => separator = Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_quotation_signature(
+    source_id: &str,
+    source: &str,
+    header: &[Token],
+    origin: &SourceOrigin,
+) -> Result<(StackSignature, bool), Vec<VmDiagnostic>> {
+    let Some(separator) = header
+        .iter()
+        .position(|token| matches!(&token.value, TokenValue::Word(word) if word == "--"))
+    else {
+        return Err(vec![control_error(
+            "E-FORTH-QUOTE-003",
+            "anonymous quotation signature requires --",
+            origin.clone(),
+        )]);
+    };
+    let effect = header
+        .iter()
+        .position(|token| matches!(&token.value, TokenValue::Word(word) if word == "!"))
+        .unwrap_or(header.len());
+    if effect < separator {
+        return Err(vec![control_error(
+            "E-FORTH-QUOTE-003",
+            "anonymous quotation ! effect follows its output types",
+            origin.clone(),
+        )]);
+    }
+    let input = parse_stack_types(source_id, source, &header[..separator])?;
+    let output = parse_stack_types(source_id, source, &header[separator + 1..effect])?;
+    if output.len() != 1 {
+        return Err(vec![control_error(
+            "E-CLOSURE-001",
+            "anonymous quotations return exactly one value; use a record or list for multiple values",
+            origin.clone(),
+        )]);
+    }
+    let declares_pure = if effect == header.len() {
+        false
+    } else {
+        let annotation = &header[effect + 1..];
+        if annotation.len() == 1
+            && matches!(&annotation[0].value, TokenValue::Word(word) if word == "pure")
+        {
+            true
+        } else if annotation.len() == 1
+            && matches!(&annotation[0].value, TokenValue::Word(word) if word == "infer")
+        {
+            false
+        } else {
+            return Err(vec![control_error(
+                "E-FORTH-QUOTE-003",
+                "anonymous quotation effect is ! pure or ! infer",
+                origin.clone(),
+            )]);
+        }
+    };
+    Ok((
+        StackSignature {
+            type_parameters: Vec::new(),
+            input: StackRow::polymorphic("S", input),
+            output: StackRow::polymorphic("S", output),
+            effects: EffectSet::pure(),
+            control: ControlEffect::Returns,
+            suspension: None,
+        },
+        declares_pure,
+    ))
+}
+
 /// Compile user/model-entered Co-Forth source text directly into Finch typed
 /// stack IR and run the common verifier. `initial_stack` is the actual typed VM
 /// stack against which the program was composed.
@@ -185,10 +283,20 @@ pub fn compile_forth_with_functions(
             &local_vocabulary,
             &functions,
             &definition.locals,
+            &[],
             Some(&definition.signature.output.values),
         )?;
         let verified = &compiled.functions[&compiled.module.entry];
         let mut function = compiled.module.functions[&compiled.module.entry].clone();
+        for (nested_name, nested_function) in &compiled.module.functions {
+            if nested_name != &compiled.module.entry {
+                functions.insert(nested_name.clone(), nested_function.clone());
+                local_vocabulary.insert(
+                    nested_name.clone(),
+                    nested_function.signature.clone(),
+                );
+            }
+        }
         let actual_output = function.signature.output.values.clone();
         if actual_output != definition.signature.output.values {
             let mut diagnostic = control_error(
@@ -252,6 +360,7 @@ fn compile_forth_body_with_functions(
         vocabulary,
         linked_functions,
         &[],
+        &[],
         None,
     )
 }
@@ -263,6 +372,7 @@ fn compile_forth_body_with_locals(
     vocabulary: &Vocabulary,
     linked_functions: &BTreeMap<String, Function>,
     locals: &[LocalBinding],
+    captures: &[LocalBinding],
     expected_return: Option<&[Type]>,
 ) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
     let tokens = tokenize(source_id, source)?;
@@ -290,6 +400,12 @@ fn compile_forth_body_with_locals(
         .enumerate()
         .map(|(index, local)| (local.name.as_str(), (index as u32, local.ty.clone())))
         .collect::<BTreeMap<_, _>>();
+    let capture_indexes = captures
+        .iter()
+        .enumerate()
+        .map(|(index, capture)| (capture.name.as_str(), (index as u32, capture.ty.clone())))
+        .collect::<BTreeMap<_, _>>();
+    let mut available_functions = linked_functions.clone();
 
     let emit = |blocks: &mut BTreeMap<u32, BasicBlock>,
                 current: u32,
@@ -345,6 +461,130 @@ fn compile_forth_body_with_locals(
         let token = tokens[token_index].clone();
         let origin = origin(source_id, source, token.start, token.end);
         if let TokenValue::Word(word) = &token.value {
+            if word == "[" {
+                if let Some((pipe_index, close_index)) =
+                    anonymous_quotation_bounds(&tokens, token_index)
+                {
+                    let (declared_signature, declares_pure) = parse_quotation_signature(
+                        source_id,
+                        source,
+                        &tokens[token_index + 1..pipe_index],
+                        &origin,
+                    )?;
+                    let body_start = tokens[pipe_index].end;
+                    let body_end = tokens[close_index].start;
+                    let mut masked = vec![b' '; source.len()];
+                    masked[body_start..body_end]
+                        .copy_from_slice(&source.as_bytes()[body_start..body_end]);
+                    let quote_source = String::from_utf8(masked)
+                        .expect("masking source bytes with spaces preserves UTF-8");
+
+                    // Locals shadow captures. Capturing all visible immutable
+                    // bindings matches Lisp's deterministic initial lowering;
+                    // later escape analysis may remove unused captures.
+                    let local_names = locals
+                        .iter()
+                        .map(|local| local.name.as_str())
+                        .collect::<BTreeSet<_>>();
+                    let mut visible = captures
+                        .iter()
+                        .filter(|capture| !local_names.contains(capture.name.as_str()))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    visible.extend_from_slice(locals);
+
+                    for capture in &visible {
+                        if let Some((index, _)) = local_indexes.get(capture.name.as_str()) {
+                            stack.push(capture.ty.clone());
+                            emit(
+                                &mut blocks,
+                                current,
+                                Instruction::LocalGet { index: *index },
+                                origin.clone(),
+                            );
+                        } else if let Some((index, _)) =
+                            capture_indexes.get(capture.name.as_str())
+                        {
+                            stack.push(capture.ty.clone());
+                            emit(
+                                &mut blocks,
+                                current,
+                                Instruction::CaptureGet { index: *index },
+                                origin.clone(),
+                            );
+                        }
+                    }
+
+                    let compiled = compile_forth_body_with_locals(
+                        source_id,
+                        &quote_source,
+                        declared_signature.input.values.clone(),
+                        vocabulary,
+                        &available_functions,
+                        &[],
+                        &visible,
+                        Some(&declared_signature.output.values),
+                    )?;
+                    let mut quote_function =
+                        compiled.module.functions[&compiled.module.entry].clone();
+                    if declares_pure
+                        && !compiled.functions[&compiled.module.entry]
+                            .inferred_effects
+                            .is_pure()
+                    {
+                        return Err(vec![control_error(
+                            "E-CAP-001",
+                            "anonymous quotation declares pure but its body requires capabilities",
+                            origin,
+                        )]);
+                    }
+                    let mut hasher = DefaultHasher::new();
+                    source_id.hash(&mut hasher);
+                    token.start.hash(&mut hasher);
+                    token.end.hash(&mut hasher);
+                    let quote_name = format!("quote${:016x}", hasher.finish());
+                    quote_function.name = quote_name.clone();
+                    quote_function.signature.effects = compiled.functions[&compiled.module.entry]
+                        .inferred_effects
+                        .clone();
+                    quote_function.signature.suspension = compiled.functions
+                        [&compiled.module.entry]
+                        .inferred_suspension
+                        .clone();
+                    quote_function.signature.control =
+                        if quote_function.signature.suspension.is_some() {
+                            ControlEffect::MaySuspend
+                        } else {
+                            ControlEffect::Returns
+                        };
+                    for (name, function) in compiled.module.functions {
+                        if name != compiled.module.entry {
+                            available_functions.insert(name, function);
+                        }
+                    }
+                    let signature = quote_function.signature.clone();
+                    available_functions.insert(quote_name.clone(), quote_function);
+                    stack.truncate(stack.len() - visible.len());
+                    stack.push(Type::Function {
+                        arguments: signature.input.values.clone(),
+                        result: Box::new(signature.output.values[0].clone()),
+                        effects: signature.effects.clone(),
+                        suspension: signature.suspension.clone(),
+                    });
+                    emit(
+                        &mut blocks,
+                        current,
+                        Instruction::MakeClosure {
+                            function: quote_name,
+                            capture_count: visible.len() as u32,
+                            signature,
+                        },
+                        origin,
+                    );
+                    token_index = close_index + 1;
+                    continue;
+                }
+            }
             if word == "[']" {
                 let Some(target) = tokens.get(token_index + 1) else {
                     return Err(vec![control_error(
@@ -360,7 +600,7 @@ fn compile_forth_body_with_locals(
                         origin,
                     )]);
                 };
-                let Some(function) = linked_functions.get(target_name) else {
+                let Some(function) = available_functions.get(target_name) else {
                     return Err(vec![control_error(
                         "E-FORTH-QUOTE-002",
                         format!("quotation target '{target_name}' is not a typed word"),
@@ -1951,6 +2191,9 @@ fn compile_forth_body_with_locals(
                 } else if let Some((index, ty)) = local_indexes.get(word.as_str()) {
                     stack.push(ty.clone());
                     Instruction::LocalGet { index: *index }
+                } else if let Some((index, ty)) = capture_indexes.get(word.as_str()) {
+                    stack.push(ty.clone());
+                    Instruction::CaptureGet { index: *index }
                 } else {
                     let Some(signature) = vocabulary.get(&word) else {
                         return Err(vec![VmDiagnostic::error(
@@ -2075,12 +2318,12 @@ fn compile_forth_body_with_locals(
             suspension,
         },
         locals: locals.iter().map(|local| local.ty.clone()).collect(),
-        captures: Vec::new(),
+        captures: captures.iter().map(|capture| capture.ty.clone()).collect(),
         entry: 0,
         blocks,
     };
     let mut module = Module::single(function);
-    for (name, function) in linked_functions {
+    for (name, function) in available_functions {
         module.functions.insert(name.clone(), function.clone());
     }
     Verifier::new(vocabulary).verify(module)
@@ -2740,7 +2983,9 @@ fn parameterized_type_end(source: &str, start: usize) -> Option<usize> {
         "map<",
         "option<",
         "result<",
+        "fn<",
         "task<",
+        "fiber<",
         "stream<",
         "resource<",
         "capability<",
@@ -3385,6 +3630,115 @@ mod tests {
             .execute(&mut stack)
             .expect("typed Co-Forth execute should call its quotation");
         assert_eq!(stack, vec![TypedValue::Int(81)]);
+    }
+
+    #[test]
+    fn anonymous_quotation_lowers_to_the_shared_closure_ir() {
+        let module = compile_forth(
+            "anonymous-quotation.forth",
+            "41 [ int -- int ! pure | 1 + ] execute",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("typed anonymous quotation should compile");
+        let quote = module
+            .module
+            .functions
+            .values()
+            .find(|function| function.name.starts_with("quote$"))
+            .expect("quotation lowering creates a typed hidden function");
+        assert!(quote.captures.is_empty());
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("anonymous quotation should execute");
+        assert_eq!(stack, vec![TypedValue::Int(42)]);
+    }
+
+    #[test]
+    fn anonymous_quotation_captures_immutable_forth_locals() {
+        let source = ": add-offset ( S offset:int value:int -- S int ! pure ) \
+            value [ int -- int ! pure | offset + ] execute ; \
+            3 39 add-offset";
+        let module = compile_forth(
+            "captured-quotation.forth",
+            source,
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("quotation should capture its enclosing typed locals");
+        let quote = module
+            .module
+            .functions
+            .values()
+            .find(|function| function.name.starts_with("quote$"))
+            .expect("captured quotation hidden function");
+        assert_eq!(quote.captures, vec![Type::Int, Type::Int]);
+        assert!(quote.blocks.values().any(|block| block.instructions.iter().any(
+            |located| matches!(located.instruction, Instruction::CaptureGet { index: 0 })
+        )));
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("captured quotation should execute");
+        assert_eq!(stack, vec![TypedValue::Int(42)]);
+    }
+
+    #[test]
+    fn anonymous_quotation_effect_contract_is_inferred_and_checked() {
+        let rejected = compile_forth(
+            "pure-output-quote.forth",
+            "[ string -- unit ! pure | say unit ]",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap_err();
+        assert_eq!(rejected[0].code, "E-CAP-001");
+
+        let source = "[ string -- unit ! infer | say unit ]";
+        let inferred = compile_forth(
+            "inferred-output-quote.forth",
+            source,
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("! infer should retain the quotation's verified effect row");
+        let quote = inferred
+            .module
+            .functions
+            .values()
+            .find(|function| function.name.starts_with("quote$"))
+            .unwrap();
+        assert!(!quote.signature.effects.is_pure());
+        let say = quote
+            .blocks
+            .values()
+            .flat_map(|block| &block.instructions)
+            .find(|located| {
+                matches!(&located.instruction, Instruction::CapabilityRequest { .. })
+            })
+            .expect("say lowers to a capability request");
+        let span = say.origin.span.as_ref().expect("quotation body source span");
+        assert_eq!(&source[span.start_byte..span.end_byte], "say");
+    }
+
+    #[test]
+    fn captured_anonymous_quotation_can_escape_its_defining_frame() {
+        let source = ": make-adder ( S offset:int -- S fn<int,int> ! pure ) \
+            [ int -- int ! pure | offset + ] ; \
+            39 3 make-adder execute";
+        let module = compile_forth(
+            "escaping-quotation.forth",
+            source,
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("a declared function type should let a closure escape its frame");
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("escaped closure owns its immutable capture");
+        assert_eq!(stack, vec![TypedValue::Int(42)]);
     }
 
     #[test]

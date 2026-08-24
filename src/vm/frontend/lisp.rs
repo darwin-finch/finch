@@ -3372,6 +3372,22 @@ fn parse_generic_type(name: &str) -> Option<Type> {
             parse_type_name(arguments[0]).ok()?,
             parse_type_name(arguments[1]).ok()?,
         )),
+        // `fn<R>` is a pure zero-argument closure and `fn<A,B,R>` is a
+        // pure closure from A,B to R. Effectful/suspending function types are
+        // inferred from quotation bodies and deliberately have no lossy
+        // compact annotation yet.
+        "fn" if !arguments.is_empty() => {
+            let (result, inputs) = arguments.split_last()?;
+            Some(Type::Function {
+                arguments: inputs
+                    .iter()
+                    .map(|input| parse_type_name(input).ok())
+                    .collect::<Option<Vec<_>>>()?,
+                result: Box::new(parse_type_name(result).ok()?),
+                effects: EffectSet::pure(),
+                suspension: None,
+            })
+        }
         _ => None,
     }
 }
@@ -4024,6 +4040,28 @@ mod tests {
             )
             .unwrap(),
             vec![TypedValue::Int(37)]
+        );
+    }
+
+    #[test]
+    fn parses_compact_pure_function_types_shared_with_forth() {
+        assert_eq!(
+            parse_type_name("fn<int,int>").unwrap(),
+            Type::Function {
+                arguments: vec![Type::Int],
+                result: Box::new(Type::Int),
+                effects: EffectSet::pure(),
+                suspension: None,
+            }
+        );
+        assert_eq!(
+            parse_type_name("fn<int>").unwrap(),
+            Type::Function {
+                arguments: Vec::new(),
+                result: Box::new(Type::Int),
+                effects: EffectSet::pure(),
+                suspension: None,
+            }
         );
     }
 

@@ -164,7 +164,8 @@ condition edge. The named exit must preserve the target loop's stack row and cur
 extra result values; it is not an arbitrary jump.
 
 Type annotations use the same compact grammar as Co-Forth signatures. In addition to
-`list<T>`, `map<K,V>`, and `result<T,E>`, a fixed product type is
+`list<T>`, `map<K,V>`, and `result<T,E>`, `fn<A,B,R>` describes a pure closure taking `A,B` and
+returning `R`; `fn<R>` describes a pure zero-argument closure. A fixed product type is
 `record{name:string,age:int}`. It describes a known field set and is distinct from an open map;
 record values are constructed with `{ :name value :age value }` and projected with `record-get`.
 

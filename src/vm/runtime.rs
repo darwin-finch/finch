@@ -3256,6 +3256,33 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_round_trips_forth_quotation_bodies_and_captures() {
+        let mut runtime = TypedRuntime::new();
+        let definition = runtime.execute(
+            ProgramLanguage::Forth,
+            "quotation-definition.forth",
+            ": make-adder ( S n:int -- S fn<int,int> ! pure ) \
+               [ int -- int ! pure | n + ] ;",
+            1_000,
+        );
+        assert_eq!(definition.status, TypedExecutionStatus::Completed);
+
+        let checkpoint = runtime.checkpoint().expect("quotation state checkpoints");
+        assert!(checkpoint.functions.keys().any(|name| name.starts_with("quote$")));
+        let mut restored = TypedRuntime::from_checkpoint(checkpoint)
+            .expect("generated quotation bodies restore with their public definition");
+        let result = restored.execute(
+            ProgramLanguage::Forth,
+            "quotation-call.forth",
+            "35 7 make-adder execute",
+            1_000,
+        );
+
+        assert_eq!(result.status, TypedExecutionStatus::Completed);
+        assert_eq!(restored.stack(), &[TypedValue::Int(42)]);
+    }
+
+    #[test]
     fn checkpoint_round_trips_a_closure_bearing_record_across_frontends() {
         let mut runtime = TypedRuntime::new();
         let created = runtime.execute(
