@@ -463,7 +463,12 @@ impl MemorySystem {
         Ok(())
     }
 
-    /// Load all persisted Lisp defines in definition order (for session replay).
+    /// Load legacy persisted Lisp definitions for explicit migration tooling.
+    ///
+    /// The interactive runtime must not replay these into the native Lisp evaluator: authored
+    /// definitions are projected into the shared typed program registry by `save_lisp_define`.
+    /// This reader remains temporarily available so older databases can be migrated without
+    /// making their obsolete evaluator state authoritative again.
     pub async fn load_lisp_defines(&self) -> Result<Vec<String>> {
         let conn = self.db.lock().await;
         let mut stmt = conn.prepare("SELECT expr FROM lisp_env ORDER BY seq ASC")?;

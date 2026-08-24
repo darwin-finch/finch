@@ -342,14 +342,6 @@ pub struct EventLoop {
     /// Stack state is cleared between evals; only the dictionary persists.
     forth_vm: crate::coforth::Forth,
 
-    /// Lisp interpreter context — holds SSH sessions and the global env.
-    /// Shared with spawned Lisp eval tasks via Arc so sessions persist across
-    /// multiple `(...)` inputs within a session.
-    lisp_ctx: std::sync::Arc<crate::lisp::LispCtx>,
-
-    /// Global Lisp environment — `define`d names persist across REPL inputs.
-    lisp_env: crate::lisp::EnvRef,
-
     /// Shared with TUI corner — updated after each eval if `check` is defined.
     corner_output: Arc<std::sync::Mutex<Option<String>>>,
 
@@ -1311,8 +1303,6 @@ impl EventLoop {
             forth_vm: crate::coforth::Library::precompiled_vm(),
             corner_output,
             forth_undo: Vec::new(),
-            lisp_ctx: std::sync::Arc::new(crate::lisp::LispCtx::new()),
-            lisp_env: crate::lisp::make_env(),
             push_rx: crate::server::handlers::PUSH_INBOX.subscribe(),
             hash_rx: crate::server::handlers::HASH_INBOX.subscribe(),
             auto_compiled_word_names: std::collections::HashSet::new(),
@@ -1343,23 +1333,6 @@ impl EventLoop {
         // For each remote daemon address: establish a bidirectional WS bridge so
         // the remote machine participates in this session's peer loop.
         self.bridge_remote_peers().await;
-
-        // ── Replay persisted Lisp defines ────────────────────────────────────
-        // Restore any `(define ...)` expressions saved in previous sessions so
-        // the Lisp env is identical to the one the user left behind.
-        if let Some(mem) = &self.memory_system {
-            if let Ok(defines) = mem.load_lisp_defines().await {
-                if !defines.is_empty() {
-                    let ctx = self.lisp_ctx.clone();
-                    let env = self.lisp_env.clone();
-                    for expr in defines {
-                        if let Err(e) = crate::lisp::run_in(&expr, env.clone(), ctx.clone()).await {
-                            tracing::warn!("lisp replay failed for {:?}: {}", expr, e);
-                        }
-                    }
-                }
-            }
-        }
 
         // ── Startup header (Claude Code style) ───────────────────────────────
         // Clear accumulated startup noise from the output manager, then print a
