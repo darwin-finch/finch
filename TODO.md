@@ -55,6 +55,14 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [x] Specify and implement the provider wire discriminator: leading `(` selects Lisp and all other
   valid program starts select Co-Forth; make the receiver incrementally tokenize Co-Forth while
   retaining complete-program verification and clear malformed-wire diagnostics.
+- [ ] Specify and test an optional mixed top-level wire stream now that Lisp and Co-Forth share one
+  IR. Outside an open string/record/definition/control construct, `(` may begin one complete Lisp
+  form while a Co-Forth token begins one complete concatenative unit; neither frontend may parse
+  through the other's owned lexical region. Define the transaction boundary explicitly: a closed,
+  independently verified unit may execute/commit and emit progressive effects, and a later malformed
+  unit cannot pretend those commits or effects rolled back. Incomplete Lisp forms and incomplete
+  Co-Forth definitions/control regions remain visible source only and never execute. Preserve an
+  explicit single-language mode for self-contained scripts, conformance fixtures, and diagnostics.
 - [x] Add one bounded provider-wire repair turn for reader/type/capability diagnostics. Preserve the
   rejected source and its diagnostic as journaled program/output WorkUnits, send the structured
   error plus exact source back to the same provider, and render any replacement as a new program
@@ -77,6 +85,13 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   prints source-free first-pass/repaired/terminal counts for every configured provider. On
   2026-08-24 the configured Grok profile completed all 3 tasks first-pass (0 repaired, 0 terminal),
   including a recursive factorial definition; other provider/model profiles remain unmeasured.
+  Expand the fixed matrix to ordinary and quoted/multiline responses, calculation, introspection,
+  bounded file effects, approval/denial, loops, closures, fibers, malformed-wire repair, and
+  unknown-word recovery. Preserve provider/model and runtime/language-package versions, sample
+  size, first-pass wire/parse/verification rates, repair success and attempts, invented-word/raw-
+  prose/Markdown-fence rates, selected frontend, tokens, and latency in a reproducible aggregate
+  artifact suitable for the eventual Finch protocol write-up; never infer a broad provider claim
+  from an ad hoc transcript.
 - [ ] Consider an opt-in typed unresolved-word handler for a module/run. Ordinary unbound bare
   words must remain linking diagnostics; an explicitly installed handler may receive the unknown
   token as `symbol`/`string` and has one declared signature/effect contract, allowing controlled
@@ -213,23 +228,20 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   compensating them. Still add durable revision history, structured outcomes for host-effect
   correlation/revocation races, and reviewed merge rules where a commutative delta can safely be
   accepted.
-- [ ] Remove the Lisp-to-Forth text compiler, native Lisp fallback, source-text effect inference,
-  and duplicate direct model-tool paths after conformance parity. The named-Brain Program/Prompt
-  compatibility endpoints now execute only the shared typed `ProgramRuntime`; other legacy paths
-  remain quarantined. The native Lisp evaluator and effectful standard library are now removed;
-  only its neutral reader syntax tree remains for direct lowering to shared IR. The interactive
-  event loop no longer replays the obsolete `lisp_env` table; its reader remains migration-only
-  until older databases have been projected into the typed program registry. Source-text effect
-  inference and generated `finch-effect` comments are removed: unverified/imported definitions are
-  conservatively `unclassified`, while explicit typed registry metadata survives independently of
-  source. The outer provider tool gate no longer trusts a submitted coarse `ExecutionEffect`:
-  every `submit_program` enters the typed broker, whose verified requirements and grants are the
-  sole host-authority decision. The provider envelope no longer exposes that redundant coarse
-  field; optional exact `declared_capabilities` remains a checked upper-bound assertion.
-  `ExecutionOutcome` now reports only the shared `typed_vm` backend; dead serialized labels for the
-  removed native-Lisp, Lisp-to-Forth, and untyped-Forth execution paths no longer imply that a
-  provider submission can select them. Explicit legacy proof/library commands remain quarantined
-  outside this outcome/runtime ABI until their useful behavior is migrated or retired.
+- [x] Remove the native Lisp evaluator, effectful Lisp standard library, Lisp-to-Forth text
+  compiler/fallback, source-text effect inference, and selectable legacy backend labels. Lisp now
+  retains only its neutral reader/types and lowers directly into the shared typed IR; named-Brain
+  Program/Prompt compatibility endpoints and `submit_program` execute the same `ProgramRuntime`.
+  The outer tool gate no longer trusts the submitted coarse `ExecutionEffect`, optional exact
+  `declared_capabilities` is only a checked upper-bound assertion, and `ExecutionOutcome` reports
+  only `typed_vm`. This is the completed one-semantic-runtime milestone; do not reintroduce a native
+  evaluator as a compatibility fallback.
+- [ ] Finish legacy-runtime cleanup after migration evidence is acceptable. Project older persisted
+  `lisp_env` rows into the typed program registry and remove that obsolete table/API. Migrate or
+  retire the remaining legacy Co-Forth proof/library, grammar, channel, POSIX/IPC, and stack-console
+  call sites identified by `finch library audit-typed`; keep them explicitly quarantined from the
+  provider/runtime ABI until then. Remove compatibility aliases and duplicate entry points only
+  after their useful behavior has a typed equivalent and replayable conformance coverage.
 - [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
   tests, concurrency tests, and provider conformance tests. Manual configured-cloud smoke checks on
   2026-08-23 successfully executed provider-emitted Lisp `say`, Lisp arithmetic, and Co-Forth
