@@ -4716,12 +4716,16 @@ Rules:\n\
                 .output_manager
                 .write_user(format!("{}: {text}", event.sender)),
             BrainEventKind::Program { language, source } => {
-                let command = match language {
-                    crate::brain::shared::ProgramLanguage::Forth => "/forth",
-                    crate::brain::shared::ProgramLanguage::Lisp => "/lisp",
+                let language = match language {
+                    crate::brain::shared::ProgramLanguage::Forth => "forth",
+                    crate::brain::shared::ProgramLanguage::Lisp => "lisp",
                 };
-                self.output_manager
-                    .write_user(format!("{} {command} {source}", event.sender));
+                let unit = self
+                    .output_manager
+                    .start_work_unit(format!("{} program", event.sender));
+                unit.set_program_source(language);
+                unit.set_response(source);
+                unit.set_complete();
             }
             BrainEventKind::ProgramPopped { program_seq } => self
                 .output_manager
@@ -4730,7 +4734,10 @@ Rules:\n\
                 if let Some(error) = error {
                     self.output_manager.write_info(format!("error: {error}"));
                 } else if !output.is_empty() {
-                    self.output_manager.write_response(output.clone());
+                    let unit = self.output_manager.start_work_unit("Brain program output");
+                    unit.set_program_output();
+                    unit.set_response(output);
+                    unit.set_complete();
                 }
             }
             // Internal durable VM state is intentionally not rendered as a
