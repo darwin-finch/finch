@@ -152,6 +152,10 @@ typed snapshot record with `task-id`, `agent-id`, `status`, `task`, `role`, `pro
 background/provider/model strings mean no override; all budgets are positive and host-bounded.
 Provider/model names go through the scheduler's configured-profile resolver rather than capturing
 the frontend's current provider. Scheduler ancestry and ownership are checked for every operation.
+Child providers receive `submit_program` plus read-only language/VM discovery tools. Filesystem and
+nested-agent work must use verified `tree-list`/`file-*`/`agent-*` words through that submission;
+the scheduler does not expose direct Read/Glob/Grep or direct agent-control tools that bypass the
+child's typed grant ceiling.
 
 Pure zero-argument closures may use `(defer :cpu (lambda () ...))` to run on Finch's bounded local
 worker pool. It returns `task<T>` with an explicit `cpu_fiber` owner kind; captured values are
@@ -317,6 +321,11 @@ Ordinary `path` / `file-read` never widen to this root.
 `file-size(path)` and `file-slice(path, offset, length)` share the same refined `file.read(path)`
 requirement. A slice is bounded (currently 8 MiB maximum per call) and may be shorter at EOF, so
 large CSV/text/binary processing can keep only a bounded window in VM memory.
+`tree-list(path, max_entries)` returns a deterministic record containing a bounded list of
+`{path:string, kind:string, size:int}` metadata records and a `truncated:bool` field. It scans and
+returns at most 100,000 entries, rejects symlinks and unsupported file kinds, and grants no
+authority to returned path strings; refine a selected string through `path` before another file
+call.
 `file-lines-open(path)` mints a ProgramRun-owned opaque `stream<string>`; `stream-next`
 returns bounded UTF-8 `option<string>` records (1 MiB maximum line) and `stream-close`
 releases the stream. The initial path grant covers later stream operations only because the stream

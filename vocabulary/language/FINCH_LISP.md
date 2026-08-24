@@ -285,7 +285,10 @@ workspace file words cannot consume it.
 For large text, CSV, or binary files, use `(file-size path)` and `(file-slice path offset length)`
 instead of `(file-read path)`. A slice returns at most the requested range (currently capped at
 8 MiB per call), with a shorter final value at EOF. Keep the byte offset in a lexical binding and
-process each slice before requesting the next. For UTF-8 line-oriented files,
+process each slice before requesting the next. Use `(tree-list directory max-entries)` for bounded,
+deterministic directory discovery. It returns
+`{entries:list<record{path:string,kind:string,size:int}>,truncated:bool}`; returned path strings
+carry no authority until refined with `path`. For UTF-8 line-oriented files,
 `(file-lines-open path)` returns a host-issued `stream<string>` and `(stream-next stream)`
 returns `option<string>` one bounded line at a time (1 MiB maximum line); `(stream-close stream)`
 releases it early. The stream is owned by its ProgramRun and cannot be forged or reused by another

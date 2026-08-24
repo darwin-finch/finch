@@ -221,6 +221,10 @@ the next.
 
 `path file-hash` computes a lowercase SHA-256 digest without putting the file's bytes on the VM
 stack. Use it for exact comparison or as a leaf value in a higher-level tree/Merkle operation.
+`path max-entries tree-list` returns a deterministic bounded record containing
+`entries:list<record{path:string,kind:string,size:int}>` and `truncated:bool`. It rejects symlinks
+and unsupported file kinds. Returned path strings are metadata, not file authority; pass a chosen
+string through `path` before reading it.
 `path tree-merkle` computes a deterministic SHA-256 digest over a directory subtree's sorted
 relative paths and file hashes, without materializing its contents. It is bounded to 100,000
 entries and rejects symlinks rather than following them. Use it as an inventory/change-detection
