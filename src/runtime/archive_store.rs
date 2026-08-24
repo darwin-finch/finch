@@ -1,6 +1,8 @@
 //! Atomic application-owned persistence for reducible typed VM state.
 
-use crate::runtime::{ProgramRuntime, ProgramRuntimeArchive};
+use crate::runtime::{
+    ProgramRuntime, ProgramRuntimeArchive, ProgramRuntimeAuthorityState,
+};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -8,12 +10,20 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const RUNTIME_ARCHIVE_FILE_VERSION: u32 = 1;
+const RUNTIME_AUTHORITY_FILE_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredRuntimeArchive {
     format_version: u32,
     archive_sha256: String,
     archive: ProgramRuntimeArchive,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredRuntimeAuthority {
+    format_version: u32,
+    authority_sha256: String,
+    authority: ProgramRuntimeAuthorityState,
 }
 
 /// Durable storage for one persistent [`ProgramRuntime`].
@@ -124,6 +134,113 @@ impl ProgramRuntimeArchiveStore {
     }
 }
 
+/// Durable storage for application-owned authority associated with one
+/// [`ProgramRuntime`]. This record is deliberately separate from the VM
+/// archive: copying or restoring executable state must never confer grants.
+#[derive(Debug, Clone)]
+pub struct ProgramRuntimeAuthorityStore {
+    path: PathBuf,
+}
+
+impl ProgramRuntimeAuthorityStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Validate and atomically replace the stored authority record.
+    pub fn save(&self, runtime: &ProgramRuntime) -> Result<()> {
+        self.save_state(runtime.authority_state()?)
+    }
+
+    fn save_state(&self, authority: ProgramRuntimeAuthorityState) -> Result<()> {
+        validate_authority_state(authority.clone())?;
+        let authority_bytes = serde_json::to_vec(&authority)?;
+        let stored = StoredRuntimeAuthority {
+            format_version: RUNTIME_AUTHORITY_FILE_VERSION,
+            authority_sha256: hex::encode(Sha256::digest(&authority_bytes)),
+            authority,
+        };
+        atomic_write_json(&self.path, &stored, "runtime authority")
+    }
+
+    pub fn load_state(&self) -> Result<Option<ProgramRuntimeAuthorityState>> {
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read runtime authority '{}'", self.path.display()))
+            }
+        };
+        let stored: StoredRuntimeAuthority = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decode runtime authority '{}'", self.path.display()))?;
+        if stored.format_version != RUNTIME_AUTHORITY_FILE_VERSION {
+            bail!(
+                "runtime authority file '{}' has version {}; expected {}",
+                self.path.display(),
+                stored.format_version,
+                RUNTIME_AUTHORITY_FILE_VERSION
+            );
+        }
+        let authority_bytes = serde_json::to_vec(&stored.authority)?;
+        let actual = hex::encode(Sha256::digest(&authority_bytes));
+        if actual != stored.authority_sha256 {
+            bail!(
+                "runtime authority file '{}' failed its SHA-256 integrity check",
+                self.path.display()
+            );
+        }
+        validate_authority_state(stored.authority.clone())?;
+        Ok(Some(stored.authority))
+    }
+
+    /// Restore a stored authority record into a newly constructed runtime.
+    /// A missing record leaves the runtime authority-free.
+    pub fn restore_into(&self, runtime: &mut ProgramRuntime) -> Result<bool> {
+        let Some(authority) = self.load_state()? else {
+            return Ok(false);
+        };
+        runtime.restore_authority_state(authority)?;
+        Ok(true)
+    }
+}
+
+fn validate_authority_state(authority: ProgramRuntimeAuthorityState) -> Result<()> {
+    let mut runtime = ProgramRuntime::new();
+    runtime.restore_authority_state(authority)
+}
+
+fn atomic_write_json<T: Serialize>(path: &Path, value: &T, label: &str) -> Result<()> {
+    let bytes = serde_json::to_vec(value)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{label} path '{}' has no parent", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create {label} directory '{}'", parent.display()))?;
+
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary {label} in '{}'", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    temporary.write_all(&bytes)?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file_mut().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replace {label} '{}'", path.display()))?;
+    sync_parent_directory(parent)
+}
+
 #[cfg(unix)]
 fn sync_parent_directory(parent: &Path) -> Result<()> {
     std::fs::File::open(parent)?.sync_all()?;
@@ -140,7 +257,9 @@ mod tests {
     use super::*;
     use crate::programs::{ExecutionEffect, ProgramLanguage};
     use crate::runtime::{ProgramSubmission, ProgramValue};
-    use crate::vm::{CapabilityKind, CapabilityRequirement, ResourceSelector};
+    use crate::vm::{
+        CapabilityKind, CapabilityRequirement, GrantScope, ResourceSelector,
+    };
 
     fn submission(runtime: &ProgramRuntime, source: &str) -> ProgramSubmission {
         ProgramSubmission {
@@ -240,5 +359,93 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = ProgramRuntimeArchiveStore::new(directory.path().join("missing.json"));
         assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn authority_store_round_trips_scoped_grants_and_audit() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProgramRuntimeAuthorityStore::new(directory.path().join("authority.json"));
+        let runtime = ProgramRuntime::new();
+        runtime
+            .issue_typed_capability(
+                CapabilityRequirement {
+                    capability: CapabilityKind::ProcessRun,
+                    selector: ResourceSelector::None,
+                },
+                GrantScope::Session {
+                    session_id: runtime.capability_session_id(),
+                },
+                "test-user",
+                None,
+            )
+            .unwrap();
+        store.save(&runtime).unwrap();
+
+        let state = store.load_state().unwrap().expect("stored authority");
+        assert_eq!(state.session_id, runtime.capability_session_id());
+        assert_eq!(state.project_id, runtime.capability_project_id());
+        assert_eq!(state.ledger.grants.grants.len(), 1);
+        assert_eq!(state.ledger.audit.len(), 1);
+
+        let mut restored = ProgramRuntime::new();
+        assert!(store.restore_into(&mut restored).unwrap());
+        assert_eq!(
+            restored.capability_session_id(),
+            runtime.capability_session_id()
+        );
+        assert_eq!(restored.capability_ledger().unwrap(), state.ledger);
+    }
+
+    #[test]
+    fn authority_store_detects_tampering_before_restore() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProgramRuntimeAuthorityStore::new(directory.path().join("authority.json"));
+        store.save(&ProgramRuntime::new()).unwrap();
+
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
+        value["authority"]["project_id"] = serde_json::json!("different-project");
+        std::fs::write(store.path(), serde_json::to_vec(&value).unwrap()).unwrap();
+        let error = store
+            .load_state()
+            .err()
+            .expect("authority tampering must fail closed");
+        assert!(error.to_string().contains("integrity check"));
+    }
+
+    #[test]
+    fn authority_store_rejects_an_active_obsolete_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProgramRuntimeAuthorityStore::new(directory.path().join("authority.json"));
+        let runtime = ProgramRuntime::new();
+        runtime
+            .grant_typed_capability(CapabilityRequirement {
+                capability: CapabilityKind::ProcessRun,
+                selector: ResourceSelector::None,
+            })
+            .unwrap();
+        let mut state = runtime.authority_state().unwrap();
+        state.ledger.grants.grants[0].policy_hash = "obsolete-policy".into();
+
+        let error = store
+            .save_state(state)
+            .err()
+            .expect("obsolete authority must not be persisted");
+        assert!(error.to_string().contains("another policy"));
+        assert!(!store.path().exists());
+    }
+
+    #[test]
+    fn missing_authority_store_confers_no_grants() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProgramRuntimeAuthorityStore::new(directory.path().join("missing.json"));
+        let mut runtime = ProgramRuntime::new();
+        assert!(!store.restore_into(&mut runtime).unwrap());
+        assert!(runtime
+            .capability_ledger()
+            .unwrap()
+            .grants
+            .grants
+            .is_empty());
     }
 }
