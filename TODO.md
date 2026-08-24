@@ -402,6 +402,14 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   structural records, variants, closures, parametric functions, concepts, modules, derivation, async
   resources, and range composition expected from a TypeScript-class application language, without
   relying routinely on `dynamic` or giving either frontend privileged semantics.
+- [ ] After the parametric compiler and AOT service ABI stabilize, make the frontend and semantic
+  scheduler self-hosting candidates. Preserve a small trusted Rust stage 0 for framing, verified
+  artifact loading, IR verification, effects, and execution; expose the Finch compiler as a
+  versioned typed service and optionally generated C-compatible `libfinch_compiler` facade. Pin a
+  content-addressed bootstrap artifact and require stage-0→stage-1→stage-2 reproducibility over
+  normalized IR/native output with complete source/module/runtime/target hashes. Compiler modules
+  must use the same public syntax/type/CTFE APIs as other Finch code rather than gaining a hidden
+  metaprogramming path.
 - [ ] Freeze and test the Runtime/Application boundary: the embedder-neutral typed VM exposes only
   verified execution, diagnostics, capability requests, and idempotent side-effect/resume records;
   the Finch application supplies Brain, UI, approval, provider, MCP, scheduler, and OS adapters.
