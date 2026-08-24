@@ -16,9 +16,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 
 /// A parsed top-level Lisp form paired with the exact source range that
-/// produced it.  The typed compiler currently preserves the enclosing form
-/// through macro expansion; nested expression/token provenance is a later,
-/// deliberately separate source-map refinement.
+/// produced it. Macro-expanded forms retain their invocation as primary
+/// provenance and link to the template definition through `expansion`.
 #[derive(Debug, Clone)]
 struct SourceForm {
     value: Val,
@@ -27,6 +26,7 @@ struct SourceForm {
     /// deliberately use only their invocation span until expansion ancestry
     /// is attached as an explicit `SourceOrigin` chain.
     source: Option<SpannedVal>,
+    expansion: Option<SourceOrigin>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +188,7 @@ struct Compiler<'a> {
     next_lambda: u64,
     current_span: Range<usize>,
     current_source: Option<SpannedVal>,
+    current_expansion: Option<SourceOrigin>,
 }
 
 /// Parse and compile Finch Lisp directly into the common typed stack IR. No
@@ -222,11 +223,7 @@ pub fn compile_lisp_with_functions(
             Some(source_origin(source_id, source, "<reader>")),
         )]
     })?;
-    let parsed_expressions = parsed_forms
-        .iter()
-        .map(|form| form.value.clone())
-        .collect::<Vec<_>>();
-    let macros = collect_template_macros(source_id, source, &parsed_expressions)?;
+    let macros = collect_template_macros(source_id, source, &parsed_forms)?;
     let mut expansion_budget = 128;
     let expressions = parsed_forms
         .iter()
@@ -239,12 +236,13 @@ pub fn compile_lisp_with_functions(
                 &macros,
                 &mut expansion_budget,
             )
-                .map(|value| {
-                    let source = (value == form.value).then(|| form.clone());
+                .map(|expanded| {
+                    let source = (expanded.value == form.value).then(|| form.clone());
                     SourceForm {
-                        value,
+                        value: expanded.value,
                         span: form.span.clone(),
                         source,
+                        expansion: expanded.expansion,
                     }
                 })
         })
@@ -258,10 +256,12 @@ pub fn compile_lisp_with_functions(
         next_lambda: 0,
         current_span: 0..source.len(),
         current_source: None,
+        current_expansion: None,
     };
     for expression in &expressions {
         compiler.current_span = expression.span.clone();
         compiler.current_source = expression.source.clone();
+        compiler.current_expansion = expression.expansion.clone();
         if is_definition(&expression.value) {
             compiler.predeclare_definition(&expression.value)?;
         }
@@ -270,6 +270,7 @@ pub fn compile_lisp_with_functions(
     for expression in &expressions {
         compiler.current_span = expression.span.clone();
         compiler.current_source = expression.source.clone();
+        compiler.current_expansion = expression.expansion.clone();
         if is_definition(&expression.value) {
             compiler.compile_definition(&expression.value)?;
         } else {
@@ -291,6 +292,7 @@ pub fn compile_lisp_with_functions(
         for (index, expression) in executable.iter().enumerate() {
             compiler.current_span = expression.span.clone();
             compiler.current_source = expression.source.clone();
+            compiler.current_expansion = expression.expansion.clone();
             compiler.compile_expression(&expression.value, &mut builder)?;
             if index + 1 != executable.len() {
                 builder.stack.pop();
@@ -333,6 +335,16 @@ pub fn compile_lisp_with_functions(
 struct TemplateMacro {
     parameters: Vec<String>,
     template: Val,
+    definition_origin: SourceOrigin,
+}
+
+#[derive(Debug, Clone)]
+struct ExpandedForm {
+    value: Val,
+    /// The innermost macro definition responsible for generated syntax. The
+    /// call-site itself remains the primary SourceForm span, giving
+    /// diagnostics an explicit and truthful expansion ancestry chain.
+    expansion: Option<SourceOrigin>,
 }
 
 fn is_macro_definition(expression: &Val) -> bool {
@@ -345,10 +357,11 @@ fn is_macro_definition(expression: &Val) -> bool {
 fn collect_template_macros(
     source_id: &str,
     source: &str,
-    expressions: &[Val],
+    forms: &[SpannedVal],
 ) -> Result<HashMap<String, TemplateMacro>, Vec<VmDiagnostic>> {
     let mut macros = HashMap::new();
-    for expression in expressions {
+    for form in forms {
+        let expression = &form.value;
         if !is_macro_definition(expression) {
             continue;
         }
@@ -406,6 +419,15 @@ fn collect_template_macros(
                 TemplateMacro {
                     parameters,
                     template: items[2].clone(),
+                    definition_origin: source_origin_in_range(
+                        source_id,
+                        source,
+                        form.children
+                            .get(2)
+                            .map(|template| template.span.clone())
+                            .unwrap_or_else(|| form.span.clone()),
+                        format!("macro {name}"),
+                    ),
                 },
             )
             .is_some()
@@ -452,14 +474,20 @@ fn expand_template_macros(
     expression: &Val,
     macros: &HashMap<String, TemplateMacro>,
     budget: &mut u16,
-) -> Result<Val, Vec<VmDiagnostic>> {
+) -> Result<ExpandedForm, Vec<VmDiagnostic>> {
     let Val::List(items) = expression else {
-        return Ok(expression.clone());
+        return Ok(ExpandedForm {
+            value: expression.clone(),
+            expansion: None,
+        });
     };
     // Data is not syntax.  In particular, a quoted list that happens to
     // start with a macro name must remain a literal symbol/list value.
     if matches!(items.first(), Some(Val::Symbol(name)) if name == "quote") {
-        return Ok(expression.clone());
+        return Ok(ExpandedForm {
+            value: expression.clone(),
+            expansion: None,
+        });
     }
     if let Some(Val::Symbol(name)) = items.first() {
         if let Some(definition) = macros.get(name) {
@@ -492,14 +520,22 @@ fn expand_template_macros(
                 .zip(arguments.iter().cloned())
                 .collect::<HashMap<_, _>>();
             let expanded = substitute_macro_template(&definition.template, &bindings);
-            return expand_template_macros(source_id, source, &expanded, macros, budget);
+            let mut expanded = expand_template_macros(source_id, source, &expanded, macros, budget)?;
+            let mut origin = definition.definition_origin.clone();
+            origin.expansion = expanded.expansion.map(Box::new);
+            expanded.expansion = Some(origin);
+            return Ok(expanded);
         }
     }
-    items
+    let values = items
         .iter()
         .map(|item| expand_template_macros(source_id, source, item, macros, budget))
-        .collect::<Result<Vec<_>, _>>()
-        .map(Val::List)
+        .collect::<Result<Vec<_>, _>>()?;
+    let expansion = values.iter().find_map(|item| item.expansion.clone());
+    Ok(ExpandedForm {
+        value: Val::List(values.into_iter().map(|item| item.value).collect()),
+        expansion,
+    })
 }
 
 fn substitute_macro_template(template: &Val, bindings: &HashMap<String, Val>) -> Val {
@@ -534,7 +570,10 @@ fn macro_error(
 
 impl Compiler<'_> {
     fn origin(&self, word: impl Into<String>) -> SourceOrigin {
-        source_origin_in_range(self.source_id, self.source, self.current_span.clone(), word)
+        let mut origin =
+            source_origin_in_range(self.source_id, self.source, self.current_span.clone(), word);
+        origin.expansion = self.current_expansion.clone().map(Box::new);
+        origin
     }
 
     fn compile_expression_at(
@@ -548,9 +587,11 @@ impl Compiler<'_> {
         };
         let previous_span = std::mem::replace(&mut self.current_span, source.span.clone());
         let previous_source = self.current_source.replace(source.clone());
+        let previous_expansion = self.current_expansion.take();
         let result = self.compile_expression(expression, builder);
         self.current_span = previous_span;
         self.current_source = previous_source;
+        self.current_expansion = previous_expansion;
         result
     }
 
@@ -2591,6 +2632,31 @@ mod tests {
                 selector: ResourceSelector::None,
             },
         )));
+    }
+
+    #[test]
+    fn macro_expansion_origins_link_call_sites_to_template_definitions() {
+        let source = "(define-syntax (announce text) (say text))\n(announce \"hello\")";
+        let module = compile_lisp("macros.lisp", source, Vec::new(), &core_vocabulary()).unwrap();
+        let main = module.module.functions.get("main").expect("main function");
+        let emitted = main
+            .blocks
+            .values()
+            .flat_map(|block| block.instructions.iter())
+            .find(|located| {
+                matches!(
+                    located.instruction,
+                    Instruction::CapabilityRequest { ref requirement, .. }
+                        if requirement.capability == CapabilityKind::SessionEmit
+                )
+            })
+            .expect("expanded say effect");
+        let span = emitted.origin.span.as_ref().expect("macro call-site span");
+        assert_eq!(&source[span.start_byte..span.end_byte], "(announce \"hello\")");
+        let expansion = emitted.origin.expansion.as_ref().expect("macro definition ancestry");
+        assert_eq!(expansion.word.as_deref(), Some("macro announce"));
+        let template = expansion.span.as_ref().expect("template span");
+        assert_eq!(&source[template.start_byte..template.end_byte], "(say text)");
     }
 
     #[test]
