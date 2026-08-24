@@ -34,6 +34,7 @@ impl AgentVmBinding {
             background: None,
             provider: None,
             model: None,
+            context: Vec::new(),
             budget: Default::default(),
         })
         .await

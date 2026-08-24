@@ -13,6 +13,7 @@ use crate::vm::EffectSet;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,6 +25,8 @@ const MAX_DEPTH: usize = 4;
 const MAX_TURNS: usize = 10;
 const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CONTEXT_REFERENCES: usize = 64;
+const MAX_CONTEXT_FIELD_BYTES: usize = 1024;
 
 #[derive(Clone)]
 pub struct ProviderResolver {
@@ -150,6 +153,32 @@ impl Default for AgentBudget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentContextReference {
+    pub kind: String,
+    pub id: String,
+    pub sha256: String,
+}
+
+impl AgentContextReference {
+    fn validate(&self) -> Result<()> {
+        for (name, value) in [("kind", &self.kind), ("id", &self.id)] {
+            if value.trim().is_empty() {
+                bail!("agent context reference {name} cannot be empty");
+            }
+            if value.len() > MAX_CONTEXT_FIELD_BYTES {
+                bail!("agent context reference {name} exceeds {MAX_CONTEXT_FIELD_BYTES} bytes");
+            }
+        }
+        if self.sha256.len() != 64
+            || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("agent context reference sha256 must be exactly 64 hexadecimal digits");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentTaskSpec {
     pub task: String,
     #[serde(default)]
@@ -161,6 +190,8 @@ pub struct AgentTaskSpec {
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
+    pub context: Vec<AgentContextReference>,
+    #[serde(default)]
     pub budget: AgentBudget,
 }
 
@@ -168,6 +199,12 @@ impl AgentTaskSpec {
     fn validate(&self) -> Result<()> {
         if self.task.trim().is_empty() {
             bail!("agent task cannot be empty");
+        }
+        if self.context.len() > MAX_CONTEXT_REFERENCES {
+            bail!("agent context has more than {MAX_CONTEXT_REFERENCES} references");
+        }
+        for reference in &self.context {
+            reference.validate()?;
         }
         if !(1..=MAX_TURNS).contains(&self.budget.max_turns) {
             bail!("agent max_turns must be between 1 and {MAX_TURNS}");
@@ -192,6 +229,7 @@ pub struct AgentIdentity {
     pub provider_model: String,
     pub vm_revision: u64,
     pub manifest_generation: u64,
+    pub starting_context_hash: String,
     /// Inherited authority fixed when this child is created. Later
     /// session/project/global grants cannot silently widen a live child;
     /// an exact task-scoped user approval remains an explicit escalation.
@@ -303,6 +341,16 @@ impl AgentScheduler {
         let task_id = Uuid::new_v4();
         let agent_id = Uuid::new_v4();
         let grant_ceiling = self.runtime.effective_grants_for(parent)?;
+        let vm_revision = self.runtime.revision();
+        let manifest_generation = self.runtime.manifest_generation();
+        let starting_context_hash = starting_context_hash(
+            &spec,
+            parent,
+            provider.name(),
+            vm_revision,
+            manifest_generation,
+            &grant_ceiling,
+        )?;
         let identity = AgentIdentity {
             agent_id,
             task_id,
@@ -310,8 +358,9 @@ impl AgentScheduler {
             root_agent_id: parent.map_or(agent_id, |identity| identity.root_agent_id),
             depth,
             provider_model: provider.name().to_string(),
-            vm_revision: self.runtime.revision(),
-            manifest_generation: self.runtime.manifest_generation(),
+            vm_revision,
+            manifest_generation,
+            starting_context_hash,
             grant_ceiling,
         };
         let snapshot = AgentTaskSnapshot {
@@ -498,20 +547,22 @@ impl AgentScheduler {
             .collect::<Vec<_>>();
         let preamble = format!(
             "You are child agent {} of root {} at depth {}. Your model is {}. \
-             VM revision={} manifest_generation={}. Stay within the assigned task and return a final answer. \
+             VM revision={} manifest_generation={} starting_context_sha256={}. Stay within the assigned task and return a final answer. \
              Workspace access and nested agents are available only by submitting verified Finch Lisp/Co-Forth programs; \
-             use tree-list/file-read/file-slice/file-lines-open and agent-* words rather than shell or legacy filesystem tools.\n\nTask: {}{}",
+             use tree-list/file-read/file-slice/file-lines-open and agent-* words rather than shell or legacy filesystem tools.\n\nTask: {}{}{}",
             identity.agent_id,
             identity.root_agent_id,
             identity.depth,
             identity.provider_model,
             identity.vm_revision,
             identity.manifest_generation,
+            identity.starting_context_hash,
             spec.task,
             spec.background
                 .as_ref()
                 .map(|value| format!("\n\nContext from parent:\n{value}"))
                 .unwrap_or_default(),
+            context_reference_preamble(&spec.context),
         );
         let mut messages = vec![Message::user(preamble)];
 
@@ -563,6 +614,52 @@ impl AgentScheduler {
             Box::new(InspectWordTool::new(Arc::clone(&self.runtime), None)),
         ]
     }
+}
+
+fn starting_context_hash(
+    spec: &AgentTaskSpec,
+    parent: Option<&AgentIdentity>,
+    provider_model: &str,
+    vm_revision: u64,
+    manifest_generation: u64,
+    grant_ceiling: &EffectSet,
+) -> Result<String> {
+    let parent_identity = parent.map(|identity| {
+        (
+            identity.agent_id,
+            identity.task_id,
+            identity.root_agent_id,
+            identity.depth,
+            &identity.starting_context_hash,
+        )
+    });
+    let encoded = serde_json::to_vec(&(
+        &spec.task,
+        spec.role,
+        &spec.background,
+        &spec.budget,
+        parent_identity,
+        provider_model,
+        vm_revision,
+        manifest_generation,
+        &spec.context,
+        grant_ceiling,
+    ))?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn context_reference_preamble(references: &[AgentContextReference]) -> String {
+    if references.is_empty() {
+        return String::new();
+    }
+    let mut output = String::from("\n\nImmutable context references (kind, id, sha256):");
+    for reference in references {
+        output.push_str(&format!(
+            "\n- {}, {}, {}",
+            reference.kind, reference.id, reference.sha256
+        ));
+    }
+    output
 }
 
 async fn execute_child_tool(tools: &[Box<dyn Tool>], name: &str, input: Value) -> Result<String> {
@@ -689,6 +786,11 @@ mod tests {
                     background: Some("bounded context".to_string()),
                     provider: None,
                     model: None,
+                    context: vec![AgentContextReference {
+                        kind: "artifact".into(),
+                        id: "report-1".into(),
+                        sha256: "a".repeat(64),
+                    }],
                     budget: AgentBudget::default(),
                 },
                 None,
@@ -698,7 +800,9 @@ mod tests {
         let result = scheduler.wait(identity.task_id).await.unwrap();
         assert_eq!(result.status, AgentTaskStatus::Completed);
         assert!(result.final_message.contains("child agent"));
+        assert!(result.final_message.contains("report-1"));
         assert_eq!(result.identity.depth, 0);
+        assert_eq!(result.identity.starting_context_hash.len(), 64);
     }
 
     #[tokio::test]
@@ -725,6 +829,7 @@ mod tests {
                     background: None,
                     provider: None,
                     model: None,
+                    context: Vec::new(),
                     budget: AgentBudget {
                         max_turns: 0,
                         ..AgentBudget::default()
@@ -736,6 +841,58 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("max_turns"));
         assert!(scheduler.tasks.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_malformed_context_hash_before_creating_a_task() {
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(EchoGenerator)),
+            Arc::new(ProgramRuntime::new()),
+        );
+        let error = scheduler
+            .spawn(
+                AgentTaskSpec {
+                    task: "inspect".into(),
+                    role: AgentRole::General,
+                    background: None,
+                    provider: None,
+                    model: None,
+                    context: vec![AgentContextReference {
+                        kind: "artifact".into(),
+                        id: "report-1".into(),
+                        sha256: "not-a-hash".into(),
+                    }],
+                    budget: AgentBudget::default(),
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("64 hexadecimal digits"));
+        assert!(scheduler.tasks.read().await.is_empty());
+    }
+
+    #[test]
+    fn starting_context_hash_is_deterministic_and_revision_bound() {
+        let spec = AgentTaskSpec {
+            task: "inspect".into(),
+            role: AgentRole::Explore,
+            background: Some("bounded".into()),
+            provider: None,
+            model: None,
+            context: vec![AgentContextReference {
+                kind: "artifact".into(),
+                id: "report-1".into(),
+                sha256: "a".repeat(64),
+            }],
+            budget: AgentBudget::default(),
+        };
+        let first = starting_context_hash(&spec, None, "echo", 7, 3, &EffectSet::pure()).unwrap();
+        let same = starting_context_hash(&spec, None, "echo", 7, 3, &EffectSet::pure()).unwrap();
+        let next_revision =
+            starting_context_hash(&spec, None, "echo", 8, 3, &EffectSet::pure()).unwrap();
+        assert_eq!(first, same);
+        assert_ne!(first, next_revision);
     }
 
     #[tokio::test]
@@ -785,6 +942,7 @@ mod tests {
             provider_model: "echo".into(),
             vm_revision: runtime.revision(),
             manifest_generation: runtime.manifest_generation(),
+            starting_context_hash: "test-context".into(),
             grant_ceiling: EffectSet::pure(),
         };
         let names = scheduler
@@ -888,6 +1046,10 @@ mod tests {
                 :background "focus on typed effects"
                 :provider ""
                 :model ""
+                :context-refs (list {
+                    :kind "artifact"
+                    :id "failure-log"
+                    :sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" })
                 :max-turns 2
                 :timeout-ms 10000
                 :max-output-bytes 4096 }))"#;
@@ -928,6 +1090,10 @@ mod tests {
             name == "provider-model"
                 && value == &crate::programs::ProgramValue::String("echo".to_string())
         }));
+        assert!(fields.iter().any(|(name, value)| {
+            name == "starting-context-hash"
+                && matches!(value, crate::programs::ProgramValue::String(hash) if hash.len() == 64)
+        }));
         let tasks = scheduler.tasks.read().await;
         let task = tasks.values().next().expect("one structured child task");
         assert_eq!(task.snapshot.role, AgentRole::Explore);
@@ -950,6 +1116,7 @@ mod tests {
             :background ""
             :provider ""
             :model "not-configured"
+            :context-refs (empty-list record{kind:string,id:string,sha256:string})
             :max-turns 2
             :timeout-ms 10000
             :max-output-bytes 4096 })"#;
@@ -992,6 +1159,7 @@ mod tests {
             background: "check shared IR"
             provider: ""
             model: ""
+            context-refs: empty-list<record{kind:string,id:string,sha256:string}>
             max-turns: 2
             timeout-ms: 10000
             max-output-bytes: 4096

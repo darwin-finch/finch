@@ -3086,12 +3086,52 @@ fn typed_agent_task_spec(
         .map_err(|_| host_binding_error(origin, "agent timeout-ms must be non-negative"))?;
     let max_output_bytes = usize::try_from(integer("max-output-bytes")?)
         .map_err(|_| host_binding_error(origin, "agent max-output-bytes must be non-negative"))?;
+    let context = match field("context-refs")? {
+        TypedValue::List { values, .. } => values
+            .iter()
+            .map(|value| {
+                let TypedValue::Record(fields) = value else {
+                    return Err(host_binding_error(
+                        origin,
+                        "agent context reference must be a record",
+                    ));
+                };
+                let string_field = |name: &str| {
+                    fields
+                        .iter()
+                        .find_map(|(field, value)| (field == name).then_some(value))
+                        .and_then(|value| match value {
+                            TypedValue::String(value) => Some(value.clone()),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            host_binding_error(
+                                origin,
+                                format!("agent context reference '{name}' must be a string"),
+                            )
+                        })
+                };
+                Ok(scheduler::AgentContextReference {
+                    kind: string_field("kind")?,
+                    id: string_field("id")?,
+                    sha256: string_field("sha256")?,
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, VmDiagnostic>>()?,
+        _ => {
+            return Err(host_binding_error(
+                origin,
+                "agent task field 'context-refs' must be a list of context-reference records",
+            ))
+        }
+    };
     Ok(scheduler::AgentTaskSpec {
         task: string("task")?,
         role,
         background: optional(string("background")?),
         provider: optional(string("provider")?),
         model: optional(string("model")?),
+        context,
         budget: scheduler::AgentBudget {
             max_turns,
             timeout_ms,
@@ -3151,6 +3191,10 @@ fn typed_agent_task_result(
             "provider-model".into(),
             TypedValue::String(result.identity.provider_model),
         ),
+        (
+            "starting-context-hash".into(),
+            TypedValue::String(result.identity.starting_context_hash),
+        ),
         ("depth".into(), TypedValue::Int(depth)),
     ]);
     debug_assert_eq!(value.value_type(), agent_task_result_type());
@@ -3178,6 +3222,10 @@ fn typed_agent_task_snapshot(
         (
             "provider-model".into(),
             TypedValue::String(snapshot.identity.provider_model),
+        ),
+        (
+            "starting-context-hash".into(),
+            TypedValue::String(snapshot.identity.starting_context_hash),
         ),
         ("depth".into(), TypedValue::Int(depth)),
         ("complete".into(), TypedValue::Bool(complete)),
@@ -3729,6 +3777,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         background: None,
                         provider: None,
                         model: None,
+                        context: Vec::new(),
                         budget: Default::default(),
                     }
                 };
@@ -5506,6 +5555,7 @@ mod tests {
             provider_model: "test-provider".into(),
             vm_revision: 0,
             manifest_generation: runtime.manifest_generation(),
+            starting_context_hash: "test-context".into(),
             grant_ceiling: EffectSet::pure(),
         };
         let request = submission(
@@ -5572,6 +5622,7 @@ mod tests {
             provider_model: "test-provider".into(),
             vm_revision: runtime.revision(),
             manifest_generation: runtime.manifest_generation(),
+            starting_context_hash: "test-context".into(),
             grant_ceiling: EffectSet::pure(),
         };
         let source = || {
@@ -5611,6 +5662,7 @@ mod tests {
             provider_model: "test-provider".into(),
             vm_revision: runtime.revision(),
             manifest_generation: runtime.manifest_generation(),
+            starting_context_hash: "test-context".into(),
             grant_ceiling: runtime.effective_grants_for(None).unwrap(),
         };
         let requirement = crate::vm::CapabilityRequirement::file(

@@ -1,7 +1,7 @@
 //! Structured provider tools for bounded child-agent fork/join.
 
 use crate::runtime::scheduler::{
-    AgentBudget, AgentIdentity, AgentRole, AgentScheduler, AgentTaskSpec,
+    AgentBudget, AgentContextReference, AgentIdentity, AgentRole, AgentScheduler, AgentTaskSpec,
 };
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
@@ -51,6 +51,19 @@ impl Tool for AgentSpawnTool {
                 "background": {"type": "string", "description": "Optional bounded context copied into the child's initial message."},
                 "provider": {"type": "string", "description": "Optional explicit provider selector."},
                 "model": {"type": "string", "description": "Optional explicit model selector."},
+                "context_refs": {
+                    "type": "array",
+                    "description": "Optional immutable starting-context references identified by declared SHA-256 digests.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string"},
+                            "id": {"type": "string"},
+                            "sha256": {"type": "string"}
+                        },
+                        "required": ["kind", "id", "sha256"]
+                    }
+                },
                 "max_turns": {"type": "integer", "minimum": 1, "maximum": 10},
                 "timeout_ms": {"type": "integer", "minimum": 1},
                 "max_output_bytes": {"type": "integer", "minimum": 1}
@@ -88,6 +101,7 @@ impl Tool for AgentSpawnTool {
                     background: optional_string(&input, "background")?,
                     provider: optional_string(&input, "provider")?,
                     model: optional_string(&input, "model")?,
+                    context: context_references(&input)?,
                     budget,
                 },
                 self.parent.as_ref(),
@@ -95,6 +109,25 @@ impl Tool for AgentSpawnTool {
             .await?;
         Ok(serde_json::to_string(&identity)?)
     }
+}
+
+fn context_references(input: &Value) -> Result<Vec<AgentContextReference>> {
+    let Some(values) = input.get("context_refs") else {
+        return Ok(Vec::new());
+    };
+    let values = values
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("context_refs must be an array"))?;
+    values
+        .iter()
+        .map(|value| {
+            Ok(AgentContextReference {
+                kind: required_string(value, "kind")?,
+                id: required_string(value, "id")?,
+                sha256: required_string(value, "sha256")?,
+            })
+        })
+        .collect()
 }
 
 pub struct AgentAwaitTool {

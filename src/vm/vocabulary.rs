@@ -132,7 +132,7 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "proposal-open" => CoreWordDocumentation { summary: "Ask the host to open a human-editable artifact proposal. Approval may execute the edited artifact through its normal validator, return edited text for chat, or cancel; this word does not run a shell itself.", lisp: "(proposal-open language title source)", forth: "language title source proposal-open", example: "(proposal-open \"python\" \"Report\" \"print('hello')\\n\")" },
         "mem-recall" | "mem-store" => CoreWordDocumentation { summary: "Read matching session memory entries or store one text memory entry. Both use the host memory tree and require their respective memory capability.", lisp: "(mem-recall query), (mem-store text)", forth: "query mem-recall; text mem-store", example: "(mem-store \"tested release candidate\")" },
         "agent-spawn" | "agent-await" | "agent-poll" | "agent-cancel" => CoreWordDocumentation { summary: "Create or control a separate typed child-agent task. Agent tasks have their own stack, budget, ancestry, and attenuated grants; poll and await return typed snapshot/result records rather than serialized text.", lisp: "(agent-spawn task), (agent-poll handle), (agent-await handle), (agent-cancel handle)", forth: "task agent-spawn; handle agent-poll; handle agent-await; handle agent-cancel", example: "(agent-poll (agent-spawn \"summarize recent test failures\"))" },
-        "agent-spawn-with" => CoreWordDocumentation { summary: "Spawn a bounded child agent from an explicit typed task specification, including role, parent-authored background, optional provider/model selection, and resource budgets. Empty background/provider/model strings select no override.", lisp: "(agent-spawn-with spec)", forth: "spec agent-spawn-with", example: "(agent-spawn-with { :task \"inspect failures\" :role \"explore\" :background \"\" :provider \"\" :model \"\" :max-turns 4 :timeout-ms 60000 :max-output-bytes 65536 })" },
+        "agent-spawn-with" => CoreWordDocumentation { summary: "Spawn a bounded child agent from an explicit typed task specification, including role, parent-authored background, hashed context references, optional provider/model selection, and resource budgets. Empty background/provider/model strings select no override.", lisp: "(agent-spawn-with spec)", forth: "spec agent-spawn-with", example: "(agent-spawn-with { :task \"inspect failures\" :role \"explore\" :background \"\" :provider \"\" :model \"\" :context-refs (empty-list record{kind:string,id:string,sha256:string}) :max-turns 4 :timeout-ms 60000 :max-output-bytes 65536 })" },
         "defer" => CoreWordDocumentation { summary: "Turn a pure zero-argument yielding closure into a cooperative fiber<Y,R>. The runtime owns its private continuation and runs it only through fiber operations.", lisp: "(defer closure) or (defer :fiber closure)", forth: "['] producer defer", example: "(defer (lambda () (begin (yield 1) 2)))" },
         "defer-cpu" => CoreWordDocumentation { summary: "Run a pure zero-argument non-producing closure on the bounded native worker pool and return task<R>.", lisp: "(defer :cpu closure) or (defer-cpu closure)", forth: "['] work defer-cpu", example: "(defer :cpu (lambda () (* 6 7)))" },
         "fiber-next" => CoreWordDocumentation { summary: "Advance one cooperative producer. It returns ok(Y) for a yielded value or err(end(R)) for the terminal return.", lisp: "(fiber-next fiber)", forth: "fiber fiber-next", example: "(match-result (fiber-next producer) (ok value value) (err end end))" },
@@ -238,6 +238,14 @@ pub fn agent_task_spec_type() -> Type {
         ("background".into(), Type::String),
         ("provider".into(), Type::String),
         ("model".into(), Type::String),
+        (
+            "context-refs".into(),
+            Type::list(Type::Record(vec![
+                ("kind".into(), Type::String),
+                ("id".into(), Type::String),
+                ("sha256".into(), Type::String),
+            ])),
+        ),
         ("max-turns".into(), Type::Int),
         ("timeout-ms".into(), Type::Int),
         ("max-output-bytes".into(), Type::Int),
@@ -269,6 +277,7 @@ pub fn agent_task_result_type() -> Type {
         ("turns".into(), Type::Int),
         ("elapsed-ms".into(), Type::Int),
         ("provider-model".into(), Type::String),
+        ("starting-context-hash".into(), Type::String),
         ("depth".into(), Type::Int),
     ])
 }
@@ -281,6 +290,7 @@ pub fn agent_task_snapshot_type() -> Type {
         ("task".into(), Type::String),
         ("role".into(), Type::String),
         ("provider-model".into(), Type::String),
+        ("starting-context-hash".into(), Type::String),
         ("depth".into(), Type::Int),
         ("complete".into(), Type::Bool),
     ])
