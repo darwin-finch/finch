@@ -34,6 +34,17 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   add row-polymorphic record rules. The deliberate typed brace-record syntax is the only record
   source surface; `json-parse`/`json-get`/scalar option projections remain the safe boundary for
   arbitrary JSON objects rather than exposing the internal `TypedValue::Record` ABI ad hoc.
+- [ ] Add named structural schema declarations and bounded compile-time derivation after record-row
+  rules are stable. Today record types are anonymous inline shapes such as
+  `record{name:string,age:int}`; define one shared declaration/alias representation with equivalent
+  Lisp and Co-Forth spellings that erases to the same structural IR type. A pure deterministic
+  `derive` facility may consume immutable schema metadata and generate ordinary inspectable typed
+  words (for example JSON/YAML encoders and `result<Record,DecodeError>` decoders), but must not run
+  host effects or hide privileged compiler behavior. If general definition reflection is later
+  exposed, specify a versioned hygienic syntax/typed-IR value and bounded read-only compile-time
+  API; `inspect_word` model/application access to source is not itself a macro capability. Keep
+  arbitrary external object keys—including names with spaces—at the `json` or `map<string,json>`
+  boundary unless an explicit schema maps them to typed fields.
 - [ ] Extend the implemented typed option/result branches, type-directed Lisp `match`, and
   no-fallthrough integer Co-Forth `case` to richer structured patterns plus expression-valued
   named `break` after the loop verifier is generalized to check each target's declared result
