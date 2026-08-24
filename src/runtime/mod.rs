@@ -518,6 +518,56 @@ impl ProgramRuntime {
         Ok(())
     }
 
+    /// A portable presentation host owns allocation of an `output-open`
+    /// handle, but the runtime still owns the per-ProgramRun capability table
+    /// that validates later `output-*` effects.  Register the externally
+    /// supplied opaque resource exactly when its correlated resume is
+    /// accepted; source code never gets a route to forge this entry.
+    fn register_resumed_output_handle(
+        &self,
+        execution_id: uuid::Uuid,
+        pending: &PendingTypedExecution,
+        values: &[TypedValue],
+    ) -> Result<()> {
+        let is_output_open = pending
+            .suspension
+            .pending_host_call
+            .as_ref()
+            .and_then(|call| call.origin.word.as_deref())
+            == Some("output-open");
+        if !is_output_open {
+            return Ok(());
+        }
+
+        let [TypedValue::Resource {
+            kind,
+            handle,
+            generation,
+        }] = values
+        else {
+            bail!("portable output-open resume requires one output-handle resource");
+        };
+        if kind != "output-handle" || handle.is_empty() {
+            bail!("portable output-open resume returned an invalid output handle");
+        }
+
+        let mut handles = self
+            .output_handles
+            .lock()
+            .map_err(|_| anyhow::anyhow!("output handle registry lock poisoned"))?;
+        if handles.contains_key(handle) {
+            bail!("portable output-open resume returned an already-live output handle");
+        }
+        handles.insert(
+            handle.clone(),
+            OutputHandleRecord {
+                owner: execution_id,
+                generation: *generation,
+            },
+        );
+        Ok(())
+    }
+
     /// Return a UI-safe summary of a suspended execution without exposing its
     /// stack, captures, or capability arguments to an unrelated client.
     pub fn pending_typed_execution(
@@ -954,6 +1004,19 @@ impl ProgramRuntime {
             )),
             None => None,
         };
+        if let Some((_, values)) = &external_effect_result {
+            if let Err(error) = self.register_resumed_output_handle(execution_id, &pending, values)
+            {
+                self.release_output_handles(execution_id)?;
+                return Ok(failed_pending_resume(
+                    execution_id,
+                    &pending,
+                    self.revision(),
+                    error.to_string(),
+                    started.elapsed(),
+                ));
+            }
+        }
         // Grants are authority policy, not a speculative stack/dictionary
         // mutation. An approval granted while this run was suspended must be
         // visible to its private continuation without installing any of its
@@ -5222,6 +5285,78 @@ mod tests {
         )));
         assert!(matches!(
             events.last().map(|effect| &effect.effect.event),
+            Some(crate::vm::interpreter::HostSideEffect::Ui {
+                operation: crate::vm::interpreter::UiOperation::Complete,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn portable_output_open_registers_the_host_issued_handle_for_later_updates() {
+        let runtime = ProgramRuntime::new();
+        let (sink, receiver) = typed_effect_channel();
+        let pending = runtime
+            .submit_with_deferred_host_effects(
+                submission(
+                    ProgramLanguage::Lisp,
+                    "(let ((handle (output-open \"download\"))) \
+                       (begin (output-status handle \"starting\") \
+                              (output-complete handle)))",
+                    ExecutionEffect::VmRead,
+                ),
+                sink,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.status, ExecutionStatus::Suspended);
+
+        let open = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("portable output-open request");
+        assert_eq!(open.execution_id, pending.execution_id);
+        assert!(matches!(
+            &open.effect.event,
+            crate::vm::interpreter::HostSideEffect::Request { arguments }
+                if matches!(arguments.as_slice(), [TypedValue::String(title)] if title == "download")
+        ));
+
+        let completed = runtime
+            .resume_vm_effect(VmResume {
+                execution_id: open.execution_id,
+                sequence: open.effect.sequence,
+                response: VmResumeResponse::Result {
+                    values: vec![TypedValue::Resource {
+                        kind: "output-handle".into(),
+                        handle: "portable-download".into(),
+                        generation: 7,
+                    }],
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ExecutionStatus::Completed);
+        assert_eq!(completed.output, "");
+
+        let updates = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            updates
+                .iter()
+                .map(|envelope| envelope.effect.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(matches!(
+            updates.first().map(|envelope| &envelope.effect.event),
+            Some(crate::vm::interpreter::HostSideEffect::Ui {
+                operation: crate::vm::interpreter::UiOperation::Status,
+                text: Some(text),
+                target: Some(TypedValue::Resource { handle, generation, .. }),
+                ..
+            }) if text == "starting" && handle == "portable-download" && *generation == 7
+        ));
+        assert!(matches!(
+            updates.last().map(|envelope| &envelope.effect.event),
             Some(crate::vm::interpreter::HostSideEffect::Ui {
                 operation: crate::vm::interpreter::UiOperation::Complete,
                 ..
