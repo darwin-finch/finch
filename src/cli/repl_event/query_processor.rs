@@ -29,21 +29,15 @@ fn raw_wire_source(source: &str) -> String {
     source.trim().to_string()
 }
 
-/// Whether a partial provider response is unambiguously beginning a Finch
-/// program. Ordinary prose and shell shebangs are buffered until the response
-/// boundary, avoiding a misleading "program" that later disappears when a
-/// tool-use block arrives.
-fn streamable_wire_prefix(source: &str) -> bool {
-    let source = source.trim_start();
-    source.starts_with('(')
-        || source.starts_with("s\"")
-        || source.starts_with(".\"")
-        || source.starts_with("\"\"\"")
-        || source.starts_with(": ")
-        || source
-            .chars()
-            .next()
-            .is_some_and(|character| character.is_ascii_digit())
+/// Whether a provider has emitted any candidate ProgramSubmission source.
+///
+/// The text channel is the Finch wire, so duplicating a small subset of the
+/// Co-Forth lexer here would hide valid programs beginning with bare strings,
+/// collections, quotations, negative numbers, or user-defined words. Invalid
+/// source also remains visible until the complete-program boundary diagnoses
+/// it, which makes provider protocol failures inspectable.
+fn has_streamed_wire_source(source: &str) -> bool {
+    !source.trim_start().is_empty()
 }
 
 /// Build the submission for a provider response carried on the VM wire rather
@@ -826,18 +820,13 @@ pub(crate) async fn process_query_with_tools(
                             // more calls or a final wire program. Buffer its
                             // text rather than replacing the tool block.
                             work_unit.add_tokens(&delta);
-                            // The streamed text is VM source, not provisional
-                            // assistant prose. As soon as its language can be
-                            // identified, project the partial program visibly
-                            // instead of hiding it behind the generic spinner.
-                            if !reusing_tool_unit && streamable_wire_prefix(&text) {
+                            // Every text-only response is candidate VM source.
+                            // Project its exact bytes immediately; parsing and
+                            // verification still wait for the complete source.
+                            if !reusing_tool_unit && has_streamed_wire_source(&text) {
                                 let language =
                                     crate::programs::ProgramLanguage::infer_source(&text);
                                 work_unit.set_program_source(language.as_str());
-                            }
-                            // Keep the shadow-buffer preview live. The program is
-                            // still only parsed/executed at the explicit boundary.
-                            if !reusing_tool_unit && streamable_wire_prefix(&text) {
                                 work_unit.set_response(&text);
                             }
                         }
@@ -1605,15 +1594,19 @@ mod tests {
     }
 
     #[test]
-    fn only_unambiguous_wire_prefixes_stream_as_programs() {
-        assert!(streamable_wire_prefix("(say \"hello\")"));
-        assert!(streamable_wire_prefix("s\"hello\" say"));
-        assert!(streamable_wire_prefix(".\"hello\""));
-        assert!(streamable_wire_prefix(": square ( S int -- S int ! pure )"));
-        assert!(streamable_wire_prefix("6 factorial"));
-        assert!(!streamable_wire_prefix("#!/bin/bash"));
-        assert!(!streamable_wire_prefix("Sure, I will inspect that."));
-        assert!(!streamable_wire_prefix("```lisp"));
+    fn every_nonempty_text_response_streams_as_candidate_program_source() {
+        assert!(has_streamed_wire_source("(say \"hello\")"));
+        assert!(has_streamed_wire_source("\"hello\" say"));
+        assert!(has_streamed_wire_source("[ 1 2 3 ]"));
+        assert!(has_streamed_wire_source("{ name: \"Finch\" }"));
+        assert!(has_streamed_wire_source("-6 factorial"));
+
+        // Invalid submissions stay visible for diagnosis instead of being
+        // silently treated as an assistant-prose side channel.
+        assert!(has_streamed_wire_source("#!/bin/bash"));
+        assert!(has_streamed_wire_source("Sure, I will inspect that."));
+        assert!(has_streamed_wire_source("```lisp"));
+        assert!(!has_streamed_wire_source("  \n\t"));
     }
 
     #[tokio::test]
