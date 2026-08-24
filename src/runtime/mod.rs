@@ -152,6 +152,45 @@ pub struct ProgramSubmission {
     pub budget: Option<ExecutionBudget>,
 }
 
+/// Versioned authority snapshot persisted with a typed scheduled callback.
+///
+/// A schedule is an instruction to run a known program later, not a blank
+/// cheque against whatever approvals happen to exist when the clock fires.
+/// The snapshot is deliberately a ceiling: the callback can use only grants
+/// that existed at schedule creation.  It is separate from a future durable
+/// approval/revocation record, which will additionally be able to narrow or
+/// invalidate this ceiling before delivery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScheduledVmContext {
+    version: u8,
+    grants: EffectSet,
+}
+
+const SCHEDULED_VM_CONTEXT_VERSION: u8 = 1;
+
+fn scheduled_vm_context(grants: EffectSet) -> Result<String> {
+    serde_json::to_string(&ScheduledVmContext {
+        version: SCHEDULED_VM_CONTEXT_VERSION,
+        grants,
+    })
+    .map_err(Into::into)
+}
+
+fn scheduled_vm_grants(context: &str) -> Result<EffectSet> {
+    let context: ScheduledVmContext = serde_json::from_str(context).map_err(|error| {
+        anyhow::anyhow!(
+            "scheduled callback has no valid Finch authority snapshot; reschedule it: {error}"
+        )
+    })?;
+    if context.version != SCHEDULED_VM_CONTEXT_VERSION {
+        bail!(
+            "scheduled callback has unsupported Finch authority snapshot version {}; reschedule it",
+            context.version
+        );
+    }
+    Ok(context.grants)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmStackCell {
     pub index_from_bottom: usize,
@@ -291,6 +330,11 @@ struct PendingTypedExecution {
     side_effects: Vec<crate::vm::interpreter::HostSideEffect>,
     effect_sink: Option<TypedEffectSink>,
     deferred_host_effects: DeferredHostEffects,
+    /// An execution-specific authority ceiling, used by durable scheduled
+    /// callbacks. Ordinary interactive runs intentionally pick up newly
+    /// granted authority while they wait for approval; scheduled work must
+    /// never gain authority merely because time passed.
+    grant_ceiling: Option<EffectSet>,
 }
 
 /// UI-safe metadata for a daemon-owned typed continuation. The full frame is
@@ -474,9 +518,10 @@ impl ProgramRuntime {
         Arc::new(move |task| {
             let runtime = Arc::clone(&self);
             Box::pin(async move {
+                let grant_ceiling = scheduled_vm_grants(&task.context)?;
                 let language = ProgramLanguage::infer_source(&task.task);
                 let outcome = runtime
-                    .submit_typed_only(ProgramSubmission {
+                    .submit_typed_only_with_grant_ceiling(ProgramSubmission {
                         language,
                         source_id: Some(format!("scheduled-callback.{}", language.as_str())),
                         source: task.task,
@@ -486,7 +531,7 @@ impl ProgramRuntime {
                         manifest_generation: runtime.manifest_generation(),
                         expected_revision: None,
                         budget: None,
-                    })
+                    }, grant_ceiling)
                     .await?;
                 if !matches!(outcome.status, ExecutionStatus::Completed) {
                     anyhow::bail!("scheduled callback did not complete: {:?}", outcome.status);
@@ -1018,17 +1063,21 @@ impl ProgramRuntime {
             }
         }
         // Grants are authority policy, not a speculative stack/dictionary
-        // mutation. An approval granted while this run was suspended must be
-        // visible to its private continuation without installing any of its
-        // uncommitted values into the shared runtime.
+        // mutation. Ordinary interactive runs see an approval granted while
+        // they were suspended. A scheduled callback instead retains its
+        // creation-time ceiling so elapsed time cannot expand authority.
         let mut resumed_runtime = pending.working_runtime.clone();
-        resumed_runtime.set_grants(
-            self.typed
-                .lock()
-                .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?
-                .grants()
-                .clone(),
-        );
+        if let Some(grant_ceiling) = &pending.grant_ceiling {
+            resumed_runtime.set_grants(grant_ceiling.clone());
+        } else {
+            resumed_runtime.set_grants(
+                self.typed
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?
+                    .grants()
+                    .clone(),
+            );
+        }
         let (working_runtime, execution) = self
             .resume_typed_program(
                 resumed_runtime,
@@ -1071,6 +1120,7 @@ impl ProgramRuntime {
                         side_effects: side_effects.clone(),
                         effect_sink: pending.effect_sink.clone(),
                         deferred_host_effects: pending.deferred_host_effects,
+                        grant_ceiling: pending.grant_ceiling.clone(),
                     },
                 );
         }
@@ -1224,7 +1274,7 @@ impl ProgramRuntime {
     async fn commit_working_runtime(
         &self,
         input_revision: u64,
-        working_runtime: TypedRuntime,
+        mut working_runtime: TypedRuntime,
     ) -> Result<u64> {
         let _submission = self.submission_gate.lock().await;
         let current = self.revision();
@@ -1233,13 +1283,17 @@ impl ProgramRuntime {
                 "stale VM transaction input revision {input_revision}; current revision is {current}"
             );
         }
-        let checkpoint = working_runtime.checkpoint();
-        *self
+        let mut typed = self
             .typed
             .lock()
-            .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))? = working_runtime;
+            .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?;
+        // Per-run execution ceilings are not persistent approval state. In
+        // particular, committing a scheduled callback must not erase newer
+        // host approval decisions from the shared runtime.
+        working_runtime.set_grants(typed.grants().clone());
+        let checkpoint = working_runtime.checkpoint();
+        *typed = working_runtime;
         let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
-        let typed = self.typed.lock().map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?;
         self.revision_history
             .lock()
             .map_err(|_| anyhow::anyhow!("revision history lock poisoned"))?
@@ -1340,8 +1394,27 @@ impl ProgramRuntime {
             None,
             None,
             DeferredHostEffects::None,
+            None,
         )
             .await
+    }
+
+    /// Internal scheduled-callback entry point. The persisted ceiling is
+    /// authored only by `schedule-create`; callers outside this module cannot
+    /// manufacture an authority-bearing `ProgramSubmission` field.
+    async fn submit_typed_only_with_grant_ceiling(
+        &self,
+        submission: ProgramSubmission,
+        grant_ceiling: EffectSet,
+    ) -> Result<ExecutionOutcome> {
+        self.submit_as_with_optional_typed_effect_sink(
+            submission,
+            None,
+            None,
+            DeferredHostEffects::None,
+            Some(grant_ceiling),
+        )
+        .await
     }
 
     /// Typed-only variant for a child/agent caller. Provider-facing protocol
@@ -1357,6 +1430,7 @@ impl ProgramRuntime {
             caller,
             None,
             DeferredHostEffects::None,
+            None,
         )
             .await
     }
@@ -1374,6 +1448,7 @@ impl ProgramRuntime {
             caller,
             Some(effect_sink),
             DeferredHostEffects::None,
+            None,
         )
         .await
     }
@@ -1405,6 +1480,7 @@ impl ProgramRuntime {
             None,
             Some(effect_sink),
             DeferredHostEffects::ProgramInvocations,
+            None,
         )
         .await
     }
@@ -1424,6 +1500,7 @@ impl ProgramRuntime {
             None,
             Some(effect_sink),
             DeferredHostEffects::AllAwaited,
+            None,
         )
         .await
     }
@@ -1454,11 +1531,12 @@ impl ProgramRuntime {
         caller: Option<scheduler::AgentIdentity>,
         effect_sink: Option<TypedEffectSink>,
         deferred_host_effects: DeferredHostEffects,
+        grant_ceiling: Option<EffectSet>,
     ) -> Result<ExecutionOutcome> {
         // This is a per-session state transaction, not a process-wide
         // interpreter lock. Independent runtimes and child model loops remain
         // concurrent while revision checks and mutations of this VM are atomic.
-        let (generation, input_revision, working_runtime) = {
+        let (generation, input_revision, mut working_runtime) = {
             // The gate protects only the snapshot/revision handshake and the
             // eventual optimistic commit. Program execution owns this cloned
             // state privately and therefore does not serialize unrelated
@@ -1489,6 +1567,9 @@ impl ProgramRuntime {
                 .clone();
             (generation, input_revision, working_runtime)
         };
+        if let Some(grant_ceiling) = &grant_ceiling {
+            working_runtime.set_grants(grant_ceiling.clone());
+        }
         let context = ExecutionContext::new(generation, submission.budget.unwrap_or_default());
         let source_id = submission.source_id.clone().unwrap_or_else(|| match submission.language {
             ProgramLanguage::Forth => "provider-response.forth".to_string(),
@@ -1531,6 +1612,7 @@ impl ProgramRuntime {
                         side_effects: execution.side_effects.clone(),
                         effect_sink,
                         deferred_host_effects,
+                        grant_ceiling: grant_ceiling.clone(),
                     },
                 );
         }
@@ -2654,6 +2736,12 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     return Err(host_binding_error(origin, "schedule queue is unavailable"));
                 };
                 let callback = callback.clone();
+                // Snapshot the run's effective grants at the moment it
+                // schedules work. This is a capability ceiling, not an
+                // approval token; the future executor must not consult later
+                // global grants as a way to expand the callback's authority.
+                let context = scheduled_vm_context(self.network_grants.clone())
+                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 let timestamp = *timestamp;
                 let scheduled_time = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
                     .ok_or_else(|| host_binding_error(origin, "invalid schedule timestamp"))?;
@@ -2663,7 +2751,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                             id: None,
                             scheduled_time,
                             task: callback.clone(),
-                            context: "{}".into(),
+                            context,
                             recurring: None,
                             status: TaskStatus::Pending,
                             created_at: chrono::Utc::now(),
@@ -5376,7 +5464,7 @@ mod tests {
                 selector: crate::vm::ResourceSelector::Schedule { policy: None },
             })
             .unwrap();
-        let timestamp = chrono::Utc::now().timestamp() + 60;
+        let timestamp = chrono::Utc::now().timestamp();
         let outcome = runtime
             .submit(submission(
                 ProgramLanguage::Lisp,
@@ -5389,7 +5477,21 @@ mod tests {
             outcome.values.first(),
             Some(ProgramValue::Resource { kind, .. }) if kind == "schedule"
         ));
-        assert_eq!(queue.get_ready_tasks().await.unwrap().len(), 0);
+        let tasks = queue.get_ready_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        let grants = scheduled_vm_grants(&tasks[0].context).unwrap();
+        assert!(grants.grants(&EffectSet::from_requirement(
+            crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::ScheduleCreate,
+                selector: crate::vm::ResourceSelector::Schedule { policy: None },
+            },
+        )));
+        assert!(grants.grants(&EffectSet::from_requirement(
+            crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::SessionEmit,
+                selector: crate::vm::ResourceSelector::None,
+            },
+        )));
     }
 
     #[tokio::test]
@@ -5401,7 +5503,7 @@ mod tests {
                 id: None,
                 scheduled_time: chrono::Utc::now(),
                 task: "s\"scheduled callback\" say".into(),
-                context: "{}".into(),
+                context: scheduled_vm_context(TypedRuntime::new().grants().clone()).unwrap(),
                 recurring: None,
                 status: TaskStatus::Pending,
                 created_at: chrono::Utc::now(),
@@ -5415,6 +5517,89 @@ mod tests {
         let scheduler = runtime.task_scheduler().expect("scheduler is attached");
         scheduler.run_once().await.unwrap();
         assert!(queue.get_ready_tasks().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduled_callback_cannot_gain_grants_after_creation() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let queue = Arc::new(TaskQueue::new(database.path().to_path_buf()).unwrap());
+        let runtime = Arc::new(ProgramRuntime::new());
+        runtime.attach_schedule_queue(Arc::clone(&queue));
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::ScheduleCreate,
+                selector: crate::vm::ResourceSelector::Schedule { policy: None },
+            })
+            .unwrap();
+
+        let scheduled = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                &format!(
+                    "(schedule-create \"(file-read (path \\\"later.txt\\\"))\" {})",
+                    chrono::Utc::now().timestamp()
+                ),
+                ExecutionEffect::VmWrite,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(scheduled.status, ExecutionStatus::Completed));
+
+        // This grant did not exist when the callback was made durable. A
+        // fresh scheduled run must remain inside its persisted ceiling.
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("./**").unwrap(),
+            ))
+            .unwrap();
+        let scheduler = runtime.task_scheduler().expect("scheduler is attached");
+        scheduler.run_once().await.unwrap();
+
+        let ready = queue.get_ready_tasks().await.unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].retries, 1);
+        assert_eq!(ready[0].status, TaskStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn scheduled_commit_does_not_erase_later_global_grants() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let queue = Arc::new(TaskQueue::new(database.path().to_path_buf()).unwrap());
+        let runtime = Arc::new(ProgramRuntime::new());
+        runtime.attach_schedule_queue(Arc::clone(&queue));
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::ScheduleCreate,
+                selector: crate::vm::ResourceSelector::Schedule { policy: None },
+            })
+            .unwrap();
+        runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                &format!(
+                    "(schedule-create \"42\" {})",
+                    chrono::Utc::now().timestamp()
+                ),
+                ExecutionEffect::VmWrite,
+            ))
+            .await
+            .unwrap();
+
+        let later_grant = crate::vm::CapabilityRequirement::file(
+            crate::vm::FileOperation::Read,
+            crate::vm::FileSelector::parse("./**").unwrap(),
+        );
+        runtime.grant_typed_capability(later_grant.clone()).unwrap();
+        runtime
+            .task_scheduler()
+            .expect("scheduler is attached")
+            .run_once()
+            .await
+            .unwrap();
+
+        let state = runtime.inspect().await.unwrap();
+        assert!(state.granted_capabilities.contains(&later_grant));
     }
 
     #[tokio::test]

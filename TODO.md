@@ -53,8 +53,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   serializable `VmResume { execution_id, sequence, response }` path now validates the host's
   result row, records result/denial/cancellation against the exact journaled effect, and never
   redispatches it. The portable-host submission policy can now suspend every approved awaited
-  capability (not just editor proposals) for an external implementation; durable approvals,
-  denial policy, and complete host adapters remain.
+  capability (not just editor proposals) for an external implementation; typed scheduled callbacks
+  now persist a versioned creation-time grant ceiling and cannot acquire approvals granted later.
+  Durable approvals, revocation policy, and complete host adapters remain.
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
 - [ ] Extend bounded `file-slice`/`file-size` and host-issued cursors with workbook cursors so large
