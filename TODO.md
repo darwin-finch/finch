@@ -398,10 +398,14 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   region/ownership path. Inventory every durable root (persistent stack and definitions, closure
   captures, suspended runs, producer fibers, host registries, revision archives, and future CTFE
   memo tables), give each an explicit release/retention/compaction policy, and add long-running
-  bounded-memory tests. Completed/cancelled fiber tombstones, abandoned suspensions, and complete
-  revision checkpoints must not grow forever. If shared or cyclic language objects are later
-  admitted, put them behind generation-checked managed handles and choose a checkpoint-aware tracing
-  scheme from measured workloads; do not add a global collector merely for acyclic temporary values.
+  bounded-memory tests. Cooperative producer records are now traced from every nested typed value
+  on the committed stack and transitively through live continuation stacks, locals, captures, and
+  terminal results at each successful commit: an unreferenced terminal record is reclaimed, while a
+  duplicate or captured handle keeps its deterministic tombstone alive. Still define bounded
+  retention for CPU-task tombstones, abandoned host suspensions, and complete revision checkpoints.
+  If shared or cyclic language objects are later admitted, put them behind generation-checked
+  managed handles and choose a checkpoint-aware tracing scheme from measured workloads; do not add
+  a global collector merely for acyclic temporary values.
 - [ ] Complete revisioned private working snapshots and conflict-aware commits. A `ProgramRuntime`
   now executes each ProgramRun on a cloned stack/dictionary snapshot and gates only snapshot/commit;
   stale resume checks and losing post-resume commits return structured failed outcomes without
