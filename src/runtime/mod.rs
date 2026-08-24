@@ -2416,6 +2416,31 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                             generation: 0,
                         }]);
                     }
+                    Some("csv-summary") => {
+                        let [_, TypedValue::Int(max_rows)] = arguments.as_slice() else {
+                            return Err(host_binding_error(
+                                origin,
+                                "csv-summary requires a path and maximum data-row count",
+                            ));
+                        };
+                        let max_rows = usize::try_from(*max_rows).map_err(|_| {
+                            host_binding_error(
+                                origin,
+                                "csv-summary maximum rows must be between 1 and 100000",
+                            )
+                        })?;
+                        if !(1..=100_000).contains(&max_rows) {
+                            return Err(host_binding_error(
+                                origin,
+                                "csv-summary maximum rows must be between 1 and 100000",
+                            ));
+                        }
+                        let file = std::fs::File::open(path)
+                            .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                        let summary = summarize_csv(BufReader::new(file), max_rows)
+                            .map_err(|message| host_binding_error(origin, message))?;
+                        return Ok(vec![TypedValue::Json(summary)]);
+                    }
                     Some("file-lines-open") => {
                         if arguments.len() != 1 {
                             return Err(host_binding_error(
@@ -3348,6 +3373,98 @@ fn csv_field_to_string(field: Vec<u8>) -> std::result::Result<String, String> {
         .map_err(|_| "CSV field is not valid UTF-8; use file-slice for binary data".into())
 }
 
+/// Compute bounded, model-friendly CSV facts without retaining source records.
+/// The first record is the header. Every subsequent record must fit that declared
+/// width; short rows contribute empty trailing fields. One extra record is read
+/// only to report whether the requested sample was truncated.
+fn summarize_csv(
+    mut reader: BufReader<std::fs::File>,
+    max_rows: usize,
+) -> std::result::Result<serde_json::Value, String> {
+    const MAX_CSV_COLUMNS: usize = 4096;
+
+    let headers = read_bounded_csv_record(&mut reader)?
+        .ok_or_else(|| "csv-summary requires a header record".to_string())?;
+    if headers.len() > MAX_CSV_COLUMNS {
+        return Err(format!(
+            "CSV header exceeds the {MAX_CSV_COLUMNS}-column summary limit"
+        ));
+    }
+
+    #[derive(Default)]
+    struct ColumnSummary {
+        empty: u64,
+        non_empty: u64,
+        numeric: u64,
+        sum: f64,
+        min: Option<f64>,
+        max: Option<f64>,
+    }
+
+    let mut columns: Vec<ColumnSummary> =
+        (0..headers.len()).map(|_| ColumnSummary::default()).collect();
+    let mut sampled_rows = 0usize;
+    while sampled_rows < max_rows {
+        let Some(record) = read_bounded_csv_record(&mut reader)? else {
+            break;
+        };
+        if record.len() > headers.len() {
+            return Err(format!(
+                "CSV data row {} has {} fields but the header declares {}",
+                sampled_rows + 1,
+                record.len(),
+                headers.len()
+            ));
+        }
+        for (index, summary) in columns.iter_mut().enumerate() {
+            let field = record.get(index).map(String::as_str).unwrap_or("").trim();
+            if field.is_empty() {
+                summary.empty += 1;
+                continue;
+            }
+            summary.non_empty += 1;
+            if let Ok(value) = field.parse::<f64>() {
+                if value.is_finite() {
+                    summary.numeric += 1;
+                    summary.sum += value;
+                    summary.min = Some(summary.min.map_or(value, |current| current.min(value)));
+                    summary.max = Some(summary.max.map_or(value, |current| current.max(value)));
+                }
+            }
+        }
+        sampled_rows += 1;
+    }
+    let truncated = read_bounded_csv_record(&mut reader)?.is_some();
+
+    let columns = headers
+        .iter()
+        .zip(columns)
+        .enumerate()
+        .map(|(index, (name, summary))| {
+            let mean = (summary.numeric != 0)
+                .then(|| summary.sum / summary.numeric as f64)
+                .filter(|value| value.is_finite());
+            serde_json::json!({
+                "index": index,
+                "name": name,
+                "empty": summary.empty,
+                "non_empty": summary.non_empty,
+                "numeric": summary.numeric,
+                "min": summary.min,
+                "max": summary.max,
+                "mean": mean,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(serde_json::json!({
+        "headers": headers,
+        "sampled_rows": sampled_rows,
+        "truncated": truncated,
+        "columns": columns,
+    }))
+}
+
 fn block_on_host<F, T>(future: F) -> anyhow::Result<T>
 where
     F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
@@ -4144,6 +4261,66 @@ mod tests {
                 vec![ProgramValue::String("[package]".into()),]
             ))))]
         );
+    }
+
+    #[tokio::test]
+    async fn csv_summary_is_bounded_and_identical_across_frontends() {
+        let mut file = tempfile::Builder::new()
+            .prefix("finch-csv-summary-")
+            .suffix(".csv")
+            .tempfile_in(".")
+            .unwrap();
+        file.write_all(b"name,score,note\nAda,10,ok\nBob,20,\nCy,not-a-number,ok\n")
+            .unwrap();
+        let relative = file
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let expected = serde_json::json!({
+            "headers": ["name", "score", "note"],
+            "sampled_rows": 2,
+            "truncated": true,
+            "columns": [
+                {"index": 0, "name": "name", "empty": 0, "non_empty": 2, "numeric": 0, "min": null, "max": null, "mean": null},
+                {"index": 1, "name": "score", "empty": 0, "non_empty": 2, "numeric": 2, "min": 10.0, "max": 20.0, "mean": 15.0},
+                {"index": 2, "name": "note", "empty": 1, "non_empty": 1, "numeric": 0, "min": null, "max": null, "mean": null}
+            ]
+        });
+
+        for (language, source) in [
+            (
+                ProgramLanguage::Lisp,
+                format!("(csv-summary (path \"{relative}\") 2)"),
+            ),
+            (
+                ProgramLanguage::Forth,
+                format!("\"{relative}\" path 2 csv-summary"),
+            ),
+        ] {
+            let runtime = ProgramRuntime::new();
+            runtime
+                .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                    crate::vm::FileOperation::Read,
+                    crate::vm::FileSelector::parse("./**").unwrap(),
+                ))
+                .unwrap();
+            let outcome = runtime
+                .submit_typed_only(submission(language, &source, ExecutionEffect::WorkspaceRead))
+                .await
+                .unwrap();
+            assert_eq!(outcome.status, ExecutionStatus::Completed);
+            assert_eq!(outcome.values, vec![ProgramValue::Json(expected.clone())]);
+        }
+    }
+
+    #[test]
+    fn csv_summary_rejects_rows_wider_than_the_header() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"one,two\n1,2,3\n").unwrap();
+        let error = summarize_csv(BufReader::new(file.reopen().unwrap()), 10).unwrap_err();
+        assert!(error.contains("has 3 fields but the header declares 2"));
     }
 
     #[tokio::test]

@@ -317,3 +317,7 @@ comma-containing, and multiline fields rather than treating physical lines as re
 quote boundaries fail with a host diagnostic. Both stream kinds use the same opaque-handle pattern;
 workbook resources must follow it too and must not smuggle an ambient filesystem path back into VM
 values.
+`csv-summary(path, max_rows)` is the bounded aggregate path for model inspection. It consumes no
+stream handle and returns managed `json` describing the header and per-column empty/non-empty and
+numeric min/max/mean statistics for at most 100,000 data records. The concrete path still determines
+the `file.read` request; the row bound is work policy, not authority.

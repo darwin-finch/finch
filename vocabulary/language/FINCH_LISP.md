@@ -319,6 +319,11 @@ newlines. `(csv-open path)` returns `stream<list<string>>`;
 UTF-8, quoted fields follow RFC-style doubled-quote and multiline rules, malformed quote boundaries
 are rejected, and each complete record is limited to 8 MiB.
 
+For bounded schema discovery and column statistics, prefer `(csv-summary path max-rows)` over
+materializing records. It treats the first record as headers, scans at most 100,000 data records,
+and returns managed `json` containing `headers`, `sampled_rows`, `truncated`, and per-column `empty`,
+`non_empty`, `numeric`, `min`, `max`, and `mean` fields. A row wider than its header is rejected.
+
 ```lisp
 (let ((cursor (csv-open (path "data.csv"))))
   (begin

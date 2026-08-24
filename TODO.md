@@ -115,8 +115,8 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their
-  own large-file loops: workspace tree metadata, bounded file hash, and a bounded host-computed
-  directory Merkle root now exist; add CSV schema and bounded per-column summaries, then workbook
+  own large-file loops: workspace tree metadata, bounded file hash, a bounded host-computed
+  directory Merkle root, and bounded host-computed CSV header/per-column summaries now exist; add workbook
   metadata/range cursors. Build security/integrity inspection from these explicit bounded facts
   (inventory, metadata, hashes, rules/signatures, provenance), with any remediation remaining a
   separately authorized proposal/effect. Each contract must advertise result shape and byte/work

@@ -41,6 +41,7 @@ pub enum CoreHostBinding {
     FileLinesNext,
     FileLinesClose,
     CsvOpen,
+    CsvSummary,
     CsvNext,
     CsvClose,
     StreamNext,
@@ -116,6 +117,7 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "file-lines-open" => CoreWordDocumentation { summary: "Open an authorized text-file stream<string>. The opaque stream owns no forgeable path authority.", lisp: "(file-lines-open path)", forth: "path file-lines-open", example: "(file-lines-open (path \"large.log\"))" },
         "file-lines-next" | "file-lines-close" => CoreWordDocumentation { summary: "Compatibility aliases for stream-next and stream-close on file-line streams. Prefer the generic stream operations in new programs.", lisp: "(stream-next stream), (stream-close stream)", forth: "stream stream-next; stream stream-close", example: "(match-option (stream-next lines) (some line (say line)) (none (stream-close lines)))" },
         "csv-open" => CoreWordDocumentation { summary: "Open an authorized stream<list<string>> of CSV records. CSV parsing preserves quoted fields and records spanning physical lines.", lisp: "(csv-open path)", forth: "path csv-open", example: "(let ((rows (csv-open (path \"data.csv\")))) (stream-next rows))" },
+        "csv-summary" => CoreWordDocumentation { summary: "Scan at most max_rows data records after the header and return bounded JSON column statistics without materializing the CSV in model context. The limit must be 1..100000.", lisp: "(csv-summary path max_rows)", forth: "path max_rows csv-summary", example: "(csv-summary (path \"data.csv\") 10000)" },
         "csv-next" | "csv-close" => CoreWordDocumentation { summary: "Compatibility aliases for stream-next and stream-close on CSV streams. Prefer the generic stream operations in new programs.", lisp: "(stream-next stream), (stream-close stream)", forth: "stream stream-next; stream stream-close", example: "(stream-next rows)" },
         "stream-next" => CoreWordDocumentation { summary: "Advance an opaque stream<T> by at most one item and return some(T), or none at end of stream. It cannot forge or widen the source stream's authority.", lisp: "(stream-next stream)", forth: "stream stream-next", example: "(match-option (stream-next rows) (some row row) (none \"done\"))" },
         "stream-close" => CoreWordDocumentation { summary: "Close an opaque stream<T>, release its backing cursor or producer, and make future operations fail safely.", lisp: "(stream-close stream)", forth: "stream stream-close", example: "rows stream-close" },
@@ -640,6 +642,22 @@ fn core_signatures() -> Vocabulary {
             ),
         ),
         (
+            "csv-summary".into(),
+            capability(
+                vec![
+                    Type::Path(FileSelector::parse("./**").expect("valid workspace root")),
+                    Type::Int,
+                ],
+                vec![Type::Json],
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileRead,
+                    selector: ResourceSelector::FileTemplate {
+                        template: path_template(),
+                    },
+                },
+            ),
+        ),
+        (
             "csv-next".into(),
             capability(
                 vec![Type::Stream(Box::new(Type::list(Type::String)))],
@@ -1135,6 +1153,7 @@ static CORE_WORD_REGISTRY: Lazy<BTreeMap<String, CoreWordSpec>> = Lazy::new(|| {
                 "file-lines-next" => CoreWordImplementation::HostEffect(CoreHostBinding::FileLinesNext),
                 "file-lines-close" => CoreWordImplementation::HostEffect(CoreHostBinding::FileLinesClose),
                 "csv-open" => CoreWordImplementation::HostEffect(CoreHostBinding::CsvOpen),
+                "csv-summary" => CoreWordImplementation::HostEffect(CoreHostBinding::CsvSummary),
                 "csv-next" => CoreWordImplementation::HostEffect(CoreHostBinding::CsvNext),
                 "csv-close" => CoreWordImplementation::HostEffect(CoreHostBinding::CsvClose),
                 "stream-next" => CoreWordImplementation::HostEffect(CoreHostBinding::StreamNext),

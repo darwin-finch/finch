@@ -267,6 +267,12 @@ fields, including doubled quotes and multiline fields, and bounds each complete 
 It rejects malformed quote boundaries instead of guessing. It has the same ProgramRun ownership and
 `file.read` requirement as a line cursor.
 
+When the model needs column shape and basic statistics rather than individual rows, use
+`path max-rows csv-summary`. It treats the first record as headers, scans at most 100,000 data
+records, and returns managed `json` containing `headers`, `sampled_rows`, `truncated`, and per-column
+`empty`, `non_empty`, `numeric`, `min`, `max`, and `mean` fields. It reads one additional record only
+to determine `truncated` and rejects rows wider than the header.
+
 ```forth
 s" data.csv" path csv-open
 dup csv-next if-some
