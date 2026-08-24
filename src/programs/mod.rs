@@ -102,6 +102,22 @@ fn complete_forth_wire_tokens(source: &str, final_boundary: bool) -> Result<Vec<
         }
 
         let start = cursor;
+        // Keep a pasted JSON object together while the provider stream is
+        // incomplete. Without this, whitespace inside `{ "key": value }`
+        // would be projected as fake independent Forth words before the
+        // typed receiver gets a complete program. The full frontend remains
+        // authoritative for JSON validity and source semantics.
+        if bytes[start] == b'{' && looks_like_streamed_json_object(source, start) {
+            match streamed_json_object_end(source, start) {
+                Some(end) => {
+                    cursor = end;
+                    tokens.push((start, end));
+                    continue;
+                }
+                None if final_boundary => bail!("unterminated pasted JSON object"),
+                None => break,
+            }
+        }
         if source[start..].starts_with("s\"\"\"") {
             let content_start = start + 4;
             match source[content_start..].find("\"\"\"") {
@@ -158,6 +174,49 @@ fn complete_forth_wire_tokens(source: &str, final_boundary: bool) -> Result<Vec<
         tokens.push((start, cursor));
     }
     Ok(tokens)
+}
+
+fn looks_like_streamed_json_object(source: &str, start: usize) -> bool {
+    matches!(
+        source[start + 1..].trim_start().as_bytes().first(),
+        Some(b'"' | b'}')
+    )
+}
+
+/// Return the byte after a structurally complete JSON object. This is only
+/// incremental framing; the typed frontend performs the real JSON parse once
+/// the complete program arrives.
+fn streamed_json_object_end(source: &str, start: usize) -> Option<usize> {
+    let mut cursor = start;
+    let mut depth = 0_u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    while cursor < source.len() {
+        let character = source[cursor..].chars().next()?;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+        } else {
+            match character {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(cursor + character.len_utf8());
+                    }
+                }
+                _ => {}
+            }
+        }
+        cursor += character.len_utf8();
+    }
+    None
 }
 
 /// Identity of one normative artifact handed to a provider. The body is
@@ -1114,6 +1173,28 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unterminated"));
+    }
+
+    #[test]
+    fn forth_wire_buffer_keeps_pasted_json_object_atomic() {
+        let mut buffer = ForthWireBuffer::default();
+        assert!(buffer.push("{\"first name\": ").unwrap().is_empty());
+        assert_eq!(
+            buffer.push("\"Ada\", \"age\": 37} ").unwrap(),
+            vec![ForthWireToken {
+                start_byte: 0,
+                end_byte: 32,
+                source: "{\"first name\": \"Ada\", \"age\": 37}".into(),
+            }]
+        );
+
+        let mut unterminated = ForthWireBuffer::default();
+        unterminated.push("{\"first name\": \"Ada\"").unwrap();
+        assert!(unterminated
+            .finish()
+            .unwrap_err()
+            .to_string()
+            .contains("unterminated pasted JSON object"));
     }
 
     #[test]
