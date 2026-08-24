@@ -4,8 +4,7 @@ use crate::claude::{ContentBlock, Message};
 use crate::generators::Generator;
 use crate::runtime::ProgramRuntime;
 use crate::tools::implementations::{
-    GetLanguageDefinitionTool, GetVmStateTool, GlobTool, GrepTool, InspectWordTool, ReadTool,
-    SearchWordTool, SubmitProgramTool,
+    GetLanguageDefinitionTool, GetVmStateTool, InspectWordTool, SearchWordTool, SubmitProgramTool,
 };
 use crate::tools::permissions::{PermissionCheck, PermissionManager};
 use crate::tools::registry::Tool;
@@ -499,7 +498,9 @@ impl AgentScheduler {
             .collect::<Vec<_>>();
         let preamble = format!(
             "You are child agent {} of root {} at depth {}. Your model is {}. \
-             VM revision={} manifest_generation={}. Stay within the assigned task and return a final answer.\n\nTask: {}{}",
+             VM revision={} manifest_generation={}. Stay within the assigned task and return a final answer. \
+             Workspace access and nested agents are available only by submitting verified Finch Lisp/Co-Forth programs; \
+             use tree-list/file-read/file-slice/file-lines-open and agent-* words rather than shell or legacy filesystem tools.\n\nTask: {}{}",
             identity.agent_id,
             identity.root_agent_id,
             identity.depth,
@@ -551,10 +552,7 @@ impl AgentScheduler {
     }
 
     fn child_tools(self: &Arc<Self>, identity: &AgentIdentity) -> Vec<Box<dyn Tool>> {
-        let mut tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(ReadTool),
-            Box::new(GlobTool),
-            Box::new(GrepTool),
+        vec![
             Box::new(SubmitProgramTool::child(
                 Arc::clone(&self.runtime),
                 identity.clone(),
@@ -563,34 +561,7 @@ impl AgentScheduler {
             Box::new(GetLanguageDefinitionTool),
             Box::new(SearchWordTool::new(Arc::clone(&self.runtime), None)),
             Box::new(InspectWordTool::new(Arc::clone(&self.runtime), None)),
-        ];
-        if identity.depth < MAX_DEPTH {
-            tools.push(Box::new(
-                crate::tools::implementations::AgentSpawnTool::child(
-                    Arc::clone(self),
-                    identity.clone(),
-                ),
-            ));
-            tools.push(Box::new(
-                crate::tools::implementations::AgentAwaitTool::child(
-                    Arc::clone(self),
-                    identity.clone(),
-                ),
-            ));
-            tools.push(Box::new(
-                crate::tools::implementations::AgentPollTool::child(
-                    Arc::clone(self),
-                    identity.clone(),
-                ),
-            ));
-            tools.push(Box::new(
-                crate::tools::implementations::AgentCancelTool::child(
-                    Arc::clone(self),
-                    identity.clone(),
-                ),
-            ));
-        }
-        tools
+        ]
     }
 }
 
@@ -796,6 +767,47 @@ mod tests {
             .required_capabilities
             .iter()
             .any(|requirement| { requirement.capability == CapabilityKind::AgentSpawn }));
+    }
+
+    #[test]
+    fn child_tools_route_effects_through_typed_programs() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(EchoGenerator)),
+            Arc::clone(&runtime),
+        );
+        let identity = AgentIdentity {
+            agent_id: Uuid::new_v4(),
+            task_id: Uuid::new_v4(),
+            parent_agent_id: None,
+            root_agent_id: Uuid::new_v4(),
+            depth: 0,
+            provider_model: "echo".into(),
+            vm_revision: runtime.revision(),
+            manifest_generation: runtime.manifest_generation(),
+            grant_ceiling: EffectSet::pure(),
+        };
+        let names = scheduler
+            .child_tools(&identity)
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "submit_program"));
+        for bypass in [
+            "read",
+            "glob",
+            "grep",
+            "agent_spawn",
+            "agent_await",
+            "agent_poll",
+            "agent_cancel",
+        ] {
+            assert!(
+                !names.iter().any(|name| name == bypass),
+                "child tool '{bypass}' bypasses the typed VM"
+            );
+        }
     }
 
     #[tokio::test]
