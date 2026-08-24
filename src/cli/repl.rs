@@ -1419,7 +1419,6 @@ impl Repl {
                         None, // repl_mode (not available in raw mode)
                         None, // plan_content
                         None, // live_output
-                        None, // stack
                     )
                     .await?;
 

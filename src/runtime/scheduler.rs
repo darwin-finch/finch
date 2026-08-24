@@ -818,7 +818,6 @@ async fn execute_child_tool(tools: &[Box<dyn Tool>], name: &str, input: Value) -
         repl_mode: None,
         plan_content: None,
         live_output: None,
-        stack: None,
         poset: None,
     };
     tool.execute(input, &context).await

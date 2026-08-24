@@ -115,7 +115,6 @@ pub(crate) fn resolve_provider_profile(
 struct PendingPosetRun {
     generator: Arc<dyn crate::generators::Generator>,
     poset: Arc<tokio::sync::Mutex<crate::poset::Poset>>,
-    stack: Arc<tokio::sync::Mutex<Vec<String>>>,
     event_tx: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
 }
 
@@ -1263,7 +1262,8 @@ impl EventLoop {
         // Initialize plan content storage
         let plan_content = Arc::new(RwLock::new(None));
 
-        // Create tool coordinator and wire the shared stack in.
+        // Create the tool coordinator. Tool results are conversation events;
+        // they never mutate the unrelated legacy semiotic stack.
         let tool_coordinator = ToolExecutionCoordinator::new(
             event_tx.clone(),
             Arc::clone(&tool_executor),
@@ -1274,7 +1274,6 @@ impl EventLoop {
             Arc::clone(&mode),
             Arc::clone(&plan_content),
         )
-        .with_stack(Arc::clone(&stack))
         .with_poset(Arc::clone(&poset));
 
         // Initialize memtree console (uses a separate dummy tree for the tree-view UI)
@@ -1840,10 +1839,10 @@ impl EventLoop {
                                     reg.register(Box::new(WriteTool));
                                     reg.register(Box::new(EditTool));
                                     let registry = Some(Arc::new(reg));
-                                    let PendingPosetRun { generator, poset, stack, event_tx } = pending;
+                                    let PendingPosetRun { generator, poset, event_tx } = pending;
                                     tokio::spawn(async move {
                                         let result = crate::poset::executor::execute_poset(
-                                            poset, generator, registry, Some(stack),
+                                            poset, generator, registry,
                                         ).await;
                                         let _ = event_tx.send(super::events::ReplEvent::PosetComplete { result });
                                     });
@@ -7697,7 +7696,6 @@ Rules:\n\
         self.pending_poset_run = Some(PendingPosetRun {
             generator,
             poset: Arc::clone(&self.poset),
-            stack: Arc::clone(&self.stack),
             event_tx: self.event_tx.clone(),
         });
 

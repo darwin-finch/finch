@@ -380,7 +380,7 @@ impl ToolExecutor {
 
     /// Execute a single tool use
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(self, tool_use, conversation, save_models_fn, batch_trainer, local_generator, tokenizer, repl_mode, plan_content, live_output, stack), fields(tool = %tool_use.name, id = %tool_use.id))]
+    #[instrument(skip(self, tool_use, conversation, save_models_fn, batch_trainer, local_generator, tokenizer, repl_mode, plan_content, live_output), fields(tool = %tool_use.name, id = %tool_use.id))]
     pub async fn execute_tool<F>(
         &self,
         tool_use: &ToolUse,
@@ -394,7 +394,6 @@ impl ToolExecutor {
         repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>,
         plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
         live_output: Option<crate::tools::types::LiveOutput>,
-        stack: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
     ) -> Result<ToolResult>
     where
         F: Fn() -> Result<()> + Send + Sync,
@@ -509,7 +508,6 @@ impl ToolExecutor {
             repl_mode,
             plan_content,
             live_output,
-            stack,
             poset: None,
         };
 
@@ -599,7 +597,6 @@ impl ToolExecutor {
                     repl_mode.clone(),
                     plan_content.clone(),
                     None, // live_output
-                    None, // stack
                 )
                 .await?;
             results.push(result);
@@ -873,7 +870,6 @@ mod tests {
                 None,
                 None,
                 None, // live_output
-                None, // stack
             )
             .await
             .unwrap();
@@ -902,7 +898,6 @@ mod tests {
                 None,
                 None,
                 None, // live_output
-                None, // stack
             )
             .await;
         assert!(result.is_err());
@@ -925,7 +920,6 @@ mod tests {
                 None,
                 None,
                 None, // live_output
-                None, // stack
             )
             .await
             .unwrap();
@@ -951,7 +945,6 @@ mod tests {
                 None,
                 None,
                 None, // live_output
-                None, // stack
             )
             .await
             .unwrap();

@@ -7,7 +7,6 @@ pub async fn execute_poset(
     poset: Arc<Mutex<Poset>>,
     generator: Arc<dyn crate::generators::Generator>,
     registry: Option<Arc<crate::tools::ToolRegistry>>,
-    stack: Option<Arc<Mutex<Vec<String>>>>,
 ) -> Result<String> {
     let mut all_results: Vec<String> = Vec::new();
 
@@ -34,8 +33,7 @@ pub async fn execute_poset(
                 let p2 = Arc::clone(&poset);
                 let g2 = Arc::clone(&generator);
                 let r2 = registry.clone();
-                let s2 = stack.clone();
-                tokio::spawn(async move { exec_node(node_id, p2, g2, r2, s2).await })
+                tokio::spawn(async move { exec_node(node_id, p2, g2, r2).await })
             })
             .collect();
 
@@ -54,7 +52,6 @@ async fn exec_node(
     poset: Arc<Mutex<Poset>>,
     generator: Arc<dyn crate::generators::Generator>,
     registry: Option<Arc<crate::tools::ToolRegistry>>,
-    stack: Option<Arc<Mutex<Vec<String>>>>,
 ) -> Result<String> {
     let (label, kind, ctx, node_tools, vocab, compiled_code, compiled_lang) = {
         let p = poset.lock().await;
@@ -247,7 +244,6 @@ async fn exec_node(
                         repl_mode: None,
                         plan_content: None,
                         live_output: None,
-                        stack: stack.clone(),
                         poset: Some(Arc::clone(&poset)),
                     };
                     match tool.execute(tu.input.clone(), &ctx_obj).await {

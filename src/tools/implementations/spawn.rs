@@ -346,7 +346,6 @@ async fn execute_subagent_tool(tools: &[Box<dyn Tool>], tool_use: &ToolUse) -> R
         repl_mode: None,
         plan_content: None,
         live_output: None,
-        stack: None,
         poset: None,
     };
 

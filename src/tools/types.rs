@@ -86,10 +86,6 @@ pub struct ToolContext<'a> {
     /// Allows the WorkUnit row to show a live scrolling preview.
     pub live_output: Option<LiveOutput>,
 
-    /// Co-Forth shared stack.  The AI can push items onto this stack via the
-    /// `Push` tool; the user executes the combined stack with /pop.
-    pub stack: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
-
     /// Co-Forth poset VM — partially-ordered task graph.
     pub poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
 }

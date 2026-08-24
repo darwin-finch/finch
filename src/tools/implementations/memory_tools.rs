@@ -279,7 +279,6 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
-            stack: None,
             poset: None,
         };
         let result = tool
@@ -318,7 +317,6 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
-            stack: None,
             poset: None,
         };
 
@@ -368,7 +366,6 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
-            stack: None,
             poset: None,
         };
         let result = tool

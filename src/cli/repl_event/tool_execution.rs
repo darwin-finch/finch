@@ -52,9 +52,6 @@ pub struct ToolExecutionCoordinator {
     /// Plan content storage
     plan_content: Arc<RwLock<Option<String>>>,
 
-    /// Co-Forth shared stack (AI can push items here via the Push tool)
-    stack: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
-
     /// Co-Forth poset — each tool call auto-pushes a trace node here.
     poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
 }
@@ -125,15 +122,8 @@ impl ToolExecutionCoordinator {
             tokenizer,
             repl_mode,
             plan_content,
-            stack: None,
             poset: None,
         }
-    }
-
-    /// Wire the Co-Forth shared stack so the Push tool can write to it.
-    pub fn with_stack(mut self, stack: Arc<tokio::sync::Mutex<Vec<String>>>) -> Self {
-        self.stack = Some(stack);
-        self
     }
 
     /// Wire the Co-Forth poset so every tool call auto-records a trace node.
@@ -173,7 +163,6 @@ impl ToolExecutionCoordinator {
         let repl_mode = Arc::clone(&self.repl_mode);
         let plan_content = Arc::clone(&self.plan_content);
         let output_manager = Arc::clone(&self.output_manager);
-        let stack = self.stack.clone();
         let poset = self.poset.clone();
 
         // Build a per-tool presentation binding. Ordinary streaming tools append
@@ -313,7 +302,6 @@ impl ToolExecutionCoordinator {
                     Some(Arc::clone(&repl_mode)),
                     Some(Arc::clone(&plan_content)),
                     Some(Arc::clone(&live_output)),
-                    stack.clone(), // Co-Forth shared stack
                 );
             let result = match timeout_duration {
                 Some(timeout) => tokio::time::timeout(timeout, execute).await,
@@ -329,22 +317,6 @@ impl ToolExecutionCoordinator {
                         tool_use.name,
                         tool_result.content.len()
                     );
-
-                    // Push tool result onto the Co-Forth stack so the user can
-                    // see what the AI observed before deciding to /run.
-                    // Skip internal tools (TodoWrite, etc.) — those manage
-                    // their own stack interaction.
-                    let skip_stack = matches!(
-                        tool_use.name.as_str(),
-                        "todo_write" | "todo_read" | "TodoWrite" | "TodoRead" | "EnterPlanMode" | "enter_plan_mode"
-                    );
-                    if !skip_stack {
-                        if let Some(ref s) = stack {
-                            let frame =
-                                format!("[{}]\n{}", tool_use.name, tool_result.content.trim());
-                            s.lock().await.push(frame);
-                        }
-                    }
 
                     let _ = event_tx.send(ReplEvent::ToolResult {
                         query_id,

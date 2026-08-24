@@ -377,7 +377,6 @@ impl QwenGenerator {
                     None,                                    // repl_mode
                     None,                                    // plan_content
                     None,                                    // live_output
-                    None,                                    // stack
                 )
                 .await
                 .unwrap_or_else(|e| {
