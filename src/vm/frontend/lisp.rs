@@ -555,7 +555,13 @@ impl Compiler<'_> {
     }
 
     fn current_list_children(&self, items: &[Val]) -> Option<&[SpannedVal]> {
-        let source = self.current_source.as_ref()?;
+        Self::source_list_children(self.current_source.as_ref()?, items)
+    }
+
+    fn source_list_children<'source>(
+        source: &'source SpannedVal,
+        items: &[Val],
+    ) -> Option<&'source [SpannedVal]> {
         let Val::List(source_items) = &source.value else {
             return None;
         };
@@ -854,10 +860,26 @@ impl Compiler<'_> {
                 source_children.as_deref().and_then(|children| children.get(1..)),
                 builder,
             ),
-            "match" => self.compile_match(&items[1..], builder),
-            "match-option" => self.compile_match_option(&items[1..], builder),
-            "match-result" => self.compile_match_result(&items[1..], builder),
-            "while" => self.compile_while(&items[1..], builder),
+            "match" => self.compile_match(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
+            "match-option" => self.compile_match_option(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
+            "match-result" => self.compile_match_result(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
+            "while" => self.compile_while(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
             "break" => self.compile_loop_exit("break", &items[1..], builder),
             "continue" => self.compile_loop_exit("continue", &items[1..], builder),
             "lambda" => self.compile_lambda(
@@ -1305,6 +1327,7 @@ impl Compiler<'_> {
     fn compile_match_option(
         &mut self,
         expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let [option_expression, some_arm, none_arm] = expressions else {
@@ -1313,7 +1336,11 @@ impl Compiler<'_> {
                 "match-option requires an option expression, (some name body...), and (none body...)",
             )]);
         };
-        let Type::Option(inner) = self.compile_expression(option_expression, builder)? else {
+        let Type::Option(inner) = self.compile_expression_at(
+            option_expression,
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )? else {
             return Err(vec![self.error(
                 "E-LISP-MATCH-002",
                 "match-option requires an option<T> expression",
@@ -1401,7 +1428,11 @@ impl Compiler<'_> {
                 ty: (*inner).clone(),
             },
         )]));
-        let some_type = self.compile_begin(some_body, None, builder)?;
+        let some_sources = expression_sources
+            .and_then(|sources| sources.get(1))
+            .and_then(|source| Self::source_list_children(source, some_items))
+            .and_then(|sources| sources.get(2..));
+        let some_type = self.compile_begin(some_body, some_sources, builder)?;
         builder.scopes.pop();
         builder.stack.push(some_type.clone());
         let some_stack = builder.stack.clone();
@@ -1414,7 +1445,11 @@ impl Compiler<'_> {
 
         builder.switch_to(else_block, branch_stack);
         builder.emit(Instruction::Drop, self.origin("match-option/none"));
-        let none_type = self.compile_begin(none_body, None, builder)?;
+        let none_sources = expression_sources
+            .and_then(|sources| sources.get(2))
+            .and_then(|source| Self::source_list_children(source, none_items))
+            .and_then(|sources| sources.get(1..));
+        let none_type = self.compile_begin(none_body, none_sources, builder)?;
         builder.stack.push(none_type.clone());
         let none_stack = builder.stack.clone();
         if some_type != none_type || some_stack != none_stack {
@@ -1441,6 +1476,7 @@ impl Compiler<'_> {
     fn compile_match(
         &mut self,
         expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let [_, first_arm, second_arm] = expressions else {
@@ -1458,10 +1494,10 @@ impl Compiler<'_> {
         };
         match (arm_marker(first_arm), arm_marker(second_arm)) {
             (Some(first), Some(second)) if first == "some" && second == "none" => {
-                self.compile_match_option(expressions, builder)
+                self.compile_match_option(expressions, expression_sources, builder)
             }
             (Some(first), Some(second)) if first == "ok" && second == "err" => {
-                self.compile_match_result(expressions, builder)
+                self.compile_match_result(expressions, expression_sources, builder)
             }
             _ => Err(vec![self.error(
                 "E-LISP-MATCH-009",
@@ -1482,6 +1518,7 @@ impl Compiler<'_> {
     fn compile_match_result(
         &mut self,
         expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let [result_expression, ok_arm, err_arm] = expressions else {
@@ -1490,8 +1527,11 @@ impl Compiler<'_> {
                 "match-result requires a result expression, (ok name body...), and (err name body...)",
             )]);
         };
-        let Type::Result(ok_type, err_type) =
-            self.compile_expression(result_expression, builder)?
+        let Type::Result(ok_type, err_type) = self.compile_expression_at(
+            result_expression,
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )?
         else {
             return Err(vec![self.error(
                 "E-LISP-MATCH-006",
@@ -1567,7 +1607,14 @@ impl Compiler<'_> {
                 ty: (*ok_type).clone(),
             },
         )]));
-        let ok_result = self.compile_begin(&ok_body, None, builder)?;
+        let ok_sources = expression_sources
+            .and_then(|sources| sources.get(1))
+            .and_then(|source| match ok_arm {
+                Val::List(items) => Self::source_list_children(source, items),
+                _ => None,
+            })
+            .and_then(|sources| sources.get(2..));
+        let ok_result = self.compile_begin(&ok_body, ok_sources, builder)?;
         builder.scopes.pop();
         builder.stack.push(ok_result.clone());
         let ok_stack = builder.stack.clone();
@@ -1599,7 +1646,14 @@ impl Compiler<'_> {
                 ty: (*err_type).clone(),
             },
         )]));
-        let err_result = self.compile_begin(&err_body, None, builder)?;
+        let err_sources = expression_sources
+            .and_then(|sources| sources.get(2))
+            .and_then(|source| match err_arm {
+                Val::List(items) => Self::source_list_children(source, items),
+                _ => None,
+            })
+            .and_then(|sources| sources.get(2..));
+        let err_result = self.compile_begin(&err_body, err_sources, builder)?;
         builder.scopes.pop();
         builder.stack.push(err_result.clone());
         let err_stack = builder.stack.clone();
@@ -1623,6 +1677,7 @@ impl Compiler<'_> {
     fn compile_while(
         &mut self,
         expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let (label, condition_index) = match expressions {
@@ -1655,7 +1710,11 @@ impl Compiler<'_> {
         );
 
         builder.switch_to(condition_block, loop_stack.clone());
-        let condition = self.compile_expression(&expressions[condition_index], builder)?;
+        let condition = self.compile_expression_at(
+            &expressions[condition_index],
+            expression_sources.and_then(|sources| sources.get(condition_index)),
+            builder,
+        )?;
         if condition != Type::Bool {
             return Err(vec![VmDiagnostic::type_mismatch(
                 Type::Bool,
@@ -1685,7 +1744,11 @@ impl Compiler<'_> {
             exit: exit_block,
             stack: loop_stack.clone(),
         });
-        let body = self.compile_begin(&expressions[condition_index + 1..], None, builder);
+        let body = self.compile_begin(
+            &expressions[condition_index + 1..],
+            expression_sources.and_then(|sources| sources.get(condition_index + 1..)),
+            builder,
+        );
         builder.loops.pop();
         body?;
         builder.emit(Instruction::Drop, self.origin("while/body-result"));
@@ -2948,6 +3011,28 @@ mod tests {
                 .iter()
                 .find(|error| error.code == "E-NAME-001")
                 .expect("unbound lexical-body diagnostic");
+            let span = missing
+                .primary
+                .as_ref()
+                .and_then(|origin| origin.span.as_ref())
+                .expect("exact source span");
+            assert_eq!(&source[span.start_byte..span.end_byte], "missing");
+        }
+    }
+
+    #[test]
+    fn match_and_loop_diagnostics_keep_nested_source_spans() {
+        for source in [
+            "(match-option (some 1) (some value missing) (none 0))",
+            "(match-result (ok 1) (ok value missing) (err problem 0))",
+            "(while true missing)",
+        ] {
+            let errors = compile_lisp("patterns.lisp", source, Vec::new(), &core_vocabulary())
+                .expect_err("nested form contains an unbound name");
+            let missing = errors
+                .iter()
+                .find(|error| error.code == "E-NAME-001")
+                .expect("unbound nested-form diagnostic");
             let span = missing
                 .primary
                 .as_ref()
