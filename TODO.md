@@ -49,6 +49,13 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   S-expressions as the canonical structural Lisp reader, while allowing a later lighter
   expression/indentation reader that immediately produces the identical syntax tree. Reader sugar
   must disappear before expansion/elaboration and must not create a second semantic path.
+- [ ] Make ordered type/value parameter packs a normal part of source-defined generics. Pure bounded
+  CTFE must be able to query pack length, index/destructure it, inspect each type/value pair, and use
+  ordinary compile-time `foreach` to generate a concrete fixed-arity specialization or an explicit
+  homogeneous typed range. Lisp and Co-Forth must expose identical pack semantics, and user-defined
+  functions must have the same type-safe variadic power as core/library words. Keep raw C ABI `...`
+  and `va_list` behind the separately authorized unsafe-FFI boundary; safe wrappers may use packs but
+  must never turn Finch values into implicit `void*` variadics.
 - [ ] Put an explicit span-preserving AST boundary between both source readers and typed stack IR.
   Formalize Lisp's existing `Val`/`SpannedVal` tree as its frontend AST. Co-Forth now tokenizes a
   module once into a span-preserving `ForthModuleAst` containing definitions and retained body

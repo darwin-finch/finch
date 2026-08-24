@@ -1479,6 +1479,16 @@ evaluation model. Generated definitions are structured syntax with expansion pro
 verified normally; string mixins and overlapping special-purpose metaprogramming subsystems are not
 part of the design.
 
+Type-safe variadics are a required consequence of that general template model, not a privileged
+calling convention. A generic definition may bind a type/value parameter pack, inspect its length,
+index or destructure it, and traverse its ordered type/value pairs with ordinary bounded compile-time
+`foreach`. Instantiation produces an ordinary concrete fixed-arity signature (or deliberately lowers
+a homogeneous pack to a typed list/range), so verification, specialization, inlining, and effect
+inference see every argument. Both Lisp and Co-Forth must be able to define and consume the same pack
+abstraction; built-ins do not receive a variadic facility unavailable to user code. This is distinct
+from C ABI `...`: an `extern` declaration for untyped `va_list`/raw variadics remains an explicitly
+unsafe FFI boundary, while a typed wrapper may use CTFE packs to present a safe Finch interface.
+
 ## Implementation work packages
 
 ### Phase 0: Freeze contracts and fixtures
