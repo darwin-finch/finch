@@ -15,17 +15,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 
-/// A parsed top-level Lisp form paired with the exact source range that
-/// produced it. Macro-expanded forms retain their invocation as primary
-/// provenance and link to the template definition through `expansion`.
+/// A parsed top-level Lisp form paired with its structural source tree.
+/// Macro-expanded forms preserve caller-owned argument spans inside that tree
+/// and link generated syntax to its definition through `expansion`.
 #[derive(Debug, Clone)]
 struct SourceForm {
     value: Val,
     span: Range<usize>,
-    /// Ordinary forms retain their structural reader tree. Macro expansions
-    /// deliberately use only their invocation span until expansion ancestry
-    /// is attached as an explicit `SourceOrigin` chain.
-    source: Option<SpannedVal>,
+    source: SpannedVal,
     expansion: Option<SourceOrigin>,
 }
 
@@ -229,19 +226,12 @@ pub fn compile_lisp_with_functions(
         .iter()
         .filter(|form| !is_macro_definition(&form.value))
         .map(|form| {
-            expand_template_macros(
-                source_id,
-                source,
-                &form.value,
-                &macros,
-                &mut expansion_budget,
-            )
+            expand_template_macros(source_id, source, form, &macros, &mut expansion_budget)
                 .map(|expanded| {
-                    let source = (expanded.value == form.value).then(|| form.clone());
                     SourceForm {
                         value: expanded.value,
                         span: form.span.clone(),
-                        source,
+                        source: expanded.source,
                         expansion: expanded.expansion,
                     }
                 })
@@ -260,7 +250,7 @@ pub fn compile_lisp_with_functions(
     };
     for expression in &expressions {
         compiler.current_span = expression.span.clone();
-        compiler.current_source = expression.source.clone();
+        compiler.current_source = Some(expression.source.clone());
         compiler.current_expansion = expression.expansion.clone();
         if is_definition(&expression.value) {
             compiler.predeclare_definition(&expression.value)?;
@@ -269,7 +259,7 @@ pub fn compile_lisp_with_functions(
     let mut executable = Vec::new();
     for expression in &expressions {
         compiler.current_span = expression.span.clone();
-        compiler.current_source = expression.source.clone();
+        compiler.current_source = Some(expression.source.clone());
         compiler.current_expansion = expression.expansion.clone();
         if is_definition(&expression.value) {
             compiler.compile_definition(&expression.value)?;
@@ -291,7 +281,7 @@ pub fn compile_lisp_with_functions(
     } else {
         for (index, expression) in executable.iter().enumerate() {
             compiler.current_span = expression.span.clone();
-            compiler.current_source = expression.source.clone();
+            compiler.current_source = Some(expression.source.clone());
             compiler.current_expansion = expression.expansion.clone();
             compiler.compile_expression(&expression.value, &mut builder)?;
             if index + 1 != executable.len() {
@@ -341,6 +331,7 @@ struct TemplateMacro {
 #[derive(Debug, Clone)]
 struct ExpandedForm {
     value: Val,
+    source: SpannedVal,
     /// The innermost macro definition responsible for generated syntax. The
     /// call-site itself remains the primary SourceForm span, giving
     /// diagnostics an explicit and truthful expansion ancestry chain.
@@ -471,13 +462,14 @@ fn reject_template_binding_forms(
 fn expand_template_macros(
     source_id: &str,
     source: &str,
-    expression: &Val,
+    expression: &SpannedVal,
     macros: &HashMap<String, TemplateMacro>,
     budget: &mut u16,
 ) -> Result<ExpandedForm, Vec<VmDiagnostic>> {
-    let Val::List(items) = expression else {
+    let Val::List(items) = &expression.value else {
         return Ok(ExpandedForm {
-            value: expression.clone(),
+            value: expression.value.clone(),
+            source: expression.clone(),
             expansion: None,
         });
     };
@@ -485,7 +477,8 @@ fn expand_template_macros(
     // start with a macro name must remain a literal symbol/list value.
     if matches!(items.first(), Some(Val::Symbol(name)) if name == "quote") {
         return Ok(ExpandedForm {
-            value: expression.clone(),
+            value: expression.value.clone(),
+            source: expression.clone(),
             expansion: None,
         });
     }
@@ -517,9 +510,13 @@ fn expand_template_macros(
                 .parameters
                 .iter()
                 .cloned()
-                .zip(arguments.iter().cloned())
+                .zip(expression.children.iter().skip(1).cloned())
                 .collect::<HashMap<_, _>>();
-            let expanded = substitute_macro_template(&definition.template, &bindings);
+            let expanded = substitute_macro_template(
+                &definition.template,
+                &bindings,
+                expression.span.clone(),
+            );
             let mut expanded = expand_template_macros(source_id, source, &expanded, macros, budget)?;
             let mut origin = definition.definition_origin.clone();
             origin.expansion = expanded.expansion.map(Box::new);
@@ -527,30 +524,53 @@ fn expand_template_macros(
             return Ok(expanded);
         }
     }
-    let values = items
+    let values = expression
+        .children
         .iter()
         .map(|item| expand_template_macros(source_id, source, item, macros, budget))
         .collect::<Result<Vec<_>, _>>()?;
     let expansion = values.iter().find_map(|item| item.expansion.clone());
     Ok(ExpandedForm {
-        value: Val::List(values.into_iter().map(|item| item.value).collect()),
+        value: Val::List(values.iter().map(|item| item.value.clone()).collect()),
+        source: SpannedVal {
+            value: Val::List(values.iter().map(|item| item.value.clone()).collect()),
+            span: expression.span.clone(),
+            children: values.into_iter().map(|item| item.source).collect(),
+        },
         expansion,
     })
 }
 
-fn substitute_macro_template(template: &Val, bindings: &HashMap<String, Val>) -> Val {
+fn substitute_macro_template(
+    template: &Val,
+    bindings: &HashMap<String, SpannedVal>,
+    generated_span: Range<usize>,
+) -> SpannedVal {
     match template {
         Val::Symbol(name) => bindings
             .get(name)
             .cloned()
-            .unwrap_or_else(|| template.clone()),
-        Val::List(items) => Val::List(
-            items
+            .unwrap_or_else(|| SpannedVal {
+                value: template.clone(),
+                span: generated_span,
+                children: Vec::new(),
+            }),
+        Val::List(items) => {
+            let children = items
                 .iter()
-                .map(|item| substitute_macro_template(item, bindings))
-                .collect(),
-        ),
-        _ => template.clone(),
+                .map(|item| substitute_macro_template(item, bindings, generated_span.clone()))
+                .collect::<Vec<_>>();
+            SpannedVal {
+                value: Val::List(children.iter().map(|child| child.value.clone()).collect()),
+                span: generated_span,
+                children,
+            }
+        }
+        _ => SpannedVal {
+            value: template.clone(),
+            span: generated_span,
+            children: Vec::new(),
+        },
     }
 }
 
@@ -587,11 +607,9 @@ impl Compiler<'_> {
         };
         let previous_span = std::mem::replace(&mut self.current_span, source.span.clone());
         let previous_source = self.current_source.replace(source.clone());
-        let previous_expansion = self.current_expansion.take();
         let result = self.compile_expression(expression, builder);
         self.current_span = previous_span;
         self.current_source = previous_source;
-        self.current_expansion = previous_expansion;
         result
     }
 
@@ -2236,12 +2254,14 @@ impl Compiler<'_> {
         let origin = operator_source.map_or_else(
             || self.origin(operator),
             |source| {
-                source_origin_in_range(
+                let mut origin = source_origin_in_range(
                     self.source_id,
                     self.source,
                     source.span.clone(),
                     operator,
-                )
+                );
+                origin.expansion = self.current_expansion.clone().map(Box::new);
+                origin
             },
         );
         let Some(signature) = self.vocabulary.get(word).cloned() else {
@@ -2866,6 +2886,31 @@ mod tests {
         assert_eq!(expansion.word.as_deref(), Some("macro announce"));
         let template = expansion.span.as_ref().expect("template span");
         assert_eq!(&source[template.start_byte..template.end_byte], "(say text)");
+    }
+
+    #[test]
+    fn macro_substituted_argument_keeps_its_exact_caller_span() {
+        let source = "(define-syntax (increment value) (+ value 1))\n(increment 41)";
+        let module = compile_lisp("macros.lisp", source, Vec::new(), &core_vocabulary()).unwrap();
+        let main = module.module.functions.get("main").expect("main function");
+        let argument = main
+            .blocks
+            .values()
+            .flat_map(|block| block.instructions.iter())
+            .find(|located| {
+                matches!(located.instruction, Instruction::Constant { value: TypedValue::Int(41) })
+            })
+            .expect("macro-substituted argument constant");
+        let span = argument.origin.span.as_ref().expect("caller argument span");
+        assert_eq!(&source[span.start_byte..span.end_byte], "41");
+        assert_eq!(
+            argument
+                .origin
+                .expansion
+                .as_ref()
+                .and_then(|origin| origin.word.as_deref()),
+            Some("macro increment")
+        );
     }
 
     #[test]
