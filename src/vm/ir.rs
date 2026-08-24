@@ -81,6 +81,19 @@ pub enum Instruction {
         value_type: Type,
         count: u32,
     },
+    /// Pop one value for every named field and construct an immutable typed
+    /// product. Field names and their types are part of the IR contract so a
+    /// frontend never has to encode a record as an untyped JSON object.
+    MakeRecord {
+        fields: Vec<(String, Type)>,
+    },
+    /// Project a statically named record field. The optional result makes a
+    /// missing field explicit at the language boundary even though verified
+    /// source normally cannot request a field absent from its record type.
+    RecordGet {
+        field: String,
+        value_type: Type,
+    },
     Dup,
     Drop,
     Swap,

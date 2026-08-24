@@ -493,6 +493,44 @@ impl<'a> VmTrampoline<'a> {
                     });
                     Ok(None)
                 }
+                Instruction::MakeRecord { fields } => {
+                    let Some(start) = continuation.stack.len().checked_sub(fields.len()) else {
+                        return VmStep::Failed(self.underflow(&located.origin, &continuation));
+                    };
+                    let values = continuation.stack.drain(start..).collect::<Vec<_>>();
+                    continuation.stack.push(TypedValue::Record(
+                        fields
+                            .into_iter()
+                            .map(|(name, _)| name)
+                            .zip(values)
+                            .collect(),
+                    ));
+                    Ok(None)
+                }
+                Instruction::RecordGet { field, value_type } => {
+                    let Some(record) = continuation.stack.pop() else {
+                        return VmStep::Failed(self.underflow(&located.origin, &continuation));
+                    };
+                    let TypedValue::Record(fields) = record else {
+                        return VmStep::Failed(self.with_trace(
+                            VmDiagnostic::error(
+                                "E-RUNTIME-028",
+                                DiagnosticPhase::Interpretation,
+                                "record field projection requires a typed record",
+                                Some(located.origin),
+                            ),
+                            &continuation,
+                        ));
+                    };
+                    let value = fields
+                        .into_iter()
+                        .find_map(|(name, value)| (name == field).then_some(value));
+                    continuation.stack.push(TypedValue::Option {
+                        inner_type: value_type,
+                        value: value.map(Box::new),
+                    });
+                    Ok(None)
+                }
                 Instruction::Dup => {
                     let Some(value) = continuation.stack.last().cloned() else {
                         return VmStep::Failed(self.underflow(&located.origin, &continuation));

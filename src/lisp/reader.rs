@@ -254,6 +254,11 @@ fn math_parse_atom(t: &[MTok], pos: &mut usize) -> Result<Val> {
 enum Tok {
     LParen,
     RParen,
+    /// Typed Finch record literal: `{ :field value ... }`. JSON object
+    /// literals remain a distinct reader form and are recognized when the
+    /// opening brace is followed by a JSON key/value spelling.
+    LBrace,
+    RBrace,
     Quote,     // '
     BackQuote, // `  (quasiquote)
     Comma,     // ,  (unquote)
@@ -359,6 +364,11 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                 tokens.push(Tok::JsonVal(crate::lisp::stdlib::json_val_to_lisp(jv)));
             }
             '{' => {
+                if brace_starts_typed_record(&chars, i) {
+                    tokens.push(Tok::LBrace);
+                    i += 1;
+                    continue;
+                }
                 // JSON literal — read a brace-balanced span, then parse with serde_json.
                 let start = i;
                 let mut depth = 0usize;
@@ -398,6 +408,10 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                 let jv: serde_json::Value = serde_json::from_str(&json_src)
                     .map_err(|e| anyhow::anyhow!("JSON literal: {e}"))?;
                 tokens.push(Tok::JsonVal(crate::lisp::stdlib::json_val_to_lisp(jv)));
+            }
+            '}' => {
+                tokens.push(Tok::RBrace);
+                i += 1;
             }
             '(' => {
                 tokens.push(Tok::LParen);
@@ -471,6 +485,8 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                     if ch.is_whitespace()
                         || ch == '('
                         || ch == ')'
+                        || ch == '{'
+                        || ch == '}'
                         || ch == '"'
                         || ch == ';'
                         || ch == '\''
@@ -493,6 +509,16 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
     }
 
     Ok(tokens)
+}
+
+/// `{ :name value }` is Finch's typed record literal. Preserve ordinary JSON
+/// objects (`{"name": value}`) as the existing explicit JSON reader form;
+/// the first non-whitespace character makes the two spellings unambiguous.
+fn brace_starts_typed_record(chars: &[char], open: usize) -> bool {
+    chars
+        .get(open + 1..)
+        .and_then(|tail| tail.iter().find(|character| !character.is_whitespace()))
+        .is_some_and(|character| *character == ':')
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────
@@ -547,6 +573,29 @@ fn decorate_span(value: Val, syntax: SyntaxForm) -> SpannedVal {
             .zip(syntax.children)
             .map(|(value, syntax)| decorate_span(value, syntax))
             .collect(),
+        // A brace record lowers in the reader to the hidden
+        // `(finch-record-literal (name value) ...)` form. Its marker is
+        // reader-introduced, so give it the enclosing span
+        // and retain precise field/value children from the original braces.
+        Val::List(values)
+            if matches!(values.first(), Some(Val::Symbol(name)) if name == "finch-record-literal")
+                && values.len() == syntax.children.len() + 1 =>
+        {
+            let mut children = Vec::with_capacity(values.len());
+            children.push(SpannedVal {
+                value: values[0].clone(),
+                span: syntax.span.clone(),
+                children: Vec::new(),
+            });
+            children.extend(
+                values[1..]
+                    .iter()
+                    .cloned()
+                    .zip(syntax.children)
+                    .map(|(value, syntax)| decorate_span(value, syntax)),
+            );
+            children
+        }
         _ => Vec::new(),
     };
     SpannedVal {
@@ -596,6 +645,7 @@ fn scan_form(source: &str, start: usize) -> Option<SyntaxForm> {
     match first {
         '(' => scan_list(source, start),
         '[' => scan_balanced_atom(source, start, '[', ']'),
+        '{' if brace_starts_typed_record_source(source, start) => scan_record(source, start),
         '{' => scan_balanced_atom(source, start, '{', '}'),
         '\'' | '`' => {
             let child_start = skip_trivia(source, start + first.len_utf8())?;
@@ -626,7 +676,8 @@ fn scan_form(source: &str, start: usize) -> Option<SyntaxForm> {
         _ => {
             let mut end = start;
             while let Some(next) = source.get(end..)?.chars().next() {
-                if next.is_whitespace() || matches!(next, '(' | ')' | '"' | ';' | '\'' | '`' | ',')
+                if next.is_whitespace()
+                    || matches!(next, '(' | ')' | '{' | '}' | '"' | ';' | '\'' | '`' | ',')
                 {
                     break;
                 }
@@ -637,6 +688,40 @@ fn scan_form(source: &str, start: usize) -> Option<SyntaxForm> {
                 children: Vec::new(),
             })
         }
+    }
+}
+
+fn brace_starts_typed_record_source(source: &str, start: usize) -> bool {
+    source[start + 1..]
+        .chars()
+        .find(|character| !character.is_whitespace())
+        .is_some_and(|character| character == ':')
+}
+
+/// Scan a typed brace record structurally so source maps retain the exact
+/// field and value locations even though the reader introduces a hidden form.
+fn scan_record(source: &str, start: usize) -> Option<SyntaxForm> {
+    let mut cursor = start + 1;
+    let mut children = Vec::new();
+    loop {
+        let field_start = skip_trivia(source, cursor)?;
+        if source.get(field_start..)?.starts_with('}') {
+            return Some(SyntaxForm {
+                span: start..field_start + 1,
+                children,
+            });
+        }
+        let field = scan_form(source, field_start)?;
+        if !source[field.span.clone()].starts_with(':') {
+            return None;
+        }
+        let value_start = skip_trivia(source, field.span.end)?;
+        let value = scan_form(source, value_start)?;
+        children.push(SyntaxForm {
+            span: field.span.start..value.span.end,
+            children: vec![field, value],
+        });
+        cursor = children.last()?.span.end;
     }
 }
 
@@ -741,6 +826,38 @@ fn parse_one(tokens: &[Tok], pos: &mut usize) -> Result<Val> {
         }
 
         Tok::RParen => bail!("unexpected ')'"),
+
+        Tok::LBrace => {
+            *pos += 1;
+            let mut fields = vec![Val::Symbol("finch-record-literal".to_string())];
+            loop {
+                if *pos >= tokens.len() {
+                    bail!("missing closing '}}' for typed record");
+                }
+                if tokens[*pos] == Tok::RBrace {
+                    *pos += 1;
+                    return Ok(Val::List(fields));
+                }
+                let Tok::Atom(field) = &tokens[*pos] else {
+                    bail!("typed record fields must use :name value syntax");
+                };
+                let Some(name) = field.strip_prefix(':') else {
+                    bail!("typed record fields must use :name value syntax");
+                };
+                if name.is_empty() {
+                    bail!("typed record field name cannot be empty");
+                }
+                let name = name.to_owned();
+                *pos += 1;
+                if *pos >= tokens.len() || tokens[*pos] == Tok::RBrace {
+                    bail!("typed record field ':{name}' needs a value");
+                }
+                let value = parse_one(tokens, pos)?;
+                fields.push(Val::List(vec![Val::Symbol(name), value]));
+            }
+        }
+
+        Tok::RBrace => bail!("unexpected '}}'"),
 
         // 'x → (quote x)
         Tok::Quote => {
@@ -855,6 +972,31 @@ mod tests {
     fn test_parse_bool() {
         assert_eq!(parse1("#t"), Val::Bool(true));
         assert_eq!(parse1("#f"), Val::Bool(false));
+    }
+
+    #[test]
+    fn typed_brace_records_remain_distinct_from_json_objects() {
+        assert_eq!(
+            parse1("{ :name \"Ada\" :age 37 }"),
+            Val::List(vec![
+                Val::Symbol("finch-record-literal".into()),
+                Val::List(vec![Val::Symbol("name".into()), Val::Str("Ada".into())]),
+                Val::List(vec![Val::Symbol("age".into()), Val::Int(37)]),
+            ])
+        );
+        // Existing JSON object spelling deliberately remains a reader value;
+        // a typed program must still cross the explicit json-* boundary.
+        assert_eq!(
+            parse1("{\"name\": \"Ada\"}"),
+            crate::lisp::stdlib::json_val_to_lisp(serde_json::json!({"name": "Ada"}))
+        );
+        assert_eq!(
+            parse1("{}"),
+            crate::lisp::stdlib::json_val_to_lisp(serde_json::json!({}))
+        );
+        let spanned = parse_str_spanned("{ :name \"Ada\" :age 37 }").unwrap();
+        assert_eq!(spanned[0].children.len(), 3);
+        assert_eq!(spanned[0].children[1].children.len(), 2);
     }
 
     #[test]

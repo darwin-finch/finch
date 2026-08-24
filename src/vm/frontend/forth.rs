@@ -80,6 +80,16 @@ struct MapLiteralFrame {
     origin: SourceOrigin,
 }
 
+/// A typed `{ name: value ... }` literal records its field
+/// labels outside the value stack. That keeps heterogeneous products explicit
+/// in source while lowering to the same record IR used by Lisp.
+#[derive(Debug, Clone)]
+struct RecordLiteralFrame {
+    stack_start: usize,
+    fields: Vec<String>,
+    origin: SourceOrigin,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatchCondition {
     Option,
@@ -249,6 +259,7 @@ fn compile_forth_body_with_locals(
     let mut conditionals: Vec<IfFrame> = Vec::new();
     let mut cases: Vec<CaseFrame> = Vec::new();
     let mut map_literals: Vec<MapLiteralFrame> = Vec::new();
+    let mut record_literals: Vec<RecordLiteralFrame> = Vec::new();
     let mut control = Vec::new();
     let local_indexes = locals
         .iter()
@@ -427,6 +438,76 @@ fn compile_forth_body_with_locals(
                 token_index += 1;
                 continue;
             }
+            if let Some(field) = word
+                .strip_prefix("field:")
+                .or_else(|| record_literals.last().and_then(|_| word.strip_suffix(':')))
+            {
+                if field.is_empty()
+                    || !field
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-')
+                {
+                    return Err(vec![control_error(
+                        "E-RECORD-001",
+                        "record fields use name: with an ASCII letter, digit, '_' or '-' name",
+                        origin,
+                    )]);
+                }
+                let Some(frame) = record_literals.last_mut() else {
+                    return Err(vec![control_error(
+                        "E-RECORD-001",
+                        "name: is valid only inside { ... }",
+                        origin,
+                    )]);
+                };
+                if stack.len() != frame.stack_start + frame.fields.len() {
+                    return Err(vec![control_error(
+                        "E-RECORD-003",
+                        "each record field: label must be followed by exactly one value",
+                        origin,
+                    )]);
+                }
+                if frame.fields.iter().any(|existing| existing == field) {
+                    return Err(vec![control_error(
+                        "E-RECORD-001",
+                        format!("record field '{field}' is declared more than once"),
+                        origin,
+                    )]);
+                }
+                frame.fields.push(field.to_owned());
+                token_index += 1;
+                continue;
+            }
+            if let Some(field) = word.strip_prefix("record-get:") {
+                let Some(Type::Record(fields)) = stack.last() else {
+                    return Err(vec![control_error(
+                        "E-RECORD-004",
+                        "record-get:<field> requires a typed record on top of the stack",
+                        origin,
+                    )]);
+                };
+                let Some((_, value_type)) = fields.iter().find(|(name, _)| name == field) else {
+                    return Err(vec![control_error(
+                        "E-RECORD-005",
+                        format!("record has no field '{field}'"),
+                        origin,
+                    )]);
+                };
+                let value_type = value_type.clone();
+                stack.pop();
+                stack.push(Type::Option(Box::new(value_type.clone())));
+                emit(
+                    &mut blocks,
+                    current,
+                    Instruction::RecordGet {
+                        field: field.to_owned(),
+                        value_type,
+                    },
+                    origin,
+                );
+                token_index += 1;
+                continue;
+            }
             match word.as_str() {
                 "map{" => {
                     map_literals.push(MapLiteralFrame {
@@ -477,6 +558,47 @@ fn compile_forth_body_with_locals(
                             value_type,
                             count,
                         },
+                        origin,
+                    );
+                    token_index += 1;
+                    continue;
+                }
+                "record{" | "{" => {
+                    record_literals.push(RecordLiteralFrame {
+                        stack_start: stack.len(),
+                        fields: Vec::new(),
+                        origin,
+                    });
+                    token_index += 1;
+                    continue;
+                }
+                "}record" | "}" => {
+                    let Some(frame) = record_literals.pop() else {
+                        return Err(vec![control_error(
+                            "E-RECORD-002",
+                            "} has no matching {",
+                            origin,
+                        )]);
+                    };
+                    let values = &stack[frame.stack_start..];
+                    if values.len() != frame.fields.len() {
+                        return Err(vec![control_error(
+                            "E-RECORD-003",
+                            "each record field: label must be followed by exactly one value",
+                            frame.origin,
+                        )]);
+                    }
+                    let fields = frame
+                        .fields
+                        .into_iter()
+                        .zip(values.iter().cloned())
+                        .collect::<Vec<_>>();
+                    stack.truncate(frame.stack_start);
+                    stack.push(Type::Record(fields.clone()));
+                    emit(
+                        &mut blocks,
+                        current,
+                        Instruction::MakeRecord { fields },
                         origin,
                     );
                     token_index += 1;
@@ -1514,6 +1636,13 @@ fn compile_forth_body_with_locals(
             frame.origin.clone(),
         )]);
     }
+    if let Some(frame) = record_literals.last() {
+        return Err(vec![control_error(
+            "E-RECORD-007",
+            "unterminated { record literal",
+            frame.origin.clone(),
+        )]);
+    }
     emit(
         &mut blocks,
         current,
@@ -1972,6 +2101,28 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
             cursor = end;
             continue;
         }
+        // Finch also accepts a bare quoted string as the concise typed-string
+        // spelling. `s"..."` remains the familiar Forth spelling (the `s`
+        // means "string", not "say"), while `"..."` is unambiguously a
+        // constant and avoids making models learn an unnecessary prefix.
+        if source[start..].starts_with('"') {
+            cursor += 1;
+            let (value, end) = read_string(
+                source_id,
+                source,
+                cursor,
+                start,
+                "E-READ-001",
+                "unterminated Co-Forth string literal",
+            )?;
+            tokens.push(Token {
+                value: TokenValue::String(value),
+                start,
+                end,
+            });
+            cursor = end;
+            continue;
+        }
         while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
             cursor += 1;
         }
@@ -2168,6 +2319,19 @@ mod tests {
     }
 
     #[test]
+    fn bare_and_standard_forth_string_literals_push_the_same_typed_value() {
+        for source in ["\"hello there\"", "s\" hello there\""] {
+            let module = compile_forth("strings.forth", source, Vec::new(), &core_vocabulary())
+                .expect("typed string literal should compile");
+            let mut stack = Vec::new();
+            Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+                .execute(&mut stack)
+                .expect("typed string literal should execute");
+            assert_eq!(stack, vec![TypedValue::String("hello there".into())]);
+        }
+    }
+
+    #[test]
     fn typed_frontend_lowers_standard_output_literal_to_say() {
         let module = compile_forth(
             "input.forth",
@@ -2330,6 +2494,31 @@ mod tests {
         )
         .expect_err("case selectors are intentionally integer-only in version 1");
         assert_eq!(non_integer[0].code, "E-TYPE-002");
+    }
+
+    #[test]
+    fn constructs_and_projects_heterogeneous_typed_records() {
+        let module = compile_forth(
+            "record.forth",
+            "{ name: \"Ada\" age: 37 } record-get:name unwrap",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("record literal should compile");
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("record projection should execute");
+        assert_eq!(stack, vec![TypedValue::String("Ada".into())]);
+
+        let invalid = compile_forth(
+            "record-invalid.forth",
+            "{ name: \"Ada\" } record-get:age",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect_err("record fields are statically known");
+        assert_eq!(invalid[0].code, "E-RECORD-005");
     }
 
     #[test]

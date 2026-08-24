@@ -55,6 +55,15 @@ else
 then
 ```
 
+`{ ... }` constructs an immutable heterogeneous record. `name:` is a syntax
+label (not a stack value), so every label must have exactly one following value. Project a known
+field with `record-get:<name>`; it produces `option<T>` and can be checked with `unwrap` or the
+typed option branch forms:
+
+```forth
+{ name: "Ada" age: 37 } record-get:age unwrap  \ leaves 37
+```
+
 `case` is a typed integer switch with no fallthrough. Each `of ... endof` arm and the optional
 `otherwise` arm must leave the same stack row. The selector is removed before an arm begins;
 `otherwise` is required whenever an unmatched case must produce values. This is structured branch
@@ -224,8 +233,9 @@ compact text.
 
 `process-run` consumes a command string and a list of argument strings; it never invokes a shell.
 
-For progressive prose, emit multiple typed chunks with `say`. `s"..."` pushes a typed `string`
-and never evaluates its contents. Both `s"text"` and the conventional `s" text"` spell the
+For progressive prose, emit multiple typed chunks with `say`. Bare `"..."` pushes one typed
+`string` and never evaluates its contents. `s"..."` is an equivalent familiar Forth spelling; the
+`s` means **string**, not `say`. Both `s"text"` and the conventional `s" text"` spell the
 identical string `text`: exactly one ASCII whitespace delimiter immediately after `s"` is ignored.
 
 Standard Forth `."..."` is supported as output shorthand: it lowers exactly to `s"..." say`,
@@ -234,7 +244,7 @@ to another word; use either `say` or `."..."` when it is user-visible output.
 Use escapes (`\"`, `\\`, `\n`, `\r`, `\t`) inside this short-string form:
 
 ```forth
-s"Hello user" say
+"Hello user" say
 s" Hello user" say  \ same string: "Hello user"
 ." Hello user"       \ output shorthand; same as s" Hello user" say
 ```

@@ -958,6 +958,16 @@ impl Compiler<'_> {
             "list" => self.compile_list_value(&items[1..], builder),
             "map" => self.compile_map_value(&items[1..], builder),
             "empty-map" => self.compile_empty_map(&items[1..], builder),
+            "finch-record-literal" => self.compile_record_value(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
+            "record-get" => self.compile_record_get(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
             _ if builder.resolve(operator).is_some() => {
                 self.compile_closure_call(
                     &items[0],
@@ -1262,6 +1272,95 @@ impl Compiler<'_> {
             self.origin("empty-map"),
         );
         Ok(Type::Map(Box::new(key_type), Box::new(value_type)))
+    }
+
+    /// Construct a heterogeneous immutable product. Field labels are syntax,
+    /// not runtime strings, so the generated record type retains exact field
+    /// names and each field's independent type.
+    fn compile_record_value(
+        &mut self,
+        fields: &[Val],
+        field_sources: Option<&[SpannedVal]>,
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let mut record_fields = Vec::with_capacity(fields.len());
+        for (index, field) in fields.iter().enumerate() {
+            let Val::List(parts) = field else {
+                return Err(vec![self.error(
+                    "E-RECORD-001",
+                    "record fields must be (name value) pairs",
+                )]);
+            };
+            let [Val::Symbol(name), value] = parts.as_slice() else {
+                return Err(vec![self.error(
+                    "E-RECORD-001",
+                    "record fields must be (name value) pairs",
+                )]);
+            };
+            if record_fields.iter().any(|(existing, _)| existing == name) {
+                return Err(vec![self.error(
+                    "E-RECORD-001",
+                    format!("record field '{name}' is declared more than once"),
+                )]);
+            }
+            let value_source = field_sources
+                .and_then(|sources| sources.get(index))
+                .and_then(|source| source.children.get(1));
+            let value_type = self.compile_expression_at(value, value_source, builder)?;
+            record_fields.push((name.clone(), value_type));
+        }
+        for _ in fields {
+            builder.stack.pop();
+        }
+        builder.emit(
+            Instruction::MakeRecord {
+                fields: record_fields.clone(),
+            },
+            self.origin("record"),
+        );
+        Ok(Type::Record(record_fields))
+    }
+
+    /// Project a statically named field. Dynamic lookup belongs to the managed
+    /// JSON boundary; a typed record stays a product with a known field set.
+    fn compile_record_get(
+        &mut self,
+        expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let [record, Val::Str(field)] = expressions else {
+            return Err(vec![self.error(
+                "E-RECORD-004",
+                "record-get requires a record expression and a literal field name string",
+            )]);
+        };
+        let Type::Record(fields) = self.compile_expression_at(
+            record,
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )? else {
+            return Err(vec![self.error(
+                "E-RECORD-004",
+                "record-get requires a typed record",
+            )]);
+        };
+        let Some((_, value_type)) = fields.iter().find(|(name, _)| name == field) else {
+            return Err(vec![self.error(
+                "E-RECORD-005",
+                format!("record has no field '{field}'"),
+            )]);
+        };
+        let value_type = value_type.clone();
+        builder.stack.pop();
+        builder.emit(
+            Instruction::RecordGet {
+                field: field.clone(),
+                value_type: value_type.clone(),
+            },
+            self.origin("record-get"),
+        );
+        Ok(Type::Option(Box::new(value_type)))
     }
 
     fn compile_let(
@@ -2900,6 +2999,22 @@ mod tests {
                 .unwrap(),
             vec![TypedValue::Int(42)]
         );
+    }
+
+    #[test]
+    fn constructs_and_projects_heterogeneous_typed_records() {
+        assert_eq!(
+            run("(unwrap (record-get { :name \"Ada\" :age 37 } \"age\"))").unwrap(),
+            vec![TypedValue::Int(37)]
+        );
+        let missing = compile_lisp(
+            "record.lisp",
+            "(record-get { :name \"Ada\" } \"age\")",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect_err("record fields are statically known");
+        assert_eq!(missing[0].code, "E-RECORD-005");
     }
 
     #[test]

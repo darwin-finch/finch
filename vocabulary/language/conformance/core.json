@@ -59,6 +59,13 @@
       "expected_output": ""
     },
     {
+      "name": "typed-record-construction-and-projection",
+      "forth": "{ name: \"Ada\" age: 37 } record-get:age unwrap",
+      "lisp": "(unwrap (record-get { :name \"Ada\" :age 37 } \"age\"))",
+      "expected_values": [{ "type": "int", "value": 37 }],
+      "expected_output": ""
+    },
+    {
       "name": "metered-loop-exit",
       "forth": "begin true until 7",
       "lisp": "(begin (while false 1) 7)",

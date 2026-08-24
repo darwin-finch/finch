@@ -80,6 +80,15 @@ same branch IR as the explicit forms; it does not perform dynamic dispatch:
   (none 0))
 ```
 
+`{ ... }` constructs a typed immutable product from `:name value` field forms. Each field keeps its own
+type; it is not an untyped JSON object. `record-get` takes a literal field name and returns an
+`option<T>`, so a record can cross a general boundary without a crash-producing implicit field
+access. Dynamic object traversal remains the explicit `json-*` boundary:
+
+```lisp
+(unwrap (record-get { :name "Ada" :age 37 } "age")) ; => 37
+```
+
 MemTree and scheduling are explicit effects. Scheduled work stores an immutable program reference,
 typed arguments, budgets, context references, and a revocable policy reference—not raw authority or
 an unvalidated Lisp string. A callback starts a fresh audited task and revalidates its environment

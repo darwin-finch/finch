@@ -17,10 +17,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   structured error/result forms.
 - [ ] Generalize the managed JSON boundary into first-class typed records/maps. Both frontends now
   share immutable typed-map construction, key lookup/update, keys/length, serialization across the
-  public runtime boundary, and map-type unification; still add records, structured patterns,
-  map iteration, and row-polymorphic record rules. `json-parse`/`json-get`/scalar option
-  projections remain the safe boundary for arbitrary JSON objects; do not expose the existing
-  internal `TypedValue::Record` ABI representation as an ad-hoc source language feature first.
+  public runtime boundary, map-type unification, immutable heterogeneous record construction, and
+  statically named option-valued field projection; still add structured patterns, map iteration,
+  and row-polymorphic record rules. The deliberate typed brace-record syntax is the only record
+  source surface; `json-parse`/`json-get`/scalar option projections remain the safe boundary for
+  arbitrary JSON objects rather than exposing the internal `TypedValue::Record` ABI ad hoc.
 - [ ] Extend the implemented typed option/result branches, type-directed Lisp `match`, and
   no-fallthrough integer Co-Forth `case` to richer structured patterns plus expression-valued
   named `break` after the loop verifier is generalized to check each target's declared result

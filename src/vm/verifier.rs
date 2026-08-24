@@ -241,6 +241,52 @@ impl<'a> Verifier<'a> {
                     Box::new(value_type.clone()),
                 ));
             }
+            Instruction::MakeRecord { fields } => {
+                let count = fields.len();
+                if stack.len() < count {
+                    return Err(underflow(origin, count, stack.len()));
+                }
+                let start = stack.len() - count;
+                for ((_, expected), found) in fields.iter().zip(&stack[start..]) {
+                    if !expected.accepts(found) {
+                        return Err(VmDiagnostic::type_mismatch(
+                            expected.clone(),
+                            found.clone(),
+                            Some(origin.clone()),
+                        ));
+                    }
+                }
+                stack.truncate(start);
+                stack.push(Type::Record(fields.clone()));
+            }
+            Instruction::RecordGet { field, value_type } => {
+                let record = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
+                let Type::Record(fields) = record else {
+                    return Err(VmDiagnostic::error(
+                        "E-RECORD-004",
+                        DiagnosticPhase::Verification,
+                        "record field projection requires a typed record",
+                        Some(origin.clone()),
+                    ));
+                };
+                let Some((_, found)) = fields.iter().find(|(name, _)| name == field) else {
+                    return Err(VmDiagnostic::error(
+                        "E-RECORD-005",
+                        DiagnosticPhase::Verification,
+                        format!("record has no field '{field}'"),
+                        Some(origin.clone()),
+                    ));
+                };
+                if found != value_type {
+                    return Err(VmDiagnostic::error(
+                        "E-RECORD-006",
+                        DiagnosticPhase::Verification,
+                        format!("record field '{field}' has an inconsistent IR type"),
+                        Some(origin.clone()),
+                    ));
+                }
+                stack.push(Type::Option(Box::new(value_type.clone())));
+            }
             Instruction::Dup => {
                 let value = stack
                     .last()
