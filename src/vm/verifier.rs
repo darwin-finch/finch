@@ -307,6 +307,38 @@ impl<'a> Verifier<'a> {
                 }
                 stack.push(Type::Variant(variants.clone()));
             }
+            Instruction::VariantGet { variants, tag, payload_type } => {
+                let found = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
+                let expected = Type::Variant(variants.clone());
+                if found != expected {
+                    return Err(VmDiagnostic::type_mismatch(
+                        expected,
+                        found,
+                        Some(origin.clone()),
+                    ));
+                }
+                let Some((_, expected_payload)) =
+                    variants.iter().find(|(candidate, _)| candidate == tag)
+                else {
+                    return Err(VmDiagnostic::error(
+                        "E-VARIANT-002",
+                        DiagnosticPhase::Verification,
+                        format!("variant has no tag '{tag}'"),
+                        Some(origin.clone()),
+                    ));
+                };
+                if expected_payload != payload_type {
+                    return Err(VmDiagnostic::error(
+                        "E-VARIANT-003",
+                        DiagnosticPhase::Verification,
+                        format!("variant tag '{tag}' has an inconsistent IR payload type"),
+                        Some(origin.clone()),
+                    ));
+                }
+                stack.push(Type::Option(Box::new(
+                    payload_type.clone().unwrap_or(Type::Unit),
+                )));
+            }
             Instruction::RecordGet { field, value_type } => {
                 let field_name = stack.pop().ok_or_else(|| underflow(origin, 2, 0))?;
                 if field_name != Type::String {
@@ -1407,6 +1439,26 @@ mod tests {
             .verify(inconsistent_payload)
             .expect_err("variant payload metadata must match the closed type");
         assert!(errors.iter().any(|error| error.code == "E-VARIANT-003"));
+
+        let variants = vec![("none".into(), None), ("some".into(), Some(Type::Int))];
+        let projection = Module::single(function(
+            StackSignature::pure(
+                StackRow::closed(vec![Type::Variant(variants.clone())]),
+                StackRow::closed(vec![Type::Option(Box::new(Type::Unit))]),
+            ),
+            vec![
+                Instruction::VariantGet {
+                    variants,
+                    tag: "missing".into(),
+                    payload_type: None,
+                },
+                Instruction::Return,
+            ],
+        ));
+        let errors = Verifier::new(&core_vocabulary())
+            .verify(projection)
+            .expect_err("unknown projection tags must not enter verified IR");
+        assert!(errors.iter().any(|error| error.code == "E-VARIANT-002"));
     }
 
     #[test]

@@ -59,6 +59,9 @@ string convention.
 Lisp constructs them with `(variant variant{none|some(int)} :some 42)`; Co-Forth uses
 `42 variant<variant{none|some(int)},some>`. Both lower to `MakeVariant`, whose verified IR carries
 the full closed type, selected tag, and optional payload type.
+Safe projection also shares one IR operation: Lisp `(variant-get value :some)` and Co-Forth
+`value variant-get<some>` return `option<int>`. A matching payload-free tag returns `some(unit)`;
+a different tag returns `none`.
 
 Structured option branches are part of the common semantics: Co-Forth `if-some ... else ... then`
 and Lisp `(match-option option (some name ...) (none ...))` both lower to typed branch edges. The

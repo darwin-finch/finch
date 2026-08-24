@@ -1123,6 +1123,11 @@ impl Compiler<'_> {
                 source_children.as_deref().and_then(|children| children.get(1..)),
                 builder,
             ),
+            "variant-get" => self.compile_variant_get(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
             _ if builder.resolve(operator).is_some() => {
                 self.compile_closure_call(
                     &items[0],
@@ -1668,6 +1673,47 @@ impl Compiler<'_> {
             self.origin(format!("variant/{tag}")),
         );
         Ok(Type::Variant(variants))
+    }
+
+    fn compile_variant_get(
+        &mut self,
+        expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let [variant, Val::Symbol(tag)] = expressions else {
+            return Err(vec![self.error(
+                "E-VARIANT-005",
+                "variant-get requires a variant value and literal tag",
+            )]);
+        };
+        let Type::Variant(variants) = self.compile_expression_at(
+            variant,
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )? else {
+            return Err(vec![self.error(
+                "E-VARIANT-005",
+                "variant-get requires a statically typed variant value",
+            )]);
+        };
+        let tag = tag.strip_prefix(':').unwrap_or(tag);
+        let Some((_, payload_type)) = variants.iter().find(|(name, _)| name == tag) else {
+            return Err(vec![self.error("E-VARIANT-002", format!("variant has no tag '{tag}'"))]);
+        };
+        let payload_type = payload_type.clone();
+        builder.stack.pop();
+        builder.emit(
+            Instruction::VariantGet {
+                variants,
+                tag: tag.to_string(),
+                payload_type: payload_type.clone(),
+            },
+            self.origin(format!("variant-get/{tag}")),
+        );
+        Ok(Type::Option(Box::new(
+            payload_type.unwrap_or(Type::Unit),
+        )))
     }
 
     /// Project a statically named field. Dynamic lookup belongs to the managed
@@ -4599,6 +4645,25 @@ mod tests {
         ] {
             assert!(compile_lisp("variant.lisp", source, Vec::new(), &core_vocabulary()).is_err());
         }
+    }
+
+    #[test]
+    fn safely_projects_closed_variant_tags() {
+        assert_eq!(
+            run("(unwrap (variant-get (variant variant{none|some(int)} :some 42) :some))")
+                .unwrap(),
+            vec![TypedValue::Int(42)]
+        );
+        assert_eq!(
+            run("(is-some (variant-get (variant variant{none|some(int)} :some 42) :none))")
+                .unwrap(),
+            vec![TypedValue::Bool(false)]
+        );
+        assert_eq!(
+            run("(is-some (variant-get (variant variant{none|some(int)} :none) :none))")
+                .unwrap(),
+            vec![TypedValue::Bool(true)]
+        );
     }
 
     #[test]

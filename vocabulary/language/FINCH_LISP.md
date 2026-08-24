@@ -158,6 +158,8 @@ declared tag requires one:
 
 The full type prevents an isolated tag value from losing the other alternatives needed for
 exhaustive checking.
+`(variant-get value :some)` safely returns `option<int>` for the example type. A payload-free tag
+returns `option<unit>`, allowing the same operation to support ordinary exhaustive branching.
 
 Records may contain ordinary typed closure values, which makes an immutable object-style value
 possible without a second object runtime. Method invocation remains explicit: project, unwrap, and

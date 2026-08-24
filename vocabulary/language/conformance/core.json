@@ -258,6 +258,13 @@
       "expected_output": ""
     },
     {
+      "name": "closed-variant-projection",
+      "forth": "42 variant<variant{none|some(int)},some> variant-get<some> unwrap",
+      "lisp": "(unwrap (variant-get (variant variant{none|some(int)} :some 42) :some))",
+      "expected_values": [{ "type": "int", "value": 42 }],
+      "expected_output": ""
+    },
+    {
       "name": "raw-prose-output",
       "forth": "s\"\"\"The user said \"hello\".\nSecond line.\"\"\" say",
       "lisp": "(say \"The user said \\\"hello\\\".\\nSecond line.\")",

@@ -768,6 +768,48 @@ fn compile_forth_body_with_locals(
                 token_index += 1;
                 continue;
             }
+            if let Some(tag) = word
+                .strip_prefix("variant-get<")
+                .and_then(|value| value.strip_suffix('>'))
+            {
+                let found = stack.pop().ok_or_else(|| {
+                    vec![control_error(
+                        "E-STACK-001",
+                        "variant-get requires one variant value",
+                        origin.clone(),
+                    )]
+                })?;
+                let Type::Variant(variants) = found else {
+                    return Err(vec![VmDiagnostic::type_mismatch(
+                        Type::Variant(Vec::new()),
+                        found,
+                        Some(origin),
+                    )]);
+                };
+                let Some((_, payload_type)) = variants.iter().find(|(name, _)| name == tag) else {
+                    return Err(vec![control_error(
+                        "E-VARIANT-002",
+                        format!("variant has no tag '{tag}'"),
+                        origin,
+                    )]);
+                };
+                let payload_type = payload_type.clone();
+                stack.push(Type::Option(Box::new(
+                    payload_type.clone().unwrap_or(Type::Unit),
+                )));
+                emit(
+                    &mut blocks,
+                    current,
+                    Instruction::VariantGet {
+                        variants,
+                        tag: tag.to_string(),
+                        payload_type,
+                    },
+                    origin,
+                );
+                token_index += 1;
+                continue;
+            }
             if let Some(field) = word
                 .strip_prefix("field:")
                 .or_else(|| record_literals.last().and_then(|_| word.strip_suffix(':')))
@@ -3026,6 +3068,7 @@ fn parameterized_type_end(source: &str, start: usize) -> Option<usize> {
         "resource<",
         "capability<",
         "variant<",
+        "variant-get<",
     ]
     .into_iter()
     .any(|prefix| remainder.starts_with(prefix));
@@ -3937,6 +3980,35 @@ mod tests {
                 value: None,
             }]
         );
+    }
+
+    #[test]
+    fn safely_projects_closed_variant_tags() {
+        let module = compile_forth(
+            "variant-get.forth",
+            "42 variant<variant{none|some(int)},some> variant-get<some> unwrap",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("variant projection should compile");
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("variant projection should execute");
+        assert_eq!(stack, vec![TypedValue::Int(42)]);
+
+        let module = compile_forth(
+            "variant-miss.forth",
+            "42 variant<variant{none|some(int)},some> variant-get<none> is-some",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("variant miss should compile");
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("variant miss should execute");
+        assert_eq!(stack, vec![TypedValue::Bool(false)]);
     }
 
     #[test]

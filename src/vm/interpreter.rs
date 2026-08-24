@@ -541,6 +541,27 @@ impl<'a> VmTrampoline<'a> {
                     continuation.stack.push(TypedValue::Variant { name: tag, value });
                     Ok(None)
                 }
+                Instruction::VariantGet { variants: _, tag, payload_type } => {
+                    let Some(TypedValue::Variant { name, value }) = continuation.stack.pop() else {
+                        return VmStep::Failed(self.with_trace(
+                            VmDiagnostic::error(
+                                "E-RUNTIME-031",
+                                DiagnosticPhase::Interpretation,
+                                "variant-get requires a variant",
+                                Some(located.origin.clone()),
+                            ),
+                            &continuation,
+                        ));
+                    };
+                    let inner_type = payload_type.clone().unwrap_or(Type::Unit);
+                    let value = if name == tag {
+                        Some(value.unwrap_or_else(|| Box::new(TypedValue::Unit)))
+                    } else {
+                        None
+                    };
+                    continuation.stack.push(TypedValue::Option { inner_type, value });
+                    Ok(None)
+                }
                 Instruction::RecordGet { field, value_type } => {
                     let Some(TypedValue::String(field_name)) = continuation.stack.pop() else {
                         return VmStep::Failed(self.with_trace(

@@ -90,6 +90,8 @@ variant<variant{none|some(int)},none>
 ```
 
 The resulting value retains the full closed variant type for exhaustive checking.
+Project a tag without trapping via `variant-get<tag>`. It returns `option<payload>`; a payload-free
+tag uses `unit`, so `variant-get<none>` returns `option<unit>`.
 
 Records may also hold typed quotations. This lets a record carry data and a reusable operation
 without introducing a separate object runtime; invocation remains explicit and receives its inputs

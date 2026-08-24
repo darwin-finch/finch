@@ -133,6 +133,13 @@ pub enum Instruction {
         tag: String,
         payload_type: Option<Type>,
     },
+    /// Safely project one tag from a closed variant. A matching payload-free
+    /// tag yields `some(unit)`; a non-matching tag yields `none`.
+    VariantGet {
+        variants: Vec<(String, Option<Type>)>,
+        tag: String,
+        payload_type: Option<Type>,
+    },
     /// Project a statically named record field. The field-name string remains
     /// on the stack for normal concatenative calling convention, though the
     /// frontend has already proven it matches `field`. The optional result
