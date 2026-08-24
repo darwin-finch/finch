@@ -63,9 +63,9 @@ pub enum Command {
     BrainPassword(Option<String>), // /brain password [new-password]
     // Execution graph
     Graph, // /graph — show causal trace of last query
-    // Co-Forth VM stack ops
+    // Reviewable execution-plan operations
     Ask(String),       // /ask <query>      — send directly to AI (bypass stack)
-    StackPush(String), // /push <text>      — push text onto the stack
+    StackPush(String), // /push <text>      — add a task node to the plan
     StackShow,         // /stack            — show current stack contents
     StackPop,          // /pop              — remove top item (undo last push)
     StackRun,          // /run              — execute full stack as one query
@@ -761,11 +761,11 @@ pub fn format_help() -> String {
          {green}  • Remember pattern{reset}         Always allow (saves to /patterns)\n\
          {red}  • Deny{reset}                     Reject the action\n\n\
          Available tools: Read, Glob, Grep, WebFetch, Bash, Restart\n\n\
-         {yellow_bold}📚 Co-Forth VM:{reset}\n\
+         {yellow_bold}📚 Typed VM and execution plans:{reset}\n\
          {cyan}  /forth <source>{reset}    Execute typed Co-Forth in ProgramRuntime\n\
-         {cyan}  /push <text>{reset}       Push a word onto the stack (silent)\n\
-         {cyan}  /pop{reset}               Remove top item (undo last push)\n\
-         {cyan}  /run{reset}               Execute the program (shows approval dialog)\n\
+         {cyan}  /push <text>{reset}       Add a task node to the pending plan\n\
+         {cyan}  /pop{reset}               Remove the most recent task node\n\
+         {cyan}  /run{reset}               Review and execute the pending plan\n\
          {cyan}  /program{reset}           Show current program as Forth source\n\
          {cyan}  /stack{reset}             Show stack contents\n\
          {cyan}  /stack clear{reset}       Drop all stack items\n\
