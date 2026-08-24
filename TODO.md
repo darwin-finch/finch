@@ -215,6 +215,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   every `submit_program` enters the typed broker, whose verified requirements and grants are the
   sole host-authority decision. The provider envelope no longer exposes that redundant coarse
   field; optional exact `declared_capabilities` remains a checked upper-bound assertion.
+  `ExecutionOutcome` now reports only the shared `typed_vm` backend; dead serialized labels for the
+  removed native-Lisp, Lisp-to-Forth, and untyped-Forth execution paths no longer imply that a
+  provider submission can select them. Explicit legacy proof/library commands remain quarantined
+  outside this outcome/runtime ABI until their useful behavior is migrated or retired.
 - [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
   tests, concurrency tests, and provider conformance tests. Manual configured-cloud smoke checks on
   2026-08-23 successfully executed provider-emitted Lisp `say`, Lisp arithmetic, and Co-Forth

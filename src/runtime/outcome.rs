@@ -19,14 +19,7 @@ pub enum ExecutionStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionBackend {
-    Forth,
     TypedVm,
-    /// Retained only so historical journals can deserialize. New submissions
-    /// are typed-only and never select either legacy Lisp backend.
-    LispCompiledToForth,
-    /// Retained only so historical journals can deserialize. New submissions
-    /// are typed-only and never select either legacy Lisp backend.
-    LispNative,
 }
 
 /// Provider-neutral result of evaluating Forth or Lisp source.
