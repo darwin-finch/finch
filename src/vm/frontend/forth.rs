@@ -40,6 +40,17 @@ struct ForthModuleAst {
 #[derive(Debug, Clone)]
 struct ForthBodyAst {
     atoms: Vec<Token>,
+    /// Structured quotation nodes keyed by their opening token's source byte.
+    /// The retained atom sequence keeps the current lowering incremental while
+    /// the parser, rather than the lowerer, owns quotation delimiters.
+    quotations: BTreeMap<usize, ForthQuotationAst>,
+}
+
+#[derive(Debug, Clone)]
+struct ForthQuotationAst {
+    signature: Vec<Token>,
+    body: ForthBodyAst,
+    close_atom_index: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -485,18 +496,13 @@ fn lower_forth_ast_body_with_locals(
         let origin = origin(source_id, source, token.start, token.end);
         if let TokenValue::Word(word) = &token.value {
             if word == "[" {
-                if let Some((pipe_index, close_index)) =
-                    anonymous_quotation_bounds(&tokens, token_index)
-                {
+                if let Some(quotation) = body.quotations.get(&token.start) {
                     let (declared_signature, declares_pure) = parse_quotation_signature(
                         source_id,
                         source,
-                        &tokens[token_index + 1..pipe_index],
+                        &quotation.signature,
                         &origin,
                     )?;
-                    let quote_body = ForthBodyAst {
-                        atoms: tokens[pipe_index + 1..close_index].to_vec(),
-                    };
 
                     // Locals shadow captures. Capturing all visible immutable
                     // bindings matches Lisp's deterministic initial lowering;
@@ -537,7 +543,7 @@ fn lower_forth_ast_body_with_locals(
                     let compiled = lower_forth_ast_body_with_locals(
                         source_id,
                         source,
-                        &quote_body,
+                        &quotation.body,
                         declared_signature.input.values.clone(),
                         vocabulary,
                         &available_functions,
@@ -601,7 +607,7 @@ fn lower_forth_ast_body_with_locals(
                         },
                         origin,
                     );
-                    token_index = close_index + 1;
+                    token_index = quotation.close_atom_index + 1;
                     continue;
                 }
             }
@@ -2563,17 +2569,44 @@ fn parse_forth_module(
             signature,
             declares_pure,
             locals,
-            body: ForthBodyAst {
-                atoms: tokens[body_start_index..end].to_vec(),
-            },
+            body: parse_forth_body(&tokens[body_start_index..end]),
             origin: origin(source_id, source, definition_start, definition_end),
         });
         cursor = end + 1;
     }
     Ok(ForthModuleAst {
         definitions,
-        body: ForthBodyAst { atoms: main_atoms },
+        body: parse_forth_body(&main_atoms),
     })
+}
+
+/// Structure quotation ownership during parsing rather than rediscovering it
+/// while emitting IR. Incomplete or list-shaped brackets deliberately remain
+/// ordinary atoms so the existing typed-list diagnostics stay authoritative.
+fn parse_forth_body(atoms: &[Token]) -> ForthBodyAst {
+    let mut quotations = BTreeMap::new();
+    let mut cursor = 0;
+    while cursor < atoms.len() {
+        if token_is(&atoms[cursor], "[") {
+            if let Some((pipe_index, close_index)) = anonymous_quotation_bounds(atoms, cursor) {
+                quotations.insert(
+                    atoms[cursor].start,
+                    ForthQuotationAst {
+                        signature: atoms[cursor + 1..pipe_index].to_vec(),
+                        body: parse_forth_body(&atoms[pipe_index + 1..close_index]),
+                        close_atom_index: close_index,
+                    },
+                );
+                cursor = close_index + 1;
+                continue;
+            }
+        }
+        cursor += 1;
+    }
+    ForthBodyAst {
+        atoms: atoms.to_vec(),
+        quotations,
+    }
 }
 
 /// Read a single public documentation line immediately preceding a typed
@@ -3750,6 +3783,18 @@ mod tests {
             .execute(&mut stack)
             .expect("anonymous quotation should execute");
         assert_eq!(stack, vec![TypedValue::Int(42)]);
+    }
+
+    #[test]
+    fn parser_owns_nested_quotation_structure_before_lowering() {
+        let source = "[ -- fn<unit,int> ! pure | [ -- int ! pure | 42 ] ]";
+        let ast = parse_forth_module("nested-quotes.forth", source)
+            .expect("quotation syntax should parse before semantic lowering");
+        assert_eq!(ast.body.quotations.len(), 1);
+        let outer = ast.body.quotations.values().next().unwrap();
+        assert_eq!(outer.body.quotations.len(), 1);
+        let inner = outer.body.quotations.values().next().unwrap();
+        assert_eq!(&source[inner.body.atoms[0].start..inner.body.atoms[0].end], "42");
     }
 
     #[test]
