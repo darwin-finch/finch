@@ -317,6 +317,14 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 
 ## Client and model integration
 
+- [ ] Keep the Brain event log and validated VM checkpoints authoritative while optionally retaining
+  an expendable remote provider-continuation cursor keyed by Brain, provider identity, model, and
+  language-package hash. When an API supports incremental continuation, send only new user/tool
+  events; rebuild a fresh remote chain from the local checkpoint/log after expiry, rejection,
+  provider/model change, or compaction. Never treat provider-side application state or prompt-cache
+  residency as durable Brain state. BOOT is an invocation contract rather than remembered dialogue:
+  attach the current BOOT/instruction capsule on every inference for APIs whose continuation cursor
+  does not inherit instructions, and start a new chain whenever its package hash changes.
 - [ ] Keep the ordinary OpenAI-compatible API client-managed and stateless with respect to named
   brains: Cline/Roo own their conversation and tool loop while Finch supplies model inference.
 - [ ] Optionally add an explicit brain-scoped OpenAI mode (for example a `finch/brain/<name>` model
