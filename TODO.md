@@ -161,9 +161,14 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   have deterministic execution/effect-bound IDs and preserve child ancestry. The atomic
   `resolve_typed_approval` path revalidates the retained prompt, issues the selected scope, audits
   allow/deny, consumes `once`, resumes only that pending boundary, and rejects stale or forged UI
-  actions before they can create reusable authority. Still bind this API to the application dialog,
-  persist Brain-owned scope identity and ledger state, implement availability/policy-driven
-  revocation and child attenuation, and complete the host adapters.
+  actions before they can create reusable authority. Interactive provider-wire runs now route that
+  exact prompt through a structured application dialog and resume the retained frame without source
+  replay. Session/project identity plus the ledger have a separate atomic, integrity-checked
+  `ProgramRuntimeAuthorityStore`; a missing or policy-incompatible record fails closed and VM
+  archives remain authority-free. Still bind that store to the Brain lifecycle, route explicit
+  interactive and provider-tool submissions through the same approval controller, implement
+  availability/policy-driven revocation and child attenuation, audit reuse at every actual host
+  boundary, and complete the host adapters.
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their
