@@ -11,7 +11,7 @@ use super::{core_vocabulary, VerifiedModule, Verifier, Vocabulary, VM_TYPE_SYSTE
 use crate::programs::ProgramLanguage;
 use crate::runtime::fiber::CpuFiberScheduler;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -225,6 +225,45 @@ impl TypedRuntime {
 
     pub fn functions(&self) -> &BTreeMap<String, Function> {
         &self.functions
+    }
+
+    /// Reclaim producer records after their last language-visible handle has
+    /// disappeared. Terminal records remain deterministic tombstones while a
+    /// duplicate/nested handle is reachable; ready records referenced by a
+    /// live producer continuation are retained transitively.
+    fn collect_unreachable_producer_fibers(&mut self) {
+        let mut pending = VecDeque::new();
+        for value in &self.stack {
+            collect_producer_fiber_ids(value, &mut pending);
+        }
+
+        let mut reachable = BTreeSet::new();
+        while let Some(id) = pending.pop_front() {
+            if !reachable.insert(id.clone()) {
+                continue;
+            }
+            let Some(record) = self.producer_fibers.get(&id) else {
+                continue;
+            };
+            match &record.state {
+                ProducerFiberState::Ready { continuation } => {
+                    for value in &continuation.stack {
+                        collect_producer_fiber_ids(value, &mut pending);
+                    }
+                    for frame in &continuation.frames {
+                        for value in frame.locals.iter().chain(&frame.captures) {
+                            collect_producer_fiber_ids(value, &mut pending);
+                        }
+                    }
+                }
+                ProducerFiberState::Completed { result } => {
+                    collect_producer_fiber_ids(result, &mut pending);
+                }
+                ProducerFiberState::Failed { .. } | ProducerFiberState::Cancelled => {}
+            }
+        }
+        self.producer_fibers
+            .retain(|id, _| reachable.contains(id));
     }
 
     /// Capture only state that can safely survive outside this process. This
@@ -1810,6 +1849,7 @@ impl TypedRuntime {
             }
         }
         self.stack = stack;
+        self.collect_unreachable_producer_fibers();
         TypedExecution {
             status: TypedExecutionStatus::Completed,
             values: self.stack.clone(),
@@ -1931,6 +1971,55 @@ fn validate_producer_record(
         ProducerFiberState::Failed { .. } | ProducerFiberState::Cancelled => {}
     }
     Ok(())
+}
+
+fn collect_producer_fiber_ids(value: &TypedValue, ids: &mut VecDeque<String>) {
+    match value {
+        TypedValue::Fiber { id, .. } => ids.push_back(id.clone()),
+        TypedValue::List { values, .. } => {
+            for value in values {
+                collect_producer_fiber_ids(value, ids);
+            }
+        }
+        TypedValue::Map { entries, .. } => {
+            for (key, value) in entries {
+                collect_producer_fiber_ids(key, ids);
+                collect_producer_fiber_ids(value, ids);
+            }
+        }
+        TypedValue::Option { value, .. } | TypedValue::Variant { value, .. } => {
+            if let Some(value) = value {
+                collect_producer_fiber_ids(value, ids);
+            }
+        }
+        TypedValue::Result { value, .. } | TypedValue::Dynamic { value, .. } => {
+            collect_producer_fiber_ids(value, ids);
+        }
+        TypedValue::Record(fields) => {
+            for (_, value) in fields {
+                collect_producer_fiber_ids(value, ids);
+            }
+        }
+        TypedValue::Closure { captures, .. } => {
+            for value in captures {
+                collect_producer_fiber_ids(value, ids);
+            }
+        }
+        TypedValue::Unit
+        | TypedValue::Bool(_)
+        | TypedValue::Int(_)
+        | TypedValue::UInt(_)
+        | TypedValue::Float(_)
+        | TypedValue::Char(_)
+        | TypedValue::Symbol(_)
+        | TypedValue::String(_)
+        | TypedValue::Bytes(_)
+        | TypedValue::Json(_)
+        | TypedValue::Path { .. }
+        | TypedValue::Task { .. }
+        | TypedValue::Stream { .. }
+        | TypedValue::Resource { .. } => {}
+    }
 }
 
 fn validate_fiber_handle(
@@ -2932,6 +3021,75 @@ mod tests {
         );
         assert_eq!(execution.status, TypedExecutionStatus::Completed);
         assert_eq!(execution.values, vec![TypedValue::Int(42)]);
+        assert!(runtime.checkpoint().unwrap().producer_fibers.is_empty());
+    }
+
+    #[test]
+    fn producer_tombstone_lives_until_the_last_duplicate_handle_is_dropped() {
+        let mut runtime = TypedRuntime::new();
+        let joined = runtime.execute(
+            ProgramLanguage::Forth,
+            "duplicate-producer.forth",
+            ": producer ( S -- S int ! infer ) 1 yield 42 ; \
+             ['] producer defer dup fiber-join",
+            5_000,
+        );
+        assert_eq!(
+            joined.status,
+            TypedExecutionStatus::Completed,
+            "{:?}",
+            joined.diagnostics
+        );
+        assert!(matches!(
+            joined.values.as_slice(),
+            [TypedValue::Fiber { .. }, TypedValue::Int(42)]
+        ));
+        assert_eq!(runtime.checkpoint().unwrap().producer_fibers.len(), 1);
+
+        let dropped = runtime.execute(
+            ProgramLanguage::Forth,
+            "drop-producer.forth",
+            "swap drop",
+            1_000,
+        );
+        assert_eq!(dropped.status, TypedExecutionStatus::Completed);
+        assert_eq!(dropped.values, vec![TypedValue::Int(42)]);
+        assert!(runtime.checkpoint().unwrap().producer_fibers.is_empty());
+    }
+
+    #[test]
+    fn producer_collection_traces_handles_captured_by_live_continuations() {
+        let mut runtime = TypedRuntime::new();
+        let deferred = runtime.execute(
+            ProgramLanguage::Lisp,
+            "nested-producers.lisp",
+            "(let ((inner (defer (lambda () (begin (yield 1) 7))))) \
+               (defer (lambda () (begin (yield 2) (fiber-join inner)))))",
+            5_000,
+        );
+        assert_eq!(
+            deferred.status,
+            TypedExecutionStatus::Completed,
+            "{:?}",
+            deferred.diagnostics
+        );
+        assert!(matches!(deferred.values.as_slice(), [TypedValue::Fiber { .. }]));
+        assert_eq!(runtime.checkpoint().unwrap().producer_fibers.len(), 2);
+
+        let dropped = runtime.execute(
+            ProgramLanguage::Forth,
+            "drop-outer.forth",
+            "drop",
+            5_000,
+        );
+        assert_eq!(
+            dropped.status,
+            TypedExecutionStatus::Completed,
+            "{:?}",
+            dropped.diagnostics
+        );
+        assert!(dropped.values.is_empty());
+        assert!(runtime.checkpoint().unwrap().producer_fibers.is_empty());
     }
 
     #[test]
