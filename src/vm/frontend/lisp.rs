@@ -275,6 +275,7 @@ pub fn compile_lisp_with_functions(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let expressions = flatten_top_level_begins(expressions);
     let mut compiler = Compiler {
         source_id,
         source,
@@ -352,6 +353,56 @@ pub fn compile_lisp_with_functions(
         },
     };
     Verifier::new(vocabulary).verify(module)
+}
+
+/// Scheme-style top-level `begin` is a declaration container, not a runtime
+/// lexical scope. Splice its children before the definition predeclaration
+/// pass so a model can naturally submit one `(begin (define ...) (use ...))`
+/// response while definitions nested inside functions and other expressions
+/// remain invalid. Reader-owned child spans preserve diagnostics for every
+/// spliced form.
+fn flatten_top_level_begins(forms: Vec<SourceForm>) -> Vec<SourceForm> {
+    fn append(form: SourceForm, flattened: &mut Vec<SourceForm>) {
+        let Val::List(items) = &form.value else {
+            flattened.push(form);
+            return;
+        };
+        if !matches!(items.first(), Some(Val::Symbol(name)) if name == "begin") {
+            flattened.push(form);
+            return;
+        }
+        let Val::List(source_items) = &form.source.value else {
+            flattened.push(form);
+            return;
+        };
+        if source_items != items || form.source.children.len() != items.len() {
+            flattened.push(form);
+            return;
+        }
+
+        for (value, source) in items
+            .iter()
+            .skip(1)
+            .cloned()
+            .zip(form.source.children.iter().skip(1).cloned())
+        {
+            append(
+                SourceForm {
+                    value,
+                    span: source.span.clone(),
+                    source,
+                    expansion: form.expansion.clone(),
+                },
+                flattened,
+            );
+        }
+    }
+
+    let mut flattened = Vec::new();
+    for form in forms {
+        append(form, &mut flattened);
+    }
+    flattened
 }
 
 /// A deliberately restricted source macro.  It is syntax-only: expansion
@@ -3611,6 +3662,18 @@ mod tests {
             run("(define (factorial (n : int)) : int \
                    (if (<= n 1) 1 (* n (factorial (- n 1))))) \
                  (factorial 6)")
+            .unwrap(),
+            vec![TypedValue::Int(720)]
+        );
+    }
+
+    #[test]
+    fn top_level_begin_can_group_a_definition_and_its_first_use() {
+        assert_eq!(
+            run("(begin
+                    (define (factorial (n : int)) : int
+                      (if (<= n 1) 1 (* n (factorial (- n 1)))))
+                    (factorial 6))")
             .unwrap(),
             vec![TypedValue::Int(720)]
         );

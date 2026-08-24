@@ -182,6 +182,17 @@ resource selectors remain inferred from typed calls and require a later selector
 Definitions enter the persistent shared dictionary only if the entire submission verifies, is
 authorized, and commits.
 
+A top-level `begin` may group definitions with executable forms in one response. Finch splices that
+container before predeclaring definitions, so recursive definitions are immediately available to
+later siblings while `define` inside a function, branch, or lexical expression remains invalid:
+
+```lisp
+(begin
+  (define (factorial (n : int)) : int
+    (if (<= n 1) 1 (* n (factorial (- n 1)))))
+  (say (int-to-string (factorial 6))))
+```
+
 The first string immediately after a `define` header, optional return annotation, and optional
 effect annotation is a docstring,
 following Common Lisp/Python practice. It is retained in the immutable definition metadata and
