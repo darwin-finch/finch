@@ -72,6 +72,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Run the fixed protocol-conformance workload across every supported configured provider/model,
   publish sample size and recovery rates, and keep regressions as replayable fixtures. A live
   configured-Grok first-pass Lisp result proves the recorder path, not cross-provider conformance.
+  The ignored `live_parity_finch_wire_programs` suite now executes three fixed response/arithmetic/
+  definition tasks through the real typed runtime, performs at most one source-only repair, and
+  prints source-free first-pass/repaired/terminal counts for every configured provider. On
+  2026-08-24 the configured Grok profile completed all 3 tasks first-pass (0 repaired, 0 terminal),
+  including a recursive factorial definition; other provider/model profiles remain unmeasured.
 - [ ] Consider an opt-in typed unresolved-word handler for a module/run. Ordinary unbound bare
   words must remain linking diagnostics; an explicitly installed handler may receive the unknown
   token as `symbol`/`string` and has one declared signature/effect contract, allowing controlled

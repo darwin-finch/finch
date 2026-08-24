@@ -8,7 +8,7 @@
 // Run one: FINCH_LIVE_TESTS=1 ANTHROPIC_API_KEY=sk-ant-... cargo test -- --include-ignored live_claude_minimal
 
 use finch::claude::Message;
-use finch::providers::{LlmProvider, ProviderRequest};
+use finch::providers::ProviderRequest;
 
 use crate::{live_tests_enabled, make_provider, resolve_api_key};
 

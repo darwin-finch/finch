@@ -72,13 +72,29 @@ pub fn resolve_api_key(provider: &str) -> Option<String> {
 /// Create a live `LlmProvider` from a provider name, or `None` to skip.
 pub fn make_provider(name: &str) -> Option<Box<dyn LlmProvider>> {
     let key = resolve_api_key(name)?;
-    let entry = TeacherEntry {
-        provider: name.to_string(),
-        api_key: key,
-        model: None,
-        base_url: None,
-        name: None,
-    };
+    // Preserve the configured model/base URL/name. Constructing an entry from
+    // only the resolved key silently selected obsolete provider defaults (for
+    // example `grok-2`) and made live conformance test a different deployment
+    // than the Finch session it was meant to measure.
+    let mut entry = finch::config::load_config()
+        .ok()
+        .and_then(|config| {
+            config
+                .providers
+                .iter()
+                .find(|provider| provider.provider_type() == name)
+                .and_then(|provider| provider.to_teacher_entry())
+        })
+        .unwrap_or_else(|| TeacherEntry {
+            provider: name.to_string(),
+            api_key: key.clone(),
+            model: None,
+            base_url: None,
+            name: None,
+        });
+    // An explicit environment key wins without discarding the rest of the
+    // locally configured profile.
+    entry.api_key = key;
     finch::providers::create_provider_from_teacher(&entry).ok()
 }
 
