@@ -287,8 +287,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   also audit remaining root/provider legacy model-selection/tool entry points before closing this gate.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their
   own large-file loops: workspace tree metadata, bounded file hash, a bounded host-computed
-  directory Merkle root, and bounded host-computed CSV header/per-column summaries now exist; add workbook
-  metadata/range cursors. Build security/integrity inspection from these explicit bounded facts
+  directory Merkle root, bounded host-computed CSV header/per-column summaries, workbook sheet-name
+  discovery, and typed workbook row cursors now exist; add bounded workbook range/column summaries.
+  Build security/integrity inspection from these explicit bounded facts
   (inventory, metadata, hashes, rules/signatures, provenance), with any remediation remaining a
   separately authorized proposal/effect. Each contract must advertise result shape and byte/work
   bounds; bulk materialization into a model-visible value must remain explicit so the VM can prefer
@@ -296,7 +297,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Extend bounded `file-slice`/`file-size` and host-issued cursors with workbook cursors so large
   Excel workbooks can be processed incrementally without whole-file/string loading. Line cursors
   and bounded `csv-open`/`csv-next`/`csv-close` record cursors now cover UTF-8 CSV quoted-record
-  framing; workbook-specific opaque resources remain.
+  framing. `workbook-open` and `workbook-sheet-open` now return the same opaque
+  `stream<list<string>>` shape, `workbook-sheets` returns structured names, only one row crosses into
+  the VM per `stream-next`, and ordinary ownership/generation/close checks apply. The current
+  Calamine adapter retains an owned decoded worksheet behind the host cursor with a 10-million-cell
+  bound; replace it with a genuinely streaming or bounded-range decoder before closing this gate.
 - [ ] Replace the compatibility output adapter with portable output-handle effects: default response
   port append (`say`), append/replace/status/progress/complete/fail operations, per-handle ownership
   and generation checks, and journal-first projection into concurrent shadow-buffer WorkUnits. Provider
