@@ -196,9 +196,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   revisions now retain a serializable, reverified stack-and-definition checkpoint whenever they
   contain no host-owned handles; authority is intentionally not serialized. Named-Brain
   compatibility execution now journals content-addressed typed checkpoints and restores them after
-  daemon restart without replaying source or effects. Add the managed heap, general durable
-  revision storage, and explicit host-handle restoration before treating every Brain run as
-  restartable.
+  daemon restart without replaying source or effects. A versioned `ProgramRuntimeArchive` now
+  validates and restores the complete reducible revision lineage while excluding grants, pending
+  calls, and execute-once effects. Add application-owned durable archive storage, the managed heap,
+  and explicit host-handle restoration before treating every Brain run as restartable.
 - [ ] Complete revisioned private working snapshots and conflict-aware commits. A `ProgramRuntime`
   now executes each ProgramRun on a cloned stack/dictionary snapshot and gates only snapshot/commit;
   stale resume checks and losing post-resume commits return structured failed outcomes without

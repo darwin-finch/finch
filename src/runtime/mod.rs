@@ -248,6 +248,18 @@ pub struct VmRevisionSnapshot {
     pub checkpoint_diagnostic: Option<String>,
 }
 
+pub const PROGRAM_RUNTIME_ARCHIVE_VERSION: u32 = 1;
+
+/// Versioned reducible state for a persistent shared VM. Authority, live host
+/// handles, pending external calls, and execute-once effect records belong to
+/// the application journal and are intentionally absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramRuntimeArchive {
+    pub format_version: u32,
+    pub current_revision: u64,
+    pub revisions: Vec<VmRevisionSnapshot>,
+}
+
 /// One session's persistent language runtimes.
 pub struct ProgramRuntime {
     typed: Arc<Mutex<TypedRuntime>>,
@@ -431,6 +443,56 @@ impl ProgramRuntime {
             },
         ];
         runtime.revision.store(revision, Ordering::Release);
+        Ok(runtime)
+    }
+
+    /// Restore a complete reducible revision lineage. The current revision
+    /// must carry a checkpoint; historical entries may retain only metadata
+    /// when their application-owned handles were not serializable.
+    pub fn from_archive(archive: ProgramRuntimeArchive) -> Result<Self> {
+        if archive.format_version != PROGRAM_RUNTIME_ARCHIVE_VERSION {
+            bail!(
+                "unsupported ProgramRuntime archive version {}; expected {}",
+                archive.format_version,
+                PROGRAM_RUNTIME_ARCHIVE_VERSION
+            );
+        }
+        if archive.revisions.is_empty() {
+            bail!("ProgramRuntime archive has no revisions");
+        }
+        if archive
+            .revisions
+            .windows(2)
+            .any(|window| window[0].revision >= window[1].revision)
+        {
+            bail!("ProgramRuntime archive revisions are not strictly increasing");
+        }
+        let current = archive
+            .revisions
+            .last()
+            .expect("a non-empty archive has a final revision");
+        if current.revision != archive.current_revision {
+            bail!(
+                "ProgramRuntime archive ends at revision {}, not declared revision {}",
+                current.revision,
+                archive.current_revision
+            );
+        }
+        let checkpoint = current.checkpoint.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "ProgramRuntime archive revision {} has no restorable checkpoint: {}",
+                current.revision,
+                current
+                    .checkpoint_diagnostic
+                    .as_deref()
+                    .unwrap_or("host-owned state was not serialized")
+            )
+        })?;
+        let runtime = Self::from_checkpoint_at_revision(checkpoint, archive.current_revision)?;
+        *runtime
+            .revision_history
+            .lock()
+            .map_err(|_| anyhow::anyhow!("revision history lock poisoned"))? = archive.revisions;
         Ok(runtime)
     }
 
@@ -1449,6 +1511,35 @@ impl ProgramRuntime {
             .lock()
             .map_err(|_| anyhow::anyhow!("revision history lock poisoned"))?
             .clone())
+    }
+
+    pub fn archive(&self) -> Result<ProgramRuntimeArchive> {
+        let revisions = self.revision_history()?;
+        let current_revision = self.revision();
+        let current = revisions
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("ProgramRuntime has no revision history"))?;
+        if current.revision != current_revision {
+            bail!(
+                "ProgramRuntime revision history ends at {}, current revision is {}",
+                current.revision,
+                current_revision
+            );
+        }
+        if current.checkpoint.is_none() {
+            bail!(
+                "ProgramRuntime revision {current_revision} is not archivable: {}",
+                current
+                    .checkpoint_diagnostic
+                    .as_deref()
+                    .unwrap_or("host-owned state is still live")
+            );
+        }
+        Ok(ProgramRuntimeArchive {
+            format_version: PROGRAM_RUNTIME_ARCHIVE_VERSION,
+            current_revision,
+            revisions,
+        })
     }
 
     pub async fn inspect(&self) -> Result<VmStateSnapshot> {
@@ -6437,6 +6528,50 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![TypedValue::Int(8), TypedValue::Int(64)]
         );
+    }
+
+    #[tokio::test]
+    async fn program_runtime_archive_restores_history_but_not_authority() {
+        let runtime = ProgramRuntime::new();
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("./src/**").unwrap(),
+            ))
+            .unwrap();
+        runtime
+            .submit(submission(
+                ProgramLanguage::Forth,
+                ": square ( S int -- S int ! pure ) dup * ; 8",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        let archive = runtime.archive().unwrap();
+        assert_eq!(archive.current_revision, 1);
+        assert_eq!(archive.revisions.len(), 2);
+        let encoded = serde_json::to_string(&archive).unwrap();
+        let restored = ProgramRuntime::from_archive(serde_json::from_str(&encoded).unwrap()).unwrap();
+
+        assert!(restored.capability_ledger().unwrap().grants.grants.is_empty());
+        assert!(!restored
+            .inspect()
+            .await
+            .unwrap()
+            .granted_capabilities
+            .iter()
+            .any(|requirement| requirement.capability == crate::vm::CapabilityKind::FileRead));
+        let result = restored
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(square 8)",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.input_revision, 1);
+        assert_eq!(result.output_revision, 2);
+        assert_eq!(restored.revision_history().unwrap().len(), 3);
     }
 
     #[tokio::test]
