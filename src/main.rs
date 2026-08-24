@@ -688,6 +688,30 @@ mod script_tests {
         assert!(prompt.contains("Default to Lisp"));
     }
 
+    #[test]
+    fn one_shot_wire_metrics_preserve_first_failure_and_repair_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = finch::metrics::MetricsLogger::new(dir.path().to_path_buf()).unwrap();
+        let mut metric = finch::metrics::WireAdherenceMetric::first_pass(
+            "xai",
+            "grok-code-fast-1",
+            "one_shot",
+        );
+        mark_wire_rejection(&mut metric, "Hello there!", "E-LINK-002: unknown word");
+        metric.repair_attempted = true;
+        finish_wire_metric(Some(&logger), &mut metric, Some("hello"), false);
+
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let recorded = logger.read_wire_metrics(&today).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].failure_class,
+            Some(finch::metrics::WireFailureClass::RawProse)
+        );
+        assert!(recorded[0].repaired_successfully);
+        assert!(!recorded[0].terminal_failure);
+    }
+
     #[tokio::test]
     async fn one_shot_wire_receiver_executes_a_daemon_style_final_response() {
         let runtime = finch::runtime::ProgramRuntime::new();
@@ -2160,6 +2184,9 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
     let client = DaemonClient::connect(daemon_config).await?;
 
     let guard = executor.lock().await;
+    let wire_metrics = default_wire_metrics_logger();
+    let mut wire_metric =
+        finch::metrics::WireAdherenceMetric::first_pass("daemon", "daemon-selected", "one_shot");
     let response = client
         .query_with_tools_with_system(
             query,
@@ -2178,6 +2205,12 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
     // identical without handing workspace/UI authority to the daemon.
     let outcome = match execute_one_shot_wire_source(&program_runtime, &response).await {
         Ok(outcome) if outcome.status == finch::runtime::outcome::ExecutionStatus::Completed => {
+            finish_wire_metric(
+                wire_metrics.as_ref(),
+                &mut wire_metric,
+                Some(&outcome.output),
+                false,
+            );
             print!("{}", outcome.output);
             return Ok(());
         }
@@ -2190,6 +2223,8 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
             if show_program {
                 eprintln!("→ rejected: {diagnostic}");
             }
+            mark_wire_rejection(&mut wire_metric, &response, &diagnostic);
+            wire_metric.repair_attempted = true;
             // A correction is source-only.  Do not give it the tool manifest:
             // a malformed, effect-free response must not turn into a new
             // arbitrary host action merely because it is being repaired.
@@ -2211,6 +2246,8 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
             if show_program {
                 eprintln!("→ rejected: {error}");
             }
+            mark_wire_rejection(&mut wire_metric, &response, &error.to_string());
+            wire_metric.repair_attempted = true;
             let repair = client
                 .query_with_tools_with_system(
                     &one_shot_wire_repair_request(&response, &error.to_string()),
@@ -2224,9 +2261,19 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
             }
             execute_one_shot_wire_source(&program_runtime, &repair).await?
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            mark_wire_rejection(&mut wire_metric, &response, &error.to_string());
+            finish_wire_metric(wire_metrics.as_ref(), &mut wire_metric, None, true);
+            return Err(error);
+        }
     };
     if outcome.status == finch::runtime::outcome::ExecutionStatus::Completed {
+        finish_wire_metric(
+            wire_metrics.as_ref(),
+            &mut wire_metric,
+            Some(&outcome.output),
+            false,
+        );
         print!("{}", outcome.output);
     } else {
         let diagnostic = outcome
@@ -2234,6 +2281,10 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
             .first()
             .cloned()
             .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
+        if wire_metric.first_pass_valid {
+            mark_wire_rejection(&mut wire_metric, &response, &diagnostic);
+        }
+        finish_wire_metric(wire_metrics.as_ref(), &mut wire_metric, None, true);
         anyhow::bail!(
             "daemon provider VM-wire program ended as {:?}: {}",
             outcome.status,
@@ -2262,6 +2313,13 @@ async fn run_query_teacher_only(
         .active_teacher()
         .and_then(|t| t.model.clone())
         .unwrap_or_else(|| finch::config::constants::DEFAULT_CLAUDE_MODEL.to_string());
+    let provider = config
+        .active_teacher()
+        .map(|teacher| teacher.provider.clone())
+        .unwrap_or_else(|| "teacher".to_string());
+    let wire_metrics = default_wire_metrics_logger();
+    let mut wire_metric =
+        finch::metrics::WireAdherenceMetric::first_pass(provider, model.clone(), "one_shot");
 
     let mut messages = vec![Message::user(query)];
     // Keep one-shot provider calls on the same wire contract as the REPL.
@@ -2299,6 +2357,8 @@ async fn run_query_teacher_only(
                     if show_program {
                         eprintln!("→ rejected: {error}");
                     }
+                    mark_wire_rejection(&mut wire_metric, &source, &error.to_string());
+                    wire_metric.repair_attempted = true;
                     messages.push(response.to_message());
                     messages.push(Message::user(one_shot_wire_repair_request(
                         &source,
@@ -2307,9 +2367,21 @@ async fn run_query_teacher_only(
                     wire_repair_requested = true;
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if wire_metric.first_pass_valid {
+                        mark_wire_rejection(&mut wire_metric, &source, &error.to_string());
+                    }
+                    finish_wire_metric(wire_metrics.as_ref(), &mut wire_metric, None, true);
+                    return Err(error);
+                }
             };
             if outcome.status == finch::runtime::outcome::ExecutionStatus::Completed {
+                finish_wire_metric(
+                    wire_metrics.as_ref(),
+                    &mut wire_metric,
+                    Some(&outcome.output),
+                    false,
+                );
                 print!("{}", outcome.output);
                 return Ok(());
             }
@@ -2323,6 +2395,8 @@ async fn run_query_teacher_only(
                 if show_program {
                     eprintln!("→ rejected: {diagnostic}");
                 }
+                mark_wire_rejection(&mut wire_metric, &source, &diagnostic);
+                wire_metric.repair_attempted = true;
                 messages.push(response.to_message());
                 messages.push(Message::user(one_shot_wire_repair_request(
                     &source,
@@ -2331,6 +2405,10 @@ async fn run_query_teacher_only(
                 wire_repair_requested = true;
                 continue;
             }
+            if wire_metric.first_pass_valid {
+                mark_wire_rejection(&mut wire_metric, &source, &diagnostic);
+            }
+            finish_wire_metric(wire_metrics.as_ref(), &mut wire_metric, None, true);
             anyhow::bail!(
                 "provider VM-wire program ended as {:?}: {}",
                 outcome.status,
@@ -2339,6 +2417,7 @@ async fn run_query_teacher_only(
         }
 
         if wire_repair_requested {
+            finish_wire_metric(wire_metrics.as_ref(), &mut wire_metric, None, true);
             anyhow::bail!("provider used tools while repairing a rejected Finch VM wire program");
         }
 
@@ -2383,6 +2462,9 @@ async fn run_query_teacher_only(
         messages.push(Message::with_content("user", result_blocks));
     }
 
+    if wire_metric.repair_attempted {
+        finish_wire_metric(wire_metrics.as_ref(), &mut wire_metric, None, true);
+    }
     eprintln!("⚠️  Reached max tool turns without a final answer");
     Ok(())
 }
@@ -2460,6 +2542,43 @@ fn is_repairable_one_shot_wire_diagnostic(diagnostic: &str) -> bool {
 
 fn one_shot_wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
     finch::programs::wire_repair_request(rejected_source, diagnostic)
+}
+
+fn default_wire_metrics_logger() -> Option<finch::metrics::MetricsLogger> {
+    dirs::home_dir()
+        .map(|home| home.join(".finch").join("metrics"))
+        .and_then(|path| finch::metrics::MetricsLogger::new(path).ok())
+}
+
+fn mark_wire_rejection(
+    metric: &mut finch::metrics::WireAdherenceMetric,
+    source: &str,
+    diagnostic: &str,
+) {
+    metric.first_pass_valid = false;
+    metric.failure_class = Some(finch::programs::classify_wire_failure(source, diagnostic));
+    metric.diagnostic_code = finch::programs::wire_diagnostic_code(diagnostic);
+}
+
+fn finish_wire_metric(
+    logger: Option<&finch::metrics::MetricsLogger>,
+    metric: &mut finch::metrics::WireAdherenceMetric,
+    output: Option<&str>,
+    terminal_failure: bool,
+) {
+    if output.is_some_and(str::is_empty) {
+        metric.first_pass_valid = false;
+        metric.failure_class = Some(finch::metrics::WireFailureClass::MissingOutputEffect);
+    }
+    metric.repaired_successfully = metric.repair_attempted
+        && !terminal_failure
+        && output.is_some_and(|value| !value.is_empty());
+    metric.terminal_failure = terminal_failure || output.is_some_and(str::is_empty);
+    if let Some(logger) = logger {
+        if let Err(error) = logger.log_wire(metric) {
+            tracing::warn!("failed to record provider wire adherence: {error}");
+        }
+    }
 }
 
 /// Run interactive setup wizard
