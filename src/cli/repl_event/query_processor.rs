@@ -168,6 +168,27 @@ fn wire_repair_messages(
     repair_messages
 }
 
+/// Pick the vocabulary-relevance query for this inference. Tool-result
+/// continuations deliberately carry an empty internal `query`, but they are
+/// still provider turns and must receive the complete VM wire ABI. Reuse the
+/// most recent human text when possible; the fallback still produces the
+/// provider-neutral boot manifest when only tool-result blocks remain.
+fn vm_manifest_query(messages: &[crate::claude::Message], query: &str) -> String {
+    if !query.trim().is_empty() {
+        return query.to_string();
+    }
+
+    messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user")
+        .flat_map(|message| message.content.iter())
+        .filter_map(ContentBlock::as_text)
+        .find(|text| !text.trim().is_empty())
+        .unwrap_or("Finch VM wire protocol")
+        .to_string()
+}
+
 struct WireExecution {
     source_for_history: String,
     response: String,
@@ -227,8 +248,16 @@ async fn execute_wire_with_single_repair(
         };
     }
 
+    // Keep the rejected result visibly live while the bounded corrective
+    // inference runs. Previously a plain output WorkUnit showed only the
+    // static error, making Finch look dead while subsequent input queued.
+    output_unit.set_output_handle("VM program rejected");
+    output_unit.set_transient_status(Some(
+        "requesting one corrected ProgramSubmission from the provider…".to_string(),
+    ));
     let repair_messages = wire_repair_messages(messages, &source, &diagnostic);
     let repair = generator.generate(repair_messages, None).await;
+    output_unit.set_transient_status(None);
     let Ok(repair) = repair else {
         output_unit.set_complete();
         return WireExecution {
@@ -676,19 +705,19 @@ pub(crate) async fn process_query_with_tools(
                 }
             }
         }
-        // The bootstrap language contract must be present regardless of
-        // whether MemTree is configured. When it is available, its program
-        // registry enriches the same manifest with relevant vocabulary.
-        if !query.is_empty() {
-            let manifest = match memory_system.as_ref() {
-                Some(memory) => memory
-                    .vm_manifest(&query, 12)
-                    .await
-                    .unwrap_or_else(|_| fallback_vm_manifest()),
-                None => fallback_vm_manifest(),
-            };
-            inject_vm_manifest(&mut msgs, &manifest);
-        }
+        // This execution contract is required on *every* provider inference,
+        // including internal empty-query continuations after tool results.
+        // The manifest is local request data rather than persisted conversation
+        // history, so it must be re-injected each round trip.
+        let manifest_query = vm_manifest_query(&msgs, &query);
+        let manifest = match memory_system.as_ref() {
+            Some(memory) => memory
+                .vm_manifest(&manifest_query, 12)
+                .await
+                .unwrap_or_else(|_| fallback_vm_manifest()),
+            None => fallback_vm_manifest(),
+        };
+        inject_vm_manifest(&mut msgs, &manifest);
         msgs
     };
     let caps = generator.capabilities();
@@ -1387,10 +1416,11 @@ mod tests {
             panic!("the system message must retain its text block");
         };
         assert!(text.contains("FINCH-VM-TYPED/1"));
-        assert!(text.contains("one complete executable Finch program"));
+        assert!(text.contains("complete body of every text response is one"));
+        assert!(text.contains("`ProgramSubmission`"));
         assert!(text.contains("Default to Lisp"));
-        assert!(text.contains("every other valid response is Co-Forth"));
-        assert!(text.contains("already writing to the active Brain's VM input"));
+        assert!(text.contains("every other valid submission is Co-Forth"));
+        assert!(text.contains("already writing the active Brain's VM input"));
         assert!(text.contains("A nested CLI"));
         assert!(text.contains("process is a different runtime"));
         assert!(text.contains("submit_program` tool only when this same inference"));
@@ -1398,7 +1428,9 @@ mod tests {
         assert!(text.contains("inspect_word(name)"));
         assert!(text.contains("\"Hello\" say"));
         assert!(text.contains("`s\"text\"` is equivalent"));
-        assert!(messages[1].content[0].as_text().is_some_and(|text| text == "add two numbers"));
+        assert!(messages[1].content[0]
+            .as_text()
+            .is_some_and(|text| text == "add two numbers"));
     }
 
     #[test]
@@ -1420,6 +1452,20 @@ mod tests {
         assert!(system.contains("## Finch VM wire protocol"));
         assert!(system.contains("FINCH-VM-TYPED/1"));
         assert_eq!(messages[1].content[0].as_text(), Some("say hello"));
+    }
+
+    #[test]
+    fn empty_tool_continuation_reuses_the_human_query_for_the_vm_manifest() {
+        let messages = vec![
+            crate::claude::Message::user("hello finch"),
+            crate::claude::Message::assistant(""),
+        ];
+
+        assert_eq!(vm_manifest_query(&messages, ""), "hello finch");
+        assert_eq!(
+            vm_manifest_query(&messages, "explicit continuation"),
+            "explicit continuation"
+        );
     }
 
     #[tokio::test]
@@ -1561,7 +1607,7 @@ mod tests {
         assert_eq!(repair[1].content[0].as_text(), Some("Hello!"));
         let prompt = repair[2].content[0].as_text().unwrap();
         assert!(prompt.contains("It was forth; repair it as forth"));
-        assert!(prompt.contains("exactly one complete raw Finch forth program"));
+        assert!(prompt.contains("exactly one complete raw Finch forth ProgramSubmission"));
         assert!(prompt.contains("Hello!"));
         assert!(prompt.contains("E-LINK-002"));
     }
