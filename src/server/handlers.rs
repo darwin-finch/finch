@@ -179,8 +179,8 @@ async fn check_brain_access(
 struct NamedBrainListEntry {
     name: String,
     environment: crate::brain::shared::BrainEnvironment,
-    revision: u64,
-    programs: usize,
+    event_revision: u64,
+    retained_programs: usize,
 }
 
 async fn list_named_brains(
@@ -202,8 +202,8 @@ async fn list_named_brains(
         result.push(NamedBrainListEntry {
             name,
             environment: snapshot.environment,
-            revision: snapshot.revision,
-            programs: snapshot.program_stack.len(),
+            event_revision: snapshot.revision,
+            retained_programs: snapshot.program_stack.len(),
         });
     }
     Ok(Json(result))
@@ -2512,5 +2512,25 @@ mod named_brain_provider_context_tests {
         assert_eq!(messages[1].text_content(), "(say \"answer\")");
         assert_eq!(messages[2].role, "user");
         assert!(messages[2].text_content().contains("program event #2"));
+    }
+
+    #[test]
+    fn named_brain_list_fields_expose_their_actual_semantics() {
+        let entry = NamedBrainListEntry {
+            name: "shared".into(),
+            environment: BrainEnvironment {
+                machine: "box.local".into(),
+                workspace: "/workspace".into(),
+                generation: 1,
+            },
+            event_revision: 21,
+            retained_programs: 7,
+        };
+
+        let value = serde_json::to_value(entry).unwrap();
+        assert_eq!(value["event_revision"], 21);
+        assert_eq!(value["retained_programs"], 7);
+        assert!(value.get("revision").is_none());
+        assert!(value.get("programs").is_none());
     }
 }

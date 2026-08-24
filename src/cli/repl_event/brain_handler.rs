@@ -205,8 +205,8 @@ impl EventLoop {
         struct NamedBrainSummary {
             name: String,
             environment: crate::brain::shared::BrainEnvironment,
-            revision: u64,
-            programs: usize,
+            event_revision: u64,
+            retained_programs: usize,
         }
 
         let brains = match reqwest::Client::new()
@@ -234,7 +234,9 @@ impl EventLoop {
                     .as_ref()
                     .map(|client| client.target.brain.as_str())
                     .unwrap_or(self.session_label.as_str());
-                let mut lines = vec!["Named Brains:".to_string()];
+                let mut lines = vec![
+                    "Named Brains (event revision · retained program stack):".to_string(),
+                ];
                 for b in &brains {
                     let current = if b.name == current_name {
                         if self.active_remote_brain.is_some() {
@@ -246,10 +248,10 @@ impl EventLoop {
                         ""
                     };
                     lines.push(format!(
-                        "  {:55}  rev {:<5}  {:<3} programs  {}{}",
+                        "  {:55}  event {:<5}  {:<3} retained programs  {}{}",
                         format!("{}@{}", b.name, b.environment.machine),
-                        b.revision,
-                        b.programs,
+                        b.event_revision,
+                        b.retained_programs,
                         b.environment.workspace.display(),
                         current,
                     ));
