@@ -732,7 +732,10 @@ impl EffectSet {
 
 impl fmt::Display for EffectSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("{")?;
+        if self.is_pure() {
+            return f.write_str("pure");
+        }
+        f.write_str("effects{")?;
         for (index, effect) in self.0.iter().enumerate() {
             if index != 0 {
                 f.write_str(", ")?;

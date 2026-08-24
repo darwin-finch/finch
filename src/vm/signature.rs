@@ -93,6 +93,6 @@ mod tests {
             StackRow::polymorphic("S", vec![Type::Int, Type::Int]),
             StackRow::polymorphic("S", vec![Type::Int]),
         );
-        assert_eq!(signature.to_string(), "( S int int -- S int ! {} )");
+        assert_eq!(signature.to_string(), "( S int int -- S int ! pure )");
     }
 }

@@ -1128,7 +1128,7 @@ mod tests {
         assert!(prompt.contains("\"response\" say"));
         assert!(prompt.contains("\"\"\"text\"\"\""));
         assert!(prompt.contains("if-some ... else ... then"));
-        assert!(prompt.contains(": factorial ( S int -- S int ! {} )"));
+        assert!(prompt.contains(": factorial ( S int -- S int ! pure )"));
         assert!(prompt.contains("begin condition while ... repeat"));
         assert!(prompt.contains("[1, 2, 3]"));
         assert!(prompt.contains("{\"first name\":\"Ada\"}"));
@@ -1333,7 +1333,7 @@ mod tests {
         let path = root.join("double.forth");
         std::fs::write(
             &path,
-            "\\ finch-doc: Return twice an integer.\n: double ( S int -- S int ! {} ) 2 * ;\n",
+            "\\ finch-doc: Return twice an integer.\n: double ( S int -- S int ! pure ) 2 * ;\n",
         )
         .unwrap();
 

@@ -72,15 +72,29 @@ payload in each required arm:
   (err problem (begin problem 0)))
 ```
 
-`match` is the preferred type-directed spelling when the arm tags make the value kind clear. In
-version 1 it accepts exactly the exhaustive `some`/`none` and `ok`/`err` pairs and lowers to the
-same branch IR as the explicit forms; it does not perform dynamic dispatch:
+`match` is the preferred type-directed spelling when the arm patterns make the value kind clear.
+It accepts exhaustive `some`/`none` and `ok`/`err` pairs and lowers to the same branch IR as the
+explicit forms. It also accepts a total boolean pair and a finite integer switch with a required
+final `_` arm. These are statically typed branch forms, not dynamic dispatch:
 
 ```lisp
 (match (some 5)
   (some value (+ value 1))
   (none 0))
+
+(match true
+  (true 42)
+  (false 0))
+
+(match 2
+  (0 100)
+  (2 42)
+  (_ 0))
 ```
+
+Integer literal arms must be unique, and `_` must be the final arm. Strings, records, lists, and
+arbitrary JSON have no general pattern matcher yet: use their explicit typed operations rather than
+falling back to a dynamic dispatcher.
 
 `{ ... }` constructs a typed immutable product from `:name value` field forms. Each field keeps its own
 type; it is not an untyped JSON object. `record-get` takes a literal field name and returns an
@@ -139,6 +153,11 @@ Use `(while :label name condition body...)` for a loop that needs a structured n
 its body, `(break name)` exits to that loop's typed exit edge and `(continue name)` returns to its
 condition edge. The named exit must preserve the target loop's stack row and currently carries no
 extra result values; it is not an arbitrary jump.
+
+Type annotations use the same compact grammar as Co-Forth signatures. In addition to
+`list<T>`, `map<K,V>`, and `result<T,E>`, a fixed product type is
+`record{name:string,age:int}`. It describes a known field set and is distinct from an open map;
+record values are constructed with `{ :name value :age value }` and projected with `record-get`.
 
 The version-1 typed frontend currently accepts literals, homogeneous non-empty lists, core
 vocabulary calls, `begin`, lexical `let`, typed `if`, typed `while`, typed `lambda`, closure calls,

@@ -308,6 +308,15 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
             continue;
         }
 
+        // `record{field:type,...}` is an annotation atom, not a record or
+        // JSON value. Keeping it intact lets typed Lisp and Co-Forth share
+        // one product-type spelling without a second type-expression reader.
+        if let Some(end) = compact_record_type_end(&chars, i) {
+            tokens.push(Tok::Atom(chars[i..end].iter().collect()));
+            i = end;
+            continue;
+        }
+
         match c {
             '$' => {
                 i += 1;
@@ -511,6 +520,30 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
     Ok(tokens)
 }
 
+fn compact_record_type_end(chars: &[char], start: usize) -> Option<usize> {
+    let prefix: Vec<char> = "record{".chars().collect();
+    if chars.get(start..start + prefix.len())? != prefix.as_slice() {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (offset, character) in chars[start..].iter().enumerate() {
+        if character.is_whitespace() || *character == '"' {
+            return None;
+        }
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(start + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// `{ :name value }` is Finch's typed record literal. Preserve ordinary JSON
 /// objects (`{"name": value}`) as the existing explicit JSON reader form;
 /// the first non-whitespace character makes the two spellings unambiguous.
@@ -641,6 +674,12 @@ fn skip_trivia(source: &str, mut cursor: usize) -> Option<usize> {
 
 fn scan_form(source: &str, start: usize) -> Option<SyntaxForm> {
     let rest = source.get(start..)?;
+    if let Some(end) = scan_compact_record_type(source, start) {
+        return Some(SyntaxForm {
+            span: start..end,
+            children: Vec::new(),
+        });
+    }
     let first = rest.chars().next()?;
     match first {
         '(' => scan_list(source, start),
@@ -689,6 +728,30 @@ fn scan_form(source: &str, start: usize) -> Option<SyntaxForm> {
             })
         }
     }
+}
+
+fn scan_compact_record_type(source: &str, start: usize) -> Option<usize> {
+    let remainder = source.get(start..)?;
+    if !remainder.starts_with("record{") {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (offset, character) in remainder.char_indices() {
+        if character.is_whitespace() || character == '"' {
+            return None;
+        }
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(start + offset + character.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn brace_starts_typed_record_source(source: &str, start: usize) -> bool {

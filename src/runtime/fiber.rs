@@ -305,7 +305,7 @@ mod tests {
     fn pure_cpu_fiber_has_a_private_stack_and_returns_a_typed_result() {
         let module = compile_forth(
             "fiber.forth",
-            ": square ( S int -- S int ! {} ) dup * ;",
+            ": square ( S int -- S int ! pure ) dup * ;",
             Vec::new(),
             &core_vocabulary(),
         )

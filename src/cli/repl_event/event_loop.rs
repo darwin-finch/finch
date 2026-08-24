@@ -10730,7 +10730,7 @@ mod peer_loop_tests {
         // Broadcast a definition — both peers should compile it.
         bcast_tx
             .send(SessionEvent::chat(
-                ": square ( int -- int ! {} ) dup * ;",
+                ": square ( S int -- S int ! pure ) dup * ;",
             ))
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

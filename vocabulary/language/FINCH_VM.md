@@ -57,7 +57,9 @@ Structured result branches use the same typed control-flow rule: Co-Forth
 else edge; Lisp `(match-result result (ok name ...) (err name ...))` binds the corresponding
 payload lexically. Both arms are required and must merge with the same verified stack/value type.
 Lisp may use the type-directed `(match value arms...)` spelling for these two exhaustive tagged
-forms; it selects the same lowering and never falls back to dynamic pattern dispatch.
+forms. It also accepts `(match bool (true ...) (false ...))` and integer literal arms ending in a
+required `(_ ...)` default; all variants select the same verified branch IR and never fall back to
+dynamic pattern dispatch.
 
 Co-Forth also supports an integer `case` with `of ... endof` arms and an optional `otherwise`.
 It lowers to the same verified branch edges, has no fallthrough, and requires every reachable arm

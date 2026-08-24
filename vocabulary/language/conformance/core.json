@@ -25,21 +25,21 @@
     },
     {
       "name": "typed-definition-and-locals",
-      "forth": ": subtract ( S int int -- S int ! {} ) locals| left right | left right - ; 10 5 subtract",
+      "forth": ": subtract ( S int int -- S int ! pure ) locals| left right | left right - ; 10 5 subtract",
       "lisp": "(define (subtract (left : int) (right : int)) (- left right)) (subtract 10 5)",
       "expected_values": [{ "type": "int", "value": 5 }],
       "expected_output": ""
     },
     {
       "name": "recursive-typed-definition",
-      "forth": ": factorial ( S int -- S int ! {} ) locals| n | n 1 <= if 1 else n n 1 - factorial * then ; 6 factorial",
+      "forth": ": factorial ( S int -- S int ! pure ) locals| n | n 1 <= if 1 else n n 1 - factorial * then ; 6 factorial",
       "lisp": "(define (factorial (n : int)) : int (if (<= n 1) 1 (* n (factorial (- n 1))))) (factorial 6)",
       "expected_values": [{ "type": "int", "value": 720 }],
       "expected_output": ""
     },
     {
       "name": "typed-closure-and-quotation",
-      "forth": ": add-two ( S int -- S int ! {} ) 2 + ; 5 ['] add-two execute",
+      "forth": ": add-two ( S int -- S int ! pure ) 2 + ; 5 ['] add-two execute",
       "lisp": "(let ((add-two (lambda ((n : int)) (+ n 2)))) (add-two 5))",
       "expected_values": [{ "type": "int", "value": 7 }],
       "expected_output": ""
@@ -192,6 +192,20 @@
       "forth": "s\"bad\" err if-ok drop 0 else drop 3 then",
       "lisp": "(match-result (err \"bad\") (ok value (begin value 0)) (err problem (begin problem 3)))",
       "expected_values": [{ "type": "int", "value": 3 }],
+      "expected_output": ""
+    },
+    {
+      "name": "literal-boolean-match",
+      "forth": "true if 42 else 0 then",
+      "lisp": "(match true (true 42) (false 0))",
+      "expected_values": [{ "type": "int", "value": 42 }],
+      "expected_output": ""
+    },
+    {
+      "name": "literal-integer-match",
+      "forth": "2 case 0 of 100 endof 2 of 42 endof otherwise 0 endcase",
+      "lisp": "(match 2 (0 100) (2 42) (_ 0))",
+      "expected_values": [{ "type": "int", "value": 42 }],
       "expected_output": ""
     },
     {

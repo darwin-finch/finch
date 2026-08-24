@@ -76,7 +76,7 @@ without introducing a separate object runtime; invocation remains explicit and r
 on the ordinary stack:
 
 ```forth
-: increment ( S int -- S int ! {} ) 1 + ;
+: increment ( S int -- S int ! pure ) 1 + ;
 { run: ['] increment } "run" record-get unwrap 41 swap execute  \ leaves 42
 ```
 
@@ -122,23 +122,29 @@ Without `otherwise`, a non-matching selector is simply dropped, so every selecte
 leave no values. Use a typed `if`/`if-some`/`if-ok` when the branch condition is not an integer
 selector.
 
-Typed signatures use `S` for the preserved unknown lower stack:
+Typed signatures must use `S` as the first item on both sides of `--`. It is the preserved unknown
+lower caller stack, so ordinary words consume only their declared inputs and preserve everything
+beneath them:
 
 ```forth
-: square ( S int -- S int ! {} )
+: square ( S int -- S int ! pure )
   dup *
 ;
 ```
 
+`S` is a type-level stack row, not a runtime value: `( S -- S ! pure )` is stack-neutral, not a
+word that consumes the whole stack. A typed definition may not omit, duplicate, or drop this row.
+
 Type names may be parameterized in a signature, including nested forms such as `list<int>`,
 `map<string,int>`, `option<list<string>>`, `result<T,E>`, `task<T>`, `resource<kind>`, and
-`capability<kind>`.
+`capability<kind>`. A fixed product type is `record{name:string,age:int}`; it is distinct from
+an open `map<string,T>` and may be the input or output of a typed word.
 
 Named input locals are an optional direct IR spelling. `locals|` must be the first form in a typed
 word and must name every declared input in bottom-to-top stack order:
 
 ```forth
-: area ( S int int -- S int ! {} )
+: area ( S int int -- S int ! pure )
   locals| width height |
   width height *
 ;
@@ -149,9 +155,9 @@ The frame owns those locals and a private operand window above the caller stack 
 keeps only the declared output values from that window, then destroys the frame; temporary values
 cannot leak into the caller.
 
-Use `! {}` to assert purity or `! infer` to accept the transitively inferred capability set in the
-current frontend. A false purity assertion rejects the entire submission and does not modify the
-dictionary. Declared-pure definitions are predeclared as a group, so they may be self- or
+Use `! pure` to assert purity or `! infer` to accept the transitively inferred capability set in
+the current frontend. A false purity
+assertion rejects the entire submission and does not modify the dictionary. Declared-pure definitions are predeclared as a group, so they may be self- or
 mutually-recursive in one submission; `! infer` definitions remain sequential until their inferred
 effects can be represented in a forward signature. Typed definitions are persistent and immediately
 callable from Finch Lisp.
@@ -161,7 +167,7 @@ the shared VM without reparsing source:
 
 ```forth
 \ finch-doc: Double an integer.
-: double ( S int -- S int ! {} ) 2 * ;
+: double ( S int -- S int ! pure ) 2 * ;
 ```
 
 Only the text after `finch-doc:` is retained on the immutable typed function contract. It is never

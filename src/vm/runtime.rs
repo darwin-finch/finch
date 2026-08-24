@@ -2192,7 +2192,7 @@ mod tests {
         let definition = runtime.execute(
             ProgramLanguage::Forth,
             "words.forth",
-            ": square ( S int -- S int ! {} ) dup * ;",
+            ": square ( S int -- S int ! pure ) dup * ;",
             1_000,
         );
         assert_eq!(definition.status, TypedExecutionStatus::Completed);
@@ -2208,7 +2208,7 @@ mod tests {
         let definition = runtime.execute(
             ProgramLanguage::Forth,
             "words.forth",
-            ": dishonest ( S string -- S ! {} ) say ;",
+            ": dishonest ( S string -- S ! pure ) say ;",
             1_000,
         );
         assert_eq!(definition.status, TypedExecutionStatus::Failed);
@@ -2274,7 +2274,7 @@ mod tests {
         let definition = runtime.execute(
             ProgramLanguage::Forth,
             "words.forth",
-            ": factorial ( S int -- S int ! {} ) \
+            ": factorial ( S int -- S int ! pure ) \
                locals| n | \
                n 1 <= if 1 else n n 1 - factorial * then ;",
             1_000,
@@ -2293,9 +2293,9 @@ mod tests {
         let definition = runtime.execute(
             ProgramLanguage::Forth,
             "words.forth",
-            ": even? ( S int -- S bool ! {} ) \
+            ": even? ( S int -- S bool ! pure ) \
                locals| n | n 0 = if true else n 1 - odd? then ; \
-             : odd? ( S int -- S bool ! {} ) \
+             : odd? ( S int -- S bool ! pure ) \
                locals| n | n 0 = if false else n 1 - even? then ;",
             1_000,
         );
@@ -2311,7 +2311,7 @@ mod tests {
         let result = runtime.execute(
             ProgramLanguage::Forth,
             "quotation.forth",
-            ": square ( S int -- S int ! {} ) dup * ; 9 ['] square execute",
+            ": square ( S int -- S int ! pure ) dup * ; 9 ['] square execute",
             1_000,
         );
         assert_eq!(result.status, TypedExecutionStatus::Completed);
@@ -2351,7 +2351,7 @@ mod tests {
         let definition = runtime.execute(
             ProgramLanguage::Forth,
             "definition.forth",
-            ": square ( S int -- S int ! {} ) dup * ;",
+            ": square ( S int -- S int ! pure ) dup * ;",
             1_000,
         );
         assert_eq!(definition.status, TypedExecutionStatus::Completed);
@@ -2445,7 +2445,7 @@ mod tests {
         runtime.execute(
             ProgramLanguage::Forth,
             "definition.forth",
-            ": square ( S int -- S int ! {} ) dup * ;",
+            ": square ( S int -- S int ! pure ) dup * ;",
             1_000,
         );
         let mut checkpoint = runtime.checkpoint().unwrap();

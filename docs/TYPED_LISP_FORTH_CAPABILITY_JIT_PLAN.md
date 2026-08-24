@@ -212,12 +212,12 @@ Signatures use row polymorphism so a word states what it consumes while preservi
 beneath it:
 
 ```text
-dup          forall A S. (S A -- S A A) ! {}
-drop         forall A S. (S A -- S) ! {}
-+            forall S.   (S int int -- S int) ! {}
+dup          forall A S. (S A -- S A A) ! pure
+drop         forall A S. (S A -- S) ! pure
++            forall S.   (S int int -- S int) ! pure
 file.read    forall R S. (S path<R> -- S bytes) ! {fs.read(R)}
 agent.await  forall T S. (S task<T> -- S result<T,agent-error>) ! {agent.await}
-yield        forall S.   (S -- S) ! {}  ; cooperative timeslice boundary
+yield        forall S.   (S -- S) ! pure  ; cooperative timeslice boundary
 ```
 
 The signature includes:
@@ -432,7 +432,7 @@ following constructs.
 Illustrative syntax:
 
 ```forth
-: square ( S int -- S int ! {} )
+: square ( S int -- S int ! pure )
   dup *
 ;
 
@@ -459,7 +459,7 @@ Provide explicit locals for generated code and readable handwritten definitions:
 Quotations are typed callable values:
 
 ```forth
-[ int -- int ! {} | 1 + ]
+[ int -- int ! pure | 1 + ]
 ```
 
 An escaping quotation is closure-converted into an immutable code reference plus a managed captured
@@ -488,9 +488,9 @@ origins are omitted here):
 ```text
 main:
   const.int 10
-  make-closure lambda$0 captures=1 : (S int -- S int ! {})
+  make-closure lambda$0 captures=1 : (S int -- S int ! pure)
   const.int 5
-  call-closure (S int -- S int ! {})
+  call-closure (S int -- S int ! pure)
   return
 
 lambda$0 captures: [int], locals: [int] # n is capture[0], x is local[0]

@@ -1037,7 +1037,7 @@ mod tests {
     #[test]
     fn generic_words_are_generated_from_one_registry() {
         let vocabulary = core_vocabulary();
-        assert_eq!(vocabulary["dup"].to_string(), "( S A -- S A A ! {} )");
+        assert_eq!(vocabulary["dup"].to_string(), "( S A -- S A A ! pure )");
         assert!(!vocabulary["agent-spawn"].effects.is_pure());
     }
 

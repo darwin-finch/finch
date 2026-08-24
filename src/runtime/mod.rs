@@ -3648,7 +3648,7 @@ mod tests {
         let definition = runtime
             .submit(submission(
                 ProgramLanguage::Forth,
-                ": square ( S int -- S int ! {} ) dup * ;",
+                ": square ( S int -- S int ! pure ) dup * ;",
                 ExecutionEffect::VmWrite,
             ))
             .await
@@ -5756,7 +5756,7 @@ mod tests {
         let defined = runtime
             .submit(submission(
                 ProgramLanguage::Forth,
-                ": square ( S int -- S int ! {} ) dup * ;",
+                ": square ( S int -- S int ! pure ) dup * ;",
                 ExecutionEffect::Pure,
             ))
             .await
@@ -5785,7 +5785,7 @@ mod tests {
         runtime
             .submit(submission(
                 ProgramLanguage::Forth,
-                ": square ( S int -- S int ! {} ) dup * ; 8",
+                ": square ( S int -- S int ! pure ) dup * ; 8",
                 ExecutionEffect::Pure,
             ))
             .await

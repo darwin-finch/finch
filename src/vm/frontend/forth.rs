@@ -2045,7 +2045,7 @@ fn forth_definition_documentation(source: &str, definition_start: usize) -> Opti
 /// Parse the direct Co-Forth spelling for frame-local parameter names:
 ///
 /// ```forth
-/// : area ( S int int -- S int ! {} ) locals| width height | width height * ;
+/// : area ( S int int -- S int ! pure ) locals| width height | width height * ;
 /// ```
 ///
 /// This is intentionally not a macro. It lowers to one `LocalSet` per
@@ -2144,11 +2144,15 @@ fn parse_definition_signature(
         })?;
     let effect = tokens.iter().position(|token| token_is(token, "!"));
     let output_end = effect.unwrap_or(tokens.len());
-    let input = parse_stack_types(source_id, source, &tokens[..separator])?;
-    let output = parse_stack_types(source_id, source, &tokens[separator + 1..output_end])?;
+    let input_tokens = &tokens[..separator];
+    let output_tokens = &tokens[separator + 1..output_end];
+    validate_preserved_stack_row(source_id, source, input_tokens, fallback, "input")?;
+    validate_preserved_stack_row(source_id, source, output_tokens, fallback, "output")?;
+    let input = parse_stack_types(source_id, source, &input_tokens[1..])?;
+    let output = parse_stack_types(source_id, source, &output_tokens[1..])?;
     let declares_pure = if let Some(effect) = effect {
         let annotation = &tokens[effect + 1..];
-        if annotation.len() == 1 && token_is(&annotation[0], "{}") {
+        if annotation.len() == 1 && token_is(&annotation[0], "pure") {
             true
         } else if annotation.len() == 1 && token_is(&annotation[0], "infer") {
             false
@@ -2157,7 +2161,7 @@ fn parse_definition_signature(
                 source_id,
                 source,
                 tokens.get(effect).unwrap_or(fallback),
-                "effect annotation must currently be '{}' or 'infer'",
+                "effect annotation must currently be 'pure' or 'infer'",
             )]);
         }
     } else {
@@ -2182,7 +2186,6 @@ fn parse_stack_types(
 ) -> Result<Vec<Type>, Vec<VmDiagnostic>> {
     tokens
         .iter()
-        .filter(|token| !token_is(token, "S"))
         .map(|token| {
             let TokenValue::Word(name) = &token.value else {
                 return Err(vec![definition_error(
@@ -2202,6 +2205,44 @@ fn parse_stack_types(
             })
         })
         .collect()
+}
+
+/// Every typed Co-Forth definition is row-polymorphic over the caller stack.
+/// The written `S` is not decorative: requiring it on both sides makes the
+/// source contract match the verifier's stack row and prevents a definition
+/// from appearing closed while silently preserving arbitrary lower values.
+fn validate_preserved_stack_row(
+    source_id: &str,
+    source: &str,
+    tokens: &[Token],
+    fallback: &Token,
+    side: &str,
+) -> Result<(), Vec<VmDiagnostic>> {
+    let Some(first) = tokens.first() else {
+        return Err(vec![definition_error(
+            source_id,
+            source,
+            fallback,
+            format!("typed word signature {side} must begin with preserved stack row 'S'"),
+        )]);
+    };
+    if !token_is(first, "S") {
+        return Err(vec![definition_error(
+            source_id,
+            source,
+            first,
+            format!("typed word signature {side} must begin with preserved stack row 'S'"),
+        )]);
+    }
+    if let Some(extra) = tokens[1..].iter().find(|token| token_is(token, "S")) {
+        return Err(vec![definition_error(
+            source_id,
+            source,
+            extra,
+            "preserved stack row 'S' may appear only once on each side of '--'",
+        )]);
+    }
+    Ok(())
 }
 
 fn token_is(token: &Token, expected: &str) -> bool {
@@ -2261,10 +2302,23 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
             });
             continue;
         }
+        // A compact record type is one signature token even though its field
+        // syntax uses braces. Record literals use `{ field: value }`; keeping
+        // this no-whitespace spelling distinct lets annotations remain a
+        // direct representation of `Type::Record`.
+        if let Some(end) = compact_record_type_end(source, start) {
+            tokens.push(Token {
+                value: TokenValue::Word(source[start..end].to_string()),
+                start,
+                end,
+            });
+            cursor = end;
+            continue;
+        }
         // These existing multi-character forms take precedence over generic
-        // brace punctuation. In particular, `{}` is the pure-effect marker
-        // in a typed word signature, not an empty JSON object.
-        if let Some(word) = ["{}", "map{", "}map", "list{", "}list", "record{", "}record"]
+        // brace punctuation. `map{`, `list{`, and `record{` retain their
+        // literal spellings; purity is written explicitly as `! pure`.
+        if let Some(word) = ["map{", "}map", "list{", "}list", "record{", "}record"]
             .into_iter()
             .find(|word| source[start..].starts_with(word))
         {
@@ -2453,6 +2507,30 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
 fn looks_like_json_object(source: &str, start: usize) -> bool {
     let remainder = &source[start + 1..];
     matches!(remainder.trim_start().as_bytes().first(), Some(b'"' | b'}'))
+}
+
+fn compact_record_type_end(source: &str, start: usize) -> Option<usize> {
+    let remainder = source.get(start..)?;
+    if !remainder.starts_with("record{") {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (offset, byte) in remainder.bytes().enumerate() {
+        if byte.is_ascii_whitespace() || byte == b'"' {
+            return None;
+        }
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(start + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn read_json_object(
@@ -2892,7 +2970,7 @@ mod tests {
 
         let closure_field = compile_forth(
             "record-closure.forth",
-            ": increment ( S int -- S int ! {} ) 1 + ; { run: ['] increment } \"run\" record-get unwrap 41 swap execute",
+            ": increment ( S int -- S int ! pure ) 1 + ; { run: ['] increment } \"run\" record-get unwrap 41 swap execute",
             Vec::new(),
             &core_vocabulary(),
         )
@@ -2956,7 +3034,7 @@ mod tests {
     fn typed_forth_locals_lower_to_explicit_frame_operations() {
         let module = compile_forth(
             "locals.forth",
-            ": area ( S int int -- S int ! {} ) locals| width height | width height * ; 4 3 area",
+            ": area ( S int int -- S int ! pure ) locals| width height | width height * ; 4 3 area",
             Vec::new(),
             &core_vocabulary(),
         )
@@ -2993,7 +3071,7 @@ mod tests {
         let module = compile_forth(
             "factorial.forth",
             r#"
-: factorial ( S int -- S int ! {} )
+: factorial ( S int -- S int ! pure )
   locals| n |
   n 1 <= if
     1
@@ -3017,7 +3095,7 @@ mod tests {
     fn typed_forth_quotation_executes_a_persistent_word() {
         let module = compile_forth(
             "quotation.forth",
-            ": square ( S int -- S int ! {} ) dup * ; 9 ['] square execute",
+            ": square ( S int -- S int ! pure ) dup * ; 9 ['] square execute",
             Vec::new(),
             &core_vocabulary(),
         )
@@ -3033,7 +3111,7 @@ mod tests {
     fn retains_finch_doc_comment_on_typed_definition() {
         let module = compile_forth(
             "documented.forth",
-            "\\ finch-doc: Double an integer.\n: double ( S int -- S int ! {} ) 2 * ; 21 double",
+            "\\ finch-doc: Double an integer.\n: double ( S int -- S int ! pure ) 2 * ; 21 double",
             Vec::new(),
             &core_vocabulary(),
         )
@@ -3049,7 +3127,7 @@ mod tests {
     fn locals_must_name_every_declared_input() {
         let errors = compile_forth(
             "locals.forth",
-            ": area ( S int int -- S int ! {} ) locals| width | width ;",
+            ": area ( S int int -- S int ! pure ) locals| width | width ;",
             Vec::new(),
             &core_vocabulary(),
         )
@@ -3058,10 +3136,49 @@ mod tests {
     }
 
     #[test]
+    fn typed_definitions_must_spell_the_preserved_stack_row_on_both_sides() {
+        for source in [
+            ": bad ( int -- S int ! pure ) ;",
+            ": bad ( S int -- int ! pure ) ;",
+            ": bad ( S S int -- S int ! pure ) ;",
+            ": bad ( S int -- S S int ! pure ) ;",
+        ] {
+            let errors = compile_forth("missing-row.forth", source, Vec::new(), &core_vocabulary())
+                .expect_err("typed definitions must state their preserved stack row");
+            assert_eq!(errors[0].code, "E-FORTH-SIG-001");
+        }
+    }
+
+    #[test]
+    fn pure_is_the_only_pure_effect_annotation() {
+        let module = compile_forth(
+            "pure.forth",
+            ": preferred ( S int -- S int ! pure ) 1 + ; 41 preferred",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("pure effect annotation should compile");
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("pure word should execute");
+        assert_eq!(stack, vec![TypedValue::Int(42)]);
+
+        let errors = compile_forth(
+            "pure.forth",
+            ": obsolete ( S int -- S int ! {} ) 1 + ;",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect_err("braces are no longer an effect annotation");
+        assert_eq!(errors[0].code, "E-FORTH-SIG-001");
+    }
+
+    #[test]
     fn accepts_parameterized_stack_signature_types() {
         let module = compile_forth(
             "generic.forth",
-            ": list-id ( S list<int> -- S list<int> ! {} ) ;",
+            ": list-id ( S list<int> -- S list<int> ! pure ) ;",
             vec![Type::list(Type::Int)],
             &core_vocabulary(),
         )
@@ -3069,6 +3186,25 @@ mod tests {
         assert_eq!(
             module.module.functions["list-id"].signature.input.values,
             vec![Type::list(Type::Int)]
+        );
+    }
+
+    #[test]
+    fn accepts_fixed_record_types_in_stack_signatures() {
+        let record = Type::Record(vec![
+            ("name".into(), Type::String),
+            ("age".into(), Type::Int),
+        ]);
+        let module = compile_forth(
+            "record-signature.forth",
+            ": identity-person ( S record{name:string,age:int} -- S record{name:string,age:int} ! pure ) ;",
+            vec![record.clone()],
+            &core_vocabulary(),
+        )
+        .expect("record type signature should compile");
+        assert_eq!(
+            module.module.functions["identity-person"].signature.input.values,
+            vec![record]
         );
     }
 

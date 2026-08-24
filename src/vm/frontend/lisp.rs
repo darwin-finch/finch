@@ -1789,12 +1789,12 @@ impl Compiler<'_> {
         expression_sources: Option<&[SpannedVal]>,
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
-        let [_, first_arm, second_arm] = expressions else {
+        if expressions.len() < 2 {
             return Err(vec![self.error(
                 "E-LISP-MATCH-009",
-                "match requires a value and exactly two exhaustive tagged arms",
+                "match requires a value and exhaustive arms",
             )]);
-        };
+        }
         let arm_marker = |arm: &Val| match arm {
             Val::List(items) => match items.first() {
                 Some(Val::Symbol(marker)) => Some(marker.clone()),
@@ -1802,18 +1802,301 @@ impl Compiler<'_> {
             },
             _ => None,
         };
-        match (arm_marker(first_arm), arm_marker(second_arm)) {
-            (Some(first), Some(second)) if first == "some" && second == "none" => {
-                self.compile_match_option(expressions, expression_sources, builder)
+        if expressions.len() >= 3 {
+            let first_arm = &expressions[1];
+            let second_arm = &expressions[2];
+            match (arm_marker(first_arm), arm_marker(second_arm)) {
+                (Some(first), Some(second)) if first == "some" && second == "none" => {
+                    return self.compile_match_option(expressions, expression_sources, builder);
+                }
+                (Some(first), Some(second)) if first == "ok" && second == "err" => {
+                    return self.compile_match_result(expressions, expression_sources, builder);
+                }
+                _ => {}
             }
-            (Some(first), Some(second)) if first == "ok" && second == "err" => {
-                self.compile_match_result(expressions, expression_sources, builder)
-            }
-            _ => Err(vec![self.error(
+        }
+        self.compile_literal_match(expressions, expression_sources, builder)
+    }
+
+    /// Compile the non-dynamic literal subset of `match`.
+    ///
+    /// Booleans require exactly `(true body...)` and `(false body...)` arms.
+    /// Integers use zero or more literal arms followed by one required final
+    /// `(_ body...)` arm, so every branch remains total and the same typed
+    /// merge rules as `if` apply.  This is deliberately not a general runtime
+    /// pattern dispatcher: strings, records, lists, and JSON retain their
+    /// explicit typed operations until their structural patterns have a
+    /// verified lowering design.
+    fn compile_literal_match(
+        &mut self,
+        expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let Some((value, arms)) = expressions.split_first() else {
+            return Err(vec![self.error(
                 "E-LISP-MATCH-009",
-                "match supports exhaustive (some name ...)/(none ...) or (ok name ...)/(err name ...) arms",
+                "match requires a value and exhaustive arms",
+            )]);
+        };
+        let value_type = self.compile_expression_at(
+            value,
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )?;
+        match value_type {
+            Type::Bool => self.compile_boolean_match(arms, expression_sources, builder),
+            Type::Int => self.compile_integer_match(arms, expression_sources, builder),
+            found => Err(vec![VmDiagnostic::type_mismatch(
+                Type::Bool,
+                found,
+                Some(self.origin("match")),
             )]),
         }
+    }
+
+    fn compile_boolean_match(
+        &mut self,
+        arms: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        if arms.len() != 2 {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-010",
+                "boolean match requires exactly (true body...) and (false body...) arms",
+            )]);
+        }
+        let parse_arm = |arm: &Val,
+                         expected: bool|
+         -> Result<(Vec<Val>, Vec<Val>), Vec<VmDiagnostic>> {
+            let Val::List(items) = arm else {
+                return Err(vec![self.error(
+                    "E-LISP-MATCH-010",
+                    "boolean match arms must be (true body...) and (false body...)",
+                )]);
+            };
+            let [Val::Bool(found), body @ ..] = items.as_slice() else {
+                return Err(vec![self.error(
+                    "E-LISP-MATCH-010",
+                    "boolean match arms must be (true body...) and (false body...)",
+                )]);
+            };
+            if *found != expected || body.is_empty() {
+                return Err(vec![self.error(
+                    "E-LISP-MATCH-010",
+                    "boolean match arms must be (true body...) and (false body...)",
+                )]);
+            }
+            Ok((items.clone(), body.to_vec()))
+        };
+
+        let (true_items, true_body) = parse_arm(&arms[0], true)?;
+        let (false_items, false_body) = parse_arm(&arms[1], false)?;
+        builder.stack.pop();
+        let branch_stack = builder.stack.clone();
+        let true_block = builder.new_block();
+        let false_block = builder.new_block();
+        let merge_block = builder.new_block();
+        builder.emit(
+            Instruction::Branch {
+                then_block: true_block,
+                else_block: false_block,
+            },
+            self.origin("match/bool-test"),
+        );
+
+        builder.switch_to(true_block, branch_stack.clone());
+        let true_sources = expression_sources
+            .and_then(|sources| sources.get(1))
+            .and_then(|source| Self::source_list_children(source, &true_items))
+            .and_then(|sources| sources.get(1..));
+        let true_type = self.compile_begin(&true_body, true_sources, builder)?;
+        builder.stack.push(true_type.clone());
+        let true_stack = builder.stack.clone();
+        builder.emit(
+            Instruction::Jump { target: merge_block },
+            self.origin("match/true-end"),
+        );
+
+        builder.switch_to(false_block, branch_stack);
+        let false_sources = expression_sources
+            .and_then(|sources| sources.get(2))
+            .and_then(|source| Self::source_list_children(source, &false_items))
+            .and_then(|sources| sources.get(1..));
+        let false_type = self.compile_begin(&false_body, false_sources, builder)?;
+        builder.stack.push(false_type.clone());
+        if true_type != false_type || builder.stack != true_stack {
+            return Err(vec![VmDiagnostic::type_mismatch(
+                true_type,
+                false_type,
+                Some(self.origin("match")),
+            )]);
+        }
+        builder.emit(
+            Instruction::Jump { target: merge_block },
+            self.origin("match/false-end"),
+        );
+        builder.switch_to(merge_block, true_stack);
+        Ok(builder.stack.pop().expect("boolean match leaves a value"))
+    }
+
+    fn compile_integer_match(
+        &mut self,
+        arms: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        if arms.len() < 2 {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-011",
+                "integer match requires literal arms and a final (_ body...) arm",
+            )]);
+        }
+
+        let mut parsed = Vec::with_capacity(arms.len());
+        let mut seen = HashSet::new();
+        for (index, arm) in arms.iter().enumerate() {
+            let Val::List(items) = arm else {
+                return Err(vec![self.error(
+                    "E-LISP-MATCH-011",
+                    "integer match arms must be (integer body...) followed by (_ body...)",
+                )]);
+            };
+            let Some((pattern, body)) = items.split_first() else {
+                return Err(vec![self.error(
+                    "E-LISP-MATCH-011",
+                    "integer match arms must have a pattern and at least one body expression",
+                )]);
+            };
+            if body.is_empty() {
+                return Err(vec![self.error(
+                    "E-LISP-MATCH-011",
+                    "integer match arms must have a pattern and at least one body expression",
+                )]);
+            }
+            let pattern = match pattern {
+                Val::Int(value) if index + 1 < arms.len() => Some(*value),
+                Val::Symbol(name) if name == "_" && index + 1 == arms.len() => None,
+                _ => {
+                    return Err(vec![self.error(
+                        "E-LISP-MATCH-011",
+                        "integer match requires unique integer literal arms followed by one final (_ body...) arm",
+                    )]);
+                }
+            };
+            if let Some(value) = pattern {
+                if !seen.insert(value) {
+                    return Err(vec![self.error(
+                        "E-LISP-MATCH-011",
+                        "integer match literal arms must be unique",
+                    )]);
+                }
+            }
+            parsed.push((pattern, items.clone(), body.to_vec()));
+        }
+
+        // Store the selector once. Each comparison reloads a typed immutable
+        // local, so branch compilation cannot accidentally consume it.
+        let selector = builder.allocate_local(Type::Int);
+        builder.stack.pop();
+        builder.emit(
+            Instruction::LocalSet { index: selector },
+            self.origin("match/int-selector"),
+        );
+        let branch_stack = builder.stack.clone();
+        let merge_block = builder.new_block();
+        let mut result: Option<(Type, Vec<Type>)> = None;
+
+        for (arm_index, (pattern, items, body)) in parsed.into_iter().enumerate() {
+            if let Some(pattern) = pattern {
+                let arm_block = builder.new_block();
+                let next_block = builder.new_block();
+                builder.emit(
+                    Instruction::LocalGet { index: selector },
+                    self.origin("match/int-selector"),
+                );
+                builder.stack.push(Type::Int);
+                builder.emit(
+                    Instruction::Constant {
+                        value: TypedValue::Int(pattern),
+                    },
+                    self.origin("match/int-literal"),
+                );
+                builder.stack.push(Type::Int);
+                builder.emit(
+                    Instruction::Call {
+                        function: "=".into(),
+                    },
+                    self.origin("match/int-test"),
+                );
+                builder.stack.pop();
+                builder.stack.pop();
+                builder.stack.push(Type::Bool);
+                builder.stack.pop();
+                builder.emit(
+                    Instruction::Branch {
+                        then_block: arm_block,
+                        else_block: next_block,
+                    },
+                    self.origin("match/int-test"),
+                );
+
+                builder.switch_to(arm_block, branch_stack.clone());
+                let body_sources = expression_sources
+                    .and_then(|sources| sources.get(arm_index + 1))
+                    .and_then(|source| Self::source_list_children(source, &items))
+                    .and_then(|sources| sources.get(1..));
+                let ty = self.compile_begin(&body, body_sources, builder)?;
+                builder.stack.push(ty.clone());
+                let stack = builder.stack.clone();
+                if let Some((expected, expected_stack)) = &result {
+                    if *expected != ty || *expected_stack != stack {
+                        return Err(vec![VmDiagnostic::type_mismatch(
+                            expected.clone(),
+                            ty,
+                            Some(self.origin("match")),
+                        )]);
+                    }
+                } else {
+                    result = Some((ty, stack));
+                }
+                builder.emit(
+                    Instruction::Jump { target: merge_block },
+                    self.origin("match/int-arm-end"),
+                );
+                builder.switch_to(next_block, branch_stack.clone());
+            } else {
+                let body_sources = expression_sources
+                    .and_then(|sources| sources.get(arm_index + 1))
+                    .and_then(|source| Self::source_list_children(source, &items))
+                    .and_then(|sources| sources.get(1..));
+                let ty = self.compile_begin(&body, body_sources, builder)?;
+                builder.stack.push(ty.clone());
+                let stack = builder.stack.clone();
+                if let Some((expected, expected_stack)) = &result {
+                    if *expected != ty || *expected_stack != stack {
+                        return Err(vec![VmDiagnostic::type_mismatch(
+                            expected.clone(),
+                            ty,
+                            Some(self.origin("match")),
+                        )]);
+                    }
+                } else {
+                    result = Some((ty, stack));
+                }
+                builder.emit(
+                    Instruction::Jump { target: merge_block },
+                    self.origin("match/default-end"),
+                );
+            }
+        }
+
+        let Some((_result_type, result_stack)) = result else {
+            unreachable!("a total integer match always has a default arm");
+        };
+        builder.switch_to(merge_block, result_stack);
+        Ok(builder.stack.pop().expect("integer match leaves a value"))
     }
 
     /// Compile a total result match. Both edges consume the result and bind
@@ -2673,7 +2956,7 @@ pub(crate) fn parse_type_name(name: &str) -> Result<Type, Vec<VmDiagnostic>> {
         "bytes" => Ok(Type::Bytes),
         "json" => Ok(Type::Json),
         "dynamic" | "any" => Ok(Type::Dynamic),
-        _ => parse_generic_type(name).ok_or_else(|| {
+        _ => parse_record_type(name).or_else(|| parse_generic_type(name)).ok_or_else(|| {
             vec![VmDiagnostic::error(
                 "E-TYPE-009",
                 DiagnosticPhase::TypeInference,
@@ -2682,6 +2965,31 @@ pub(crate) fn parse_type_name(name: &str) -> Result<Type, Vec<VmDiagnostic>> {
             )]
         }),
     }
+}
+
+/// Parse a fixed, named product type. Records deliberately use braces rather
+/// than angle brackets so `record{name:string,age:int}` remains visually and
+/// semantically distinct from an open `map<string,string>`.
+fn parse_record_type(name: &str) -> Option<Type> {
+    let fields = name.strip_prefix("record{")?.strip_suffix('}')?;
+    if fields.is_empty() {
+        return Some(Type::Record(Vec::new()));
+    }
+    let mut parsed = Vec::new();
+    for field in split_type_arguments(fields)? {
+        let (field_name, field_type) = field.split_once(':')?;
+        let field_name = field_name.trim();
+        if field_name.is_empty()
+            || !field_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            || parsed.iter().any(|(existing, _)| existing == field_name)
+        {
+            return None;
+        }
+        parsed.push((field_name.to_string(), parse_type_name(field_type.trim()).ok()?));
+    }
+    Some(Type::Record(parsed))
 }
 
 fn parse_generic_type(name: &str) -> Option<Type> {
@@ -2714,13 +3022,16 @@ fn parse_generic_type(name: &str) -> Option<Type> {
 
 fn split_type_arguments(source: &str) -> Option<Vec<&str>> {
     let mut arguments = Vec::new();
-    let mut depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut record_depth = 0usize;
     let mut start = 0;
     for (index, character) in source.char_indices() {
         match character {
-            '<' => depth += 1,
-            '>' => depth = depth.checked_sub(1)?,
-            ',' if depth == 0 => {
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.checked_sub(1)?,
+            '{' => record_depth += 1,
+            '}' => record_depth = record_depth.checked_sub(1)?,
+            ',' if angle_depth == 0 && record_depth == 0 => {
                 let argument = source[start..index].trim();
                 if argument.is_empty() {
                     return None;
@@ -2731,7 +3042,7 @@ fn split_type_arguments(source: &str) -> Option<Vec<&str>> {
             _ => {}
         }
     }
-    if depth != 0 {
+    if angle_depth != 0 || record_depth != 0 {
         return None;
     }
     let argument = source[start..].trim();
@@ -3242,6 +3553,35 @@ mod tests {
     }
 
     #[test]
+    fn generic_match_supports_total_boolean_and_integer_literals() {
+        assert_eq!(
+            run("(match true (true 42) (false 0))").unwrap(),
+            vec![TypedValue::Int(42)]
+        );
+        assert_eq!(
+            run("(match 2 (0 100) (2 42) (_ 0))").unwrap(),
+            vec![TypedValue::Int(42)]
+        );
+        assert_eq!(
+            run("(match 9 (0 100) (2 42) (_ 0))").unwrap(),
+            vec![TypedValue::Int(0)]
+        );
+    }
+
+    #[test]
+    fn generic_integer_match_requires_a_total_unique_literal_shape() {
+        for source in [
+            "(match 2 (2 42))",
+            "(match 2 (_ 0) (2 42))",
+            "(match 2 (2 42) (2 99) (_ 0))",
+        ] {
+            let errors = compile_lisp("match.lisp", source, Vec::new(), &core_vocabulary())
+                .expect_err("invalid integer match shape must not compile");
+            assert_eq!(errors[0].code, "E-LISP-MATCH-011");
+        }
+    }
+
+    #[test]
     fn accepts_parameterized_return_annotations() {
         assert_eq!(
             run(
@@ -3254,6 +3594,19 @@ mod tests {
     }
 
     #[test]
+    fn accepts_fixed_record_return_annotations() {
+        assert_eq!(
+            run(
+                "(define (person) : record{name:string,age:int} \
+                 { :name \"Ada\" :age 37 }) \
+                 (unwrap (record-get (person) \"age\"))"
+            )
+            .unwrap(),
+            vec![TypedValue::Int(37)]
+        );
+    }
+
+    #[test]
     fn parses_nested_parameterized_type_annotations() {
         assert_eq!(
             parse_type_name("result<option<list<int>>,string>").unwrap(),
@@ -3262,6 +3615,19 @@ mod tests {
         assert_eq!(
             parse_type_name("stream<list<string>>").unwrap(),
             Type::Stream(Box::new(Type::list(Type::String)))
+        );
+        assert_eq!(
+            parse_type_name("record{name:string,meta:map<string,list<int>>}").unwrap(),
+            Type::Record(vec![
+                ("name".into(), Type::String),
+                (
+                    "meta".into(),
+                    Type::Map(
+                        Box::new(Type::String),
+                        Box::new(Type::list(Type::Int)),
+                    ),
+                ),
+            ])
         );
     }
 
