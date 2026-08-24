@@ -2777,16 +2777,6 @@ Rules:\n\
         }
 
         // `push <message>` — send plain text to all peers.
-        // The message is wrapped in a print statement and scattered.
-        // No approval dialog. No Forth visible. Just the push.
-        if let Some(msg) = input.trim().strip_prefix("push ") {
-            let msg = msg.trim();
-            if !msg.is_empty() {
-                self.output_manager.write_user(input.clone());
-                return self.handle_push_message(msg.to_string()).await;
-            }
-        }
-
         // Direct AI query: `?? question` — bypasses the stack and asks the AI.
         if let Some(query) = input
             .trim()
@@ -2829,19 +2819,12 @@ Rules:\n\
                 .await;
         }
 
-        // Broadcast to all joined channels (slash-commands are excluded above).
-        // Try to prove the stack effect before sending; extract comments so
-        // receivers can read the intent before executing.
+        // Broadcast ordinary user text as text. A channel must not gain an
+        // execution interpretation merely because the legacy dictionary happens
+        // to recognize its words.
         if !self.joined_channels.is_empty() {
-            let comments = crate::coforth::extract_comments(&input);
-            let promise = {
-                let effect = self.forth_vm.infer_effect(&input).ok();
-                match effect {
-                    Some(e) => crate::session::Promise::forth_proven(input.clone(), e),
-                    None => crate::session::Promise::forth(input.clone()),
-                }
-            };
-            let bundle = crate::session::ProofBundle::new(promise, comments);
+            let promise = crate::session::Promise::natural(input.clone());
+            let bundle = crate::session::ProofBundle::new(promise, vec![]);
             for chan in &self.joined_channels {
                 let ev = crate::session::SessionEvent::ChannelMessage {
                     channel: chan.clone(),
@@ -2852,29 +2835,17 @@ Rules:\n\
             }
         }
 
-        // Route: natural language → AI; Forth tokens → stack.
-        let is_nl = looks_like_natural_language(
-            &input,
-            |w| self.forth_vm.word_exists(w),
-            |w| {
-                self.forth_vm.word_source(w).is_some() && !self.auto_compiled_word_names.contains(w)
-            },
-        );
-
-        if is_nl {
-            // Conversation is never partially executed. Explicit `/forth <program>`
-            // remains available when the user intends VM evaluation.
-            return self.execute_query(input).await;
-        }
-
-        // ── Co-Forth: plain text pushes onto the stack (no AI trigger) ──────────
-        self.output_manager.write_user(input.clone());
-        self.handle_stack_push(input).await?;
-        return Ok(());
+        // Plain terminal text is always a user turn. Executable source is
+        // deliberately explicit: Lisp begins with `(`, typed definitions begin
+        // with `:`, and other Co-Forth uses `/forth`. Never classify prose by
+        // asking the historical semiotic dictionary whether its words exist.
+        self.execute_query(input).await
     }
 
-    /// Route text through the NL/Forth/Lisp decision without slash-command handling or
-    /// channel broadcast. Used by `/exec` to run a received channel message.
+    /// Route an explicitly selected received channel message without slash-command
+    /// handling or another channel broadcast. Lisp remains structurally
+    /// unambiguous; all other text is an agent turn rather than an implicit legacy
+    /// stack program.
     async fn handle_forth_or_query(&mut self, input: String) -> Result<()> {
         // Lisp
         if input.trim_start().starts_with('(') {
@@ -2885,17 +2856,7 @@ Rules:\n\
                 )
                 .await;
         }
-        let is_nl = looks_like_natural_language(
-            &input,
-            |w| self.forth_vm.word_exists(w),
-            |w| {
-                self.forth_vm.word_source(w).is_some() && !self.auto_compiled_word_names.contains(w)
-            },
-        );
-        if is_nl {
-            return self.execute_query(input).await;
-        }
-        self.handle_stack_push(input).await
+        self.execute_query(input).await
     }
 
     /// Execute explicit interactive source through the same typed runtime and
@@ -5770,19 +5731,6 @@ Rules:\n\
                 .write_info(format!("→  {}", cleaned.as_str().cyan()));
         }
 
-        self.render_tui().await
-    }
-
-    async fn handle_push_message(&mut self, msg: String) -> Result<()> {
-        use crossterm::style::Stylize;
-        let peers = self.forth_vm.peers.clone();
-        if peers.is_empty() {
-            self.output_manager
-                .write_info("push: no peers".dark_grey().to_string());
-            return self.render_tui().await;
-        }
-        let from = self.forth_vm.registry_addr.clone();
-        crate::coforth::scatter::scatter_push(&peers, &msg, from.as_deref()).await;
         self.render_tui().await
     }
 
