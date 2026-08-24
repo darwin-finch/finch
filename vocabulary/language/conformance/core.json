@@ -59,6 +59,13 @@
       "expected_output": ""
     },
     {
+      "name": "safe-list-decomposition",
+      "forth": "[ 4 8 ] list-uncons unwrap \"head\" record-get unwrap",
+      "lisp": "(unwrap (record-get (unwrap (list-uncons (list 4 8))) \"head\"))",
+      "expected_values": [{ "type": "int", "value": 4 }],
+      "expected_output": ""
+    },
+    {
       "name": "explicit-typed-empty-list",
       "forth": "empty-list<int> 3 list-append 0 list-get",
       "lisp": "(list-get (list-append (empty-list int) 3) 0)",

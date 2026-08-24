@@ -208,6 +208,9 @@ replacement list; `list-get` and `list-length` inspect it. `['] word` remains th
 Co-Forth quotation syntax. Empty list literals require an explicit element type and are therefore
 intentionally not inferred by either source form: use `(empty-list type)` in Lisp or
 `empty-list<type>` in Co-Forth. `list{ value ... }list` remains a compatibility spelling.
+`list-uncons` consumes `list<A>` and returns `option<record{head:A,tail:list<A>}>`, giving both
+frontends a safe ordinary-word basis for list patterns and range-style traversal without
+compiler-only multiple returns.
 
 Lisp symbols are identifiers, not strings: `'name` is quoted data (equivalent to `(quote name)`),
 whereas `(say "name")` contains text. Co-Forth uses bare tokens for executable dictionary words;

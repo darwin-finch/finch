@@ -2093,6 +2093,45 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
                 values,
             });
         }
+        "list-uncons" => {
+            let list = pop(stack)?;
+            let TypedValue::List {
+                element_type,
+                values,
+            } = list
+            else {
+                return Err(VmDiagnostic::error(
+                    "E-RUNTIME-035",
+                    DiagnosticPhase::Interpretation,
+                    "list-uncons requires a typed list",
+                    Some(origin),
+                ));
+            };
+            let pair_type = Type::Record(vec![
+                ("head".into(), element_type.clone()),
+                ("tail".into(), Type::list(element_type.clone())),
+            ]);
+            let value = if values.is_empty() {
+                None
+            } else {
+                let mut values = values.into_iter();
+                let head = values.next().expect("non-empty list has a head");
+                Some(Box::new(TypedValue::Record(vec![
+                    ("head".into(), head),
+                    (
+                        "tail".into(),
+                        TypedValue::List {
+                            element_type,
+                            values: values.collect(),
+                        },
+                    ),
+                ])))
+            };
+            stack.push(TypedValue::Option {
+                inner_type: pair_type,
+                value,
+            });
+        }
         "map-get" => {
             let key = pop(stack)?;
             let map = pop(stack)?;

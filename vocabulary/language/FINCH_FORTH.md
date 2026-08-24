@@ -98,6 +98,13 @@ using the ordinary list and loop forms:
 map{ "answer" 42 }map map-entries 0 list-get "value" record-get unwrap  \ leaves 42
 ```
 
+`list-uncons` safely decomposes a homogeneous list without a special multi-return. It returns
+`none` for an empty list or `some(record{head:A,tail:list<A>})`:
+
+```forth
+[ 4 8 ] list-uncons if-some "head" record-get unwrap else 0 then  \ leaves 4
+```
+
 External JSON remains `json`, rather than being silently coerced into a typed record. Its keys may
 contain spaces or other arbitrary text; access them with a string through `json-get`:
 

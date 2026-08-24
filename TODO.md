@@ -36,8 +36,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   no-fallthrough integer Co-Forth `case` to richer structured patterns plus expression-valued
   named `break` after the loop verifier is generalized to check each target's declared result
   stack row. Total record subset patterns now bind statically present fields through ordinary
-  shared projection/local operations. Simple named stack-preserving `break`/`continue` already
-  lower to verified loop edges; do not add unrestricted jumps or C-style fallthrough switches.
+  shared projection/local operations, and polymorphic `list-uncons` provides both frontends the
+  ordinary `option<record{head:A,tail:list<A>}>` decomposition primitive for list patterns. Simple
+  named stack-preserving `break`/`continue` already lower to verified loop edges; do not add
+  unrestricted jumps or C-style fallthrough switches.
 - [x] Add explicit typed result propagation after branch forms are stable: Lisp `try` and
   Co-Forth `?` early-return an `err` only from a function whose sole declared output is a
   compatible `result<T,E>`. The verifier checks the cold return edge, the interpreter unwinds the

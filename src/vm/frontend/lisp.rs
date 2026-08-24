@@ -4002,6 +4002,20 @@ mod tests {
             run("(list-length (list \"a\" \"b\"))").unwrap(),
             vec![TypedValue::Int(2)]
         );
+        assert_eq!(
+            run("(unwrap (record-get (unwrap (list-uncons (list 4 8))) \"head\"))")
+                .unwrap(),
+            vec![TypedValue::Int(4)]
+        );
+        assert_eq!(
+            run("(list-length (unwrap (record-get (unwrap (list-uncons (list 4 8))) \"tail\")))")
+                .unwrap(),
+            vec![TypedValue::Int(1)]
+        );
+        assert_eq!(
+            run("(is-some (list-uncons (empty-list int)))").unwrap(),
+            vec![TypedValue::Bool(false)]
+        );
     }
 
     #[test]

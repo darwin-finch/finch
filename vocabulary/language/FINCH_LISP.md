@@ -115,6 +115,16 @@ This is syntax over the same `record-get` plus typed-local operations available 
 not a Lisp-only runtime matcher. Strings, lists, and arbitrary JSON have no general pattern matcher
 yet: use their explicit typed operations rather than falling back to a dynamic dispatcher.
 
+`list-uncons` is the safe shared decomposition primitive for lists. It returns `none` for an empty
+list or `some(record{head:A,tail:list<A>})`, avoiding an exception or a language-special
+multi-return while richer list-pattern syntax is built on top:
+
+```lisp
+(match-option (list-uncons (list 4 8))
+  (some pair (unwrap (record-get pair "head")))
+  (none 0)) ; => 4
+```
+
 `{ ... }` constructs a typed immutable product from `:name value` field forms. Each field keeps its own
 type; it is not an untyped JSON object. `record-get` takes a literal field name and returns an
 `option<T>`, so a record can cross a general boundary without a crash-producing implicit field
