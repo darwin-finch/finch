@@ -170,8 +170,6 @@ pub enum ReplEvent {
     /// mDNS background boot scan found finch instances on the LAN.
     /// The event loop adds them to the Forth VM's peer list and shows a notice.
     /// (host, port, friendly_name, token)
-    PeersDiscovered(Vec<(String, u16, String, Option<String>)>),
-
     /// A message arrived from the peer event loop (the AI's own loop).
     PeerMessage {
         text: String,

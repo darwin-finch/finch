@@ -265,10 +265,6 @@ pub struct EventLoop {
     /// From config.features.auto_compact_enabled. Default: true.
     auto_compact_enabled: bool,
 
-    /// Whether to auto-discover peers via mDNS at startup.
-    /// From config.client.auto_discover.
-    auto_discover: bool,
-
     /// Remote peer daemon addresses (host:port) from --peer flag.
     remote_peers: Vec<String>,
 
@@ -337,12 +333,6 @@ pub struct EventLoop {
     /// Stored so the user can re-plan without losing the word.
     plan_word: Option<String>,
 
-    /// Explicit legacy semiotic-Forth interpreter for compatibility commands
-    /// and the old stack/poset subsystem. Typed `: word ... ;` and `/forth`
-    /// source execute through ProgramRuntime and never enter this dictionary.
-    /// Stack state is cleared between evals; only the dictionary persists.
-    forth_vm: crate::coforth::Forth,
-
     /// Broadcast sender — pushes code to ALL peer event loops simultaneously.
     peer_tx: tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
 
@@ -374,56 +364,6 @@ pub enum ViewMode {
     List,
     /// Tree-structured conversation view
     Tree,
-}
-
-/// Scan Forth source for `scatter-exec" cmd"` literals and return formatted plan lines.
-///
-/// Used for pre-flight plan display before remote execution.
-/// Extract a Forth definition from a channel message, if present.
-/// Channel messages have the format `[#channel] sender: <content>`.
-/// If `<content>` starts with `:` (a colon definition), return it.
-/// Try to fetch the `name` field from a peer's `/v1/node/info` endpoint.
-/// Returns `None` on any error (network, timeout, missing field).
-async fn fetch_peer_name(addr: &str) -> Option<String> {
-    let url = if addr.starts_with("http://") || addr.starts_with("https://") {
-        format!("{addr}/v1/node/info")
-    } else {
-        format!("http://{addr}/v1/node/info")
-    };
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-        .ok()?;
-    let resp = client.get(&url).send().await.ok()?;
-    let json: serde_json::Value = resp.json().await.ok()?;
-    json.get("name")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-/// Fetch the Forth source from a peer's `/v1/forth/vocab` endpoint.
-/// Returns an empty string on any error.
-async fn fetch_peer_vocab_source(addr: &str) -> String {
-    let url = if addr.starts_with("http://") || addr.starts_with("https://") {
-        format!("{addr}/v1/forth/vocab")
-    } else {
-        format!("http://{addr}/v1/forth/vocab")
-    };
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-    else {
-        return String::new();
-    };
-    match client.get(&url).send().await {
-        Ok(resp) => resp
-            .json::<serde_json::Value>()
-            .await
-            .ok()
-            .and_then(|j| j["source"].as_str().map(|s| s.to_string()))
-            .unwrap_or_default(),
-        Err(_) => String::new(),
-    }
 }
 
 /// Application-owned data extracted from one verified, suspended
@@ -705,7 +645,6 @@ impl EventLoop {
         enable_summarization: bool,
         auto_compact_enabled: bool,
         brain_provider: Option<Arc<dyn crate::providers::LlmProvider>>,
-        auto_discover: bool,
         remote_peers: Vec<String>,
         daemon_base_url: Option<String>,
         provider_resolver: crate::runtime::scheduler::ProviderResolver,
@@ -867,7 +806,6 @@ impl EventLoop {
             todo_list,
             enable_summarization,
             auto_compact_enabled,
-            auto_discover,
             brain_provider,
             brain_context: Arc::new(RwLock::new(None)),
             active_brain: Arc::new(RwLock::new(None)),
@@ -883,7 +821,6 @@ impl EventLoop {
             stack,
             poset,
             plan_word: None,
-            forth_vm: crate::coforth::Forth::new(),
             peer_tx,
             peer_inbox_tx,
             peer_inbox_rx,
@@ -1038,57 +975,6 @@ impl EventLoop {
             .await;
         }
 
-        // Wire TUI callbacks into the VM so words that call confirm" or select"
-        // work in the explicit legacy subsystem as well as its internal calls.
-        // These callbacks are stable for the lifetime of the session; gen_fn is
-        // Keep confirmation and presentation hooks local to this legacy peer subsystem.
-        {
-            let tui_c = self.tui_renderer.clone();
-            self.forth_vm.set_confirm_fn(Box::new(move |msg: &str| {
-                let msg = msg.to_string();
-                let tui = tui_c.clone();
-                // futures::executor::block_on works on both current-thread and multi-thread
-                // runtimes, and inside LocalSet — unlike block_in_place which panics there.
-                futures::executor::block_on(async move {
-                    use crate::cli::tui::{Dialog, DialogResult};
-                    let dialog = Dialog::confirm(msg, false);
-                    matches!(
-                        tui.lock().await.show_dialog(dialog),
-                        Ok(DialogResult::Confirmed(true))
-                    )
-                })
-            }));
-
-            let tui_s = self.tui_renderer.clone();
-            self.forth_vm
-                .set_select_fn(Box::new(move |title: &str, options: &[String]| {
-                    let title = title.to_string();
-                    let options = options.to_vec();
-                    let tui = tui_s.clone();
-                    futures::executor::block_on(async move {
-                        use crate::cli::tui::{Dialog, DialogOption, DialogResult};
-                        let dialog_opts: Vec<DialogOption> = options
-                            .iter()
-                            .map(|o| DialogOption::new(o.as_str()))
-                            .collect();
-                        let dialog = Dialog::select(title, dialog_opts);
-                        match tui.lock().await.show_dialog(dialog) {
-                            Ok(DialogResult::Selected(idx)) => idx as i64,
-                            _ => -1,
-                        }
-                    })
-                }));
-
-            let tui_o = self.tui_renderer.clone();
-            self.forth_vm.set_open_file_fn(Box::new(move |path: &str| {
-                let path = path.to_string();
-                let tui = tui_o.clone();
-                futures::executor::block_on(async move {
-                    let _ = tui.lock().await.show_file_viewer(&path);
-                });
-            }));
-        }
-
         // ── Spawn LLM worker loop ─────────────────────────────────────────────
         // Hand the receiver half of the channel to LlmLoop so it runs as its own
         // Tokio task, decoupled from TUI select! timing.
@@ -1200,7 +1086,6 @@ impl EventLoop {
                         ReplEvent::PosetComplete { result: Err(_) } => "PosetComplete(err)",
                         ReplEvent::LispResult { result: Ok(_) } => "LispResult(ok)",
                         ReplEvent::LispResult { result: Err(_) } => "LispResult(err)",
-                        ReplEvent::PeersDiscovered(_) => "PeersDiscovered",
                         ReplEvent::PeerMessage { .. } => "PeerMessage",
                         ReplEvent::RemoteBrainMessage { .. } => "RemoteBrainMessage",
                         ReplEvent::RemoteBrainError { .. } => "RemoteBrainError",
@@ -1929,18 +1814,6 @@ Rules:\n\
                             )
                             .await?;
                         }
-                    }
-                    Command::Machines => {
-                        self.handle_machines().await?;
-                    }
-                    Command::Discover => {
-                        self.handle_discover().await?;
-                    }
-                    Command::Connect(addr) => {
-                        self.handle_connect(addr).await?;
-                    }
-                    Command::Disconnect(name) => {
-                        self.handle_disconnect(name).await?;
                     }
                     Command::BrainAttach(target) => {
                         self.handle_brain_attach(target).await?;
@@ -3010,42 +2883,6 @@ Rules:\n\
                 self.render_tui().await?;
             }
 
-            ReplEvent::PeersDiscovered(peers) => {
-                // Background boot scan found finch instances on the LAN.
-                // Add each to the Forth VM's peer list and establish a WS bridge.
-                let mut added = Vec::new();
-                for (host, port, name, token) in peers {
-                    let addr = format!("{host}:{port}");
-                    if !self.forth_vm.peers.contains(&addr) {
-                        self.forth_vm.peers.push(addr.clone());
-                        let meta = self.forth_vm.peer_meta.entry(addr.clone()).or_default();
-                        if !name.is_empty() {
-                            meta.label = Some(name.clone());
-                        }
-                        if let Some(t) = token {
-                            meta.token = Some(t);
-                        }
-                        self.bridge_single_peer(addr);
-                        added.push(name);
-                    }
-                }
-                if !added.is_empty() {
-                    use crossterm::style::Stylize;
-                    let lines: Vec<String> = added
-                        .iter()
-                        .map(|n| {
-                            let display = if n.is_empty() {
-                                "someone".to_string()
-                            } else {
-                                n.clone()
-                            };
-                            format!("  {} is here", display.as_str().cyan().bold())
-                        })
-                        .collect();
-                    self.output_manager.write_info(lines.join("\n"));
-                    self.render_tui().await?;
-                }
-            }
             ReplEvent::RemoteBrainMessage { target, message } => {
                 let is_current = self
                     .active_remote_brain
@@ -3382,50 +3219,6 @@ Rules:\n\
         self.render_tui().await
     }
 
-    /// `/machines` — show known peer machines from LAN discovery.
-    async fn handle_machines(&mut self) -> Result<()> {
-        use crossterm::style::Stylize;
-        let peers = &self.forth_vm.peers;
-        if peers.is_empty() {
-            self.output_manager.write_info(format!(
-                "{}  no peers found yet — run {} to scan",
-                "machines:".dark_grey(),
-                "/discover".cyan()
-            ));
-        } else {
-            let mut lines = vec![format!("{}", "machines:".dark_grey())];
-            for addr in peers {
-                lines.push(format!("  {}", addr.as_str().cyan()));
-            }
-            self.output_manager.write_info(lines.join("\n"));
-        }
-        self.render_tui().await
-    }
-
-    /// `/discover` — run a fresh mDNS scan for peers on the LAN.
-    async fn handle_discover(&mut self) -> Result<()> {
-        use crossterm::style::Stylize;
-        self.output_manager
-            .write_info(format!("{}", "scanning LAN for Finch peers…".dark_grey()));
-        self.render_tui().await.ok();
-
-        let event_tx = self.event_tx.clone();
-        tokio::spawn(async move {
-            let peers = tokio::task::spawn_blocking(|| {
-                crate::coforth::interpreter::run_peers_discover_pub(3000)
-            })
-            .await
-            .unwrap_or_default();
-            if peers.is_empty() {
-                // No peers found — write a message via the output channel
-                tracing::debug!("[DISCOVER] No peers found on LAN");
-            }
-            let _ = event_tx.send(crate::cli::repl_event::ReplEvent::PeersDiscovered(peers));
-        });
-
-        Ok(())
-    }
-
     /// Attach this TUI to one daemon-owned brain. All prompts and explicit
     /// Forth/Lisp programs are routed to that host until `/brain detach`.
     async fn handle_brain_attach(&mut self, value: String) -> Result<()> {
@@ -3655,131 +3448,6 @@ Rules:\n\
             // projection.
             BrainEventKind::RuntimeCommitted { .. } => {}
         }
-    }
-
-    /// `/connect <host:port>` — manually add a peer to peers list and current room.
-    async fn handle_connect(&mut self, addr: String) -> Result<()> {
-        use crossterm::style::Stylize;
-        let addr = addr.trim().to_string();
-        // Add to peer list
-        if !self.forth_vm.peers.contains(&addr) {
-            self.forth_vm.peers.push(addr.clone());
-        }
-        // Add to current room if one is set
-        if let Some(ref room_id) = self.forth_vm.current_room.clone() {
-            let room = self.forth_vm.rooms.entry(room_id.clone()).or_default();
-            if !room.members.contains(&addr) {
-                room.members.push(addr.clone());
-            }
-        }
-        // Fetch the node name from the peer (best-effort via /v1/node/info)
-        let label = fetch_peer_name(&addr).await;
-        let meta = self.forth_vm.peer_meta.entry(addr.clone()).or_default();
-        if let Some(ref name) = label {
-            meta.label = Some(name.clone());
-        }
-        let display = label.unwrap_or_else(|| addr.clone());
-        self.output_manager.write_info(format!(
-            "  {} {}",
-            display.as_str().cyan().bold(),
-            "connected".dark_grey()
-        ));
-
-        // Fetch the peer's vocabulary and open it in $EDITOR.
-        // Whatever the user saves (or writes fresh, or deletes) is sent back
-        // into the event loop as a UserInput so the single select! handles it.
-        let peer_source = fetch_peer_vocab_source(&addr).await;
-        let description = format!("peer: {addr} — edit and save to define these words locally");
-
-        // propose_forth_in_editor handles TUI suspend/resume internally via
-        // EDITOR_ACTIVE + TerminalRestorer — no manual tui.suspend()/resume() needed.
-        let editor_result = crate::tools::implementations::propose::propose_forth_in_editor(
-            &description,
-            &peer_source,
-        )
-        .await;
-
-        if let Ok(Some(content)) = editor_result {
-            // Strip comment lines before feeding back so only Forth code runs.
-            let code: String = content
-                .lines()
-                .filter(|l| !l.trim_start().starts_with('\\') && !l.trim().is_empty())
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !code.trim().is_empty() {
-                let _ = self.event_tx.send(ReplEvent::UserInput { input: code });
-            }
-        }
-
-        self.render_tui().await
-    }
-
-    /// Establish a WebSocket bridge to a single peer address.
-    ///
-    /// Spawns three tasks:
-    /// 1. Remote → local inbox: their Chat replies appear as peer responses.
-    /// 2. Our in-process peer mirror → remote.
-    /// 3. Our peer_tx broadcasts → remote (they execute our Forth programs).
-    fn bridge_single_peer(&self, peer_addr: String) {
-        let ws_url = match &self.daemon_base_url {
-            Some(base) => {
-                let my_addr = base
-                    .trim_start_matches("http://")
-                    .trim_start_matches("https://");
-                format!("ws://{peer_addr}/v1/session/ws?from={my_addr}")
-            }
-            None => format!("ws://{peer_addr}/v1/session/ws"),
-        };
-
-        let peer_tx = self.peer_tx.clone();
-        let peer_inbox_tx = self.peer_inbox_tx.clone();
-        let mirror_rx = self.peer_inbox_mirror_tx.subscribe();
-        let addr = peer_addr.clone();
-
-        tokio::spawn(async move {
-            match crate::session::transport::connect(&ws_url).await {
-                Ok(crate::session::SessionBus {
-                    tx: ws_tx,
-                    rx: mut ws_rx,
-                }) => {
-                    tracing::info!("auto-joined remote peer {addr}");
-
-                    let inbox = peer_inbox_tx.clone();
-                    let a2 = addr.clone();
-                    tokio::spawn(async move {
-                        while let Some(ev) = ws_rx.recv().await {
-                            if let crate::session::SessionEvent::Chat { text } = ev {
-                                if !text.is_empty() {
-                                    let id = uuid::Uuid::new_v4();
-                                    let name =
-                                        format!("peer@{}", a2.split(':').next().unwrap_or(&a2));
-                                    let _ = inbox.send((id, name, text));
-                                }
-                            }
-                        }
-                    });
-
-                    let ws_tx3 = ws_tx.clone();
-                    let mut mirror_rx = mirror_rx;
-                    tokio::spawn(async move {
-                        while let Ok((name, text)) = mirror_rx.recv().await {
-                            let ev = crate::session::SessionEvent::chat(format!("{name}: {text}"));
-                            if ws_tx3.send(ev).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-
-                    let mut bcast_rx = peer_tx.subscribe();
-                    while let Ok(ev) = bcast_rx.recv().await {
-                        if ws_tx.send(ev).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(e) => tracing::debug!("auto-join {addr}: connect failed: {e}"),
-            }
-        });
     }
 
     /// Establish WebSocket bridges to all addresses in `self.remote_peers`.
@@ -4015,43 +3683,6 @@ Rules:\n\
                 }
             });
         }
-    }
-
-    /// `/disconnect <name-or-addr>` — remove a peer from peers list and current room.
-    async fn handle_disconnect(&mut self, name: String) -> Result<()> {
-        use crossterm::style::Stylize;
-        // Resolve by label first, then by addr substring
-        let addr = self
-            .forth_vm
-            .peer_meta
-            .iter()
-            .find(|(_, meta)| meta.label.as_deref() == Some(name.as_str()))
-            .map(|(a, _)| a.clone())
-            .or_else(|| {
-                self.forth_vm
-                    .peers
-                    .iter()
-                    .find(|a| a.contains(name.as_str()))
-                    .cloned()
-            });
-        if let Some(ref addr) = addr {
-            self.forth_vm.peers.retain(|p| p != addr);
-            if let Some(ref room_id) = self.forth_vm.current_room.clone() {
-                if let Some(room) = self.forth_vm.rooms.get_mut(room_id) {
-                    room.members.retain(|m| m != addr);
-                }
-            }
-            self.forth_vm.peer_meta.remove(addr);
-            self.output_manager.write_info(format!(
-                "  {} {}",
-                name.as_str().dark_grey(),
-                "disconnected".dark_grey()
-            ));
-        } else {
-            self.output_manager
-                .write_info(format!("  {} not found", name.as_str().dark_grey()));
-        }
-        self.render_tui().await
     }
 
     /// Render the TUI

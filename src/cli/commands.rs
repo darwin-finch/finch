@@ -48,9 +48,6 @@ pub enum Command {
     ModelList,           // /provider list
     ModelSwitch(String), // /provider <name>  e.g. /provider grok
     ModelShow,           // /provider  (show current active provider)
-    // Service discovery (Phase 3)
-    Discover, // Discover Finch daemons on local network
-    Machines, // List known peer machines (from LAN discovery)
     // License management
     LicenseStatus,           // /license or /license status
     LicenseActivate(String), // /license activate <key>
@@ -80,9 +77,6 @@ pub enum Command {
     StackSwap(usize, usize),       // /swap W1 W2       — swap labels of two words
     ForthEval(String),             // : word ... ; or /forth <expr> — execute in the typed VM
     Setup,   // /setup — open the setup wizard (run 'finch setup' to reconfigure)
-    // Peer connect / disconnect
-    Connect(String), // /connect <host:port>   — add peer to current room + peer list
-    Disconnect(String), // /disconnect <name-or-addr> — remove peer from room + list
     SelfFix,              // /self-fix     — diagnose, fix, verify, restart
     // Diff proposal flow
     Accept(Option<String>), // /accept [diff-id-prefix] — accept most-recent (or matched) pending diff
@@ -138,9 +132,6 @@ impl Command {
             "/provider" | "/provider show" | "/model" | "/model show" | "/teacher"
             | "/teacher show" => return Some(Command::ModelShow),
             "/provider list" | "/model list" | "/teacher list" => return Some(Command::ModelList),
-            // Service discovery
-            "/discover" => return Some(Command::Discover),
-            "/machines" | "/peers" | "/nodes" => return Some(Command::Machines),
             // License management
             "/license" | "/license status" => return Some(Command::LicenseStatus),
             "/license remove" => return Some(Command::LicenseRemove),
@@ -168,7 +159,6 @@ impl Command {
         }
 
         // Handle /license activate <key>
-        // Peer connect / disconnect
         // Diff proposal flow with arguments
         if let Some(rest) = trimmed.strip_prefix("/accept ") {
             let prefix = rest.trim();
@@ -187,18 +177,6 @@ impl Command {
             }));
         }
 
-        if let Some(rest) = trimmed.strip_prefix("/connect ") {
-            let addr = rest.trim();
-            if !addr.is_empty() {
-                return Some(Command::Connect(addr.to_string()));
-            }
-        }
-        if let Some(rest) = trimmed.strip_prefix("/disconnect ") {
-            let name = rest.trim();
-            if !name.is_empty() {
-                return Some(Command::Disconnect(name.to_string()));
-            }
-        }
         if let Some(rest) = trimmed.strip_prefix("/license activate ") {
             let key = rest.trim();
             if !key.is_empty() {
@@ -507,10 +485,6 @@ pub fn handle_command(
         Command::ModelList | Command::ModelSwitch(_) | Command::ModelShow => Ok(
             CommandOutput::Status("Model commands should be handled in REPL.".to_string()),
         ),
-        // Service discovery is handled directly in REPL (Phase 3)
-        Command::Discover | Command::Machines => Ok(CommandOutput::Status(
-            "Service discovery commands should be handled in REPL.".to_string(),
-        )),
         // License commands are handled directly in REPL
         Command::LicenseStatus | Command::LicenseActivate(_) | Command::LicenseRemove => Ok(
             CommandOutput::Status("License commands should be handled in REPL.".to_string()),
@@ -547,10 +521,6 @@ pub fn handle_command(
         // Setup command is handled directly in REPL
         Command::Setup => Ok(CommandOutput::Status(
             "Setup command should be handled in REPL.".to_string(),
-        )),
-        // Peer commands are handled in the REPL event loop.
-        Command::Connect(_) | Command::Disconnect(_) => Ok(CommandOutput::Status(
-            "Peer command should be handled in REPL.".to_string(),
         )),
         Command::SelfFix => Ok(CommandOutput::Status(
             "SelfFix command should be handled in REPL.".to_string(),
@@ -968,6 +938,20 @@ mod tests {
             "/share",
             "/prove",
             "/box-diff",
+        ] {
+            assert!(matches!(Command::parse(source), Some(Command::Help)));
+        }
+    }
+
+    #[test]
+    fn removed_legacy_peer_commands_do_not_enter_the_command_surface() {
+        for source in [
+            "/discover",
+            "/machines",
+            "/peers",
+            "/nodes",
+            "/connect peer.example:8000",
+            "/disconnect peer.example",
         ] {
             assert!(matches!(Command::parse(source), Some(Command::Help)));
         }

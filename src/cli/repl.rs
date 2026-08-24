@@ -1815,7 +1815,6 @@ impl Repl {
             } else {
                 None
             },
-            self.auto_discover,
             self.peer_hosts.clone(),
             self.daemon_client
                 .as_ref()
@@ -2082,11 +2081,6 @@ impl Repl {
                     }
                     Command::ModelShow => {
                         self.handle_model_show().await?;
-                        continue;
-                    }
-                    // Phase 3: Service discovery
-                    Command::Discover => {
-                        self.handle_discover().await?;
                         continue;
                     }
                     // Phase 4: Memory system
