@@ -308,10 +308,10 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
             continue;
         }
 
-        // `record{field:type,...}` is an annotation atom, not a record or
-        // JSON value. Keeping it intact lets typed Lisp and Co-Forth share
-        // one product-type spelling without a second type-expression reader.
-        if let Some(end) = compact_record_type_end(&chars, i) {
+        // Compact structural types are annotation atoms, not record/JSON
+        // values. Keeping the balanced spelling intact lets typed Lisp and
+        // Co-Forth share one type-expression grammar.
+        if let Some(end) = compact_braced_type_end(&chars, i) {
             tokens.push(Tok::Atom(chars[i..end].iter().collect()));
             i = end;
             continue;
@@ -531,9 +531,12 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
     Ok(tokens)
 }
 
-fn compact_record_type_end(chars: &[char], start: usize) -> Option<usize> {
-    let prefix: Vec<char> = "record{".chars().collect();
-    if chars.get(start..start + prefix.len())? != prefix.as_slice() {
+fn compact_braced_type_end(chars: &[char], start: usize) -> Option<usize> {
+    let has_type_prefix = ["record{", "variant{"].iter().any(|prefix| {
+        let prefix: Vec<char> = prefix.chars().collect();
+        chars.get(start..start + prefix.len()) == Some(prefix.as_slice())
+    });
+    if !has_type_prefix {
         return None;
     }
     let mut depth = 0usize;
@@ -685,7 +688,7 @@ fn skip_trivia(source: &str, mut cursor: usize) -> Option<usize> {
 
 fn scan_form(source: &str, start: usize) -> Option<SyntaxForm> {
     let rest = source.get(start..)?;
-    if let Some(end) = scan_compact_record_type(source, start) {
+    if let Some(end) = scan_compact_braced_type(source, start) {
         return Some(SyntaxForm {
             span: start..end,
             children: Vec::new(),
@@ -753,9 +756,9 @@ fn scan_form(source: &str, start: usize) -> Option<SyntaxForm> {
     }
 }
 
-fn scan_compact_record_type(source: &str, start: usize) -> Option<usize> {
+fn scan_compact_braced_type(source: &str, start: usize) -> Option<usize> {
     let remainder = source.get(start..)?;
-    if !remainder.starts_with("record{") {
+    if !["record{", "variant{"].iter().any(|prefix| remainder.starts_with(prefix)) {
         return None;
     }
     let mut depth = 0usize;
@@ -1186,6 +1189,24 @@ mod tests {
     fn test_parse_multiple_exprs() {
         let exprs = parse_str("1 2 3").unwrap();
         assert_eq!(exprs, vec![Val::Int(1), Val::Int(2), Val::Int(3)]);
+    }
+
+    #[test]
+    fn compact_structural_types_are_single_symbols() {
+        let source = "record{name:string,meta:map<string,list<int>>} \
+                      variant{none|some(int)|metadata(record{name:string})}";
+        let exprs = parse_str(source).unwrap();
+        assert_eq!(
+            exprs,
+            vec![
+                Val::Symbol("record{name:string,meta:map<string,list<int>>}".into()),
+                Val::Symbol("variant{none|some(int)|metadata(record{name:string})}".into()),
+            ]
+        );
+
+        let spanned = parse_str_spanned(source).unwrap();
+        assert_eq!(&source[spanned[0].span.clone()], "record{name:string,meta:map<string,list<int>>}");
+        assert_eq!(&source[spanned[1].span.clone()], "variant{none|some(int)|metadata(record{name:string})}");
     }
 
     #[test]

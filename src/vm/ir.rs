@@ -125,6 +125,14 @@ pub enum Instruction {
     MakeRecord {
         fields: Vec<(String, Type)>,
     },
+    /// Construct one member of a closed tagged sum. The full variant type and
+    /// selected tag are carried in verified IR; source code cannot smuggle an
+    /// unchecked tag string into the runtime representation.
+    MakeVariant {
+        variants: Vec<(String, Option<Type>)>,
+        tag: String,
+        payload_type: Option<Type>,
+    },
     /// Project a statically named record field. The field-name string remains
     /// on the stack for normal concatenative calling convention, though the
     /// frontend has already proven it matches `field`. The optional result

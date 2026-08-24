@@ -1118,6 +1118,11 @@ impl Compiler<'_> {
                 source_children.as_deref().and_then(|children| children.get(1..)),
                 builder,
             ),
+            "variant" => self.compile_variant_value(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
             _ if builder.resolve(operator).is_some() => {
                 self.compile_closure_call(
                     &items[0],
@@ -1597,6 +1602,72 @@ impl Compiler<'_> {
             self.origin("record"),
         );
         Ok(Type::Record(record_fields))
+    }
+
+    /// Construct a member of one explicitly closed variant type.
+    /// `(variant variant{none|some(int)} :some 42)` and the equivalent
+    /// Co-Forth template both lower to `MakeVariant`.
+    fn compile_variant_value(
+        &mut self,
+        expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let [Val::Symbol(type_name), Val::Symbol(tag), rest @ ..] = expressions else {
+            return Err(vec![self.error(
+                "E-VARIANT-001",
+                "variant requires a closed variant type, tag, and exactly its declared payload",
+            )]);
+        };
+        let Type::Variant(variants) = parse_type_name(type_name)? else {
+            return Err(vec![self.error(
+                "E-VARIANT-001",
+                "variant constructor's first argument must be a variant{...} type",
+            )]);
+        };
+        let tag = tag.strip_prefix(':').unwrap_or(tag);
+        let Some((_, payload_type)) = variants.iter().find(|(name, _)| name == tag) else {
+            return Err(vec![self.error("E-VARIANT-002", format!("variant has no tag '{tag}'"))]);
+        };
+        match (payload_type, rest) {
+            (None, []) => {}
+            (Some(expected), [payload]) => {
+                let found = self.compile_expression_at(
+                    payload,
+                    expression_sources.and_then(|sources| sources.get(2)),
+                    builder,
+                )?;
+                if !expected.accepts(&found) {
+                    return Err(vec![VmDiagnostic::type_mismatch(
+                        expected.clone(),
+                        found,
+                        Some(self.origin("variant")),
+                    )]);
+                }
+                builder.stack.pop();
+            }
+            (None, _) => {
+                return Err(vec![self.error(
+                    "E-VARIANT-004",
+                    format!("variant tag '{tag}' carries no payload"),
+                )]);
+            }
+            (Some(expected), _) => {
+                return Err(vec![self.error(
+                    "E-VARIANT-004",
+                    format!("variant tag '{tag}' requires one {expected} payload"),
+                )]);
+            }
+        }
+        builder.emit(
+            Instruction::MakeVariant {
+                variants: variants.clone(),
+                tag: tag.to_string(),
+                payload_type: payload_type.clone(),
+            },
+            self.origin(format!("variant/{tag}")),
+        );
+        Ok(Type::Variant(variants))
     }
 
     /// Project a statically named field. Dynamic lookup belongs to the managed
@@ -3741,6 +3812,22 @@ fn parse_variant_type(name: &str) -> Option<Type> {
     Some(Type::Variant(parsed))
 }
 
+pub(crate) fn parse_variant_constructor_name(
+    name: &str,
+) -> Option<(Vec<(String, Option<Type>)>, String, Option<Type>)> {
+    let inner = name.strip_prefix("variant<")?.strip_suffix('>')?;
+    let arguments = split_type_arguments(inner)?;
+    if arguments.len() != 2 {
+        return None;
+    }
+    let Type::Variant(variants) = parse_type_name(arguments[0]).ok()? else {
+        return None;
+    };
+    let tag = arguments[1].trim();
+    let (_, payload_type) = variants.iter().find(|(name, _)| name == tag)?;
+    Some((variants.clone(), tag.to_string(), payload_type.clone()))
+}
+
 fn split_variant_alternatives(source: &str) -> Option<Vec<&str>> {
     let mut alternatives = Vec::new();
     let mut angle_depth = 0usize;
@@ -4487,6 +4574,31 @@ mod tests {
             run("(match 9 (0 100) (2 42) (_ 0))").unwrap(),
             vec![TypedValue::Int(0)]
         );
+    }
+
+    #[test]
+    fn constructs_closed_variant_values() {
+        assert_eq!(
+            run("(variant variant{none|some(int)} :some 42)").unwrap(),
+            vec![TypedValue::Variant {
+                name: "some".into(),
+                value: Some(Box::new(TypedValue::Int(42))),
+            }]
+        );
+        assert_eq!(
+            run("(variant variant{none|some(int)} :none)").unwrap(),
+            vec![TypedValue::Variant {
+                name: "none".into(),
+                value: None,
+            }]
+        );
+        for source in [
+            "(variant variant{none|some(int)} :missing)",
+            "(variant variant{none|some(int)} :some)",
+            "(variant variant{none|some(int)} :none 1)",
+        ] {
+            assert!(compile_lisp("variant.lisp", source, Vec::new(), &core_vocabulary()).is_err());
+        }
     }
 
     #[test]

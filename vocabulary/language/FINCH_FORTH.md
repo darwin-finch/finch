@@ -82,6 +82,15 @@ a literal string, and the replacement must have the field's statically known typ
 `record-get:<name>` remains accepted as compatibility syntax, but new programs should use the
 ordinary stack spelling `"name" record-get`.
 
+Closed variants use a typed constructor template. It consumes exactly the selected tag's payload:
+
+```forth
+variant<variant{none|some(int)},none>
+42 variant<variant{none|some(int)},some>
+```
+
+The resulting value retains the full closed variant type for exhaustive checking.
+
 Records may also hold typed quotations. This lets a record carry data and a reusable operation
 without introducing a separate object runtime; invocation remains explicit and receives its inputs
 on the ordinary stack:

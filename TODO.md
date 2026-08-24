@@ -29,9 +29,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   construction/immutable append in both frontends, direct pasted Co-Forth JSON-object literals,
   explicit `json-as-map -> option<map<string,json>>` normalization, and total statically checked
   Lisp record-subset and exhaustive list destructuring lowered to shared public words/branch/local
-  IR; still add variant patterns and row-polymorphic record rules. The deliberate typed brace-record syntax is the only record
-  source surface; `json-parse`/`json-get`/scalar option projections remain the safe boundary for
-  arbitrary JSON objects rather than exposing the internal `TypedValue::Record` ABI ad hoc.
+  IR. Closed `variant{...}` types and payload-checked constructors now share one IR instruction and
+  conformance fixture across both frontends; still add exhaustive variant patterns and
+  row-polymorphic record rules. The deliberate typed brace-record syntax is the only record source
+  surface; `json-parse`/`json-get`/scalar option projections remain the safe boundary for arbitrary
+  JSON objects rather than exposing the internal `TypedValue::Record` ABI ad hoc.
 - [ ] Extend the implemented typed option/result branches, type-directed Lisp `match`, and
   no-fallthrough integer Co-Forth `case` to richer structured patterns plus expression-valued
   named `break` after the loop verifier is generalized to check each target's declared result

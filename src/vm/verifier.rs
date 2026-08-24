@@ -276,6 +276,37 @@ impl<'a> Verifier<'a> {
                 stack.truncate(start);
                 stack.push(Type::Record(fields.clone()));
             }
+            Instruction::MakeVariant { variants, tag, payload_type } => {
+                let Some((_, expected_payload)) =
+                    variants.iter().find(|(candidate, _)| candidate == tag)
+                else {
+                    return Err(VmDiagnostic::error(
+                        "E-VARIANT-002",
+                        DiagnosticPhase::Verification,
+                        format!("variant has no tag '{tag}'"),
+                        Some(origin.clone()),
+                    ));
+                };
+                if expected_payload != payload_type {
+                    return Err(VmDiagnostic::error(
+                        "E-VARIANT-003",
+                        DiagnosticPhase::Verification,
+                        format!("variant tag '{tag}' has an inconsistent IR payload type"),
+                        Some(origin.clone()),
+                    ));
+                }
+                if let Some(expected) = payload_type {
+                    let found = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
+                    if !expected.accepts(&found) {
+                        return Err(VmDiagnostic::type_mismatch(
+                            expected.clone(),
+                            found,
+                            Some(origin.clone()),
+                        ));
+                    }
+                }
+                stack.push(Type::Variant(variants.clone()));
+            }
             Instruction::RecordGet { field, value_type } => {
                 let field_name = stack.pop().ok_or_else(|| underflow(origin, 2, 0))?;
                 if field_name != Type::String {
@@ -1336,6 +1367,46 @@ mod tests {
             .verify(module)
             .unwrap_err();
         assert!(errors.iter().any(|error| error.code == "E-TYPE-002"));
+    }
+
+    #[test]
+    fn rejects_malformed_variant_construction_ir() {
+        let variants = vec![("none".into(), None), ("some".into(), Some(Type::Int))];
+        let signature = StackSignature::pure(
+            StackRow::closed(Vec::new()),
+            StackRow::closed(vec![Type::Variant(variants.clone())]),
+        );
+        let unknown_tag = Module::single(function(
+            signature.clone(),
+            vec![
+                Instruction::MakeVariant {
+                    variants: variants.clone(),
+                    tag: "missing".into(),
+                    payload_type: None,
+                },
+                Instruction::Return,
+            ],
+        ));
+        let errors = Verifier::new(&core_vocabulary())
+            .verify(unknown_tag)
+            .expect_err("unknown variant tags must not enter verified IR");
+        assert!(errors.iter().any(|error| error.code == "E-VARIANT-002"));
+
+        let inconsistent_payload = Module::single(function(
+            signature,
+            vec![
+                Instruction::MakeVariant {
+                    variants,
+                    tag: "some".into(),
+                    payload_type: Some(Type::String),
+                },
+                Instruction::Return,
+            ],
+        ));
+        let errors = Verifier::new(&core_vocabulary())
+            .verify(inconsistent_payload)
+            .expect_err("variant payload metadata must match the closed type");
+        assert!(errors.iter().any(|error| error.code == "E-VARIANT-003"));
     }
 
     #[test]

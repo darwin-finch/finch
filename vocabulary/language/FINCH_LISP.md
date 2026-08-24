@@ -148,6 +148,17 @@ access. Dynamic object traversal remains the explicit `json-*` boundary:
 `record-set` creates a new record rather than mutating the original. Its field name is also a
 literal string, and the replacement must match the field's statically known type.
 
+Closed variants use an explicit full type and selected tag. A payload is present exactly when the
+declared tag requires one:
+
+```lisp
+(variant variant{none|some(int)} :none)
+(variant variant{none|some(int)} :some 42)
+```
+
+The full type prevents an isolated tag value from losing the other alternatives needed for
+exhaustive checking.
+
 Records may contain ordinary typed closure values, which makes an immutable object-style value
 possible without a second object runtime. Method invocation remains explicit: project, unwrap, and
 call the closure. A later method-sugar layer may pass `self` explicitly, but no closure gains

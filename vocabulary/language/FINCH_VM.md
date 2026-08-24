@@ -56,6 +56,9 @@ Closed tagged sums use the shared compact type spelling
 typed payload. This spelling is accepted identically in Lisp annotations and Co-Forth signatures;
 values and exhaustive matching use verified vocabulary/IR operations rather than an untyped tag
 string convention.
+Lisp constructs them with `(variant variant{none|some(int)} :some 42)`; Co-Forth uses
+`42 variant<variant{none|some(int)},some>`. Both lower to `MakeVariant`, whose verified IR carries
+the full closed type, selected tag, and optional payload type.
 
 Structured option branches are part of the common semantics: Co-Forth `if-some ... else ... then`
 and Lisp `(match-option option (some name ...) (none ...))` both lower to typed branch edges. The

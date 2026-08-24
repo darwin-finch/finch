@@ -529,6 +529,18 @@ impl<'a> VmTrampoline<'a> {
                     ));
                     Ok(None)
                 }
+                Instruction::MakeVariant { variants: _, tag, payload_type } => {
+                    let value = if payload_type.is_some() {
+                        let Some(value) = continuation.stack.pop() else {
+                            return VmStep::Failed(self.underflow(&located.origin, &continuation));
+                        };
+                        Some(Box::new(value))
+                    } else {
+                        None
+                    };
+                    continuation.stack.push(TypedValue::Variant { name: tag, value });
+                    Ok(None)
+                }
                 Instruction::RecordGet { field, value_type } => {
                     let Some(TypedValue::String(field_name)) = continuation.stack.pop() else {
                         return VmStep::Failed(self.with_trace(

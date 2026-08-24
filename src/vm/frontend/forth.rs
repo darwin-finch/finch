@@ -732,6 +732,42 @@ fn compile_forth_body_with_locals(
                 token_index += 1;
                 continue;
             }
+            if word.starts_with("variant<") {
+                let Some((variants, tag, payload_type)) =
+                    super::lisp::parse_variant_constructor_name(word)
+                else {
+                    return Err(vec![control_error(
+                        "E-VARIANT-001",
+                        "variant constructor must be variant<variant{tag|tag(type)},selected-tag>",
+                        origin,
+                    )]);
+                };
+                if let Some(expected) = &payload_type {
+                    let found = stack.pop().ok_or_else(|| {
+                        vec![control_error(
+                            "E-STACK-001",
+                            format!("variant tag '{tag}' requires one {expected} payload"),
+                            origin.clone(),
+                        )]
+                    })?;
+                    if !expected.accepts(&found) {
+                        return Err(vec![VmDiagnostic::type_mismatch(
+                            expected.clone(),
+                            found,
+                            Some(origin),
+                        )]);
+                    }
+                }
+                stack.push(Type::Variant(variants.clone()));
+                emit(
+                    &mut blocks,
+                    current,
+                    Instruction::MakeVariant { variants, tag, payload_type },
+                    origin,
+                );
+                token_index += 1;
+                continue;
+            }
             if let Some(field) = word
                 .strip_prefix("field:")
                 .or_else(|| record_literals.last().and_then(|_| word.strip_suffix(':')))
@@ -2989,6 +3025,7 @@ fn parameterized_type_end(source: &str, start: usize) -> Option<usize> {
         "stream<",
         "resource<",
         "capability<",
+        "variant<",
     ]
     .into_iter()
     .any(|prefix| remainder.starts_with(prefix));
@@ -3858,6 +3895,47 @@ mod tests {
         assert_eq!(
             module.module.functions["identity-result"].signature.input.values,
             vec![variant]
+        );
+    }
+
+    #[test]
+    fn constructs_closed_variant_values() {
+        let module = compile_forth(
+            "variant.forth",
+            "42 variant<variant{none|some(int)},some>",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("payload variant constructor should compile");
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("payload variant constructor should execute");
+        assert_eq!(
+            stack,
+            vec![TypedValue::Variant {
+                name: "some".into(),
+                value: Some(Box::new(TypedValue::Int(42))),
+            }]
+        );
+
+        let module = compile_forth(
+            "variant-unit.forth",
+            "variant<variant{none|some(int)},none>",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("payload-free variant constructor should compile");
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("payload-free variant constructor should execute");
+        assert_eq!(
+            stack,
+            vec![TypedValue::Variant {
+                name: "none".into(),
+                value: None,
+            }]
         );
     }
 
