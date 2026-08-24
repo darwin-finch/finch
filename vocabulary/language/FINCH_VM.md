@@ -201,6 +201,12 @@ producers use fibers.
 `vm-vocabulary` is a pure VM inspection operation that returns the current serialized typed
 vocabulary. Use it (or the external `get_vm_state` tool) instead of guessing callable names.
 
+`mcp-call` is the explicit managed-JSON fallback for a host-configured MCP tool. It consumes a
+server string, tool string, and `json`, then returns `json`. The runtime derives the concrete
+`mcp.call(server,tool)` requirement from those first two arguments before dispatch; installing an
+MCP transport does not grant it. Schema-derived namespaced words may provide narrower static types,
+but unsupported schemas stay at this boundary rather than becoming `dynamic`.
+
 Structured values are part of the shared ABI. `some` and `none` construct `option<T>` values;
 `is-some` tests one and `unwrap` extracts its payload (returning a structured `E-OPTION-001`
 diagnostic for `none`). `ok` and `err` construct `result<T,E>` values, `is-ok` inspects which

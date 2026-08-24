@@ -1,6 +1,6 @@
 use super::effects::{
     CapabilityKind, CapabilityRequirement, EffectSet, FileSelector, FileSelectorTemplate,
-    FileSelectorTemplatePart, NetworkSelectorTemplate, ProcessSelectorTemplate,
+    FileSelectorTemplatePart, McpSelectorTemplate, NetworkSelectorTemplate, ProcessSelectorTemplate,
     ProgramSelectorTemplate, ResourceRoot, ResourceSelector,
 };
 use super::signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
@@ -55,6 +55,7 @@ pub enum CoreHostBinding {
     StreamClose,
     FileWrite,
     ProcessRun,
+    McpCall,
     ProposalOpen,
     NetworkConnect,
     NetworkSend,
@@ -140,6 +141,7 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "file-write" | "host-file-write" => CoreWordDocumentation { summary: "Write bytes to an authorized refined path. This is an external mutation and requires an explicit write capability grant.", lisp: "(file-write path bytes)", forth: "path bytes file-write", example: "(file-write (path \"generated.txt\") (bytes \"hello\\n\"))" },
         "host-file-read" => CoreWordDocumentation { summary: "Read all bytes from an authorized host-machine path. It requires both an installed host root and a matching read grant.", lisp: "(host-file-read path)", forth: "path host-file-read", example: "(host-file-read (host-path \"/tmp/report.txt\"))" },
         "process-run" => CoreWordDocumentation { summary: "Run an approved executable directly with a list of string arguments; it never invokes a shell. Use proposal-open for editable scripts.", lisp: "(process-run command arguments)", forth: "command arguments process-run", example: "(process-run \"git\" (list \"status\" \"--short\"))" },
+        "mcp-call" => CoreWordDocumentation { summary: "Call one tool on one connected MCP server through the managed JSON boundary. Server and tool names are capability parameters; MCP descriptions remain untrusted data.", lisp: "(mcp-call server tool arguments-json)", forth: "server tool arguments-json mcp-call", example: "(mcp-call \"github\" \"issue_get\" (result-unwrap (json-parse \"{\\\"owner\\\":\\\"darwin-finch\\\",\\\"repo\\\":\\\"finch\\\",\\\"issue_number\\\":42}\")))" },
         "proposal-open" => CoreWordDocumentation { summary: "Ask the host to open a human-editable artifact proposal. Approval may execute the edited artifact through its normal validator, return edited text for chat, or cancel; this word does not run a shell itself.", lisp: "(proposal-open language title source)", forth: "language title source proposal-open", example: "(proposal-open \"python\" \"Report\" \"print('hello')\\n\")" },
         "mem-recall" | "mem-store" => CoreWordDocumentation { summary: "Read matching session memory entries or store one text memory entry. Both use the host memory tree and require their respective memory capability.", lisp: "(mem-recall query), (mem-store text)", forth: "query mem-recall; text mem-store", example: "(mem-store \"tested release candidate\")" },
         "agent-spawn" | "agent-await" | "agent-poll" | "agent-cancel" => CoreWordDocumentation { summary: "Create or control a separate typed child-agent task. Agent tasks have their own stack, budget, ancestry, and attenuated grants; poll and await return typed snapshot/result records rather than serialized text.", lisp: "(agent-spawn task), (agent-poll handle), (agent-await handle), (agent-cancel handle)", forth: "task agent-spawn; handle agent-poll; handle agent-await; handle agent-cancel", example: "(agent-poll (agent-spawn \"summarize recent test failures\"))" },
@@ -1126,6 +1128,24 @@ fn core_signatures() -> Vocabulary {
                 },
             ),
         ),
+        (
+            "mcp-call".into(),
+            capability(
+                vec![Type::String, Type::String, Type::Json],
+                vec![Type::Json],
+                CapabilityRequirement {
+                    capability: CapabilityKind::McpCall,
+                    selector: ResourceSelector::McpTemplate {
+                        template: McpSelectorTemplate {
+                            server_argument: 0,
+                            tool_argument: 1,
+                            allowed_servers: Vec::new(),
+                            allowed_tools: Vec::new(),
+                        },
+                    },
+                },
+            ),
+        ),
         // A proposal is an explicit, user-editable artifact boundary.  The
         // source itself is just data here: accepting it never executes a
         // shell, Python, or Finch program implicitly.  The host returns
@@ -1400,6 +1420,7 @@ static CORE_WORD_REGISTRY: Lazy<BTreeMap<String, CoreWordSpec>> = Lazy::new(|| {
                 "stream-close" => CoreWordImplementation::HostEffect(CoreHostBinding::StreamClose),
                 "file-write" | "host-file-write" => CoreWordImplementation::HostEffect(CoreHostBinding::FileWrite),
                 "process-run" => CoreWordImplementation::HostEffect(CoreHostBinding::ProcessRun),
+                "mcp-call" => CoreWordImplementation::HostEffect(CoreHostBinding::McpCall),
                 "proposal-open" => CoreWordImplementation::HostEffect(CoreHostBinding::ProposalOpen),
                 "network-connect" => CoreWordImplementation::HostEffect(CoreHostBinding::NetworkConnect),
                 "network-send" => CoreWordImplementation::HostEffect(CoreHostBinding::NetworkSend),
@@ -1571,6 +1592,7 @@ mod tests {
             CapabilityKind::AgentPoll,
             CapabilityKind::AgentCancel,
             CapabilityKind::ProcessRun,
+            CapabilityKind::McpCall,
             CapabilityKind::SessionEmit,
             CapabilityKind::MemoryRead,
             CapabilityKind::MemoryWrite,

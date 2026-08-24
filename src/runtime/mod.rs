@@ -14,7 +14,7 @@ use crate::scheduling::{ScheduledTask, TaskQueue, TaskScheduler, TaskStatus};
 use crate::vm::{
     ApprovalChoice, ApprovalPrompt, AuthorizationContext, AuthorizationDecision,
     CapabilityAvailability, CapabilityKind, CapabilityLedger, CapabilityPolicy, CapabilityRequest,
-    CapabilityRequirement, EffectSet, GrantScope,
+    CapabilityRequirement, EffectSet, GrantScope, ResourceSelector,
     SourceOrigin, Type, TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint,
     TypedSuspension, TypedValue, VmDiagnostic, VmSideEffect,
 };
@@ -343,6 +343,9 @@ pub struct ProgramRuntime {
     /// still checked for every call.
     host_machine_root: Arc<RwLock<Option<Arc<PathBuf>>>>,
     memory: RwLock<Option<Arc<crate::memory::MemorySystem>>>,
+    /// Host-owned MCP transport. Installing it makes configured servers
+    /// callable but never grants authority to any server or tool.
+    mcp_client: RwLock<Option<Arc<crate::tools::mcp::McpClient>>>,
     network: Arc<Mutex<HashMap<String, NetworkSocket>>>,
     /// Output handles are opaque, per-execution presentation resources.  They
     /// intentionally do not name an ambient "current work unit".
@@ -615,6 +618,7 @@ impl ProgramRuntime {
             project_id,
             host_machine_root: Arc::new(RwLock::new(None)),
             memory: RwLock::new(None),
+            mcp_client: RwLock::new(None),
             network: Arc::new(Mutex::new(HashMap::new())),
             output_handles: Arc::new(Mutex::new(HashMap::new())),
             streams: Arc::new(Mutex::new(HashMap::new())),
@@ -713,11 +717,26 @@ impl ProgramRuntime {
             CapabilityKind::NetworkConnect
             | CapabilityKind::ProcessRun
             | CapabilityKind::ProgramInvoke => CapabilityAvailability::Available,
+            CapabilityKind::McpCall => match self.mcp_client.read() {
+                Ok(client) if client.is_some() => CapabilityAvailability::Available,
+                Ok(_) => CapabilityAvailability::Disabled,
+                Err(_) => CapabilityAvailability::Degraded {
+                    reason: "MCP client binding lock poisoned".into(),
+                },
+            },
             CapabilityKind::VmWrite
             | CapabilityKind::MemoryConsolidate
-            | CapabilityKind::McpCall
             | CapabilityKind::UnsafeMemory => CapabilityAvailability::Unsupported,
         }
+    }
+
+    /// Install the application-owned MCP transport without changing grants.
+    pub fn bind_mcp_client(&self, client: Arc<crate::tools::mcp::McpClient>) -> Result<()> {
+        *self
+            .mcp_client
+            .write()
+            .map_err(|_| anyhow::anyhow!("MCP client binding lock poisoned"))? = Some(client);
+        Ok(())
     }
 
     /// Install the host-owned root behind `root<host-machine>`. This is an
@@ -2805,6 +2824,11 @@ impl ProgramRuntime {
             .read()
             .expect("memory binding lock poisoned")
             .clone();
+        let mcp_client = self
+            .mcp_client
+            .read()
+            .expect("MCP client binding lock poisoned")
+            .clone();
         let network = Arc::clone(&self.network);
         let output_handles = Arc::clone(&self.output_handles);
         let streams = Arc::clone(&self.streams);
@@ -2851,6 +2875,7 @@ impl ProgramRuntime {
                         Arc::clone(&host_machine_root),
                         scheduler,
                         memory,
+                        mcp_client,
                         vocabulary,
                         network,
                         output_handles,
@@ -2890,6 +2915,11 @@ impl ProgramRuntime {
             .memory
             .read()
             .expect("memory binding lock poisoned")
+            .clone();
+        let mcp_client = self
+            .mcp_client
+            .read()
+            .expect("MCP client binding lock poisoned")
             .clone();
         let network = Arc::clone(&self.network);
         let output_handles = Arc::clone(&self.output_handles);
@@ -2935,6 +2965,7 @@ impl ProgramRuntime {
                         Arc::clone(&host_machine_root),
                         scheduler,
                         memory,
+                        mcp_client,
                         vocabulary,
                         network,
                         output_handles,
@@ -2973,6 +3004,7 @@ struct TypedHostHandler {
     side_effects: Vec<crate::vm::interpreter::HostSideEffect>,
     scheduler: Option<agent_vm::AgentVmBinding>,
     memory: Option<Arc<crate::memory::MemorySystem>>,
+    mcp_client: Option<Arc<crate::tools::mcp::McpClient>>,
     vocabulary: String,
     network: Arc<Mutex<HashMap<String, NetworkSocket>>>,
     output_handles: Arc<Mutex<HashMap<String, OutputHandleRecord>>>,
@@ -3002,6 +3034,7 @@ impl TypedHostHandler {
         host_machine_root: Arc<RwLock<Option<Arc<PathBuf>>>>,
         scheduler: Option<agent_vm::AgentVmBinding>,
         memory: Option<Arc<crate::memory::MemorySystem>>,
+        mcp_client: Option<Arc<crate::tools::mcp::McpClient>>,
         vocabulary: String,
         network: Arc<Mutex<HashMap<String, NetworkSocket>>>,
         output_handles: Arc<Mutex<HashMap<String, OutputHandleRecord>>>,
@@ -3022,6 +3055,7 @@ impl TypedHostHandler {
             side_effects: Vec::new(),
             scheduler,
             memory,
+            mcp_client,
             vocabulary,
             network,
             output_handles,
@@ -4231,6 +4265,44 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     handle: uuid::Uuid::new_v4().to_string(),
                     generation: 0,
                 }]);
+            }
+            crate::vm::CapabilityKind::McpCall => {
+                let [TypedValue::String(server), TypedValue::String(tool), TypedValue::Json(parameters)] =
+                    arguments.as_slice()
+                else {
+                    return Err(host_binding_error(
+                        origin,
+                        "mcp-call requires server, tool, and JSON arguments",
+                    ));
+                };
+                let ResourceSelector::Mcp {
+                    server: authorized_server,
+                    tool: authorized_tool,
+                } = &requirement.selector
+                else {
+                    return Err(host_binding_error(
+                        origin,
+                        "mcp-call reached the host without a concrete server/tool selector",
+                    ));
+                };
+                if server != authorized_server || tool != authorized_tool {
+                    return Err(host_binding_error(
+                        origin,
+                        "mcp-call arguments do not match the authorized server/tool selector",
+                    ));
+                }
+                let Some(client) = self.mcp_client.clone() else {
+                    return Err(host_binding_error(origin, "MCP client is unavailable"));
+                };
+                let wire_name = format!("mcp_{server}_{tool}");
+                let parameters = parameters.clone();
+                let response = block_on_host(async move {
+                    client.execute_tool(&wire_name, parameters).await
+                })
+                .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                let value = serde_json::from_str(&response)
+                    .unwrap_or_else(|_| serde_json::Value::String(response));
+                return Ok(vec![TypedValue::Json(value)]);
             }
             crate::vm::CapabilityKind::ProcessRun => {
                 let [TypedValue::String(command), TypedValue::List { values, .. }] =
@@ -7817,6 +7889,63 @@ mod tests {
         assert!(matches!(
             stored.values.first(),
             Some(ProgramValue::Resource { kind, .. }) if kind == "memory-node"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn typed_mcp_call_uses_concrete_authority_and_managed_json() {
+        let script = r#"
+IFS= read -r discover
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"fixture","version":"1"}}}}'
+IFS= read -r list
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo_value","description":"untrusted fixture prose","inputSchema":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}]}}'
+IFS= read -r call
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"fixture result"}],"structuredContent":{"ok":true},"isError":false}}'
+"#;
+        let config = std::collections::HashMap::from([(
+            "fixture".to_string(),
+            crate::tools::mcp::McpServerConfig {
+                command: Some("sh".to_string()),
+                args: vec!["-c".to_string(), script.to_string()],
+                transport: crate::tools::mcp::TransportType::Stdio,
+                url: None,
+                env: std::collections::HashMap::new(),
+                enabled: true,
+                timeout_secs: 5,
+            },
+        )]);
+        let client = Arc::new(crate::tools::mcp::McpClient::from_config(&config).await.unwrap());
+        let runtime = ProgramRuntime::new();
+        runtime.bind_mcp_client(client).unwrap();
+        let requirement = CapabilityRequirement {
+            capability: CapabilityKind::McpCall,
+            selector: ResourceSelector::Mcp {
+                server: "fixture".into(),
+                tool: "echo_value".into(),
+            },
+        };
+        runtime.grant_typed_capability(requirement).unwrap();
+
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                r#"(mcp-call "fixture" "echo_value" (result-unwrap (json-parse "{\"value\":\"hello\"}")))"#,
+                ExecutionEffect::ExternalRead,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.status,
+            ExecutionStatus::Completed,
+            "diagnostics: {:?}",
+            outcome.diagnostics
+        );
+        assert!(matches!(
+            outcome.values.as_slice(),
+            [ProgramValue::Json(serde_json::Value::String(value))]
+                if value.contains("fixture result") && value.contains("\"ok\": true")
         ));
     }
 

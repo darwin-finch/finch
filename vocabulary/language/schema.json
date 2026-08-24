@@ -22,7 +22,7 @@
       "required": ["capability", "selector"],
       "properties": {
         "capability": {
-          "enum": ["vm_read", "vm_write", "file_read", "file_write", "network_connect", "automation_inspect", "automation_write", "agent_spawn", "agent_await", "agent_poll", "agent_cancel", "process_run", "session_emit", "memory_read", "memory_write", "memory_consolidate", "schedule_create", "schedule_read", "schedule_manage", "program_invoke", "unsafe_memory"]
+          "enum": ["vm_read", "vm_write", "file_read", "file_write", "network_connect", "automation_inspect", "automation_write", "agent_spawn", "agent_await", "agent_poll", "agent_cancel", "process_run", "mcp_call", "session_emit", "memory_read", "memory_write", "memory_consolidate", "schedule_create", "schedule_read", "schedule_manage", "program_invoke", "unsafe_memory"]
         },
         "selector": { "$ref": "#/$defs/resource_selector" }
       },

@@ -385,6 +385,13 @@ a typed record.
 
 `process-run` consumes a command string and a list of argument strings; it never invokes a shell.
 
+The generic MCP boundary is `server tool arguments-json mcp-call`. It returns managed `json` and
+requires authority for that exact server/tool pair. For example:
+
+```forth
+"github" "issue_get" {"owner":"darwin-finch","repo":"finch","issue_number":42} mcp-call
+```
+
 For progressive prose, emit multiple typed chunks with `say`. Bare `"..."` pushes one typed
 `string` and never evaluates its contents. `s"..."` is an equivalent familiar Forth spelling; the
 `s` means **string**, not `say`. Both `s"text"` and the conventional `s" text"` spell the

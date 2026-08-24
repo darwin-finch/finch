@@ -455,6 +455,10 @@ never becomes a capability, path, or executable form merely by being parsed.
 explicitly normalizes an object to `option<map<string,json>>`, preserving arbitrary string keys;
 it returns `none` for non-objects and never guesses a typed-record schema.
 
+The generic MCP boundary is `(mcp-call server tool arguments-json)`. It returns managed `json` and
+requires authority for that exact server/tool pair. Construct arguments through `json-parse` in
+Lisp source; discovered namespaced bindings may expose narrower schema-derived types later.
+
 Typed maps are immutable shared-language collections, separate from JSON. Construct one with
 alternating key/value forms: `(map "answer" 42 "other" 7)`. All keys must share one type and all
 values must share one type. `(map-get table key)` returns `option<V>`; `(map-set table key value)`
