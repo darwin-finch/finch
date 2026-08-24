@@ -35,6 +35,64 @@ pub struct RequestMetric {
     pub validator_confidence: Option<f64>,
 }
 
+/// Why a provider's first Finch VM wire submission was not accepted.
+///
+/// Keep this deliberately coarse and source-free: conformance reporting needs
+/// provider/model aggregates, not a second log of user prompts or generated
+/// programs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireFailureClass {
+    RawProse,
+    MarkdownFence,
+    InventedWord,
+    StackOrType,
+    WrongLanguageDispatch,
+    MissingOutputEffect,
+    Capability,
+    Other,
+}
+
+/// One terminal provider-wire attempt, including whether bounded repair was
+/// needed and whether it succeeded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireAdherenceMetric {
+    pub timestamp: DateTime<Utc>,
+    pub provider: String,
+    pub model: String,
+    /// Receiver surface such as `interactive`, `one_shot`, or `named_brain`.
+    pub surface: String,
+    pub first_pass_valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<WireFailureClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_code: Option<String>,
+    pub repair_attempted: bool,
+    pub repaired_successfully: bool,
+    pub terminal_failure: bool,
+}
+
+impl WireAdherenceMetric {
+    pub fn first_pass(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        surface: impl Into<String>,
+    ) -> Self {
+        Self {
+            timestamp: Utc::now(),
+            provider: provider.into(),
+            model: model.into(),
+            surface: surface.into(),
+            first_pass_valid: true,
+            failure_class: None,
+            diagnostic_code: None,
+            repair_attempted: false,
+            repaired_successfully: false,
+            terminal_failure: false,
+        }
+    }
+}
+
 impl RequestMetric {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -176,5 +234,22 @@ mod tests {
         let decoded: ResponseComparison = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.quality_score, 0.75);
         assert_eq!(decoded.similarity_score, Some(0.9));
+    }
+
+    #[test]
+    fn wire_adherence_metric_does_not_require_source_text() {
+        let mut metric = WireAdherenceMetric::first_pass("xai", "grok", "interactive");
+        metric.first_pass_valid = false;
+        metric.failure_class = Some(WireFailureClass::RawProse);
+        metric.diagnostic_code = Some("E-LINK-002".into());
+        metric.repair_attempted = true;
+        metric.repaired_successfully = true;
+
+        let json = serde_json::to_string(&metric).unwrap();
+        assert!(!json.contains("generated_source"));
+        assert_eq!(
+            serde_json::from_str::<WireAdherenceMetric>(&json).unwrap(),
+            metric
+        );
     }
 }

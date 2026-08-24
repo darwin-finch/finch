@@ -7,7 +7,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
-use super::types::RequestMetric;
+use super::types::{RequestMetric, WireAdherenceMetric};
 
 pub struct MetricsLogger {
     metrics_dir: PathBuf,
@@ -42,6 +42,37 @@ impl MetricsLogger {
         writeln!(file, "{}", json).context("Failed to write metric to log")?;
 
         Ok(())
+    }
+
+    /// Append one provider-wire conformance result without retaining prompt or
+    /// source text. This uses a separate file so legacy routing metrics remain
+    /// backwards-compatible.
+    pub fn log_wire(&self, metric: &WireAdherenceMetric) -> Result<()> {
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let log_file = self.metrics_dir.join(format!("wire-{today}.jsonl"));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file)
+            .with_context(|| format!("Failed to open wire metrics log: {}", log_file.display()))?;
+        let json = serde_json::to_string(metric).context("Failed to serialize wire metric")?;
+        writeln!(file, "{json}").context("Failed to write wire metric")?;
+        Ok(())
+    }
+
+    pub fn read_wire_metrics(&self, date: &str) -> Result<Vec<WireAdherenceMetric>> {
+        let log_file = self.metrics_dir.join(format!("wire-{date}.jsonl"));
+        if !log_file.exists() {
+            return Ok(Vec::new());
+        }
+        let contents = fs::read_to_string(&log_file)
+            .with_context(|| format!("Failed to read wire metrics: {}", log_file.display()))?;
+        contents
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to parse wire metrics")
     }
 
     /// Hash a query for privacy (SHA256)
@@ -152,5 +183,16 @@ mod tests {
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, hash3);
         assert_eq!(hash1.len(), 64); // SHA256 produces 64 hex chars
+    }
+
+    #[test]
+    fn wire_metrics_use_a_separate_source_free_jsonl_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = MetricsLogger::new(dir.path().to_path_buf()).unwrap();
+        let metric = WireAdherenceMetric::first_pass("xai", "grok", "interactive");
+        logger.log_wire(&metric).unwrap();
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        assert_eq!(logger.read_wire_metrics(&today).unwrap(), vec![metric]);
+        assert!(!dir.path().join(format!("{today}.jsonl")).exists());
     }
 }
