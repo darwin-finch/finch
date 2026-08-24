@@ -118,8 +118,13 @@ fn complete_forth_wire_tokens(source: &str, final_boundary: bool) -> Result<Vec<
                 None => break,
             }
         }
-        if source[start..].starts_with("s\"\"\"") {
-            let content_start = start + 4;
+        if source[start..].starts_with("s\"\"\"") || source[start..].starts_with("\"\"\"") {
+            let content_start = start
+                + if source[start..].starts_with("s\"\"\"") {
+                    4
+                } else {
+                    3
+                };
             match source[content_start..].find("\"\"\"") {
                 Some(offset) => {
                     cursor = content_start + offset + 3;
@@ -130,12 +135,17 @@ fn complete_forth_wire_tokens(source: &str, final_boundary: bool) -> Result<Vec<
                 None => break,
             }
         }
-        // `s"..."` pushes a string and standard Forth `."..."` emits one.
-        // Both use the same escaping and optional single-space delimiter, so
-        // the wire receiver must keep either form intact while it is streamed.
-        if source[start..].starts_with("s\"") || source[start..].starts_with(".\"") {
-            cursor += 2;
-            if cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        // Bare `"..."` and `s"..."` push strings; standard Forth `."..."`
+        // emits one. Keep all three forms intact while the provider stream is
+        // incomplete. Only conventional Forth prefixes discard a delimiter
+        // space after the quote.
+        if source[start..].starts_with("s\"")
+            || source[start..].starts_with(".\"")
+            || source[start..].starts_with('"')
+        {
+            let prefixed = source[start..].starts_with("s\"") || source[start..].starts_with(".\"");
+            cursor += if prefixed { 2 } else { 1 };
+            if prefixed && cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
                 cursor += 1;
             }
             let mut escaped = false;
@@ -1115,8 +1125,8 @@ mod tests {
         assert!(!prompt.contains("12345"));
         assert!(prompt.contains("otherwise treats the source as Forth"));
         assert!(prompt.contains("get_language_definition"));
-        assert!(prompt.contains("s\"response\" say"));
-        assert!(prompt.contains("s\"\"\"text\"\"\""));
+        assert!(prompt.contains("\"response\" say"));
+        assert!(prompt.contains("\"\"\"text\"\"\""));
         assert!(prompt.contains("if-some ... else ... then"));
         assert!(prompt.contains(": factorial ( S int -- S int ! {} )"));
         assert!(prompt.contains("begin condition while ... repeat"));
@@ -1173,6 +1183,34 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unterminated"));
+    }
+
+    #[test]
+    fn forth_wire_buffer_keeps_bare_quoted_strings_atomic() {
+        let mut buffer = ForthWireBuffer::default();
+        assert!(buffer.push("\"hello").unwrap().is_empty());
+        assert_eq!(
+            buffer.push(" world\" say ").unwrap(),
+            vec![
+                ForthWireToken {
+                    start_byte: 0,
+                    end_byte: 13,
+                    source: "\"hello world\"".into(),
+                },
+                ForthWireToken {
+                    start_byte: 14,
+                    end_byte: 17,
+                    source: "say".into(),
+                },
+            ]
+        );
+
+        let mut raw = ForthWireBuffer::default();
+        assert!(raw.push("\"\"\"hello ").unwrap().is_empty());
+        assert_eq!(
+            raw.push("world\"\"\" ").unwrap()[0].source,
+            "\"\"\"hello world\"\"\""
+        );
     }
 
     #[test]

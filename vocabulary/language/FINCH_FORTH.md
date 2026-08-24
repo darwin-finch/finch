@@ -296,9 +296,11 @@ For prose or copied text containing quotes/newlines, use a raw triple-quoted lit
 are verbatim until the next `"""`; it has no escapes and preserves all leading whitespace:
 
 ```forth
-s"""The user said "hello".
+"""The user said "hello".
 Second line.""" say
 ```
+
+`s"""..."""` remains a compatible spelling.
 
 The delimiter `"""` itself cannot appear in a raw literal; split the text into ordinary typed
 string operations if it is needed.

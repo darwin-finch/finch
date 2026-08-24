@@ -2326,8 +2326,8 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
         // The contents are verbatim (including newlines and ordinary quotes)
         // until the next `"""`; use it for model/user prose that would make
         // ordinary escaping needlessly fragile.
-        if source[start..].starts_with("s\"\"\"") {
-            cursor += 4;
+        if source[start..].starts_with("s\"\"\"") || source[start..].starts_with("\"\"\"") {
+            cursor += if source[start..].starts_with("s\"\"\"") { 4 } else { 3 };
             let (value, end) = read_raw_string(
                 source_id,
                 source,
@@ -3300,6 +3300,27 @@ mod tests {
         let module = compile_forth(
             "input.forth",
             "s\"\"\"The user said \"hello\".\nSecond line.\"\"\"",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .unwrap();
+        assert_eq!(
+            stack,
+            vec![TypedValue::String(
+                "The user said \"hello\".\nSecond line.".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn bare_raw_string_literal_preserves_quotes_and_newlines_without_escaping() {
+        let module = compile_forth(
+            "input.forth",
+            "\"\"\"The user said \"hello\".\nSecond line.\"\"\"",
             Vec::new(),
             &core_vocabulary(),
         )

@@ -31,24 +31,26 @@ Programs may include an explicit `language` field whose value is `lisp` or `fort
 the compact submission boundary, Finch infers Lisp only when the first non-whitespace character is
 `(` and otherwise treats the source as Forth. **Default to Lisp** for model-authored programs,
 including ordinary user-facing responses: `(say "response")`. Use Co-Forth only when incremental
-wire buffering or a short, already-obvious stack pipeline is materially useful; `s"response" say`
-is its equivalent. Repeat `say` for progressive output. Both languages compile to one internal
+wire buffering or a short, already-obvious stack pipeline is materially useful; `"response" say`
+is its equivalent. `s"response" say` remains a familiar Forth-compatible spelling. Repeat `say`
+for progressive output. Both languages compile to one internal
 typed stack IR. Never emit internal IR or CLIF.
 
 Standard Co-Forth `."response"` is also accepted as output shorthand and lowers to
-`s"response" say`. `s"..."` by itself is only a string value; use it without `say` when passing
-text to another typed word such as `path`, `str-cat`, or `process-run`.
+`"response" say`. Bare `"..."` (preferred) and `s"..."` (compatible) each push only a typed
+string; use either without `say` when passing text to another typed word such as `path`,
+`str-cat`, or `process-run`.
 
 `say` appends its text **exactly** to the current response output; it inserts no space and no
 newline. When emitting more than one chunk, include the separator yourself. For example, emit
-`s"result: " say 2 3 + int-to-string say s"\n" say` rather than expecting a space after `5`.
+`"result: " say 2 3 + int-to-string say "\n" say` rather than expecting a space after `5`.
 Prefer one `say` for an ordinary short response; use several only when progressive output is
 intentional.
 
-For ordinary Co-Forth strings, both `s"text"` and conventional `s" text"` mean exactly `text`;
-the single delimiter space is discarded. Escape `\"`, `\\`, `\n`, `\r`, and `\t` in that short
-form. For prose containing ordinary quotes or newlines, use the verbatim form
-`s"""text"""` (no escapes; it ends at the next `"""`). Use `if-some ... else ... then` or Lisp
+For ordinary Co-Forth strings, use bare `"text"`; `s"text"` and conventional `s" text"` also
+mean exactly `text` and discard the single delimiter space. Escape `\"`, `\\`, `\n`, `\r`, and
+`\t` in the short form. For prose containing ordinary quotes or newlines, use the verbatim form
+`"""text"""` (or compatible `s"""text"""`; no escapes; it ends at the next `"""`). Use `if-some ... else ... then` or Lisp
 `match-option` to consume `option<T>` without speculative `unwrap` calls.
 
 Co-Forth collections are typed values, not JSON-by-default: `[1, 2, 3]` is a homogeneous
