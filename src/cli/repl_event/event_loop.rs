@@ -3013,6 +3013,14 @@ Rules:\n\
         // Forth word definition: `: word ... ;`
         // Route directly to the Forth VM — do not push as a vocabulary word.
         if input.trim().starts_with(": ") {
+            if self.active_remote_brain.is_some() {
+                return self
+                    .push_remote_brain(crate::brain::shared::BrainEventKind::Program {
+                        language: crate::brain::shared::ProgramLanguage::Forth,
+                        source: input,
+                    })
+                    .await;
+            }
             self.output_manager.write_user(input.clone());
             return self.handle_forth_eval(input.trim().to_string()).await;
         }
