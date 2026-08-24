@@ -2870,11 +2870,6 @@ Rules:\n\
         language: crate::programs::ProgramLanguage,
         source: String,
     ) -> Result<()> {
-        self.program_runtime.grant_typed_capability(crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::SessionEmit,
-            selector: crate::vm::ResourceSelector::None,
-        })?;
-
         let source_unit = self.output_manager.start_work_unit("typed program");
         source_unit.set_program_source(language.as_str());
         source_unit.set_response(source.clone());
@@ -2904,10 +2899,19 @@ Rules:\n\
         let runtime = Arc::clone(&self.program_runtime);
         let event_tx = self.event_tx.clone();
         tokio::spawn(async move {
-            let result = runtime
-                .submit_with_deferred_program_effects(submission, sink)
+            let result = async {
+                let outcome = runtime
+                    .submit_with_deferred_program_effects(submission, sink)
+                    .await?;
+                super::query_processor::resume_interactive_boundaries(
+                    &runtime,
+                    event_tx.clone(),
+                    outcome,
+                )
                 .await
-                .map_err(|error| error.to_string());
+            }
+            .await
+            .map_err(|error: anyhow::Error| error.to_string());
             let _ = event_tx.send(ReplEvent::TypedProgramComplete {
                 output_unit,
                 result,

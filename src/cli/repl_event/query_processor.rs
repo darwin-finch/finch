@@ -94,7 +94,7 @@ async fn execute_direct_wire_response(
 /// resume automatically; capability requests wait for a structured dialog
 /// choice and then resume the exact retained continuation. Source is never
 /// resubmitted, so approval cannot duplicate prior output or host effects.
-async fn resume_interactive_boundaries(
+pub(super) async fn resume_interactive_boundaries(
     runtime: &crate::runtime::ProgramRuntime,
     event_tx: mpsc::UnboundedSender<ReplEvent>,
     mut outcome: crate::runtime::outcome::ExecutionOutcome,
