@@ -2660,6 +2660,28 @@ mod tests {
     }
 
     #[test]
+    fn nested_macro_expansion_origins_preserve_the_full_definition_chain() {
+        let source = "(define-syntax (inc value) (+ value 1))\n\
+                      (define-syntax (twice value) (inc (inc value)))\n\
+                      (twice 40)";
+        let module = compile_lisp("nested-macros.lisp", source, Vec::new(), &core_vocabulary())
+            .expect("nested macro program compiles");
+        let main = &module.module.functions["main"];
+        let call = main
+            .blocks
+            .values()
+            .flat_map(|block| block.instructions.iter())
+            .find(|located| {
+                matches!(located.instruction, Instruction::Call { ref function } if function == "+")
+            })
+            .expect("expanded arithmetic call");
+        let twice = call.origin.expansion.as_ref().expect("outer macro ancestry");
+        assert_eq!(twice.word.as_deref(), Some("macro twice"));
+        let inc = twice.expansion.as_ref().expect("nested macro ancestry");
+        assert_eq!(inc.word.as_deref(), Some("macro inc"));
+    }
+
+    #[test]
     fn rejects_template_macros_that_introduce_a_binding_form() {
         let errors = compile_lisp(
             "input.lisp",
