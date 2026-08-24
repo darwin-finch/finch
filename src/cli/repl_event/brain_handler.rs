@@ -1,4 +1,4 @@
-// In-process and daemon brain session handlers for EventLoop.
+// In-process context-gathering and durable Brain session handlers for EventLoop.
 //
 // This file is included verbatim into src/cli/repl_event/event_loop.rs by:
 //
@@ -18,12 +18,9 @@
 //   handle_brain_question   — shows dialog for in-process brain question
 //   handle_brain_proposed_action — shows Yes/No dialog for brain action
 //
-// impl EventLoop (daemon brain):
+// impl EventLoop (durable Brain sessions):
 //   handle_brains_list      — /brains: lists authoritative named Brains
-//   poll_daemon_brains      — 500ms poll: detects state transitions
-//   update_brain_status_bar — updates status bar brain count
-//   show_daemon_brain_question — shows question dialog from daemon brain
-//   show_daemon_brain_plan  — shows plan approval dialog from daemon brain
+//   handle_brain_archive    — archives an inactive named Brain
 
 // ── In-process brain handlers ─────────────────────────────────────────────────
 
@@ -79,7 +76,8 @@ impl EventLoop {
             return Ok(());
         }
 
-        self.show_brain_question_dialog(question, options, response_tx).await
+        self.show_brain_question_dialog(question, options, response_tx)
+            .await
     }
 
     /// Actually show the brain question dialog in TUI and store the response channel.
@@ -124,7 +122,8 @@ impl EventLoop {
     pub(super) async fn maybe_show_deferred_brain_question(&mut self) -> Result<()> {
         if let Some((question, options, response_tx)) = self.deferred_brain_question.take() {
             tracing::debug!("[EVENT_LOOP] Showing deferred brain question now that user is idle");
-            self.show_brain_question_dialog(question, options, response_tx).await?;
+            self.show_brain_question_dialog(question, options, response_tx)
+                .await?;
         }
         Ok(())
     }
@@ -180,10 +179,6 @@ impl EventLoop {
 // ── Daemon brain command handlers ─────────────────────────────────────────────
 
 impl EventLoop {
-    fn ipc(&self) -> Option<&crate::ipc::IpcClient> {
-        self.ipc_client.as_ref()
-    }
-
     /// Register the frontend's home Brain in the daemon's durable named store.
     /// The frontend remains the environment-owning runner.
     async fn register_home_brain(&self) -> Result<bool> {
@@ -196,33 +191,6 @@ impl EventLoop {
             .await?
             .error_for_status()?;
         Ok(true)
-    }
-
-    /// Handle `/brain <task>` — spawn a brain in the daemon.
-    async fn handle_brain_spawn(&mut self, task: String) -> Result<()> {
-        let Some(ipc) = self.ipc() else {
-            self.output_manager
-                .write_info("⚠️  Daemon not connected — brain sessions require the daemon.");
-            return self.render_tui().await;
-        };
-
-        match ipc.spawn_brain(&task, None).await {
-            Ok(id) => {
-                let name: String = task.chars().take(30).collect();
-                self.output_manager.write_info(format!(
-                    "🧠 Brain '{}' started (id: {})",
-                    name, id
-                ));
-                self.known_brain_states.insert(id, crate::server::BrainState::Running);
-                self.update_brain_status_bar().await;
-            }
-            Err(e) => {
-                self.output_manager
-                    .write_info(format!("⚠️  Failed to spawn brain: {}", e));
-            }
-        }
-
-        self.render_tui().await
     }
 
     /// Handle `/brains` — list the daemon's authoritative named Brains.
@@ -319,9 +287,7 @@ impl EventLoop {
         {
             Ok(response) if response.status().is_success() => {
                 let body: serde_json::Value = response.json().await.unwrap_or_default();
-                let destination = body["archived_to"]
-                    .as_str()
-                    .unwrap_or("in-memory archive");
+                let destination = body["archived_to"].as_str().unwrap_or("in-memory archive");
                 self.output_manager
                     .write_info(format!("archived Brain {name} → {destination}"));
             }
@@ -333,250 +299,6 @@ impl EventLoop {
                 .output_manager
                 .write_info(format!("could not archive Brain {name}: {error}")),
         }
-        self.render_tui().await
-    }
-
-    /// Handle `/brain cancel <name-or-id>`.
-    async fn handle_brain_cancel(&mut self, name_or_id: String) -> Result<()> {
-        let Some(ipc) = self.ipc() else {
-            self.output_manager.write_info("⚠️  Daemon not connected.");
-            return self.render_tui().await;
-        };
-
-        let id = if let Ok(id) = name_or_id.parse::<uuid::Uuid>() {
-            id
-        } else {
-            match ipc.list_brains().await {
-                Ok(brains) => match brains.iter().find(|b| b.name == name_or_id) {
-                    Some(b) => b.id,
-                    None => {
-                        self.output_manager
-                            .write_info(format!("⚠️  No brain named '{}'.", name_or_id));
-                        return self.render_tui().await;
-                    }
-                },
-                Err(e) => {
-                    self.output_manager
-                        .write_info(format!("⚠️  Failed to list brains: {}", e));
-                    return self.render_tui().await;
-                }
-            }
-        };
-
-        match self.ipc_client.as_ref().unwrap().cancel_brain(id).await {
-            Ok(()) => {
-                self.known_brain_states.remove(&id);
-                self.output_manager
-                    .write_info(format!("🧠 Brain {} cancelled.", id));
-                self.update_brain_status_bar().await;
-            }
-            Err(e) => {
-                self.output_manager
-                    .write_info(format!("⚠️  Failed to cancel brain: {}", e));
-            }
-        }
-
-        self.render_tui().await
-    }
-
-    // -------------------------------------------------------------------------
-    // Brain polling
-    // -------------------------------------------------------------------------
-
-    /// Poll daemon for active brain state transitions (called every 500ms).
-    async fn poll_daemon_brains(&mut self) -> Result<()> {
-        if self.ipc_client.is_none() {
-            return Ok(());
-        }
-
-        // Phase 1: fetch list (borrow dropped after block)
-        let brains = {
-            match self.ipc_client.as_ref().unwrap().list_brains().await {
-                Ok(b) => b,
-                Err(_) => return Ok(()), // daemon not reachable — non-fatal
-            }
-        };
-
-        let active_count = brains.len();
-        if active_count > 0 {
-            let plural = if active_count == 1 { "brain" } else { "brains" };
-            self.status_bar.update_line(
-                crate::cli::status_bar::StatusLineType::Custom("brains".to_string()),
-                format!("🧠 {} {}", active_count, plural),
-            );
-        } else {
-            self.status_bar
-                .remove_line(&crate::cli::status_bar::StatusLineType::Custom("brains".to_string()));
-            self.known_brain_states.clear();
-            return Ok(());
-        }
-
-        let live_ids: std::collections::HashSet<Uuid> = brains.iter().map(|b| b.id).collect();
-        self.known_brain_states.retain(|id, _| live_ids.contains(id));
-
-        struct Transition {
-            id: Uuid,
-            name: String,
-            state: crate::server::BrainState,
-        }
-        let mut transitions: Vec<Transition> = Vec::new();
-        for summary in &brains {
-            let prev = self.known_brain_states.get(&summary.id).cloned();
-            let new_state = summary.state.clone();
-            self.known_brain_states.insert(summary.id, new_state.clone());
-            if prev.map(|p| p != new_state).unwrap_or(false) {
-                transitions.push(Transition {
-                    id: summary.id,
-                    name: summary.name.clone(),
-                    state: new_state,
-                });
-            }
-        }
-
-        // Phase 2: fetch details for UI-relevant transitions (borrow dropped after each block)
-        struct Detail {
-            id: Uuid,
-            name: String,
-            question: Option<crate::server::brain_registry::PendingQuestionView>,
-            plan: Option<crate::server::brain_registry::PendingPlanView>,
-            final_summary: Option<String>,
-        }
-        let mut details: Vec<Detail> = Vec::new();
-        for t in &transitions {
-            match &t.state {
-                crate::server::BrainState::WaitingForInput
-                | crate::server::BrainState::PlanReady => {
-                    if let Ok(d) = self.ipc_client.as_ref().unwrap().get_brain(t.id).await {
-                        details.push(Detail {
-                            id: t.id,
-                            name: t.name.clone(),
-                            question: d.pending_question,
-                            plan: d.pending_plan,
-                            final_summary: None,
-                        });
-                    }
-                }
-                crate::server::BrainState::Dead => {
-                    if let Ok(d) = self.ipc_client.as_ref().unwrap().get_brain(t.id).await {
-                        details.push(Detail {
-                            id: t.id,
-                            name: t.name.clone(),
-                            question: None,
-                            plan: None,
-                            final_summary: d.final_summary,
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Phase 3: show dialogs / inject summaries (needs &mut self, no ipc_client borrow held)
-        for d in details {
-            if let Some(q) = d.question {
-                self.show_daemon_brain_question(d.id, &d.name, q).await?;
-            } else if let Some(p) = d.plan {
-                self.show_daemon_brain_plan(d.id, &d.name, p).await?;
-            } else if let Some(summary) = d.final_summary {
-                // Brain finished — inject its summary so the next query benefits from it.
-                *self.brain_context.write().await = Some(summary.clone());
-                self.output_manager.write_info(format!(
-                    "🧠 Brain '{}' finished — context ready.",
-                    d.name
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Update status bar brain count from cached state.
-    async fn update_brain_status_bar(&self) {
-        let n = self.known_brain_states.len();
-        if n > 0 {
-            let plural = if n == 1 { "brain" } else { "brains" };
-            self.status_bar.update_line(
-                crate::cli::status_bar::StatusLineType::Custom("brains".to_string()),
-                format!("🧠 {} {}", n, plural),
-            );
-        } else {
-            self.status_bar
-                .remove_line(&crate::cli::status_bar::StatusLineType::Custom("brains".to_string()));
-        }
-    }
-
-    /// Show a dialog for a daemon brain question.
-    async fn show_daemon_brain_question(
-        &mut self,
-        brain_id: Uuid,
-        brain_name: &str,
-        q: crate::server::brain_registry::PendingQuestionView,
-    ) -> Result<()> {
-        use crate::cli::tui::{Dialog, DialogOption};
-
-        let title = format!("Brain \"{}\" asks:\n{}", brain_name, q.question);
-
-        let dialog = if q.options.is_empty() {
-            Dialog::text_input(title, None)
-        } else {
-            let opts: Vec<DialogOption> = q.options.iter().map(DialogOption::new).collect();
-            Dialog::select_with_custom(title, opts)
-        };
-
-        // Store context for when dialog result arrives
-        self.pending_daemon_brain_id = Some(brain_id);
-        self.pending_daemon_brain_question_options = q.options;
-
-        {
-            let mut tui = self.tui_renderer.lock().await;
-            tui.active_dialog = Some(dialog);
-            tui.pending_dialog_result = None;
-        }
-
-        // Write question to scrollback
-        self.output_manager.write_info(format!(
-            "🧠 Brain '{}' asks: {}",
-            brain_name, q.question
-        ));
-        self.render_tui().await
-    }
-
-    /// Show a plan approval dialog for a daemon brain.
-    async fn show_daemon_brain_plan(
-        &mut self,
-        brain_id: Uuid,
-        brain_name: &str,
-        p: crate::server::brain_registry::PendingPlanView,
-    ) -> Result<()> {
-        use crate::cli::tui::{Dialog, DialogOption};
-
-        let opts = vec![
-            DialogOption::new("Approve"),
-            DialogOption::new("Request changes"),
-            DialogOption::new("Reject"),
-        ];
-        let mut dialog = Dialog::select(
-            format!("Brain \"{}\" plan:", brain_name),
-            opts,
-        );
-        // Show plan content in the dialog body
-        dialog.body = Some(p.plan.clone());
-
-        self.pending_daemon_brain_id = Some(brain_id);
-        self.pending_daemon_brain_plan = true;
-        self.pending_daemon_brain_plan_id = Some(brain_id);
-
-        {
-            let mut tui = self.tui_renderer.lock().await;
-            tui.active_dialog = Some(dialog);
-            tui.pending_dialog_result = None;
-        }
-
-        // Write plan to scrollback
-        self.output_manager.write_info(format!(
-            "🧠 Brain '{}' plan:\n{}",
-            brain_name, p.plan
-        ));
         self.render_tui().await
     }
 }

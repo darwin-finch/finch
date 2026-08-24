@@ -314,9 +314,6 @@ pub struct EventLoop {
     /// Data for a pending Co-Forth poset run that is waiting on a confirmation dialog.
     pending_poset_run: Option<PendingPosetRun>,
 
-    /// Known brain states from last poll (Uuid -> BrainState), for transition detection.
-    known_brain_states: std::collections::HashMap<Uuid, crate::server::BrainState>,
-
     /// Per-query tool call history: query_id -> set of "tool_name:input_json" strings.
     /// Used to detect infinite loops (same tool called with same args multiple times).
     tool_call_history:
@@ -324,18 +321,6 @@ pub struct EventLoop {
 
     /// Execution graph for the current (or most recent) query.
     current_graph: Arc<tokio::sync::Mutex<crate::graph::ExecutionGraph>>,
-
-    /// Brain UUID that the REPL is currently waiting for a question/plan from.
-    /// Set when a transition to WaitingForInput/PlanReady is detected.
-    pending_daemon_brain_id: Option<Uuid>,
-
-    /// Oneshot sender for daemon brain question dialog response.
-    pending_daemon_brain_question_tx: Option<tokio::sync::oneshot::Sender<String>>,
-    pending_daemon_brain_question_options: Vec<String>,
-
-    /// Whether the REPL is currently showing a plan dialog for a daemon brain.
-    pending_daemon_brain_plan: bool,
-    pending_daemon_brain_plan_id: Option<Uuid>,
 
     /// Deferred brain question: held when a BrainQuestion arrives while the user
     /// is busy (active query in flight).  Shown when the user becomes idle.
@@ -1317,13 +1302,7 @@ impl EventLoop {
             pending_brain_action_command: None,
             pending_dialog_tx: None,
             pending_poset_run: None,
-            known_brain_states: std::collections::HashMap::new(),
             tool_call_history: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            pending_daemon_brain_id: None,
-            pending_daemon_brain_question_tx: None,
-            pending_daemon_brain_question_options: Vec::new(),
-            pending_daemon_brain_plan: false,
-            pending_daemon_brain_plan_id: None,
             current_graph: Arc::new(tokio::sync::Mutex::new(crate::graph::ExecutionGraph::new())),
             stack,
             poset,
@@ -1864,40 +1843,6 @@ impl EventLoop {
                                     tracing::debug!("[EVENT_LOOP] Brain action denied");
                                     let _ = action_tx.send(None);
                                 }
-                            } else if self.pending_daemon_brain_plan {
-                                // Daemon brain plan response
-                                self.pending_daemon_brain_plan = false;
-                                if let Some(brain_id) = self.pending_daemon_brain_plan_id.take() {
-                                    let (approved, instruction) = match &dialog_result {
-                                        crate::cli::tui::DialogResult::Selected(0) => (true, None),
-                                        crate::cli::tui::DialogResult::CustomText(s) => (false, Some(s.clone())),
-                                        crate::cli::tui::DialogResult::TextEntered(s) => (false, Some(s.clone())),
-                                        _ => (false, None),
-                                    };
-                                    if let Some(ref ipc) = self.ipc_client {
-                                        let _ = ipc.respond_to_brain_plan(
-                                            brain_id,
-                                            approved,
-                                            instruction.as_deref(),
-                                        ).await;
-                                    }
-                                }
-                            } else if let Some(brain_id) = self.pending_daemon_brain_id.take() {
-                                // Daemon brain question response
-                                let opts = std::mem::take(&mut self.pending_daemon_brain_question_options);
-                                let answer = match &dialog_result {
-                                    crate::cli::tui::DialogResult::TextEntered(s) => s.clone(),
-                                    crate::cli::tui::DialogResult::CustomText(s) => s.clone(),
-                                    crate::cli::tui::DialogResult::Selected(idx) => opts
-                                        .get(*idx)
-                                        .cloned()
-                                        .unwrap_or_else(|| format!("option_{}", idx)),
-                                    _ => "[no answer]".to_string(),
-                                };
-                                if let Some(ref ipc) = self.ipc_client {
-                                    let _ = ipc.answer_brain_question(brain_id, &answer).await;
-                                }
-                                tracing::debug!("[EVENT_LOOP] Daemon brain question answered");
                             } else {
                                 // Find which query this dialog was for (tool approval)
                                 let mut approvals = self.pending_approvals.write().await;

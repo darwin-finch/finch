@@ -1124,12 +1124,23 @@ mod tests {
             Command::parse("/brain password new-secret-value"),
             Some(Command::BrainPassword(Some(password))) if password == "new-secret-value"
         ));
-        assert!(matches!(Command::parse("/brain list"), Some(Command::Brains)));
+        assert!(matches!(
+            Command::parse("/brain list"),
+            Some(Command::Brains)
+        ));
         assert!(matches!(Command::parse("/brain ls"), Some(Command::Brains)));
         assert!(matches!(
             Command::parse("/brain archive old-project"),
             Some(Command::BrainArchive(name)) if name == "old-project"
         ));
+        assert!(format_help().contains("/brain list"));
+        assert!(!format_help().contains("Spawn a background research brain"));
+    }
+
+    #[test]
+    fn rejects_legacy_brain_worker_commands() {
+        // A Brain is a detachable session, not a spelling for a background
+        // task. Unknown `/brain` subcommands intentionally fall back to help.
         assert!(matches!(
             Command::parse("/brain investigate flaky tests"),
             Some(Command::Help)
@@ -1138,8 +1149,6 @@ mod tests {
             Command::parse("/brain cancel old-worker"),
             Some(Command::Help)
         ));
-        assert!(format_help().contains("/brain list"));
-        assert!(!format_help().contains("Spawn a background research brain"));
     }
 
     #[test]
