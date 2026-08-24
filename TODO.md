@@ -151,12 +151,35 @@ still blocks the corresponding Brain phase until it is unified.
   Co-Forth `?` early-return an `err` only from a function whose sole declared output is a
   compatible `result<T,E>`. The verifier checks the cold return edge, the interpreter unwinds the
   current frame without replaying effects, and the normal edge retains the unwrapped `ok` value.
-  Keep `match-result`/`if-ok` for recovery and `unwrap` as a deliberate diagnostic trap; do not
-  introduce dynamically catchable language exceptions or silently replay host effects.
-- [ ] After typed result propagation is established, add lexical scope guards (`on-exit`, `on-ok`,
-  `on-err`) as compiler-generated once-only cleanup edges for normal return, result propagation,
-  cancellation, and resumed continuations. They must not imply rollback of journaled external
-  effects or become a dynamically catchable exception system.
+  Keep `match-result`/`if-ok` for expected recovery and `unwrap` as a deliberate diagnostic trap;
+  do not silently replay host effects.
+- [ ] Add statically declared/inferred exception effects for failures whose intermediate callers
+  have no recovery policy. `throws<E>` participates in the one canonical effect row, propagates
+  transitively through ordinary calls, and typed handlers subtract only variants they handle;
+  unchecked Java-style exceptions are not permitted. Keep `option<T>` for ordinary absence and
+  `result<T,E>` for expected alternatives. Cancellation is an unwind reason but is not ordinarily
+  catchable, and verifier traps remain diagnostics rather than source-level exceptions.
+- [ ] Add lexical scope guards (`on-exit`, `on-success`, `on-failure`) as serialized once-only guard
+  records owned by a lexical frame/scope. They run in reverse registration order on actual scope
+  exit, exception propagation, cancellation, or trap as appropriate, but never merely because the
+  execution yields or awaits. Permit explicit dismissal/commit. Guards may perform explicit
+  compensating actions, but must not imply rollback of journaled external effects or conceal the
+  original unwind reason.
+- [ ] Standardize declaration attributes as ordinary namespaced compile-time metadata and bounded
+  `syntax -> syntax` transforms. Built-in and user-defined attributes use the same `@name(...)`
+  lookup, reflection value, hygiene, and wrapper contract; no D-style mixture of magic bare
+  attributes and second-class user annotations. Inputs/outputs and the canonical `! EffectRow`
+  remain callable type structure rather than attributes. Omitted `!` means an inferred empty row;
+  optional `! pure` asserts that the complete row is empty and is verifier-checked.
+- [ ] Generalize concrete host capability enum cases into versioned namespaced capability
+  descriptors with stable unforgeable identity, typed selector/schema metadata, containment, and
+  host binding. User modules may define abstract effects, attributes, wrappers, handlers, and
+  attenuation, but cannot mint host authority by declaring a matching name. Normalize capability,
+  exception, suspension, mutation, and other observable effects into one reflectable row while the
+  broker selects only capability-bearing members for authorization. Preserve the existing broker
+  and generated registry during migration. Spell source rows as `! fs.read<R> | throws<IoError> |
+  yields<Y,Resume>` and canonicalize member order; these become typed effect data rather than
+  privileged parser syntax.
 - [x] Specify and implement the provider wire discriminator: leading `(` selects Lisp and all other
   valid program starts select Co-Forth; make the receiver incrementally tokenize Co-Forth while
   retaining complete-program verification and clear malformed-wire diagnostics.

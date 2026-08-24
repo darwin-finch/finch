@@ -314,18 +314,23 @@ beneath it:
 dup          forall A S. (S A -- S A A) ! pure
 drop         forall A S. (S A -- S) ! pure
 +            forall S.   (S int int -- S int) ! pure
-file.read    forall R S. (S path<R> -- S bytes) ! {fs.read(R)}
-agent.await  forall T S. (S task<T> -- S result<T,agent-error>) ! {agent.await}
-yield        forall Y S. (S Y -- S) ! pure ; typed suspension; unit is a timeslice
+file.read    forall R S. (S path<R> -- S bytes) ! fs.read<R> | throws<IoError>
+agent.await  forall T S. (S task<T> -- S result<T,agent-error>) ! agent.await
+yield        forall Y Resume S. (S Y -- S Resume) ! yields<Y,Resume>
 ```
 
-Here `pure` means that `yield` requires no host capability and performs no durable VM/external
-mutation; it does **not** mean that suspension is observationally invisible. Suspension belongs to
-the separately verified control contract (`yields<Y,Resume>`/`MaySuspend`) because it changes
-callability, scheduling, cancellation, and resumption rather than authority. Optimizers must treat
-it as a control barrier and may not reorder it as an ordinary total pure call. Keeping the two axes
-separate lets a pure producer suspend without falsely acquiring host authority, while introspection
-and diagnostics always display both `! pure` and its `yields<...>` contract together.
+`!` introduces one canonical typed effect row. Capability requirements, exceptions, suspension,
+mutation, nondeterminism, and other observable behavior are distinct tagged members of that row,
+not unrelated annotation systems. The broker selects capability-bearing members for authorization;
+the verifier, optimizer, scheduler, handlers, and generic reflection inspect the whole row. Omitted
+`!` means the inferred row is empty, and `! pure` is optional explicit syntax asserting that complete
+emptiness. A yielding callable is therefore not pure merely because it requires no host authority.
+Optimizers treat `yields<Y,Resume>` as a control barrier, while the scheduler uses its typed payload
+and resumption contract. Source spells row union with `|`, for example
+`! fs.read<R> | throws<IoError> | yields<Progress,unit>`. Within a signature this pipe belongs to the
+effect-row grammar, not general control flow. The reader canonicalizes member order immediately so
+spelling order does not affect type identity. Separate readable clauses may be accepted as surface
+sugar only if they normalize into that same row value.
 
 The signature includes:
 
@@ -334,6 +339,19 @@ The signature includes:
 - control-flow behavior such as return, throw, or suspend;
 - a capability/effect row;
 - optional determinism, allocation, and numeric-overflow properties useful to optimization.
+
+Declaration attributes are separate compile-time metadata, uniformly spelled `@name(...)` for both
+core and user definitions. Core attributes live in explicit namespaces and may be imported into
+short names; user attributes have the same typed reflection and bounded `syntax -> syntax`
+transformation contract. Callable inputs/outputs and `! EffectRow` are type structure rather than
+attributes. There is no D-style mixture of magic bare attributes and second-class user annotations.
+
+Capability requirements should likewise become ordinary versioned typed descriptors rather than a
+permanent closed compiler enum. A host registry supplies the stable unforgeable capability identity,
+selector schema, containment relation, and implementation binding. User modules may define abstract
+effects, handlers, wrappers, attributes, and attenuation, but declaring the same textual name never
+mints host authority. This lets `fs.read(R)` be reflected, structurally matched, and wrapped as typed
+effect-row data while preserving the broker as the authority boundary.
 
 The implementation currently represents type variables in `Type::Variable`, records quantified
 names in `StackSignature::type_parameters`, and substitutes a generic word signature against the
@@ -708,7 +726,35 @@ expression-valued named breaks, where a break target declares its
 result stack row and every reachable break must produce exactly that row. This permits nested-loop
 exits and useful expression-valued loops without allowing a branch to strand intermediate values
 on a caller stack. `for` may be added only as a bounded desugaring to these loop blocks. `try` handles
-typed `result`/diagnostic values; it is not an ambient exception escape hatch around effects.
+typed `result` values today; future exception handlers follow the separate statically typed unwind
+contract below and never catch authorization, replay, or verifier diagnostics indiscriminately.
+
+### Typed failures and scope guards
+
+Finch keeps three distinct failure shapes because they communicate different contracts:
+
+```text
+option<T>       ordinary absence
+result<T,E>     expected recoverable alternative
+throws<E>       exceptional control transfer to an actual recovery policy
+```
+
+`throws<E>` is a tagged member of the callable's canonical effect row. Throwing propagates
+transitively through ordinary calls; a typed handler removes only the variants it handles and leaves
+the remainder in the outward row. There are no unchecked Java-style exceptions. Cancellation uses
+the same internal unwind machinery but is not catchable by ordinary source unless a future
+explicitly privileged control API requires it. A verifier/runtime trap remains a diagnostic, not a
+convenient exception for source to swallow.
+
+Every execution frame may retain lexical guard records containing a trigger (`exit`, `success`, or
+`failure`), a typed closure, source origin, and once-only state. Guards run in reverse registration
+order when that lexical scope actually exits. Yielding, awaiting a host effect, migration between
+workers, or serializing a continuation does not fire them; the continuation carries them until
+normal return, exception propagation, cancellation, or trap unwinds the scope. Explicit dismissal
+supports commit-style compensation. Guards may invoke separately authorized compensating effects,
+but they cannot erase an execute-once journal entry or claim that an external mutation rolled back.
+If a guard fails while another exception is active, retain both with deterministic primary and
+suppressed diagnostics rather than losing the original cause.
 
 ### Dynamic and unsafe boundaries
 
