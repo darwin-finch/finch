@@ -19,9 +19,7 @@
 //   handle_brain_proposed_action — shows Yes/No dialog for brain action
 //
 // impl EventLoop (daemon brain):
-//   handle_brain_spawn      — /brain <task>: spawns brain in daemon
 //   handle_brains_list      — /brains: lists authoritative named Brains
-//   handle_brain_cancel     — /brain cancel <id>: cancels a daemon brain
 //   poll_daemon_brains      — 500ms poll: detects state transitions
 //   update_brain_status_bar — updates status bar brain count
 //   show_daemon_brain_question — shows question dialog from daemon brain

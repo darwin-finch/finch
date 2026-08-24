@@ -1921,9 +1921,6 @@ impl EventLoop {
         // Cleanup interval (30 seconds)
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
 
-        // Brain poll interval (500ms) - polls daemon for active brain state transitions
-        let mut brain_poll_interval = tokio::time::interval(Duration::from_millis(500));
-
         // Flag to control the loop
         let mut should_exit = false;
 
@@ -2287,13 +2284,6 @@ impl EventLoop {
                 // Periodic cleanup
                 _ = cleanup_interval.tick() => {
                     self.cleanup_old_queries().await;
-                }
-
-                // Brain poll (500ms) — detect state transitions in daemon brains
-                _ = brain_poll_interval.tick() => {
-                    if let Err(e) = self.poll_daemon_brains().await {
-                        tracing::debug!("Brain poll error (non-fatal): {}", e);
-                    }
                 }
 
                 // Peer reply — one of the forked event loops responded
@@ -2794,14 +2784,8 @@ Rules:\n\
                         }
                         self.render_tui().await?;
                     }
-                    Command::Brain(task) => {
-                        self.handle_brain_spawn(task).await?;
-                    }
                     Command::Brains => {
                         self.handle_brains_list().await?;
-                    }
-                    Command::BrainCancel(name_or_id) => {
-                        self.handle_brain_cancel(name_or_id).await?;
                     }
                     Command::Graph => {
                         self.handle_graph_command().await?;
@@ -4647,7 +4631,7 @@ Rules:\n\
         }
         self.status_bar.update_line(
             crate::cli::status_bar::StatusLineType::SessionLabel,
-            format!("◆ {}", self.session_label),
+            format!("◆ brain: {} · runner", self.session_label),
         );
         self.render_tui().await
     }

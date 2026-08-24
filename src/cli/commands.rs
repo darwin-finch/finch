@@ -55,10 +55,8 @@ pub enum Command {
     LicenseStatus,           // /license or /license status
     LicenseActivate(String), // /license activate <key>
     LicenseRemove,           // /license remove
-    // Daemon brain sessions
-    Brain(String),                 // /brain <task>  — spawn background research brain
-    Brains,                        // /brains        — list active brain sessions
-    BrainCancel(String),           // /brain cancel <name-or-id>
+    // Durable Brain sessions
+    Brains,                        // /brains — list named, detachable sessions
     BrainAttach(String),           // /brain attach <name@machine[:port]>
     BrainDetach,                   // /brain detach
     BrainPassword(Option<String>), // /brain password [new-password]
@@ -433,7 +431,6 @@ impl Command {
             }
         }
 
-        // Handle /brain cancel <name-or-id>
         if let Some(rest) = trimmed.strip_prefix("/brain attach ") {
             let target = rest.trim();
             if !target.is_empty() {
@@ -446,21 +443,6 @@ impl Command {
                 return Some(Command::BrainPassword(Some(password.to_string())));
             }
         }
-        if let Some(rest) = trimmed.strip_prefix("/brain cancel ") {
-            let name = rest.trim();
-            if !name.is_empty() {
-                return Some(Command::BrainCancel(name.to_string()));
-            }
-        }
-
-        // Handle /brain <task>  (must come after /brain cancel)
-        if let Some(rest) = trimmed.strip_prefix("/brain ") {
-            let task = rest.trim();
-            if !task.is_empty() {
-                return Some(Command::Brain(task.to_string()));
-            }
-        }
-
         // Handle /persona select <name>
         if let Some(rest) = trimmed.strip_prefix("/persona select ") {
             let persona_name = rest.trim();
@@ -732,9 +714,7 @@ pub fn handle_command(
             CommandOutput::Status("License commands should be handled in REPL.".to_string()),
         ),
         // Brain commands are handled directly in REPL
-        Command::Brain(_)
-        | Command::Brains
-        | Command::BrainCancel(_)
+        Command::Brains
         | Command::BrainAttach(_)
         | Command::BrainDetach
         | Command::BrainPassword(_) => Ok(CommandOutput::Status(
@@ -952,17 +932,13 @@ pub fn format_help() -> String {
          {cyan}  /accept <prefix>{reset}   Apply the diff whose id starts with prefix\n\
          {cyan}  /reject [reason]{reset}   Reject the most recent pending diff\n\
          {reset}\n\
-         {yellow_bold}🧠 Daemon Brain Sessions:{reset}\n\
-         {cyan}  /brain <task>{reset}      Spawn a background research brain\n\
-         {gray}                     Example: /brain investigate why auth tests are flaky{reset}\n\
-         {cyan}  /brain list{reset}        List active brain sessions ({gray}/brains{reset} also works)\n\
-         {cyan}  /brain cancel <n>{reset}  Cancel a brain by name or id\n\
+         {yellow_bold}🧠 Detachable Brains:{reset}\n\
+         {cyan}  /brain list{reset}        List named Brain sessions ({gray}/brains{reset} also works)\n\
          {cyan}  /brain attach <brain@machine>{reset}  Attach to a named remote brain\n\
-         {cyan}  /brain detach{reset}      Return to this local session\n\
+         {cyan}  /brain detach{reset}      Return to this console's home Brain\n\
          {cyan}  /brain password [new]{reset} Show or rotate the local brain credential\n\
          {reset}\n\
-         {gray}  Brains run in the daemon and survive REPL disconnects.{reset}\n\
-         {gray}  When a brain has a question or plan, a dialog appears in the REPL.{reset}\n\n\
+         {gray}  A Brain is one durable session; agents and scheduled work are runs within it.{reset}\n\n\
          {yellow_bold}📚 Learn More:{reset}\n\
          {cyan}  GitHub:{reset}   https://github.com/darwin-finch/finch\n\
          {cyan}  Issues:{reset}   https://github.com/darwin-finch/finch/issues\n\
@@ -1141,7 +1117,16 @@ mod tests {
         ));
         assert!(matches!(Command::parse("/brain list"), Some(Command::Brains)));
         assert!(matches!(Command::parse("/brain ls"), Some(Command::Brains)));
+        assert!(matches!(
+            Command::parse("/brain investigate flaky tests"),
+            Some(Command::Help)
+        ));
+        assert!(matches!(
+            Command::parse("/brain cancel old-worker"),
+            Some(Command::Help)
+        ));
         assert!(format_help().contains("/brain list"));
+        assert!(!format_help().contains("Spawn a background research brain"));
     }
 
     #[test]
