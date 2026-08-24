@@ -19,8 +19,9 @@ use crate::vm::{
     TypedSuspension, TypedValue, VmDiagnostic, VmSideEffect,
 };
 use crate::vm::vocabulary::{
-    agent_task_result_type, agent_task_snapshot_type, agent_task_spec_type, core_word_spec,
-    tree_entry_type, tree_listing_type, CoreHostBinding, CoreWordImplementation,
+    agent_task_result_type, agent_task_snapshot_type, agent_task_spec_type,
+    capability_grant_entry_type, core_word_spec, tree_entry_type, tree_listing_type,
+    CoreHostBinding, CoreWordImplementation,
 };
 use anyhow::{bail, Context, Result};
 use automation::AutomationBroker;
@@ -1184,6 +1185,45 @@ impl ProgramRuntime {
             });
         let inherited = attenuate_effects(&reusable, &caller.grant_ceiling);
         Ok(inherited.union(&task_grants))
+    }
+
+    /// Resolve host-issued grant identities into a child creation-time
+    /// ceiling. IDs are only lookup keys: every spawn rechecks live policy,
+    /// caller scope, expiry/revocation, and the caller's existing ceiling.
+    pub(crate) fn resolve_capability_grant_subset(
+        &self,
+        caller: Option<&scheduler::AgentIdentity>,
+        grant_ids: &[uuid::Uuid],
+    ) -> Result<EffectSet> {
+        let context = self.authorization_context_for(caller)?;
+        let available = self.effective_grants_for(caller)?;
+        let ledger = self
+            .capability_ledger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?;
+        let applicable = ledger
+            .grants
+            .active_grants_for(&context)
+            .map(|grant| (grant.id, &grant.requirement))
+            .collect::<HashMap<_, _>>();
+        let mut seen = std::collections::HashSet::new();
+        let mut selected = TypedRuntime::intrinsic_grants();
+        for grant_id in grant_ids {
+            if !seen.insert(*grant_id) {
+                bail!("capability grant {grant_id} was selected more than once");
+            }
+            let requirement = applicable.get(grant_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "capability grant {grant_id} is unknown, inactive, or outside the caller scope"
+                )
+            })?;
+            let requested = EffectSet::from_requirement((*requirement).clone());
+            if !available.grants(&requested) {
+                bail!("capability grant {grant_id} exceeds the caller's inherited ceiling");
+            }
+            selected = selected.union(&requested);
+        }
+        Ok(selected)
     }
 
     fn authorization_context_for(
@@ -3125,6 +3165,39 @@ fn typed_agent_task_spec(
             ))
         }
     };
+    let capability_grant_ids = match field("capabilities")? {
+        TypedValue::List { values, .. } => values
+            .iter()
+            .map(|value| {
+                let TypedValue::Resource {
+                    kind,
+                    handle,
+                    generation,
+                } = value
+                else {
+                    return Err(host_binding_error(
+                        origin,
+                        "agent capability selection requires capability-grant resources",
+                    ));
+                };
+                if kind != "capability-grant" || *generation != 0 {
+                    return Err(host_binding_error(
+                        origin,
+                        "agent capability selection contains an invalid grant resource",
+                    ));
+                }
+                uuid::Uuid::parse_str(handle).map_err(|_| {
+                    host_binding_error(origin, "capability-grant resource has an invalid handle")
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, VmDiagnostic>>()?,
+        _ => {
+            return Err(host_binding_error(
+                origin,
+                "agent task field 'capabilities' must be a list of capability-grant resources",
+            ))
+        }
+    };
     Ok(scheduler::AgentTaskSpec {
         task: string("task")?,
         role,
@@ -3132,6 +3205,7 @@ fn typed_agent_task_spec(
         provider: optional(string("provider")?),
         model: optional(string("model")?),
         context,
+        capability_grant_ids: Some(capability_grant_ids),
         budget: scheduler::AgentBudget {
             max_turns,
             timeout_ms,
@@ -3486,6 +3560,40 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 if origin.word.as_deref() == Some("vm-vocabulary") {
                     return Ok(vec![TypedValue::String(self.vocabulary.clone())]);
                 }
+                if origin.word.as_deref() == Some("capability-list") {
+                    let ledger = self.authorization.ledger.lock().map_err(|_| {
+                        host_binding_error(origin, "capability ledger lock poisoned")
+                    })?;
+                    let values = ledger
+                        .grants
+                        .active_grants_for(&self.authorization.context)
+                        .filter(|grant| {
+                            self.network_grants.grants(&EffectSet::from_requirement(
+                                grant.requirement.clone(),
+                            ))
+                        })
+                        .map(|grant| {
+                            let requirement = serde_json::to_value(&grant.requirement).map_err(
+                                |error| host_binding_error(origin, error.to_string()),
+                            )?;
+                            Ok(TypedValue::Record(vec![
+                                (
+                                    "grant".into(),
+                                    TypedValue::Resource {
+                                        kind: "capability-grant".into(),
+                                        handle: grant.id.to_string(),
+                                        generation: 0,
+                                    },
+                                ),
+                                ("requirement".into(), TypedValue::Json(requirement)),
+                            ]))
+                        })
+                        .collect::<std::result::Result<Vec<_>, VmDiagnostic>>()?;
+                    return Ok(vec![TypedValue::List {
+                        element_type: capability_grant_entry_type(),
+                        values,
+                    }]);
+                }
                 return Err(host_binding_error(
                     origin,
                     "unknown VM inspection operation",
@@ -3778,6 +3886,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         provider: None,
                         model: None,
                         context: Vec::new(),
+                        capability_grant_ids: None,
                         budget: Default::default(),
                     }
                 };

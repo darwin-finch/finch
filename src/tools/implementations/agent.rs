@@ -102,6 +102,7 @@ impl Tool for AgentSpawnTool {
                     provider: optional_string(&input, "provider")?,
                     model: optional_string(&input, "model")?,
                     context: context_references(&input)?,
+                    capability_grant_ids: None,
                     budget,
                 },
                 self.parent.as_ref(),

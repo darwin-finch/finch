@@ -32,6 +32,7 @@ pub struct CoreWordDocumentation {
 pub enum CoreHostBinding {
     SessionEmit,
     VmVocabulary,
+    CapabilityList,
     FileRead,
     FileHash,
     TreeList,
@@ -147,7 +148,8 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "schedule-create" => CoreWordDocumentation { summary: "Create a capability-bound scheduled event using a callback descriptor and time. Scheduled work never gains new authority when it fires.", lisp: "(schedule-create callback when)", forth: "callback when schedule-create", example: "(schedule-create \"daily-summary\" 1770000000)" },
         "schedule-get" => CoreWordDocumentation { summary: "Inspect one opaque schedule handle. Returns some(json) while the host still knows the schedule, or none; callback authority remains redacted inside its host-owned context.", lisp: "(schedule-get schedule)", forth: "schedule schedule-get", example: "(schedule-get (schedule-create \"daily-summary\" 1770000000))" },
         "schedule-cancel" => CoreWordDocumentation { summary: "Cancel one pending opaque schedule handle without deleting its durable record. Returns false if it was unknown or no longer pending.", lisp: "(schedule-cancel schedule)", forth: "schedule schedule-cancel", example: "(schedule-cancel schedule)" },
-        "vm-vocabulary" => CoreWordDocumentation { summary: "Return the serialized current typed vocabulary. Use the external search_vm_vocabulary/describe_vm_word tools for compact targeted discovery.", lisp: "(vm-vocabulary)", forth: "vm-vocabulary", example: "(say (vm-vocabulary))" },
+        "vm-vocabulary" => CoreWordDocumentation { summary: "Return the serialized current typed vocabulary. Use search_word/inspect_word for compact targeted discovery.", lisp: "(vm-vocabulary)", forth: "vm-vocabulary", example: "(say (vm-vocabulary))" },
+        "capability-list" => CoreWordDocumentation { summary: "List reusable grants applicable to this ProgramRun as metadata paired with opaque capability-grant resources. The resource, not its printed UUID or JSON metadata, is the selectable authority reference.", lisp: "(capability-list)", forth: "capability-list", example: "(capability-list)" },
         "automation-availability" | "automation-displays" | "automation-windows" | "automation-click" | "automation-type" => CoreWordDocumentation { summary: "Inspect or operate desktop automation through the host adapter. Availability and every concrete target remain capability-checked at the execution boundary.", lisp: "(automation-availability), (automation-click x y button count), (automation-type text delay)", forth: "automation-availability; x y button count automation-click; text delay automation-type", example: "(automation-availability)" },
         "list-length" | "list-get" | "list-append" | "list-uncons" => CoreWordDocumentation { summary: "Inspect or immutably decompose/extend a homogeneous typed list. list-uncons returns none for empty or some(record{head:A,tail:list<A>}); list-append returns a replacement list.", lisp: "(list-length items), (list-get items index), (list-append items value), (list-uncons items)", forth: "items list-length; items index list-get; items value list-append; items list-uncons", example: "(match-option (list-uncons (list 4 8)) (some pair (unwrap (record-get pair \"head\"))) (none 0))" },
         "map-get" | "map-set" | "map-keys" | "map-entries" | "map-length" => CoreWordDocumentation { summary: "Inspect or immutably update a typed map. map-get returns option<V>; map-set returns a replacement map; map-entries returns insertion-ordered key/value typed records. None mutates a shared value.", lisp: "(map-get map key), (map-set map key value), (map-keys map), (map-entries map), (map-length map)", forth: "map key map-get; map key value map-set; map map-keys; map map-entries; map map-length", example: "(unwrap (record-get (list-get (map-entries (map \"answer\" 42)) 0) \"value\"))" },
@@ -246,9 +248,20 @@ pub fn agent_task_spec_type() -> Type {
                 ("sha256".into(), Type::String),
             ])),
         ),
+        (
+            "capabilities".into(),
+            Type::list(Type::Resource("capability-grant".into())),
+        ),
         ("max-turns".into(), Type::Int),
         ("timeout-ms".into(), Type::Int),
         ("max-output-bytes".into(), Type::Int),
+    ])
+}
+
+pub fn capability_grant_entry_type() -> Type {
+    Type::Record(vec![
+        ("grant".into(), Type::Resource("capability-grant".into())),
+        ("requirement".into(), Type::Json),
     ])
 }
 
@@ -997,6 +1010,14 @@ fn core_signatures() -> Vocabulary {
             ),
         ),
         (
+            "capability-list".into(),
+            capability(
+                Vec::new(),
+                vec![Type::list(capability_grant_entry_type())],
+                unscoped(CapabilityKind::VmRead),
+            ),
+        ),
+        (
             "process-run".into(),
             capability(
                 vec![Type::String, Type::list(Type::String)],
@@ -1263,6 +1284,7 @@ static CORE_WORD_REGISTRY: Lazy<BTreeMap<String, CoreWordSpec>> = Lazy::new(|| {
                 _ if signature.effects.is_pure() => CoreWordImplementation::Interpreter,
                 "say" | "emit" => CoreWordImplementation::HostEffect(CoreHostBinding::SessionEmit),
                 "vm-vocabulary" => CoreWordImplementation::HostEffect(CoreHostBinding::VmVocabulary),
+                "capability-list" => CoreWordImplementation::HostEffect(CoreHostBinding::CapabilityList),
                 "file-read" | "host-file-read" => CoreWordImplementation::HostEffect(CoreHostBinding::FileRead),
                 "file-hash" => CoreWordImplementation::HostEffect(CoreHostBinding::FileHash),
                 "tree-list" => CoreWordImplementation::HostEffect(CoreHostBinding::TreeList),

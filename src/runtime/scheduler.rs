@@ -191,6 +191,11 @@ pub struct AgentTaskSpec {
     pub model: Option<String>,
     #[serde(default)]
     pub context: Vec<AgentContextReference>,
+    /// `None` inherits the caller's full creation-time ceiling (the compact
+    /// `agent-spawn` convenience). `Some`, including an empty set, is an
+    /// explicit selection of live opaque grant references.
+    #[serde(default)]
+    pub capability_grant_ids: Option<Vec<Uuid>>,
     #[serde(default)]
     pub budget: AgentBudget,
 }
@@ -340,7 +345,12 @@ impl AgentScheduler {
         }
         let task_id = Uuid::new_v4();
         let agent_id = Uuid::new_v4();
-        let grant_ceiling = self.runtime.effective_grants_for(parent)?;
+        let grant_ceiling = match &spec.capability_grant_ids {
+            Some(grant_ids) => self
+                .runtime
+                .resolve_capability_grant_subset(parent, grant_ids)?,
+            None => self.runtime.effective_grants_for(parent)?,
+        };
         let vm_revision = self.runtime.revision();
         let manifest_generation = self.runtime.manifest_generation();
         let starting_context_hash = starting_context_hash(
@@ -643,6 +653,7 @@ fn starting_context_hash(
         vm_revision,
         manifest_generation,
         &spec.context,
+        &spec.capability_grant_ids,
         grant_ceiling,
     ))?;
     Ok(format!("{:x}", Sha256::digest(encoded)))
@@ -791,6 +802,7 @@ mod tests {
                         id: "report-1".into(),
                         sha256: "a".repeat(64),
                     }],
+                    capability_grant_ids: None,
                     budget: AgentBudget::default(),
                 },
                 None,
@@ -830,6 +842,7 @@ mod tests {
                     provider: None,
                     model: None,
                     context: Vec::new(),
+                    capability_grant_ids: None,
                     budget: AgentBudget {
                         max_turns: 0,
                         ..AgentBudget::default()
@@ -862,6 +875,7 @@ mod tests {
                         id: "report-1".into(),
                         sha256: "not-a-hash".into(),
                     }],
+                    capability_grant_ids: None,
                     budget: AgentBudget::default(),
                 },
                 None,
@@ -885,6 +899,7 @@ mod tests {
                 id: "report-1".into(),
                 sha256: "a".repeat(64),
             }],
+            capability_grant_ids: None,
             budget: AgentBudget::default(),
         };
         let first = starting_context_hash(&spec, None, "echo", 7, 3, &EffectSet::pure()).unwrap();
@@ -992,7 +1007,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Completed
+            crate::runtime::outcome::ExecutionStatus::Completed,
+            "{:?}",
+            outcome.diagnostics
         );
         assert_eq!(scheduler.tasks.read().await.len(), 1);
     }
@@ -1050,6 +1067,7 @@ mod tests {
                     :kind "artifact"
                     :id "failure-log"
                     :sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" })
+                :capabilities (empty-list resource<capability-grant>)
                 :max-turns 2
                 :timeout-ms 10000
                 :max-output-bytes 4096 }))"#;
@@ -1103,6 +1121,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_agent_spec_attenuates_to_selected_opaque_grant() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        let file_read = CapabilityRequirement::file(
+            crate::vm::FileOperation::Read,
+            crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+        );
+        runtime.grant_typed_capability(file_read.clone()).unwrap();
+        grant_agent_capabilities(&runtime);
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(EchoGenerator)),
+            Arc::clone(&runtime),
+        );
+        let source = r#"(let ((grant-entry (list-get (capability-list) 0)))
+            (agent-spawn-with {
+                :task "inspect one file"
+                :role "explore"
+                :background ""
+                :provider ""
+                :model ""
+                :context-refs (empty-list record{kind:string,id:string,sha256:string})
+                :capabilities (list (unwrap (record-get grant-entry "grant")))
+                :max-turns 2
+                :timeout-ms 10000
+                :max-output-bytes 4096 }))"#;
+        let outcome = runtime
+            .submit(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Lisp,
+                source_id: None,
+                source: source.to_string(),
+                intent: "spawn with one selected grant".to_string(),
+                effect: crate::programs::ExecutionEffect::VmWrite,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: None,
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Completed,
+            "{:?}",
+            outcome.diagnostics
+        );
+        let tasks = scheduler.tasks.read().await;
+        let identity = &tasks.values().next().expect("one child").snapshot.identity;
+        assert!(identity
+            .grant_ceiling
+            .grants(&EffectSet::from_requirement(file_read)));
+        assert!(!identity.grant_ceiling.grants(&EffectSet::from_requirement(
+            CapabilityRequirement {
+                capability: CapabilityKind::AgentSpawn,
+                selector: ResourceSelector::None,
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn forged_capability_grant_id_is_rejected_before_task_creation() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(EchoGenerator)),
+            Arc::clone(&runtime),
+        );
+        let error = scheduler
+            .spawn(
+                AgentTaskSpec {
+                    task: "inspect".into(),
+                    role: AgentRole::General,
+                    background: None,
+                    provider: None,
+                    model: None,
+                    context: Vec::new(),
+                    capability_grant_ids: Some(vec![Uuid::new_v4()]),
+                    budget: AgentBudget::default(),
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown, inactive, or outside"));
+        assert!(scheduler.tasks.read().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn typed_agent_spec_routes_model_selection_through_the_resolver() {
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
@@ -1117,6 +1220,7 @@ mod tests {
             :provider ""
             :model "not-configured"
             :context-refs (empty-list record{kind:string,id:string,sha256:string})
+            :capabilities (empty-list resource<capability-grant>)
             :max-turns 2
             :timeout-ms 10000
             :max-output-bytes 4096 })"#;
@@ -1160,6 +1264,7 @@ mod tests {
             provider: ""
             model: ""
             context-refs: empty-list<record{kind:string,id:string,sha256:string}>
+            capabilities: empty-list<resource<capability-grant>>
             max-turns: 2
             timeout-ms: 10000
             max-output-bytes: 4096
@@ -1180,7 +1285,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             outcome.status,
-            crate::runtime::outcome::ExecutionStatus::Completed
+            crate::runtime::outcome::ExecutionStatus::Completed,
+            "{:?}",
+            outcome.diagnostics
         );
         let tasks = scheduler.tasks.read().await;
         let task = tasks.values().next().expect("one structured child task");

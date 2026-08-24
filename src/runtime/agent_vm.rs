@@ -35,6 +35,7 @@ impl AgentVmBinding {
             provider: None,
             model: None,
             context: Vec::new(),
+            capability_grant_ids: None,
             budget: Default::default(),
         })
         .await

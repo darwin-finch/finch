@@ -140,6 +140,17 @@ impl GrantSet {
         &'a self,
         context: &'a AuthorizationContext,
     ) -> impl Iterator<Item = &'a CapabilityRequirement> + 'a {
+        self.active_grants_for(context)
+            .map(|grant| &grant.requirement)
+    }
+
+    /// Active reusable grants with their stable host-owned identity retained.
+    /// This is used to mint opaque capability-grant resources; the UUID alone
+    /// is never authority and must be revalidated through this iterator.
+    pub fn active_grants_for<'a>(
+        &'a self,
+        context: &'a AuthorizationContext,
+    ) -> impl Iterator<Item = &'a CapabilityGrant> + 'a {
         self.grants
             .iter()
             .filter(move |grant| {
@@ -155,7 +166,6 @@ impl GrantSet {
                         GrantScope::Global => true,
                     }
             })
-            .map(|grant| &grant.requirement)
     }
 
     pub fn authorize(
