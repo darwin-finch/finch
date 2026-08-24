@@ -1398,6 +1398,16 @@ surface; portable or object/library output exposes or leaves unresolved the effe
 an embedder. The executable carries its inferred effect manifest. `say` always means the same
 `session.emit` effect—it never silently becomes a distinct native-print operation.
 
+A standard asynchronous application host is a third ordinary profile, not a language exception.
+It links a small Finch runtime that owns the platform poller and maps opaque, generation-checked
+listener/socket/file resources to native descriptors. Typed `connect`, `listen`, `accept`, `read`,
+`write`, and `close` operations suspend and resume through the same effect ABI used by an
+interactive embedder. HTTP clients and servers can then be Finch libraries over byte streams (with
+optional optimized host vocabulary), while source programs never receive a forgeable integer file
+descriptor. Code that intentionally needs raw descriptor or foreign-ABI manipulation must enter an
+explicit unsafe native-extension boundary with a separately declared capability; producing an AOT
+binary does not silently grant that authority.
+
 Compile-time reflection should make immutable `type`, schema, syntax, symbol/module-reference, and
 constraint-evidence values available to pure bounded Finch functions. Generics, concepts,
 compile-time branching/traversal, derive operations, and hygienic macros must all use this one staged
