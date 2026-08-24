@@ -248,6 +248,13 @@ async fn execute_wire_with_single_repair(
         generator.name(),
         "interactive",
     );
+    crate::programs::corpus::capture_from_env(
+        generator.name(),
+        generator.name(),
+        "interactive",
+        crate::programs::corpus::WireCorpusAttempt::FirstPass,
+        &source,
+    );
     let output_unit = output_manager.start_work_unit("VM program output");
     output_unit.set_program_output();
     let initial = execute_direct_wire_response(
@@ -334,6 +341,13 @@ async fn execute_wire_with_single_repair(
     output_unit.set_complete();
 
     let repaired_source = raw_wire_source(&repair.text);
+    crate::programs::corpus::capture_from_env(
+        generator.name(),
+        generator.name(),
+        "interactive",
+        crate::programs::corpus::WireCorpusAttempt::Repair,
+        &repaired_source,
+    );
     let repair_source_unit = output_manager.start_work_unit("VM program repair");
     repair_source_unit.set_program_source(
         crate::programs::ProgramLanguage::infer_source(&repaired_source).as_str(),

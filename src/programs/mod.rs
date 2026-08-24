@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+pub mod corpus;
+
 /// Version of the model/runtime vocabulary handshake.
 pub const MANIFEST_PROTOCOL_VERSION: u32 = 1;
 

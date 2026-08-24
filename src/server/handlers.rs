@@ -400,6 +400,17 @@ async fn execute_named_brain_prompt(
         if source.is_empty() {
             anyhow::bail!("provider returned no Finch wire program");
         }
+        crate::programs::corpus::capture_from_env(
+            provider.name(),
+            provider.default_model(),
+            "named_brain",
+            if attempt == 0 {
+                crate::programs::corpus::WireCorpusAttempt::FirstPass
+            } else {
+                crate::programs::corpus::WireCorpusAttempt::Repair
+            },
+            &source,
+        );
 
         // Record malformed source too. `infer_source` is presentation-only;
         // the typed frontend remains authoritative and returns the diagnostic.

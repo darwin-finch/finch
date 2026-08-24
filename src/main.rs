@@ -149,6 +149,11 @@ enum Command {
         #[command(subcommand)]
         library_command: LibraryCommand,
     },
+    /// Capture/replay evidence for the Finch provider wire protocol
+    WireCorpus {
+        #[command(subcommand)]
+        wire_corpus_command: WireCorpusCommand,
+    },
     /// Run as an autonomous agent, working through a task backlog
     Agent {
         /// Persona name (builtin or ~/.finch/personas/<name>.toml) or path to .toml
@@ -215,6 +220,18 @@ enum LibraryCommand {
         /// Show each accepted, missing, and rejected source
         #[arg(long)]
         verbose: bool,
+    },
+}
+
+#[derive(Parser, Debug)]
+enum WireCorpusCommand {
+    /// Compile and verify a versioned JSONL corpus without executing it
+    Audit {
+        /// Corpus written through FINCH_WIRE_CORPUS_PATH
+        corpus: PathBuf,
+        /// Emit the aggregate report as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -606,6 +623,24 @@ mod script_tests {
         assert!(!recorded[0].terminal_failure);
     }
 
+    #[test]
+    fn wire_corpus_audit_command_parses_without_starting_the_repl() {
+        let args = Args::try_parse_from([
+            "finch",
+            "wire-corpus",
+            "audit",
+            "fixtures/provider-wire.jsonl",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::WireCorpus {
+                wire_corpus_command: WireCorpusCommand::Audit { corpus, json: true }
+            }) if corpus == PathBuf::from("fixtures/provider-wire.jsonl")
+        ));
+    }
+
     #[tokio::test]
     async fn one_shot_wire_receiver_executes_a_daemon_style_final_response() {
         let runtime = finch::runtime::ProgramRuntime::new();
@@ -737,6 +772,11 @@ async fn main() -> Result<()> {
         }
         Some(Command::Library { library_command }) => {
             return run_library_command(library_command).await;
+        }
+        Some(Command::WireCorpus {
+            wire_corpus_command,
+        }) => {
+            return run_wire_corpus_command(wire_corpus_command);
         }
         Some(Command::Agent {
             persona,
@@ -2076,6 +2116,13 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
             &guard,
         )
         .await?;
+    finch::programs::corpus::capture_from_env(
+        "daemon",
+        "daemon-selected",
+        "one_shot",
+        finch::programs::corpus::WireCorpusAttempt::FirstPass,
+        &response,
+    );
     if show_program {
         print_wire_program(&response);
     }
@@ -2117,6 +2164,13 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
                     &guard,
                 )
                 .await?;
+            finch::programs::corpus::capture_from_env(
+                "daemon",
+                "daemon-selected",
+                "one_shot",
+                finch::programs::corpus::WireCorpusAttempt::Repair,
+                &repair,
+            );
             if show_program {
                 print_wire_program(&repair);
             }
@@ -2137,6 +2191,13 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
                     &guard,
                 )
                 .await?;
+            finch::programs::corpus::capture_from_env(
+                "daemon",
+                "daemon-selected",
+                "one_shot",
+                finch::programs::corpus::WireCorpusAttempt::Repair,
+                &repair,
+            );
             if show_program {
                 print_wire_program(&repair);
             }
@@ -2200,7 +2261,7 @@ async fn run_query_teacher_only(
         .unwrap_or_else(|| "teacher".to_string());
     let wire_metrics = default_wire_metrics_logger();
     let mut wire_metric =
-        finch::metrics::WireAdherenceMetric::first_pass(provider, model.clone(), "one_shot");
+        finch::metrics::WireAdherenceMetric::first_pass(&provider, model.clone(), "one_shot");
 
     let mut messages = vec![Message::user(query)];
     // Keep one-shot provider calls on the same wire contract as the REPL.
@@ -2226,6 +2287,17 @@ async fn run_query_teacher_only(
         // as though it were an ordinary chat response.
         if !response.has_tool_uses() {
             let source = response.text();
+            finch::programs::corpus::capture_from_env(
+                &provider,
+                &model,
+                "one_shot",
+                if wire_repair_requested {
+                    finch::programs::corpus::WireCorpusAttempt::Repair
+                } else {
+                    finch::programs::corpus::WireCorpusAttempt::FirstPass
+                },
+                &source,
+            );
             if show_program {
                 print_wire_program(&source);
             }
@@ -2624,6 +2696,41 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
 
     }
 
+    Ok(())
+}
+
+fn run_wire_corpus_command(cmd: WireCorpusCommand) -> Result<()> {
+    match cmd {
+        WireCorpusCommand::Audit { corpus, json } => {
+            let report = finch::programs::corpus::audit(&corpus)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+            println!("Finch provider wire corpus audit");
+            println!("  report only: source was compiled and verified, never executed");
+            println!("  total:       {}", report.counts.total);
+            println!("  accepted:    {}", report.counts.accepted);
+            println!("  rejected:    {}", report.counts.rejected);
+            println!("  Lisp:        {}", report.counts.lisp);
+            println!("  Co-Forth:    {}", report.counts.forth);
+            for (versions, count) in &report.source_versions {
+                println!("  source {versions}: {count}");
+            }
+            for (class, count) in &report.counts.failure_classes {
+                println!("  failure {class}: {count}");
+            }
+            for (code, count) in &report.counts.diagnostics {
+                println!("  diagnostic {code}: {count}");
+            }
+            for (provider_model, counts) in report.by_provider_model {
+                println!(
+                    "  {provider_model}: {} total, {} accepted, {} rejected",
+                    counts.total, counts.accepted, counts.rejected
+                );
+            }
+        }
+    }
     Ok(())
 }
 
