@@ -328,6 +328,16 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   still refusing to persist authority or live handles. Bind the store to the converged application
   lifecycle, then add the managed heap and explicit host-handle restoration before treating every
   Brain run as restartable.
+- [ ] Specify and test VM memory ownership and retention before introducing a managed heap. Current
+  immutable `TypedValue` trees, call-frame windows, failed working snapshots, and continuations are
+  acyclic Rust-owned values and are reclaimed when their owning root is dropped; preserve that cheap
+  region/ownership path. Inventory every durable root (persistent stack and definitions, closure
+  captures, suspended runs, producer fibers, host registries, revision archives, and future CTFE
+  memo tables), give each an explicit release/retention/compaction policy, and add long-running
+  bounded-memory tests. Completed/cancelled fiber tombstones, abandoned suspensions, and complete
+  revision checkpoints must not grow forever. If shared or cyclic language objects are later
+  admitted, put them behind generation-checked managed handles and choose a checkpoint-aware tracing
+  scheme from measured workloads; do not add a global collector merely for acyclic temporary values.
 - [ ] Complete revisioned private working snapshots and conflict-aware commits. A `ProgramRuntime`
   now executes each ProgramRun on a cloned stack/dictionary snapshot and gates only snapshot/commit;
   stale resume checks and losing post-resume commits return structured failed outcomes without
@@ -370,7 +380,13 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   model-authored CLIF/native artifacts as trusted input. Make host selection explicit: a `none`
   profile rejects unsupported effects, a terminal wrapper may project `session.emit` to stdout, and
   portable/library output exposes or links the structured effect/resume shims. `say` must retain one
-  semantic meaning rather than becoming a different primitive in compiled programs.
+  semantic meaning rather than becoming a different primitive in compiled programs. Add a standard
+  async host profile for executable applications: the linked runtime owns its poller/event loop and
+  maps opaque generation-checked listener/socket/file resources to OS descriptors internally. A
+  compiled web client/server uses typed connect/listen/accept/read/write/close effects and suspends
+  through the same continuation ABI; ordinary Finch code never receives or forges a raw descriptor.
+  Deliberate low-level descriptor/FFI work remains an unsafe native extension with a separately
+  declared capability and ABI, not an implicit privilege of AOT compilation.
 - [ ] Freeze and test the Runtime/Application boundary: the embedder-neutral typed VM exposes only
   verified execution, diagnostics, capability requests, and idempotent side-effect/resume records;
   the Finch application supplies Brain, UI, approval, provider, MCP, scheduler, and OS adapters.
