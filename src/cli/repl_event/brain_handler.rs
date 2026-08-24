@@ -20,7 +20,7 @@
 //
 // impl EventLoop (daemon brain):
 //   handle_brain_spawn      — /brain <task>: spawns brain in daemon
-//   handle_brains_list      — /brains: lists active daemon brains
+//   handle_brains_list      — /brains: lists authoritative named Brains
 //   handle_brain_cancel     — /brain cancel <id>: cancels a daemon brain
 //   poll_daemon_brains      — 500ms poll: detects state transitions
 //   update_brain_status_bar — updates status bar brain count
@@ -186,6 +186,20 @@ impl EventLoop {
         self.ipc_client.as_ref()
     }
 
+    /// Register the frontend's home Brain in the daemon's durable named store.
+    /// The frontend remains the environment-owning runner.
+    async fn register_home_brain(&self) -> Result<bool> {
+        let Some(base) = self.daemon_base_url.as_deref() else {
+            return Ok(false);
+        };
+        reqwest::Client::new()
+            .get(format!("{base}/v1/brains/named/{}", self.session_label))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(true)
+    }
+
     /// Handle `/brain <task>` — spawn a brain in the daemon.
     async fn handle_brain_spawn(&mut self, task: String) -> Result<()> {
         let Some(ipc) = self.ipc() else {
@@ -213,27 +227,63 @@ impl EventLoop {
         self.render_tui().await
     }
 
-    /// Handle `/brains` — list active brains.
+    /// Handle `/brains` — list the daemon's authoritative named Brains.
+    /// Legacy background workers are runs/tasks, not another Brain namespace.
     async fn handle_brains_list(&mut self) -> Result<()> {
-        let Some(ipc) = self.ipc() else {
+        let Some(base) = self.daemon_base_url.as_deref() else {
             self.output_manager.write_info("⚠️  Daemon not connected.");
             return self.render_tui().await;
         };
 
-        match ipc.list_brains().await {
+        #[derive(serde::Deserialize)]
+        struct NamedBrainSummary {
+            name: String,
+            environment: crate::brain::shared::BrainEnvironment,
+            revision: u64,
+            programs: usize,
+        }
+
+        let brains = match reqwest::Client::new()
+            .get(format!("{base}/v1/brains/named"))
+            .send()
+            .await
+        {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => response
+                    .json::<Vec<NamedBrainSummary>>()
+                    .await
+                    .map_err(anyhow::Error::from),
+                Err(error) => Err(anyhow::Error::from(error)),
+            },
+            Err(error) => Err(anyhow::Error::from(error)),
+        };
+
+        match brains {
             Ok(brains) if brains.is_empty() => {
-                self.output_manager.write_info("No active brain sessions.");
+                self.output_manager.write_info("No named Brains.");
             }
             Ok(brains) => {
-                let mut lines = vec!["Active brain sessions:".to_string()];
+                let current_name = self
+                    .active_remote_brain
+                    .as_ref()
+                    .map(|client| client.target.brain.as_str())
+                    .unwrap_or(self.session_label.as_str());
+                let mut lines = vec!["Named Brains:".to_string()];
                 for b in &brains {
-                    let state_str = match b.state {
-                        crate::server::BrainState::Running => "running",
-                        crate::server::BrainState::WaitingForInput => "waiting for input",
-                        crate::server::BrainState::PlanReady => "plan ready",
-                        crate::server::BrainState::Dead => "dead",
+                    let current = if b.name == current_name {
+                        " · current runner"
+                    } else {
+                        ""
                     };
-                    lines.push(format!("  {:30}  {}  {}s", b.name, state_str, b.age_secs));
+                    lines.push(format!(
+                        "  {:30}  rev {:<5}  {:<3} programs  {}:{}{}",
+                        b.name,
+                        b.revision,
+                        b.programs,
+                        b.environment.machine,
+                        b.environment.workspace.display(),
+                        current,
+                    ));
                 }
                 self.output_manager.write_info(lines.join("\n"));
             }

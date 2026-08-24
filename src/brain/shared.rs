@@ -478,6 +478,13 @@ impl SharedBrainStore {
             return Ok(());
         }
         let events = self.read_events(name)?;
+        // Preserve an empty named Brain across daemon restarts, even before
+        // its first conversational event is appended.
+        if let Some(root) = &self.root {
+            let directory = root.join(name);
+            std::fs::create_dir_all(&directory)
+                .with_context(|| format!("create {}", directory.display()))?;
+        }
         self.brains
             .write()
             .expect("shared brain lock poisoned")
@@ -640,6 +647,17 @@ mod tests {
             .unwrap();
         assert_eq!(first.try_recv().unwrap(), event);
         assert_eq!(second.try_recv().unwrap(), event);
+    }
+
+    #[test]
+    fn empty_named_brain_remains_listed_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        store.snapshot("quiet-brain").unwrap();
+
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        assert_eq!(restarted.list().unwrap(), vec!["quiet-brain"]);
+        assert_eq!(restarted.snapshot("quiet-brain").unwrap().revision, 0);
     }
 
     #[tokio::test]

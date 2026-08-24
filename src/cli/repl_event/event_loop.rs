@@ -1632,9 +1632,20 @@ impl EventLoop {
             })
             .unwrap_or_else(|| "~".to_string());
         self.cwd = cwd.clone();
+        let home_brain_registered = match self.register_home_brain().await {
+            Ok(registered) => registered,
+            Err(error) => {
+                tracing::warn!("could not register home Brain: {error}");
+                false
+            }
+        };
         self.status_bar.update_line(
             crate::cli::status_bar::StatusLineType::SessionLabel,
-            format!("◆ {}", self.session_label),
+            if home_brain_registered {
+                format!("◆ brain: {} · runner", self.session_label)
+            } else {
+                format!("◆ brain: {} · runner · daemon offline", self.session_label)
+            },
         );
 
         {
