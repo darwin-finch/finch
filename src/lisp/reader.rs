@@ -489,8 +489,19 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
             _ => {
                 // Atom: read until delimiter
                 let start = i;
+                let mut angle_depth = 0usize;
                 while i < chars.len() {
                     let ch = chars[i];
+                    if ch == '<' {
+                        angle_depth += 1;
+                        i += 1;
+                        continue;
+                    }
+                    if ch == '>' && angle_depth > 0 {
+                        angle_depth -= 1;
+                        i += 1;
+                        continue;
+                    }
                     if ch.is_whitespace()
                         || ch == '('
                         || ch == ')'
@@ -500,7 +511,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                         || ch == ';'
                         || ch == '\''
                         || ch == '`'
-                        || ch == ','
+                        || (ch == ',' && angle_depth == 0)
                     {
                         break;
                     }
@@ -714,9 +725,21 @@ fn scan_form(source: &str, start: usize) -> Option<SyntaxForm> {
         ')' | ']' | '}' | ';' => None,
         _ => {
             let mut end = start;
+            let mut angle_depth = 0usize;
             while let Some(next) = source.get(end..)?.chars().next() {
+                if next == '<' {
+                    angle_depth += 1;
+                    end += next.len_utf8();
+                    continue;
+                }
+                if next == '>' && angle_depth > 0 {
+                    angle_depth -= 1;
+                    end += next.len_utf8();
+                    continue;
+                }
                 if next.is_whitespace()
-                    || matches!(next, '(' | ')' | '{' | '}' | '"' | ';' | '\'' | '`' | ',')
+                    || matches!(next, '(' | ')' | '{' | '}' | '"' | ';' | '\'' | '`')
+                    || (next == ',' && angle_depth == 0)
                 {
                     break;
                 }
@@ -1072,6 +1095,17 @@ mod tests {
     #[test]
     fn test_parse_float() {
         assert_eq!(parse1("3.14"), Val::Float(3.14));
+    }
+
+    #[test]
+    fn keeps_comma_separated_generic_types_as_one_atom() {
+        assert_eq!(
+            parse1("result<option<int>,string>"),
+            Val::Symbol("result<option<int>,string>".into())
+        );
+        let spanned = parse_str_spanned("(define (example) : result<int,string> (ok 1))")
+            .expect("generic type annotation parses");
+        assert_eq!(spanned[0].children[3].value, Val::Symbol("result<int,string>".into()));
     }
 
     #[test]

@@ -72,6 +72,15 @@ payload in each required arm:
   (err problem (begin problem 0)))
 ```
 
+When a definition returns one compatible `result<R,E>`, `(try expression)` short-circuits an
+`err(E)` back to that definition's caller and otherwise evaluates to the `ok` payload. It is not
+an exception and does not make host effects retryable:
+
+```lisp
+(define (parse-config (text : string)) : result<json,string>
+  (ok (try (json-parse text))))
+```
+
 `match` is the preferred type-directed spelling when the arm patterns make the value kind clear.
 It accepts exhaustive `some`/`none` and `ok`/`err` pairs and lowers to the same branch IR as the
 explicit forms. It also accepts a total boolean pair and a finite integer switch with a required

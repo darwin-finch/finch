@@ -9,6 +9,11 @@ verified, and execute in the recipient's local VM. A text-only provider response
 display prose: use `say` for human-visible language. Shell stdout remains display content and is
 never executable VM input. Never emit internal IR or CLIF.
 
+Every executable IR operation has a canonical Co-Forth spelling. Lisp may provide tree-oriented
+syntax and bounded macro expansion, but its expanded forms lower directly to that same IR; it does
+not gain Lisp-only execution semantics or serialize through reparsed Forth text. This preserves
+source origins while allowing an inspected Lisp program to be represented by canonical Co-Forth.
+
 The submission envelope may identify the source language explicitly (`language: "lisp"` or
 `language: "forth"`). For compact tool calls that omit it, Finch infers Lisp only when the first
 non-whitespace character is `(` and otherwise treats the source as Forth; the resolved language
@@ -147,6 +152,13 @@ diagnostic for `none`). `ok` and `err` construct `result<T,E>` values, `is-ok` i
 branch was produced, and `result-unwrap`/`result-error` project the corresponding payload with a
 structured diagnostic on the wrong branch. These values remain typed when crossing the VM/runtime boundary and
 are rendered to legacy Lisp callers as `(some value)`, `(none)`, `(ok value)`, or `(err value)`.
+
+Inside a typed function whose sole declared return value is `result<R,E>`, Lisp `try` and
+Co-Forth `?` inspect one `result<T,E>` once. An `ok(T)` continues with `T`; an `err(E)` returns
+that error directly from the current function, discarding intermediate stack values. This lowers
+to a verified cold error edge, not a mutable error accumulator or a catchable exception. Use
+`match-result` / `if-ok` at the caller's boundary to recover. Top-level forms and closures cannot
+use propagation because they have no declared `result` return target.
 
 `json-parse` is pure and returns `result<json,string>` rather than throwing on untrusted input.
 `json-get` takes a managed `json` value and a string field name, returning `option<json>`; it only

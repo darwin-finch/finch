@@ -62,6 +62,10 @@ struct FunctionBuilder {
     stack: Vec<Type>,
     input: Vec<Type>,
     effects: EffectSet,
+    /// The enclosing definition's result contract, when it opted into
+    /// early-result propagation. Top-level forms and closures intentionally
+    /// have none: `try` must not manufacture a hidden dynamic return path.
+    return_result: Option<(Type, Type)>,
 }
 
 impl FunctionBuilder {
@@ -84,6 +88,7 @@ impl FunctionBuilder {
             stack: input.clone(),
             input,
             effects: EffectSet::pure(),
+            return_result: None,
         }
     }
 
@@ -745,12 +750,17 @@ impl Compiler<'_> {
                 format!("function '{name}' is already defined"),
             )]);
         }
+        let declared_return = definition.return_type.clone();
         let parameters = definition.parameters;
         let arguments = parameters
             .iter()
             .map(|(_, ty)| ty.clone())
             .collect::<Vec<_>>();
         let mut child = FunctionBuilder::new(name, arguments);
+        child.return_result = declared_return.as_ref().and_then(|ty| match ty {
+            Type::Result(ok, error) => Some(((**ok).clone(), (**error).clone())),
+            _ => None,
+        });
         for (parameter_name, ty) in &parameters {
             let index = child.allocate_local(ty.clone());
             child.scopes[0].insert(
@@ -772,8 +782,8 @@ impl Compiler<'_> {
         }
         let body_sources = self.current_form_suffix_sources(definition.body);
         let result_type = self.compile_begin(definition.body, body_sources.as_deref(), &mut child)?;
-        if let Some(expected) = &definition.return_type {
-            if result_type != *expected {
+        if let Some(expected) = &declared_return {
+            if !declared_type_accepts(expected, &result_type) {
                 return Err(vec![self.error(
                     "E-LISP-DEF-005",
                     format!(
@@ -785,7 +795,7 @@ impl Compiler<'_> {
         // A return annotation is also the marker that this definition was
         // predeclared for recursive calls.  An omitted `! (...)` therefore
         // means an explicit pure bound, preserving the old safe default.
-        if definition.return_type.is_some() {
+        if declared_return.is_some() {
             let declared_effects = definition
                 .declared_effects
                 .clone()
@@ -804,6 +814,14 @@ impl Compiler<'_> {
         child.emit(Instruction::Return, self.origin("define-return"));
         let output = child.stack.clone();
         let mut function = child.finish(output);
+        if let Some(return_type) = declared_return {
+            // The annotation is a public call contract, not merely a check
+            // against this body's initially inferred `dynamic` component.
+            // This preserves the exact `result<T,E>` error type for callers
+            // and recursive definitions while the verifier still validates
+            // the body's concrete return against it.
+            function.signature.output = StackRow::polymorphic("S", vec![return_type]);
+        }
         function.documentation = definition.documentation.map(str::to_owned);
         self.vocabulary
             .insert(name.to_string(), function.signature.clone());
@@ -930,6 +948,11 @@ impl Compiler<'_> {
                 builder,
             ),
             "match-result" => self.compile_match_result(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
+            "try" => self.compile_try(
                 &items[1..],
                 source_children.as_deref().and_then(|children| children.get(1..)),
                 builder,
@@ -2267,6 +2290,56 @@ impl Compiler<'_> {
         Ok(builder.stack.pop().expect("match-result leaves a value"))
     }
 
+    /// Lower `(try expression)` to the shared result-propagation instruction.
+    /// The success value remains an ordinary expression value; the error edge
+    /// returns directly from the enclosing typed `result<R,E>` definition.
+    fn compile_try(
+        &mut self,
+        expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let [expression] = expressions else {
+            return Err(vec![self.error(
+                "E-RESULT-TRY-001",
+                "try requires exactly one result<T,E> expression",
+            )]);
+        };
+        let (return_ok_type, return_error_type) = builder.return_result.clone().ok_or_else(|| {
+            vec![self.error(
+                "E-RESULT-TRY-002",
+                "try is valid only inside a typed definition returning result<T,E>",
+            )]
+        })?;
+        let result_type = self.compile_expression_at(
+            expression,
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )?;
+        let Type::Result(ok_type, error_type) = result_type else {
+            return Err(vec![self.error(
+                "E-RESULT-TRY-001",
+                "try requires a result<T,E> expression",
+            )]);
+        };
+        if !return_error_type.accepts(&error_type) {
+            return Err(vec![VmDiagnostic::type_mismatch(
+                return_error_type,
+                *error_type,
+                Some(self.origin("try")),
+            )]);
+        }
+        builder.stack.pop();
+        builder.emit(
+            Instruction::PropagateResult {
+                return_ok_type,
+                error_type: (*error_type).clone(),
+            },
+            self.origin("try"),
+        );
+        Ok(*ok_type)
+    }
+
     fn compile_while(
         &mut self,
         expressions: &[Val],
@@ -2698,6 +2771,38 @@ impl Compiler<'_> {
             message,
             Some(self.origin("lisp")),
         )
+    }
+}
+
+/// Match the verifier's permissive treatment of an unresolved `dynamic`
+/// component inside a structured value.  Core `ok`/`err` constructors infer
+/// only the component they receive, so a definition's explicit
+/// `result<T,E>` contract is the contextual information that closes the
+/// other component without discarding the structure of the check.
+fn declared_type_accepts(expected: &Type, actual: &Type) -> bool {
+    if expected.accepts(actual) {
+        return true;
+    }
+    match (expected, actual) {
+        (Type::List(expected), Type::List(actual))
+        | (Type::Option(expected), Type::Option(actual))
+        | (Type::Task(expected), Type::Task(actual))
+        | (Type::Stream(expected), Type::Stream(actual)) => declared_type_accepts(expected, actual),
+        (Type::Map(expected_key, expected_value), Type::Map(actual_key, actual_value))
+        | (Type::Result(expected_key, expected_value), Type::Result(actual_key, actual_value)) => {
+            declared_type_accepts(expected_key, actual_key)
+                && declared_type_accepts(expected_value, actual_value)
+        }
+        (Type::Record(expected_fields), Type::Record(actual_fields)) => {
+            expected_fields.len() == actual_fields.len()
+                && expected_fields.iter().zip(actual_fields).all(
+                    |((expected_name, expected_type), (actual_name, actual_type))| {
+                        expected_name == actual_name
+                            && declared_type_accepts(expected_type, actual_type)
+                    },
+                )
+        }
+        _ => false,
     }
 }
 
@@ -3443,6 +3548,59 @@ mod tests {
             run("(list-length (list \"a\" \"b\"))").unwrap(),
             vec![TypedValue::Int(2)]
         );
+    }
+
+    #[test]
+    fn try_returns_an_err_from_the_enclosing_typed_definition() {
+        let stack = run(
+            "(define (fail-fast) : result<dynamic,string> \
+                (begin (try (err \"no\")) (err \"unreachable\"))) \
+             (fail-fast)",
+        )
+        .expect("try must compile as typed result propagation");
+        assert_eq!(
+            stack,
+            vec![TypedValue::Result {
+                ok_type: Type::Dynamic,
+                error_type: Type::String,
+                is_ok: false,
+                value: Box::new(TypedValue::String("no".into())),
+            }]
+        );
+    }
+
+    #[test]
+    fn try_continues_with_an_ok_payload() {
+        let source = "(define (keep-going) : result<int,string> \
+                      (begin (try (ok 7)) (ok 8))) \
+                      (keep-going)";
+        let module = compile_lisp("try-ok.lisp", source, Vec::new(), &core_vocabulary())
+            .expect("successful try must leave the unwrapped payload for the next expression");
+        assert_eq!(
+            module.module.functions["keep-going"].signature.output.values,
+            vec![Type::result(Type::Int, Type::String)],
+            "the declared result contract remains visible to callers"
+        );
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .unwrap();
+        assert!(matches!(
+            stack.as_slice(),
+            [TypedValue::Result { is_ok: true, value, .. }] if **value == TypedValue::Int(8)
+        ));
+    }
+
+    #[test]
+    fn rejects_try_outside_a_typed_result_definition() {
+        let errors = compile_lisp(
+            "try.lisp",
+            "(try (ok 7))",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect_err("top-level try has no typed result return target");
+        assert!(errors.iter().any(|error| error.code == "E-RESULT-TRY-002"));
     }
 
     #[test]

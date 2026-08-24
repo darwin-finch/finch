@@ -160,6 +160,16 @@ pub enum Instruction {
     /// consumes the handle and resumes with unit; cancellation is observed at
     /// the worker's next VM boundary rather than forcefully killing a thread.
     CancelCpuFiber,
+    /// Continue with the `ok` payload of a `result<T, E>`, or immediately
+    /// return `err(E)` from the current typed function.  This is the shared
+    /// lowering for Lisp `try` and Co-Forth `?`: it is a statically verified
+    /// control edge, not a mutable error slot or a catchable exception.
+    PropagateResult {
+        /// The successful payload returned by the enclosing function's
+        /// `result<R, E>` contract. It can differ from this operation's `T`.
+        return_ok_type: Type,
+        error_type: Type,
+    },
     Jump {
         target: BlockId,
     },

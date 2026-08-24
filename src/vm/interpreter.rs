@@ -1025,6 +1025,57 @@ impl<'a> VmTrampoline<'a> {
                         continuation,
                     };
                 }
+                Instruction::PropagateResult {
+                    return_ok_type,
+                    error_type,
+                } => {
+                    let Some(result) = continuation.stack.pop() else {
+                        return VmStep::Failed(self.underflow(&located.origin, &continuation));
+                    };
+                    let TypedValue::Result {
+                        is_ok,
+                        value,
+                        ..
+                    } = result
+                    else {
+                        return VmStep::Failed(self.with_trace(
+                            VmDiagnostic::error(
+                                "E-RUNTIME-036",
+                                DiagnosticPhase::Interpretation,
+                                "result propagation requires result<T,E>",
+                                Some(located.origin),
+                            ),
+                            &continuation,
+                        ));
+                    };
+                    if is_ok {
+                        continuation.stack.push(*value);
+                        Ok(None)
+                    } else {
+                        let frame = continuation.frames.last().expect("frame exists");
+                        if frame.output_arity != 1 {
+                            return VmStep::Failed(self.with_trace(
+                                VmDiagnostic::error(
+                                    "E-RUNTIME-037",
+                                    DiagnosticPhase::Interpretation,
+                                    "result propagation requires one result<T,E> return value",
+                                    Some(located.origin),
+                                ),
+                                &continuation,
+                            ));
+                        }
+                        let stack_base = frame.stack_base;
+                        continuation.stack.truncate(stack_base);
+                        continuation.stack.push(TypedValue::Result {
+                            ok_type: return_ok_type,
+                            error_type,
+                            is_ok: false,
+                            value,
+                        });
+                        continuation.frames.pop();
+                        Ok(None)
+                    }
+                }
                 Instruction::Jump { target } => {
                     let frame = continuation.frames.last_mut().unwrap();
                     frame.block = target;

@@ -185,6 +185,7 @@ pub fn compile_forth_with_functions(
             &local_vocabulary,
             &functions,
             &definition.locals,
+            Some(&definition.signature.output.values),
         )?;
         let verified = &compiled.functions[&compiled.module.entry];
         let mut function = compiled.module.functions[&compiled.module.entry].clone();
@@ -245,6 +246,7 @@ fn compile_forth_body_with_functions(
         vocabulary,
         linked_functions,
         &[],
+        None,
     )
 }
 
@@ -255,6 +257,7 @@ fn compile_forth_body_with_locals(
     vocabulary: &Vocabulary,
     linked_functions: &BTreeMap<String, Function>,
     locals: &[LocalBinding],
+    expected_return: Option<&[Type]>,
 ) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
     let tokens = tokenize(source_id, source)?;
     let mut stack = initial_stack.clone();
@@ -1775,6 +1778,51 @@ fn compile_forth_body_with_locals(
                     }
                     stack.push(Type::Unit);
                     Instruction::CancelCpuFiber
+                } else if word == "?" {
+                    let Some(expected_return) = expected_return else {
+                        return Err(vec![VmDiagnostic::error(
+                            "E-RESULT-TRY-002",
+                            DiagnosticPhase::TypeInference,
+                            "? is valid only inside a typed definition returning result<T,E>",
+                            Some(origin),
+                        )]);
+                    };
+                    let [Type::Result(return_ok_type, return_error_type)] = expected_return else {
+                        return Err(vec![VmDiagnostic::error(
+                            "E-RESULT-TRY-002",
+                            DiagnosticPhase::TypeInference,
+                            "? is valid only inside a typed definition returning one result<T,E>",
+                            Some(origin),
+                        )]);
+                    };
+                    let result = stack.pop().ok_or_else(|| {
+                        vec![VmDiagnostic::error(
+                            "E-RESULT-TRY-001",
+                            DiagnosticPhase::TypeInference,
+                            "? requires result<T,E>",
+                            Some(origin.clone()),
+                        )]
+                    })?;
+                    let Type::Result(ok_type, error_type) = result else {
+                        return Err(vec![VmDiagnostic::error(
+                            "E-RESULT-TRY-001",
+                            DiagnosticPhase::TypeInference,
+                            "? requires result<T,E>",
+                            Some(origin),
+                        )]);
+                    };
+                    if !return_error_type.accepts(&error_type) {
+                        return Err(vec![VmDiagnostic::type_mismatch(
+                            (**return_error_type).clone(),
+                            *error_type.clone(),
+                            Some(origin),
+                        )]);
+                    }
+                    stack.push(*ok_type);
+                    Instruction::PropagateResult {
+                        return_ok_type: (**return_ok_type).clone(),
+                        error_type: (**return_error_type).clone(),
+                    }
                 } else if let Some((index, ty)) = local_indexes.get(word.as_str()) {
                     stack.push(ty.clone());
                     Instruction::LocalGet { index: *index }
@@ -1877,7 +1925,11 @@ fn compile_forth_body_with_locals(
         signature: StackSignature {
             type_parameters: Vec::new(),
             input: StackRow::closed(initial_stack),
-            output: StackRow::closed(stack),
+            output: StackRow::closed(
+                expected_return
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| stack.clone()),
+            ),
             effects,
             control: ControlEffect::Returns,
         },
@@ -2282,6 +2334,19 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
             cursor = end;
             continue;
         }
+        // Parameterized type signatures are single tokens even when their
+        // type arguments use commas. Ordinary collection commas remain
+        // optional separators, but `result<int,string>` must not become two
+        // unrelated stack types during definition parsing.
+        if let Some(end) = parameterized_type_end(source, start) {
+            tokens.push(Token {
+                value: TokenValue::Word(source[start..end].to_string()),
+                start,
+                end,
+            });
+            cursor = end;
+            continue;
+        }
         // These existing multi-character forms take precedence over generic
         // brace punctuation. `map{`, `list{`, and `record{` retain their
         // literal spellings; purity is written explicitly as `! pure`.
@@ -2500,6 +2565,42 @@ fn compact_record_type_end(source: &str, start: usize) -> Option<usize> {
     None
 }
 
+fn parameterized_type_end(source: &str, start: usize) -> Option<usize> {
+    let remainder = source.get(start..)?;
+    let known_prefix = [
+        "list<",
+        "map<",
+        "option<",
+        "result<",
+        "task<",
+        "stream<",
+        "resource<",
+        "capability<",
+    ]
+    .into_iter()
+    .any(|prefix| remainder.starts_with(prefix));
+    if !known_prefix {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (offset, byte) in remainder.bytes().enumerate() {
+        if byte.is_ascii_whitespace() || byte == b'"' {
+            return None;
+        }
+        match byte {
+            b'<' => depth += 1,
+            b'>' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(start + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn read_json_object(
     source_id: &str,
     source: &str,
@@ -2671,6 +2772,51 @@ mod tests {
             .execute(&mut stack)
             .unwrap();
         assert_eq!(stack, vec![TypedValue::Int(11)]);
+    }
+
+    #[test]
+    fn result_question_mark_returns_error_without_running_the_rest_of_a_word() {
+        let module = compile_forth(
+            "try.forth",
+            ": fail-fast ( S -- S result<dynamic,string> ! pure ) \
+             s\" no\" err ? drop s\" unreachable\" err ; fail-fast",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("typed result propagation compiles");
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("error result is an ordinary return, not a VM failure");
+        assert_eq!(
+            stack,
+            vec![TypedValue::Result {
+                ok_type: Type::Dynamic,
+                error_type: Type::String,
+                is_ok: false,
+                value: Box::new(TypedValue::String("no".into())),
+            }]
+        );
+    }
+
+    #[test]
+    fn result_question_mark_continues_with_the_ok_payload() {
+        let module = compile_forth(
+            "try-ok.forth",
+            ": keep-going ( S -- S result<int,dynamic> ! pure ) \
+             7 ok ? 1 + ok ; keep-going",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("successful result propagation compiles");
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .unwrap();
+        assert!(matches!(
+            stack.as_slice(),
+            [TypedValue::Result { is_ok: true, value, .. }] if **value == TypedValue::Int(8)
+        ));
     }
 
     #[test]

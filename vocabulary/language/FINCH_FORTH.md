@@ -55,6 +55,17 @@ else
 then
 ```
 
+Inside a typed word returning exactly one compatible `result<R,E>`, `?` unwraps an `ok` payload
+or returns an `err` immediately from the word. It is a verified early-return edge, not a hidden
+error variable or an exception. The normal path still owns the unwrapped value:
+
+```forth
+: parse-then-use ( S string -- S result<int,string> ! pure )
+  json-parse ? drop
+  42 ok
+;
+```
+
 `{ ... }` constructs an immutable heterogeneous record. `name:` is a syntax
 label (not a stack value), so every label must have exactly one following value. Project a known
 field with `"name" record-get`; it produces `option<T>` and can be checked with `unwrap` or the

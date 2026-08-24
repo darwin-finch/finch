@@ -14,7 +14,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   shadow-buffer redraws.
 - [ ] Finish both source frontends and their shared typed IR semantics: definitions/signatures,
   conditionals, metered loops, locals, quotations, closures, collections, bounded macros, and
-  structured error/result forms.
+  structured error/result forms. Maintain a hard parity invariant: every executable shared-IR
+  operation must have one canonical Co-Forth spelling and conformance test; Lisp may add readable
+  syntax but must lower directly to that same IR rather than introduce Lisp-only execution
+  semantics. Preserve source spans directly—never satisfy parity by reparsing generated Forth text.
 - [ ] Generalize the managed JSON boundary into first-class typed records/maps. Both frontends now
   share immutable typed-map construction, key lookup/update, keys/length, serialization across the
   public runtime boundary, map-type unification, immutable heterogeneous record construction, and
@@ -30,11 +33,16 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   named `break` after the loop verifier is generalized to check each target's declared result
   stack row. Simple named stack-preserving `break`/`continue` already lower to verified loop
   edges; do not add unrestricted jumps or C-style fallthrough switches.
-- [ ] Add explicit typed result propagation after branch forms are stable: a Lisp/Co-Forth
-  `try`/`?`-style form may early-return an `err` only from a function whose declared result is a
-  compatible `result<T,E>`. Keep `match-result`/`if-ok` for recovery and `unwrap` as a deliberate
-  diagnostic trap; do not introduce dynamically catchable language exceptions or silently replay
-  host effects.
+- [x] Add explicit typed result propagation after branch forms are stable: Lisp `try` and
+  Co-Forth `?` early-return an `err` only from a function whose sole declared output is a
+  compatible `result<T,E>`. The verifier checks the cold return edge, the interpreter unwinds the
+  current frame without replaying effects, and the normal edge retains the unwrapped `ok` value.
+  Keep `match-result`/`if-ok` for recovery and `unwrap` as a deliberate diagnostic trap; do not
+  introduce dynamically catchable language exceptions or silently replay host effects.
+- [ ] After typed result propagation is established, add lexical scope guards (`on-exit`, `on-ok`,
+  `on-err`) as compiler-generated once-only cleanup edges for normal return, result propagation,
+  cancellation, and resumed continuations. They must not imply rollback of journaled external
+  effects or become a dynamically catchable exception system.
 - [x] Specify and implement the provider wire discriminator: leading `(` selects Lisp and all other
   valid program starts select Co-Forth; make the receiver incrementally tokenize Co-Forth while
   retaining complete-program verification and clear malformed-wire diagnostics.
@@ -53,8 +61,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Later language evolution: typed records already carry ordinary closure values; add explicit
   method-call sugar that passes `self` and returns a replacement record (never hidden ambient
   mutation). Design concepts/constraints and coherent overload resolution only after the core
-  vocabulary, diagnostics, capability inference, and closure serialization are stable; a concept
-  must remain a statically inspectable contract, not a runtime dynamic escape hatch.
+  vocabulary, diagnostics, capability inference, and closure serialization are stable. Concepts
+  must be structural requirements over explicitly imported, visible typed words—not nominal
+  Rust-style trait implementations—and resolution must select one coherent candidate or diagnose
+  ambiguity rather than escape through `dynamic`.
 - [ ] Generate every production word/function from one typed signature, effect, documentation, and
   host-implementation registry.
 - [x] Finish Lisp source maps: the reader retains structural spans and typed lowering preserves
@@ -182,9 +192,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   `stream<T>` handles now provide bounded `stream-next -> option<T>` and `stream-close`, with
   ProgramRun ownership/generation checks, path-scoped capability propagation, concrete polymorphic
   host-result rows, and shared Lisp/Co-Forth lowering. File-line and CSV streams are the first
-  backends; producer-backed repeated-yield fibers remain a distinct later extension. Legacy
-  Co-Forth generators remain outside typed-runtime vocabulary until their state, effects, and
-  suspension semantics are verified.
+  backends. Scheduler `yield` remains control-only for fibers; a future user-defined
+  `generator`/`produce` construct must lower to a private resumable range state machine rather
+  than overload fiber yield. Legacy Co-Forth generators remain outside typed-runtime vocabulary
+  until their state, effects, and suspension semantics are verified.
 - [ ] Make resource roots first-class capability objects. Workspace/project paths remain safely
   relative; an intentional full-machine grant is a separate audited host root, never ambient
   authority inferred from an absolute path string. `host-path` and distinct

@@ -627,6 +627,34 @@ impl<'a> Verifier<'a> {
                 }
                 stack.push(Type::Unit);
             }
+            Instruction::PropagateResult {
+                return_ok_type,
+                error_type,
+            } => {
+                let result = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
+                let Type::Result(ok_type, found_error) = result else {
+                    return Err(VmDiagnostic::error(
+                        "E-RESULT-TRY-001",
+                        DiagnosticPhase::Verification,
+                        "result propagation requires result<T,E>",
+                        Some(origin.clone()),
+                    ));
+                };
+                let [Type::Result(declared_ok, declared_error)] =
+                    function.signature.output.values.as_slice()
+                else {
+                    return Err(VmDiagnostic::error(
+                        "E-RESULT-TRY-002",
+                        DiagnosticPhase::Verification,
+                        "result propagation is valid only in a function returning one result<T,E>",
+                        Some(origin.clone()),
+                    ));
+                };
+                unify(declared_ok, return_ok_type, &mut BTreeMap::new(), origin)?;
+                unify(declared_error, error_type, &mut BTreeMap::new(), origin)?;
+                unify(error_type, &found_error, &mut BTreeMap::new(), origin)?;
+                stack.push(*ok_type);
+            }
             Instruction::Jump { target } => return Ok(vec![*target]),
             Instruction::Branch {
                 then_block,
@@ -942,14 +970,14 @@ fn verify_return(
             Some(origin.clone()),
         ));
     }
+    let mut substitutions = BTreeMap::new();
     for (expected, found) in expected.values.iter().zip(suffix.iter()) {
-        if !expected.accepts(found) {
-            return Err(VmDiagnostic::type_mismatch(
-                expected.clone(),
-                found.clone(),
-                Some(origin.clone()),
-            ));
-        }
+        // Return annotations are real structured contracts. In particular,
+        // `ok(value)` initially leaves `result<T,dynamic>` until an enclosing
+        // declared `result<T,E>` return fixes its otherwise unknown error
+        // component. Use the same recursive unification as normal calls
+        // rather than comparing only the outer type constructor.
+        unify(expected, found, &mut substitutions, origin)?;
     }
     Ok(())
 }
