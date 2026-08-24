@@ -55,10 +55,12 @@ fn test_output_manager() {
 /// Test that piped input mode doesn't try to use TUI
 #[test]
 fn test_non_interactive_mode() {
-    // When stdin is not a TTY, TUI should not be used
+    // When stdin is not a TTY, TUI should not be used. Keep this test local
+    // and deterministic: ordinary English invokes the configured provider and
+    // used to make the suite wait through network retries.
     let output = Command::new(env!("CARGO_BIN_EXE_finch"))
         .arg("query")
-        .arg("test")
+        .arg("(say \"test\")")
         .output()
         .expect("Failed to run query");
 
