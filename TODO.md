@@ -67,8 +67,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   and generation checks, and journal-first projection into concurrent shadow-buffer WorkUnits. Provider
   wire effects and the provider `submit_program` tool now cross the client's ordered REPL event bus
   before any WorkUnit mutation, and explicitly entered typed programs run as background ProgramRuns
-  whose completion returns through that same loop. Client projections reject duplicate or gapped
-  `(execution_id, sequence)` envelopes, but this is only a live reconnect guard; still replace the
+  whose completion returns through that same loop. Client projections reject duplicates and retain
+  a gapped in-memory `(execution_id, sequence)` suffix until its prefix arrives, but this is only a
+  live reconnect guard; still replace the
   remaining direct compatibility projections with durable application-journal/replay support.
 - [ ] Complete the application-owned policy for cooperative typed-VM `yield`: the interactive
   provider-wire runner now yields its Tokio task and automatically resumes only an exact
