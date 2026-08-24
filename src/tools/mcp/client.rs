@@ -20,6 +20,7 @@ pub struct McpToolDescriptor {
     pub tool: String,
     pub description: Option<String>,
     pub input_schema: Value,
+    pub output_schema: Option<Value>,
 }
 
 /// MCP client that manages multiple server connections.
@@ -124,6 +125,7 @@ impl McpClient {
                     tool: tool.name.clone(),
                     description: tool.description.clone(),
                     input_schema: tool.input_schema.clone(),
+                    output_schema: tool.output_schema.clone(),
                 });
             }
         }

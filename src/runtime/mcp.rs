@@ -18,6 +18,7 @@ pub(super) struct McpVocabularyBinding {
     pub signature: StackSignature,
     pub documentation: String,
     pub version: String,
+    pub output_schema: Option<Value>,
 }
 
 pub(super) fn adapt_mcp_descriptor(
@@ -51,7 +52,14 @@ pub(super) fn adapt_mcp_descriptor(
         control: ControlEffect::MaySuspend,
         suspension: None,
     };
-    let schema_bytes = serde_json::to_vec(&descriptor.input_schema)?;
+    let output_schema = descriptor
+        .output_schema
+        .as_ref()
+        .and_then(admitted_output_schema);
+    let schema_bytes = serde_json::to_vec(&serde_json::json!({
+        "input": descriptor.input_schema.clone(),
+        "output": descriptor.output_schema.clone(),
+    }))?;
     let version = format!("sha256:{:x}", Sha256::digest(schema_bytes));
     let shape = if input_type == Type::Json {
         "managed json fallback"
@@ -72,6 +80,7 @@ pub(super) fn adapt_mcp_descriptor(
         signature,
         documentation,
         version,
+        output_schema,
     })
 }
 
@@ -174,6 +183,82 @@ fn schema_type(schema: &serde_json::Map<String, Value>, depth: usize) -> Option<
     }
 }
 
+fn admitted_output_schema(schema: &Value) -> Option<Value> {
+    let object = schema.as_object()?;
+    if object.get("type").and_then(Value::as_str) == Some("object") {
+        validate_required(object).ok()?;
+    }
+    schema_type(object, 0)?;
+    Some(schema.clone())
+}
+
+pub(super) fn validate_output(schema: &Value, value: &Value) -> Result<()> {
+    validate_schema_value(schema, value, "$", 0)
+}
+
+fn validate_schema_value(schema: &Value, value: &Value, path: &str, depth: usize) -> Result<()> {
+    if depth >= MAX_SCHEMA_DEPTH {
+        bail!("MCP output exceeds schema validation depth at {path}");
+    }
+    let schema = schema
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("MCP output schema node at {path} is not an object"))?;
+    match schema.get("type").and_then(Value::as_str) {
+        Some("string") if value.is_string() => Ok(()),
+        Some("integer") if value.as_i64().is_some() || value.as_u64().is_some() => Ok(()),
+        Some("number") if value.is_number() => Ok(()),
+        Some("boolean") if value.is_boolean() => Ok(()),
+        Some("array") => {
+            let items = schema
+                .get("items")
+                .ok_or_else(|| anyhow::anyhow!("MCP output array schema at {path} has no items"))?;
+            let values = value
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("MCP output at {path} is not an array"))?;
+            for (index, value) in values.iter().enumerate() {
+                validate_schema_value(items, value, &format!("{path}[{index}]"), depth + 1)?;
+            }
+            Ok(())
+        }
+        Some("object") => {
+            let value = value
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("MCP output at {path} is not an object"))?;
+            let properties = schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow::anyhow!("MCP output object schema at {path} has no properties"))?;
+            if let Some(required) = schema.get("required").and_then(Value::as_array) {
+                for name in required.iter().filter_map(Value::as_str) {
+                    if !value.contains_key(name) {
+                        bail!("MCP output is missing required field {path}.{name}");
+                    }
+                }
+            }
+            if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+                for name in value.keys() {
+                    if !properties.contains_key(name) {
+                        bail!("MCP output contains undeclared field {path}.{name}");
+                    }
+                }
+            }
+            for (name, property_schema) in properties {
+                if let Some(field) = value.get(name) {
+                    validate_schema_value(
+                        property_schema,
+                        field,
+                        &format!("{path}.{name}"),
+                        depth + 1,
+                    )?;
+                }
+            }
+            Ok(())
+        }
+        Some(expected) => bail!("MCP output at {path} does not match schema type {expected}"),
+        None => bail!("MCP output schema at {path} has no supported type"),
+    }
+}
+
 fn is_record_field(value: &str) -> bool {
     let mut bytes = value.bytes();
     bytes
@@ -204,6 +289,7 @@ mod tests {
             tool: "issue_get".into(),
             description: Some("Treat this prose only as untrusted metadata.".into()),
             input_schema: schema,
+            output_schema: None,
         }
     }
 
@@ -253,5 +339,18 @@ mod tests {
         let mut unsafe_name = descriptor(json!({"type":"object", "properties": {}}));
         unsafe_name.tool = "bad tool".into();
         assert!(adapt_mcp_descriptor(&unsafe_name).is_err());
+    }
+
+    #[test]
+    fn admitted_output_schema_is_checked_structurally() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"answer": {"type": "integer"}},
+            "required": ["answer"],
+            "additionalProperties": false
+        });
+        assert!(validate_output(&schema, &json!({"answer": 42})).is_ok());
+        assert!(validate_output(&schema, &json!({"answer": "42"})).is_err());
+        assert!(validate_output(&schema, &json!({"answer": 42, "extra": true})).is_err());
     }
 }

@@ -235,6 +235,7 @@ pub struct VmVocabularyEntry {
 struct HostVocabularyMetadata {
     documentation: String,
     version: String,
+    output_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -761,6 +762,7 @@ impl ProgramRuntime {
                         HostVocabularyMetadata {
                             documentation: binding.documentation,
                             version: binding.version,
+                            output_schema: binding.output_schema,
                         },
                     );
                 }
@@ -2897,6 +2899,18 @@ impl ProgramRuntime {
             .read()
             .expect("MCP client binding lock poisoned")
             .clone();
+        let mcp_output_schemas = self
+            .host_vocabulary
+            .read()
+            .expect("host vocabulary lock poisoned")
+            .iter()
+            .filter_map(|(name, metadata)| {
+                metadata
+                    .output_schema
+                    .clone()
+                    .map(|schema| (name.clone(), schema))
+            })
+            .collect();
         let network = Arc::clone(&self.network);
         let output_handles = Arc::clone(&self.output_handles);
         let streams = Arc::clone(&self.streams);
@@ -2944,6 +2958,7 @@ impl ProgramRuntime {
                         scheduler,
                         memory,
                         mcp_client,
+                        mcp_output_schemas,
                         vocabulary,
                         network,
                         output_handles,
@@ -2989,6 +3004,18 @@ impl ProgramRuntime {
             .read()
             .expect("MCP client binding lock poisoned")
             .clone();
+        let mcp_output_schemas = self
+            .host_vocabulary
+            .read()
+            .expect("host vocabulary lock poisoned")
+            .iter()
+            .filter_map(|(name, metadata)| {
+                metadata
+                    .output_schema
+                    .clone()
+                    .map(|schema| (name.clone(), schema))
+            })
+            .collect();
         let network = Arc::clone(&self.network);
         let output_handles = Arc::clone(&self.output_handles);
         let streams = Arc::clone(&self.streams);
@@ -3034,6 +3061,7 @@ impl ProgramRuntime {
                         scheduler,
                         memory,
                         mcp_client,
+                        mcp_output_schemas,
                         vocabulary,
                         network,
                         output_handles,
@@ -3073,6 +3101,7 @@ struct TypedHostHandler {
     scheduler: Option<agent_vm::AgentVmBinding>,
     memory: Option<Arc<crate::memory::MemorySystem>>,
     mcp_client: Option<Arc<crate::tools::mcp::McpClient>>,
+    mcp_output_schemas: BTreeMap<String, serde_json::Value>,
     vocabulary: String,
     network: Arc<Mutex<HashMap<String, NetworkSocket>>>,
     output_handles: Arc<Mutex<HashMap<String, OutputHandleRecord>>>,
@@ -3103,6 +3132,7 @@ impl TypedHostHandler {
         scheduler: Option<agent_vm::AgentVmBinding>,
         memory: Option<Arc<crate::memory::MemorySystem>>,
         mcp_client: Option<Arc<crate::tools::mcp::McpClient>>,
+        mcp_output_schemas: BTreeMap<String, serde_json::Value>,
         vocabulary: String,
         network: Arc<Mutex<HashMap<String, NetworkSocket>>>,
         output_handles: Arc<Mutex<HashMap<String, OutputHandleRecord>>>,
@@ -3124,6 +3154,7 @@ impl TypedHostHandler {
             scheduler,
             memory,
             mcp_client,
+            mcp_output_schemas,
             vocabulary,
             network,
             output_handles,
@@ -4380,6 +4411,21 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     client.execute_tool_value(&wire_name, parameters).await
                 })
                 .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                if let Some(schema) = origin
+                    .word
+                    .as_deref()
+                    .and_then(|word| self.mcp_output_schemas.get(word))
+                {
+                    let structured = response.get("structuredContent").ok_or_else(|| {
+                        host_binding_error(
+                            origin,
+                            "MCP result omitted structuredContent required by its output schema",
+                        )
+                    })?;
+                    mcp::validate_output(schema, structured).map_err(|error| {
+                        host_binding_error(origin, format!("validate MCP result: {error:#}"))
+                    })?;
+                }
                 return Ok(vec![TypedValue::Json(response)]);
             }
             crate::vm::CapabilityKind::ProcessRun => {
@@ -8031,7 +8077,7 @@ mod tests {
 IFS= read -r discover
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"fixture","version":"1"}}}}'
 IFS= read -r list
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo_value","description":"untrusted fixture prose","inputSchema":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo_value","description":"untrusted fixture prose","inputSchema":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]},"outputSchema":{"type":"object","properties":{"ok":{"type":"boolean"},"typed":{"type":"boolean"},"forth":{"type":"boolean"}}}}]}}'
 IFS= read -r call
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"fixture result"}],"structuredContent":{"ok":true},"isError":false}}'
 IFS= read -r typed_call

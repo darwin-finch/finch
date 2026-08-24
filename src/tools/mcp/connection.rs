@@ -61,6 +61,8 @@ pub struct McpTool {
     pub description: Option<String>,
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
+    #[serde(default, rename = "outputSchema")]
+    pub output_schema: Option<Value>,
 }
 
 /// MCP server implementation info
