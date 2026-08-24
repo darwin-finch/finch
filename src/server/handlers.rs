@@ -250,13 +250,21 @@ async fn push_named_brain_event(
         .map_err(|error| AppError(error).into_response())?;
 
     let execution = match request.kind {
-        BrainEventKind::Program { language, .. } => {
-            Some(execute_named_brain_program(&server, &name, language).await)
+        BrainEventKind::Program { language, source } => {
+            Some(execute_named_brain_program(
+                &server,
+                &name,
+                accepted.seq,
+                language,
+                &source,
+            ).await)
         }
         BrainEventKind::Prompt { text } => {
             Some(execute_named_brain_prompt(&server, &name, &text).await)
         }
-        BrainEventKind::ProgramPopped { .. } | BrainEventKind::Result { .. } => None,
+        BrainEventKind::ProgramPopped { .. }
+        | BrainEventKind::Result { .. }
+        | BrainEventKind::RuntimeCommitted { .. } => None,
     };
     let result = execution.map(|result| {
         let (output, error) = match result {
@@ -284,47 +292,37 @@ async fn push_named_brain_event(
 async fn execute_named_brain_program(
     server: &AgentServer,
     name: &str,
+    request_seq: u64,
     language: crate::brain::shared::ProgramLanguage,
+    source: &str,
 ) -> anyhow::Result<String> {
-    use crate::brain::shared::ProgramLanguage;
-
     let snapshot = server.shared_brains().snapshot(name)?;
     ensure_named_brain_environment(server, &snapshot)?;
-    match language {
-        ProgramLanguage::Forth => {
-            let base = LIVE_VM.read().await;
-            let mut vm = base.clone_dict();
-            drop(base);
-            vm.remote_mode = true;
-            let mut output = String::new();
-            for program in snapshot
-                .program_stack
-                .iter()
-                .filter(|program| program.language == ProgramLanguage::Forth)
-            {
-                output = vm.exec(&program.source)?;
-            }
-            if output.trim().is_empty() && !vm.data_stack().is_empty() {
-                output = format!("{:?}", vm.data_stack());
-            }
-            Ok(output)
-        }
-        ProgramLanguage::Lisp => {
-            let env = crate::lisp::make_env();
-            let ctx = Arc::new(crate::lisp::LispCtx::new());
-            let mut output = String::new();
-            for program in snapshot
-                .program_stack
-                .iter()
-                .filter(|program| program.language == ProgramLanguage::Lisp)
-            {
-                output = crate::lisp::run_in(&program.source, env.clone(), ctx.clone())
-                    .await?
-                    .to_string();
-            }
-            Ok(output)
-        }
+    let runtime = server.shared_brains().program_runtime(name)?;
+    let language = match language {
+        crate::brain::shared::ProgramLanguage::Forth => crate::programs::ProgramLanguage::Forth,
+        crate::brain::shared::ProgramLanguage::Lisp => crate::programs::ProgramLanguage::Lisp,
+    };
+    let submission = crate::runtime::ProgramSubmission {
+        language,
+        source_id: Some(format!("brain:{name}:event:{request_seq}")),
+        source: source.to_string(),
+        intent: format!("named Brain program event {request_seq}"),
+        effect: crate::programs::ExecutionEffect::Pure,
+        declared_capabilities: Vec::new(),
+        manifest_generation: runtime.manifest_generation(),
+        expected_revision: Some(runtime.revision()),
+        budget: None,
+    };
+    let outcome = resume_named_brain_yields(&runtime, runtime.submit_typed_only(submission).await?)
+        .await?;
+    if outcome.status != crate::runtime::outcome::ExecutionStatus::Completed {
+        anyhow::bail!(render_named_brain_failure(&outcome));
     }
+    server
+        .shared_brains()
+        .commit_runtime(name, request_seq, outcome.output_revision, &runtime)?;
+    Ok(render_named_brain_output(&outcome))
 }
 
 async fn execute_named_brain_prompt(
@@ -350,13 +348,15 @@ async fn execute_named_brain_prompt(
         .join("\n");
     let request = crate::providers::ProviderRequest::new(vec![Message::user(prompt)])
         .with_system(format!(
-            "You are attached to Finch brain {name}. Its sole execution environment is {}:{}.\n\
+            "{}\n\nYou are attached to Finch brain {name}. Its sole execution environment is {}:{}.\n\
+             Reply only with one raw executable Finch Lisp or Co-Forth wire program. All user-facing prose must be emitted with say.\n\
              All file and process effects belong to that workspace. Its authoritative recent event log follows.\n{context}",
+            crate::programs::BOOT_CAPSULE,
             snapshot.environment.machine,
             snapshot.environment.workspace.display(),
         ));
     let response = provider.send_message(&request).await?;
-    Ok(response
+    let source = response
         .content
         .iter()
         .filter_map(|block| match block {
@@ -364,7 +364,66 @@ async fn execute_named_brain_prompt(
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join(""))
+        .join("")
+        .trim()
+        .to_string();
+    if source.is_empty() {
+        anyhow::bail!("provider returned no Finch wire program");
+    }
+    let language = crate::programs::ProgramLanguage::infer_wire_source(&source)?;
+    let shared_language = match language {
+        crate::programs::ProgramLanguage::Forth => crate::brain::shared::ProgramLanguage::Forth,
+        crate::programs::ProgramLanguage::Lisp => crate::brain::shared::ProgramLanguage::Lisp,
+    };
+    let program = server.shared_brains().push(
+        name,
+        "provider",
+        crate::brain::shared::BrainEventKind::Program {
+            language: shared_language,
+            source: source.clone(),
+        },
+    )?;
+    execute_named_brain_program(server, name, program.seq, shared_language, &source).await
+}
+
+async fn resume_named_brain_yields(
+    runtime: &crate::runtime::ProgramRuntime,
+    mut outcome: crate::runtime::outcome::ExecutionOutcome,
+) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
+    while outcome.status == crate::runtime::outcome::ExecutionStatus::Suspended
+        && matches!(
+            runtime.pending_typed_execution(outcome.execution_id)?,
+            Some(crate::runtime::PendingTypedExecutionInfo {
+                reason: crate::runtime::PendingTypedReason::Yielded,
+                yielded_value: Some(crate::programs::ProgramValue::Nil),
+                ..
+            })
+        )
+    {
+        tokio::task::yield_now().await;
+        outcome = runtime.resume_typed_execution(outcome.execution_id).await?;
+    }
+    Ok(outcome)
+}
+
+fn render_named_brain_output(outcome: &crate::runtime::outcome::ExecutionOutcome) -> String {
+    if !outcome.output.is_empty() {
+        outcome.output.clone()
+    } else if outcome.values.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(&outcome.values).unwrap_or_else(|_| format!("{:?}", outcome.values))
+    }
+}
+
+fn render_named_brain_failure(outcome: &crate::runtime::outcome::ExecutionOutcome) -> String {
+    if !outcome.diagnostics.is_empty() {
+        outcome.diagnostics.join("; ")
+    } else if !outcome.required_capabilities.is_empty() {
+        format!("named Brain program requires approval: {:?}", outcome.required_capabilities)
+    } else {
+        format!("named Brain program stopped with {:?}", outcome.status)
+    }
 }
 
 fn ensure_named_brain_environment(
@@ -396,13 +455,17 @@ async fn watch_named_brain(
     ws: axum::extract::WebSocketUpgrade,
 ) -> Result<Response, Response> {
     check_brain_access(&server, addr, &headers).await?;
-    let snapshot = server
-        .shared_brains()
-        .snapshot(&name)
-        .map_err(|error| AppError(error).into_response())?;
+    // Subscribe before taking the snapshot. Events appended after the
+    // snapshot revision then wait in this receiver and are sent immediately
+    // afterward, so an attaching console cannot miss the gap between two
+    // independent HTTP/WebSocket requests.
     let mut events = server
         .shared_brains()
         .subscribe(&name)
+        .map_err(|error| AppError(error).into_response())?;
+    let snapshot = server
+        .shared_brains()
+        .snapshot(&name)
         .map_err(|error| AppError(error).into_response())?;
     let store = server.shared_brains().clone();
     Ok(ws

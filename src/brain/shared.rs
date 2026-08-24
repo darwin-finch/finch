@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -33,7 +34,7 @@ pub struct BrainEnvironment {
     pub generation: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrainEventKind {
     Prompt {
@@ -52,9 +53,17 @@ pub enum BrainEventKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// Content-addressed typed-VM state committed after one accepted program.
+    /// This is an internal Brain event, not a request to replay source after
+    /// restart; the checkpoint bytes live beside the append-only log.
+    RuntimeCommitted {
+        request_seq: u64,
+        runtime_revision: u64,
+        checkpoint_sha256: String,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrainEvent {
     pub seq: u64,
     /// Binds this event to the exact environment revision in which it ran.
@@ -74,7 +83,7 @@ pub struct BrainProgram {
     pub source: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrainSnapshot {
     pub name: String,
     pub environment: BrainEnvironment,
@@ -83,7 +92,7 @@ pub struct BrainSnapshot {
     pub program_stack: Vec<BrainProgram>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrainWireMessage {
     Snapshot { brain: BrainSnapshot },
@@ -93,6 +102,7 @@ pub enum BrainWireMessage {
 struct BrainState {
     events: Vec<BrainEvent>,
     program_stack: Vec<BrainProgram>,
+    runtime_checkpoint: Option<(u64, String)>,
     tx: broadcast::Sender<BrainEvent>,
 }
 
@@ -102,6 +112,7 @@ impl BrainState {
         let mut state = Self {
             events: Vec::new(),
             program_stack: Vec::new(),
+            runtime_checkpoint: None,
             tx,
         };
         for event in events {
@@ -125,6 +136,20 @@ impl BrainState {
                     self.program_stack.pop();
                 }
             }
+            BrainEventKind::RuntimeCommitted {
+                runtime_revision,
+                checkpoint_sha256,
+                ..
+            } => {
+                if self
+                    .runtime_checkpoint
+                    .as_ref()
+                    .is_none_or(|(current, _)| runtime_revision >= current)
+                {
+                    self.runtime_checkpoint =
+                        Some((*runtime_revision, checkpoint_sha256.clone()));
+                }
+            }
             BrainEventKind::Prompt { .. } | BrainEventKind::Result { .. } => {}
         }
         self.events.push(event);
@@ -141,6 +166,9 @@ pub struct SharedBrainStore {
     root: Option<PathBuf>,
     environment: BrainEnvironment,
     brains: Arc<RwLock<HashMap<String, BrainState>>>,
+    runtimes: Arc<RwLock<HashMap<String, Arc<crate::runtime::ProgramRuntime>>>>,
+    runtime_checkpoints:
+        Arc<RwLock<HashMap<String, crate::vm::TypedRuntimeCheckpoint>>>,
 }
 
 impl SharedBrainStore {
@@ -169,6 +197,8 @@ impl SharedBrainStore {
                 generation: initial_environment_generation(),
             },
             brains: Arc::new(RwLock::new(HashMap::new())),
+            runtimes: Arc::new(RwLock::new(HashMap::new())),
+            runtime_checkpoints: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -249,6 +279,145 @@ impl SharedBrainStore {
         self.ensure_loaded(name)?;
         let brains = self.brains.read().expect("shared brain lock poisoned");
         Ok(brains.get(name).expect("brain loaded above").tx.subscribe())
+    }
+
+    /// Return the one live typed runtime for a named Brain, restoring its
+    /// latest reducible checkpoint on first access after daemon restart.
+    pub fn program_runtime(&self, name: &str) -> Result<Arc<crate::runtime::ProgramRuntime>> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        if let Some(runtime) = self
+            .runtimes
+            .read()
+            .expect("shared brain runtime lock poisoned")
+            .get(name)
+            .cloned()
+        {
+            return Ok(runtime);
+        }
+        let checkpoint_sha256 = self
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .get(name)
+            .and_then(|state| state.runtime_checkpoint.clone())
+            .map(|(_, checkpoint_sha256)| checkpoint_sha256);
+        let runtime = Arc::new(match checkpoint_sha256 {
+            Some(checkpoint_sha256) => crate::runtime::ProgramRuntime::from_checkpoint(
+                self.read_runtime_checkpoint(name, &checkpoint_sha256)?,
+            )?,
+            None => crate::runtime::ProgramRuntime::new(),
+        });
+        let mut runtimes = self
+            .runtimes
+            .write()
+            .expect("shared brain runtime lock poisoned");
+        Ok(runtimes
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::clone(&runtime))
+            .clone())
+    }
+
+    /// Journal the latest checkpoint only after a ProgramRuntime commit. The
+    /// source event remains the audit record; restart restores state rather
+    /// than replaying effects from that source.
+    pub fn commit_runtime(
+        &self,
+        name: &str,
+        request_seq: u64,
+        runtime_revision: u64,
+        runtime: &crate::runtime::ProgramRuntime,
+    ) -> Result<BrainEvent> {
+        let snapshot = runtime
+            .revision_history()?
+            .into_iter()
+            .find(|snapshot| snapshot.revision == runtime_revision)
+            .with_context(|| {
+                format!("typed runtime has no revision snapshot {runtime_revision}")
+            })?;
+        let checkpoint = snapshot.checkpoint.context(
+            "typed runtime revision contains host-owned handles and cannot be persisted yet",
+        )?;
+        let encoded = serde_json::to_vec(&checkpoint)?;
+        let checkpoint_sha256 = hex::encode(Sha256::digest(&encoded));
+        self.write_runtime_checkpoint(name, &checkpoint_sha256, &encoded)?;
+        self.runtime_checkpoints
+            .write()
+            .expect("shared brain checkpoint lock poisoned")
+            .insert(checkpoint_sha256.clone(), checkpoint);
+        self.push(
+            name,
+            "daemon",
+            BrainEventKind::RuntimeCommitted {
+                request_seq,
+                runtime_revision: snapshot.revision,
+                checkpoint_sha256,
+            },
+        )
+    }
+
+    fn read_runtime_checkpoint(
+        &self,
+        name: &str,
+        checkpoint_sha256: &str,
+    ) -> Result<crate::vm::TypedRuntimeCheckpoint> {
+        if let Some(checkpoint) = self
+            .runtime_checkpoints
+            .read()
+            .expect("shared brain checkpoint lock poisoned")
+            .get(checkpoint_sha256)
+            .cloned()
+        {
+            return Ok(checkpoint);
+        }
+        let root = self
+            .root
+            .as_ref()
+            .context("named Brain checkpoint is not available in this process")?;
+        let path = root
+            .join(name)
+            .join("runtime")
+            .join(format!("{checkpoint_sha256}.json"));
+        let encoded = std::fs::read(&path)
+            .with_context(|| format!("read {}", path.display()))?;
+        let actual = hex::encode(Sha256::digest(&encoded));
+        if actual != checkpoint_sha256 {
+            anyhow::bail!("typed runtime checkpoint hash mismatch for {checkpoint_sha256}");
+        }
+        let checkpoint: crate::vm::TypedRuntimeCheckpoint = serde_json::from_slice(&encoded)
+            .with_context(|| format!("parse {}", path.display()))?;
+        self.runtime_checkpoints
+            .write()
+            .expect("shared brain checkpoint lock poisoned")
+            .insert(checkpoint_sha256.to_string(), checkpoint.clone());
+        Ok(checkpoint)
+    }
+
+    fn write_runtime_checkpoint(
+        &self,
+        name: &str,
+        checkpoint_sha256: &str,
+        encoded: &[u8],
+    ) -> Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let directory = root.join(name).join("runtime");
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("create {}", directory.display()))?;
+        let path = directory.join(format!("{checkpoint_sha256}.json"));
+        if path.exists() {
+            return Ok(());
+        }
+        let temporary = directory.join(format!(
+            ".{checkpoint_sha256}.{}.tmp",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&temporary, encoded)
+            .with_context(|| format!("write {}", temporary.display()))?;
+        std::fs::rename(&temporary, &path)
+            .with_context(|| format!("commit {}", path.display()))?;
+        Ok(())
     }
 
     fn ensure_loaded(&self, name: &str) -> Result<()> {
@@ -412,7 +581,8 @@ mod tests {
     #[test]
     fn subscribers_receive_the_authoritative_sequence() {
         let store = SharedBrainStore::with_root("box.local", None);
-        let mut rx = store.subscribe("brain").unwrap();
+        let mut first = store.subscribe("brain").unwrap();
+        let mut second = store.subscribe("brain").unwrap();
         let event = store
             .push(
                 "brain",
@@ -420,7 +590,118 @@ mod tests {
                 BrainEventKind::Prompt { text: "hi".into() },
             )
             .unwrap();
-        assert_eq!(rx.try_recv().unwrap(), event);
+        assert_eq!(first.try_recv().unwrap(), event);
+        assert_eq!(second.try_recv().unwrap(), event);
+    }
+
+    #[tokio::test]
+    async fn named_brain_restores_one_typed_runtime_without_replaying_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let runtime = store.program_runtime("brain").unwrap();
+        let outcome = runtime
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Forth,
+                source_id: Some("brain:event:1".into()),
+                source: ": square ( S n:int -- S int ! pure ) n n * ;".into(),
+                intent: "define square".into(),
+                effect: crate::programs::ExecutionEffect::VmWrite,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Completed
+        );
+        let checkpoint = runtime
+            .revision_history()
+            .unwrap()
+            .last()
+            .and_then(|revision| revision.checkpoint.clone())
+            .unwrap();
+        let encoded_checkpoint = serde_json::to_string(&checkpoint).unwrap();
+        serde_json::from_str::<crate::vm::TypedRuntimeCheckpoint>(&encoded_checkpoint)
+            .expect("checkpoint itself must round-trip through JSON");
+        store
+            .commit_runtime("brain", 1, outcome.output_revision, &runtime)
+            .unwrap();
+
+        let event_log = std::fs::read_to_string(temp.path().join("brain/events.jsonl")).unwrap();
+        for line in event_log.lines() {
+            if let Err(error) = serde_json::from_str::<BrainEvent>(line) {
+                panic!("checkpoint event must round-trip through JSONL: {error}\n{line}");
+            }
+        }
+
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restored = restarted.program_runtime("brain").unwrap();
+        let outcome = restored
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Lisp,
+                source_id: Some("brain:event:2".into()),
+                source: "(square 7)".into(),
+                intent: "call restored definition".into(),
+                effect: crate::programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: restored.manifest_generation(),
+                expected_revision: Some(restored.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Completed
+        );
+        assert_eq!(outcome.values, vec![crate::programs::ProgramValue::Int(49)]);
+    }
+
+    #[tokio::test]
+    async fn out_of_order_checkpoint_events_never_regress_a_brain_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let runtime = store.program_runtime("brain").unwrap();
+        let submit = |source: &str, revision| crate::runtime::ProgramSubmission {
+            language: crate::programs::ProgramLanguage::Forth,
+            source_id: None,
+            source: source.into(),
+            intent: "concurrent checkpoint ordering".into(),
+            effect: crate::programs::ExecutionEffect::Pure,
+            declared_capabilities: Vec::new(),
+            manifest_generation: runtime.manifest_generation(),
+            expected_revision: Some(revision),
+            budget: None,
+        };
+        let first = runtime.submit_typed_only(submit("1", 0)).await.unwrap();
+        let second = runtime.submit_typed_only(submit("2", 1)).await.unwrap();
+        store
+            .commit_runtime("brain", 2, second.output_revision, &runtime)
+            .unwrap();
+        store
+            .commit_runtime("brain", 1, first.output_revision, &runtime)
+            .unwrap();
+
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restored = restarted.program_runtime("brain").unwrap();
+        let values = restored
+            .inspect()
+            .await
+            .unwrap()
+            .stack
+            .into_iter()
+            .map(|cell| cell.value)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                crate::programs::ProgramValue::Int(1),
+                crate::programs::ProgramValue::Int(2),
+            ]
+        );
     }
 
     #[test]

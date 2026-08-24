@@ -109,12 +109,14 @@ HTTP handlers, the Cap'n Proto IPC server, daemon clients, remote HTTP/WebSocket
 in-process callers currently duplicate parts of spawn/list/get/respond/cancel behavior. They should
 be adapters over one service.
 
-The legacy named-Brain HTTP `Program` handler additionally replays the accumulated program stack
-through the old Co-Forth or native Lisp evaluators. It is an explicitly quarantined compatibility
-path, not evidence that a Brain has a shared typed VM. Do not extend it with capabilities, provider
-wire handling, or new Brain behavior. During the gated convergence phase it must either become a
-typed `ProgramRuntime` adapter with the ordinary broker/effect journal, or remain a separately
-versioned legacy endpoint until it can be removed.
+The named-Brain HTTP compatibility handler no longer replays the accumulated program stack through
+the old Co-Forth or native Lisp evaluators. Program events and raw provider-wire responses enter one
+typed `ProgramRuntime`; successful reducible revisions are stored as content-addressed checkpoints
+beside the event log and restored without replaying source or effects. Concurrent commits journal
+their exact runtime revision and recovery never regresses to a later-appended older checkpoint.
+This remains a compatibility adapter, not the final runner-lease architecture: it has no approval
+audience and therefore cannot acquire workspace/host grants. B2-B4 must move its runtime ownership
+to the leased environment runner and retain the daemon as durable coordinator only.
 
 ## Target model
 

@@ -163,9 +163,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Finish the persistent `ProgramRuntime` state model. Lisp and Co-Forth already share one
   persistent typed stack and dictionary, exposed by one inspection/revision boundary. Successful
   revisions now retain a serializable, reverified stack-and-definition checkpoint whenever they
-  contain no host-owned handles; authority is intentionally not serialized. Add the managed heap,
-  durable storage, host-handle restoration, and transaction manager before treating it as a
-  restartable Brain state.
+  contain no host-owned handles; authority is intentionally not serialized. Named-Brain
+  compatibility execution now journals content-addressed typed checkpoints and restores them after
+  daemon restart without replaying source or effects. Add the managed heap, general durable
+  revision storage, and explicit host-handle restoration before treating every Brain run as
+  restartable.
 - [ ] Complete revisioned private working snapshots and conflict-aware commits. A `ProgramRuntime`
   now executes each ProgramRun on a cloned stack/dictionary snapshot and gates only snapshot/commit;
   stale resume checks and losing post-resume commits return structured failed outcomes without
@@ -174,7 +176,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   correlation/revocation races, and reviewed merge rules where a commutative delta can safely be
   accepted.
 - [ ] Remove the Lisp-to-Forth text compiler, native Lisp fallback, source-text effect inference,
-  and duplicate direct model-tool paths after conformance parity.
+  and duplicate direct model-tool paths after conformance parity. The named-Brain Program/Prompt
+  compatibility endpoints now execute only the shared typed `ProgramRuntime`; other legacy paths
+  remain quarantined.
 - [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
   tests, concurrency tests, and provider conformance tests. Manual configured-cloud smoke checks on
   2026-08-23 successfully executed provider-emitted Lisp `say`, Lisp arithmetic, and Co-Forth

@@ -4536,18 +4536,6 @@ Rules:\n\
             .map(|config| config.server.brain_password)
             .unwrap_or_default();
         let mut client = crate::brain::remote::RemoteBrainClient::new(target, password)?;
-        let snapshot = match client.snapshot().await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.output_manager.write_info(format!(
-                    "brain attach {}: {error}",
-                    client.target.display_name()
-                ));
-                self.render_tui().await?;
-                return Ok(());
-            }
-        };
-        client.target.machine = snapshot.environment.machine.clone();
         let mut incoming = match client.watch().await {
             Ok(incoming) => incoming,
             Err(error) => {
@@ -4559,12 +4547,32 @@ Rules:\n\
                 return Ok(());
             }
         };
+        let snapshot = match incoming.recv().await {
+            Some(crate::brain::shared::BrainWireMessage::Snapshot { brain }) => brain,
+            Some(crate::brain::shared::BrainWireMessage::Event { .. }) => {
+                self.output_manager.write_info(format!(
+                    "brain attach {}: event stream did not begin with a snapshot",
+                    client.target.display_name()
+                ));
+                self.render_tui().await?;
+                return Ok(());
+            }
+            None => {
+                self.output_manager.write_info(format!(
+                    "brain attach {}: event stream closed before its snapshot",
+                    client.target.display_name()
+                ));
+                self.render_tui().await?;
+                return Ok(());
+            }
+        };
+        client.target.machine = snapshot.environment.machine.clone();
 
         let target_name = client.target.display_name();
         self.active_remote_brain = Some(client);
         self.status_bar.update_line(
             crate::cli::status_bar::StatusLineType::SessionLabel,
-            format!("◆ {target_name}"),
+            format!("◆ brain: {target_name} · driver · runner online"),
         );
         self.render_remote_brain_message(crate::brain::shared::BrainWireMessage::Snapshot {
             brain: snapshot,
@@ -4717,6 +4725,10 @@ Rules:\n\
                     self.output_manager.write_response(output.clone());
                 }
             }
+            // Internal durable VM state is intentionally not rendered as a
+            // chat item. The adjacent Program/Result events are its visible
+            // projection.
+            BrainEventKind::RuntimeCommitted { .. } => {}
         }
     }
 
