@@ -208,7 +208,7 @@ pub fn compile_lisp_with_functions(
     vocabulary: &Vocabulary,
     linked_functions: &BTreeMap<String, Function>,
 ) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
-    let parsed_expressions = crate::lisp::reader::parse_str(source).map_err(|error| {
+    let parsed_forms = crate::lisp::reader::parse_str_spanned(source).map_err(|error| {
         vec![VmDiagnostic::error(
             "E-READ-002",
             DiagnosticPhase::Reader,
@@ -216,24 +216,27 @@ pub fn compile_lisp_with_functions(
             Some(source_origin(source_id, source, "<reader>")),
         )]
     })?;
-    let spans = top_level_form_spans(source)
-        .filter(|spans| spans.len() == parsed_expressions.len())
-        .unwrap_or_else(|| {
-        // The legacy reader is authoritative for acceptance.  Never reject a
-        // program merely because diagnostic decoration could not be derived;
-        // retain the previous whole-submission fallback in that exceptional
-        // case.
-        vec![0..source.len(); parsed_expressions.len()]
-    });
+    let parsed_expressions = parsed_forms
+        .iter()
+        .map(|form| form.value.clone())
+        .collect::<Vec<_>>();
     let macros = collect_template_macros(source_id, source, &parsed_expressions)?;
     let mut expansion_budget = 128;
-    let expressions = parsed_expressions
+    let expressions = parsed_forms
         .iter()
-        .zip(spans)
-        .filter(|(expression, _)| !is_macro_definition(expression))
-        .map(|(expression, span)| {
-            expand_template_macros(source_id, source, expression, &macros, &mut expansion_budget)
-                .map(|value| SourceForm { value, span })
+        .filter(|form| !is_macro_definition(&form.value))
+        .map(|form| {
+            expand_template_macros(
+                source_id,
+                source,
+                &form.value,
+                &macros,
+                &mut expansion_budget,
+            )
+            .map(|value| SourceForm {
+                value,
+                span: form.span.clone(),
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut compiler = Compiler {
@@ -411,7 +414,8 @@ fn reject_template_binding_forms(
 ) -> Result<(), Vec<VmDiagnostic>> {
     match template {
         Val::List(items) => {
-            if matches!(items.first(), Some(Val::Symbol(name)) if matches!(name.as_str(), "let" | "lambda" | "define" | "define-syntax")) {
+            if matches!(items.first(), Some(Val::Symbol(name)) if matches!(name.as_str(), "let" | "lambda" | "define" | "define-syntax"))
+            {
                 return Err(vec![macro_error(
                     source_id,
                     source,
@@ -516,12 +520,7 @@ fn macro_error(
 
 impl Compiler<'_> {
     fn origin(&self, word: impl Into<String>) -> SourceOrigin {
-        source_origin_in_range(
-            self.source_id,
-            self.source,
-            self.current_span.clone(),
-            word,
-        )
+        source_origin_in_range(self.source_id, self.source, self.current_span.clone(), word)
     }
 
     fn compile_expression(
@@ -992,10 +991,9 @@ impl Compiler<'_> {
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         if expressions.is_empty() || expressions.len() % 2 != 0 {
-            return Err(vec![self.error(
-                "E-MAP-001",
-                "map requires one or more key/value pairs",
-            )]);
+            return Err(vec![
+                self.error("E-MAP-001", "map requires one or more key/value pairs")
+            ]);
         }
         let key_type = self.compile_expression(&expressions[0], builder)?;
         let value_type = self.compile_expression(&expressions[1], builder)?;
@@ -1042,9 +1040,8 @@ impl Compiler<'_> {
                 "empty-map requires key and value type names, for example (empty-map string int)",
             )]);
         };
-        let key_type = parse_type_name(key).map_err(|_| {
-            vec![self.error("E-MAP-005", format!("unknown map key type '{key}'"))]
-        })?;
+        let key_type = parse_type_name(key)
+            .map_err(|_| vec![self.error("E-MAP-005", format!("unknown map key type '{key}'"))])?;
         let value_type = parse_type_name(value).map_err(|_| {
             vec![self.error("E-MAP-005", format!("unknown map value type '{value}'"))]
         })?;
@@ -2230,7 +2227,11 @@ fn source_origin_in_range(
     range: Range<usize>,
     word: impl Into<String>,
 ) -> SourceOrigin {
-    let range = range.start.min(source.len())..range.end.min(source.len()).max(range.start.min(source.len()));
+    let range = range.start.min(source.len())
+        ..range
+            .end
+            .min(source.len())
+            .max(range.start.min(source.len()));
     let (start_line, start_column) = source_position(source, range.start);
     let (end_line, end_column) = source_position(source, range.end);
     SourceOrigin {
@@ -2251,128 +2252,17 @@ fn source_origin_in_range(
 
 fn source_position(source: &str, byte: usize) -> (usize, usize) {
     let prefix = &source[..byte];
-    let line = prefix.bytes().filter(|character| *character == b'\n').count() + 1;
+    let line = prefix
+        .bytes()
+        .filter(|character| *character == b'\n')
+        .count()
+        + 1;
     let column = prefix
         .rsplit_once('\n')
-        .map_or(prefix.chars().count() + 1, |(_, tail)| tail.chars().count() + 1);
+        .map_or(prefix.chars().count() + 1, |(_, tail)| {
+            tail.chars().count() + 1
+        });
     (line, column)
-}
-
-/// Return the source range for every top-level reader form.  This scanner is
-/// intentionally concerned only with form boundaries; the normal Lisp reader
-/// remains the parser and semantic authority.  It recognises the reader's
-/// strings, comments, quoting prefixes, JSON literals, and `$...$` forms so
-/// its result can safely decorate each parsed top-level expression.
-fn top_level_form_spans(source: &str) -> Option<Vec<Range<usize>>> {
-    let mut cursor = 0;
-    let mut forms = Vec::new();
-    while let Some(start) = skip_lisp_trivia(source, cursor) {
-        let end = scan_lisp_form(source, start)?;
-        forms.push(start..end);
-        cursor = end;
-    }
-    Some(forms)
-}
-
-fn skip_lisp_trivia(source: &str, mut cursor: usize) -> Option<usize> {
-    loop {
-        while let Some(character) = source[cursor..].chars().next() {
-            if !character.is_whitespace() {
-                break;
-            }
-            cursor += character.len_utf8();
-        }
-        if source[cursor..].starts_with(';') {
-            cursor += source[cursor..].find('\n').map_or(source.len() - cursor, |offset| offset);
-            continue;
-        }
-        if source[cursor..].starts_with("#|") {
-            let end = source[cursor + 2..].find("|#")?;
-            cursor += 2 + end + 2;
-            continue;
-        }
-        return (cursor < source.len()).then_some(cursor);
-    }
-}
-
-fn scan_lisp_form(source: &str, cursor: usize) -> Option<usize> {
-    let rest = &source[cursor..];
-    let character = rest.chars().next()?;
-    match character {
-        '\'' | '`' => scan_lisp_form(source, skip_lisp_trivia(source, cursor + 1)?),
-        ',' => {
-            let after_prefix = if rest.starts_with(",@") { cursor + 2 } else { cursor + 1 };
-            scan_lisp_form(source, skip_lisp_trivia(source, after_prefix)?)
-        }
-        '(' => scan_balanced_lisp_form(source, cursor, '(', ')'),
-        '[' => scan_balanced_lisp_form(source, cursor, '[', ']'),
-        '{' => scan_balanced_lisp_form(source, cursor, '{', '}'),
-        '"' => scan_lisp_string(source, cursor),
-        '$' => source[cursor + 1..].find('$').map(|offset| cursor + 1 + offset + 1),
-        ')' | ']' | '}' | ';' => None,
-        _ => {
-            let mut end = cursor;
-            while let Some(next) = source[end..].chars().next() {
-                if next.is_whitespace()
-                    || matches!(next, '(' | ')' | '"' | ';' | '\'' | '`' | ',')
-                {
-                    break;
-                }
-                end += next.len_utf8();
-            }
-            (end > cursor).then_some(end)
-        }
-    }
-}
-
-fn scan_lisp_string(source: &str, mut cursor: usize) -> Option<usize> {
-    cursor += 1; // opening quote
-    while let Some(character) = source[cursor..].chars().next() {
-        cursor += character.len_utf8();
-        match character {
-            '\\' => {
-                let escaped = source[cursor..].chars().next()?;
-                cursor += escaped.len_utf8();
-            }
-            '"' => return Some(cursor),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn scan_balanced_lisp_form(
-    source: &str,
-    mut cursor: usize,
-    open: char,
-    close: char,
-) -> Option<usize> {
-    let mut depth = 0usize;
-    while let Some(character) = source[cursor..].chars().next() {
-        if character == '"' {
-            cursor = scan_lisp_string(source, cursor)?;
-            continue;
-        }
-        if character == ';' && open == '(' {
-            cursor += source[cursor..].find('\n').map_or(source.len() - cursor, |offset| offset);
-            continue;
-        }
-        if source[cursor..].starts_with("#|") && open == '(' {
-            let end = source[cursor + 2..].find("|#")?;
-            cursor += 2 + end + 2;
-            continue;
-        }
-        cursor += character.len_utf8();
-        if character == open {
-            depth += 1;
-        } else if character == close {
-            depth = depth.checked_sub(1)?;
-            if depth == 0 {
-                return Some(cursor);
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -2586,12 +2476,12 @@ mod tests {
         .unwrap();
 
         let announce = module.functions.get("announce").unwrap();
-        assert!(announce.inferred_effects.grants(&EffectSet::from_requirement(
-            CapabilityRequirement {
+        assert!(announce
+            .inferred_effects
+            .grants(&EffectSet::from_requirement(CapabilityRequirement {
                 capability: CapabilityKind::SessionEmit,
                 selector: ResourceSelector::None,
-            },
-        )));
+            },)));
     }
 
     #[test]
@@ -2679,8 +2569,7 @@ mod tests {
             vec![TypedValue::Int(42)]
         );
         assert_eq!(
-            run("(is-some (json-get (result-unwrap (json-parse \"{}\")) \"missing\"))")
-                .unwrap(),
+            run("(is-some (json-get (result-unwrap (json-parse \"{}\")) \"missing\"))").unwrap(),
             vec![TypedValue::Bool(false)]
         );
         assert_eq!(
@@ -2835,11 +2724,13 @@ mod tests {
         let instructions = &module.module.functions["main"].blocks[&0].instructions;
         let say = instructions
             .iter()
-            .find(|located| matches!(
-                located.instruction,
-                Instruction::CapabilityRequest { ref requirement, .. }
-                    if requirement.capability == CapabilityKind::SessionEmit
-            ))
+            .find(|located| {
+                matches!(
+                    located.instruction,
+                    Instruction::CapabilityRequest { ref requirement, .. }
+                        if requirement.capability == CapabilityKind::SessionEmit
+                )
+            })
             .expect("say lowers to an awaited effect");
         let add = instructions
             .iter()
@@ -2848,7 +2739,10 @@ mod tests {
         let say_span = say.origin.span.as_ref().expect("Lisp span");
         let add_span = add.origin.span.as_ref().expect("Lisp span");
         assert_eq!(say_span.source_id, "spans.lisp");
-        assert_eq!(&source[say_span.start_byte..say_span.end_byte], "(say \"first\")");
+        assert_eq!(
+            &source[say_span.start_byte..say_span.end_byte],
+            "(say \"first\")"
+        );
         assert_eq!(&source[add_span.start_byte..add_span.end_byte], "(+ 2 3)");
         assert_eq!((say_span.start_line, say_span.start_column), (2, 1));
         assert_eq!((add_span.start_line, add_span.start_column), (3, 1));
@@ -2857,12 +2751,18 @@ mod tests {
     #[test]
     fn finds_top_level_forms_through_comments_quotes_and_json_literals() {
         let source = "; lead\n'(say \"quoted\") #| ignored ( ) |#\n[1, {\"x\": \"y\"}]\n$2*x$";
-        let spans = top_level_form_spans(source).expect("reader-compatible top-level forms");
-        let forms = spans
+        let forms = crate::lisp::reader::parse_str_spanned(source)
+            .expect("reader-compatible top-level forms")
             .iter()
-            .map(|span| &source[span.clone()])
+            .map(|form| &source[form.span.clone()])
             .collect::<Vec<_>>();
-        assert_eq!(forms, vec!["'(say \"quoted\")", "[1, {\"x\": \"y\"}]", "$2*x$"]);
-        assert_eq!(crate::lisp::reader::parse_str(source).unwrap().len(), spans.len());
+        assert_eq!(
+            forms,
+            vec!["'(say \"quoted\")", "[1, {\"x\": \"y\"}]", "$2*x$"]
+        );
+        assert_eq!(
+            crate::lisp::reader::parse_str(source).unwrap().len(),
+            forms.len()
+        );
     }
 }

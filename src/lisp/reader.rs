@@ -9,8 +9,23 @@
 ///   `$2*x + 1$`          → `(+ (* 2 x) 1)`
 ///   `$d/dx(x^2 + x)$`    → `(diff (+ (pow x 2) x) x)`
 use anyhow::{bail, Result};
+use std::ops::Range;
 
 use super::types::Val;
+
+/// A reader value paired with the exact byte range that produced it.
+///
+/// `children` follows the source tree for ordinary Lisp lists.  Reader
+/// sugar that expands one token into several values (for example `'name`)
+/// keeps the complete source span but deliberately has no invented child
+/// ranges.  This lets typed lowering preserve a truthful enclosing origin
+/// until it can attach explicit macro/reader expansion ancestry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpannedVal {
+    pub value: Val,
+    pub span: Range<usize>,
+    pub children: Vec<SpannedVal>,
+}
 
 // ── Math expression parser ─────────────────────────────────────────────────────
 
@@ -493,6 +508,213 @@ pub fn parse_str(src: &str) -> Result<Vec<Val>> {
     Ok(exprs)
 }
 
+/// Parse all top-level expressions while retaining their source structure.
+///
+/// The ordinary [`parse_str`] reader remains the semantic authority: this
+/// routine first obtains exactly those values, then decorates them with a
+/// lexical source tree.  If an extended reader form expands into a different
+/// tree shape (math, JSON, quote shorthand), it keeps its exact enclosing
+/// span and intentionally omits invented child spans.
+pub fn parse_str_spanned(src: &str) -> Result<Vec<SpannedVal>> {
+    let values = parse_str(src)?;
+    let syntax = scan_top_level_forms(src)
+        .ok_or_else(|| anyhow::anyhow!("could not determine Lisp source form boundaries"))?;
+    if values.len() != syntax.len() {
+        bail!(
+            "reader/source span disagreement: parsed {} forms but found {} source forms",
+            values.len(),
+            syntax.len()
+        );
+    }
+    Ok(values
+        .into_iter()
+        .zip(syntax)
+        .map(|(value, syntax)| decorate_span(value, syntax))
+        .collect())
+}
+
+#[derive(Debug, Clone)]
+struct SyntaxForm {
+    span: Range<usize>,
+    children: Vec<SyntaxForm>,
+}
+
+fn decorate_span(value: Val, syntax: SyntaxForm) -> SpannedVal {
+    let children = match &value {
+        Val::List(values) if values.len() == syntax.children.len() => values
+            .iter()
+            .cloned()
+            .zip(syntax.children)
+            .map(|(value, syntax)| decorate_span(value, syntax))
+            .collect(),
+        _ => Vec::new(),
+    };
+    SpannedVal {
+        value,
+        span: syntax.span,
+        children,
+    }
+}
+
+fn scan_top_level_forms(source: &str) -> Option<Vec<SyntaxForm>> {
+    let mut cursor = 0;
+    let mut forms = Vec::new();
+    while let Some(start) = skip_trivia(source, cursor) {
+        let form = scan_form(source, start)?;
+        cursor = form.span.end;
+        forms.push(form);
+    }
+    Some(forms)
+}
+
+fn skip_trivia(source: &str, mut cursor: usize) -> Option<usize> {
+    loop {
+        while let Some(character) = source.get(cursor..)?.chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            cursor += character.len_utf8();
+        }
+        if source.get(cursor..)?.starts_with(';') {
+            cursor += source[cursor..]
+                .find('\n')
+                .map_or(source.len() - cursor, |offset| offset);
+            continue;
+        }
+        if source.get(cursor..)?.starts_with("#|") {
+            let end = source[cursor + 2..].find("|#")?;
+            cursor += 2 + end + 2;
+            continue;
+        }
+        return (cursor < source.len()).then_some(cursor);
+    }
+}
+
+fn scan_form(source: &str, start: usize) -> Option<SyntaxForm> {
+    let rest = source.get(start..)?;
+    let first = rest.chars().next()?;
+    match first {
+        '(' => scan_list(source, start),
+        '[' => scan_balanced_atom(source, start, '[', ']'),
+        '{' => scan_balanced_atom(source, start, '{', '}'),
+        '\'' | '`' => {
+            let child_start = skip_trivia(source, start + first.len_utf8())?;
+            let child = scan_form(source, child_start)?;
+            Some(SyntaxForm {
+                span: start..child.span.end,
+                children: vec![child],
+            })
+        }
+        ',' => {
+            let prefix_len = if rest.starts_with(",@") { 2 } else { 1 };
+            let child_start = skip_trivia(source, start + prefix_len)?;
+            let child = scan_form(source, child_start)?;
+            Some(SyntaxForm {
+                span: start..child.span.end,
+                children: vec![child],
+            })
+        }
+        '"' => scan_string(source, start).map(|end| SyntaxForm {
+            span: start..end,
+            children: Vec::new(),
+        }),
+        '$' => source[start + 1..].find('$').map(|offset| SyntaxForm {
+            span: start..start + 1 + offset + 1,
+            children: Vec::new(),
+        }),
+        ')' | ']' | '}' | ';' => None,
+        _ => {
+            let mut end = start;
+            while let Some(next) = source.get(end..)?.chars().next() {
+                if next.is_whitespace() || matches!(next, '(' | ')' | '"' | ';' | '\'' | '`' | ',')
+                {
+                    break;
+                }
+                end += next.len_utf8();
+            }
+            (end > start).then_some(SyntaxForm {
+                span: start..end,
+                children: Vec::new(),
+            })
+        }
+    }
+}
+
+fn scan_list(source: &str, start: usize) -> Option<SyntaxForm> {
+    let mut cursor = start + 1;
+    let mut children = Vec::new();
+    loop {
+        let next = skip_trivia(source, cursor)?;
+        if source.get(next..)?.starts_with(')') {
+            return Some(SyntaxForm {
+                span: start..next + 1,
+                children,
+            });
+        }
+        let child = scan_form(source, next)?;
+        cursor = child.span.end;
+        children.push(child);
+    }
+}
+
+fn scan_string(source: &str, mut cursor: usize) -> Option<usize> {
+    cursor += 1;
+    while let Some(character) = source.get(cursor..)?.chars().next() {
+        cursor += character.len_utf8();
+        match character {
+            '\\' => {
+                let escaped = source.get(cursor..)?.chars().next()?;
+                cursor += escaped.len_utf8();
+            }
+            '"' => return Some(cursor),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn scan_balanced_atom(
+    source: &str,
+    mut cursor: usize,
+    open: char,
+    close: char,
+) -> Option<SyntaxForm> {
+    let start = cursor;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(character) = source.get(cursor..)?.chars().next() {
+        cursor += character.len_utf8();
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if character == open {
+            depth += 1;
+        } else if character == close {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(SyntaxForm {
+                    span: start..cursor,
+                    children: Vec::new(),
+                });
+            }
+        }
+    }
+    None
+}
+
 fn parse_one(tokens: &[Tok], pos: &mut usize) -> Result<Val> {
     if *pos >= tokens.len() {
         bail!("unexpected end of expression");
@@ -676,6 +898,31 @@ mod tests {
                 Val::List(vec![Val::Symbol("*".to_string()), Val::Int(2), Val::Int(3),]),
             ])
         );
+    }
+
+    #[test]
+    fn spanned_reader_retains_exact_nested_list_and_token_ranges() {
+        let source = "; lead\n(+ 1 (* 2 3))";
+        let forms = parse_str_spanned(source).unwrap();
+        let root = &forms[0];
+        assert_eq!(&source[root.span.clone()], "(+ 1 (* 2 3))");
+        assert_eq!(&source[root.children[0].span.clone()], "+");
+        assert_eq!(&source[root.children[1].span.clone()], "1");
+        let product = &root.children[2];
+        assert_eq!(&source[product.span.clone()], "(* 2 3)");
+        assert_eq!(&source[product.children[2].span.clone()], "3");
+    }
+
+    #[test]
+    fn spanned_reader_keeps_reader_sugar_truthful_without_invented_children() {
+        let source = "'answer $2*x$ {\"answer\": 42}";
+        let forms = parse_str_spanned(source).unwrap();
+        assert_eq!(&source[forms[0].span.clone()], "'answer");
+        assert!(forms[0].children.is_empty());
+        assert_eq!(&source[forms[1].span.clone()], "$2*x$");
+        assert!(forms[1].children.is_empty());
+        assert_eq!(&source[forms[2].span.clone()], "{\"answer\": 42}");
+        assert!(forms[2].children.is_empty());
     }
 
     #[test]
