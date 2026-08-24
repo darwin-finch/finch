@@ -68,6 +68,16 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   normalization conformance fixtures proving that each sugared program and its canonical
   S-expression produce structurally identical `syntax` modulo spelling-specific source origins,
   then identical elaborated HIR/IR. Do not brand or implement the notation as a third language.
+  Treat every statically known signature, effect/yield row, schema, parameter pack, symbol/module
+  reference, and structural-concept result as an ordinary immutable CTFE value. Resolve a concept
+  once against the concrete type's resolved interface and cache `ConceptEvidence` containing its
+  derived type bindings and concrete operation word IDs; do not repeatedly probe by speculatively
+  compiling expressions. Structural matching may bind explicit output variables such as
+  `T : Map<K,V>, infer K, infer V` or
+  `F : fn(Args...) -> R ! E, infer Args, infer R, infer E`. Resolution remains bounded and
+  directional: explicit generic arguments, ordinary argument types, concept evidence and derived
+  outputs, remaining validation, then memoized specialization. Ambiguous evidence is a diagnostic,
+  never an import-order-dependent winner.
 - [ ] Make ordered type/value parameter packs a normal part of source-defined generics. Pure bounded
   CTFE must be able to query pack length, index/destructure it, inspect each type/value pair, and use
   ordinary compile-time `foreach` to generate a concrete fixed-arity specialization or an explicit

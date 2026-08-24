@@ -1542,6 +1542,29 @@ evaluation model. Generated definitions are structured syntax with expansion pro
 verified normally; string mixins and overlapping special-purpose metaprogramming subsystems are not
 part of the design.
 
+Structural concept resolution produces immutable evidence rather than repeatedly asking the
+compiler whether candidate expressions happen to compile. Once a concrete type's interface is
+resolved, matching a concept yields a cacheable value such as:
+
+```text
+ConceptEvidence {
+    concept: List,
+    concrete: MyList<int>,
+    derived: { R = int },
+    operations: { empty = word#41, front = word#73, pop-front = word#74 }
+}
+```
+
+The evidence gives specialization and inlining concrete word identities and makes ambiguity a
+stable diagnostic rather than an import-order-dependent choice. Generic variables marked `infer`
+are outputs of structural matching over compile-time values, not independent inputs to global type
+deduction. Thus `T : Map<K,V>, infer K, infer V` derives key/value types from `T`, while
+`F : fn(Args...) -> R ! E, infer Args, infer R, infer E` derives a callable's parameter pack,
+return type, and effects. Directional resolution is: apply explicit generic arguments, infer from
+ordinary arguments, resolve and cache concept evidence plus derived outputs, validate remaining
+arguments, then memoize the concrete specialization. It never back-propagates a later call-site
+expectation into an earlier concrete binding.
+
 Type-safe variadics are a required consequence of that general template model, not a privileged
 calling convention. A generic definition may bind a type/value parameter pack, inspect its length,
 index or destructure it, and traverse its ordered type/value pairs with ordinary bounded compile-time
