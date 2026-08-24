@@ -1384,6 +1384,24 @@ verifies and compiles it locally.
 - measurable improvement on representative hot vocabulary, not microbenchmarks alone;
 - automatic fallback to interpretation after compilation failure.
 
+### Performance and expressiveness targets
+
+Native-code generation is not itself the performance goal. For monomorphized effect-free numeric,
+collection, parsing, and control-flow kernels, optimized Finch should compete in the performance
+class of optimized Rust/C++ on the same machine. Track wall time, allocations, peak resident memory,
+code size, compile latency, and dispatch/host-boundary overhead against checked-in equivalent Rust,
+C++, and interpreter baselines. Publish distributions over representative programs; do not claim
+parity from one arithmetic microbenchmark. Gaps caused by missing vectorization, alias analysis,
+escape analysis, bounds-check elimination, or range fusion remain named compiler work.
+
+The source-language expressiveness target is comparable to TypeScript for ordinary application
+modeling—structural records, closed variants, closures, parametric functions, structural concepts,
+modules, reflection/derivation, asynchronous resources, and ergonomic collection/range composition—
+without JavaScript prototype mutation or `dynamic` as the routine escape hatch. Both Lisp and
+Co-Forth must expose that same typed semantic surface even when Lisp is the more ergonomic human
+frontend. Maintain a corpus of equivalent application-sized programs to measure source size,
+required annotations, diagnostic quality, and generated IR as features land.
+
 ### Later AOT compiler target
 
 After the interpreter contract and JIT differential gates are stable, the same verified pipeline
