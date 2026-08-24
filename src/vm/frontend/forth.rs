@@ -2341,6 +2341,22 @@ mod tests {
     }
 
     #[test]
+    fn typed_forth_quotation_executes_a_persistent_word() {
+        let module = compile_forth(
+            "quotation.forth",
+            ": square ( S int -- S int ! {} ) dup * ; 9 ['] square execute",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("a typed Co-Forth quotation should link to its definition");
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("typed Co-Forth execute should call its quotation");
+        assert_eq!(stack, vec![TypedValue::Int(81)]);
+    }
+
+    #[test]
     fn retains_finch_doc_comment_on_typed_definition() {
         let module = compile_forth(
             "documented.forth",
