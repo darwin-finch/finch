@@ -194,7 +194,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   separate integrity-checked authority record immediately, even when no VM revision commits or the
   surrounding run later rolls back. Persistence failure restores the prior in-memory ledger and
   fails closed; archiving detaches the sink so retained runtime references cannot recreate the old
-  policy path. Still implement policy-driven revocation and complete the host adapters.
+  policy path. Typed scheduling now binds create/read/manage through opaque `schedule` resources:
+  `schedule-get` returns redacted structured metadata, `schedule-cancel` preserves the durable row,
+  and the queue atomically arbitrates `Pending → Running|Cancelled` so cancellation cannot report
+  success after a worker has claimed the callback. Still implement policy-driven revocation and
+  complete the remaining host adapters.
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their

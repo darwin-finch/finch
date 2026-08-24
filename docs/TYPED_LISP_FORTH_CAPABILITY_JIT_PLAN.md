@@ -1067,6 +1067,13 @@ ProgramRun later rolls back, while a failed VM transaction cannot erase or manuf
 Archiving a Brain detaches this sink before removing the live runtime so a retained runtime handle
 cannot recreate the archived policy path.
 
+Scheduled callbacks use the same broker rather than a parallel queue authority path. Creation
+returns an opaque host-issued `schedule` resource; `schedule-get` requires `schedule_read` and
+returns redacted managed JSON without the callback's persisted authority ceiling, while
+`schedule-cancel` requires `schedule_manage` and retains a cancelled durable record. The queue
+atomically changes `Pending` to either `Running` or `Cancelled`, so a cancellation cannot succeed
+after a scheduler has claimed the callback and two runners cannot execute the same pending row.
+
 The VM's compact active `EffectSet` is only a fast execution guard. Immediately before an
 authorized non-intrinsic effect is dispatched locally or handed to a portable host, the Finch host
 reconstructs its deterministic request identity from `(execution_id, effect sequence)`, resolves it
