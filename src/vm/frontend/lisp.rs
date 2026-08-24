@@ -1,3 +1,4 @@
+use crate::lisp::reader::SpannedVal;
 use crate::lisp::Val;
 use crate::vm::diagnostic::{
     DiagnosticPhase, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic,
@@ -22,6 +23,10 @@ use std::ops::Range;
 struct SourceForm {
     value: Val,
     span: Range<usize>,
+    /// Ordinary forms retain their structural reader tree. Macro expansions
+    /// deliberately use only their invocation span until expansion ancestry
+    /// is attached as an explicit `SourceOrigin` chain.
+    source: Option<SpannedVal>,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +187,7 @@ struct Compiler<'a> {
     functions: BTreeMap<String, Function>,
     next_lambda: u64,
     current_span: Range<usize>,
+    current_source: Option<SpannedVal>,
 }
 
 /// Parse and compile Finch Lisp directly into the common typed stack IR. No
@@ -233,10 +239,14 @@ pub fn compile_lisp_with_functions(
                 &macros,
                 &mut expansion_budget,
             )
-            .map(|value| SourceForm {
-                value,
-                span: form.span.clone(),
-            })
+                .map(|value| {
+                    let source = (value == form.value).then(|| form.clone());
+                    SourceForm {
+                        value,
+                        span: form.span.clone(),
+                        source,
+                    }
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut compiler = Compiler {
@@ -247,9 +257,11 @@ pub fn compile_lisp_with_functions(
         functions: BTreeMap::new(),
         next_lambda: 0,
         current_span: 0..source.len(),
+        current_source: None,
     };
     for expression in &expressions {
         compiler.current_span = expression.span.clone();
+        compiler.current_source = expression.source.clone();
         if is_definition(&expression.value) {
             compiler.predeclare_definition(&expression.value)?;
         }
@@ -257,6 +269,7 @@ pub fn compile_lisp_with_functions(
     let mut executable = Vec::new();
     for expression in &expressions {
         compiler.current_span = expression.span.clone();
+        compiler.current_source = expression.source.clone();
         if is_definition(&expression.value) {
             compiler.compile_definition(&expression.value)?;
         } else {
@@ -277,6 +290,7 @@ pub fn compile_lisp_with_functions(
     } else {
         for (index, expression) in executable.iter().enumerate() {
             compiler.current_span = expression.span.clone();
+            compiler.current_source = expression.source.clone();
             compiler.compile_expression(&expression.value, &mut builder)?;
             if index + 1 != executable.len() {
                 builder.stack.pop();
@@ -523,6 +537,31 @@ impl Compiler<'_> {
         source_origin_in_range(self.source_id, self.source, self.current_span.clone(), word)
     }
 
+    fn compile_expression_at(
+        &mut self,
+        expression: &Val,
+        source: Option<&SpannedVal>,
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let Some(source) = source else {
+            return self.compile_expression(expression, builder);
+        };
+        let previous_span = std::mem::replace(&mut self.current_span, source.span.clone());
+        let previous_source = self.current_source.replace(source.clone());
+        let result = self.compile_expression(expression, builder);
+        self.current_span = previous_span;
+        self.current_source = previous_source;
+        result
+    }
+
+    fn current_list_children(&self, items: &[Val]) -> Option<&[SpannedVal]> {
+        let source = self.current_source.as_ref()?;
+        let Val::List(source_items) = &source.value else {
+            return None;
+        };
+        (source_items.as_slice() == items).then_some(source.children.as_slice())
+    }
+
     fn compile_expression(
         &mut self,
         expression: &Val,
@@ -755,6 +794,11 @@ impl Compiler<'_> {
         items: &[Val],
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
+        // Source children are owned by the reader tree, not reconstructed by
+        // text matching. Clone this small metadata vector before recursive
+        // lowering so mutable compiler operations can temporarily enter each
+        // argument's exact source context.
+        let source_children = self.current_list_children(items).map(ToOwned::to_owned);
         if items.len() == 2 && items[0] == Val::Symbol("quote".into()) {
             let Val::Symbol(name) = &items[1] else {
                 return Err(vec![
@@ -795,7 +839,13 @@ impl Compiler<'_> {
             _ if builder.resolve(operator).is_some() => {
                 self.compile_closure_call(&items[0], &items[1..], builder)
             }
-            _ => self.compile_named_call(operator, &items[1..], builder),
+            _ => self.compile_named_call(
+                operator,
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                source_children.as_deref().and_then(|children| children.first()),
+                builder,
+            ),
         }
     }
 
@@ -1744,16 +1794,31 @@ impl Compiler<'_> {
         &mut self,
         operator: &str,
         arguments: &[Val],
+        argument_sources: Option<&[SpannedVal]>,
+        operator_source: Option<&SpannedVal>,
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
         let word = match operator {
             "string-append" => "str-cat",
             other => other,
         };
+        let origin = operator_source.map_or_else(
+            || self.origin(operator),
+            |source| {
+                source_origin_in_range(
+                    self.source_id,
+                    self.source,
+                    source.span.clone(),
+                    operator,
+                )
+            },
+        );
         let Some(signature) = self.vocabulary.get(word).cloned() else {
-            return Err(vec![self.error(
+            return Err(vec![VmDiagnostic::error(
                 "E-LINK-002",
+                DiagnosticPhase::Linking,
                 format!("unknown Lisp function '{operator}'"),
+                Some(origin),
             )]);
         };
         if arguments.len() != signature.input.values.len() {
@@ -1766,10 +1831,13 @@ impl Compiler<'_> {
                 ),
             )]);
         }
-        for argument in arguments {
-            self.compile_expression(argument, builder)?;
+        for (index, argument) in arguments.iter().enumerate() {
+            self.compile_expression_at(
+                argument,
+                argument_sources.and_then(|sources| sources.get(index)),
+                builder,
+            )?;
         }
-        let origin = self.origin(operator);
         let concrete_signature = instantiate_signature_types(&signature, &builder.stack, &origin)
             .map_err(|diagnostic| vec![diagnostic])?;
         apply_signature_types(&signature, &mut builder.stack, &origin)
@@ -2718,7 +2786,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_the_enclosing_top_level_form_span_on_lisp_ir() {
+    fn preserves_exact_operator_spans_on_lisp_ir() {
         let source = "; setup\n(say \"first\")\n(+ 2 3)";
         let module = compile_lisp("spans.lisp", source, Vec::new(), &core_vocabulary()).unwrap();
         let instructions = &module.module.functions["main"].blocks[&0].instructions;
@@ -2739,13 +2807,33 @@ mod tests {
         let say_span = say.origin.span.as_ref().expect("Lisp span");
         let add_span = add.origin.span.as_ref().expect("Lisp span");
         assert_eq!(say_span.source_id, "spans.lisp");
-        assert_eq!(
-            &source[say_span.start_byte..say_span.end_byte],
-            "(say \"first\")"
-        );
-        assert_eq!(&source[add_span.start_byte..add_span.end_byte], "(+ 2 3)");
-        assert_eq!((say_span.start_line, say_span.start_column), (2, 1));
-        assert_eq!((add_span.start_line, add_span.start_column), (3, 1));
+        assert_eq!(&source[say_span.start_byte..say_span.end_byte], "say");
+        assert_eq!(&source[add_span.start_byte..add_span.end_byte], "+");
+        assert_eq!((say_span.start_line, say_span.start_column), (2, 2));
+        assert_eq!((add_span.start_line, add_span.start_column), (3, 2));
+    }
+
+    #[test]
+    fn nested_named_call_diagnostics_point_to_the_exact_operator_or_argument() {
+        let source = "(+ missing (unknown 2))";
+        let errors = compile_lisp("nested.lisp", source, Vec::new(), &core_vocabulary())
+            .expect_err("both the unbound argument and unknown nested call are invalid");
+        let unbound = errors
+            .iter()
+            .find(|error| error.code == "E-NAME-001")
+            .expect("unbound argument diagnostic");
+        let span = unbound.primary.as_ref().and_then(|origin| origin.span.as_ref()).unwrap();
+        assert_eq!(&source[span.start_byte..span.end_byte], "missing");
+
+        let source = "(+ 1 (unknown 2))";
+        let errors = compile_lisp("nested.lisp", source, Vec::new(), &core_vocabulary())
+            .expect_err("unknown nested call is invalid");
+        let unknown = errors
+            .iter()
+            .find(|error| error.code == "E-LINK-002")
+            .expect("unknown nested call diagnostic");
+        let span = unknown.primary.as_ref().and_then(|origin| origin.span.as_ref()).unwrap();
+        assert_eq!(&source[span.start_byte..span.end_byte], "unknown");
     }
 
     #[test]
