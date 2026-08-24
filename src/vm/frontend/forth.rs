@@ -39,18 +39,30 @@ struct ForthModuleAst {
 
 #[derive(Debug, Clone)]
 struct ForthBodyAst {
-    atoms: Vec<Token>,
-    /// Structured quotation nodes keyed by their opening token's source byte.
-    /// The retained atom sequence keeps the current lowering incremental while
-    /// the parser, rather than the lowerer, owns quotation delimiters.
-    quotations: BTreeMap<usize, ForthQuotationAst>,
+    nodes: Vec<ForthBodyNode>,
+}
+
+#[derive(Debug, Clone)]
+enum ForthBodyNode {
+    Atom(Token),
+    Quotation(ForthQuotationAst),
+}
+
+impl ForthBodyNode {
+    fn leading_token(&self) -> &Token {
+        match self {
+            Self::Atom(token) => token,
+            Self::Quotation(quotation) => &quotation.open,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 struct ForthQuotationAst {
+    open: Token,
     signature: Vec<Token>,
     body: ForthBodyAst,
-    close_atom_index: usize,
+    end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -409,7 +421,11 @@ fn lower_forth_ast_body_with_locals(
     captures: &[LocalBinding],
     expected_return: Option<&[Type]>,
 ) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
-    let tokens = &body.atoms;
+    let tokens = body
+        .nodes
+        .iter()
+        .map(|node| node.leading_token().clone())
+        .collect::<Vec<_>>();
     let mut stack = initial_stack.clone();
     let mut effects = EffectSet::pure();
     let mut suspension: Option<SuspensionSignature> = None;
@@ -493,124 +509,114 @@ fn lower_forth_ast_body_with_locals(
     }
     while token_index < tokens.len() {
         let token = tokens[token_index].clone();
-        let origin = origin(source_id, source, token.start, token.end);
-        if let TokenValue::Word(word) = &token.value {
-            if word == "[" {
-                if let Some(quotation) = body.quotations.get(&token.start) {
-                    let (declared_signature, declares_pure) = parse_quotation_signature(
-                        source_id,
-                        source,
-                        &quotation.signature,
-                        &origin,
-                    )?;
+        if let ForthBodyNode::Quotation(quotation) = &body.nodes[token_index] {
+            let origin = origin(source_id, source, token.start, quotation.end);
+            let (declared_signature, declares_pure) =
+                parse_quotation_signature(source_id, source, &quotation.signature, &origin)?;
 
-                    // Locals shadow captures. Capturing all visible immutable
-                    // bindings matches Lisp's deterministic initial lowering;
-                    // later escape analysis may remove unused captures.
-                    let local_names = locals
-                        .iter()
-                        .map(|local| local.name.as_str())
-                        .collect::<BTreeSet<_>>();
-                    let mut visible = captures
-                        .iter()
-                        .filter(|capture| !local_names.contains(capture.name.as_str()))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    visible.extend_from_slice(locals);
+            // Locals shadow captures. Capturing all visible immutable
+            // bindings matches Lisp's deterministic initial lowering;
+            // later escape analysis may remove unused captures.
+            let local_names = locals
+                .iter()
+                .map(|local| local.name.as_str())
+                .collect::<BTreeSet<_>>();
+            let mut visible = captures
+                .iter()
+                .filter(|capture| !local_names.contains(capture.name.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            visible.extend_from_slice(locals);
 
-                    for capture in &visible {
-                        if let Some((index, _)) = local_indexes.get(capture.name.as_str()) {
-                            stack.push(capture.ty.clone());
-                            emit(
-                                &mut blocks,
-                                current,
-                                Instruction::LocalGet { index: *index },
-                                origin.clone(),
-                            );
-                        } else if let Some((index, _)) =
-                            capture_indexes.get(capture.name.as_str())
-                        {
-                            stack.push(capture.ty.clone());
-                            emit(
-                                &mut blocks,
-                                current,
-                                Instruction::CaptureGet { index: *index },
-                                origin.clone(),
-                            );
-                        }
-                    }
-
-                    let compiled = lower_forth_ast_body_with_locals(
-                        source_id,
-                        source,
-                        &quotation.body,
-                        declared_signature.input.values.clone(),
-                        vocabulary,
-                        &available_functions,
-                        &[],
-                        &visible,
-                        Some(&declared_signature.output.values),
-                    )?;
-                    let mut quote_function =
-                        compiled.module.functions[&compiled.module.entry].clone();
-                    if declares_pure
-                        && !compiled.functions[&compiled.module.entry]
-                            .inferred_effects
-                            .is_pure()
-                    {
-                        return Err(vec![control_error(
-                            "E-CAP-001",
-                            "anonymous quotation declares pure but its body requires capabilities",
-                            origin,
-                        )]);
-                    }
-                    let mut hasher = DefaultHasher::new();
-                    source_id.hash(&mut hasher);
-                    token.start.hash(&mut hasher);
-                    token.end.hash(&mut hasher);
-                    let quote_name = format!("quote${:016x}", hasher.finish());
-                    quote_function.name = quote_name.clone();
-                    quote_function.signature.effects = compiled.functions[&compiled.module.entry]
-                        .inferred_effects
-                        .clone();
-                    quote_function.signature.suspension = compiled.functions
-                        [&compiled.module.entry]
-                        .inferred_suspension
-                        .clone();
-                    quote_function.signature.control =
-                        if quote_function.signature.suspension.is_some() {
-                            ControlEffect::MaySuspend
-                        } else {
-                            ControlEffect::Returns
-                        };
-                    for (name, function) in compiled.module.functions {
-                        if name != compiled.module.entry {
-                            available_functions.insert(name, function);
-                        }
-                    }
-                    let signature = quote_function.signature.clone();
-                    available_functions.insert(quote_name.clone(), quote_function);
-                    stack.truncate(stack.len() - visible.len());
-                    stack.push(Type::Function {
-                        arguments: signature.input.values.clone(),
-                        result: Box::new(signature.output.values[0].clone()),
-                        effects: signature.effects.clone(),
-                        suspension: signature.suspension.clone(),
-                    });
+            for capture in &visible {
+                if let Some((index, _)) = local_indexes.get(capture.name.as_str()) {
+                    stack.push(capture.ty.clone());
                     emit(
                         &mut blocks,
                         current,
-                        Instruction::MakeClosure {
-                            function: quote_name,
-                            capture_count: visible.len() as u32,
-                            signature,
-                        },
-                        origin,
+                        Instruction::LocalGet { index: *index },
+                        origin.clone(),
                     );
-                    token_index = quotation.close_atom_index + 1;
-                    continue;
+                } else if let Some((index, _)) = capture_indexes.get(capture.name.as_str()) {
+                    stack.push(capture.ty.clone());
+                    emit(
+                        &mut blocks,
+                        current,
+                        Instruction::CaptureGet { index: *index },
+                        origin.clone(),
+                    );
                 }
             }
+
+            let compiled = lower_forth_ast_body_with_locals(
+                source_id,
+                source,
+                &quotation.body,
+                declared_signature.input.values.clone(),
+                vocabulary,
+                &available_functions,
+                &[],
+                &visible,
+                Some(&declared_signature.output.values),
+            )?;
+            let mut quote_function = compiled.module.functions[&compiled.module.entry].clone();
+            if declares_pure
+                && !compiled.functions[&compiled.module.entry]
+                    .inferred_effects
+                    .is_pure()
+            {
+                return Err(vec![control_error(
+                    "E-CAP-001",
+                    "anonymous quotation declares pure but its body requires capabilities",
+                    origin,
+                )]);
+            }
+            let mut hasher = DefaultHasher::new();
+            source_id.hash(&mut hasher);
+            token.start.hash(&mut hasher);
+            quotation.end.hash(&mut hasher);
+            let quote_name = format!("quote${:016x}", hasher.finish());
+            quote_function.name = quote_name.clone();
+            quote_function.signature.effects = compiled.functions[&compiled.module.entry]
+                .inferred_effects
+                .clone();
+            quote_function.signature.suspension = compiled.functions[&compiled.module.entry]
+                .inferred_suspension
+                .clone();
+            quote_function.signature.control = if quote_function.signature.suspension.is_some() {
+                ControlEffect::MaySuspend
+            } else {
+                ControlEffect::Returns
+            };
+            for (name, function) in compiled.module.functions {
+                if name != compiled.module.entry {
+                    available_functions.insert(name, function);
+                }
+            }
+            let signature = quote_function.signature.clone();
+            available_functions.insert(quote_name.clone(), quote_function);
+            stack.truncate(stack.len() - visible.len());
+            stack.push(Type::Function {
+                arguments: signature.input.values.clone(),
+                result: Box::new(signature.output.values[0].clone()),
+                effects: signature.effects.clone(),
+                suspension: signature.suspension.clone(),
+            });
+            emit(
+                &mut blocks,
+                current,
+                Instruction::MakeClosure {
+                    function: quote_name,
+                    capture_count: visible.len() as u32,
+                    signature,
+                },
+                origin,
+            );
+            token_index += 1;
+            continue;
+        }
+        let origin = origin(source_id, source, token.start, token.end);
+        if let TokenValue::Word(word) = &token.value {
             if word == "[']" {
                 let Some(target) = tokens.get(token_index + 1) else {
                     return Err(vec![control_error(
@@ -2584,29 +2590,25 @@ fn parse_forth_module(
 /// while emitting IR. Incomplete or list-shaped brackets deliberately remain
 /// ordinary atoms so the existing typed-list diagnostics stay authoritative.
 fn parse_forth_body(atoms: &[Token]) -> ForthBodyAst {
-    let mut quotations = BTreeMap::new();
+    let mut nodes = Vec::new();
     let mut cursor = 0;
     while cursor < atoms.len() {
         if token_is(&atoms[cursor], "[") {
             if let Some((pipe_index, close_index)) = anonymous_quotation_bounds(atoms, cursor) {
-                quotations.insert(
-                    atoms[cursor].start,
-                    ForthQuotationAst {
-                        signature: atoms[cursor + 1..pipe_index].to_vec(),
-                        body: parse_forth_body(&atoms[pipe_index + 1..close_index]),
-                        close_atom_index: close_index,
-                    },
-                );
+                nodes.push(ForthBodyNode::Quotation(ForthQuotationAst {
+                    open: atoms[cursor].clone(),
+                    signature: atoms[cursor + 1..pipe_index].to_vec(),
+                    body: parse_forth_body(&atoms[pipe_index + 1..close_index]),
+                    end: atoms[close_index].end,
+                }));
                 cursor = close_index + 1;
                 continue;
             }
         }
+        nodes.push(ForthBodyNode::Atom(atoms[cursor].clone()));
         cursor += 1;
     }
-    ForthBodyAst {
-        atoms: atoms.to_vec(),
-        quotations,
-    }
+    ForthBodyAst { nodes }
 }
 
 /// Read a single public documentation line immediately preceding a typed
@@ -3790,11 +3792,31 @@ mod tests {
         let source = "[ -- fn<unit,int> ! pure | [ -- int ! pure | 42 ] ]";
         let ast = parse_forth_module("nested-quotes.forth", source)
             .expect("quotation syntax should parse before semantic lowering");
-        assert_eq!(ast.body.quotations.len(), 1);
-        let outer = ast.body.quotations.values().next().unwrap();
-        assert_eq!(outer.body.quotations.len(), 1);
-        let inner = outer.body.quotations.values().next().unwrap();
-        assert_eq!(&source[inner.body.atoms[0].start..inner.body.atoms[0].end], "42");
+        assert_eq!(ast.body.nodes.len(), 1);
+        let ForthBodyNode::Quotation(outer) = &ast.body.nodes[0] else {
+            panic!("outer quotation should be a recursive body node");
+        };
+        assert_eq!(outer.body.nodes.len(), 1);
+        let ForthBodyNode::Quotation(inner) = &outer.body.nodes[0] else {
+            panic!("inner quotation should be a recursive body node");
+        };
+        let ForthBodyNode::Atom(value) = &inner.body.nodes[0] else {
+            panic!("quotation body should own its literal atom");
+        };
+        assert_eq!(&source[value.start..value.end], "42");
+    }
+
+    #[test]
+    fn parser_represents_a_quotation_as_one_body_node() {
+        let source = "[ -- int ! pure | 42 ] execute";
+        let ast = parse_forth_module("quote-node.forth", source)
+            .expect("quotation syntax should parse before semantic lowering");
+        assert_eq!(ast.body.nodes.len(), 2);
+        assert!(matches!(ast.body.nodes[0], ForthBodyNode::Quotation(_)));
+        let ForthBodyNode::Atom(execute) = &ast.body.nodes[1] else {
+            panic!("the word after a quotation should remain the adjacent body node");
+        };
+        assert_eq!(&source[execute.start..execute.end], "execute");
     }
 
     #[test]
