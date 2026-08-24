@@ -40,6 +40,59 @@ pub fn is_repairable_wire_diagnostic(diagnostic: &str) -> bool {
     )
 }
 
+/// Return the stable leading diagnostic code without retaining the diagnostic
+/// prose in conformance metrics.
+pub fn wire_diagnostic_code(diagnostic: &str) -> Option<String> {
+    diagnostic
+        .split_once(':')
+        .map(|(code, _)| code.trim())
+        .filter(|code| code.starts_with("E-"))
+        .map(str::to_string)
+}
+
+/// Classify a rejected provider submission for aggregate conformance metrics.
+/// This intentionally never stores the submitted source or diagnostic text.
+pub fn classify_wire_failure(
+    source: &str,
+    diagnostic: &str,
+) -> crate::metrics::WireFailureClass {
+    use crate::metrics::WireFailureClass;
+
+    let trimmed = source.trim_start();
+    let code = wire_diagnostic_code(diagnostic).unwrap_or_default();
+    if trimmed.starts_with("```") || code == "E-WIRE-002" {
+        return WireFailureClass::MarkdownFence;
+    }
+    if (trimmed.starts_with('(') && diagnostic.contains("Co-Forth"))
+        || (!trimmed.starts_with('(') && diagnostic.contains("Lisp"))
+    {
+        return WireFailureClass::WrongLanguageDispatch;
+    }
+    if code.starts_with("E-STACK") || code.starts_with("E-TYPE") || code.starts_with("E-VERIFY") {
+        return WireFailureClass::StackOrType;
+    }
+    if code.starts_with("E-CAP") || code.starts_with("E-EFFECT") || code.starts_with("E-AUTH") {
+        return WireFailureClass::Capability;
+    }
+    if code.starts_with("E-LINK") || code.starts_with("E-NAME") {
+        let first = trimmed.chars().next();
+        let prose_punctuation = trimmed.contains(". ")
+            || trimmed.contains("! ")
+            || trimmed.contains("? ")
+            || trimmed.lines().count() > 1;
+        if first.is_some_and(char::is_uppercase)
+            && (trimmed.contains(char::is_whitespace) || prose_punctuation)
+        {
+            return WireFailureClass::RawProse;
+        }
+        return WireFailureClass::InventedWord;
+    }
+    if code == "E-WIRE-001" {
+        return WireFailureClass::RawProse;
+    }
+    WireFailureClass::Other
+}
+
 /// Construct the provider-neutral correction request for a rejected program.
 pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
     let language = ProgramLanguage::infer_source(rejected_source).as_str();
@@ -1411,5 +1464,31 @@ mod tests {
         let lisp = wire_repair_request("(say message)", "E-NAME-001: unbound name");
         assert!(lisp.contains("It was lisp; repair it as lisp"));
         assert!(lisp.contains("smallest source correction"));
+    }
+
+    #[test]
+    fn wire_failure_classification_is_source_free_and_stable() {
+        use crate::metrics::WireFailureClass;
+
+        assert_eq!(
+            classify_wire_failure("```lisp\n(say \"hi\")\n```", "E-WIRE-002: fenced"),
+            WireFailureClass::MarkdownFence
+        );
+        assert_eq!(
+            classify_wire_failure("Hello! How can I help?", "E-LINK-002: unknown word"),
+            WireFailureClass::RawProse
+        );
+        assert_eq!(
+            classify_wire_failure("mispelled-word", "E-LINK-002: unknown word"),
+            WireFailureClass::InventedWord
+        );
+        assert_eq!(
+            classify_wire_failure("1 +", "E-STACK-001: missing integer"),
+            WireFailureClass::StackOrType
+        );
+        assert_eq!(
+            classify_wire_failure("(say \"hi\")", "E-CAP-003: denied"),
+            WireFailureClass::Capability
+        );
     }
 }
