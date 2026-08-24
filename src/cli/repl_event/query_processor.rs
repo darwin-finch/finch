@@ -1390,6 +1390,10 @@ mod tests {
         assert!(text.contains("one complete executable Finch program"));
         assert!(text.contains("Default to Lisp"));
         assert!(text.contains("every other valid response is Co-Forth"));
+        assert!(text.contains("already writing to the active Brain's VM input"));
+        assert!(text.contains("A nested CLI"));
+        assert!(text.contains("process is a different runtime"));
+        assert!(text.contains("submit_program` tool only when this same inference"));
         assert!(text.contains("search_word(query)"));
         assert!(text.contains("inspect_word(name)"));
         assert!(text.contains("\"Hello\" say"));

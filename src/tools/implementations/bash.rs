@@ -21,7 +21,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute bash commands. Use for terminal operations like git, npm, ls, etc."
+        "Execute a host shell command when behavior exists only in an external program such as git, cargo, npm, or a build script. Never use bash, finch, target/debug/finch, echo, printf, or cat to execute, test, or display Finch Lisp/Co-Forth source: your final text response is already executed by the active Brain VM."
     }
 
     fn input_schema(&self) -> ToolInputSchema {

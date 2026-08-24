@@ -710,7 +710,7 @@ impl Tool for SubmitProgramTool {
     }
 
     fn description(&self) -> &str {
-        "Execute Forth or Lisp directly in Finch's persistent session VM. Returns structured values, portable output events, diagnostics, and VM revisions without using the shell or conversational stack. Effects and concrete capabilities are verified by the typed runtime."
+        "Execute Forth or Lisp inside the active Brain only when this same inference must inspect the structured result before composing its final response. Do not use it merely to deliver a final reply: raw response text is already executed as Finch Lisp/Co-Forth. Never invoke a nested finch CLI through bash. Returns typed values, portable output events, diagnostics, and VM revisions; capabilities remain verified by the runtime."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
