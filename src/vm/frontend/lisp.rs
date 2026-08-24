@@ -3667,14 +3667,17 @@ pub(crate) fn parse_type_name(name: &str) -> Result<Type, Vec<VmDiagnostic>> {
         "bytes" => Ok(Type::Bytes),
         "json" => Ok(Type::Json),
         "dynamic" | "any" => Ok(Type::Dynamic),
-        _ => parse_record_type(name).or_else(|| parse_generic_type(name)).ok_or_else(|| {
-            vec![VmDiagnostic::error(
-                "E-TYPE-009",
-                DiagnosticPhase::TypeInference,
-                format!("unknown type '{name}'"),
-                None,
-            )]
-        }),
+        _ => parse_record_type(name)
+            .or_else(|| parse_variant_type(name))
+            .or_else(|| parse_generic_type(name))
+            .ok_or_else(|| {
+                vec![VmDiagnostic::error(
+                    "E-TYPE-009",
+                    DiagnosticPhase::TypeInference,
+                    format!("unknown type '{name}'"),
+                    None,
+                )]
+            }),
     }
 }
 
@@ -3701,6 +3704,77 @@ fn parse_record_type(name: &str) -> Option<Type> {
         parsed.push((field_name.to_string(), parse_type_name(field_type.trim()).ok()?));
     }
     Some(Type::Record(parsed))
+}
+
+/// Parse a closed tagged sum. A tag either carries no payload (`none`) or one
+/// typed payload (`some(int)`). This is a type spelling only; construction and
+/// matching remain ordinary verified operations rather than parser magic.
+fn parse_variant_type(name: &str) -> Option<Type> {
+    let alternatives = name.strip_prefix("variant{")?.strip_suffix('}')?;
+    if alternatives.is_empty() {
+        return None;
+    }
+    let mut parsed = Vec::new();
+    for alternative in split_variant_alternatives(alternatives)? {
+        let alternative = alternative.trim();
+        let (tag, payload) = if alternative.ends_with(')') {
+            let open = alternative.find('(')?;
+            let tag = alternative[..open].trim();
+            let payload = &alternative[open + 1..alternative.len() - 1];
+            if payload.is_empty() {
+                return None;
+            }
+            (tag, Some(parse_type_name(payload).ok()?))
+        } else {
+            (alternative, None)
+        };
+        if tag.is_empty()
+            || !tag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            || parsed.iter().any(|(existing, _)| existing == tag)
+        {
+            return None;
+        }
+        parsed.push((tag.to_string(), payload));
+    }
+    Some(Type::Variant(parsed))
+}
+
+fn split_variant_alternatives(source: &str) -> Option<Vec<&str>> {
+    let mut alternatives = Vec::new();
+    let mut angle_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut start = 0;
+    for (index, character) in source.char_indices() {
+        match character {
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.checked_sub(1)?,
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.checked_sub(1)?,
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.checked_sub(1)?,
+            '|' if angle_depth == 0 && brace_depth == 0 && paren_depth == 0 => {
+                let alternative = source[start..index].trim();
+                if alternative.is_empty() {
+                    return None;
+                }
+                alternatives.push(alternative);
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if angle_depth != 0 || brace_depth != 0 || paren_depth != 0 {
+        return None;
+    }
+    let alternative = source[start..].trim();
+    if alternative.is_empty() {
+        return None;
+    }
+    alternatives.push(alternative);
+    Some(alternatives)
 }
 
 fn parse_generic_type(name: &str) -> Option<Type> {
@@ -4499,6 +4573,17 @@ mod tests {
                         Box::new(Type::String),
                         Box::new(Type::list(Type::Int)),
                     ),
+                ),
+            ])
+        );
+        assert_eq!(
+            parse_type_name("variant{none|some(int)|metadata(record{name:string})}").unwrap(),
+            Type::Variant(vec![
+                ("none".into(), None),
+                ("some".into(), Some(Type::Int)),
+                (
+                    "metadata".into(),
+                    Some(Type::Record(vec![("name".into(), Type::String)])),
                 ),
             ])
         );

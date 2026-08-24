@@ -51,6 +51,12 @@ empty requirement set is pure. Requirements are inferred transitively; declaring
 cannot hide a capability-bearing call. The receiver independently verifies types, stack shape,
 effects, grants, resource selectors, revisions, and budgets.
 
+Closed tagged sums use the shared compact type spelling
+`variant{none|some(int)|metadata(record{name:string})}`. Each tag carries either no payload or one
+typed payload. This spelling is accepted identically in Lisp annotations and Co-Forth signatures;
+values and exhaustive matching use verified vocabulary/IR operations rather than an untyped tag
+string convention.
+
 Structured option branches are part of the common semantics: Co-Forth `if-some ... else ... then`
 and Lisp `(match-option option (some name ...) (none ...))` both lower to typed branch edges. The
 some edge receives `T`, the none edge consumes the option, and the two edges must merge with the

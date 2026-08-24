@@ -2736,7 +2736,7 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
         // syntax uses braces. Record literals use `{ field: value }`; keeping
         // this no-whitespace spelling distinct lets annotations remain a
         // direct representation of `Type::Record`.
-        if let Some(end) = compact_record_type_end(source, start) {
+        if let Some(end) = compact_braced_type_end(source, start) {
             tokens.push(Token {
                 value: TokenValue::Word(source[start..end].to_string()),
                 start,
@@ -2952,9 +2952,9 @@ fn looks_like_json_object(source: &str, start: usize) -> bool {
     matches!(remainder.trim_start().as_bytes().first(), Some(b'"' | b'}'))
 }
 
-fn compact_record_type_end(source: &str, start: usize) -> Option<usize> {
+fn compact_braced_type_end(source: &str, start: usize) -> Option<usize> {
     let remainder = source.get(start..)?;
-    if !remainder.starts_with("record{") {
+    if !remainder.starts_with("record{") && !remainder.starts_with("variant{") {
         return None;
     }
     let mut depth = 0usize;
@@ -3839,6 +3839,25 @@ mod tests {
         assert_eq!(
             module.module.functions["identity-person"].signature.input.values,
             vec![record]
+        );
+    }
+
+    #[test]
+    fn accepts_closed_variant_types_in_stack_signatures() {
+        let variant = Type::Variant(vec![
+            ("none".into(), None),
+            ("some".into(), Some(Type::Int)),
+        ]);
+        let module = compile_forth(
+            "variant-signature.forth",
+            ": identity-result ( S variant{none|some(int)} -- S variant{none|some(int)} ! pure ) ;",
+            vec![variant.clone()],
+            &core_vocabulary(),
+        )
+        .expect("variant type signature should compile");
+        assert_eq!(
+            module.module.functions["identity-result"].signature.input.values,
+            vec![variant]
         );
     }
 
