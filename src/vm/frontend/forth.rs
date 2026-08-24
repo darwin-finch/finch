@@ -29,6 +29,9 @@ struct Token {
 enum TokenValue {
     Word(String),
     String(String),
+    /// A pasted JSON object literal. It is deliberately retained as managed
+    /// JSON rather than guessed to be a typed record or map.
+    Json(serde_json::Value),
 }
 
 #[derive(Debug, Clone)]
@@ -1615,6 +1618,12 @@ fn compile_forth_body_with_locals(
             }
         }
         let instruction = match token.value {
+            TokenValue::Json(value) => {
+                stack.push(Type::Json);
+                Instruction::Constant {
+                    value: TypedValue::Json(value),
+                }
+            }
             TokenValue::String(value) => {
                 stack.push(Type::String);
                 Instruction::Constant {
@@ -2227,6 +2236,13 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
         if cursor == bytes.len() {
             break;
         }
+        // Commas are optional collection separators.  They are ignored by
+        // Co-Forth's ordinary stack syntax as well, so `[1, 2]` and
+        // `[ 1 2 ]` share the same typed lowering.
+        if bytes[cursor] == b',' {
+            cursor += 1;
+            continue;
+        }
         if bytes[cursor] == b'\\' {
             while cursor < bytes.len() && bytes[cursor] != b'\n' {
                 cursor += 1;
@@ -2234,6 +2250,77 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
             continue;
         }
         let start = cursor;
+        // Preserve the conventional quotation token before treating `[` as a
+        // typed-list delimiter.
+        if source[start..].starts_with("[']") {
+            cursor += 3;
+            tokens.push(Token {
+                value: TokenValue::Word("[']".to_string()),
+                start,
+                end: cursor,
+            });
+            continue;
+        }
+        // These existing multi-character forms take precedence over generic
+        // brace punctuation. In particular, `{}` is the pure-effect marker
+        // in a typed word signature, not an empty JSON object.
+        if let Some(word) = ["{}", "map{", "}map", "list{", "}list", "record{", "}record"]
+            .into_iter()
+            .find(|word| source[start..].starts_with(word))
+        {
+            cursor += word.len();
+            tokens.push(Token {
+                value: TokenValue::Word(word.to_string()),
+                start,
+                end: cursor,
+            });
+            continue;
+        }
+        // Generic collection type applications are one source token even
+        // though their closing `>` may be immediately followed by ordinary
+        // collection punctuation.
+        if source[start..].starts_with("empty-map<") || source[start..].starts_with("empty-list<") {
+            let Some(close) = source[start..].find('>') else {
+                return Err(vec![VmDiagnostic::error(
+                    "E-READ-007",
+                    DiagnosticPhase::Reader,
+                    "unterminated typed empty collection",
+                    Some(origin(source_id, source, start, source.len())),
+                )]);
+            };
+            cursor = start + close + 1;
+            tokens.push(Token {
+                value: TokenValue::Word(source[start..cursor].to_string()),
+                start,
+                end: cursor,
+            });
+            continue;
+        }
+        // A JSON object begins with a quoted key (or is `{}`).  Keep it as a
+        // managed JSON value so ordinary pasted JSON does not need escaping
+        // or conversion into a record/map source form. Bare identifier field
+        // labels continue into the typed `{ field: value }` record grammar.
+        if bytes[start] == b'{' && looks_like_json_object(source, start) {
+            let (value, end) = read_json_object(source_id, source, start)?;
+            tokens.push(Token {
+                value: TokenValue::Json(value),
+                start,
+                end,
+            });
+            cursor = end;
+            continue;
+        }
+        // Split collection/record delimiters even when pasted without
+        // whitespace: `[1,2]` and `{name: \"Ada\"}` are valid source.
+        if matches!(bytes[start], b'[' | b']' | b'{' | b'}') {
+            cursor += 1;
+            tokens.push(Token {
+                value: TokenValue::Word(source[start..cursor].to_string()),
+                start,
+                end: cursor,
+            });
+            continue;
+        }
         // Raw prose literal.  It deliberately comes before `s"` so the
         // triple-quote opener is not mistaken for an empty escaped string.
         // The contents are verbatim (including newlines and ordinary quotes)
@@ -2331,7 +2418,10 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
             cursor = end;
             continue;
         }
-        while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+        while cursor < bytes.len()
+            && !bytes[cursor].is_ascii_whitespace()
+            && !matches!(bytes[cursor], b',' | b'[' | b']' | b'}')
+        {
             cursor += 1;
         }
         // Keep the conventional Forth line-break word available without
@@ -2358,6 +2448,65 @@ fn tokenize(source_id: &str, source: &str) -> Result<Vec<Token>, Vec<VmDiagnosti
         });
     }
     Ok(tokens)
+}
+
+fn looks_like_json_object(source: &str, start: usize) -> bool {
+    let remainder = &source[start + 1..];
+    matches!(remainder.trim_start().as_bytes().first(), Some(b'"' | b'}'))
+}
+
+fn read_json_object(
+    source_id: &str,
+    source: &str,
+    start: usize,
+) -> Result<(serde_json::Value, usize), Vec<VmDiagnostic>> {
+    let mut cursor = start;
+    let mut depth = 0_u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    while cursor < source.len() {
+        let character = source[cursor..]
+            .chars()
+            .next()
+            .expect("cursor remains on a UTF-8 boundary");
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+        } else {
+            match character {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.checked_sub(1).expect("JSON object starts at an opening brace");
+                    if depth == 0 {
+                        let end = cursor + character.len_utf8();
+                        let value = serde_json::from_str(&source[start..end]).map_err(|error| {
+                            vec![VmDiagnostic::error(
+                                "E-READ-006",
+                                DiagnosticPhase::Reader,
+                                format!("invalid pasted JSON object: {error}"),
+                                Some(origin(source_id, source, start, end)),
+                            )]
+                        })?;
+                        return Ok((value, end));
+                    }
+                }
+                _ => {}
+            }
+        }
+        cursor += character.len_utf8();
+    }
+    Err(vec![VmDiagnostic::error(
+        "E-READ-006",
+        DiagnosticPhase::Reader,
+        "unterminated pasted JSON object",
+        Some(origin(source_id, source, start, source.len())),
+    )])
 }
 
 fn read_string(
@@ -3078,6 +3227,35 @@ mod tests {
             .execute(&mut stack)
             .unwrap();
         assert_eq!(stack, vec![TypedValue::Int(3)]);
+    }
+
+    #[test]
+    fn accepts_comma_separated_lists_and_pasted_json_objects() {
+        let list = compile_forth(
+            "input.forth",
+            "[1, 2, 3] 2 list-get",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let mut stack = Vec::new();
+        Interpreter::new(&list, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .unwrap();
+        assert_eq!(stack, vec![TypedValue::Int(3)]);
+
+        let json = compile_forth(
+            "input.forth",
+            "{\"first name\":\"Ada\",\"age\":37} \"first name\" json-get unwrap json-as-string unwrap",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let mut stack = Vec::new();
+        Interpreter::new(&json, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .unwrap();
+        assert_eq!(stack, vec![TypedValue::String("Ada".into())]);
     }
 
     #[test]

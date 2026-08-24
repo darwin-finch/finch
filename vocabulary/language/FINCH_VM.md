@@ -154,6 +154,15 @@ known scalar through `json-as-string`, `json-as-int`, `json-as-float`, or `json-
 element, and `json-keys` returns a typed `list<string>` (empty for a non-object). `json-stringify`
 explicitly returns compact JSON text.
 
+`json-as-map` explicitly normalizes a JSON object to `option<map<string,json>>`, preserving its
+field strings (including spaces) as map keys. It returns `none` for non-object JSON and never
+silently converts an object into a typed record.
+
+Co-Forth also accepts a pasted JSON object literal directly when its first key is quoted (for
+example `{"first name":"Ada"}`). It pushes managed `json`, not a record or map. `{ name: "Ada" }`
+continues to be the typed-record grammar. Commas are optional separators in Co-Forth list source,
+so `[1, 2, 3]` and `[ 1 2 3 ]` are equivalent.
+
 Typed maps and records are also shared source values, distinct from arbitrary `json`. Maps accept
 typed keys and values: Lisp spells construction `(map key value ...)`, while Co-Forth spells
 `map{ key value ... }map`. `map-get` returns `option<V>`, `map-set` returns a replacement map, and

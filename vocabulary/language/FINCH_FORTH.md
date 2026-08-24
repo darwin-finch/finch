@@ -95,6 +95,16 @@ s"{\"first name\":\"Ada\"}" json-parse result-unwrap
 s"first name" json-get unwrap json-as-string unwrap  \ leaves "Ada"
 ```
 
+Co-Forth accepts a pasted JSON object directly when its first key is quoted, so commas and ordinary
+JSON string escaping work without translating it into a record or map literal. The value remains
+managed `json`; `{ name: "Ada" }` with an identifier label is still a typed record. Commas are
+also optional separators in typed list source, including tight pasted forms:
+
+```forth
+{"first name":"Ada","age":37} "first name" json-get unwrap json-as-string unwrap
+[1, 2, 3] 2 list-get                 \ leaves 3
+```
+
 `case` is a typed integer switch with no fallthrough. Each `of ... endof` arm and the optional
 `otherwise` arm must leave the same stack row. The selector is removed before an arm begins;
 `otherwise` is required whenever an unmatched case must produce values. This is structured branch
@@ -259,8 +269,10 @@ s" answer" json-get unwrap json-as-int unwrap
 
 `json-as-string`, `json-as-int`, `json-as-float`, and `json-as-bool` return `none` for a mismatched JSON kind;
 `json-index` returns `option<json>` for an array index, `json-keys` returns `list<string>` for an
-object (or an empty list otherwise), and `json-stringify` converts a managed JSON value back to
-compact text.
+object (or an empty list otherwise), `json-as-map` explicitly normalizes an object to
+`option<map<string,json>>`, and `json-stringify` converts a managed JSON value back to compact
+text. `json-as-map` preserves arbitrary keys such as `"first name"`; it does not coerce JSON into
+a typed record.
 
 `process-run` consumes a command string and a list of argument strings; it never invokes a shell.
 

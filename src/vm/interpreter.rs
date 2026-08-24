@@ -1636,6 +1636,33 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
                 values,
             });
         }
+        "json-as-map" => {
+            let value = pop(stack)?;
+            let TypedValue::Json(value) = value else {
+                return Err(VmDiagnostic::error(
+                    "E-JSON-008",
+                    DiagnosticPhase::Interpretation,
+                    "json-as-map requires a JSON value",
+                    Some(origin),
+                ));
+            };
+            let value = value.as_object().map(|object| {
+                Box::new(TypedValue::Map {
+                    key_type: Type::String,
+                    value_type: Type::Json,
+                    entries: object
+                        .iter()
+                        .map(|(key, value)| {
+                            (TypedValue::String(key.clone()), TypedValue::Json(value.clone()))
+                        })
+                        .collect(),
+                })
+            });
+            stack.push(TypedValue::Option {
+                inner_type: Type::Map(Box::new(Type::String), Box::new(Type::Json)),
+                value,
+            });
+        }
         "json-as-string" | "json-as-int" | "json-as-float" | "json-as-bool" => {
             let value = pop(stack)?;
             let TypedValue::Json(value) = value else {

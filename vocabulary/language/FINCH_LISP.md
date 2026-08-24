@@ -297,7 +297,9 @@ example:
 Use `(json-stringify value)` only when text serialization is actually needed. User text inside JSON
 never becomes a capability, path, or executable form merely by being parsed.
 `(json-index value index)` returns `option<json>` for array data, while `(json-keys value)` returns
-`list<string>` for an object and an empty list for any other JSON value.
+`list<string>` for an object and an empty list for any other JSON value. `(json-as-map value)`
+explicitly normalizes an object to `option<map<string,json>>`, preserving arbitrary string keys;
+it returns `none` for non-objects and never guesses a typed-record schema.
 
 Typed maps are immutable shared-language collections, separate from JSON. Construct one with
 alternating key/value forms: `(map "answer" 42 "other" 7)`. All keys must share one type and all

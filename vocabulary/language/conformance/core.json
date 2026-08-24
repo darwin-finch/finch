@@ -87,6 +87,20 @@
       "expected_output": ""
     },
     {
+      "name": "forth-pasted-json-object-and-comma-list",
+      "forth": "{\"first name\":\"Ada\",\"age\":37} \"first name\" json-get unwrap json-as-string unwrap",
+      "lisp": "(unwrap (json-as-string (unwrap (json-get (result-unwrap (json-parse \"{\\\"first name\\\":\\\"Ada\\\",\\\"age\\\":37}\")) \"first name\"))))",
+      "expected_values": [{ "type": "string", "value": "Ada" }],
+      "expected_output": ""
+    },
+    {
+      "name": "json-object-explicit-map-normalization",
+      "forth": "s\"{\\\"first name\\\":\\\"Ada\\\"}\" json-parse result-unwrap json-as-map unwrap s\"first name\" map-get unwrap json-as-string unwrap",
+      "lisp": "(unwrap (json-as-string (unwrap (map-get (unwrap (json-as-map (result-unwrap (json-parse \"{\\\"first name\\\":\\\"Ada\\\"}\")))) \"first name\"))))",
+      "expected_values": [{ "type": "string", "value": "Ada" }],
+      "expected_output": ""
+    },
+    {
       "name": "typed-record-construction-and-projection",
       "forth": "{ name: \"Ada\" age: 37 } \"age\" record-get unwrap",
       "lisp": "(unwrap (record-get { :name \"Ada\" :age 37 } \"age\"))",
