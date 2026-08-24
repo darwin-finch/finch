@@ -1408,6 +1408,21 @@ descriptor. Code that intentionally needs raw descriptor or foreign-ABI manipula
 explicit unsafe native-extension boundary with a separately declared capability; producing an AOT
 binary does not silently grant that authority.
 
+The asynchronous host is selected through a narrow reactor/scheduler interface rather than being
+hard-wired to Tokio or one operating-system poller. A standalone service may let the Finch runtime
+own the loop; a Cocoa, Win32, GTK, game, or existing C application may instead own the main thread
+and supply timers, readiness registration, wakeups, and event delivery. Native callbacks enqueue a
+typed correlated resumption onto that scheduler and do not re-enter arbitrary VM frames directly.
+This keeps continuation ordering, cancellation, and execute-once effect records intact when the
+host loop is swapped.
+
+Later C interoperability should use versioned typed `extern` declarations and generated ABI shims.
+Safe wrappers describe argument/result layout, ownership, callback lifetime, thread affinity, and
+effects; opaque C pointers remain generation-checked resources. Calling an unverified symbol,
+passing a raw pointer/integer descriptor, variadic calls, and unchecked shared-memory access require
+an explicit unsafe-FFI capability. The same declarations feed interpreter bindings and Cranelift
+AOT lowering so FFI does not become a second language semantic path.
+
 Compile-time reflection should make immutable `type`, schema, syntax, symbol/module-reference, and
 constraint-evidence values available to pure bounded Finch functions. Generics, concepts,
 compile-time branching/traversal, derive operations, and hygienic macros must all use this one staged
