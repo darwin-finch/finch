@@ -129,7 +129,7 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "vm-vocabulary" => CoreWordDocumentation { summary: "Return the serialized current typed vocabulary. Use the external search_vm_vocabulary/describe_vm_word tools for compact targeted discovery.", lisp: "(vm-vocabulary)", forth: "vm-vocabulary", example: "(say (vm-vocabulary))" },
         "automation-availability" | "automation-displays" | "automation-windows" | "automation-click" | "automation-type" => CoreWordDocumentation { summary: "Inspect or operate desktop automation through the host adapter. Availability and every concrete target remain capability-checked at the execution boundary.", lisp: "(automation-availability), (automation-click x y button count), (automation-type text delay)", forth: "automation-availability; x y button count automation-click; text delay automation-type", example: "(automation-availability)" },
         "list-length" | "list-get" => CoreWordDocumentation { summary: "Return a typed list's length or one element at a zero-based integer index.", lisp: "(list-length items), (list-get items index)", forth: "items list-length; items index list-get", example: "(list-get (list 4 8 15 16) 2)" },
-        "map-get" | "map-set" | "map-keys" | "map-length" => CoreWordDocumentation { summary: "Inspect or immutably update a typed map. map-get returns option<V>; map-set returns a replacement map and never mutates a shared value.", lisp: "(map-get map key), (map-set map key value), (map-keys map), (map-length map)", forth: "map key map-get; map key value map-set; map map-keys; map map-length", example: "(map-get (map \"answer\" 42) \"answer\")" },
+        "map-get" | "map-set" | "map-keys" | "map-entries" | "map-length" => CoreWordDocumentation { summary: "Inspect or immutably update a typed map. map-get returns option<V>; map-set returns a replacement map; map-entries returns insertion-ordered key/value typed records. None mutates a shared value.", lisp: "(map-get map key), (map-set map key value), (map-keys map), (map-entries map), (map-length map)", forth: "map key map-get; map key value map-set; map map-keys; map map-entries; map map-length", example: "(unwrap (record-get (list-get (map-entries (map \"answer\" 42)) 0) \"value\"))" },
         "str-cat" | "bytes" | "int-to-string" | "atoi" | "space" => CoreWordDocumentation { summary: "Pure text/byte conversion helpers. str-cat preserves both inputs exactly; say adds no formatting of its own.", lisp: "(str-cat left right), (bytes text), (int-to-string n), (atoi text), (space)", forth: "left right str-cat; text bytes; n int-to-string; text atoi; space", example: "s\"answer: \" 42 int-to-string str-cat say" },
         "json-parse" | "json-stringify" | "json-get" | "json-index" | "json-keys" | "json-as-string" | "json-as-int" | "json-as-float" | "json-as-bool" => CoreWordDocumentation { summary: "Pure managed JSON operations. json-parse returns result<json,string>; field/index lookup and scalar projections return options rather than coercing or treating text as authority. json-keys returns an empty typed list for a non-object.", lisp: "(json-parse text), (json-get value field), (json-index value index), (json-keys value), (json-as-string value), (json-as-int value), (json-as-float value), (json-as-bool value)", forth: "text json-parse; json field json-get; json index json-index; json json-keys; json json-as-string|json-as-int|json-as-float|json-as-bool", example: "s\" {\\\"answer\\\":42}\" json-parse result-unwrap s\" answer\" json-get unwrap json-as-int unwrap" },
         "dup" | "drop" | "swap" => CoreWordDocumentation { summary: "Pure stack shuffles. Prefer Lisp let bindings or Co-Forth locals for complex programs rather than deep positional juggling.", lisp: "Usually use let instead of stack shuffles.", forth: "value dup; value drop; left right swap", example: "3 dup * int-to-string say" },
@@ -606,6 +606,19 @@ fn core_signatures() -> Vocabulary {
                     Box::new(Type::Variable("V".into())),
                 )],
                 vec![Type::list(Type::Variable("K".into()))],
+            ),
+        ),
+        (
+            "map-entries".into(),
+            pure(
+                vec![Type::Map(
+                    Box::new(Type::Variable("K".into())),
+                    Box::new(Type::Variable("V".into())),
+                )],
+                vec![Type::list(Type::Record(vec![
+                    ("key".into(), Type::Variable("K".into())),
+                    ("value".into(), Type::Variable("V".into())),
+                ]))],
             ),
         ),
         (

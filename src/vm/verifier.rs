@@ -813,6 +813,56 @@ fn unify(
             unify(expected_ok, found_ok, substitutions, origin)?;
             unify(expected_err, found_err, substitutions, origin)
         }
+        (Type::Record(expected_fields), Type::Record(found_fields)) => {
+            if expected_fields.len() != found_fields.len()
+                || expected_fields
+                    .iter()
+                    .zip(found_fields)
+                    .any(|((expected_name, _), (found_name, _))| expected_name != found_name)
+            {
+                return Err(VmDiagnostic::type_mismatch(
+                    expected.clone(),
+                    found.clone(),
+                    Some(origin.clone()),
+                ));
+            }
+            for ((_, expected_type), (_, found_type)) in expected_fields.iter().zip(found_fields) {
+                unify(expected_type, found_type, substitutions, origin)?;
+            }
+            Ok(())
+        }
+        (Type::Variant(expected_variants), Type::Variant(found_variants)) => {
+            if expected_variants.len() != found_variants.len()
+                || expected_variants
+                    .iter()
+                    .zip(found_variants)
+                    .any(|((expected_name, _), (found_name, _))| expected_name != found_name)
+            {
+                return Err(VmDiagnostic::type_mismatch(
+                    expected.clone(),
+                    found.clone(),
+                    Some(origin.clone()),
+                ));
+            }
+            for ((_, expected_payload), (_, found_payload)) in
+                expected_variants.iter().zip(found_variants)
+            {
+                match (expected_payload, found_payload) {
+                    (Some(expected_type), Some(found_type)) => {
+                        unify(expected_type, found_type, substitutions, origin)?;
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(VmDiagnostic::type_mismatch(
+                            expected.clone(),
+                            found.clone(),
+                            Some(origin.clone()),
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
         _ if expected.accepts(found) => Ok(()),
         _ => Err(VmDiagnostic::type_mismatch(
             expected.clone(),
@@ -837,6 +887,25 @@ fn substitute(ty: &Type, substitutions: &BTreeMap<String, Type>) -> Type {
         Type::Map(key, value) => Type::Map(
             Box::new(substitute(key, substitutions)),
             Box::new(substitute(value, substitutions)),
+        ),
+        Type::Record(fields) => Type::Record(
+            fields
+                .iter()
+                .map(|(name, ty)| (name.clone(), substitute(ty, substitutions)))
+                .collect(),
+        ),
+        Type::Variant(variants) => Type::Variant(
+            variants
+                .iter()
+                .map(|(name, payload)| {
+                    (
+                        name.clone(),
+                        payload
+                            .as_ref()
+                            .map(|payload| substitute(payload, substitutions)),
+                    )
+                })
+                .collect(),
         ),
         Type::Task(inner) => Type::Task(Box::new(substitute(inner, substitutions))),
         Type::Stream(inner) => Type::Stream(Box::new(substitute(inner, substitutions))),

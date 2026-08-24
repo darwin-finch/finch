@@ -103,6 +103,16 @@ ambient mutable access to the record that contains it.
   ((unwrap (record-get object "run")) 41)) ; => 42
 ```
 
+`map-entries` converts a typed map into an insertion-ordered `list` of typed
+`{ :key ... :value ... }` records. This is the portable basis for inspecting or looping over both
+keys and values without dropping into untyped JSON:
+
+```lisp
+(unwrap (record-get
+  (list-get (map-entries (map "answer" 42)) 0)
+  "value")) ; => 42
+```
+
 MemTree and scheduling are explicit effects. Scheduled work stores an immutable program reference,
 typed arguments, budgets, context references, and a revocable policy reference—not raw authority or
 an unvalidated Lisp string. A callback starts a fresh audited task and revalidates its environment

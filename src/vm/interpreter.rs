@@ -1951,6 +1951,35 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
                 values: entries.into_iter().map(|(key, _)| key).collect(),
             });
         }
+        "map-entries" => {
+            let map = pop(stack)?;
+            let TypedValue::Map {
+                key_type,
+                value_type,
+                entries,
+            } = map
+            else {
+                return Err(VmDiagnostic::error(
+                    "E-RUNTIME-033",
+                    DiagnosticPhase::Interpretation,
+                    "map-entries requires a typed map",
+                    Some(origin),
+                ));
+            };
+            let element_type = Type::Record(vec![
+                ("key".into(), key_type),
+                ("value".into(), value_type),
+            ]);
+            stack.push(TypedValue::List {
+                element_type,
+                values: entries
+                    .into_iter()
+                    .map(|(key, value)| {
+                        TypedValue::Record(vec![("key".into(), key), ("value".into(), value)])
+                    })
+                    .collect(),
+            });
+        }
         "map-length" => {
             let map = pop(stack)?;
             let TypedValue::Map { entries, .. } = map else {

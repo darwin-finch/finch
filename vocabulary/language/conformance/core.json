@@ -59,6 +59,13 @@
       "expected_output": ""
     },
     {
+      "name": "typed-map-entries",
+      "forth": "map{ \"answer\" 42 }map map-entries 0 list-get \"value\" record-get unwrap",
+      "lisp": "(unwrap (record-get (list-get (map-entries (map \"answer\" 42)) 0) \"value\"))",
+      "expected_values": [{ "type": "int", "value": 42 }],
+      "expected_output": ""
+    },
+    {
       "name": "typed-record-construction-and-projection",
       "forth": "{ name: \"Ada\" age: 37 } \"age\" record-get unwrap",
       "lisp": "(unwrap (record-get { :name \"Ada\" :age 37 } \"age\"))",
