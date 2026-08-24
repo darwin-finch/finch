@@ -379,8 +379,10 @@ bounded parent-authored background, provider/model selection, or tighter budgets
 Roles are `general`, `explore`, `research`, or `code`. Empty background/provider/model strings
 mean no override. Use `(empty-list record{kind:string,id:string,sha256:string})` when there are no
 context references. References and the effective `starting-context-hash` make child inputs
-auditable; the host must still resolve referenced artifacts and verify their declared digests. An
-unavailable explicit provider/model fails before a child task is created. Use `(capability-list)`
+auditable. The host registers immutable bounded UTF-8 artifacts and supplies their computed
+references; child creation resolves and SHA-256 verifies the bytes before allocating a task. An
+unknown, rebound, oversized, non-text, or mismatched artifact fails closed. An unavailable explicit
+provider/model likewise fails before a child task is created. Use `(capability-list)`
 to discover live delegable grants, extract a chosen entry's opaque `grant` resource with
 `record-get`, and place those resources in `:capabilities`. An empty capability list delegates no
 non-intrinsic authority; UUID strings and the adjacent JSON requirement metadata cannot be used in

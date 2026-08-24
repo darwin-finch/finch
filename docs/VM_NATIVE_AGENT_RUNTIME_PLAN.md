@@ -324,6 +324,13 @@ spawn result records a hash of the effective starting context so the run can be 
 reproduced. Secrets are passed only as opaque capability grants and are never inserted into the
 prompt.
 
+The scheduler now owns an injectable immutable context store. A host registers bounded UTF-8 bytes
+under a stable kind/ID and receives the computed SHA-256 reference. Spawn resolves every reference,
+enforces per-artifact and aggregate byte limits, verifies the digest, and materializes the verified
+text before allocating the task. Unknown references, identity rebinding, non-text content, and
+digest mismatch fail closed. The default store is process-local; a Brain host must supply a durable
+implementation before references are promised across daemon restarts.
+
 The implemented typed surface obtains those resources through `capability-list`. Discovery is
 filtered by the current ProgramRun ceiling, and spawn revalidates every selected grant against live
 policy, scope, expiry/revocation, and parent containment. An explicit empty selection delegates only

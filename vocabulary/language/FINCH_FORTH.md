@@ -313,8 +313,10 @@ same structured spawn contract is available without a frontend special case:
 
 Roles are `general`, `explore`, `research`, or `code`; empty background/provider/model strings mean
 no override. Context references are bounded `{kind,id,sha256}` descriptors and poll/await expose the
-effective `starting-context-hash`; an artifact host must verify referenced bytes against those
-digests before materializing them. Budgets are positive and host-bounded, and unavailable explicit
+effective `starting-context-hash`. The host registers immutable bounded UTF-8 artifacts and supplies
+their computed references; child creation resolves and SHA-256 verifies every artifact before task
+allocation. Unknown, rebound, oversized, non-text, or mismatched artifacts fail closed. Budgets are
+positive and host-bounded, and unavailable explicit
 model selection fails before the scheduler creates a task. `capability-list` returns typed records
 whose `grant` field is an opaque `resource<capability-grant>`; select only those resources to pass
 in `capabilities`. An empty list delegates no non-intrinsic authority. Printed UUID strings and JSON

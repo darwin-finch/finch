@@ -156,7 +156,9 @@ Provider/model names go through the scheduler's configured-profile resolver rath
 the frontend's current provider. Poll and await expose `starting-context-hash`, a deterministic
 digest bound to the task, role, background, budgets, parent ancestry, selected provider/model, VM
 revision/manifest generation, declared references, and inherited grant ceiling. A reference digest
-identifies expected content; a future artifact resolver must verify bytes before materializing them.
+identifies expected content. Hosts register immutable bounded UTF-8 artifacts and receive the
+computed `{kind,id,sha256}` reference; child creation resolves and verifies every byte before a task
+is allocated, and includes the verified contents in the child's explicit data context.
 `capability-list` returns the reusable grants visible within the current ProgramRun ceiling as
 typed metadata paired with opaque `resource<capability-grant>` values. Put only the desired resource
 values in `capabilities`; an empty list delegates no non-intrinsic authority. The compact
