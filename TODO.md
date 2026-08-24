@@ -54,6 +54,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [x] Publish the canonical source surface in the generated language package: `s"..."` strings,
   exact escaping/comment rules, `say` composition, Lisp form examples, and no-free-prose protocol
   rule. Include common stack-error corrections rather than only error codes.
+- [ ] Measure provider wire adherence by provider/model and failure class: first-pass valid
+  `ProgramSubmission`, raw prose, Markdown fence, invented word, stack/type error, wrong language
+  dispatch, missing output effect, capability error, repaired successfully, and terminal failure.
+  Treat this as a protocol-conformance benchmark; never hide the first rejected source or its
+  diagnostic merely because the bounded repair succeeds.
 - [ ] Consider an opt-in typed unresolved-word handler for a module/run. Ordinary unbound bare
   words must remain linking diagnostics; an explicitly installed handler may receive the unknown
   token as `symbol`/`string` and has one declared signature/effect contract, allowing controlled

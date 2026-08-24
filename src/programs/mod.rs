@@ -44,10 +44,12 @@ pub fn is_repairable_wire_diagnostic(diagnostic: &str) -> bool {
 pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
     let language = ProgramLanguage::infer_source(rejected_source).as_str();
     format!(
-        "The preceding Finch VM wire program was rejected before execution. \
+        "E-WIRE-001. You do not communicate with the human directly; every byte of your text output is Finch VM input. \
+         The preceding Finch VM wire program was rejected before execution. \
          It was {language}; repair it as {language} and do not switch languages. \
          Make the smallest source correction justified by the diagnostic. \
-         Re-emit exactly one complete raw Finch {language} program; do not use Markdown, prose, or tools.\n\n\
+         Re-emit exactly one complete raw Finch {language} ProgramSubmission; do not use Markdown, prose, labels, or tools. \
+         User-visible text must be produced by an output effect inside that program.\n\n\
          Rejected source:\n---\n{rejected_source}\n---\n\
          Diagnostic:\n{diagnostic}"
     )
@@ -1171,7 +1173,7 @@ mod tests {
         let prompt = manifest.prompt_block();
         assert!(prompt.contains("secret-helper"));
         assert!(!prompt.contains("12345"));
-        assert!(prompt.contains("every other valid response is Co-Forth"));
+        assert!(prompt.contains("every other valid submission is Co-Forth"));
         assert!(prompt.contains("get_language_definition"));
         assert!(prompt.contains("\"Hello\" say"));
         assert!(prompt.contains("search_word(query)"));
@@ -1401,8 +1403,9 @@ mod tests {
         ));
 
         let request = wire_repair_request("Hello!", "E-LINK-002: unknown word");
+        assert!(request.contains("do not communicate with the human directly"));
         assert!(request.contains("It was forth; repair it as forth"));
-        assert!(request.contains("exactly one complete raw Finch forth program"));
+        assert!(request.contains("exactly one complete raw Finch forth ProgramSubmission"));
         assert!(request.contains("Hello!"));
 
         let lisp = wire_repair_request("(say message)", "E-NAME-001: unbound name");
