@@ -42,11 +42,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   words must remain linking diagnostics; an explicitly installed handler may receive the unknown
   token as `symbol`/`string` and has one declared signature/effect contract, allowing controlled
   lookup/delegation without silently turning leaked prose or misspelled capabilities into data.
-- [ ] Later language evolution: allow immutable typed records to contain closure values and define
-  explicit method-call sugar that passes `self` and returns a replacement record (never hidden
-  ambient mutation). Design concepts/constraints and coherent overload resolution only after the
-  core vocabulary, diagnostics, capability inference, and closure serialization are stable; a
-  concept must remain a statically inspectable contract, not a runtime dynamic escape hatch.
+- [ ] Later language evolution: typed records already carry ordinary closure values; add explicit
+  method-call sugar that passes `self` and returns a replacement record (never hidden ambient
+  mutation). Design concepts/constraints and coherent overload resolution only after the core
+  vocabulary, diagnostics, capability inference, and closure serialization are stable; a concept
+  must remain a statically inspectable contract, not a runtime dynamic escape hatch.
 - [ ] Generate every production word/function from one typed signature, effect, documentation, and
   host-implementation registry.
 - [ ] Finish Lisp source maps: the reader now retains structural spans and typed lowering preserves

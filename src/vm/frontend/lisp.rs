@@ -3091,6 +3091,13 @@ mod tests {
                 .unwrap(),
             vec![TypedValue::Int(38)]
         );
+        assert_eq!(
+            run(
+                "(let ((object { :run (lambda ((x : int)) (+ x 1)) })) ((unwrap (record-get object \"run\")) 41))",
+            )
+            .unwrap(),
+            vec![TypedValue::Int(42)]
+        );
     }
 
     #[test]

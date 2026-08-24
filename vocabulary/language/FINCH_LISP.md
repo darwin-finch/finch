@@ -93,6 +93,16 @@ access. Dynamic object traversal remains the explicit `json-*` boundary:
 `record-set` creates a new record rather than mutating the original. Its field name is also a
 literal string, and the replacement must match the field's statically known type.
 
+Records may contain ordinary typed closure values, which makes an immutable object-style value
+possible without a second object runtime. Method invocation remains explicit: project, unwrap, and
+call the closure. A later method-sugar layer may pass `self` explicitly, but no closure gains
+ambient mutable access to the record that contains it.
+
+```lisp
+(let ((object { :run (lambda ((x : int)) (+ x 1)) }))
+  ((unwrap (record-get object "run")) 41)) ; => 42
+```
+
 MemTree and scheduling are explicit effects. Scheduled work stores an immutable program reference,
 typed arguments, budgets, context references, and a revocable policy reference—not raw authority or
 an unvalidated Lisp string. A callback starts a fresh audited task and revalidates its environment
