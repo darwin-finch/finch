@@ -249,9 +249,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   subsets now use opaque host-issued `resource<capability-grant>` values discovered within the
   current ProgramRun ceiling; child creation rechecks live policy/scope/revocation and parent
   containment, while printed grant IDs and requirement JSON remain non-authoritative metadata.
-  Still resolve context references through a host artifact store with byte-for-digest verification
-  and audit remaining root/provider legacy model-selection/tool entry points before closing this
-  gate.
+  Child context references now resolve through an injectable immutable store before task creation,
+  with per-item/aggregate bounds, UTF-8 validation, byte-for-digest verification, identity-rebinding
+  rejection, and verified content materialization. Persist that store with the owning Brain and wire
+  artifact-producing host paths to register content instead of accepting caller-invented references;
+  also audit remaining root/provider legacy model-selection/tool entry points before closing this gate.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their
   own large-file loops: workspace tree metadata, bounded file hash, a bounded host-computed
   directory Merkle root, and bounded host-computed CSV header/per-column summaries now exist; add workbook
