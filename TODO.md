@@ -197,8 +197,13 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   policy path. Typed scheduling now binds create/read/manage through opaque `schedule` resources:
   `schedule-get` returns redacted structured metadata, `schedule-cancel` preserves the durable row,
   and the queue atomically arbitrates `Pending → Running|Cancelled` so cancellation cannot report
-  success after a worker has claimed the callback. Still implement policy-driven revocation and
-  complete the remaining host adapters.
+  success after a worker has claimed the callback. Host-owned `CapabilityPolicy` revisions and
+  capability-wide denials now persist in that authority record: a new immutable policy identity
+  atomically revokes every active grant from the prior revision, denial prevents reissuance, every
+  host boundary re-reads the live policy, and sink failure restores both policy and ledger. Reusing
+  one policy identity for different contents fails closed; old integrity-signed authority records
+  without an explicit policy migrate to the original default without losing their checksum proof.
+  Still complete the remaining host adapters and the approval/history UI for policy changes.
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their

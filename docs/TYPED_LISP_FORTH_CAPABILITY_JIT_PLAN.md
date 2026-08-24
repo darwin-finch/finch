@@ -133,7 +133,11 @@ promoted vocabulary still needs the same registry migration. Named Brain storage
 integrity-checked host authority record separately from content-addressed VM checkpoints, so a
 checkpoint copied without that record confers no grants. Policy mutation persistence outside Brain
 runtime commits is now immediate and fail-closed through an application-owned authority sink.
-Policy-driven revocation, complete host adapters, and provider conformance remain unfinished.
+The persisted authority state now includes an immutable `CapabilityPolicy` identity and
+capability-wide denials. Installing a new policy atomically revokes active grants issued under the
+prior identity, blocks grants for denied kinds, and is re-read at every host boundary; storage
+failure rolls back the policy and its revocations together. Complete host adapters, policy UI, and
+provider conformance remain unfinished.
 
 The target removes those explicit migration APIs after conformance parity and gives interpreted
 and JIT execution the same verified IR, transaction, and error behavior.
@@ -1066,6 +1070,16 @@ host operation fails closed. Consequently an external effect remains audited eve
 ProgramRun later rolls back, while a failed VM transaction cannot erase or manufacture authority.
 Archiving a Brain detaches this sink before removing the live runtime so a retained runtime handle
 cannot recreate the archived policy path.
+
+The authority record also owns the current immutable `CapabilityPolicy`. Its identity binds every
+grant to the policy revision under which it was approved. Installing a different identity revokes
+all still-active grants from the former revision in the same persisted mutation; capability-wide
+denials prevent reissuance, and intrinsic `session_emit`/`vm_read` operations cannot be disabled by
+host policy. Reusing an identity for different contents is rejected. Execution and resumption
+derive compact grants from the current identity, while the host call boundary independently reads
+the live policy and ledger again. This closes the race in which a ProgramRun began before a policy
+change but reached an external operation afterward. Pre-policy integrity-signed authority files
+are verified against their exact historical payload before receiving the original default policy.
 
 Scheduled callbacks use the same broker rather than a parallel queue authority path. Creation
 returns an opaque host-issued `schedule` resource; `schedule-get` requires `schedule_read` and
