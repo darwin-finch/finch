@@ -21,6 +21,13 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   Captured anonymous Co-Forth quotations now lower to the same closure IR as Lisp lambdas, retain
   exact body spans/effect inference, may escape their defining frame, and survive checkpoints;
   finish the remaining bounded compile-time and structured-pattern surface before closing this gate.
+- [ ] Enforce single-pass source parsing for every Lisp and Co-Forth module. Consume each source
+  byte stream once into span-carrying syntax/lowering events; macro expansion, name resolution,
+  optimization, linking, and the independent security verifier may operate on those retained
+  structures but must never rescan source, reparse generated text, or require C++-style iterative
+  parsing. Use declaration-before-use and explicit typed module interfaces where necessary;
+  mutually recursive definitions may be declared in an interface before their bodies. Keep the
+  verifier as an independent semantic pass over IR—security verification is not source parsing.
 - [ ] Generalize the managed JSON boundary into first-class typed records/maps. Both frontends now
   share immutable typed-map construction, key lookup/update, keys/length, serialization across the
   public runtime boundary, map-type unification, immutable heterogeneous record construction, and
@@ -216,9 +223,20 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   (never the legacy interpreters), returns structured `--json` output, and uses the ordinary
   capability broker; it currently creates only an isolated runtime. Do not add named-Brain script
   state until the Brain convergence gate is open.
-- [ ] Add package/import namespaces only after self-contained scripts and task/session/project/user
-  vocabulary lifetimes are reliable. Keep promotion to project/user/published vocabulary an
-  authority-bearing, reviewable operation.
+- [ ] Add real compilation modules after self-contained scripts and task/session/project/user
+  vocabulary lifetimes are reliable: typed namespaces, explicit imports/exports, immutable module
+  identities, and separately linkable interfaces/IR. Never implement imports as C-style textual
+  inclusion or source concatenation, and never make an import implicitly execute initialization
+  effects. Keep promotion to project/user/published vocabulary a separate authority-bearing,
+  reviewable operation.
+- [ ] Later, add deterministic decentralized dependency resolution. An import or module manifest
+  must identify a package source and exact version or immutable content hash; a checked-in lockfile
+  pins the complete transitive graph. Support local paths plus Git and HTTPS/content-addressed
+  sources so Finch does not require a centrally operated registry. A future registry may provide
+  discovery, metadata, mirrors, and caching, but is never the root of identity or authority.
+  Fetch/cache and verify packages before compilation; prevent dependency confusion, reject
+  undeclared mutable resolution, do not run ambient install scripts, and do not grant runtime
+  capabilities merely because a module was imported.
 - [ ] Adapt discovered MCP client tools into versioned namespaced typed VM bindings with schema
   validation, managed JSON fallback, parameter-bounded `mcp.call` capability grants, and normal
   suspension/resume; keep MCP transport lifecycle host-owned rather than a VM subagent protocol.

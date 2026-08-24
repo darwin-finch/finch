@@ -64,6 +64,35 @@ and auditable in one file. Bash, Python, and other external scripts remain valid
 artifacts* when they are the appropriate user-editable delivery format; Finch scripts do not
 remove that capability.
 
+### Single-pass parsing, modules, and packages
+
+Single-pass parsing is a hard language constraint. Each Lisp or Co-Forth module's source byte
+stream is lexed/read exactly once into span-carrying syntax or direct lowering events. Subsequent
+macro expansion, name resolution, type inference, optimization, linking, and independent IR
+verification operate on retained structured data; none may rescan the source or serialize code and
+reparse it. The independent verifier remains mandatory because it proves the produced IR rather
+than interpreting source a second time.
+
+The grammar and declaration rules must make that constraint practical. Definitions are visible
+after declaration, and forward or mutually recursive calls use explicit typed declarations from
+the same module or an imported module interface. Macros are bounded structured transformations,
+not context-sensitive token reinterpretation. A parser must never need to guess and revisit an
+earlier token after discovering a later declaration.
+
+Modules are compilation units, never textual includes. A module has an immutable identity, typed
+imports and exports, a namespace, a compiled interface, IR, source map, and content hash. Importing
+a module links its declared interface/IR; it does not paste source, execute ambient initialization,
+or confer capabilities. Self-contained model-authored scripts remain the default when an import
+would make an artifact harder to audit.
+
+Package retrieval is a separate later layer over modules. Dependency declarations identify a
+source locator and exact version or immutable content hash, and a checked-in lockfile fixes the
+complete transitive graph. Resolvers must support local paths and decentralized Git, HTTPS, and
+content-addressed sources; a future Finch or third-party registry may be a discovery index, mirror,
+or cache but must not be required infrastructure or the authority for package identity. Resolution
+verifies hashes and, when available, signatures/provenance before compilation, prevents dependency
+confusion, and never runs ambient install scripts or grants runtime authority.
+
 The repository now contains the first verified typed path: both frontends lower directly to typed
 IR, the typed runtime owns a `Vec<TypedValue>` stack, effects are resource-scoped capability
 requirements, diagnostics carry stable codes, and host execution is transactional. Ordinary
