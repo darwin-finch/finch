@@ -282,10 +282,11 @@ async fn exec_node(
     Ok(text_result)
 }
 
-/// Execute a compiled word natively — no LLM, no external processes.
-/// Words compile to Forth and run at CPU speed in the built-in interpreter.
+/// Execute a reviewed node without an LLM or external process. Both source
+/// syntaxes enter the shared typed runtime; the poset is a scheduling/review
+/// artifact and never selects the historical semiotic interpreter.
 async fn run_compiled(
-    _lang: &str,
+    lang: &str,
     code: &str,
     predecessor_results: &[String],
 ) -> anyhow::Result<String> {
@@ -299,6 +300,91 @@ async fn run_compiled(
             prelude.push(' ');
         }
     }
-    let full_code = format!("{}{}", prelude, code);
-    crate::coforth::Forth::run(&full_code)
+    let language = match lang {
+        "forth" => crate::programs::ProgramLanguage::Forth,
+        "lisp" => crate::programs::ProgramLanguage::Lisp,
+        other => anyhow::bail!("unsupported typed poset node language '{other}'"),
+    };
+    let source = if language == crate::programs::ProgramLanguage::Forth {
+        format!("{prelude}{code}")
+    } else {
+        code.to_string()
+    };
+    let runtime = crate::runtime::ProgramRuntime::new();
+    runtime.grant_typed_capability(crate::vm::CapabilityRequirement {
+        capability: crate::vm::CapabilityKind::SessionEmit,
+        selector: crate::vm::ResourceSelector::None,
+    })?;
+    let outcome = runtime
+        .submit_typed_only(crate::runtime::ProgramSubmission {
+            language,
+            source_id: Some("poset-node".into()),
+            source,
+            intent: "execute approved poset node".into(),
+            effect: crate::programs::ExecutionEffect::Unclassified,
+            declared_capabilities: Vec::new(),
+            manifest_generation: runtime.manifest_generation(),
+            expected_revision: Some(runtime.revision()),
+            budget: None,
+        })
+        .await?;
+    if outcome.status != crate::runtime::outcome::ExecutionStatus::Completed {
+        let detail = outcome
+            .vm_diagnostics
+            .first()
+            .map(ToString::to_string)
+            .or_else(|| outcome.diagnostics.first().cloned())
+            .unwrap_or_else(|| format!("typed poset node ended with {:?}", outcome.status));
+        anyhow::bail!(detail);
+    }
+    if !outcome.output.is_empty() {
+        return Ok(outcome.output.trim_end().to_string());
+    }
+    Ok(outcome
+        .values
+        .iter()
+        .map(display_program_value)
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+fn display_program_value(value: &crate::programs::ProgramValue) -> String {
+    use crate::programs::ProgramValue;
+    match value {
+        ProgramValue::Nil => "nil".into(),
+        ProgramValue::Bool(value) => value.to_string(),
+        ProgramValue::Int(value) => value.to_string(),
+        ProgramValue::Float(value) => value.to_string(),
+        ProgramValue::Symbol(value) | ProgramValue::String(value) => value.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| format!("{other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_compiled;
+
+    #[tokio::test]
+    async fn reviewed_forth_node_runs_in_typed_runtime_with_predecessor_values() {
+        assert_eq!(
+            run_compiled("forth", "2 *", &["21".into()])
+                .await
+                .unwrap(),
+            "42"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewed_lisp_node_runs_in_the_same_typed_runtime() {
+        assert_eq!(
+            run_compiled("lisp", "(+ 20 22)", &[]).await.unwrap(),
+            "42"
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewed_node_never_falls_back_to_legacy_forth() {
+        let error = run_compiled("forth", "2 3 + .", &[]).await.unwrap_err();
+        assert!(error.to_string().contains("unknown Co-Forth word '.'"));
+    }
 }

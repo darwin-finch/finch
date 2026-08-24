@@ -52,10 +52,10 @@ pub struct Node {
     pub author: NodeAuthor,
     /// Tool names this node is allowed to use during execution (empty = plain generation).
     pub tools: Vec<String>,
-    /// Compiled native code for this word (bash, python, etc.).
-    /// When set, execution runs this directly without calling the LLM.
+    /// Reviewed Finch source for this node. When set, execution enters the
+    /// shared typed runtime directly without calling the LLM.
     pub compiled_code: Option<String>,
-    /// Language of the compiled code: "bash", "python", etc.
+    /// Typed source language: `forth` or `lisp`.
     pub compiled_lang: Option<String>,
 }
 
