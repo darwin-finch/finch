@@ -378,12 +378,14 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   `declared_capabilities` is only a checked upper-bound assertion, and `ExecutionOutcome` reports
   only `typed_vm`. This is the completed one-semantic-runtime milestone; do not reintroduce a native
   evaluator as a compatibility fallback.
-- [ ] Finish legacy-runtime cleanup after migration evidence is acceptable. Project older persisted
-  `lisp_env` rows into the typed program registry and remove that obsolete table/API. Migrate or
-  retire the remaining legacy Co-Forth proof/library, grammar, channel, POSIX/IPC, and stack-console
-  call sites identified by `finch library audit-typed`; keep them explicitly quarantined from the
-  provider/runtime ABI until then. Remove compatibility aliases and duplicate entry points only
-  after their useful behavior has a typed equivalent and replayable conformance coverage.
+- [ ] Finish legacy-runtime deletion after migration evidence is acceptable. Public `: ... ;` and
+  `/forth` source execution now enter only `ProgramRuntime`, and the old dictionary undo shortcut is
+  gone. Project older persisted `lisp_env` rows into the typed program registry and remove that
+  obsolete table/API. Port useful proof/library behavior to typed words, then delete the remaining
+  semiotic Co-Forth grammar, channel, POSIX/IPC, peer-demo, and stack-console interpreter call sites
+  identified by `finch library audit-typed`. Until deletion, keep that implementation explicitly
+  internal to those named subsystems: it is not a supported language, compatibility runtime, or
+  fallback, and no new public aliases may enter it.
 - [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
   tests, concurrency tests, and provider conformance tests. Manual configured-cloud smoke checks on
   2026-08-23 successfully executed provider-emitted Lisp `say`, Lisp arithmetic, and Co-Forth
