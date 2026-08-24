@@ -437,7 +437,15 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   Markdown leakage, invented words, annotation needs, forward-reference/source-order patterns,
   inferred capability mismatches, language choice, and tokens per successful ProgramRun by
   provider/model. Keep the corpus immutable and versioned so syntax and prompt changes can be
-  compared rather than judged from interactive anecdotes.
+  compared rather than judged from interactive anecdotes. Opt-in capture is now implemented for
+  interactive, one-shot, and named-Brain provider responses: setting `FINCH_WIRE_CORPUS_PATH`
+  appends locked, source-hashed version-1 JSONL records for both first-pass and repair attempts,
+  separately from the source-free aggregate metrics. `finch wire-corpus audit <file> [--json]`
+  validates record hashes and compiles/verifies every retained Lisp/Co-Forth source without
+  creating a `ProgramRuntime` or executing effects. Still collect and freeze a representative
+  multi-provider corpus, retain exact provider/model rather than only an interactive profile name,
+  preserve the relevant vocabulary/module context for submissions that call promoted words, add
+  token/latency metadata, and publish the first reproducible report.
 
 ### Separate language/compiler research track — not a Brain convergence prerequisite
 
