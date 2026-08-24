@@ -1,8 +1,6 @@
 //! Atomic application-owned persistence for reducible typed VM state.
 
-use crate::runtime::{
-    ProgramRuntime, ProgramRuntimeArchive, ProgramRuntimeAuthorityState,
-};
+use crate::runtime::{ProgramRuntime, ProgramRuntimeArchive, ProgramRuntimeAuthorityState};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,6 +22,17 @@ struct StoredRuntimeAuthority {
     format_version: u32,
     authority_sha256: String,
     authority: ProgramRuntimeAuthorityState,
+}
+
+/// Version-1 authority payload before capability policy became explicit.
+/// Field order is part of the historical SHA-256 input and therefore must not
+/// be changed. This exists only to verify and migrate an already-written file.
+#[derive(Serialize)]
+struct LegacyRuntimeAuthority<'a> {
+    format_version: u32,
+    session_id: uuid::Uuid,
+    project_id: &'a str,
+    ledger: &'a crate::vm::CapabilityLedger,
 }
 
 /// Durable storage for one persistent [`ProgramRuntime`].
@@ -179,7 +188,13 @@ impl ProgramRuntimeAuthorityStore {
                     .with_context(|| format!("read runtime authority '{}'", self.path.display()))
             }
         };
-        let stored: StoredRuntimeAuthority = serde_json::from_slice(&bytes)
+        let raw: serde_json::Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decode runtime authority '{}'", self.path.display()))?;
+        let policy_was_present = raw
+            .get("authority")
+            .and_then(|authority| authority.get("policy"))
+            .is_some();
+        let stored: StoredRuntimeAuthority = serde_json::from_value(raw)
             .with_context(|| format!("decode runtime authority '{}'", self.path.display()))?;
         if stored.format_version != RUNTIME_AUTHORITY_FILE_VERSION {
             bail!(
@@ -191,7 +206,20 @@ impl ProgramRuntimeAuthorityStore {
         }
         let authority_bytes = serde_json::to_vec(&stored.authority)?;
         let actual = hex::encode(Sha256::digest(&authority_bytes));
-        if actual != stored.authority_sha256 {
+        let legacy_actual = (!policy_was_present)
+            .then(|| {
+                serde_json::to_vec(&LegacyRuntimeAuthority {
+                    format_version: stored.authority.format_version,
+                    session_id: stored.authority.session_id,
+                    project_id: &stored.authority.project_id,
+                    ledger: &stored.authority.ledger,
+                })
+            })
+            .transpose()?
+            .map(|bytes| hex::encode(Sha256::digest(&bytes)));
+        if actual != stored.authority_sha256
+            && legacy_actual.as_deref() != Some(stored.authority_sha256.as_str())
+        {
             bail!(
                 "runtime authority file '{}' failed its SHA-256 integrity check",
                 self.path.display()
@@ -397,6 +425,43 @@ mod tests {
             runtime.capability_session_id()
         );
         assert_eq!(restored.capability_ledger().unwrap(), state.ledger);
+    }
+
+    #[test]
+    fn authority_store_migrates_the_signed_pre_policy_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProgramRuntimeAuthorityStore::new(directory.path().join("authority.json"));
+        let runtime = ProgramRuntime::new();
+        runtime
+            .issue_typed_capability(
+                CapabilityRequirement {
+                    capability: CapabilityKind::ProcessRun,
+                    selector: ResourceSelector::None,
+                },
+                GrantScope::Global,
+                "test-user",
+                None,
+            )
+            .unwrap();
+        let state = runtime.authority_state().unwrap();
+        let legacy = LegacyRuntimeAuthority {
+            format_version: state.format_version,
+            session_id: state.session_id,
+            project_id: &state.project_id,
+            ledger: &state.ledger,
+        };
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        let stored = serde_json::json!({
+            "format_version": RUNTIME_AUTHORITY_FILE_VERSION,
+            "authority_sha256": hex::encode(Sha256::digest(&legacy_bytes)),
+            "authority": serde_json::from_slice::<serde_json::Value>(&legacy_bytes).unwrap(),
+        });
+        std::fs::write(store.path(), serde_json::to_vec(&stored).unwrap()).unwrap();
+
+        let restored = store.load_state().unwrap().expect("legacy authority");
+        assert_eq!(restored.policy.policy_hash, "finch-local-runtime-v1");
+        assert!(restored.policy.denied_capabilities.is_empty());
+        assert_eq!(restored.ledger, state.ledger);
     }
 
     #[test]

@@ -18,8 +18,8 @@ pub mod vocabulary;
 pub use capability::{
     ApprovalChoice, ApprovalPrompt, AuthorizationContext, AuthorizationDecision,
     CapabilityAuditAction, CapabilityAuditEntry, CapabilityAuthorizationAuditEntry,
-    CapabilityAvailability, CapabilityGrant, CapabilityLedger, CapabilityRequest, GrantScope,
-    GrantSet,
+    CapabilityAvailability, CapabilityGrant, CapabilityLedger, CapabilityPolicy,
+    CapabilityRequest, GrantScope, GrantSet,
 };
 pub use diagnostic::{
     DiagnosticPhase, Severity, SourceLanguage, SourceOrigin, SourceSpan, VmDiagnostic,

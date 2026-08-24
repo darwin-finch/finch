@@ -1,8 +1,38 @@
 use super::diagnostic::SourceOrigin;
-use super::effects::{CapabilityRequirement, FileSelector, ResourceSelector};
+use super::effects::{CapabilityKind, CapabilityRequirement, FileSelector, ResourceSelector};
 use super::types::TypedValue;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use uuid::Uuid;
+
+/// Host-owned approval policy. The hash identifies one immutable policy
+/// revision; changing it invalidates grants issued under an earlier revision.
+/// Initial policy denials are deliberately capability-wide because selector
+/// overlap is not total for every supported pattern language.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityPolicy {
+    pub policy_hash: String,
+    #[serde(default)]
+    pub denied_capabilities: BTreeSet<CapabilityKind>,
+}
+
+impl CapabilityPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.policy_hash.trim().is_empty() {
+            return Err("capability policy requires a non-empty hash".into());
+        }
+        if self.denied_capabilities.contains(&CapabilityKind::SessionEmit)
+            || self.denied_capabilities.contains(&CapabilityKind::VmRead)
+        {
+            return Err("intrinsic VM capabilities cannot be denied by host policy".into());
+        }
+        Ok(())
+    }
+
+    pub fn permits(&self, requirement: &CapabilityRequirement) -> bool {
+        !self.denied_capabilities.contains(&requirement.capability)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "scope", rename_all = "snake_case")]
@@ -480,6 +510,27 @@ mod tests {
             agent_ancestry: Vec::new(),
             program_hash: "program".into(),
         }
+    }
+
+    #[test]
+    fn policy_requires_an_identity_and_cannot_deny_intrinsic_vm_operations() {
+        let mut policy = CapabilityPolicy {
+            policy_hash: " ".into(),
+            denied_capabilities: BTreeSet::new(),
+        };
+        assert!(policy.validate().unwrap_err().contains("non-empty hash"));
+
+        policy.policy_hash = "policy-v2".into();
+        policy.denied_capabilities.insert(CapabilityKind::VmRead);
+        assert!(policy.validate().unwrap_err().contains("intrinsic"));
+
+        policy.denied_capabilities.clear();
+        policy.denied_capabilities.insert(CapabilityKind::FileWrite);
+        policy.validate().unwrap();
+        assert!(!policy.permits(&CapabilityRequirement {
+            capability: CapabilityKind::FileWrite,
+            selector: ResourceSelector::None,
+        }));
     }
 
     #[test]

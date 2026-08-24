@@ -945,6 +945,71 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn named_brain_persists_policy_changes_and_denials_without_a_vm_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let runtime = store.program_runtime("brain").unwrap();
+        let requirement = crate::vm::CapabilityRequirement {
+            capability: crate::vm::CapabilityKind::ProcessRun,
+            selector: crate::vm::ResourceSelector::None,
+        };
+        let grant_id = runtime
+            .issue_typed_capability(
+                requirement.clone(),
+                crate::vm::GrantScope::Session {
+                    session_id: runtime.capability_session_id(),
+                },
+                "test-user",
+                None,
+            )
+            .unwrap();
+        let mut denied = std::collections::BTreeSet::new();
+        denied.insert(crate::vm::CapabilityKind::ProcessRun);
+        assert_eq!(
+            runtime
+                .apply_capability_policy(
+                    crate::vm::CapabilityPolicy {
+                        policy_hash: "locked-policy-v2".into(),
+                        denied_capabilities: denied.clone(),
+                    },
+                    "policy-admin",
+                )
+                .unwrap(),
+            vec![grant_id]
+        );
+
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restored = restarted.program_runtime("brain").unwrap();
+        assert_eq!(
+            restored.capability_policy().unwrap(),
+            crate::vm::CapabilityPolicy {
+                policy_hash: "locked-policy-v2".into(),
+                denied_capabilities: denied,
+            }
+        );
+        assert!(restored
+            .capability_ledger()
+            .unwrap()
+            .grants
+            .grants
+            .iter()
+            .find(|grant| grant.id == grant_id)
+            .unwrap()
+            .revoked_at_unix_ms
+            .is_some());
+        assert!(restored
+            .issue_typed_capability(
+                requirement,
+                crate::vm::GrantScope::Global,
+                "test-user",
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("denied by policy"));
+    }
+
     #[tokio::test]
     async fn named_brain_persists_denial_without_a_vm_commit() {
         let temp = tempfile::tempdir().unwrap();

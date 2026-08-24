@@ -13,7 +13,7 @@ use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramValue};
 use crate::scheduling::{ScheduledTask, TaskQueue, TaskScheduler, TaskStatus};
 use crate::vm::{
     ApprovalChoice, ApprovalPrompt, AuthorizationContext, AuthorizationDecision,
-    CapabilityAvailability, CapabilityKind, CapabilityLedger, CapabilityRequest,
+    CapabilityAvailability, CapabilityKind, CapabilityLedger, CapabilityPolicy, CapabilityRequest,
     CapabilityRequirement, EffectSet, GrantScope,
     SourceOrigin, Type, TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint,
     TypedSuspension, TypedValue, VmDiagnostic, VmSideEffect,
@@ -37,6 +37,13 @@ use std::sync::{mpsc, Mutex, RwLock, Weak};
 use std::time::Instant;
 
 const LOCAL_CAPABILITY_POLICY_HASH: &str = "finch-local-runtime-v1";
+
+fn default_capability_policy() -> CapabilityPolicy {
+    CapabilityPolicy {
+        policy_hash: LOCAL_CAPABILITY_POLICY_HASH.into(),
+        denied_capabilities: Default::default(),
+    }
+}
 
 /// A portable VM event attached to its owning ProgramRun. The VM event itself
 /// remains embedder-neutral; the envelope provides the other half of its
@@ -281,6 +288,8 @@ pub struct ProgramRuntimeAuthorityState {
     pub format_version: u32,
     pub session_id: uuid::Uuid,
     pub project_id: String,
+    #[serde(default = "default_capability_policy")]
+    pub policy: CapabilityPolicy,
     pub ledger: CapabilityLedger,
 }
 
@@ -315,6 +324,7 @@ pub struct ProgramRuntime {
     /// checkpoints. Stable grant IDs and audit events can be persisted beside
     /// a Brain/session log, while only the active requirements enter a run.
     capability_ledger: Arc<Mutex<CapabilityLedger>>,
+    capability_policy: Arc<RwLock<CapabilityPolicy>>,
     authority_sink: Arc<RwLock<Option<ProgramRuntimeAuthoritySink>>>,
     schedule_queue: RwLock<Option<Arc<TaskQueue>>>,
     agent_scheduler: RwLock<Weak<scheduler::AgentScheduler>>,
@@ -564,6 +574,7 @@ impl ProgramRuntime {
             output_handles: Arc::new(Mutex::new(HashMap::new())),
             streams: Arc::new(Mutex::new(HashMap::new())),
             capability_ledger: Arc::new(Mutex::new(CapabilityLedger::default())),
+            capability_policy: Arc::new(RwLock::new(default_capability_policy())),
             authority_sink: Arc::new(RwLock::new(None)),
             schedule_queue: RwLock::new(None),
             agent_scheduler: RwLock::new(Weak::new()),
@@ -806,11 +817,18 @@ impl ProgramRuntime {
         actor: impl Into<String>,
         expires_at_unix_ms: Option<u64>,
     ) -> Result<uuid::Uuid> {
-        self.mutate_authority(|ledger| {
+        self.mutate_authority(|policy, ledger| {
+            if !policy.permits(&requirement) {
+                bail!(
+                    "capability {:?} is denied by policy {}",
+                    requirement.capability,
+                    policy.policy_hash
+                );
+            }
             ledger.issue(
                 requirement,
                 scope,
-                LOCAL_CAPABILITY_POLICY_HASH,
+                policy.policy_hash.clone(),
                 actor,
                 unix_time_ms(),
                 expires_at_unix_ms,
@@ -830,7 +848,7 @@ impl ProgramRuntime {
     /// Revoke one recorded grant by stable identity. Pending and future runs
     /// observe the rebuilt active set at their next verified boundary.
     pub fn revoke_typed_capability(&self, grant_id: uuid::Uuid) -> Result<bool> {
-        self.mutate_authority(|ledger| {
+        self.mutate_authority(|_, ledger| {
             Ok(ledger.revoke(grant_id, "local-user", unix_time_ms()))
         })
     }
@@ -844,12 +862,29 @@ impl ProgramRuntime {
     }
 
     pub fn authority_state(&self) -> Result<ProgramRuntimeAuthorityState> {
+        let policy = self
+            .capability_policy
+            .read()
+            .map_err(|_| anyhow::anyhow!("capability policy lock poisoned"))?;
+        let ledger = self
+            .capability_ledger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?;
         Ok(ProgramRuntimeAuthorityState {
             format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
             session_id: self.session_id,
             project_id: self.project_id.clone(),
-            ledger: self.capability_ledger()?,
+            policy: policy.clone(),
+            ledger: ledger.clone(),
         })
+    }
+
+    pub fn capability_policy(&self) -> Result<CapabilityPolicy> {
+        Ok(self
+            .capability_policy
+            .read()
+            .map_err(|_| anyhow::anyhow!("capability policy lock poisoned"))?
+            .clone())
     }
 
     /// Install application persistence for subsequent authority mutations.
@@ -876,25 +911,30 @@ impl ProgramRuntime {
     /// the previous in-memory ledger and active compact grants.
     fn mutate_authority<T>(
         &self,
-        mutation: impl FnOnce(&mut CapabilityLedger) -> Result<T>,
+        mutation: impl FnOnce(&CapabilityPolicy, &mut CapabilityLedger) -> Result<T>,
     ) -> Result<T> {
         let sink = self
             .authority_sink
             .read()
             .map_err(|_| anyhow::anyhow!("authority sink lock poisoned"))?
             .clone();
+        let policy = self
+            .capability_policy
+            .read()
+            .map_err(|_| anyhow::anyhow!("capability policy lock poisoned"))?;
         let (result, previous) = {
             let mut ledger = self
                 .capability_ledger
                 .lock()
                 .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?;
             let previous = ledger.clone();
-            let result = mutation(&mut ledger)?;
+            let result = mutation(&policy, &mut ledger)?;
             if let Some(sink) = &sink {
                 let state = ProgramRuntimeAuthorityState {
                     format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
                     session_id: self.session_id,
                     project_id: self.project_id.clone(),
+                    policy: policy.clone(),
                     ledger: ledger.clone(),
                 };
                 if let Err(error) = sink(state) {
@@ -904,6 +944,7 @@ impl ProgramRuntime {
             }
             (result, previous)
         };
+        drop(policy);
         if let Err(error) = self.refresh_active_grants() {
             if let Ok(mut ledger) = self.capability_ledger.lock() {
                 *ledger = previous.clone();
@@ -913,12 +954,102 @@ impl ProgramRuntime {
                     format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
                     session_id: self.session_id,
                     project_id: self.project_id.clone(),
+                    policy: self.capability_policy()?,
                     ledger: previous,
                 });
             }
             return Err(error);
         }
         Ok(result)
+    }
+
+    /// Replace the host-owned policy atomically with the corresponding grant
+    /// revocations. A changed policy hash invalidates every active grant from
+    /// the previous immutable policy revision. Reusing a revision identity
+    /// for different contents fails closed.
+    pub fn apply_capability_policy(
+        &self,
+        policy: CapabilityPolicy,
+        actor: impl Into<String>,
+    ) -> Result<Vec<uuid::Uuid>> {
+        policy.validate().map_err(anyhow::Error::msg)?;
+        let actor = actor.into();
+        let sink = self
+            .authority_sink
+            .read()
+            .map_err(|_| anyhow::anyhow!("authority sink lock poisoned"))?
+            .clone();
+        let mut current_policy = self
+            .capability_policy
+            .write()
+            .map_err(|_| anyhow::anyhow!("capability policy lock poisoned"))?;
+        let mut ledger = self
+            .capability_ledger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?;
+        let previous_policy = current_policy.clone();
+        let previous_ledger = ledger.clone();
+        if current_policy.policy_hash == policy.policy_hash {
+            if *current_policy == policy {
+                return Ok(Vec::new());
+            }
+            bail!(
+                "capability policy revision {} cannot be reused for different policy contents",
+                policy.policy_hash
+            );
+        }
+        let now = unix_time_ms();
+        let revoked = ledger
+            .grants
+            .grants
+            .iter()
+            .filter(|grant| {
+                grant.is_active(now)
+                    && (grant.policy_hash != policy.policy_hash
+                        || !policy.permits(&grant.requirement))
+            })
+            .map(|grant| grant.id)
+            .collect::<Vec<_>>();
+        for grant_id in &revoked {
+            let did_revoke = ledger.revoke(*grant_id, actor.clone(), now);
+            debug_assert!(did_revoke);
+        }
+        if let Some(sink) = &sink {
+            let state = ProgramRuntimeAuthorityState {
+                format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
+                session_id: self.session_id,
+                project_id: self.project_id.clone(),
+                policy: policy.clone(),
+                ledger: ledger.clone(),
+            };
+            if let Err(error) = sink(state) {
+                *ledger = previous_ledger;
+                return Err(error).context("persist ProgramRuntime capability policy");
+            }
+        }
+        *current_policy = policy;
+        drop(ledger);
+        drop(current_policy);
+
+        if let Err(error) = self.refresh_active_grants() {
+            if let Ok(mut current_policy) = self.capability_policy.write() {
+                *current_policy = previous_policy.clone();
+            }
+            if let Ok(mut ledger) = self.capability_ledger.lock() {
+                *ledger = previous_ledger.clone();
+            }
+            if let Some(sink) = sink {
+                let _ = sink(ProgramRuntimeAuthorityState {
+                    format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
+                    session_id: self.session_id,
+                    project_id: self.project_id.clone(),
+                    policy: previous_policy,
+                    ledger: previous_ledger,
+                });
+            }
+            return Err(error);
+        }
+        Ok(revoked)
     }
 
     /// Restore authority only before this runtime is shared with concurrent
@@ -938,14 +1069,23 @@ impl ProgramRuntime {
         if state.project_id.trim().is_empty() {
             bail!("ProgramRuntime authority state has no project identity");
         }
+        state.policy.validate().map_err(anyhow::Error::msg)?;
         let now = unix_time_ms();
         if state.ledger.grants.grants.iter().any(|grant| {
-            grant.is_active(now) && grant.policy_hash != LOCAL_CAPABILITY_POLICY_HASH
+            grant.is_active(now)
+                && (grant.policy_hash != state.policy.policy_hash
+                    || !state.policy.permits(&grant.requirement))
         }) {
-            bail!("ProgramRuntime authority state contains an active grant from another policy");
+            bail!(
+                "ProgramRuntime authority state contains an active grant from another policy or for a denied capability"
+            );
         }
         self.session_id = state.session_id;
         self.project_id = state.project_id;
+        *self
+            .capability_policy
+            .write()
+            .map_err(|_| anyhow::anyhow!("capability policy lock poisoned"))? = state.policy;
         *self
             .capability_ledger
             .lock()
@@ -955,6 +1095,15 @@ impl ProgramRuntime {
 
     /// Restore host-owned authority records independently of a VM checkpoint.
     pub fn restore_capability_ledger(&self, ledger: CapabilityLedger) -> Result<()> {
+        let policy = self.capability_policy()?;
+        let now = unix_time_ms();
+        if ledger.grants.grants.iter().any(|grant| {
+            grant.is_active(now)
+                && (grant.policy_hash != policy.policy_hash
+                    || !policy.permits(&grant.requirement))
+        }) {
+            bail!("capability ledger contains an active grant rejected by the current policy");
+        }
         *self
             .capability_ledger
             .lock()
@@ -964,6 +1113,7 @@ impl ProgramRuntime {
 
     fn refresh_active_grants(&self) -> Result<()> {
         let now = unix_time_ms();
+        let policy = self.capability_policy()?;
         let ledger = self
             .capability_ledger
             .lock()
@@ -975,7 +1125,7 @@ impl ProgramRuntime {
                 task_id: None,
                 session_id: self.session_id,
                 project_id: Some(self.project_id.clone()),
-                policy_hash: LOCAL_CAPABILITY_POLICY_HASH.into(),
+                policy_hash: policy.policy_hash,
             })
             .cloned()
             .fold(TypedRuntime::intrinsic_grants(), |grants, requirement| {
@@ -992,7 +1142,7 @@ impl ProgramRuntime {
         &self,
         caller: Option<&scheduler::AgentIdentity>,
     ) -> Result<EffectSet> {
-        let context = self.authorization_context_for(caller);
+        let context = self.authorization_context_for(caller)?;
         let ledger = self
             .capability_ledger
             .lock()
@@ -1035,14 +1185,14 @@ impl ProgramRuntime {
     fn authorization_context_for(
         &self,
         caller: Option<&scheduler::AgentIdentity>,
-    ) -> AuthorizationContext {
-        AuthorizationContext {
+    ) -> Result<AuthorizationContext> {
+        Ok(AuthorizationContext {
             now_unix_ms: unix_time_ms(),
             task_id: caller.map(|caller| caller.task_id),
             session_id: self.session_id,
             project_id: Some(self.project_id.clone()),
-            policy_hash: LOCAL_CAPABILITY_POLICY_HASH.into(),
-        }
+            policy_hash: self.capability_policy()?.policy_hash,
+        })
     }
 
     fn release_output_handles(&self, execution_id: uuid::Uuid) -> Result<()> {
@@ -1465,11 +1615,11 @@ impl ProgramRuntime {
                 .request
                 .effect_sequence
                 .ok_or_else(|| anyhow::anyhow!("a runtime approval requires an effect sequence"))?;
-            let context = self.authorization_context_for(pending.caller.as_ref());
+            let context = self.authorization_context_for(pending.caller.as_ref())?;
             let denied = matches!(&choice, ApprovalChoice::Deny);
 
             if denied {
-                self.mutate_authority(|ledger| {
+                self.mutate_authority(|_, ledger| {
                     ledger.deny(
                         &prompt.request,
                         "denied by user",
@@ -1524,18 +1674,27 @@ impl ProgramRuntime {
                     }
                     ApprovalChoice::AllowGlobal => (prompt.exact.clone(), GrantScope::Global),
                 };
-                self.mutate_authority(|ledger| {
+                self.mutate_authority(|policy, ledger| {
+                    if !policy.permits(&requirement) {
+                        bail!(
+                            "capability {:?} is denied by policy {}",
+                            requirement.capability,
+                            policy.policy_hash
+                        );
+                    }
+                    let mut current_context = context.clone();
+                    current_context.policy_hash = policy.policy_hash.clone();
                     ledger.issue(
                         requirement,
                         scope,
-                        LOCAL_CAPABILITY_POLICY_HASH,
+                        policy.policy_hash.clone(),
                         actor.clone(),
                         context.now_unix_ms,
                         None,
                     )
                     .map_err(anyhow::Error::msg)?;
                     if !matches!(
-                        ledger.grants.authorize(&prompt.request, &context),
+                        ledger.grants.authorize(&prompt.request, &current_context),
                         AuthorizationDecision::Allowed { .. }
                     ) {
                         bail!("new capability grant did not authorize its exact request");
@@ -2514,12 +2673,13 @@ impl ProgramRuntime {
         let execution_id = context.execution_id;
         let authorization = HostAuthorizationAudit {
             ledger: Arc::clone(&self.capability_ledger),
+            policy: Arc::clone(&self.capability_policy),
             sink: self
                 .authority_sink
                 .read()
                 .map_err(|_| anyhow::anyhow!("authority sink lock poisoned"))?
                 .clone(),
-            context: self.authorization_context_for(caller.as_ref()),
+            context: self.authorization_context_for(caller.as_ref())?,
             reason: intent.to_string(),
             program_hash: hash_program_source(&source),
             agent_ancestry: agent_ancestry(caller.as_ref()),
@@ -2597,12 +2757,13 @@ impl ProgramRuntime {
         let execution_id = pending.context.execution_id;
         let authorization = HostAuthorizationAudit {
             ledger: Arc::clone(&self.capability_ledger),
+            policy: Arc::clone(&self.capability_policy),
             sink: self
                 .authority_sink
                 .read()
                 .map_err(|_| anyhow::anyhow!("authority sink lock poisoned"))?
                 .clone(),
-            context: self.authorization_context_for(pending.caller.as_ref()),
+            context: self.authorization_context_for(pending.caller.as_ref())?,
             reason: pending.intent.clone(),
             program_hash: hash_program_source(&pending.source),
             agent_ancestry: agent_ancestry(pending.caller.as_ref()),
@@ -2672,6 +2833,7 @@ struct TypedHostHandler {
 
 struct HostAuthorizationAudit {
     ledger: Arc<Mutex<CapabilityLedger>>,
+    policy: Arc<RwLock<CapabilityPolicy>>,
     sink: Option<ProgramRuntimeAuthoritySink>,
     context: AuthorizationContext,
     reason: String,
@@ -2892,6 +3054,26 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
             agent_ancestry: self.authorization.agent_ancestry.clone(),
             program_hash: self.authorization.program_hash.clone(),
         };
+        let policy = self
+            .authorization
+            .policy
+            .read()
+            .map_err(|_| host_binding_error(&effect.origin, "capability policy lock poisoned"))?
+            .clone();
+        if !policy.permits(&effect.requirement) {
+            return Err(VmDiagnostic::error(
+                "E-CAP-006",
+                crate::vm::DiagnosticPhase::HostCall,
+                format!(
+                    "capability {:?} is denied by policy {}",
+                    effect.requirement.capability, policy.policy_hash
+                ),
+                Some(effect.origin.clone()),
+            ));
+        }
+        let mut context = self.authorization.context.clone();
+        context.now_unix_ms = unix_time_ms();
+        context.policy_hash = policy.policy_hash.clone();
         let mut ledger = self.authorization.ledger.lock().map_err(|_| {
             host_binding_error(&effect.origin, "capability ledger lock poisoned")
         })?;
@@ -2900,12 +3082,12 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         let decision = recorded.unwrap_or_else(|| {
             ledger.authorize(
                 &request,
-                &self.authorization.context,
+                &context,
                 "typed-host-boundary",
             )
         });
         if let (Some(previous), Some(sink)) = (previous, &self.authorization.sink) {
-            let Some(project_id) = self.authorization.context.project_id.clone() else {
+            let Some(project_id) = context.project_id.clone() else {
                 *ledger = previous;
                 return Err(host_binding_error(
                     &effect.origin,
@@ -2914,8 +3096,9 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
             };
             let state = ProgramRuntimeAuthorityState {
                 format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
-                session_id: self.authorization.context.session_id,
+                session_id: context.session_id,
                 project_id,
+                policy,
                 ledger: ledger.clone(),
             };
             if let Err(error) = sink(state) {
@@ -6248,6 +6431,138 @@ mod tests {
             .unwrap()
             .grants()
             .grants(&EffectSet::from_requirement(requirement)));
+    }
+
+    #[test]
+    fn policy_change_revokes_obsolete_and_denied_grants_and_blocks_reissue() {
+        let runtime = ProgramRuntime::new();
+        let file_read = CapabilityRequirement::file(
+            crate::vm::FileOperation::Read,
+            crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+        );
+        let process_run = CapabilityRequirement {
+            capability: CapabilityKind::ProcessRun,
+            selector: crate::vm::ResourceSelector::None,
+        };
+        let file_grant = runtime
+            .issue_typed_capability(file_read.clone(), GrantScope::Global, "test-user", None)
+            .unwrap();
+        let process_grant = runtime
+            .issue_typed_capability(process_run, GrantScope::Global, "test-user", None)
+            .unwrap();
+
+        let mut denied = std::collections::BTreeSet::new();
+        denied.insert(CapabilityKind::FileRead);
+        let revoked = runtime
+            .apply_capability_policy(
+                CapabilityPolicy {
+                    policy_hash: "finch-local-runtime-v2".into(),
+                    denied_capabilities: denied,
+                },
+                "policy-admin",
+            )
+            .unwrap();
+        assert_eq!(revoked, vec![file_grant, process_grant]);
+        let ledger = runtime.capability_ledger().unwrap();
+        assert!(ledger
+            .grants
+            .grants
+            .iter()
+            .find(|grant| grant.id == file_grant)
+            .unwrap()
+            .revoked_at_unix_ms
+            .is_some());
+        assert!(ledger
+            .grants
+            .grants
+            .iter()
+            .find(|grant| grant.id == process_grant)
+            .unwrap()
+            .revoked_at_unix_ms
+            .is_some());
+        assert!(runtime
+            .issue_typed_capability(file_read, GrantScope::Global, "test-user", None)
+            .unwrap_err()
+            .to_string()
+            .contains("denied by policy"));
+        assert!(runtime
+            .apply_capability_policy(
+                CapabilityPolicy {
+                    policy_hash: "finch-local-runtime-v2".into(),
+                    denied_capabilities: Default::default(),
+                },
+                "policy-admin",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be reused"));
+
+        let replacement_process_grant = runtime
+            .issue_typed_capability(
+                CapabilityRequirement {
+                    capability: CapabilityKind::ProcessRun,
+                    selector: crate::vm::ResourceSelector::None,
+                },
+                GrantScope::Global,
+                "test-user",
+                None,
+            )
+            .unwrap();
+        let revoked = runtime
+            .apply_capability_policy(
+                CapabilityPolicy {
+                    policy_hash: "finch-local-runtime-v3".into(),
+                    denied_capabilities: Default::default(),
+                },
+                "policy-admin",
+            )
+            .unwrap();
+        assert_eq!(revoked, vec![replacement_process_grant]);
+        assert_eq!(
+            runtime.capability_policy().unwrap().policy_hash,
+            "finch-local-runtime-v3"
+        );
+    }
+
+    #[test]
+    fn failed_authority_sink_rolls_back_policy_and_its_revocations() {
+        let runtime = ProgramRuntime::new();
+        let requirement = CapabilityRequirement {
+            capability: CapabilityKind::ProcessRun,
+            selector: crate::vm::ResourceSelector::None,
+        };
+        let grant_id = runtime
+            .issue_typed_capability(requirement, GrantScope::Global, "test-user", None)
+            .unwrap();
+        let previous_policy = runtime.capability_policy().unwrap();
+        let previous_ledger = runtime.capability_ledger().unwrap();
+        runtime
+            .set_authority_sink(Arc::new(|_| {
+                Err(anyhow::anyhow!("simulated policy storage failure"))
+            }))
+            .unwrap();
+
+        let error = runtime
+            .apply_capability_policy(
+                CapabilityPolicy {
+                    policy_hash: "finch-local-runtime-v2".into(),
+                    denied_capabilities: Default::default(),
+                },
+                "policy-admin",
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("simulated policy storage failure"));
+        assert_eq!(runtime.capability_policy().unwrap(), previous_policy);
+        assert_eq!(runtime.capability_ledger().unwrap(), previous_ledger);
+        assert!(runtime
+            .capability_ledger()
+            .unwrap()
+            .grants
+            .grants
+            .iter()
+            .find(|grant| grant.id == grant_id)
+            .unwrap()
+            .is_active(unix_time_ms()));
     }
 
     #[tokio::test]
