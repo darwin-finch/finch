@@ -1241,19 +1241,39 @@ fn fallback_vm_manifest() -> crate::programs::VmManifest {
 /// message, and all providers reject `tool_result` without a matching `tool_use`.
 ///
 /// When the orphaned turn is followed immediately by another assistant `tool_use`
-/// (the start of the next still-valid round-trip), a placeholder user message is
-/// inserted instead of cascading removal. Without this, removing the orphan and
-/// the following assistant would orphan the *next* tool_result, cascading all the
-/// way down to a 2-message floor that still starts with an orphaned tool_result.
+/// (the start of the next still-valid round-trip), the most recent dropped human
+/// request is restored as its user anchor instead of cascading removal. Without
+/// this, removing the orphan and following assistant would orphan the *next*
+/// tool_result; using a generic placeholder instead loses the task semantics.
 pub(crate) fn apply_sliding_window(
     msgs: Vec<crate::claude::Message>,
     max: usize,
 ) -> Vec<crate::claude::Message> {
-    let mut window = if max == 0 || msgs.len() <= max {
-        msgs
+    let keep_from = if max == 0 || msgs.len() <= max {
+        0
     } else {
-        msgs[msgs.len() - max..].to_vec()
+        msgs.len() - max
     };
+    // Tool-result continuations may consume the entire verbatim window. Keep
+    // the latest dropped human request available as their semantic anchor;
+    // replacing it with a generic "context omitted" user turn made providers
+    // reasonably conclude that no actual task had been supplied.
+    let boundary_request = msgs[..keep_from]
+        .iter()
+        .rev()
+        .find(|message| {
+            message.role == "user"
+                && message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()))
+                && !message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        })
+        .cloned();
+    let mut window = msgs[keep_from..].to_vec();
     // Ensure the window starts with a user message (API requirement).
     while window.len() > 2 && window.first().map(|m| m.role.as_str()) == Some("assistant") {
         window.remove(0);
@@ -1289,12 +1309,12 @@ pub(crate) fn apply_sliding_window(
         if window.first().map(|m| m.role.as_str()) == Some("assistant") {
             window.insert(
                 0,
-                crate::claude::Message {
+                boundary_request.clone().unwrap_or_else(|| crate::claude::Message {
                     role: "user".to_string(),
                     content: vec![ContentBlock::Text {
-                        text: "[earlier context omitted by sliding window]".to_string(),
+                        text: "[Internal context boundary: this is not a new user request. Continue the retained tool-call transcript and complete its existing request.]".to_string(),
                     }],
-                },
+                }),
             );
             break;
         }

@@ -9088,6 +9088,11 @@ mod tests {
             "orphaned tool_result must not be first: {:?}",
             result.first()
         );
+        assert_eq!(
+            result.first().unwrap().content[0].as_text(),
+            Some("query"),
+            "the dropped human request, not a synthetic placeholder, anchors retained tools"
+        );
         // Valid tool rounds (B and C) must be preserved.
         assert!(
             result.len() >= 4,
