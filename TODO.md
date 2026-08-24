@@ -29,13 +29,16 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   mutually recursive definitions may be declared in an interface before their bodies. Keep the
   verifier as an independent semantic pass over IR—security verification is not source parsing.
 - [ ] Put an explicit span-preserving AST boundary between both source readers and typed stack IR.
-  Formalize Lisp's existing `Val`/`SpannedVal` tree as its frontend AST, and replace Co-Forth's
-  token-to-IR lowering path with a structured Co-Forth AST for definitions, signatures, quotations,
-  control flow, literals, and calls. Parse each source stream once, then perform one post-order
-  semantic lowering into the shared IR; lower syntactic sugar and bounded macro rewrites over AST
-  nodes without serializing or reparsing source. Do not add a chain of incidental HIR passes: add a
-  shared HIR only if a concrete cross-frontend transformation cannot be expressed cleanly by shared
-  AST-to-IR lowering helpers. Preserve every original and expansion span through the final IR.
+  Formalize Lisp's existing `Val`/`SpannedVal` tree as its frontend AST. Co-Forth now tokenizes a
+  module once into a span-preserving `ForthModuleAst` containing definitions and retained body
+  atoms; definition and anonymous-quotation bodies lower from those retained nodes without source
+  copying, masking, or re-tokenization, and nested diagnostics retain original module coordinates.
+  Finish replacing the remaining flat body atoms with structured Co-Forth AST nodes for signatures,
+  quotations, control flow, literals, and calls. Then perform one post-order semantic lowering into
+  the shared IR; lower syntactic sugar and bounded macro rewrites over AST nodes without serializing
+  or reparsing source. Do not add a chain of incidental HIR passes: add a shared HIR only if a
+  concrete cross-frontend transformation cannot be expressed cleanly by shared AST-to-IR lowering
+  helpers. Preserve every original and expansion span through the final IR.
 - [ ] Generalize the managed JSON boundary into first-class typed records/maps. Both frontends now
   share immutable typed-map construction, key lookup/update, keys/length, serialization across the
   public runtime boundary, map-type unification, immutable heterogeneous record construction, and

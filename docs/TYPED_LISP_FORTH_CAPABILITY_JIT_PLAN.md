@@ -81,11 +81,14 @@ earlier token after discovering a later declaration.
 
 Single-pass parsing does not mean emitting final IR directly from lexer tokens. Each frontend must
 produce an explicit, span-preserving syntax tree in that one source pass. Lisp already has the
-beginnings of this boundary in `Val` and `SpannedVal`; Co-Forth must replace its predominantly
-token-to-IR compiler with structured nodes for definitions, signatures, quotations, control flow,
-literals, and calls. Syntactic sugar, macros, and other rewrites operate on those nodes, and one
-post-order semantic lowering emits the common typed stack IR. Generated syntax retains both its
-call-site and definition origin and is never converted to text and reparsed.
+beginnings of this boundary in `Val` and `SpannedVal`. Co-Forth now performs one tokenization into a
+span-preserving module tree whose definition, top-level, and anonymous-quotation bodies are retained
+and lowered against the original source; it no longer copies/masks and re-tokenizes those bodies.
+Its remaining flat body atoms must become structured nodes for signatures, quotations, control
+flow, literals, and calls before this gate closes. Syntactic sugar, macros, and other rewrites
+operate on those nodes, and one post-order semantic lowering emits the common typed stack IR.
+Generated syntax retains both its call-site and definition origin and is never converted to text
+and reparsed.
 
 Keep that pipeline deliberately short:
 
