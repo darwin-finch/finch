@@ -319,6 +319,14 @@ agent.await  forall T S. (S task<T> -- S result<T,agent-error>) ! {agent.await}
 yield        forall Y S. (S Y -- S) ! pure ; typed suspension; unit is a timeslice
 ```
 
+Here `pure` means that `yield` requires no host capability and performs no durable VM/external
+mutation; it does **not** mean that suspension is observationally invisible. Suspension belongs to
+the separately verified control contract (`yields<Y,Resume>`/`MaySuspend`) because it changes
+callability, scheduling, cancellation, and resumption rather than authority. Optimizers must treat
+it as a control barrier and may not reorder it as an ordinary total pure call. Keeping the two axes
+separate lets a pure producer suspend without falsely acquiring host authority, while introspection
+and diagnostics always display both `! pure` and its `yields<...>` contract together.
+
 The signature includes:
 
 - input and output stack rows;
