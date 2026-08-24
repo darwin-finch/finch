@@ -321,17 +321,19 @@ impl SharedBrainStore {
         {
             return Ok(runtime);
         }
-        let checkpoint_sha256 = self
+        let checkpoint = self
             .brains
             .read()
             .expect("shared brain lock poisoned")
             .get(name)
-            .and_then(|state| state.runtime_checkpoint.clone())
-            .map(|(_, checkpoint_sha256)| checkpoint_sha256);
-        let runtime = Arc::new(match checkpoint_sha256 {
-            Some(checkpoint_sha256) => crate::runtime::ProgramRuntime::from_checkpoint(
-                self.read_runtime_checkpoint(name, &checkpoint_sha256)?,
-            )?,
+            .and_then(|state| state.runtime_checkpoint.clone());
+        let runtime = Arc::new(match checkpoint {
+            Some((runtime_revision, checkpoint_sha256)) => {
+                crate::runtime::ProgramRuntime::from_checkpoint_at_revision(
+                    self.read_runtime_checkpoint(name, &checkpoint_sha256)?,
+                    runtime_revision,
+                )?
+            }
             None => crate::runtime::ProgramRuntime::new(),
         });
         let mut runtimes = self
@@ -666,6 +668,7 @@ mod tests {
             outcome.status,
             crate::runtime::outcome::ExecutionStatus::Completed
         );
+        let committed_revision = outcome.output_revision;
         let checkpoint = runtime
             .revision_history()
             .unwrap()
@@ -688,6 +691,7 @@ mod tests {
 
         let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = restarted.program_runtime("brain").unwrap();
+        assert_eq!(restored.revision(), committed_revision);
         let outcome = restored
             .submit_typed_only(crate::runtime::ProgramSubmission {
                 language: crate::programs::ProgramLanguage::Lisp,
@@ -707,6 +711,7 @@ mod tests {
             crate::runtime::outcome::ExecutionStatus::Completed
         );
         assert_eq!(outcome.values, vec![crate::programs::ProgramValue::Int(49)]);
+        assert_eq!(outcome.output_revision, committed_revision + 1);
     }
 
     #[tokio::test]
@@ -736,6 +741,7 @@ mod tests {
 
         let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = restarted.program_runtime("brain").unwrap();
+        assert_eq!(restored.revision(), second.output_revision);
         let values = restored
             .inspect()
             .await

@@ -385,6 +385,20 @@ impl ProgramRuntime {
     /// daemon/Brain event log is responsible for assigning durable revision
     /// identity and restoring host-owned resources or approvals around it.
     pub fn from_checkpoint(checkpoint: TypedRuntimeCheckpoint) -> Result<Self> {
+        Self::from_checkpoint_at_revision(checkpoint, 0)
+    }
+
+    /// Restore reducible state at a durable application-owned revision.
+    ///
+    /// The checkpoint deliberately contains no Brain identity or authority,
+    /// so an application that persists those separately must supply the exact
+    /// committed revision from its event journal. This keeps optimistic
+    /// concurrency monotonic across process restart without putting host
+    /// policy into the embedder-neutral VM checkpoint.
+    pub fn from_checkpoint_at_revision(
+        checkpoint: TypedRuntimeCheckpoint,
+        revision: u64,
+    ) -> Result<Self> {
         let typed_runtime = TypedRuntime::from_checkpoint(checkpoint.clone())
             .map_err(|diagnostics| anyhow::anyhow!(
                 "cannot restore typed runtime checkpoint: {}",
@@ -406,13 +420,14 @@ impl ProgramRuntime {
             .lock()
             .map_err(|_| anyhow::anyhow!("revision history lock poisoned"))? = vec![
             VmRevisionSnapshot {
-                revision: 0,
+                revision,
                 stack,
                 vocabulary,
                 checkpoint: Some(checkpoint),
                 checkpoint_diagnostic: None,
             },
         ];
+        runtime.revision.store(revision, Ordering::Release);
         Ok(runtime)
     }
 
