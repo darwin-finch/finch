@@ -386,7 +386,13 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   compiled web client/server uses typed connect/listen/accept/read/write/close effects and suspends
   through the same continuation ABI; ordinary Finch code never receives or forges a raw descriptor.
   Deliberate low-level descriptor/FFI work remains an unsafe native extension with a separately
-  declared capability and ABI, not an implicit privilege of AOT compilation.
+  declared capability and ABI, not an implicit privilege of AOT compilation. Define the linked
+  scheduler as a replaceable reactor interface: Finch-owned service loops and host-owned Cocoa,
+  Win32, GTK, game, or C loops provide the same timer/readiness/wakeup contract, and native callbacks
+  enqueue typed resumptions rather than re-entering VM frames. Add versioned typed C `extern`
+  declarations and generated interpreter/Cranelift shims with explicit layout, ownership, callback
+  lifetime, thread-affinity, and effect metadata; raw pointers, variadics, and unchecked descriptor
+  access require a distinct unsafe-FFI capability.
 - [ ] Freeze and test the Runtime/Application boundary: the embedder-neutral typed VM exposes only
   verified execution, diagnostics, capability requests, and idempotent side-effect/resume records;
   the Finch application supplies Brain, UI, approval, provider, MCP, scheduler, and OS adapters.
