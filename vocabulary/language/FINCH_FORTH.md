@@ -284,9 +284,12 @@ drop                    \ branch result; retain the cursor
 csv-close
 ```
 
-Agent words operate on persistent typed `task<string>` handles: `s" task" agent-spawn`,
+Agent words operate on persistent typed `task<agent-result>` handles: `s" task" agent-spawn`,
 `agent-poll`, `agent-await`, and `agent-cancel`. A handle can remain on the VM stack across later
-turns. Poll is nonblocking and returns serialized status; await returns the final message. The
+turns. Poll is nonblocking and returns a typed snapshot record with status, identity,
+task/role/model, depth, and completion fields. Await returns a typed result record containing
+status, identity, final message, diagnostics, turn/timing metadata, model, and depth. Programs can
+project those fields with `record-get` instead of parsing JSON or scraping text. The
 same structured spawn contract is available without a frontend special case:
 
 ```forth

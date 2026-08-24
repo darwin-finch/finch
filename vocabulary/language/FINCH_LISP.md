@@ -347,11 +347,14 @@ value on the shared stack.
 The handle is owned by its ProgramRun, survives that run's verified suspension/resumption, and is
 rejected if a different submission tries to reuse it.
 
-Agent coordination uses persistent typed `task<string>` handles: `(agent-spawn "task")`,
+Agent coordination uses persistent typed `task<agent-result>` handles: `(agent-spawn "task")`,
 `(agent-poll task)`, `(agent-await task)`, and `(agent-cancel task)`. A task value may remain in
 the VM across later turns; poll while work is running and await only when the final result is
-needed. Use `agent-spawn-with` when the child needs an explicit role, bounded parent-authored
-background, provider/model selection, or tighter budgets:
+needed. Poll returns a typed snapshot record with status, identity, task/role/model, depth, and a
+`complete` flag. Await returns a typed result record with status, identity, final message,
+diagnostics, turn/timing metadata, model, and depth. Use `record-get` to inspect those fields; no
+JSON or message parsing is required. Use `agent-spawn-with` when the child needs an explicit role,
+bounded parent-authored background, provider/model selection, or tighter budgets:
 
 ```lisp
 (agent-spawn-with {

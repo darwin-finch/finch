@@ -139,12 +139,16 @@ When desktop automation is enabled, the typed vocabulary exposes
 `automation-type`. These return serialized operation results as strings and remain capability- and
 availability-checked at the host boundary.
 
-Child-agent handles are opaque, persistent `task<string>` values: they carry a daemon task ID and
-their declared terminal type, not a process-local future. A handle may remain on the VM stack
-across later program turns. `agent-spawn` starts bounded work, `agent-poll` returns a nonblocking
-JSON snapshot, `agent-await` joins and returns the final message, and `agent-cancel` requests
-cancellation. `agent-spawn-with` accepts one exact typed record with `task`, `role`, `background`,
-`provider`, `model`, `max-turns`, `timeout-ms`, and `max-output-bytes` fields. Empty
+Child-agent handles are opaque, persistent `task<agent-result>` values: they carry a daemon task ID
+and their declared terminal type, not a process-local future. A handle may remain on the VM stack
+across later program turns. `agent-spawn` starts bounded work. `agent-poll` returns a nonblocking
+typed snapshot record with `task-id`, `agent-id`, `status`, `task`, `role`, `provider-model`,
+`depth`, and `complete`. `agent-await` joins and returns a typed result record with `task-id`,
+`agent-id`, `status`, `final-message`, `diagnostics`, `turns`, `elapsed-ms`, `provider-model`, and
+`depth`; programs never need to parse scheduler JSON or scrape a final-message string.
+`agent-cancel` requests cancellation. `agent-spawn-with` accepts one exact typed record with
+`task`, `role`, `background`, `provider`, `model`, `max-turns`, `timeout-ms`, and
+`max-output-bytes` fields. Empty
 background/provider/model strings mean no override; all budgets are positive and host-bounded.
 Provider/model names go through the scheduler's configured-profile resolver rather than capturing
 the frontend's current provider. Scheduler ancestry and ownership are checked for every operation.
