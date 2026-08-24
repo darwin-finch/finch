@@ -674,7 +674,8 @@ mod script_tests {
         ));
 
         let request = one_shot_wire_repair_request("Hello!", "E-LINK-002: unknown word");
-        assert!(request.contains("exactly one complete raw Finch Lisp or Co-Forth program"));
+        assert!(request.contains("It was forth; repair it as forth"));
+        assert!(request.contains("exactly one complete raw Finch forth program"));
         assert!(request.contains("Hello!"));
         assert!(request.contains("E-LINK-002"));
     }
@@ -2187,6 +2188,9 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
                 .first()
                 .cloned()
                 .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
+            if show_program {
+                eprintln!("→ rejected: {diagnostic}");
+            }
             // A correction is source-only.  Do not give it the tool manifest:
             // a malformed, effect-free response must not turn into a new
             // arbitrary host action merely because it is being repaired.
@@ -2205,6 +2209,9 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
         }
         Ok(outcome) => outcome,
         Err(error) if is_repairable_one_shot_wire_diagnostic(&error.to_string()) => {
+            if show_program {
+                eprintln!("→ rejected: {error}");
+            }
             let repair = client
                 .query_with_tools_with_system(
                     &one_shot_wire_repair_request(&response, &error.to_string()),
@@ -2290,6 +2297,9 @@ async fn run_query_teacher_only(
                     if !wire_repair_requested
                         && is_repairable_one_shot_wire_diagnostic(&error.to_string()) =>
                 {
+                    if show_program {
+                        eprintln!("→ rejected: {error}");
+                    }
                     messages.push(response.to_message());
                     messages.push(Message::user(one_shot_wire_repair_request(
                         &source,
@@ -2311,6 +2321,9 @@ async fn run_query_teacher_only(
                 .cloned()
                 .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
             if !wire_repair_requested && can_repair_one_shot_wire_outcome(&outcome) {
+                if show_program {
+                    eprintln!("→ rejected: {diagnostic}");
+                }
                 messages.push(response.to_message());
                 messages.push(Message::user(one_shot_wire_repair_request(
                     &source,

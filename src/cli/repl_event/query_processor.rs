@@ -1560,7 +1560,8 @@ mod tests {
         assert_eq!(repair[1].role, "assistant");
         assert_eq!(repair[1].content[0].as_text(), Some("Hello!"));
         let prompt = repair[2].content[0].as_text().unwrap();
-        assert!(prompt.contains("exactly one complete raw Finch Lisp or Co-Forth program"));
+        assert!(prompt.contains("It was forth; repair it as forth"));
+        assert!(prompt.contains("exactly one complete raw Finch forth program"));
         assert!(prompt.contains("Hello!"));
         assert!(prompt.contains("E-LINK-002"));
     }

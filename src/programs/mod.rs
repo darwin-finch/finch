@@ -42,9 +42,12 @@ pub fn is_repairable_wire_diagnostic(diagnostic: &str) -> bool {
 
 /// Construct the provider-neutral correction request for a rejected program.
 pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
+    let language = ProgramLanguage::infer_source(rejected_source).as_str();
     format!(
         "The preceding Finch VM wire program was rejected before execution. \
-         Re-emit exactly one complete raw Finch Lisp or Co-Forth program; do not use Markdown, prose, or tools.\n\n\
+         It was {language}; repair it as {language} and do not switch languages. \
+         Make the smallest source correction justified by the diagnostic. \
+         Re-emit exactly one complete raw Finch {language} program; do not use Markdown, prose, or tools.\n\n\
          Rejected source:\n---\n{rejected_source}\n---\n\
          Diagnostic:\n{diagnostic}"
     )
@@ -1398,7 +1401,12 @@ mod tests {
         ));
 
         let request = wire_repair_request("Hello!", "E-LINK-002: unknown word");
-        assert!(request.contains("exactly one complete raw Finch Lisp or Co-Forth program"));
+        assert!(request.contains("It was forth; repair it as forth"));
+        assert!(request.contains("exactly one complete raw Finch forth program"));
         assert!(request.contains("Hello!"));
+
+        let lisp = wire_repair_request("(say message)", "E-NAME-001: unbound name");
+        assert!(lisp.contains("It was lisp; repair it as lisp"));
+        assert!(lisp.contains("smallest source correction"));
     }
 }
