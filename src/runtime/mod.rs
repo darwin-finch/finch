@@ -1417,6 +1417,7 @@ impl ProgramRuntime {
                     &pending.source,
                     &pending.intent,
                     suspension.as_ref(),
+                    pending.caller.as_ref(),
                 ),
                 inferred_capabilities: inferred_capabilities.clone(),
                 required_capabilities: requirements,
@@ -1940,6 +1941,7 @@ impl ProgramRuntime {
                     &submission.source,
                     &submission.intent,
                     suspension.as_ref(),
+                    caller.as_ref(),
                 ),
                 inferred_capabilities: inferred_capabilities.clone(),
                 required_capabilities: requirements,
@@ -3727,38 +3729,67 @@ fn approval_prompts(
     source: &str,
     intent: &str,
     suspension: Option<&TypedSuspension>,
+    caller: Option<&scheduler::AgentIdentity>,
 ) -> Vec<ApprovalPrompt> {
     let mut hasher = DefaultHasher::new();
     source.hash(&mut hasher);
     let program_hash = format!("{:016x}", hasher.finish());
+    let agent_ancestry = caller.map_or_else(Vec::new, |caller| {
+        let mut ancestry = vec![caller.root_agent_id];
+        if let Some(parent) = caller.parent_agent_id {
+            if !ancestry.contains(&parent) {
+                ancestry.push(parent);
+            }
+        }
+        if !ancestry.contains(&caller.agent_id) {
+            ancestry.push(caller.agent_id);
+        }
+        ancestry
+    });
     if let Some(call) = suspension.and_then(|suspension| suspension.pending_host_call.as_ref()) {
+        let effect_sequence = suspension
+            .and_then(|suspension| suspension.event_journal.last())
+            .map(|effect| effect.sequence);
+        let request_key = effect_sequence.map_or_else(
+            || {
+                format!(
+                    "runtime:{}",
+                    serde_json::to_string(&call.requirement)
+                        .expect("capability requirements are serializable")
+                )
+            },
+            |sequence| format!("effect:{sequence}"),
+        );
         return vec![ApprovalPrompt::for_request(CapabilityRequest {
-            id: uuid::Uuid::new_v4(),
+            id: uuid::Uuid::new_v5(&execution_id, request_key.as_bytes()),
             execution_id,
-            effect_sequence: suspension
-                .and_then(|suspension| suspension.event_journal.last())
-                .map(|effect| effect.sequence),
+            effect_sequence,
             reason: intent.to_string(),
             requirement: call.requirement.clone(),
             arguments: call.arguments.clone(),
             origin: call.origin.clone(),
-            agent_ancestry: Vec::new(),
+            agent_ancestry,
             program_hash,
         })];
     }
     requirements
         .iter()
-        .cloned()
-        .map(|requirement| {
+        .enumerate()
+        .map(|(index, requirement)| {
+            let request_key = format!(
+                "preflight:{index}:{}",
+                serde_json::to_string(requirement)
+                    .expect("capability requirements are serializable")
+            );
             ApprovalPrompt::for_request(CapabilityRequest {
-                id: uuid::Uuid::new_v4(),
+                id: uuid::Uuid::new_v5(&execution_id, request_key.as_bytes()),
                 execution_id,
                 effect_sequence: None,
                 reason: intent.to_string(),
-                requirement,
+                requirement: requirement.clone(),
                 arguments: Vec::new(),
                 origin: SourceOrigin::generated("capability-preflight"),
-                agent_ancestry: Vec::new(),
+                agent_ancestry: agent_ancestry.clone(),
                 program_hash: program_hash.clone(),
             })
         })
@@ -4291,6 +4322,58 @@ mod tests {
                 },
             ] if matches!(values.as_slice(), [TypedValue::Bytes(_)])
         ));
+    }
+
+    #[tokio::test]
+    async fn approval_requests_are_stable_and_preserve_agent_ancestry() {
+        let runtime = ProgramRuntime::new();
+        let root_agent_id = uuid::Uuid::new_v4();
+        let parent_agent_id = uuid::Uuid::new_v4();
+        let caller = scheduler::AgentIdentity {
+            agent_id: uuid::Uuid::new_v4(),
+            task_id: uuid::Uuid::new_v4(),
+            parent_agent_id: Some(parent_agent_id),
+            root_agent_id,
+            depth: 2,
+            provider_model: "test-provider".into(),
+            vm_revision: 0,
+            manifest_generation: runtime.manifest_generation(),
+        };
+        let request = submission(
+            ProgramLanguage::Lisp,
+            "(file-read (path \"Cargo.toml\"))",
+            ExecutionEffect::WorkspaceRead,
+        );
+        let pending = runtime
+            .submit_as(request, Some(caller.clone()))
+            .await
+            .unwrap();
+        let prompt = &pending.approval_prompts[0];
+        assert_eq!(
+            prompt.request.agent_ancestry,
+            vec![root_agent_id, parent_agent_id, caller.agent_id]
+        );
+
+        let stored = runtime
+            .pending_typed
+            .lock()
+            .unwrap()
+            .get(&pending.execution_id)
+            .cloned()
+            .unwrap();
+        let rendered_again = approval_prompts(
+            pending.execution_id,
+            &pending.required_capabilities,
+            &stored.source,
+            &stored.intent,
+            Some(&stored.suspension),
+            Some(&caller),
+        );
+        assert_eq!(rendered_again[0].request.id, prompt.request.id);
+        assert_eq!(
+            rendered_again[0].request.effect_sequence,
+            prompt.request.effect_sequence
+        );
     }
 
     #[tokio::test]
