@@ -397,6 +397,36 @@ fn compile_forth_body_with_locals(
                 token_index += 1;
                 continue;
             }
+            if let Some(arguments) = word
+                .strip_prefix("empty-map<")
+                .and_then(|value| value.strip_suffix('>'))
+            {
+                let map_type = format!("map<{arguments}>");
+                let Type::Map(key_type, value_type) =
+                    super::lisp::parse_type_name(&map_type).map_err(|_| {
+                        vec![control_error(
+                            "E-MAP-005",
+                            "empty-map requires two valid type arguments, for example empty-map<string,int>",
+                            origin.clone(),
+                        )]
+                    })?
+                else {
+                    unreachable!("map spelling always parses as a map type");
+                };
+                stack.push(Type::Map(key_type.clone(), value_type.clone()));
+                emit(
+                    &mut blocks,
+                    current,
+                    Instruction::MakeMap {
+                        key_type: *key_type,
+                        value_type: *value_type,
+                        count: 0,
+                    },
+                    origin,
+                );
+                token_index += 1;
+                continue;
+            }
             match word.as_str() {
                 "map{" => {
                     map_literals.push(MapLiteralFrame {
@@ -2600,6 +2630,22 @@ mod tests {
         let module = compile_forth(
             "input.forth",
             "map{ s\" answer\" 42 s\" other\" 7 }map s\" answer\" map-get unwrap",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .unwrap();
+        assert_eq!(stack, vec![TypedValue::Int(42)]);
+    }
+
+    #[test]
+    fn constructs_an_explicitly_typed_empty_map() {
+        let module = compile_forth(
+            "input.forth",
+            "empty-map<string,int> s\" answer\" 42 map-set s\" answer\" map-get unwrap",
             Vec::new(),
             &core_vocabulary(),
         )

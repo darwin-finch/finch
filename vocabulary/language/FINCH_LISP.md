@@ -257,7 +257,8 @@ Typed maps are immutable shared-language collections, separate from JSON. Constr
 alternating key/value forms: `(map "answer" 42 "other" 7)`. All keys must share one type and all
 values must share one type. `(map-get table key)` returns `option<V>`; `(map-set table key value)`
 returns a replacement map; `(map-keys table)` returns `list<K>`; and `(map-length table)` returns
-an integer. Later duplicate keys replace the earlier value:
+an integer. Start an incrementally built map with `(empty-map key-type value-type)`. Later duplicate
+keys replace the earlier value:
 
 ```lisp
 (unwrap (map-get (map-set (map "answer" 42) "answer" 99) "answer"))

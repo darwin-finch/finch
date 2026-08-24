@@ -792,6 +792,7 @@ impl Compiler<'_> {
             "task-cancel" => self.compile_cpu_task_cancel(&items[1..], builder),
             "list" => self.compile_list_value(&items[1..], builder),
             "map" => self.compile_map_value(&items[1..], builder),
+            "empty-map" => self.compile_empty_map(&items[1..], builder),
             _ if builder.resolve(operator).is_some() => {
                 self.compile_closure_call(&items[0], &items[1..], builder)
             }
@@ -1026,6 +1027,34 @@ impl Compiler<'_> {
                 count: (expressions.len() / 2) as u32,
             },
             self.origin("map"),
+        );
+        Ok(Type::Map(Box::new(key_type), Box::new(value_type)))
+    }
+
+    fn compile_empty_map(
+        &mut self,
+        expressions: &[Val],
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let [Val::Symbol(key), Val::Symbol(value)] = expressions else {
+            return Err(vec![self.error(
+                "E-MAP-005",
+                "empty-map requires key and value type names, for example (empty-map string int)",
+            )]);
+        };
+        let key_type = parse_type_name(key).map_err(|_| {
+            vec![self.error("E-MAP-005", format!("unknown map key type '{key}'"))]
+        })?;
+        let value_type = parse_type_name(value).map_err(|_| {
+            vec![self.error("E-MAP-005", format!("unknown map value type '{value}'"))]
+        })?;
+        builder.emit(
+            Instruction::MakeMap {
+                key_type: key_type.clone(),
+                value_type: value_type.clone(),
+                count: 0,
+            },
+            self.origin("empty-map"),
         );
         Ok(Type::Map(Box::new(key_type), Box::new(value_type)))
     }
@@ -2632,6 +2661,11 @@ mod tests {
         assert_eq!(
             run("(map-length (map \"a\" 1 \"a\" 2))").unwrap(),
             vec![TypedValue::Int(1)]
+        );
+        assert_eq!(
+            run("(unwrap (map-get (map-set (empty-map string int) \"answer\" 42) \"answer\"))")
+                .unwrap(),
+            vec![TypedValue::Int(42)]
         );
     }
 

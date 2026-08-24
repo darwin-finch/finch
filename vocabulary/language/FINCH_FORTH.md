@@ -253,7 +253,8 @@ string operations if it is needed.
 Typed maps are immutable shared-language collections. Co-Forth uses `map{` / `}map` around an
 even sequence of key/value expressions; the closing delimiter lowers the suffix directly to typed
 IR. `map-get` returns `option<V>`, `map-set` returns a replacement map, `map-keys` returns
-`list<K>`, and `map-length` returns an integer. Later duplicate keys replace earlier values:
+`list<K>`, and `map-length` returns an integer. Use `empty-map<K,V>` for an explicitly typed empty
+map. Later duplicate keys replace earlier values:
 
 ```forth
 map{ s" answer" 42 s" other" 7 }map
