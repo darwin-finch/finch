@@ -9,15 +9,11 @@ use capnp::capability::Promise;
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-use uuid::Uuid;
 
 use crate::claude::{ContentBlock, Message};
 use crate::generators::StreamChunk;
-use crate::ipc::schema::finch_ipc_capnp::{
-    self, finch_daemon, stream_receiver, BrainState as CapnpBrainState,
-};
+use crate::ipc::schema::finch_ipc_capnp::{self, finch_daemon, stream_receiver};
 use crate::ipc::transport::sock_path;
-use crate::server::{BrainDetail, BrainState, BrainSummary};
 use crate::tools::types::{ToolDefinition, ToolUse};
 
 // ---------------------------------------------------------------------------
@@ -114,140 +110,6 @@ impl IpcClient {
         });
 
         Ok(rx)
-    }
-
-    // -----------------------------------------------------------------------
-    // Brain management
-    // -----------------------------------------------------------------------
-
-    pub async fn spawn_brain(
-        &self,
-        task_description: &str,
-        provider: Option<&str>,
-    ) -> Result<Uuid> {
-        let mut req = self.client.spawn_brain_request();
-        req.get().set_task_description(task_description);
-        req.get().set_provider(provider.unwrap_or(""));
-        let reply = req.send().promise.await?;
-        let id_str = reply.get()?.get_id()?.to_str()?;
-        Uuid::parse_str(id_str).context("invalid UUID from daemon")
-    }
-
-    pub async fn list_brains(&self) -> Result<Vec<BrainSummary>> {
-        let req = self.client.list_brains_request();
-        let reply = req.send().promise.await?;
-        let list = reply.get()?.get_brains()?;
-        let mut out = Vec::with_capacity(list.len() as usize);
-        for s in list.iter() {
-            out.push(BrainSummary {
-                id: Uuid::parse_str(s.get_id()?.to_str()?)?,
-                name: s.get_name()?.to_str()?.to_string(),
-                task: s.get_task()?.to_str()?.to_string(),
-                state: brain_state_to_server(s.get_state()),
-                age_secs: s.get_age_secs(),
-            });
-        }
-        Ok(out)
-    }
-
-    pub async fn get_brain(&self, id: Uuid) -> Result<BrainDetail> {
-        use crate::server::{PendingPlanView, PendingQuestionView};
-
-        let mut req = self.client.get_brain_request();
-        req.get().set_id(id.to_string().as_str());
-        let reply = req.send().promise.await?;
-        let d = reply.get()?.get_details()?;
-
-        let question_str = d.get_question()?.to_str()?.to_string();
-        let plan_str = d.get_plan()?.to_str()?.to_string();
-
-        let pending_question = if question_str.is_empty() {
-            None
-        } else {
-            let options: Vec<String> = d
-                .get_question_options()?
-                .iter()
-                .map(|s| {
-                    s.and_then(|s| {
-                        s.to_str()
-                            .map(|s| s.to_string())
-                            .map_err(|e| capnp::Error::failed(e.to_string()))
-                    })
-                    .unwrap_or_default()
-                })
-                .collect();
-            Some(PendingQuestionView {
-                question: question_str,
-                options,
-            })
-        };
-
-        let pending_plan = if plan_str.is_empty() {
-            None
-        } else {
-            Some(PendingPlanView { plan: plan_str })
-        };
-
-        let event_log: Vec<String> = d
-            .get_event_log()?
-            .iter()
-            .map(|s| {
-                s.and_then(|s| {
-                    s.to_str()
-                        .map(|s| s.to_string())
-                        .map_err(|e| capnp::Error::failed(e.to_string()))
-                })
-                .unwrap_or_default()
-            })
-            .collect();
-
-        let result_str = d.get_result()?.to_str()?.to_string();
-        let final_summary = if result_str.is_empty() {
-            None
-        } else {
-            Some(result_str)
-        };
-
-        Ok(BrainDetail {
-            id: Uuid::parse_str(d.get_id()?.to_str()?)?,
-            name: d.get_name()?.to_str()?.to_string(),
-            task: d.get_task()?.to_str()?.to_string(),
-            state: brain_state_to_server(d.get_state()),
-            age_secs: 0, // not tracked over IPC; caller uses fresh list for age
-            event_log,
-            pending_question,
-            pending_plan,
-            final_summary,
-        })
-    }
-
-    pub async fn answer_brain_question(&self, id: Uuid, answer: &str) -> Result<()> {
-        let mut req = self.client.answer_brain_question_request();
-        req.get().set_id(id.to_string().as_str());
-        req.get().set_answer(answer);
-        req.send().promise.await?;
-        Ok(())
-    }
-
-    pub async fn respond_to_brain_plan(
-        &self,
-        id: Uuid,
-        approved: bool,
-        instruction: Option<&str>,
-    ) -> Result<()> {
-        let mut req = self.client.respond_to_brain_plan_request();
-        req.get().set_id(id.to_string().as_str());
-        req.get().set_approved(approved);
-        req.get().set_instruction(instruction.unwrap_or(""));
-        req.send().promise.await?;
-        Ok(())
-    }
-
-    pub async fn cancel_brain(&self, id: Uuid) -> Result<()> {
-        let mut req = self.client.cancel_brain_request();
-        req.get().set_id(id.to_string().as_str());
-        req.send().promise.await?;
-        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -516,16 +378,5 @@ mod tests {
             assert!(!version.is_empty(), "version string should be non-empty");
             println!("IPC ping OK — daemon version: {}", version);
         }));
-    }
-}
-
-fn brain_state_to_server(s: Result<CapnpBrainState, capnp::NotInSchema>) -> BrainState {
-    match s.unwrap_or(CapnpBrainState::Cancelled) {
-        CapnpBrainState::Running => BrainState::Running,
-        CapnpBrainState::WaitingForInput => BrainState::WaitingForInput,
-        CapnpBrainState::PlanReady => BrainState::PlanReady,
-        CapnpBrainState::Completed | CapnpBrainState::Failed | CapnpBrainState::Cancelled => {
-            BrainState::Dead
-        }
     }
 }

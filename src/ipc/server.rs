@@ -10,10 +10,9 @@ use capnp::capability::Promise;
 use capnp_rpc::{pry, rpc_twoparty_capnp, twoparty, RpcSystem};
 use tokio::net::UnixListener;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-use uuid::Uuid;
 
-use crate::ipc::schema::finch_ipc_capnp::{self, finch_daemon, BrainState as CapnpBrainState};
-use crate::server::{AgentServer, PlanResponse};
+use crate::ipc::schema::finch_ipc_capnp::{self, finch_daemon};
+use crate::server::AgentServer;
 
 // ---------------------------------------------------------------------------
 // Server implementation struct
@@ -267,192 +266,6 @@ impl finch_daemon::Server for FinchDaemonImpl {
         })
     }
 
-    // ---- brain management ------------------------------------------------
-
-    fn spawn_brain(
-        &mut self,
-        params: finch_daemon::SpawnBrainParams,
-        mut results: finch_daemon::SpawnBrainResults,
-    ) -> Promise<(), capnp::Error> {
-        use crate::brain::daemon_brain::run_daemon_brain_loop;
-
-        let p = pry!(params.get());
-        let task = pry!(p.get_task_description())
-            .to_str()
-            .unwrap_or("")
-            .to_string();
-        let provider_name = pry!(p.get_provider()).to_str().unwrap_or("").to_string();
-        let server = Arc::clone(&self.server);
-
-        Promise::from_future(async move {
-            let id = Uuid::new_v4();
-            let registry = Arc::clone(server.brain_registry());
-
-            let provider = server
-                .provider_for_name(if provider_name.is_empty() {
-                    None
-                } else {
-                    Some(&provider_name)
-                })
-                .cloned()
-                .ok_or_else(|| {
-                    capnp::Error::failed("No provider configured for daemon brains".into())
-                })?;
-
-            let cwd = std::env::current_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "~".to_string());
-
-            registry.insert(id, task.clone()).await;
-
-            let registry_clone = Arc::clone(&registry);
-            let task_clone = task.clone();
-            let cwd_clone = cwd.clone();
-            tokio::spawn(async move {
-                run_daemon_brain_loop(id, task_clone, registry_clone, provider, cwd_clone).await;
-            });
-
-            results.get().set_id(id.to_string().as_str());
-            Ok(())
-        })
-    }
-
-    fn list_brains(
-        &mut self,
-        _params: finch_daemon::ListBrainsParams,
-        mut results: finch_daemon::ListBrainsResults,
-    ) -> Promise<(), capnp::Error> {
-        let server = Arc::clone(&self.server);
-        Promise::from_future(async move {
-            let summaries = server.brain_registry().list_all().await;
-            let mut list = results.get().init_brains(summaries.len() as u32);
-            for (i, s) in summaries.iter().enumerate() {
-                let mut b = list.reborrow().get(i as u32);
-                b.set_id(s.id.to_string().as_str());
-                b.set_name(s.name.as_str());
-                b.set_task(s.task.as_str());
-                b.set_state(brain_state_from_server(&s.state));
-                b.set_age_secs(s.age_secs);
-            }
-            Ok(())
-        })
-    }
-
-    fn get_brain(
-        &mut self,
-        params: finch_daemon::GetBrainParams,
-        mut results: finch_daemon::GetBrainResults,
-    ) -> Promise<(), capnp::Error> {
-        let id_str = pry!(pry!(params.get()).get_id())
-            .to_str()
-            .unwrap_or("")
-            .to_string();
-        let id = pry!(Uuid::parse_str(&id_str).map_err(|e| capnp::Error::failed(e.to_string())));
-        let server = Arc::clone(&self.server);
-
-        Promise::from_future(async move {
-            let detail = server
-                .brain_registry()
-                .get_detail(id)
-                .await
-                .ok_or_else(|| capnp::Error::failed(format!("brain {} not found", id)))?;
-            let mut d = results.get().init_details();
-            d.set_id(detail.id.to_string().as_str());
-            d.set_name(detail.name.as_str());
-            d.set_task(detail.task.as_str());
-            d.set_state(brain_state_from_server(&detail.state));
-            if let Some(pq) = &detail.pending_question {
-                d.set_question(pq.question.as_str());
-                let mut ol = d.reborrow().init_question_options(pq.options.len() as u32);
-                for (i, o) in pq.options.iter().enumerate() {
-                    ol.set(i as u32, o.as_str());
-                }
-            }
-            if let Some(pp) = &detail.pending_plan {
-                d.set_plan(pp.plan.as_str());
-            }
-            if let Some(summary) = &detail.final_summary {
-                d.set_result(summary.as_str());
-            }
-            let logs = &detail.event_log;
-            let mut el = d.init_event_log(logs.len() as u32);
-            for (i, line) in logs.iter().enumerate() {
-                el.set(i as u32, line.as_str());
-            }
-            Ok(())
-        })
-    }
-
-    fn answer_brain_question(
-        &mut self,
-        params: finch_daemon::AnswerBrainQuestionParams,
-        _results: finch_daemon::AnswerBrainQuestionResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let id_str = pry!(p.get_id()).to_str().unwrap_or("").to_string();
-        let answer = pry!(p.get_answer()).to_str().unwrap_or("").to_string();
-        let id = pry!(Uuid::parse_str(&id_str).map_err(|e| capnp::Error::failed(e.to_string())));
-        let server = Arc::clone(&self.server);
-
-        Promise::from_future(async move {
-            server
-                .brain_registry()
-                .answer_question(id, answer)
-                .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))
-        })
-    }
-
-    fn respond_to_brain_plan(
-        &mut self,
-        params: finch_daemon::RespondToBrainPlanParams,
-        _results: finch_daemon::RespondToBrainPlanResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let id_str = pry!(p.get_id()).to_str().unwrap_or("").to_string();
-        let approved = p.get_approved();
-        let instruction = pry!(p.get_instruction()).to_str().unwrap_or("").to_string();
-        let id = pry!(Uuid::parse_str(&id_str).map_err(|e| capnp::Error::failed(e.to_string())));
-        let server = Arc::clone(&self.server);
-
-        Promise::from_future(async move {
-            let response = if approved {
-                if instruction.is_empty() {
-                    PlanResponse::Approve
-                } else {
-                    PlanResponse::ChangesRequested {
-                        feedback: instruction,
-                    }
-                }
-            } else {
-                PlanResponse::Reject
-            };
-            server
-                .brain_registry()
-                .respond_to_plan(id, response)
-                .await
-                .map_err(|e| capnp::Error::failed(e.to_string()))
-        })
-    }
-
-    fn cancel_brain(
-        &mut self,
-        params: finch_daemon::CancelBrainParams,
-        _results: finch_daemon::CancelBrainResults,
-    ) -> Promise<(), capnp::Error> {
-        let id_str = pry!(pry!(params.get()).get_id())
-            .to_str()
-            .unwrap_or("")
-            .to_string();
-        let id = pry!(Uuid::parse_str(&id_str).map_err(|e| capnp::Error::failed(e.to_string())));
-        let server = Arc::clone(&self.server);
-
-        Promise::from_future(async move {
-            server.brain_registry().cancel(id).await;
-            Ok(())
-        })
-    }
-
     // ---- Co-Forth --------------------------------------------------------
 
     fn eval_forth(
@@ -500,15 +313,6 @@ impl finch_daemon::Server for FinchDaemonImpl {
 // ---------------------------------------------------------------------------
 // Enum conversion helper
 // ---------------------------------------------------------------------------
-
-fn brain_state_from_server(s: &crate::server::BrainState) -> CapnpBrainState {
-    match s {
-        crate::server::BrainState::Running => CapnpBrainState::Running,
-        crate::server::BrainState::WaitingForInput => CapnpBrainState::WaitingForInput,
-        crate::server::BrainState::PlanReady => CapnpBrainState::PlanReady,
-        crate::server::BrainState::Dead => CapnpBrainState::Completed,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Accept loop — call this from daemon startup

@@ -81,40 +81,6 @@ struct UsageUpdate {
 }
 
 # ---------------------------------------------------------------------------
-# Brain sessions
-# ---------------------------------------------------------------------------
-
-enum BrainState {
-  running          @0;
-  waitingForInput  @1;
-  planReady        @2;
-  completed        @3;
-  failed           @4;
-  cancelled        @5;
-}
-
-struct BrainSummary {
-  id              @0 :Text;
-  name            @1 :Text;
-  task            @2 :Text;
-  state           @3 :BrainState;
-  ageSecs         @4 :UInt64;
-}
-
-struct BrainDetails {
-  id              @0 :Text;
-  name            @1 :Text;
-  task            @2 :Text;
-  state           @3 :BrainState;
-  question        @4 :Text;               # non-empty when waitingForInput
-  questionOptions @5 :List(Text);
-  plan            @6 :Text;               # non-empty when planReady
-  result          @7 :Text;               # non-empty when completed
-  errorMsg        @8 :Text;               # non-empty when failed
-  eventLog        @9 :List(Text);
-}
-
-# ---------------------------------------------------------------------------
 # Streaming callback capability
 # ---------------------------------------------------------------------------
 
@@ -162,21 +128,13 @@ interface FinchDaemon {
                   tools       :List(ToolDefinition),
                   receiver    :StreamReceiver) -> ();
 
-  # Brain session management.
-  spawnBrain           @2 (taskDescription :Text, provider :Text)  -> (id :Text);
-  listBrains           @3 ()                                        -> (brains :List(BrainSummary));
-  getBrain             @4 (id :Text)                                -> (details :BrainDetails);
-  answerBrainQuestion  @5 (id :Text, answer :Text)                  -> ();
-  respondToBrainPlan   @6 (id :Text, approved :Bool, instruction :Text) -> ();
-  cancelBrain          @7 (id :Text)                                -> ();
-
   # Health.
-  ping @8 () -> (version :Text);
+  ping @2 () -> (version :Text);
 
   # Co-Forth: send a program, get back the stack.
   # The request IS the sentence.  The response IS the result.
   # stack: all values, bottom to top.  Top is the "return value".
   # output: anything printed by . cr etc.
   # error: non-empty if evaluation failed.
-  evalForth @9 (program :Text) -> (stack :List(Int64), output :Text, error :Text);
+  evalForth @3 (program :Text) -> (stack :List(Int64), output :Text, error :Text);
 }

@@ -1,7 +1,6 @@
 // Shammah - Agent Server Module
 // HTTP daemon mode for multi-tenant agent serving
 
-pub mod brain_registry;
 mod feedback_handler;
 pub mod handlers;
 mod middleware;
@@ -11,10 +10,6 @@ mod session;
 pub mod session_registry;
 mod training_worker;
 
-pub use brain_registry::{
-    BrainDetail, BrainRegistry, BrainState, BrainSummary, PendingPlanView, PendingQuestionView,
-    PlanResponse,
-};
 pub use feedback_handler::{handle_feedback, handle_training_status};
 pub use handlers::{
     create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint,
@@ -103,8 +98,6 @@ pub struct AgentServer {
     training_rx: std::sync::Mutex<
         Option<tokio::sync::mpsc::UnboundedReceiver<crate::models::WeightedExample>>,
     >,
-    /// Brain registry — tracks all daemon brain sessions
-    brain_registry: Arc<BrainRegistry>,
     /// Authoritative event logs and program stacks for named shared brains.
     shared_brains: crate::brain::shared::SharedBrainStore,
     /// Runtime-rotatable password for remote named-brain access.
@@ -171,7 +164,6 @@ impl AgentServer {
             training_coordinator,
             training_tx: Arc::new(training_tx),
             training_rx: std::sync::Mutex::new(Some(training_rx)),
-            brain_registry: Arc::new(BrainRegistry::new()),
             shared_brains: crate::brain::shared::SharedBrainStore::new(machine),
             brain_password: Arc::new(RwLock::new(brain_password)),
         })
@@ -444,11 +436,6 @@ impl AgentServer {
     /// Get reference to training coordinator
     pub fn training_coordinator(&self) -> &Arc<TrainingCoordinator> {
         &self.training_coordinator
-    }
-
-    /// Get reference to brain registry
-    pub fn brain_registry(&self) -> &Arc<BrainRegistry> {
-        &self.brain_registry
     }
 
     /// Return the primary cloud provider (first in the configured list, if any).
