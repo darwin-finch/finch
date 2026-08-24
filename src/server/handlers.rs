@@ -394,6 +394,11 @@ async fn execute_named_brain_prompt(
     let provider = server
         .provider_for_name(None)
         .ok_or_else(|| anyhow::anyhow!("no LLM provider configured on the brain host"))?;
+    let mut wire_metric = crate::metrics::WireAdherenceMetric::first_pass(
+        provider.name(),
+        provider.default_model(),
+        "named_brain",
+    );
     let snapshot = server.shared_brains().snapshot(name)?;
     ensure_named_brain_environment(server, &snapshot)?;
     let system = format!(
@@ -454,19 +459,42 @@ async fn execute_named_brain_prompt(
             &source,
         )
         .await;
+        let output = execution.as_ref().ok().cloned();
         let diagnostic = execution.as_ref().err().map(ToString::to_string);
         let result = push_named_brain_result(server, name, program.seq, execution)?;
 
         let Some(diagnostic) = diagnostic else {
+            if output.as_deref().is_some_and(str::is_empty) {
+                wire_metric.first_pass_valid = false;
+                wire_metric.failure_class =
+                    Some(crate::metrics::WireFailureClass::MissingOutputEffect);
+                wire_metric.terminal_failure = true;
+            }
+            wire_metric.repaired_successfully = wire_metric.repair_attempted
+                && !wire_metric.terminal_failure;
+            if let Err(error) = server.metrics_logger().log_wire(&wire_metric) {
+                tracing::warn!("failed to record named-Brain wire adherence: {error}");
+            }
             return Ok(result);
         };
+        if wire_metric.first_pass_valid {
+            wire_metric.first_pass_valid = false;
+            wire_metric.failure_class =
+                Some(crate::programs::classify_wire_failure(&source, &diagnostic));
+            wire_metric.diagnostic_code = crate::programs::wire_diagnostic_code(&diagnostic);
+        }
         if attempt == 0 && crate::programs::is_repairable_wire_diagnostic(&diagnostic) {
+            wire_metric.repair_attempted = true;
             messages.push(Message::assistant(source.clone()));
             messages.push(Message::user(crate::programs::wire_repair_request(
                 &source,
                 &diagnostic,
             )));
             continue;
+        }
+        wire_metric.terminal_failure = true;
+        if let Err(error) = server.metrics_logger().log_wire(&wire_metric) {
+            tracing::warn!("failed to record named-Brain wire adherence: {error}");
         }
         return Ok(result);
     }
