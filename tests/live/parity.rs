@@ -211,6 +211,14 @@ async fn live_parity_finch_wire_programs() {
             "In one Finch program, create a producer fiber that yields integers 2 and 3 before returning integer 5, join it, and emit only its decimal terminal result.",
             "5",
         ),
+        (
+            "In one Finch program, use a typed while loop to increment an integer from 0 until it reaches 5, then emit only the decimal result.",
+            "5",
+        ),
+        (
+            "In one Finch program, construct a typed record with an integer field named `answer` equal to 42, project that field, and emit only the decimal result.",
+            "42",
+        ),
     ];
 
     for (name, provider) in providers {
