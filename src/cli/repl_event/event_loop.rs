@@ -911,6 +911,26 @@ struct DeferredProposal {
     source: String,
 }
 
+/// Exact approval continuation returned by a provider-native
+/// `submit_program` call. The application retains the prompt rather than
+/// asking the model to resubmit or broaden its source declaration.
+struct DeferredVmApproval {
+    prompt: crate::vm::ApprovalPrompt,
+}
+
+fn deferred_vm_approval_from_tool_result(
+    result: &anyhow::Result<String>,
+) -> Option<DeferredVmApproval> {
+    let content = result.as_ref().ok()?;
+    let outcome: crate::runtime::outcome::ExecutionOutcome = serde_json::from_str(content).ok()?;
+    if outcome.status != crate::runtime::outcome::ExecutionStatus::AuthorizationRequired {
+        return None;
+    }
+    Some(DeferredVmApproval {
+        prompt: outcome.approval_prompts.into_iter().next()?,
+    })
+}
+
 fn deferred_proposal_from_tool_result(
     result: &anyhow::Result<String>,
 ) -> Option<DeferredProposal> {
@@ -1032,6 +1052,39 @@ mod deferred_proposal_tests {
         assert_eq!(proposal.language, "python");
         assert_eq!(proposal.intent, "inspect artifact");
         assert_eq!(proposal.source, "print('ok')");
+    }
+
+    #[tokio::test]
+    async fn extracts_the_exact_submit_program_approval_prompt() {
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        let outcome = runtime
+            .submit_with_deferred_program_effects(
+                crate::runtime::ProgramSubmission {
+                    language: crate::programs::ProgramLanguage::Lisp,
+                    source_id: Some("approval-tool-test.lisp".into()),
+                    source: "(file-read (path \"Cargo.toml\"))".into(),
+                    intent: "read the manifest".into(),
+                    effect: crate::programs::ExecutionEffect::WorkspaceRead,
+                    declared_capabilities: Vec::new(),
+                    manifest_generation: runtime.manifest_generation(),
+                    expected_revision: None,
+                    budget: None,
+                },
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap();
+        let approval = deferred_vm_approval_from_tool_result(&Ok(
+            serde_json::to_string(&outcome).unwrap(),
+        ))
+        .expect("authorization-required tool outcome");
+
+        assert_eq!(approval.prompt.request.execution_id, outcome.execution_id);
+        assert_eq!(approval.prompt.request.effect_sequence, Some(0));
+        assert_eq!(
+            approval.prompt.exact.capability,
+            crate::vm::CapabilityKind::FileRead
+        );
     }
 
     #[tokio::test]
@@ -3511,6 +3564,12 @@ Rules:\n\
                         proposal.handle.sequence
                     ));
                     self.spawn_deferred_proposal(query_id, tool_id, proposal);
+                } else if let Some(approval) = deferred_vm_approval_from_tool_result(&result) {
+                    self.output_manager.write_status(format!(
+                        "VM capability request {} is awaiting approval",
+                        approval.prompt.request.id
+                    ));
+                    self.spawn_deferred_vm_approval(query_id, tool_id, approval);
                 } else {
                     self.handle_tool_result(query_id, tool_id, result).await?;
                 }
@@ -3974,6 +4033,48 @@ Rules:\n\
                 )
                 .await?;
                 let outcome = resume_deferred_proposal(runtime.as_ref(), &proposal, decision).await?;
+                Ok::<_, anyhow::Error>(serde_json::to_string(&outcome)?)
+            }
+            .await;
+            let _ = event_tx.send(ReplEvent::ToolResult {
+                query_id,
+                tool_id,
+                result,
+            });
+        });
+    }
+
+    /// Resolve a capability prompt emitted through provider-native
+    /// `submit_program`, then return the resumed outcome through the original
+    /// tool-result lifecycle. A later capability boundary naturally repeats
+    /// this process with its own prompt and sequence.
+    fn spawn_deferred_vm_approval(
+        &self,
+        query_id: Uuid,
+        tool_id: String,
+        approval: DeferredVmApproval,
+    ) {
+        let event_tx = self.event_tx.clone();
+        let runtime = Arc::clone(&self.program_runtime);
+        tokio::spawn(async move {
+            let result = async {
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                event_tx
+                    .send(ReplEvent::VmApprovalNeeded {
+                        prompt: approval.prompt.clone(),
+                        response_tx,
+                    })
+                    .map_err(|_| anyhow::anyhow!("VM approval UI is unavailable"))?;
+                let choice = response_rx
+                    .await
+                    .map_err(|_| anyhow::anyhow!("VM approval dialog was cancelled"))?;
+                let outcome = runtime
+                    .resolve_typed_approval(
+                        &approval.prompt,
+                        choice,
+                        "interactive-tool-user",
+                    )
+                    .await?;
                 Ok::<_, anyhow::Error>(serde_json::to_string(&outcome)?)
             }
             .await;
