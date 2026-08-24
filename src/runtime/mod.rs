@@ -4172,6 +4172,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn yielded_execution_resumes_by_exact_id_until_completion() {
+        let runtime = ProgramRuntime::new();
+        let first = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(begin (say \"one\") (yield) (say \"two\") (yield) (say \"three\"))",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status, ExecutionStatus::Suspended);
+        assert_eq!(first.output, "one");
+        assert!(matches!(
+            runtime
+                .pending_typed_execution(first.execution_id)
+                .unwrap()
+                .expect("first yield must persist its continuation")
+                .reason,
+            PendingTypedReason::Yielded
+        ));
+
+        let second = runtime
+            .resume_typed_execution(first.execution_id)
+            .await
+            .unwrap();
+        assert_eq!(second.status, ExecutionStatus::Suspended);
+        assert_eq!(second.execution_id, first.execution_id);
+        assert_eq!(second.output, "onetwo");
+        assert!(matches!(
+            runtime
+                .pending_typed_execution(first.execution_id)
+                .unwrap()
+                .expect("second yield must replace the saved continuation")
+                .reason,
+            PendingTypedReason::Yielded
+        ));
+
+        let complete = runtime
+            .resume_typed_execution(first.execution_id)
+            .await
+            .unwrap();
+        assert_eq!(complete.status, ExecutionStatus::Completed);
+        assert_eq!(complete.execution_id, first.execution_id);
+        assert_eq!(complete.output, "onetwothree");
+        assert_eq!(complete.output_chunks, ["one", "two", "three"]);
+        assert!(runtime
+            .pending_typed_execution(first.execution_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(runtime.revision(), first.input_revision + 1);
+    }
+
+    #[tokio::test]
     async fn typed_capability_request_does_not_mutate_or_fallback() {
         let runtime = ProgramRuntime::new();
         let outcome = runtime
