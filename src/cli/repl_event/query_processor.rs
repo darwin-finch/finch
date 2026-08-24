@@ -74,11 +74,12 @@ async fn execute_direct_wire_response(
 ) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
     let submission = direct_wire_submission(runtime, source)?;
     let projection = VmOutputProjection::new(output_manager, work_unit);
+    let effect_event_tx = event_tx.clone();
     let sink: crate::runtime::TypedEffectSink = Arc::new(move |envelope| {
         // The typed VM executes on a blocking worker. Projection belongs on
         // the event-loop task so shadow-buffer mutations and rendering remain
         // serialized with all other client events.
-        let _ = event_tx.send(ReplEvent::VmEffect {
+        let _ = effect_event_tx.send(ReplEvent::VmEffect {
             projection: projection.clone(),
             envelope,
         });
@@ -86,7 +87,37 @@ async fn execute_direct_wire_response(
     let outcome = runtime
         .submit_with_deferred_program_effects(submission, sink)
         .await?;
-    resume_interactive_yields(runtime, outcome).await
+    resume_interactive_boundaries(runtime, event_tx, outcome).await
+}
+
+/// Drive only application-owned interactive boundaries. Cooperative yields
+/// resume automatically; capability requests wait for a structured dialog
+/// choice and then resume the exact retained continuation. Source is never
+/// resubmitted, so approval cannot duplicate prior output or host effects.
+async fn resume_interactive_boundaries(
+    runtime: &crate::runtime::ProgramRuntime,
+    event_tx: mpsc::UnboundedSender<ReplEvent>,
+    mut outcome: crate::runtime::outcome::ExecutionOutcome,
+) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
+    loop {
+        outcome = resume_interactive_yields(runtime, outcome).await?;
+        let Some(prompt) = outcome.approval_prompts.first().cloned() else {
+            return Ok(outcome);
+        };
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        event_tx
+            .send(ReplEvent::VmApprovalNeeded {
+                prompt: prompt.clone(),
+                response_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("interactive VM approval UI is unavailable"))?;
+        let choice = response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("interactive VM approval dialog was cancelled"))?;
+        outcome = runtime
+            .resolve_typed_approval(&prompt, choice, "interactive-user")
+            .await?;
+    }
 }
 
 /// Cooperative `yield` is a scheduling boundary, not a request for the model
@@ -1578,6 +1609,58 @@ mod tests {
             .pending_typed_execution(complete.execution_id)
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn interactive_wire_approval_resumes_the_exact_saved_program() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let work_unit = output.start_work_unit("VM output");
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let execution = execute_direct_wire_response(
+            &runtime,
+            Arc::clone(&output),
+            work_unit,
+            event_tx,
+            "(file-read (path \"Cargo.toml\"))".to_string(),
+        );
+        tokio::pin!(execution);
+        loop {
+            tokio::select! {
+                result = &mut execution => {
+                    panic!("execution completed before requesting approval: {result:?}")
+                }
+                event = event_rx.recv() => match event.expect("interactive VM event") {
+                    ReplEvent::VmApprovalNeeded { prompt, response_tx } => {
+                        assert_eq!(prompt.exact.capability, crate::vm::CapabilityKind::FileRead);
+                        response_tx.send(crate::vm::ApprovalChoice::AllowOnce).unwrap();
+                        break;
+                    }
+                    ReplEvent::VmEffect { .. } => {}
+                    other => panic!("unexpected event while awaiting approval: {other:?}"),
+                }
+            }
+        }
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), execution)
+            .await
+            .expect("approved execution should resume")
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Completed
+        );
+        assert!(matches!(
+            outcome.values.as_slice(),
+            [crate::programs::ProgramValue::Bytes(bytes)] if !bytes.is_empty()
+        ));
+        assert!(runtime
+            .pending_typed_execution(outcome.execution_id)
+            .unwrap()
+            .is_none());
+        let ledger = runtime.capability_ledger().unwrap();
+        assert_eq!(ledger.grants.grants.len(), 1);
+        assert!(ledger.grants.grants[0].consumed_at_unix_ms.is_some());
     }
 
     #[test]

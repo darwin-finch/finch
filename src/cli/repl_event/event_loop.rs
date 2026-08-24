@@ -192,6 +192,13 @@ pub struct EventLoop {
     /// Pending tool approval requests (query_id -> (tool_use, response_tx))
     pending_approvals: PendingApprovalsMap,
 
+    /// Structured approval continuation for an exact typed-VM capability
+    /// request. The choices mirror the displayed rows by index.
+    pending_vm_approval: Option<(
+        tokio::sync::oneshot::Sender<crate::vm::ApprovalChoice>,
+        Vec<crate::vm::ApprovalChoice>,
+    )>,
+
     /// IPC client — Cap'n Proto channel to the daemon.
     /// Must live inside a tokio LocalSet (capnp-rpc !Send).
     ipc_client: Option<crate::ipc::IpcClient>,
@@ -1262,6 +1269,7 @@ impl EventLoop {
             active_query_id: Arc::new(RwLock::new(None)),
             pending_queries: std::collections::VecDeque::new(),
             pending_approvals: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            pending_vm_approval: None,
             ipc_client,
             mode,
             plan_content,
@@ -1693,6 +1701,7 @@ impl EventLoop {
                         ReplEvent::QueryFailed { .. } => "QueryFailed",
                         ReplEvent::ToolResult { .. } => "ToolResult",
                         ReplEvent::ToolApprovalNeeded { .. } => "ToolApprovalNeeded",
+                        ReplEvent::VmApprovalNeeded { .. } => "VmApprovalNeeded",
                         ReplEvent::OutputReady { .. } => "OutputReady",
                         ReplEvent::VmEffect { .. } => "VmEffect",
                         ReplEvent::TypedProgramComplete { .. } => "TypedProgramComplete",
@@ -1818,6 +1827,17 @@ impl EventLoop {
                                     tracing::debug!("[EVENT_LOOP] Brain action denied");
                                     let _ = action_tx.send(None);
                                 }
+                            } else if let Some((response_tx, choices)) =
+                                self.pending_vm_approval.take()
+                            {
+                                let choice = match dialog_result {
+                                    crate::cli::tui::DialogResult::Selected(index) => choices
+                                        .get(index)
+                                        .cloned()
+                                        .unwrap_or(crate::vm::ApprovalChoice::Deny),
+                                    _ => crate::vm::ApprovalChoice::Deny,
+                                };
+                                let _ = response_tx.send(choice);
                             } else {
                                 // Find which query this dialog was for (tool approval)
                                 let mut approvals = self.pending_approvals.write().await;
@@ -3499,6 +3519,13 @@ Rules:\n\
             } => {
                 self.handle_tool_approval_request(query_id, tool_use, response_tx)
                     .await?;
+            }
+
+            ReplEvent::VmApprovalNeeded {
+                prompt,
+                response_tx,
+            } => {
+                self.handle_vm_approval_request(prompt, response_tx).await?;
             }
 
             ReplEvent::OutputReady { message } => {
@@ -7696,6 +7723,76 @@ Rules:\n\
 
         tracing::debug!("[EVENT_LOOP] Tool approval dialog shown, waiting for user response");
 
+        Ok(())
+    }
+
+    /// Present one exact typed-VM capability request. Unlike legacy tool
+    /// approval, these choices become structured grant scopes and are checked
+    /// again against the retained ProgramRun before any authority is issued.
+    async fn handle_vm_approval_request(
+        &mut self,
+        prompt: crate::vm::ApprovalPrompt,
+        response_tx: tokio::sync::oneshot::Sender<crate::vm::ApprovalChoice>,
+    ) -> Result<()> {
+        use crate::cli::tui::{Dialog, DialogOption};
+
+        if self.pending_vm_approval.is_some() {
+            let _ = response_tx.send(crate::vm::ApprovalChoice::Deny);
+            self.output_manager.write_error(
+                "Denied a concurrent VM capability request while another approval dialog was active",
+            );
+            return Ok(());
+        }
+
+        let mut choices = vec![crate::vm::ApprovalChoice::AllowOnce];
+        let mut options = vec![DialogOption::with_description(
+            "Allow once",
+            "Resume only this exact pending effect",
+        )];
+        if !prompt.request.agent_ancestry.is_empty() {
+            choices.push(crate::vm::ApprovalChoice::AllowTask);
+            options.push(DialogOption::with_description(
+                "Allow for task",
+                "Reuse only within this child task",
+            ));
+        }
+        choices.push(crate::vm::ApprovalChoice::AllowSession);
+        options.push(DialogOption::with_description(
+            "Allow for session",
+            "Reuse in this resumable Finch session",
+        ));
+        choices.push(crate::vm::ApprovalChoice::AllowProjectExact);
+        options.push(DialogOption::with_description(
+            "Allow for project",
+            "Reuse this exact capability in the current project",
+        ));
+        if let Some(requirement) = prompt.suggested_patterns.first().cloned() {
+            choices.push(crate::vm::ApprovalChoice::AllowProjectPattern { requirement });
+            options.push(DialogOption::with_description(
+                "Allow project pattern",
+                "Reuse the displayed narrowed pattern in this project",
+            ));
+        }
+        choices.push(crate::vm::ApprovalChoice::Deny);
+        options.push(DialogOption::new("Deny"));
+
+        let exact = serde_json::to_string_pretty(&prompt.exact)
+            .unwrap_or_else(|_| format!("{:?}", prompt.exact));
+        let warning = if prompt.broad_scope_warning {
+            "\n\nWarning: this request covers a broad resource scope."
+        } else {
+            ""
+        };
+        let dialog = Dialog::select("Finch VM capability request", options).with_body(format!(
+            "Reason: {}\n\nRequired capability:\n{}{}",
+            prompt.request.reason, exact, warning
+        ));
+
+        self.pending_vm_approval = Some((response_tx, choices));
+        let mut tui = self.tui_renderer.lock().await;
+        tui.active_dialog = Some(dialog);
+        tui.pending_dialog_result = None;
+        tui.render()?;
         Ok(())
     }
 

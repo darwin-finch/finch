@@ -67,6 +67,14 @@ pub enum ReplEvent {
         response_tx: oneshot::Sender<ConfirmationResult>,
     },
 
+    /// A verified typed ProgramRun is suspended at one exact capability
+    /// boundary. The dialog returns a structured scope choice; the provider
+    /// source is never replayed after approval.
+    VmApprovalNeeded {
+        prompt: crate::vm::ApprovalPrompt,
+        response_tx: oneshot::Sender<crate::vm::ApprovalChoice>,
+    },
+
     /// Output is ready to display
     OutputReady {
         message: String,
