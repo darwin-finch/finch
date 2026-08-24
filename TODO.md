@@ -288,8 +288,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their
   own large-file loops: workspace tree metadata, bounded file hash, a bounded host-computed
   directory Merkle root, bounded host-computed CSV header/per-column summaries, workbook sheet-name
-  discovery, and typed workbook row cursors now exist; add bounded workbook range/column summaries.
-  Build security/integrity inspection from these explicit bounded facts
+  discovery, typed workbook row cursors, 10,000-cell rectangular workbook slices, and bounded
+  workbook header/per-column summaries now exist. Build security/integrity inspection from these
+  explicit bounded facts
   (inventory, metadata, hashes, rules/signatures, provenance), with any remediation remaining a
   separately authorized proposal/effect. Each contract must advertise result shape and byte/work
   bounds; bulk materialization into a model-visible value must remain explicit so the VM can prefer
