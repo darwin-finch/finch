@@ -26,7 +26,8 @@ pub use diagnostic::{
 };
 pub use effects::{
     CapabilityKind, CapabilityRequirement, EffectSet, FileOperation, FileSelector,
-    FileSelectorTemplate, FileSelectorTemplatePart, ResourceRoot, ResourceSelector, SelectorError,
+    FileSelectorTemplate, FileSelectorTemplatePart, McpSelectorTemplate, ResourceRoot,
+    ResourceSelector, SelectorError,
 };
 pub use interpreter::{
     HostSideEffect, UiOperation, UiProgress, VmContinuation, VmFrame, VmSideEffect, VmStep,

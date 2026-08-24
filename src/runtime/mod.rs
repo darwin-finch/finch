@@ -715,6 +715,7 @@ impl ProgramRuntime {
             | CapabilityKind::ProgramInvoke => CapabilityAvailability::Available,
             CapabilityKind::VmWrite
             | CapabilityKind::MemoryConsolidate
+            | CapabilityKind::McpCall
             | CapabilityKind::UnsafeMemory => CapabilityAvailability::Unsupported,
         }
     }

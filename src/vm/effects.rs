@@ -78,6 +78,10 @@ pub enum SelectorError {
     InvalidProgramTemplateArgument(usize),
     #[error("program selector template argument {0} exceeds its declared bound")]
     ProgramTemplateArgumentOutOfBounds(usize),
+    #[error("MCP selector template argument {0} is missing or has the wrong type")]
+    InvalidMcpTemplateArgument(usize),
+    #[error("MCP selector template argument {0} exceeds its declared bound")]
+    McpTemplateArgumentOutOfBounds(usize),
 }
 
 /// A deliberately small expression language for argument-dependent file
@@ -134,6 +138,23 @@ pub struct ProgramSelectorTemplate {
     pub language_argument: usize,
     #[serde(default)]
     pub allowed_languages: Vec<String>,
+}
+
+/// Argument-dependent MCP authority. Starting or maintaining an MCP server
+/// transport is host authority and is deliberately absent; this selector
+/// authorizes only one concrete tool call after its server/tool arguments are
+/// checked against the descriptor's upper bound.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct McpSelectorTemplate {
+    pub server_argument: usize,
+    pub tool_argument: usize,
+    /// Empty means any connected server. Dynamic namespaced bindings should
+    /// install the exact server whenever their descriptor is known.
+    #[serde(default)]
+    pub allowed_servers: Vec<String>,
+    /// Empty means any advertised tool on an allowed server.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
 }
 
 impl NetworkSelectorTemplate {
@@ -222,6 +243,41 @@ impl ProgramSelectorTemplate {
             ));
         }
         Ok(language)
+    }
+}
+
+impl McpSelectorTemplate {
+    pub fn instantiate(
+        &self,
+        arguments: &[super::types::TypedValue],
+    ) -> Result<(String, String), SelectorError> {
+        let Some(super::types::TypedValue::String(server)) =
+            arguments.get(self.server_argument)
+        else {
+            return Err(SelectorError::InvalidMcpTemplateArgument(
+                self.server_argument,
+            ));
+        };
+        if server.trim().is_empty()
+            || (!self.allowed_servers.is_empty() && !self.allowed_servers.contains(server))
+        {
+            return Err(SelectorError::McpTemplateArgumentOutOfBounds(
+                self.server_argument,
+            ));
+        }
+        let Some(super::types::TypedValue::String(tool)) = arguments.get(self.tool_argument) else {
+            return Err(SelectorError::InvalidMcpTemplateArgument(
+                self.tool_argument,
+            ));
+        };
+        if tool.trim().is_empty()
+            || (!self.allowed_tools.is_empty() && !self.allowed_tools.contains(tool))
+        {
+            return Err(SelectorError::McpTemplateArgumentOutOfBounds(
+                self.tool_argument,
+            ));
+        }
+        Ok((server.clone(), tool.clone()))
     }
 }
 
@@ -460,6 +516,7 @@ pub enum CapabilityKind {
     ScheduleRead,
     ScheduleManage,
     ProgramInvoke,
+    McpCall,
     UnsafeMemory,
 }
 
@@ -499,6 +556,13 @@ pub enum ResourceSelector {
     },
     ProgramTemplate {
         template: ProgramSelectorTemplate,
+    },
+    Mcp {
+        server: String,
+        tool: String,
+    },
+    McpTemplate {
+        template: McpSelectorTemplate,
     },
     Memory {
         tree: String,
@@ -669,6 +733,43 @@ impl CapabilityRequirement {
             (
                 ResourceSelector::ProgramTemplate { template: grant },
                 ResourceSelector::ProgramTemplate { template: request },
+            ) => grant == request,
+            (
+                ResourceSelector::Mcp {
+                    server: grant_server,
+                    tool: grant_tool,
+                },
+                ResourceSelector::Mcp {
+                    server: request_server,
+                    tool: request_tool,
+                },
+            ) => {
+                (grant_server == "*" || grant_server == request_server)
+                    && (grant_tool == "*" || grant_tool == request_tool)
+            }
+            (
+                ResourceSelector::Mcp {
+                    server: grant_server,
+                    tool: grant_tool,
+                },
+                ResourceSelector::McpTemplate { template },
+            ) => {
+                (grant_server == "*"
+                    || (!template.allowed_servers.is_empty()
+                        && template
+                            .allowed_servers
+                            .iter()
+                            .all(|server| server == grant_server)))
+                    && (grant_tool == "*"
+                        || (!template.allowed_tools.is_empty()
+                            && template
+                                .allowed_tools
+                                .iter()
+                                .all(|tool| tool == grant_tool)))
+            }
+            (
+                ResourceSelector::McpTemplate { template: grant },
+                ResourceSelector::McpTemplate { template: request },
             ) => grant == request,
             (
                 ResourceSelector::Memory {
@@ -918,6 +1019,59 @@ mod tests {
                 .unwrap_err(),
             SelectorError::ProgramTemplateArgumentOutOfBounds(0)
         );
+    }
+
+    #[test]
+    fn mcp_call_authority_is_concrete_at_the_tool_boundary() {
+        let template = McpSelectorTemplate {
+            server_argument: 0,
+            tool_argument: 1,
+            allowed_servers: vec!["github".into()],
+            allowed_tools: vec!["issue_get".into()],
+        };
+        let arguments = [
+            super::super::types::TypedValue::String("github".into()),
+            super::super::types::TypedValue::String("issue_get".into()),
+            super::super::types::TypedValue::Json(serde_json::json!({"number": 42})),
+        ];
+        assert_eq!(
+            template.instantiate(&arguments).unwrap(),
+            ("github".into(), "issue_get".into())
+        );
+        assert_eq!(
+            template
+                .instantiate(&[
+                    super::super::types::TypedValue::String("filesystem".into()),
+                    super::super::types::TypedValue::String("issue_get".into()),
+                ])
+                .unwrap_err(),
+            SelectorError::McpTemplateArgumentOutOfBounds(0)
+        );
+
+        let broad = CapabilityRequirement {
+            capability: CapabilityKind::McpCall,
+            selector: ResourceSelector::Mcp {
+                server: "github".into(),
+                tool: "*".into(),
+            },
+        };
+        let exact = CapabilityRequirement {
+            capability: CapabilityKind::McpCall,
+            selector: ResourceSelector::Mcp {
+                server: "github".into(),
+                tool: "issue_get".into(),
+            },
+        };
+        let other_server = CapabilityRequirement {
+            capability: CapabilityKind::McpCall,
+            selector: ResourceSelector::Mcp {
+                server: "filesystem".into(),
+                tool: "issue_get".into(),
+            },
+        };
+        assert!(broad.covers(&exact));
+        assert!(!exact.covers(&broad));
+        assert!(!broad.covers(&other_server));
     }
 
     #[test]

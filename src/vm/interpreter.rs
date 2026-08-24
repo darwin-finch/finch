@@ -1678,6 +1678,12 @@ fn instantiate_requirement(
                 languages: vec![language],
             }
         }
+        ResourceSelector::McpTemplate { template } => {
+            let (server, tool) = template.instantiate(arguments).map_err(|error| {
+                format!("capability selector could not be instantiated: {error}")
+            })?;
+            ResourceSelector::Mcp { server, tool }
+        }
         selector => {
             return Ok(CapabilityRequirement {
                 capability: requirement.capability.clone(),
