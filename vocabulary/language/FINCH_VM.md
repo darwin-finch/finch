@@ -143,7 +143,11 @@ Child-agent handles are opaque, persistent `task<string>` values: they carry a d
 their declared terminal type, not a process-local future. A handle may remain on the VM stack
 across later program turns. `agent-spawn` starts bounded work, `agent-poll` returns a nonblocking
 JSON snapshot, `agent-await` joins and returns the final message, and `agent-cancel` requests
-cancellation. Scheduler ancestry and ownership are checked for every operation.
+cancellation. `agent-spawn-with` accepts one exact typed record with `task`, `role`, `background`,
+`provider`, `model`, `max-turns`, `timeout-ms`, and `max-output-bytes` fields. Empty
+background/provider/model strings mean no override; all budgets are positive and host-bounded.
+Provider/model names go through the scheduler's configured-profile resolver rather than capturing
+the frontend's current provider. Scheduler ancestry and ownership are checked for every operation.
 
 Pure zero-argument closures may use `(defer :cpu (lambda () ...))` to run on Finch's bounded local
 worker pool. It returns `task<T>` with an explicit `cpu_fiber` owner kind; captured values are

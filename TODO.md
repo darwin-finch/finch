@@ -225,7 +225,12 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   without an explicit policy migrate to the original default without losing their checksum proof.
   Still complete the remaining host adapters and the approval/history UI for policy changes.
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
-  and agent fork/join/model selection through typed VM primitives.
+  and agent fork/join/model selection through typed VM primitives. `agent-spawn-with` now carries
+  one exact typed role/background/provider/model/budget record through both frontends into the
+  configured-profile resolver; unavailable models and invalid budgets fail before task creation.
+  Still replace serialized poll/final-message surfaces with structured agent results, add explicit
+  starting-context references/hashes and capability-subset requests, and audit remaining legacy
+  model-selection/tool entry points before closing this gate.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their
   own large-file loops: workspace tree metadata, bounded file hash, a bounded host-computed
   directory Merkle root, and bounded host-computed CSV header/per-column summaries now exist; add workbook

@@ -286,7 +286,25 @@ csv-close
 
 Agent words operate on persistent typed `task<string>` handles: `s" task" agent-spawn`,
 `agent-poll`, `agent-await`, and `agent-cancel`. A handle can remain on the VM stack across later
-turns. Poll is nonblocking and returns serialized status; await returns the final message.
+turns. Poll is nonblocking and returns serialized status; await returns the final message. The
+same structured spawn contract is available without a frontend special case:
+
+```forth
+{
+  task: "inspect recent failures"
+  role: "explore"
+  background: "focus on typed effects"
+  provider: ""
+  model: ""
+  max-turns: 4
+  timeout-ms: 60000
+  max-output-bytes: 65536
+} agent-spawn-with
+```
+
+Roles are `general`, `explore`, `research`, or `code`; empty background/provider/model strings mean
+no override. Budgets are positive and host-bounded, and unavailable explicit model selection fails
+before the scheduler creates a task.
 
 For CPU-bound pure closures, `['] zero-argument-word defer-cpu` starts a private worker and leaves
 `task<T>`. `task-poll` replaces it with `option<T>`; `task-join` replaces it with `T`, suspending

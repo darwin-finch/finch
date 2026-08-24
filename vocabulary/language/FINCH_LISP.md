@@ -350,7 +350,23 @@ rejected if a different submission tries to reuse it.
 Agent coordination uses persistent typed `task<string>` handles: `(agent-spawn "task")`,
 `(agent-poll task)`, `(agent-await task)`, and `(agent-cancel task)`. A task value may remain in
 the VM across later turns; poll while work is running and await only when the final result is
-needed.
+needed. Use `agent-spawn-with` when the child needs an explicit role, bounded parent-authored
+background, provider/model selection, or tighter budgets:
+
+```lisp
+(agent-spawn-with {
+  :task "inspect recent failures"
+  :role "explore"
+  :background "focus on typed effects"
+  :provider ""
+  :model ""
+  :max-turns 4
+  :timeout-ms 60000
+  :max-output-bytes 65536 })
+```
+
+Roles are `general`, `explore`, `research`, or `code`. Empty background/provider/model strings
+mean no override. An unavailable explicit provider/model fails before a child task is created.
 
 `(defer :cpu (lambda () expression))` starts a pure zero-argument closure on a bounded private CPU
 worker and returns `task<T>`. Captures are immutable snapshots, not references to the parent stack.
