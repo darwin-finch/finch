@@ -21,6 +21,7 @@ use automation::AutomationRequest;
 use context::{ExecutionBudget, ExecutionContext};
 use outcome::{ExecutionBackend, ExecutionOutcome, ExecutionStatus};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -2413,6 +2414,25 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         })?;
                         return Ok(vec![TypedValue::Int(size)]);
                     }
+                    Some("file-hash") => {
+                        if arguments.len() != 1 {
+                            return Err(host_binding_error(origin, "file-hash requires one path"));
+                        }
+                        let mut file = std::fs::File::open(path)
+                            .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                        let mut hasher = Sha256::new();
+                        let mut buffer = [0_u8; 64 * 1024];
+                        loop {
+                            let read = file
+                                .read(&mut buffer)
+                                .map_err(|error| host_binding_error(origin, error.to_string()))?;
+                            if read == 0 {
+                                break;
+                            }
+                            hasher.update(&buffer[..read]);
+                        }
+                        return Ok(vec![TypedValue::String(format!("{:x}", hasher.finalize()))]);
+                    }
                     Some("file-slice") => {
                         let [_, TypedValue::Int(offset), TypedValue::Int(length)] =
                             arguments.as_slice()
@@ -3855,6 +3875,40 @@ mod tests {
             completed.values,
             vec![ProgramValue::Bytes(b"[package]".to_vec())]
         );
+    }
+
+    #[tokio::test]
+    async fn typed_file_hash_returns_sha256_without_materializing_file_bytes() {
+        let runtime = ProgramRuntime::new();
+        let pending = runtime
+            .submit_typed_only(submission(
+                ProgramLanguage::Forth,
+                "s\"Cargo.toml\" path file-hash",
+                ExecutionEffect::WorkspaceRead,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
+        let sequence = pending.approval_prompts[0]
+            .request
+            .effect_sequence
+            .expect("file-hash must create a portable host request");
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("./**").unwrap(),
+            ))
+            .unwrap();
+        let outcome = runtime
+            .resume_typed_execution_for_effect(pending.execution_id, sequence)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        assert!(matches!(
+            outcome.values.as_slice(),
+            [ProgramValue::String(digest)]
+                if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        ));
     }
 
     #[tokio::test]

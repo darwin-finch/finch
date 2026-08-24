@@ -33,6 +33,7 @@ pub enum CoreHostBinding {
     SessionEmit,
     VmVocabulary,
     FileRead,
+    FileHash,
     FileSize,
     FileSlice,
     FileLinesOpen,
@@ -107,6 +108,7 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "path" => CoreWordDocumentation { summary: "Resolve text as a normalized workspace-relative path value. It cannot escape the workspace root.", lisp: "(path relative-text)", forth: "relative-text path", example: "(file-read (path \"src/main.rs\"))" },
         "host-path" => CoreWordDocumentation { summary: "Resolve text under the explicitly installed host-machine root. This identifies a host path but grants no authority by itself.", lisp: "(host-path text)", forth: "text host-path", example: "s\"/tmp/report.txt\" host-path" },
         "file-read" => CoreWordDocumentation { summary: "Read all bytes from an authorized workspace path. Prefer file-slice or cursor resources for large inputs.", lisp: "(file-read path)", forth: "path file-read", example: "(file-read (path \"Cargo.toml\"))" },
+        "file-hash" => CoreWordDocumentation { summary: "Compute an authorized file's SHA-256 digest as lowercase hexadecimal without exposing its contents to the VM or model context.", lisp: "(file-hash path)", forth: "path file-hash", example: "(file-hash (path \"data.csv\"))" },
         "file-slice" => CoreWordDocumentation { summary: "Read a bounded byte range from an authorized workspace path: offset and maximum byte count.", lisp: "(file-slice path offset length)", forth: "path offset length file-slice", example: "(file-slice (path \"data.csv\") 0 4096)" },
         "file-size" => CoreWordDocumentation { summary: "Return the byte length of an authorized workspace file without reading its contents.", lisp: "(file-size path)", forth: "path file-size", example: "(file-size (path \"data.csv\"))" },
         "file-lines-open" => CoreWordDocumentation { summary: "Open an authorized text-file stream<string>. The opaque stream owns no forgeable path authority.", lisp: "(file-lines-open path)", forth: "path file-lines-open", example: "(file-lines-open (path \"large.log\"))" },
@@ -394,6 +396,21 @@ fn core_signatures() -> Vocabulary {
                     FileSelector::parse("./**").expect("valid workspace root"),
                 )],
                 vec![Type::Bytes],
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileRead,
+                    selector: ResourceSelector::FileTemplate {
+                        template: path_template(),
+                    },
+                },
+            ),
+        ),
+        (
+            "file-hash".into(),
+            capability(
+                vec![Type::Path(
+                    FileSelector::parse("./**").expect("valid workspace root"),
+                )],
+                vec![Type::String],
                 CapabilityRequirement {
                     capability: CapabilityKind::FileRead,
                     selector: ResourceSelector::FileTemplate {
@@ -958,6 +975,7 @@ static CORE_WORD_REGISTRY: Lazy<BTreeMap<String, CoreWordSpec>> = Lazy::new(|| {
                 "say" | "emit" => CoreWordImplementation::HostEffect(CoreHostBinding::SessionEmit),
                 "vm-vocabulary" => CoreWordImplementation::HostEffect(CoreHostBinding::VmVocabulary),
                 "file-read" | "host-file-read" => CoreWordImplementation::HostEffect(CoreHostBinding::FileRead),
+                "file-hash" => CoreWordImplementation::HostEffect(CoreHostBinding::FileHash),
                 "file-size" => CoreWordImplementation::HostEffect(CoreHostBinding::FileSize),
                 "file-slice" => CoreWordImplementation::HostEffect(CoreHostBinding::FileSlice),
                 "file-lines-open" => CoreWordImplementation::HostEffect(CoreHostBinding::FileLinesOpen),

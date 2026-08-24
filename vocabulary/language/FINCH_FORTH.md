@@ -188,6 +188,9 @@ range (currently capped at 8 MiB per call) and returns `bytes`; EOF simply retur
 slice. Maintain an explicit byte offset in a local and decode/process each slice before requesting
 the next.
 
+`path file-hash` computes a lowercase SHA-256 digest without putting the file's bytes on the VM
+stack. Use it for exact comparison or as a leaf value in a higher-level tree/Merkle operation.
+
 `host-path` is a separate, host-issued root type, never an absolute-path bypass. If the host has
 explicitly installed `root<host-machine>` and the user has approved a matching selector, use
 `s" var/log/system.log" host-path host-file-read`. Workspace `file-read` and `file-write` reject
