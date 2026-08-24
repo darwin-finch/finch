@@ -165,10 +165,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   exact prompt through a structured application dialog and resume the retained frame without source
   replay. Session/project identity plus the ledger have a separate atomic, integrity-checked
   `ProgramRuntimeAuthorityStore`; a missing or policy-incompatible record fails closed and VM
-  archives remain authority-free. Still bind that store to the Brain lifecycle, route explicit
-  interactive and provider-tool submissions through the same approval controller, implement
-  availability/policy-driven revocation and child attenuation, audit reuse at every actual host
-  boundary, and complete the host adapters.
+  archives remain authority-free. Provider wire, explicitly entered Lisp/Co-Forth, and legacy
+  provider-tool submissions now share that approval controller; repeated capability boundaries
+  continue through their exact saved frames. Still bind the authority store to the Brain lifecycle,
+  implement availability/policy-driven revocation and child attenuation, audit reuse at every
+  actual host boundary, and complete the host adapters.
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their
