@@ -272,6 +272,20 @@
       "expected_output": ""
     },
     {
+      "name": "typed-result-early-propagation",
+      "forth": ": keep-going ( S -- S result<int,string> ! pure ) 7 ok ? drop 8 ok ; keep-going",
+      "lisp": "(define (keep-going) : result<int,string> (begin (try (ok 7)) (ok 8))) (keep-going)",
+      "expected_values": [{ "type": "result", "value": { "ok_type": { "kind": "int" }, "error_type": { "kind": "string" }, "is_ok": true, "value": { "type": "int", "value": 8 } } }],
+      "expected_output": ""
+    },
+    {
+      "name": "cooperative-producer-fiber-join",
+      "forth": ": producer ( S -- S int ! infer ) 3 yield 5 yield 8 ; ['] producer defer fiber-join",
+      "lisp": "(fiber-join (defer (lambda () (begin (yield 3) (yield 5) 8))))",
+      "expected_values": [{ "type": "int", "value": 8 }],
+      "expected_output": ""
+    },
+    {
       "name": "raw-prose-output",
       "forth": "s\"\"\"The user said \"hello\".\nSecond line.\"\"\" say",
       "lisp": "(say \"The user said \\\"hello\\\".\\nSecond line.\")",

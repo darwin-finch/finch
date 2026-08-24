@@ -259,6 +259,102 @@ impl Default for InterpreterConfig {
     }
 }
 
+/// Replace placeholder type metadata introduced by polymorphic constructors
+/// with the concrete type promised at a verified function boundary. Values
+/// remain immutable; this only rebuilds managed wrappers whose runtime type is
+/// part of their serialized representation.
+fn refine_return_value(value: TypedValue, expected: &Type) -> TypedValue {
+    match (value, expected) {
+        (TypedValue::Option { value, .. }, Type::Option(inner_type)) => TypedValue::Option {
+            inner_type: (**inner_type).clone(),
+            value: value.map(|value| Box::new(refine_return_value(*value, inner_type))),
+        },
+        (TypedValue::Result { is_ok, value, .. }, Type::Result(ok_type, error_type)) => {
+            let payload_type = if is_ok { ok_type } else { error_type };
+            TypedValue::Result {
+                ok_type: (**ok_type).clone(),
+                error_type: (**error_type).clone(),
+                is_ok,
+                value: Box::new(refine_return_value(*value, payload_type)),
+            }
+        }
+        (TypedValue::List { values, .. }, Type::List(element_type)) => TypedValue::List {
+            element_type: (**element_type).clone(),
+            values: values
+                .into_iter()
+                .map(|value| refine_return_value(value, element_type))
+                .collect(),
+        },
+        (TypedValue::Map { entries, .. }, Type::Map(key_type, value_type)) => TypedValue::Map {
+            key_type: (**key_type).clone(),
+            value_type: (**value_type).clone(),
+            entries: entries
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        refine_return_value(key, key_type),
+                        refine_return_value(value, value_type),
+                    )
+                })
+                .collect(),
+        },
+        (TypedValue::Record(values), Type::Record(fields)) => TypedValue::Record(
+            values
+                .into_iter()
+                .map(|(name, value)| {
+                    let expected = fields
+                        .iter()
+                        .find(|(field, _)| field == &name)
+                        .map(|(_, ty)| ty);
+                    let value = match expected {
+                        Some(ty) => refine_return_value(value, ty),
+                        None => value,
+                    };
+                    (name, value)
+                })
+                .collect(),
+        ),
+        (TypedValue::Variant { name, value }, Type::Variant(variants)) => {
+            let payload_type = variants
+                .iter()
+                .find(|(variant, _)| variant == &name)
+                .and_then(|(_, payload)| payload.as_ref());
+            TypedValue::Variant {
+                name,
+                value: match (value, payload_type) {
+                    (Some(value), Some(ty)) => Some(Box::new(refine_return_value(*value, ty))),
+                    (value, _) => value,
+                },
+            }
+        }
+        (TypedValue::Task { id, kind, .. }, Type::Task(result_type)) => TypedValue::Task {
+            id,
+            result_type: (**result_type).clone(),
+            kind,
+        },
+        (TypedValue::Fiber { id, .. }, Type::Fiber(yield_type, result_type)) => TypedValue::Fiber {
+            id,
+            yield_type: (**yield_type).clone(),
+            result_type: (**result_type).clone(),
+        },
+        (
+            TypedValue::Stream {
+                id,
+                kind,
+                generation,
+                ..
+            },
+            Type::Stream(element_type),
+        ) => TypedValue::Stream {
+            id,
+            element_type: (**element_type).clone(),
+            kind,
+            generation,
+        },
+        (value, _) => value,
+    }
+}
+
 /// Serializable activation record for the VM's internal trampoline. This is
 /// deliberately VM data, not a Rust callback: a daemon can persist it beside
 /// an immutable verified-module reference and resume it after reconnect.
@@ -274,6 +370,14 @@ pub struct VmFrame {
     /// This duplicates the verifier's static contract as a runtime boundary
     /// check for persisted continuations and interpreter correctness.
     pub output_arity: usize,
+    /// Declared result row used to refine polymorphic constructor metadata at
+    /// the function boundary. For example, `ok(8)` is constructed as
+    /// `result<int,dynamic>` locally, but a function declared to return
+    /// `result<int,string>` must expose that concrete type to its caller and
+    /// across serialization. Older suspended frames retain arity-only
+    /// behavior when this field is absent.
+    #[serde(default)]
+    pub output_types: Vec<Type>,
     pub locals: Vec<TypedValue>,
     pub captures: Vec<TypedValue>,
 }
@@ -1236,9 +1340,16 @@ impl<'a> VmTrampoline<'a> {
                             &continuation,
                         ));
                     }
-                    let results = continuation
+                    let mut results = continuation
                         .stack
                         .split_off(continuation.stack.len() - frame.output_arity);
+                    if frame.output_types.len() == results.len() {
+                        results = results
+                            .into_iter()
+                            .zip(&frame.output_types)
+                            .map(|(value, expected)| refine_return_value(value, expected))
+                            .collect();
+                    }
                     continuation.stack.truncate(frame.stack_base);
                     continuation.stack.extend(results);
                     continuation.frames.pop();
@@ -1282,6 +1393,7 @@ impl<'a> VmTrampoline<'a> {
             instruction: 0,
             stack_base,
             output_arity: function_def.signature.output.values.len(),
+            output_types: function_def.signature.output.values.clone(),
             locals: vec![TypedValue::Unit; function_def.locals.len()],
             captures,
         })
