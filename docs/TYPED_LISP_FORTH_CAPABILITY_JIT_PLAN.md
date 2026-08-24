@@ -86,9 +86,10 @@ span-preserving module tree whose definition and top-level bodies retain an orde
 and lower against the original source; it no longer copies/masks and re-tokenizes those bodies.
 Anonymous quotations are recursive parser-owned body nodes containing their signature and body,
 rather than delimiter ranges in a byte-offset side table rediscovered or skipped during IR
-emission. Its remaining atom nodes must become
-structured nodes for definition signatures, control flow, literals, and calls before this gate
-closes. Syntactic sugar, macros, and other rewrites
+emission. Integers, booleans, symbols, strings, and pasted JSON are classified as typed literal
+nodes in the same source pass, so IR emission no longer discovers literals by reinterpreting word
+text. Its remaining atom nodes must become structured nodes for definition signatures, control
+flow, and calls before this gate closes. Syntactic sugar, macros, and other rewrites
 operate on those nodes, and one post-order semantic lowering emits the common typed stack IR.
 Generated syntax retains both its call-site and definition origin and is never converted to text
 and reparsed.
