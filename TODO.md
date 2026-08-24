@@ -157,7 +157,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   overload resolution or optimization unavailable to a normal typed definition: compiler-owned
   `for`/`foreach` syntax may select an indexed, range, fiber, or collection-specific loop lowering,
   but selection must use public structural contracts and resolved word IDs so user-defined types
-  and traversal functions can receive the same specialization/inlining as built-ins.
+  and traversal functions can receive the same specialization/inlining as built-ins. Keep one
+  `foreach` surface: a compile-time range plus pure compile-time body executes through bounded CTFE,
+  while a runtime range lowers to the verified loop protocol; do not add a separate `static foreach`.
 - [x] Generate every production core word from one typed signature, effect, documentation, and
   host-implementation registry. `CoreWordSpec` is the immutable source consumed by frontend
   discovery, the verifier, interpreter dispatch, and host-binding validation; user definitions
@@ -229,9 +231,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   one exact typed role/background/provider/model/budget record through both frontends into the
   configured-profile resolver; unavailable models and invalid budgets fail before task creation.
   Poll and await now return exact typed snapshot/result records rather than scheduler JSON or a
-  bare final-message string. Still add explicit starting-context references/hashes and
-  capability-subset requests, and audit remaining legacy model-selection/tool entry points before
-  closing this gate.
+  bare final-message string. Child schedulers no longer expose direct Read/Glob/Grep or direct
+  agent-control tools: they retain typed `submit_program` plus read-only discovery, and use the
+  bounded structural `tree-list`/`file-*`/`agent-*` vocabulary under the child grant ceiling.
+  Still add explicit starting-context references/hashes and capability-subset requests, and audit
+  remaining root/provider legacy model-selection/tool entry points before closing this gate.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their
   own large-file loops: workspace tree metadata, bounded file hash, a bounded host-computed
   directory Merkle root, and bounded host-computed CSV header/per-column summaries now exist; add workbook
@@ -358,6 +362,15 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   across tool-result continuations. Keep the unchecked gate items unchecked until their missing
   semantics and fixed cross-provider measurements exist. Do not require the later Cranelift JIT
   optimization tier to begin Brain convergence.
+- [ ] After interpreter semantics, parametric HIR, CTFE, monomorphization, and Cranelift differential
+  gates are stable, add a separate `finchc` AOT target. It should emit either a pure standalone
+  executable with a minimal runtime or a capability-hosted executable linked to the portable
+  `VmSideEffect`/`VmResume` ABI. Reuse the same frontends, semantic scheduler, verifier, source maps,
+  and compile-time type/syntax reflection; do not create a second metaprogramming language or accept
+  model-authored CLIF/native artifacts as trusted input. Make host selection explicit: a `none`
+  profile rejects unsupported effects, a terminal wrapper may project `session.emit` to stdout, and
+  portable/library output exposes or links the structured effect/resume shims. `say` must retain one
+  semantic meaning rather than becoming a different primitive in compiled programs.
 - [ ] Freeze and test the Runtime/Application boundary: the embedder-neutral typed VM exposes only
   verified execution, diagnostics, capability requests, and idempotent side-effect/resume records;
   the Finch application supplies Brain, UI, approval, provider, MCP, scheduler, and OS adapters.
