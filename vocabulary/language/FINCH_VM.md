@@ -126,9 +126,10 @@ CPU task operations reject agent-task handles; agent coordination remains `agent
 separate protocol.
 
 `yield` is a stack-neutral control instruction. It returns the VM's remaining frames to the Finch
-event-loop trampoline as a saved `ProgramRun` suspension. A host resumes that exact execution with
-its execution id; Finch does not yet automatically requeue yielded runs. It may occur more than
-once in one program; it is not an LLM-authored continuation value. Future `fiber<yield,return>`
+event-loop trampoline as a saved `ProgramRun` suspension. The interactive provider-wire runner
+currently yields its Tokio task and resumes that exact execution automatically; all other hosts
+choose their own scheduling policy. It may occur more than once in one program; it is not an
+LLM-authored continuation value. Future `fiber<yield,return>`
 handles will expose repeated yielded values separately from terminal task joins.
 
 It is not a lazy sequence generator. This revision has no `next`, `generator<T>`, or generic

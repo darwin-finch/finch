@@ -72,9 +72,39 @@ async fn execute_direct_wire_response(
             envelope,
         });
     });
-    runtime
+    let outcome = runtime
         .submit_with_deferred_program_effects(submission, sink)
-        .await
+        .await?;
+    resume_interactive_yields(runtime, outcome).await
+}
+
+/// Cooperative `yield` is a scheduling boundary, not a request for the model
+/// or user to intervene.  The interactive wire runner therefore gives other
+/// Tokio work a chance to run and then resumes the exact saved execution.
+///
+/// This intentionally handles *only* [`PendingTypedReason::Yielded`].  A host
+/// request, approval, proposal editor, task join, or cancellation remains
+/// suspended for its owning application lifecycle; treating any of those as a
+/// generic auto-retry would duplicate side effects or bypass a human decision.
+/// Durable timer/I/O/message wakeups belong to the later daemon scheduler.
+async fn resume_interactive_yields(
+    runtime: &crate::runtime::ProgramRuntime,
+    mut outcome: crate::runtime::outcome::ExecutionOutcome,
+) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
+    while outcome.status == crate::runtime::outcome::ExecutionStatus::Suspended
+        && matches!(
+            runtime.pending_typed_execution(outcome.execution_id)?.map(|pending| pending.reason),
+            Some(crate::runtime::PendingTypedReason::Yielded)
+        )
+    {
+        // Do not spin a whole VM run inside the provider-response task. The
+        // typed runtime preserves fuel across continuations, and explicit
+        // yielding makes cancellation/presentation events observable between
+        // slices.
+        tokio::task::yield_now().await;
+        outcome = runtime.resume_typed_execution(outcome.execution_id).await?;
+    }
+    Ok(outcome)
 }
 
 /// A rejected provider response may be repaired once only when the VM proved
@@ -1357,6 +1387,38 @@ mod tests {
             crate::runtime::outcome::ExecutionStatus::Completed
         );
         assert_eq!(outcome.output, "world");
+    }
+
+    #[tokio::test]
+    async fn interactive_wire_scheduler_resumes_only_cooperative_yields() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let work_unit = output.start_work_unit("VM output");
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let complete = execute_direct_wire_response(
+            &runtime,
+            Arc::clone(&output),
+            work_unit,
+            event_tx,
+            "(begin (say \"one\") (yield) (say \"two\") (yield) (say \"three\"))".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            complete.status,
+            crate::runtime::outcome::ExecutionStatus::Completed
+        );
+        assert_eq!(complete.output, "onetwothree");
+        let mut emitted = 0;
+        while event_rx.try_recv().is_ok() {
+            emitted += 1;
+        }
+        assert_eq!(emitted, 3, "all say events cross the UI bus");
+        assert!(runtime
+            .pending_typed_execution(complete.execution_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

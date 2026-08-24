@@ -69,10 +69,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   whose completion returns through that same loop. Client projections reject duplicate or gapped
   `(execution_id, sequence)` envelopes, but this is only a live reconnect guard; still replace the
   remaining direct compatibility projections with durable application-journal/replay support.
-- [ ] Add an application-owned policy for cooperative typed-VM `yield`: the VM already persists a
-  `PendingTypedReason::Yielded` continuation and exposes exact-id resume/cancel APIs, but no daemon
-  or frontend scheduler automatically requeues it yet. Define fairness, timer/I/O/message wakeups,
-  cancellation, and durable replay before treating `yield` as autonomous background execution.
+- [ ] Complete the application-owned policy for cooperative typed-VM `yield`: the interactive
+  provider-wire runner now yields its Tokio task and automatically resumes only an exact
+  `PendingTypedReason::Yielded` continuation. General daemon/frontend scheduling still needs
+  fairness, timer/I/O/message wakeups, cancellation, and durable replay before treating `yield` as
+  autonomous background execution.
 - [ ] Reimplement the existing model-facing `TodoRead`/`TodoWrite` tools over a typed, journaled
   task-list projection owned by the Brain/runtime. Keep their useful visible-plan UX and stable tool
   surface, but make task creation, status changes, hierarchy, progress, cancellation, and durable

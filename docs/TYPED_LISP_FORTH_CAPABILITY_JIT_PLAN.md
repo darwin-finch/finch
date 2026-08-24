@@ -704,8 +704,10 @@ Fail(diagnostic)                discard uncommitted VM-local mutation
 `thunk` is the runtime's implementation term for a zero-argument continuation. In memory it may
 be a compact frame object; for a durable Brain it must serialize as VM data rather than an opaque
 Rust closure. The event loop is the trampoline: it repeatedly invokes `Continue`/`Emit` thunks,
-projects emitted events to the shadow buffer, and stores `Await` continuations. Approval, timer,
-agent-completion, and host-I/O events resume the saved thunk with its typed result. They never
+projects emitted events to the shadow buffer, and stores `Await` continuations. The current
+interactive provider-wire runner automatically requeues only a stack-neutral `yield` after first
+yielding its Tokio task; approval, timer, agent-completion, and host-I/O events require their
+explicit host lifecycle before they resume the saved thunk with a typed result. They never
 resubmit source text or mutate an LLM prompt.
 
 This is also the streaming rule. `say` yields an `Emit(ResponseChunk(...), thunk)` event; it does
