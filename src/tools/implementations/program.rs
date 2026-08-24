@@ -201,6 +201,21 @@ const SOURCE_SYNTAX: &[SourceSyntaxEntry] = &[
         description: "Immutable statically checked typed-record field replacement. Lisp: (record-set record \"field\" value); Co-Forth: record value \"field\" record-set. It returns a replacement record and never mutates a shared value.",
     },
     SourceSyntaxEntry {
+        name: "list",
+        languages: &["lisp"],
+        description: "Homogeneous immutable typed list literal: (list value ...). All elements must share one inferred type; use list-get and list-length to inspect it.",
+    },
+    SourceSyntaxEntry {
+        name: "map",
+        languages: &["lisp"],
+        description: "Immutable typed map literal: (map key value ...). Keys share one inferred type and values share one inferred type; use map-get, map-set, map-entries, or map-length to inspect it.",
+    },
+    SourceSyntaxEntry {
+        name: "map{",
+        languages: &["forth"],
+        description: "Immutable Co-Forth typed map literal: map{ key value ... }map. Keys and values alternate and each side has one inferred type.",
+    },
+    SourceSyntaxEntry {
         name: ":",
         languages: &["forth"],
         description: "Persistent typed word definition: : name ( S inputs -- S outputs ! effects ) body ;.",
@@ -1158,6 +1173,24 @@ mod tests {
                     && entry["description"]
                         .as_str()
                         .is_some_and(|description| description.contains("never mutates"))
+            }));
+
+        let collection_result: Value = serde_json::from_str(
+            &tool
+                .execute(json!({"query": "map{"}), &context)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(collection_result["syntax_matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["name"] == "map{"
+                    && entry["languages"]
+                        .as_array()
+                        .is_some_and(|languages| languages.iter().any(|language| language == "forth"))
             }));
     }
 
