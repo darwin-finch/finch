@@ -167,9 +167,12 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   `ProgramRuntimeAuthorityStore`; a missing or policy-incompatible record fails closed and VM
   archives remain authority-free. Provider wire, explicitly entered Lisp/Co-Forth, and legacy
   provider-tool submissions now share that approval controller; repeated capability boundaries
-  continue through their exact saved frames. Still bind the authority store to the Brain lifecycle,
-  implement availability/policy-driven revocation and child attenuation, audit reuse at every
-  actual host boundary, and complete the host adapters.
+  continue through their exact saved frames. Host availability is now a selector-aware property
+  independent from grants and is visible in approval dialogs. Child agents retain a creation-time
+  inherited grant ceiling, so later session/project/global grants cannot silently widen them;
+  explicit task-scoped approval is the escalation path. Still bind the authority store to the Brain
+  lifecycle, implement policy-driven revocation, audit reuse at every actual host boundary, and
+  complete the host adapters.
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their
