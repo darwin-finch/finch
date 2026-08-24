@@ -88,8 +88,9 @@ Anonymous quotations are recursive parser-owned body nodes containing their sign
 rather than delimiter ranges in a byte-offset side table rediscovered or skipped during IR
 emission. Integers, booleans, symbols, strings, and pasted JSON are classified as typed literal
 nodes in the same source pass, so IR emission no longer discovers literals by reinterpreting word
-text. Its remaining atom nodes must become structured nodes for definition signatures, control
-flow, and calls before this gate closes. Syntactic sugar, macros, and other rewrites
+text. Every other body element is retained as an explicit unresolved-word node rather than a
+generic atom. Elaboration must turn those words into structured control nodes and resolved
+local/call references before this gate closes. Syntactic sugar, macros, and other rewrites
 operate on those nodes, and one post-order semantic lowering emits the common typed stack IR.
 Generated syntax retains both its call-site and definition origin and is never converted to text
 and reparsed.

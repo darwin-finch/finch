@@ -49,8 +49,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   sequence—there is no byte-offset quotation side table, and lowering does not rediscover or skip
   their delimiters. Integers, booleans, symbols, strings, and pasted JSON are likewise classified
   as typed literal nodes during that source pass rather than reinterpreted during IR emission.
-  Finish replacing the remaining atom nodes with structured Co-Forth AST nodes for definitions'
-  signatures, control flow, and calls. Then perform one post-order semantic lowering into
+  All other body elements are explicit unresolved-word nodes rather than generic token atoms.
+  Finish elaborating those words into structured Co-Forth AST nodes for control flow and resolved
+  local/call references. Then perform one post-order semantic lowering into
   the shared IR; lower syntactic sugar and bounded macro rewrites over AST nodes without serializing
   or reparsing source. Source-defined generics and compile-time templates are now the concrete case
   that may require one small shared parametric HIR (or equivalently elaborated AST): retain generic
