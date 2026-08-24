@@ -3,7 +3,8 @@
 #
 # This is deliberately a manual smoke test: it sends two tiny requests to the
 # configured provider and therefore requires an already-configured credential.
-# It neither reads nor prints credentials.  CI should use deterministic fixtures.
+# It prints the returned raw program to stderr, never reads or prints
+# credentials. CI should use deterministic fixtures.
 #
 # Usage:
 #   ./scripts/smoke_vm_wire_provider.sh
@@ -25,7 +26,7 @@ run_smoke() {
   local expected="$3"
   local output
 
-  output="$("$finch_bin" --cloud-only query "$prompt")"
+  output="$("$finch_bin" --cloud-only query --show-program "$prompt")"
   if [[ "$output" != "$expected" ]]; then
     echo "$name VM-wire smoke test failed." >&2
     echo "Expected: $expected" >&2

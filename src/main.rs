@@ -120,6 +120,9 @@ enum Command {
     Query {
         /// Query text
         query: String,
+        /// Print each raw provider VM program to stderr before Finch executes it
+        #[arg(long)]
+        show_program: bool,
     },
     /// Run as a network worker node (accepts queries from other machines)
     ///
@@ -797,8 +800,11 @@ async fn main() -> Result<()> {
         Some(Command::Train { train_command }) => {
             return run_train_command(train_command).await;
         }
-        Some(Command::Query { query }) => {
-            return run_query(&query, cloud_only).await;
+        Some(Command::Query {
+            query,
+            show_program,
+        }) => {
+            return run_query(&query, cloud_only, show_program).await;
         }
         Some(Command::Worker { bind, info }) => {
             return run_worker(bind, info).await;
@@ -882,7 +888,7 @@ async fn main() -> Result<()> {
         }
 
         // Run query via daemon
-        return run_query(input.trim(), cloud_only).await;
+        return run_query(input.trim(), cloud_only, false).await;
     }
 
     // CRITICAL: Create and configure OutputManager BEFORE initializing tracing
@@ -2095,7 +2101,7 @@ fn is_clearly_forth(s: &str) -> bool {
 }
 
 /// Run a single query with full tool support (agentic mode)
-async fn run_query(query: &str, cloud_only: bool) -> Result<()> {
+async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<()> {
     use finch::client::DaemonClient;
     use finch::daemon::ensure_daemon_running;
 
@@ -2123,16 +2129,30 @@ async fn run_query(query: &str, cloud_only: bool) -> Result<()> {
     // defeating the flag, that startup attempt can consume the whole caller
     // timeout and makes direct-provider smoke tests look hung.
     if cloud_only {
-        return run_query_teacher_only(query, &config, executor, tool_definitions, program_runtime)
-            .await;
+        return run_query_teacher_only(
+            query,
+            &config,
+            executor,
+            tool_definitions,
+            program_runtime,
+            show_program,
+        )
+        .await;
     }
 
     // Ensure daemon is running (auto-spawn if needed)
     if let Err(e) = ensure_daemon_running(Some(&config.client.daemon_address)).await {
         eprintln!("⚠️  Daemon failed to start: {}", e);
         eprintln!("   Using teacher API directly (no local model)");
-        return run_query_teacher_only(query, &config, executor, tool_definitions, program_runtime)
-            .await;
+        return run_query_teacher_only(
+            query,
+            &config,
+            executor,
+            tool_definitions,
+            program_runtime,
+            show_program,
+        )
+        .await;
     }
 
     // Create daemon client and run full tool loop
@@ -2148,6 +2168,9 @@ async fn run_query(query: &str, cloud_only: bool) -> Result<()> {
             &guard,
         )
         .await?;
+    if show_program {
+        print_wire_program(&response);
+    }
     // The daemon owns model inference and tool-loop routing, but this CLI
     // process owns the local typed runtime.  A final text response is therefore
     // still Finch wire source, never user-facing prose to print verbatim.
@@ -2175,6 +2198,9 @@ async fn run_query(query: &str, cloud_only: bool) -> Result<()> {
                     &guard,
                 )
                 .await?;
+            if show_program {
+                print_wire_program(&repair);
+            }
             execute_one_shot_wire_source(&program_runtime, &repair).await?
         }
         Ok(outcome) => outcome,
@@ -2187,6 +2213,9 @@ async fn run_query(query: &str, cloud_only: bool) -> Result<()> {
                     &guard,
                 )
                 .await?;
+            if show_program {
+                print_wire_program(&repair);
+            }
             execute_one_shot_wire_source(&program_runtime, &repair).await?
         }
         Err(error) => return Err(error),
@@ -2216,6 +2245,7 @@ async fn run_query_teacher_only(
     executor: Arc<tokio::sync::Mutex<finch::tools::ToolExecutor>>,
     tool_definitions: Vec<finch::tools::types::ToolDefinition>,
     program_runtime: Arc<finch::runtime::ProgramRuntime>,
+    show_program: bool,
 ) -> Result<()> {
     use finch::claude::{ContentBlock, Message, MessageRequest};
 
@@ -2251,6 +2281,9 @@ async fn run_query_teacher_only(
         // as though it were an ordinary chat response.
         if !response.has_tool_uses() {
             let source = response.text();
+            if show_program {
+                print_wire_program(&source);
+            }
             let outcome = match execute_one_shot_wire_source(&program_runtime, &source).await {
                 Ok(outcome) => outcome,
                 Err(error)
@@ -2340,6 +2373,18 @@ async fn run_query_teacher_only(
 
     eprintln!("⚠️  Reached max tool turns without a final answer");
     Ok(())
+}
+
+/// Render a raw model response for an explicit human inspection request.
+///
+/// This stays on stderr so `finch query` retains stdout as the executed
+/// program's user-visible result, which keeps scripts and shell pipelines
+/// stable. The source is never executed by this helper.
+fn print_wire_program(source: &str) {
+    match finch::programs::ProgramLanguage::infer_wire_source(source) {
+        Ok(language) => eprintln!("→ program ({})\n{}", language.as_str(), source),
+        Err(error) => eprintln!("→ program (invalid wire source: {error})\n{source}"),
+    }
 }
 
 /// The same provider-facing contract accompanies every one-shot transport.
