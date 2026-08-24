@@ -3511,7 +3511,29 @@ fn typed_value(value: TypedValue) -> Result<ProgramValue> {
             ok: is_ok,
             value: Box::new(typed_value(*value)?),
         },
+        TypedValue::Record(fields) => ProgramValue::Record(
+            fields
+                .into_iter()
+                .map(|(name, value)| Ok((name, typed_value(value)?)))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        TypedValue::Variant { name, value } => ProgramValue::Variant {
+            name,
+            value: value
+                .map(|value| typed_value(*value))
+                .transpose()?
+                .map(Box::new),
+        },
         TypedValue::Task { id, .. } => ProgramValue::Task(id),
+        TypedValue::Fiber {
+            id,
+            yield_type,
+            result_type,
+        } => ProgramValue::Fiber {
+            id,
+            yield_type,
+            result_type,
+        },
         TypedValue::Stream {
             id,
             kind,
@@ -4652,6 +4674,64 @@ mod tests {
             .unwrap();
         assert_eq!(completed.status, ExecutionStatus::Completed);
         assert_eq!(completed.values, vec![ProgramValue::Int(7)]);
+    }
+
+    #[tokio::test]
+    async fn typed_producer_values_cross_the_public_runtime_boundary() {
+        let runtime = ProgramRuntime::new();
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(let ((numbers (defer (lambda () (begin (yield 2) (yield 3) 5))))) (list (fiber-next numbers) (fiber-next numbers) (fiber-next numbers)))",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        assert_eq!(
+            outcome.values,
+            vec![ProgramValue::List(vec![
+                ProgramValue::Result {
+                    ok: true,
+                    value: Box::new(ProgramValue::Int(2)),
+                },
+                ProgramValue::Result {
+                    ok: true,
+                    value: Box::new(ProgramValue::Int(3)),
+                },
+                ProgramValue::Result {
+                    ok: false,
+                    value: Box::new(ProgramValue::Variant {
+                        name: "end".into(),
+                        value: Some(Box::new(ProgramValue::Int(5))),
+                    }),
+                },
+            ])]
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_fiber_handle_crosses_the_public_runtime_boundary() {
+        let runtime = ProgramRuntime::new();
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(defer (lambda () (begin (yield 2) 5)))",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        assert!(matches!(
+            outcome.values.as_slice(),
+            [ProgramValue::Fiber {
+                yield_type: Type::Int,
+                result_type: Type::Int,
+                ..
+            }]
+        ));
     }
 
     #[tokio::test]

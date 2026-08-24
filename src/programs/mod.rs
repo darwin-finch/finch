@@ -572,7 +572,23 @@ pub enum ProgramValue {
         ok: bool,
         value: Box<ProgramValue>,
     },
+    /// An immutable structural record. Field order is retained so display and
+    /// replay remain deterministic across embedders.
+    Record(Vec<(String, ProgramValue)>),
+    /// One selected branch of a typed variant. The enclosing function or
+    /// result signature supplies the complete set of possible branches.
+    Variant {
+        name: String,
+        value: Option<Box<ProgramValue>>,
+    },
     Task(String),
+    /// A runtime-owned producer continuation that may be retained and resumed
+    /// by a later turn in the same Brain/runtime generation.
+    Fiber {
+        id: String,
+        yield_type: crate::vm::Type,
+        result_type: crate::vm::Type,
+    },
     Resource {
         kind: String,
         handle: String,
