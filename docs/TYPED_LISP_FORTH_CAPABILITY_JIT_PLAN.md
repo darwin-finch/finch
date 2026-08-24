@@ -124,8 +124,11 @@ only into shared typed IR. The legacy Co-Forth interpreter remains behind explic
 migration-only APIs while historical programs are ported; it is not a fallback. Core words are now generated through one
 immutable signature/documentation/implementation registry, and the broker has a real typed
 `(execution_id, sequence)` suspension/resumption boundary with an effect journal. Persisted and
-promoted vocabulary still needs the same registry migration, while durable approval policy,
-complete host adapters, and provider conformance remain unfinished.
+promoted vocabulary still needs the same registry migration. Named Brain storage now restores its
+integrity-checked host authority record separately from content-addressed VM checkpoints, so a
+checkpoint copied without that record confers no grants. Policy mutation persistence outside Brain
+runtime commits, policy-driven revocation, complete host adapters, and provider conformance remain
+unfinished.
 
 The target removes those explicit migration APIs after conformance parity and gives interpreted
 and JIT execution the same verified IR, transaction, and error behavior.

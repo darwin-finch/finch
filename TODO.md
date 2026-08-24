@@ -178,9 +178,12 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   continue through their exact saved frames. Host availability is now a selector-aware property
   independent from grants and is visible in approval dialogs. Child agents retain a creation-time
   inherited grant ceiling, so later session/project/global grants cannot silently widen them;
-  explicit task-scoped approval is the escalation path. Still bind the authority store to the Brain
-  lifecycle, implement policy-driven revocation, audit reuse at every actual host boundary, and
-  complete the host adapters.
+  explicit task-scoped approval is the escalation path. Named Brain compatibility storage now
+  persists and restores that separate authority record beside its content-addressed VM checkpoints;
+  a missing record restores no grants, a tampered record fails closed, and archiving the Brain moves
+  both lifecycles together. Still implement policy-driven revocation, audit reuse at every actual
+  host boundary, persist policy changes that occur outside a runtime commit, and complete the host
+  adapters.
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their
