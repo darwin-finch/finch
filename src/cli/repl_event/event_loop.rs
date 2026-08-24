@@ -1828,25 +1828,11 @@ impl EventLoop {
                             // Priority 1: Poset run confirmation (state machine — no oneshot)
                             else if let Some(pending) = self.pending_poset_run.take() {
                                 if matches!(dialog_result, crate::cli::tui::DialogResult::Selected(0)) {
-                                    use crate::tools::implementations::{
-                                        BashTool, EditTool, GlobTool, GrepTool, ReadTool,
-                                        WebFetchTool, WriteTool,
-                                    };
-                                    let mut reg = crate::tools::ToolRegistry::new();
-                                    reg.register(Box::new(ReadTool));
-                                    reg.register(Box::new(GlobTool));
-                                    reg.register(Box::new(GrepTool));
-                                    reg.register(Box::new(BashTool));
-                                    reg.register(Box::new(WebFetchTool::new()));
-                                    reg.register(Box::new(WriteTool));
-                                    reg.register(Box::new(EditTool));
-                                    let registry = Some(Arc::new(reg));
                                     let PendingPosetRun { generator, poset, event_tx } = pending;
                                     tokio::spawn(async move {
                                         let result = crate::poset::executor::execute_poset(
                                             Arc::new(tokio::sync::Mutex::new(poset)),
                                             generator,
-                                            registry,
                                         ).await;
                                         let _ = event_tx.send(super::events::ReplEvent::PosetComplete { result });
                                     });
@@ -6460,16 +6446,15 @@ Rules:\n\
 
     /// Handle `/program` — render the current stack as Forth source code.
     ///
-    /// Seed the stack with a small "codebase archaeology" language as a demo.
+    /// Seed the plan with a small typed Co-Forth dependency graph as a demo.
     ///
     /// Defines four words:
-    ///   W0  ENTRY-POINTS  — find main() and binary entry points  [Glob, Grep]
-    ///   W1  MODULE-MAP    — map modules and public interfaces     [Glob, Grep]
-    ///   W2  CALL-GRAPH    — trace call graph from entry points    [Read]       needs W0
-    ///   W3  STORY         — onboarding narrative                              needs W1, W2
+    ///   W0  TWENTY       — produces 20
+    ///   W1  ONE          — produces 1
+    ///   W2  TWENTY-ONE   — adds W0 and W1                                     needs W0, W1
+    ///   W3  ANSWER       — doubles W2                                         needs W2
     ///
-    /// Parallel roots: W0 and W1 run concurrently.
-    /// Then W2 (needs W0), then W3 (needs W1 and W2).
+    /// Parallel roots W0 and W1 run concurrently; W2 then W3 consume their typed results.
     async fn handle_stack_demo(&mut self) -> Result<()> {
         use crate::poset::{NodeAuthor, NodeKind};
 
@@ -6480,49 +6465,26 @@ Rules:\n\
             *p = crate::poset::Poset::new();
         }
 
-        // Word definitions: (label, kind, tools, predecessors)
-        let words: &[(&str, NodeKind, &[&str], &[usize])] = &[
-            (
-                "find main() and binary entry points in this codebase",
-                NodeKind::Task,
-                &["Glob", "Grep"],
-                &[],
-            ),
-            (
-                "map all modules and their public interfaces",
-                NodeKind::Task,
-                &["Glob", "Grep"],
-                &[],
-            ),
-            (
-                "trace the call graph from entry points",
-                NodeKind::Task,
-                &["Read"],
-                &[0], // needs W0
-            ),
-            (
-                "write a developer onboarding story for this codebase",
-                NodeKind::Task,
-                &[],
-                &[1, 2], // needs W1 and W2
-            ),
+        // Reviewed nodes: (label, typed Co-Forth source, predecessors).
+        let words: &[(&str, &str, &[usize])] = &[
+            ("produce twenty", "20", &[]),
+            ("produce one", "1", &[]),
+            ("add the two predecessor values", "+", &[0, 1]),
+            ("double the predecessor value", "2 *", &[2]),
         ];
 
         let mut ids: Vec<usize> = Vec::new();
         {
             let mut p = self.poset.lock().await;
-            for &(label, ref kind, tools, _) in words {
-                let tool_names: Vec<String> = tools.iter().map(|s| s.to_string()).collect();
-                let id = p.add_node_with_tools(
-                    label.to_string(),
-                    kind.clone(),
-                    NodeAuthor::User,
-                    tool_names,
-                );
+            for &(label, source, _) in words {
+                let id = p.add_node(label.to_string(), NodeKind::Task, NodeAuthor::User);
+                let node = p.node_mut(id).expect("newly added plan node");
+                node.compiled_code = Some(source.to_string());
+                node.compiled_lang = Some("forth".to_string());
                 ids.push(id);
             }
             // Wire edges based on predecessor lists.
-            for (i, &(_, _, _, preds)) in words.iter().enumerate() {
+            for (i, &(_, _, preds)) in words.iter().enumerate() {
                 for &pred_idx in preds {
                     p.edges.push((ids[pred_idx], ids[i]));
                 }
@@ -6532,14 +6494,14 @@ Rules:\n\
         // Mirror into the flat stack (for /stack show compatibility).
         {
             let mut s = self.stack.lock().await;
-            for &(label, _, _, _) in words {
+            for &(label, _, _) in words {
                 s.push(label.to_string());
             }
         }
 
         self.output_manager.write_info(
-            "📚 Demo language seeded: 4 words, 3 edges.\n\
-             W0 + W1 run in parallel → W2 → W3.\n\
+            "📚 Demo plan seeded: 4 reviewed typed nodes, 3 edges.\n\
+             W0 + W1 run in parallel → W2 → W3, producing 42.\n\
              /program to see the vocabulary · /view for graph · /run to execute.",
         );
 
@@ -6738,19 +6700,27 @@ Rules:\n\
                     continue;
                 }
 
-                let names: Vec<String> = group.iter().map(|n| format!("W{}", n.id)).collect();
-
                 let concurrent = if group.len() > 1 {
-                    "  \\ concurrent"
+                    "  (concurrent)"
                 } else {
                     ""
                 };
-                lines.push(format!("  {}{}", names.join("  "), concurrent));
+                lines.push(format!("stage {lvl}{concurrent}"));
+                for node in group {
+                    let executable = match (&node.compiled_lang, &node.compiled_code) {
+                        (Some(language), Some(source)) => {
+                            format!(" [{language}: {source}]")
+                        }
+                        _ if node.tools.is_empty() => " [inference only]".to_string(),
+                        _ => format!(" [UNSAFE LEGACY TOOLS: {}]", node.tools.join(", ")),
+                    };
+                    lines.push(format!("  W{}: {}{}", node.id, node.label, executable));
+                }
             }
             lines.join("\n")
         };
 
-        let title = format!(": PROGRAM\n{}\n;\n\nthis will run on your machine.", plan);
+        let title = format!("Execution plan\n\n{plan}\n\nThis exact snapshot will run.");
         let dialog = Dialog::select(
             title,
             vec![DialogOption::new("run"), DialogOption::new("cancel")],
