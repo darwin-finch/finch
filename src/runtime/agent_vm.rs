@@ -28,19 +28,19 @@ impl AgentVmBinding {
     }
 
     pub async fn spawn(&self, task: String) -> Result<AgentIdentity> {
-        self.scheduler()?
-            .spawn(
-                AgentTaskSpec {
-                    task,
-                    role: Default::default(),
-                    background: None,
-                    provider: None,
-                    model: None,
-                    budget: Default::default(),
-                },
-                self.parent.as_ref(),
-            )
-            .await
+        self.spawn_spec(AgentTaskSpec {
+            task,
+            role: Default::default(),
+            background: None,
+            provider: None,
+            model: None,
+            budget: Default::default(),
+        })
+        .await
+    }
+
+    pub async fn spawn_spec(&self, spec: AgentTaskSpec) -> Result<AgentIdentity> {
+        self.scheduler()?.spawn(spec, self.parent.as_ref()).await
     }
 
     pub async fn poll(&self, task_id: Uuid) -> Result<AgentTaskSnapshot> {

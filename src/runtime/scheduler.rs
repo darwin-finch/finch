@@ -23,6 +23,8 @@ use uuid::Uuid;
 
 const MAX_DEPTH: usize = 4;
 const MAX_TURNS: usize = 10;
+const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
+const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ProviderResolver {
@@ -163,6 +165,24 @@ pub struct AgentTaskSpec {
     pub budget: AgentBudget,
 }
 
+impl AgentTaskSpec {
+    fn validate(&self) -> Result<()> {
+        if self.task.trim().is_empty() {
+            bail!("agent task cannot be empty");
+        }
+        if !(1..=MAX_TURNS).contains(&self.budget.max_turns) {
+            bail!("agent max_turns must be between 1 and {MAX_TURNS}");
+        }
+        if !(1..=MAX_TIMEOUT_MS).contains(&self.budget.timeout_ms) {
+            bail!("agent timeout_ms must be between 1 and {MAX_TIMEOUT_MS}");
+        }
+        if !(1..=MAX_OUTPUT_BYTES).contains(&self.budget.max_output_bytes) {
+            bail!("agent max_output_bytes must be between 1 and {MAX_OUTPUT_BYTES}");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentIdentity {
     pub agent_id: Uuid,
@@ -269,9 +289,7 @@ impl AgentScheduler {
         spec: AgentTaskSpec,
         parent: Option<&AgentIdentity>,
     ) -> Result<AgentIdentity> {
-        if spec.task.trim().is_empty() {
-            bail!("agent task cannot be empty");
-        }
+        spec.validate()?;
         let depth = parent.map_or(0, |identity| identity.depth + 1);
         if depth > MAX_DEPTH {
             bail!("agent nesting depth exceeds {MAX_DEPTH}");
@@ -723,6 +741,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_rejects_unbounded_or_empty_resource_budgets() {
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(EchoGenerator)),
+            Arc::new(ProgramRuntime::new()),
+        );
+        let error = scheduler
+            .spawn(
+                AgentTaskSpec {
+                    task: "inspect".into(),
+                    role: AgentRole::General,
+                    background: None,
+                    provider: None,
+                    model: None,
+                    budget: AgentBudget {
+                        max_turns: 0,
+                        ..AgentBudget::default()
+                    },
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("max_turns"));
+        assert!(scheduler.tasks.read().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn installed_scheduler_does_not_implicitly_authorize_agent_words() {
         let runtime = Arc::new(ProgramRuntime::new());
         let _scheduler = AgentScheduler::new(
@@ -814,6 +859,140 @@ mod tests {
             crate::runtime::outcome::ExecutionBackend::TypedVm
         );
         assert_eq!(scheduler.tasks.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn typed_agent_spec_selects_role_context_model_and_budgets() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(EchoGenerator)),
+            Arc::clone(&runtime),
+        );
+        let source = r#"(agent-await
+            (agent-spawn-with {
+                :task "inspect the VM"
+                :role "explore"
+                :background "focus on typed effects"
+                :provider ""
+                :model ""
+                :max-turns 2
+                :timeout-ms 10000
+                :max-output-bytes 4096 }))"#;
+        let outcome = runtime
+            .submit(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Lisp,
+                source_id: None,
+                source: source.to_string(),
+                intent: "spawn a bounded configured child".to_string(),
+                effect: crate::programs::ExecutionEffect::VmWrite,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: None,
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Completed
+        );
+        let tasks = scheduler.tasks.read().await;
+        let task = tasks.values().next().expect("one structured child task");
+        assert_eq!(task.snapshot.role, AgentRole::Explore);
+        let result = task.snapshot.result.as_ref().expect("completed child result");
+        assert!(result.final_message.contains("focus on typed effects"));
+        assert_eq!(result.identity.provider_model, "echo");
+    }
+
+    #[tokio::test]
+    async fn typed_agent_spec_routes_model_selection_through_the_resolver() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(EchoGenerator)),
+            Arc::clone(&runtime),
+        );
+        let source = r#"(agent-spawn-with {
+            :task "inspect the VM"
+            :role "general"
+            :background ""
+            :provider ""
+            :model "not-configured"
+            :max-turns 2
+            :timeout-ms 10000
+            :max-output-bytes 4096 })"#;
+        let outcome = runtime
+            .submit(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Lisp,
+                source_id: None,
+                source: source.to_string(),
+                intent: "reject an unavailable child model".to_string(),
+                effect: crate::programs::ExecutionEffect::VmWrite,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: None,
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Failed
+        );
+        assert!(outcome
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("NoEligibleModel")));
+        assert!(scheduler.tasks.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn coforth_can_spawn_from_the_same_typed_agent_spec() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(EchoGenerator)),
+            Arc::clone(&runtime),
+        );
+        let source = r#"{
+            task: "inspect the VM"
+            role: "code"
+            background: "check shared IR"
+            provider: ""
+            model: ""
+            max-turns: 2
+            timeout-ms: 10000
+            max-output-bytes: 4096
+        } agent-spawn-with agent-await"#;
+        let outcome = runtime
+            .submit(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Forth,
+                source_id: None,
+                source: source.to_string(),
+                intent: "spawn the same structured child from Co-Forth".to_string(),
+                effect: crate::programs::ExecutionEffect::VmWrite,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: None,
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Completed
+        );
+        let tasks = scheduler.tasks.read().await;
+        let task = tasks.values().next().expect("one structured child task");
+        assert_eq!(task.snapshot.role, AgentRole::Code);
+        assert!(task
+            .snapshot
+            .result
+            .as_ref()
+            .expect("completed child result")
+            .final_message
+            .contains("check shared IR"));
     }
 
     #[tokio::test]

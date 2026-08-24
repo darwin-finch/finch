@@ -57,6 +57,7 @@ pub enum CoreHostBinding {
     ScheduleGet,
     ScheduleCancel,
     AgentSpawn,
+    AgentSpawnWith,
     AgentAwait,
     AgentPoll,
     AgentCancel,
@@ -129,6 +130,7 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "proposal-open" => CoreWordDocumentation { summary: "Ask the host to open a human-editable artifact proposal. Approval may execute the edited artifact through its normal validator, return edited text for chat, or cancel; this word does not run a shell itself.", lisp: "(proposal-open language title source)", forth: "language title source proposal-open", example: "(proposal-open \"python\" \"Report\" \"print('hello')\\n\")" },
         "mem-recall" | "mem-store" => CoreWordDocumentation { summary: "Read matching session memory entries or store one text memory entry. Both use the host memory tree and require their respective memory capability.", lisp: "(mem-recall query), (mem-store text)", forth: "query mem-recall; text mem-store", example: "(mem-store \"tested release candidate\")" },
         "agent-spawn" | "agent-await" | "agent-poll" | "agent-cancel" => CoreWordDocumentation { summary: "Create or control a separate typed child-agent task. Agent tasks have their own stack, budget, ancestry, and attenuated grants; they are not fibers or shared-stack threads.", lisp: "(agent-spawn task), (agent-poll handle), (agent-await handle), (agent-cancel handle)", forth: "task agent-spawn; handle agent-poll; handle agent-await; handle agent-cancel", example: "(agent-poll (agent-spawn \"summarize recent test failures\"))" },
+        "agent-spawn-with" => CoreWordDocumentation { summary: "Spawn a bounded child agent from an explicit typed task specification, including role, parent-authored background, optional provider/model selection, and resource budgets. Empty background/provider/model strings select no override.", lisp: "(agent-spawn-with spec)", forth: "spec agent-spawn-with", example: "(agent-spawn-with { :task \"inspect failures\" :role \"explore\" :background \"\" :provider \"\" :model \"\" :max-turns 4 :timeout-ms 60000 :max-output-bytes 65536 })" },
         "defer" => CoreWordDocumentation { summary: "Turn a pure zero-argument yielding closure into a cooperative fiber<Y,R>. The runtime owns its private continuation and runs it only through fiber operations.", lisp: "(defer closure) or (defer :fiber closure)", forth: "['] producer defer", example: "(defer (lambda () (begin (yield 1) 2)))" },
         "defer-cpu" => CoreWordDocumentation { summary: "Run a pure zero-argument non-producing closure on the bounded native worker pool and return task<R>.", lisp: "(defer :cpu closure) or (defer-cpu closure)", forth: "['] work defer-cpu", example: "(defer :cpu (lambda () (* 6 7)))" },
         "fiber-next" => CoreWordDocumentation { summary: "Advance one cooperative producer. It returns ok(Y) for a yielded value or err(end(R)) for the terminal return.", lisp: "(fiber-next fiber)", forth: "fiber fiber-next", example: "(match-result (fiber-next producer) (ok value value) (err end end))" },
@@ -227,6 +229,19 @@ fn host_path_template() -> FileSelectorTemplate {
 /// Canonical signatures for the first verified core. Runtime implementations,
 /// provider documentation, and tests consume this registry rather than keeping
 /// independent handwritten signature tables.
+pub fn agent_task_spec_type() -> Type {
+    Type::Record(vec![
+        ("task".into(), Type::String),
+        ("role".into(), Type::String),
+        ("background".into(), Type::String),
+        ("provider".into(), Type::String),
+        ("model".into(), Type::String),
+        ("max-turns".into(), Type::Int),
+        ("timeout-ms".into(), Type::Int),
+        ("max-output-bytes".into(), Type::Int),
+    ])
+}
+
 fn core_signatures() -> Vocabulary {
     let a = Type::Variable("A".into());
     let y = Type::Variable("Y".into());
@@ -1059,6 +1074,14 @@ fn core_signatures() -> Vocabulary {
             ),
         ),
         (
+            "agent-spawn-with".into(),
+            capability(
+                vec![agent_task_spec_type()],
+                vec![Type::Task(Box::new(Type::String))],
+                unscoped(CapabilityKind::AgentSpawn),
+            ),
+        ),
+        (
             "agent-await".into(),
             capability(
                 vec![Type::Task(Box::new(Type::String))],
@@ -1195,6 +1218,7 @@ static CORE_WORD_REGISTRY: Lazy<BTreeMap<String, CoreWordSpec>> = Lazy::new(|| {
                 "schedule-get" => CoreWordImplementation::HostEffect(CoreHostBinding::ScheduleGet),
                 "schedule-cancel" => CoreWordImplementation::HostEffect(CoreHostBinding::ScheduleCancel),
                 "agent-spawn" => CoreWordImplementation::HostEffect(CoreHostBinding::AgentSpawn),
+                "agent-spawn-with" => CoreWordImplementation::HostEffect(CoreHostBinding::AgentSpawnWith),
                 "agent-await" => CoreWordImplementation::HostEffect(CoreHostBinding::AgentAwait),
                 "agent-poll" => CoreWordImplementation::HostEffect(CoreHostBinding::AgentPoll),
                 "agent-cancel" => CoreWordImplementation::HostEffect(CoreHostBinding::AgentCancel),

@@ -18,7 +18,9 @@ use crate::vm::{
     SourceOrigin, Type, TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint,
     TypedSuspension, TypedValue, VmDiagnostic, VmSideEffect,
 };
-use crate::vm::vocabulary::{core_word_spec, CoreHostBinding, CoreWordImplementation};
+use crate::vm::vocabulary::{
+    agent_task_spec_type, core_word_spec, CoreHostBinding, CoreWordImplementation,
+};
 use anyhow::{bail, Context, Result};
 use automation::AutomationBroker;
 use automation::AutomationRequest;
@@ -3022,6 +3024,80 @@ impl TypedHostHandler {
     }
 }
 
+fn typed_agent_task_spec(
+    value: &TypedValue,
+    origin: &SourceOrigin,
+) -> std::result::Result<scheduler::AgentTaskSpec, VmDiagnostic> {
+    let TypedValue::Record(fields) = value else {
+        return Err(host_binding_error(
+            origin,
+            "agent-spawn-with requires an agent task specification record",
+        ));
+    };
+    if value.value_type() != agent_task_spec_type() {
+        return Err(host_binding_error(
+            origin,
+            "agent task specification has the wrong fields or field types",
+        ));
+    }
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find_map(|(field, value)| (field == name).then_some(value))
+            .ok_or_else(|| {
+                host_binding_error(
+                    origin,
+                    format!("agent task specification is missing '{name}'"),
+                )
+            })
+    };
+    let string = |name: &str| match field(name)? {
+        TypedValue::String(value) => Ok(value.clone()),
+        _ => Err(host_binding_error(
+            origin,
+            format!("agent task field '{name}' must be a string"),
+        )),
+    };
+    let integer = |name: &str| match field(name)? {
+        TypedValue::Int(value) => Ok(*value),
+        _ => Err(host_binding_error(
+            origin,
+            format!("agent task field '{name}' must be an integer"),
+        )),
+    };
+    let role = match string("role")?.as_str() {
+        "general" => scheduler::AgentRole::General,
+        "explore" => scheduler::AgentRole::Explore,
+        "research" => scheduler::AgentRole::Research,
+        "code" => scheduler::AgentRole::Code,
+        role => {
+            return Err(host_binding_error(
+                origin,
+                format!("unknown agent role '{role}'"),
+            ))
+        }
+    };
+    let optional = |value: String| (!value.trim().is_empty()).then_some(value);
+    let max_turns = usize::try_from(integer("max-turns")?)
+        .map_err(|_| host_binding_error(origin, "agent max-turns must be non-negative"))?;
+    let timeout_ms = u64::try_from(integer("timeout-ms")?)
+        .map_err(|_| host_binding_error(origin, "agent timeout-ms must be non-negative"))?;
+    let max_output_bytes = usize::try_from(integer("max-output-bytes")?)
+        .map_err(|_| host_binding_error(origin, "agent max-output-bytes must be non-negative"))?;
+    Ok(scheduler::AgentTaskSpec {
+        task: string("task")?,
+        role,
+        background: optional(string("background")?),
+        provider: optional(string("provider")?),
+        model: optional(string("model")?),
+        budget: scheduler::AgentBudget {
+            max_turns,
+            timeout_ms,
+            max_output_bytes,
+        },
+    })
+}
+
 impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
     fn authorize_awaited_effect(
         &mut self,
@@ -3513,16 +3589,33 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 return Ok(vec![TypedValue::Unit]);
             }
             crate::vm::CapabilityKind::AgentSpawn => {
-                let [TypedValue::String(task)] = arguments.as_slice() else {
-                    return Err(host_binding_error(origin, "agent-spawn requires one task"));
+                let [argument] = arguments.as_slice() else {
+                    return Err(host_binding_error(
+                        origin,
+                        "agent spawn requires exactly one task or task specification",
+                    ));
+                };
+                let spec = if origin.word.as_deref() == Some("agent-spawn-with") {
+                    typed_agent_task_spec(argument, origin)?
+                } else {
+                    let TypedValue::String(task) = argument else {
+                        return Err(host_binding_error(origin, "agent-spawn requires one task"));
+                    };
+                    scheduler::AgentTaskSpec {
+                        task: task.clone(),
+                        role: Default::default(),
+                        background: None,
+                        provider: None,
+                        model: None,
+                        budget: Default::default(),
+                    }
                 };
                 let Some(binding) = self.scheduler.clone() else {
                     return Err(host_binding_error(origin, "agent scheduler is unavailable"));
                 };
                 let spawn_binding = binding.clone();
-                let task = task.clone();
                 let identity = binding
-                    .block_on(async move { spawn_binding.spawn(task).await })
+                    .block_on(async move { spawn_binding.spawn_spec(spec).await })
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 return Ok(vec![TypedValue::Task {
                     id: identity.task_id.to_string(),
