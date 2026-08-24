@@ -254,6 +254,7 @@ pub struct VmRevisionSnapshot {
 }
 
 pub const PROGRAM_RUNTIME_ARCHIVE_VERSION: u32 = 1;
+pub const PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION: u32 = 1;
 
 /// Versioned reducible state for a persistent shared VM. Authority, live host
 /// handles, pending external calls, and execute-once effect records belong to
@@ -263,6 +264,16 @@ pub struct ProgramRuntimeArchive {
     pub format_version: u32,
     pub current_revision: u64,
     pub revisions: Vec<VmRevisionSnapshot>,
+}
+
+/// Host-owned authority state persisted beside, never inside, the reducible
+/// VM archive. Restoring this record is an explicit application policy step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramRuntimeAuthorityState {
+    pub format_version: u32,
+    pub session_id: uuid::Uuid,
+    pub project_id: String,
+    pub ledger: CapabilityLedger,
 }
 
 /// One session's persistent language runtimes.
@@ -505,6 +516,18 @@ impl ProgramRuntime {
         Ok(runtime)
     }
 
+    /// Restore reducible VM state and host authority as two independently
+    /// validated records. The application chooses whether to supply the
+    /// authority record; loading a VM archive alone remains authority-free.
+    pub fn from_archive_with_authority(
+        archive: ProgramRuntimeArchive,
+        authority: ProgramRuntimeAuthorityState,
+    ) -> Result<Self> {
+        let mut runtime = Self::from_archive(archive)?;
+        runtime.restore_authority_state(authority)?;
+        Ok(runtime)
+    }
+
     pub fn with_automation(enabled: bool) -> Self {
         let automation = Arc::new(AutomationBroker::new(enabled));
         let typed_runtime = TypedRuntime::new();
@@ -737,6 +760,47 @@ impl ProgramRuntime {
             .lock()
             .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?
             .clone())
+    }
+
+    pub fn authority_state(&self) -> Result<ProgramRuntimeAuthorityState> {
+        Ok(ProgramRuntimeAuthorityState {
+            format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
+            session_id: self.session_id,
+            project_id: self.project_id.clone(),
+            ledger: self.capability_ledger()?,
+        })
+    }
+
+    /// Restore authority only before this runtime is shared with concurrent
+    /// callers. Active grants from another policy version are rejected rather
+    /// than silently becoming ambient or unexpectedly inactive.
+    pub fn restore_authority_state(
+        &mut self,
+        state: ProgramRuntimeAuthorityState,
+    ) -> Result<()> {
+        if state.format_version != PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION {
+            bail!(
+                "unsupported ProgramRuntime authority state version {}; expected {}",
+                state.format_version,
+                PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION
+            );
+        }
+        if state.project_id.trim().is_empty() {
+            bail!("ProgramRuntime authority state has no project identity");
+        }
+        let now = unix_time_ms();
+        if state.ledger.grants.grants.iter().any(|grant| {
+            grant.is_active(now) && grant.policy_hash != LOCAL_CAPABILITY_POLICY_HASH
+        }) {
+            bail!("ProgramRuntime authority state contains an active grant from another policy");
+        }
+        self.session_id = state.session_id;
+        self.project_id = state.project_id;
+        *self
+            .capability_ledger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))? = state.ledger;
+        self.refresh_active_grants()
     }
 
     /// Restore host-owned authority records independently of a VM checkpoint.
@@ -7135,6 +7199,67 @@ mod tests {
         assert_eq!(result.input_revision, 1);
         assert_eq!(result.output_revision, 2);
         assert_eq!(restored.revision_history().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn authority_state_restores_scoped_grants_beside_the_vm_archive() {
+        let runtime = ProgramRuntime::new();
+        runtime
+            .issue_typed_capability(
+                crate::vm::CapabilityRequirement::file(
+                    crate::vm::FileOperation::Read,
+                    crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+                ),
+                GrantScope::Session {
+                    session_id: runtime.capability_session_id(),
+                },
+                "test-user",
+                None,
+            )
+            .unwrap();
+        let authority: ProgramRuntimeAuthorityState = serde_json::from_str(
+            &serde_json::to_string(&runtime.authority_state().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let restored = ProgramRuntime::from_archive_with_authority(
+            runtime.archive().unwrap(),
+            authority,
+        )
+        .unwrap();
+
+        assert_eq!(
+            restored.capability_session_id(),
+            runtime.capability_session_id()
+        );
+        assert_eq!(
+            restored.capability_project_id(),
+            runtime.capability_project_id()
+        );
+        let read = restored
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(file-read (path \"Cargo.toml\"))",
+                ExecutionEffect::WorkspaceRead,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(read.status, ExecutionStatus::Completed);
+    }
+
+    #[test]
+    fn authority_restore_rejects_active_grants_from_another_policy() {
+        let runtime = ProgramRuntime::new();
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+            ))
+            .unwrap();
+        let mut state = runtime.authority_state().unwrap();
+        state.ledger.grants.grants[0].policy_hash = "obsolete-policy".into();
+        let mut restored = ProgramRuntime::new();
+        assert!(restored.restore_authority_state(state).is_err());
+        assert!(restored.capability_ledger().unwrap().grants.grants.is_empty());
     }
 
     #[tokio::test]
