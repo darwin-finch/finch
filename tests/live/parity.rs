@@ -9,8 +9,8 @@
 
 use finch::claude::Message;
 use finch::programs::{
-    wire_repair_request, ExecutionEffect, ProgramLanguage, BOOT_CAPSULE,
-    FORTH_LANGUAGE_DEFINITION, LISP_LANGUAGE_DEFINITION, VM_LANGUAGE_DEFINITION,
+    wire_repair_request, ExecutionEffect, ProgramLanguage, BOOT_CAPSULE, FORTH_LANGUAGE_DEFINITION,
+    LISP_LANGUAGE_DEFINITION, VM_LANGUAGE_DEFINITION,
 };
 use finch::providers::ProviderRequest;
 use finch::runtime::outcome::ExecutionStatus;
@@ -19,9 +19,8 @@ use std::time::Duration;
 
 use crate::{all_available_providers, live_tests_enabled};
 
-async fn execute_wire_source(source: &str) -> Result<String, String> {
+async fn execute_wire_source_in(runtime: &ProgramRuntime, source: &str) -> Result<String, String> {
     let language = ProgramLanguage::infer_wire_source(source).map_err(|error| error.to_string())?;
-    let runtime = ProgramRuntime::new();
     let outcome = runtime
         .submit_typed_only(ProgramSubmission {
             language,
@@ -46,6 +45,22 @@ async fn execute_wire_source(source: &str) -> Result<String, String> {
             .or_else(|| outcome.diagnostics.first().cloned())
             .unwrap_or_else(|| format!("wire execution ended as {:?}", outcome.status)))
     }
+}
+
+async fn execute_wire_source(source: &str) -> Result<String, String> {
+    execute_wire_source_in(&ProgramRuntime::new(), source).await
+}
+
+fn source_only_wire_system() -> String {
+    format!(
+        "{}\n\n{}\n\nNo introspection tools are attached to this source-only conformance request. \
+         The complete canonical language package follows; use it directly.\n\n{}\n\n{}\n\n{}",
+        finch::generators::claude::CODING_SYSTEM_PROMPT,
+        BOOT_CAPSULE,
+        VM_LANGUAGE_DEFINITION,
+        LISP_LANGUAGE_DEFINITION,
+        FORTH_LANGUAGE_DEFINITION,
+    )
 }
 
 /// Every configured provider must return non-empty text for a simple prompt.
@@ -173,15 +188,7 @@ async fn live_parity_finch_wire_programs() {
         return;
     }
 
-    let system = format!(
-        "{}\n\n{}\n\nNo introspection tools are attached to this source-only conformance request. \
-         The complete canonical language package follows; use it directly.\n\n{}\n\n{}\n\n{}",
-        finch::generators::claude::CODING_SYSTEM_PROMPT,
-        BOOT_CAPSULE,
-        VM_LANGUAGE_DEFINITION,
-        LISP_LANGUAGE_DEFINITION,
-        FORTH_LANGUAGE_DEFINITION,
-    );
+    let system = source_only_wire_system();
     let cases = [
         ("Emit exactly `ready` to the user.", "ready"),
         (
@@ -309,5 +316,141 @@ async fn live_parity_finch_wire_programs() {
             terminal
         );
         assert_eq!(terminal, 0, "{name} failed the Finch wire workload");
+    }
+}
+
+/// A provider conversation and its VM revision advance together: the second
+/// turn must be able to call a typed word committed by the first turn. This is
+/// the smallest fixture that distinguishes Finch from isolated code snippets.
+#[tokio::test]
+#[ignore = "live — set FINCH_LIVE_TESTS=1"]
+async fn live_parity_finch_wire_stateful_session() {
+    if !live_tests_enabled() {
+        return;
+    }
+    let providers = all_available_providers();
+    if providers.is_empty() {
+        eprintln!("skip: no providers configured");
+        return;
+    }
+
+    let system = source_only_wire_system();
+    for (name, provider) in providers {
+        let runtime = ProgramRuntime::new();
+        let first_request = "Define a typed function named `triple` that multiplies an integer by 3, then emit exactly `registered`.";
+        let first = tokio::time::timeout(
+            Duration::from_secs(60),
+            provider.send_message(
+                &ProviderRequest::new(vec![Message::user(first_request)])
+                    .with_system(system.clone())
+                    .with_max_tokens(512),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{name}: first stateful turn exceeded 60 seconds"))
+        .unwrap_or_else(|error| panic!("{name}: first stateful turn failed: {error}"))
+        .text();
+        finch::programs::corpus::capture_with_runtime_from_env(
+            &runtime,
+            name,
+            provider.default_model(),
+            "live_conformance_stateful",
+            finch::programs::corpus::WireCorpusAttempt::FirstPass,
+            &first,
+        );
+        let first_output = execute_wire_source_in(&runtime, &first)
+            .await
+            .unwrap_or_else(|error| panic!("{name}: first stateful program failed: {error}"));
+        assert_eq!(
+            first_output, "registered",
+            "{name}: unexpected first output"
+        );
+
+        let second_request =
+            "Using the `triple` function already committed by your previous program, compute triple 14 and emit only the decimal result. Do not redefine `triple`.";
+        let second = tokio::time::timeout(
+            Duration::from_secs(60),
+            provider.send_message(
+                &ProviderRequest::new(vec![
+                    Message::user(first_request),
+                    Message::assistant(first),
+                    Message::user(second_request),
+                ])
+                .with_system(system.clone())
+                .with_max_tokens(512),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{name}: second stateful turn exceeded 60 seconds"))
+        .unwrap_or_else(|error| panic!("{name}: second stateful turn failed: {error}"))
+        .text();
+        finch::programs::corpus::capture_with_runtime_from_env(
+            &runtime,
+            name,
+            provider.default_model(),
+            "live_conformance_stateful",
+            finch::programs::corpus::WireCorpusAttempt::FirstPass,
+            &second,
+        );
+        let second_output = execute_wire_source_in(&runtime, &second)
+            .await
+            .unwrap_or_else(|error| panic!("{name}: second stateful program failed: {error}"));
+        assert_eq!(second_output, "42", "{name}: unexpected second output");
+    }
+}
+
+/// Feed every configured provider the same malformed prior submission and the
+/// real structured repair request. This measures correction independently of
+/// whether a provider happened to fail an ordinary first-pass fixture.
+#[tokio::test]
+#[ignore = "live — set FINCH_LIVE_TESTS=1"]
+async fn live_parity_finch_wire_diagnostic_repair() {
+    if !live_tests_enabled() {
+        return;
+    }
+    let providers = all_available_providers();
+    if providers.is_empty() {
+        eprintln!("skip: no providers configured");
+        return;
+    }
+
+    let system = source_only_wire_system();
+    let request = "Compute 6 multiplied by 7 locally in Finch and emit only the decimal result.";
+    let rejected = "The answer is 42.";
+    let diagnostic = execute_wire_source_in(&ProgramRuntime::new(), rejected)
+        .await
+        .expect_err("raw prose must fail the wire contract");
+    let repair = wire_repair_request(rejected, &diagnostic);
+
+    for (name, provider) in providers {
+        let runtime = ProgramRuntime::new();
+        let replacement = tokio::time::timeout(
+            Duration::from_secs(60),
+            provider.send_message(
+                &ProviderRequest::new(vec![
+                    Message::user(request),
+                    Message::assistant(rejected),
+                    Message::user(repair.clone()),
+                ])
+                .with_system(system.clone())
+                .with_max_tokens(512),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{name}: diagnostic repair exceeded 60 seconds"))
+        .unwrap_or_else(|error| panic!("{name}: diagnostic repair failed: {error}"))
+        .text();
+        finch::programs::corpus::capture_with_runtime_from_env(
+            &runtime,
+            name,
+            provider.default_model(),
+            "live_conformance_repair",
+            finch::programs::corpus::WireCorpusAttempt::Repair,
+            &replacement,
+        );
+        let output = execute_wire_source_in(&runtime, &replacement)
+            .await
+            .unwrap_or_else(|error| panic!("{name}: repaired program failed: {error}"));
+        assert_eq!(output, "42", "{name}: unexpected repaired output");
     }
 }
