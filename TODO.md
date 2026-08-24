@@ -388,8 +388,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   contain no host-owned handles; authority is intentionally not serialized. Named-Brain
   compatibility execution now journals content-addressed typed checkpoints and restores them after
   daemon restart without replaying source or effects. A versioned `ProgramRuntimeArchive` now
-  validates and restores the complete reducible revision lineage while excluding grants, pending
-  calls, and execute-once effects. `ProgramRuntimeArchiveStore` now atomically persists that archive
+  validates and restores a bounded recent reducible revision window while excluding grants, pending
+  calls, and execute-once effects. The window records its base revision, retains at most 256 full
+  checkpoints, and continues monotonic revision identity after restoration; older history belongs
+  to the application event/checkpoint store. `ProgramRuntimeArchiveStore` atomically persists that archive
   with a SHA-256 integrity envelope and restores it only after current-verifier validation, while
   still refusing to persist authority or live handles. Bind the store to the converged application
   lifecycle, then add the managed heap and explicit host-handle restoration before treating every
@@ -409,9 +411,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   alone spawned, and the final release removes the tombstone or cooperatively cancels an unobserved
   worker. Private host suspensions are now hard-capped at 256 per `ProgramRuntime`; existing human
   approvals are never silently evicted, while a newly suspending run at capacity is cancelled with
-  its complete structured outcome and resource cleanup. Still bind an explicit participant/time
-  expiry policy to the application event log and define compaction for complete revision
-  checkpoints.
+  its complete structured outcome and resource cleanup. Reducible revision history is likewise
+  bounded to the most recent 256 full checkpoints with an explicit archive base revision. Still
+  bind an explicit participant/time expiry policy and any longer historical retention to the
+  application event/checkpoint log.
   If shared or cyclic language objects are later admitted, put them behind generation-checked
   managed handles and choose a checkpoint-aware tracing scheme from measured workloads; do not add
   a global collector merely for acyclic temporary values.
