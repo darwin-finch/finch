@@ -67,8 +67,9 @@ struct Args {
     #[arg(long = "exec", value_name = "SCRIPT")]
     exec_script: Option<PathBuf>,
 
-    /// Print the structured typed-runtime outcome for `--exec`.
-    #[arg(long, requires = "exec_script")]
+    /// Print the structured typed-runtime outcome for `--exec` or direct
+    /// `--forth` source.
+    #[arg(long)]
     json: bool,
 
     /// Join a named session (UUIDv5 derived from name).
@@ -490,6 +491,17 @@ async fn run_direct_typed_source(
     language: finch::programs::ProgramLanguage,
     source: &str,
 ) -> Result<()> {
+    run_direct_typed_source_with_json(language, source, false).await
+}
+
+/// Variant of [`run_direct_typed_source`] for non-interactive callers. It
+/// serializes the same `ExecutionOutcome` used by shebang-style `--exec`, so
+/// direct Co-Forth is not a second text-only result protocol.
+async fn run_direct_typed_source_with_json(
+    language: finch::programs::ProgramLanguage,
+    source: &str,
+    json_output: bool,
+) -> Result<()> {
     let runtime = finch::runtime::ProgramRuntime::new();
     runtime.grant_typed_capability(finch::vm::CapabilityRequirement {
         capability: finch::vm::CapabilityKind::SessionEmit,
@@ -509,7 +521,9 @@ async fn run_direct_typed_source(
         })
         .await?;
 
-    if let Some(presentation) = terminal_script_presentation(&outcome.output) {
+    if json_output {
+        println!("{}", serde_json::to_string(&outcome)?);
+    } else if let Some(presentation) = terminal_script_presentation(&outcome.output) {
         print!("{presentation}");
     }
     if outcome.status == finch::runtime::outcome::ExecutionStatus::Completed {
@@ -534,6 +548,13 @@ mod script_tests {
     fn shebang_style_exec_arguments_parse_as_a_script_invocation() {
         let args = Args::try_parse_from(["finch", "--exec", "reply.lisp", "--json"]).unwrap();
         assert_eq!(args.exec_script, Some(PathBuf::from("reply.lisp")));
+        assert!(args.json);
+    }
+
+    #[test]
+    fn direct_forth_json_arguments_parse_as_a_typed_invocation() {
+        let args = Args::try_parse_from(["finch", "--forth", "1 2 +", "--json"]).unwrap();
+        assert_eq!(args.forth.as_deref(), Some("1 2 +"));
         assert!(args.json);
     }
 
@@ -816,7 +837,16 @@ async fn main() -> Result<()> {
     // legacy interpreter's home; provider-facing/direct source must not gain
     // a bypass around the shared verifier and capability broker.
     if let Some(forth_expr) = &args.forth {
-        return run_direct_typed_source(finch::programs::ProgramLanguage::Forth, forth_expr).await;
+        return run_direct_typed_source_with_json(
+            finch::programs::ProgramLanguage::Forth,
+            forth_expr,
+            args.json,
+        )
+        .await;
+    }
+
+    if args.json {
+        anyhow::bail!("--json requires --exec <SCRIPT> or --forth <SOURCE>");
     }
 
     // Check for piped input BEFORE initializing anything else
