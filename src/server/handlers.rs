@@ -267,44 +267,66 @@ async fn push_named_brain_event(
         .push(&name, &request.sender, request.kind.clone())
         .map_err(|error| AppError(error).into_response())?;
 
-    let execution = match request.kind {
+    let result = match request.kind {
         BrainEventKind::Program { language, source } => {
-            Some(execute_named_brain_program(
+            let execution = execute_named_brain_program(
                 &server,
                 &name,
                 accepted.seq,
                 language,
                 &source,
-            ).await)
+            )
+            .await;
+            Some(push_named_brain_result(
+                &server,
+                &name,
+                accepted.seq,
+                execution,
+            ))
         }
         BrainEventKind::Prompt { text } => {
-            Some(execute_named_brain_prompt(&server, &name, &text).await)
+            let execution = execute_named_brain_prompt(&server, &name, &text).await;
+            Some(match execution {
+                Ok(result) => Ok(result),
+                Err(error) => push_named_brain_result(
+                    &server,
+                    &name,
+                    accepted.seq,
+                    Err(error),
+                ),
+            })
         }
         BrainEventKind::ProgramPopped { .. }
         | BrainEventKind::Result { .. }
         | BrainEventKind::RuntimeCommitted { .. } => None,
     };
-    let result = execution.map(|result| {
-        let (output, error) = match result {
-            Ok(output) => (output, None),
-            Err(error) => (String::new(), Some(error.to_string())),
-        };
-        server.shared_brains().push(
-            &name,
-            "daemon",
-            BrainEventKind::Result {
-                request_seq: accepted.seq,
-                output,
-                error,
-            },
-        )
-    });
     let result = match result {
         Some(result) => Some(result.map_err(|error| AppError(error).into_response())?),
         None => None,
     };
 
     Ok(Json(PushNamedBrainResponse { accepted, result }))
+}
+
+fn push_named_brain_result(
+    server: &AgentServer,
+    name: &str,
+    request_seq: u64,
+    result: anyhow::Result<String>,
+) -> anyhow::Result<crate::brain::shared::BrainEvent> {
+    let (output, error) = match result {
+        Ok(output) => (output, None),
+        Err(error) => (String::new(), Some(error.to_string())),
+    };
+    server.shared_brains().push(
+        name,
+        "daemon",
+        crate::brain::shared::BrainEventKind::Result {
+            request_seq,
+            output,
+            error,
+        },
+    )
 }
 
 async fn execute_named_brain_program(
@@ -347,7 +369,7 @@ async fn execute_named_brain_prompt(
     server: &AgentServer,
     name: &str,
     prompt: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<crate::brain::shared::BrainEvent> {
     let provider = server
         .provider_for_name(None)
         .ok_or_else(|| anyhow::anyhow!("no LLM provider configured on the brain host"))?;
@@ -364,44 +386,80 @@ async fn execute_named_brain_prompt(
         .map(|event| format!("#{} {}: {:?}", event.seq, event.sender, event.kind))
         .collect::<Vec<_>>()
         .join("\n");
-    let request = crate::providers::ProviderRequest::new(vec![Message::user(prompt)])
-        .with_system(format!(
-            "{}\n\nYou are attached to Finch brain {name}. Its sole execution environment is {}:{}.\n\
+    let system = format!(
+        "{}\n\nYou are attached to Finch brain {name}. Its sole execution environment is {}:{}.\n\
              Reply only with one raw executable Finch Lisp or Co-Forth wire program. All user-facing prose must be emitted with say.\n\
              All file and process effects belong to that workspace. Its authoritative recent event log follows.\n{context}",
-            crate::programs::BOOT_CAPSULE,
-            snapshot.environment.machine,
-            snapshot.environment.workspace.display(),
-        ));
-    let response = provider.send_message(&request).await?;
-    let source = response
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
-        .trim()
-        .to_string();
-    if source.is_empty() {
-        anyhow::bail!("provider returned no Finch wire program");
+        crate::programs::BOOT_CAPSULE,
+        snapshot.environment.machine,
+        snapshot.environment.workspace.display(),
+    );
+    let mut messages = vec![Message::user(prompt)];
+
+    for attempt in 0..=1 {
+        let request = crate::providers::ProviderRequest::new(messages.clone())
+            .with_system(system.clone());
+        let response = provider.send_message(&request).await?;
+        let source = response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+            .trim()
+            .to_string();
+        if source.is_empty() {
+            anyhow::bail!("provider returned no Finch wire program");
+        }
+
+        // Record malformed source too. `infer_source` is presentation-only;
+        // the typed frontend remains authoritative and returns the diagnostic.
+        let shared_language = match crate::programs::ProgramLanguage::infer_source(&source) {
+            crate::programs::ProgramLanguage::Forth => {
+                crate::brain::shared::ProgramLanguage::Forth
+            }
+            crate::programs::ProgramLanguage::Lisp => {
+                crate::brain::shared::ProgramLanguage::Lisp
+            }
+        };
+        let program = server.shared_brains().push(
+            name,
+            "provider",
+            crate::brain::shared::BrainEventKind::Program {
+                language: shared_language,
+                source: source.clone(),
+            },
+        )?;
+        let execution = execute_named_brain_program(
+            server,
+            name,
+            program.seq,
+            shared_language,
+            &source,
+        )
+        .await;
+        let diagnostic = execution.as_ref().err().map(ToString::to_string);
+        let result = push_named_brain_result(server, name, program.seq, execution)?;
+
+        let Some(diagnostic) = diagnostic else {
+            return Ok(result);
+        };
+        if attempt == 0 && crate::programs::is_repairable_wire_diagnostic(&diagnostic) {
+            messages.push(Message::assistant(source.clone()));
+            messages.push(Message::user(crate::programs::wire_repair_request(
+                &source,
+                &diagnostic,
+            )));
+            continue;
+        }
+        return Ok(result);
     }
-    let language = crate::programs::ProgramLanguage::infer_wire_source(&source)?;
-    let shared_language = match language {
-        crate::programs::ProgramLanguage::Forth => crate::brain::shared::ProgramLanguage::Forth,
-        crate::programs::ProgramLanguage::Lisp => crate::brain::shared::ProgramLanguage::Lisp,
-    };
-    let program = server.shared_brains().push(
-        name,
-        "provider",
-        crate::brain::shared::BrainEventKind::Program {
-            language: shared_language,
-            source: source.clone(),
-        },
-    )?;
-    execute_named_brain_program(server, name, program.seq, shared_language, &source).await
+
+    // The loop always returns after the initial response or its sole repair.
+    anyhow::bail!("provider wire repair did not terminate")
 }
 
 async fn resume_named_brain_yields(

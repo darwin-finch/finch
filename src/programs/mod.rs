@@ -21,6 +21,35 @@ pub const FORTH_LANGUAGE_DEFINITION: &str =
 pub const LISP_LANGUAGE_DEFINITION: &str = include_str!("../../vocabulary/language/FINCH_LISP.md");
 pub const LANGUAGE_SCHEMA: &str = include_str!("../../vocabulary/language/schema.json");
 
+/// Whether a rejected wire program is eligible for one source-only repair.
+///
+/// These are compile/link boundary diagnostics. Runtime limits, cancellation,
+/// approvals, and host-effect failures deliberately do not match: callers must
+/// never turn retrying model output into implicit effect replay.
+pub fn is_repairable_wire_diagnostic(diagnostic: &str) -> bool {
+    matches!(
+        diagnostic,
+        value if value.starts_with("E-READ-")
+            || value.starts_with("E-TYPE-")
+            || value.starts_with("E-STACK-")
+            || value.starts_with("E-LISP-")
+            || value.starts_with("E-FORTH-")
+            || value.starts_with("E-LINK-")
+            || value.starts_with("E-CAP-")
+            || value.starts_with("E-WIRE-")
+    )
+}
+
+/// Construct the provider-neutral correction request for a rejected program.
+pub fn wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
+    format!(
+        "The preceding Finch VM wire program was rejected before execution. \
+         Re-emit exactly one complete raw Finch Lisp or Co-Forth program; do not use Markdown, prose, or tools.\n\n\
+         Rejected source:\n---\n{rejected_source}\n---\n\
+         Diagnostic:\n{diagnostic}"
+    )
+}
+
 /// One complete Co-Forth lexical token observed while a provider response is
 /// still streaming. The runtime must not execute these incrementally: callers
 /// use them only for safe progress/display projection before the complete
@@ -1354,5 +1383,22 @@ mod tests {
         let definition =
             ProgramDefinition::from_source_file(&path, &root, ProgramScope::Project).unwrap();
         assert_eq!(definition.documentation, "Return twice an integer.");
+    }
+
+    #[test]
+    fn wire_repair_contract_excludes_execution_failures() {
+        assert!(is_repairable_wire_diagnostic(
+            "E-LINK-002: unknown Co-Forth word"
+        ));
+        assert!(is_repairable_wire_diagnostic(
+            "E-WIRE-002: Markdown is not source"
+        ));
+        assert!(!is_repairable_wire_diagnostic(
+            "E-LIMIT-001: fuel exhausted"
+        ));
+
+        let request = wire_repair_request("Hello!", "E-LINK-002: unknown word");
+        assert!(request.contains("exactly one complete raw Finch Lisp or Co-Forth program"));
+        assert!(request.contains("Hello!"));
     }
 }

@@ -2443,26 +2443,11 @@ fn can_repair_one_shot_wire_outcome(outcome: &finch::runtime::outcome::Execution
 }
 
 fn is_repairable_one_shot_wire_diagnostic(diagnostic: &str) -> bool {
-    matches!(
-        diagnostic,
-        value if value.starts_with("E-READ-")
-            || value.starts_with("E-TYPE-")
-            || value.starts_with("E-STACK-")
-            || value.starts_with("E-LISP-")
-            || value.starts_with("E-FORTH-")
-            || value.starts_with("E-LINK-")
-            || value.starts_with("E-CAP-")
-            || value.starts_with("E-WIRE-")
-    )
+    finch::programs::is_repairable_wire_diagnostic(diagnostic)
 }
 
 fn one_shot_wire_repair_request(rejected_source: &str, diagnostic: &str) -> String {
-    format!(
-        "The preceding Finch VM wire program was rejected before execution. \
-         Re-emit exactly one complete raw Finch Lisp or Co-Forth program; do not use Markdown, prose, or tools.\n\n\
-         Rejected source:\n---\n{rejected_source}\n---\n\
-         Diagnostic:\n{diagnostic}"
-    )
+    finch::programs::wire_repair_request(rejected_source, diagnostic)
 }
 
 /// Run interactive setup wizard
