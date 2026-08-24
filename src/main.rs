@@ -675,7 +675,7 @@ mod script_tests {
 
         let request = one_shot_wire_repair_request("Hello!", "E-LINK-002: unknown word");
         assert!(request.contains("It was forth; repair it as forth"));
-        assert!(request.contains("exactly one complete raw Finch forth program"));
+        assert!(request.contains("exactly one complete raw Finch forth ProgramSubmission"));
         assert!(request.contains("Hello!"));
         assert!(request.contains("E-LINK-002"));
     }
@@ -683,9 +683,8 @@ mod script_tests {
     #[test]
     fn daemon_and_teacher_one_shot_paths_share_the_vm_wire_contract() {
         let prompt = vm_wire_system_prompt();
-        assert!(
-            prompt.contains("Every text response is exactly one complete executable Finch program")
-        );
+        assert!(prompt.contains("complete body of every text response is one"));
+        assert!(prompt.contains("`ProgramSubmission`"));
         assert!(prompt.contains("Default to Lisp"));
     }
 
