@@ -30,6 +30,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   named `break` after the loop verifier is generalized to check each target's declared result
   stack row. Simple named stack-preserving `break`/`continue` already lower to verified loop
   edges; do not add unrestricted jumps or C-style fallthrough switches.
+- [ ] Add explicit typed result propagation after branch forms are stable: a Lisp/Co-Forth
+  `try`/`?`-style form may early-return an `err` only from a function whose declared result is a
+  compatible `result<T,E>`. Keep `match-result`/`if-ok` for recovery and `unwrap` as a deliberate
+  diagnostic trap; do not introduce dynamically catchable language exceptions or silently replay
+  host effects.
 - [x] Specify and implement the provider wire discriminator: leading `(` selects Lisp and all other
   valid program starts select Co-Forth; make the receiver incrementally tokenize Co-Forth while
   retaining complete-program verification and clear malformed-wire diagnostics.
