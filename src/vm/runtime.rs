@@ -2397,6 +2397,37 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_round_trips_a_closure_bearing_record_across_frontends() {
+        let mut runtime = TypedRuntime::new();
+        let created = runtime.execute(
+            ProgramLanguage::Lisp,
+            "record-closure.lisp",
+            "{ :run (lambda ((x : int)) (+ x 1)) }",
+            1_000,
+        );
+        assert_eq!(created.status, TypedExecutionStatus::Completed);
+
+        let encoded = serde_json::to_string(
+            &runtime
+                .checkpoint()
+                .expect("closure-bearing record is VM-owned data"),
+        )
+        .expect("checkpoint must serialize");
+        let checkpoint = serde_json::from_str(&encoded).expect("checkpoint must deserialize");
+        let mut restored = TypedRuntime::from_checkpoint(checkpoint)
+            .expect("closure body and record value must be reverified on restore");
+        let invoked = restored.execute(
+            ProgramLanguage::Forth,
+            "record-closure.forth",
+            "\"run\" record-get unwrap 41 swap execute",
+            1_000,
+        );
+
+        assert_eq!(invoked.status, TypedExecutionStatus::Completed);
+        assert_eq!(restored.stack(), &[TypedValue::Int(42)]);
+    }
+
+    #[test]
     fn checkpoint_rejects_host_owned_handles() {
         let value = TypedValue::Stream {
             id: "cursor-1".into(),
