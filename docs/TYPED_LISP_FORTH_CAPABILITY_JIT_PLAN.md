@@ -67,9 +67,10 @@ remove that capability.
 The repository now contains the first verified typed path: both frontends lower directly to typed
 IR, the typed runtime owns a `Vec<TypedValue>` stack, effects are resource-scoped capability
 requirements, diagnostics carry stable codes, and host execution is transactional. Ordinary
-`ProgramRuntime`, provider, scheduler, and script submission are typed-only. The legacy Co-Forth
-interpreter and native Lisp evaluator remain behind explicitly named migration-only APIs while
-historical programs are ported; they are not a fallback. Core words are now generated through one
+`ProgramRuntime`, provider, scheduler, and script submission are typed-only. The native Lisp
+evaluator and its effectful standard library have been removed; the retained Lisp reader lowers
+only into shared typed IR. The legacy Co-Forth interpreter remains behind explicitly named
+migration-only APIs while historical programs are ported; it is not a fallback. Core words are now generated through one
 immutable signature/documentation/implementation registry, and the broker has a real typed
 `(execution_id, sequence)` suspension/resumption boundary with an effect journal. Persisted and
 promoted vocabulary still needs the same registry migration, while durable approval policy,
@@ -1332,7 +1333,7 @@ measured target rate without full vocabulary injection.
 
 - Reject or explicitly sandbox untyped definitions that cannot be migrated.
 - Remove source-spelling effect inference.
-- Remove native Lisp fallback after semantic and persistence parity.
+- Keep native Lisp execution removed; new semantics must lower to shared typed IR.
 - Remove legacy direct model tools after VM-native equivalents meet compatibility gates.
 - Keep explicit versioned import/conversion tools for old stored programs.
 
@@ -1391,8 +1392,8 @@ revoked. JIT-enabled and interpreter-only configurations run the same conformanc
 5. Version persisted definitions and retain their original runtime requirement for replay.
 6. Never silently reinterpret an old program under new word definitions or language semantics.
 7. Provide automated rewrites only when source and effect behavior are provably preserved.
-8. Remove the native Lisp fallback only after conformance, closure, macro, capability, persistence,
-   and diagnostic parity gates pass.
+8. Keep the removed native Lisp evaluator from returning as a compatibility escape hatch; missing
+   closure, macro, capability, persistence, or diagnostic semantics must be implemented in shared IR.
 
 ## Initial module layout
 

@@ -198,9 +198,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Remove the Lisp-to-Forth text compiler, native Lisp fallback, source-text effect inference,
   and duplicate direct model-tool paths after conformance parity. The named-Brain Program/Prompt
   compatibility endpoints now execute only the shared typed `ProgramRuntime`; other legacy paths
-  remain quarantined. The interactive event loop no longer constructs a native Lisp evaluator or
-  replays the obsolete `lisp_env` table at startup; its reader remains migration-only until older
-  databases have been projected into the typed program registry.
+  remain quarantined. The native Lisp evaluator and effectful standard library are now removed;
+  only its neutral reader syntax tree remains for direct lowering to shared IR. The interactive
+  event loop no longer replays the obsolete `lisp_env` table; its reader remains migration-only
+  until older databases have been projected into the typed program registry.
 - [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
   tests, concurrency tests, and provider conformance tests. Manual configured-cloud smoke checks on
   2026-08-23 successfully executed provider-emitted Lisp `say`, Lisp arithmetic, and Co-Forth

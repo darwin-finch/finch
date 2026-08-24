@@ -1,112 +1,5 @@
-/// Lisp value types.
-///
-/// Clone is O(1) for Lambda (Arc-wrapped) and O(n) for Str/Bytes/List.
-/// Every variant is Send so values can cross task boundaries.
-///
-/// `Val` is serializable for peer exchange.  `Lambda`, `NativeFn`, and
-/// `SshSession` are not portable across the wire and serialize as the
-/// symbol `#<opaque>`.  Deserializing that symbol reconstructs
-/// `Val::Symbol("#<opaque>")`, which is safe but not callable.
+/// Neutral Lisp reader values used as a syntax tree by the typed frontend.
 use std::fmt;
-use std::sync::Arc;
-use uuid::Uuid;
-
-use super::env::EnvRef;
-
-// ── Type language ─────────────────────────────────────────────────────────────
-
-/// A first-class type that can appear in annotations.
-///
-/// Syntax inside Lisp source:
-/// ```text
-/// int  float  str  bool  bytes  list  symbol  nil  any
-/// (-> arg-type... return-type)          ; function type
-/// ```
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum Type {
-    Int,
-    Float,
-    Str,
-    Bool,
-    Bytes,
-    List,
-    Symbol,
-    Nil,
-    Any,
-    /// `(-> arg... ret)`
-    Fn(Vec<Type>, Box<Type>),
-}
-
-impl Type {
-    /// Parse a `Val` (read from source) into a `Type`.
-    pub fn from_val(v: &Val) -> anyhow::Result<Type> {
-        match v {
-            Val::Symbol(s) => match s.as_str() {
-                "int" => Ok(Type::Int),
-                "float" => Ok(Type::Float),
-                "str" | "string" => Ok(Type::Str),
-                "bool" => Ok(Type::Bool),
-                "bytes" => Ok(Type::Bytes),
-                "list" => Ok(Type::List),
-                "symbol" => Ok(Type::Symbol),
-                "nil" => Ok(Type::Nil),
-                "any" => Ok(Type::Any),
-                other => anyhow::bail!("unknown type: {other}"),
-            },
-            Val::List(parts) if parts.first() == Some(&Val::Symbol("->".to_string())) => {
-                if parts.len() < 2 {
-                    anyhow::bail!("-> requires at least a return type");
-                }
-                let ret = Type::from_val(parts.last().unwrap())?;
-                let args = parts[1..parts.len() - 1]
-                    .iter()
-                    .map(Type::from_val)
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                Ok(Type::Fn(args, Box::new(ret)))
-            }
-            other => anyhow::bail!("expected type annotation, got {}", other.type_name()),
-        }
-    }
-
-    /// Return `true` if `v` satisfies this type.
-    pub fn check(&self, v: &Val) -> bool {
-        match self {
-            Type::Any => true,
-            Type::Int => matches!(v, Val::Int(_)),
-            Type::Float => matches!(v, Val::Float(_) | Val::Int(_)),
-            Type::Str => matches!(v, Val::Str(_)),
-            Type::Bool => matches!(v, Val::Bool(_)),
-            Type::Bytes => matches!(v, Val::Bytes(_)),
-            Type::List => matches!(v, Val::List(_) | Val::Nil),
-            Type::Symbol => matches!(v, Val::Symbol(_)),
-            Type::Nil => matches!(v, Val::Nil),
-            Type::Fn(_, _) => matches!(v, Val::Lambda(_) | Val::Native(_)),
-        }
-    }
-}
-
-impl fmt::Display for Type {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Type::Int => write!(f, "int"),
-            Type::Float => write!(f, "float"),
-            Type::Str => write!(f, "str"),
-            Type::Bool => write!(f, "bool"),
-            Type::Bytes => write!(f, "bytes"),
-            Type::List => write!(f, "list"),
-            Type::Symbol => write!(f, "symbol"),
-            Type::Nil => write!(f, "nil"),
-            Type::Any => write!(f, "any"),
-            Type::Fn(args, ret) => {
-                write!(f, "(-> ")?;
-                for a in args {
-                    write!(f, "{a} ")?;
-                }
-                write!(f, "{ret})")
-            }
-        }
-    }
-}
 
 // ── Serde ─────────────────────────────────────────────────────────────────────
 
@@ -160,13 +53,6 @@ impl serde::Serialize for Val {
                 let mut m = s.serialize_map(Some(2))?;
                 m.serialize_entry("t", "list")?;
                 m.serialize_entry("v", vs)?;
-                m.end()
-            }
-            // Not portable across the wire — serialize as opaque symbol.
-            Val::Lambda(_) | Val::Native(_) | Val::SshSession(_) => {
-                let mut m = s.serialize_map(Some(2))?;
-                m.serialize_entry("t", "symbol")?;
-                m.serialize_entry("v", "#<opaque>")?;
                 m.end()
             }
         }
@@ -292,39 +178,6 @@ pub enum Val {
     Bytes(Vec<u8>),
     /// Proper list
     List(Vec<Val>),
-    /// Closure (params + captured env)
-    Lambda(Arc<Lambda>),
-    /// Synchronous native function (arithmetic, string ops, crypto)
-    Native(NativeFn),
-    /// SSH session handle — actual session lives in LispCtx::ssh_sessions
-    SshSession(Uuid),
-}
-
-#[derive(Clone, Debug)]
-pub struct Lambda {
-    /// Positional parameter names.
-    pub params: Vec<String>,
-    /// Optional type annotation for each param, parallel to `params`.
-    pub param_types: Vec<Option<Type>>,
-    /// If true, last param collects remaining args into a list.
-    pub variadic: bool,
-    pub body: Box<Val>,
-    pub env: EnvRef,
-    /// Optional declared return type; checked after body evaluation.
-    pub return_type: Option<Type>,
-}
-
-/// A named synchronous built-in function.
-#[derive(Clone)]
-pub struct NativeFn {
-    pub name: &'static str,
-    pub f: fn(&[Val]) -> anyhow::Result<Val>,
-}
-
-impl fmt::Debug for NativeFn {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "#<builtin:{}>", self.name)
-    }
 }
 
 // ── Display ───────────────────────────────────────────────────────────────────
@@ -361,9 +214,6 @@ impl fmt::Display for Val {
                 }
                 write!(f, ")")
             }
-            Val::Lambda(_) => write!(f, "#<lambda>"),
-            Val::Native(n) => write!(f, "#<builtin:{}>", n.name),
-            Val::SshSession(id) => write!(f, "#<ssh:{}>", &id.to_string()[..8]),
         }
     }
 }
@@ -391,9 +241,6 @@ impl Val {
             Val::Symbol(_) => "symbol",
             Val::Bytes(_) => "bytes",
             Val::List(_) => "list",
-            Val::Lambda(_) => "lambda",
-            Val::Native(_) => "builtin",
-            Val::SshSession(_) => "ssh-session",
         }
     }
 
@@ -436,12 +283,6 @@ impl Val {
         }
     }
 
-    pub fn as_ssh_id(&self) -> anyhow::Result<Uuid> {
-        match self {
-            Val::SshSession(id) => Ok(*id),
-            other => anyhow::bail!("expected ssh-session, got {}", other.type_name()),
-        }
-    }
 }
 
 impl PartialEq for Val {
@@ -455,7 +296,6 @@ impl PartialEq for Val {
             (Val::Symbol(a), Val::Symbol(b)) => a == b,
             (Val::Bytes(a), Val::Bytes(b)) => a == b,
             (Val::List(a), Val::List(b)) => a == b,
-            (Val::SshSession(a), Val::SshSession(b)) => a == b,
             _ => false,
         }
     }
@@ -542,18 +382,4 @@ mod tests {
         assert_eq!(val, back);
     }
 
-    #[test]
-    fn test_val_opaque_serializes_as_symbol() {
-        let val = Val::Lambda(std::sync::Arc::new(crate::lisp::types::Lambda {
-            params: vec![],
-            param_types: vec![],
-            variadic: false,
-            body: Box::new(Val::Nil),
-            env: super::super::env::Env::new_root(),
-            return_type: None,
-        }));
-        let json = serde_json::to_string(&val).unwrap();
-        let back: Val = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, Val::Symbol("#<opaque>".to_string()));
-    }
 }

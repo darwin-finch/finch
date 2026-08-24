@@ -2,7 +2,7 @@
 ///
 /// Each `SshSession` wraps a `russh::client::Handle` (the authenticated
 /// session object).  Sessions are stored in `SshSessionStore` and
-/// referenced from Lisp via `Val::SshSession(Uuid)`.
+/// referenced by host adapters through an opaque session identifier.
 ///
 /// Security note: `check_server_key` currently accepts all host keys.
 /// A future version will verify against `~/.finch/known_hosts`.

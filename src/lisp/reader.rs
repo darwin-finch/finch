@@ -270,6 +270,31 @@ enum Tok {
     JsonVal(Val), // from {...} JSON literal
 }
 
+/// Convert pasted JSON literals into the neutral Lisp syntax tree consumed by
+/// the typed frontend. This is reader behavior, not a native evaluator builtin.
+fn json_value_to_syntax(value: serde_json::Value) -> Val {
+    match value {
+        serde_json::Value::Null => Val::Nil,
+        serde_json::Value::Bool(value) => Val::Bool(value),
+        serde_json::Value::Number(value) => value
+            .as_i64()
+            .map(Val::Int)
+            .unwrap_or_else(|| Val::Float(value.as_f64().unwrap_or(f64::NAN))),
+        serde_json::Value::String(value) => Val::Str(value),
+        serde_json::Value::Array(values) => {
+            Val::List(values.into_iter().map(json_value_to_syntax).collect())
+        }
+        serde_json::Value::Object(values) => Val::List(
+            values
+                .into_iter()
+                .map(|(key, value)| {
+                    Val::List(vec![Val::Str(key), json_value_to_syntax(value)])
+                })
+                .collect(),
+        ),
+    }
+}
+
 fn tokenize(src: &str) -> Result<Vec<Tok>> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = src.chars().collect();
@@ -370,7 +395,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                 let json_src: String = chars[start..i].iter().collect();
                 let jv: serde_json::Value = serde_json::from_str(&json_src)
                     .map_err(|e| anyhow::anyhow!("JSON array literal: {e}"))?;
-                tokens.push(Tok::JsonVal(crate::lisp::stdlib::json_val_to_lisp(jv)));
+                tokens.push(Tok::JsonVal(json_value_to_syntax(jv)));
             }
             '{' => {
                 if brace_starts_typed_record(&chars, i) {
@@ -416,7 +441,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                 let json_src: String = chars[start..i].iter().collect();
                 let jv: serde_json::Value = serde_json::from_str(&json_src)
                     .map_err(|e| anyhow::anyhow!("JSON literal: {e}"))?;
-                tokens.push(Tok::JsonVal(crate::lisp::stdlib::json_val_to_lisp(jv)));
+                tokens.push(Tok::JsonVal(json_value_to_syntax(jv)));
             }
             '}' => {
                 tokens.push(Tok::RBrace);
@@ -1077,11 +1102,11 @@ mod tests {
         // a typed program must still cross the explicit json-* boundary.
         assert_eq!(
             parse1("{\"name\": \"Ada\"}"),
-            crate::lisp::stdlib::json_val_to_lisp(serde_json::json!({"name": "Ada"}))
+            json_value_to_syntax(serde_json::json!({"name": "Ada"}))
         );
         assert_eq!(
             parse1("{}"),
-            crate::lisp::stdlib::json_val_to_lisp(serde_json::json!({}))
+            json_value_to_syntax(serde_json::json!({}))
         );
         let spanned = parse_str_spanned("{ :name \"Ada\" :age 37 }").unwrap();
         assert_eq!(spanned[0].children.len(), 3);

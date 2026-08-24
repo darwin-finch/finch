@@ -75,8 +75,9 @@ No Brain convergence phase beyond inventory and tests begins until all of these 
   external effects are separately journaled.
 - Agent spawning, joining, cancellation, model selection, starting context, MemTree, automation,
   and scheduled callbacks run through typed VM primitives without shelling out.
-- The Lisp-to-Forth text path, native Lisp fallback, source-text effect inference, and duplicate
-  legacy model-tool paths are removed or isolated behind an explicit versioned legacy boundary.
+- The removed native Lisp evaluator stays removed; the Lisp-to-Forth text path, source-text effect
+  inference, and duplicate legacy model-tool paths are removed or isolated behind an explicit
+  versioned legacy boundary.
 - Parser, verifier, interpreter, broker, host-binding, concurrency, provider-conformance, and UI
   suites pass, including adversarial selector and rollback tests.
 - Independent executions do not require a process-wide GIL.
