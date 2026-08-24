@@ -243,6 +243,20 @@ async fn push_named_brain_event(
     use crate::brain::shared::BrainEventKind;
 
     check_brain_access(&server, addr, &headers).await?;
+    if !matches!(
+        request.kind,
+        BrainEventKind::Prompt { .. }
+            | BrainEventKind::Program { .. }
+            | BrainEventKind::ProgramPopped { .. }
+    ) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "internal Brain events cannot be submitted through the program endpoint"
+            })),
+        )
+            .into_response());
+    }
     // A Brain is one ordered conversation and one authoritative VM revision.
     // Hold its lane from input acceptance through the corresponding result so
     // two attached consoles cannot race commits or interleave turn events.
@@ -287,7 +301,9 @@ async fn push_named_brain_event(
         }
         BrainEventKind::ProgramPopped { .. }
         | BrainEventKind::Result { .. }
-        | BrainEventKind::RuntimeCommitted { .. } => None,
+        | BrainEventKind::RuntimeCommitted { .. }
+        | BrainEventKind::ClientAttached { .. }
+        | BrainEventKind::ClientDetached { .. } => None,
     };
     let result = match result {
         Some(result) => Some(result.map_err(|error| AppError(error).into_response())?),
@@ -503,7 +519,14 @@ fn named_brain_provider_messages(
         .events
         .iter()
         .rev()
-        .filter(|event| !matches!(event.kind, BrainEventKind::RuntimeCommitted { .. }))
+        .filter(|event| {
+            !matches!(
+                event.kind,
+                BrainEventKind::RuntimeCommitted { .. }
+                    | BrainEventKind::ClientAttached { .. }
+                    | BrainEventKind::ClientDetached { .. }
+            )
+        })
         .take(80)
         .collect::<Vec<_>>();
     events
@@ -544,7 +567,9 @@ fn named_brain_provider_messages(
                     "[Finch VM result for program event #{request_seq}]\n{result}"
                 ))
             }
-            BrainEventKind::RuntimeCommitted { .. } => unreachable!("filtered above"),
+            BrainEventKind::RuntimeCommitted { .. }
+            | BrainEventKind::ClientAttached { .. }
+            | BrainEventKind::ClientDetached { .. } => unreachable!("filtered above"),
         })
         .collect()
 }
@@ -1796,6 +1821,7 @@ mod named_brain_provider_context_tests {
                 ),
             ],
             program_stack: Vec::new(),
+            attachments: Vec::new(),
         };
 
         let messages = named_brain_provider_messages(&snapshot);

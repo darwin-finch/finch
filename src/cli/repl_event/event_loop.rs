@@ -3402,6 +3402,15 @@ Rules:\n\
     fn render_remote_brain_event(&self, event: &crate::brain::shared::BrainEvent) {
         use crate::brain::shared::BrainEventKind;
         match &event.kind {
+            BrainEventKind::ClientAttached {
+                subject, role, ..
+            } => self.output_manager.write_info(format!(
+                "{subject} attached as {}",
+                format!("{role:?}").to_lowercase()
+            )),
+            BrainEventKind::ClientDetached { attachment_id } => self
+                .output_manager
+                .write_info(format!("attachment {} disconnected", attachment_id.0)),
             BrainEventKind::Prompt { text } => self
                 .output_manager
                 .write_user(format!("{}: {text}", event.sender)),

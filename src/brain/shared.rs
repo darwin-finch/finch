@@ -34,6 +34,42 @@ impl BrainId {
     }
 }
 
+/// Stable identity of one client projection of a Brain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AttachmentId(pub uuid::Uuid);
+
+impl AttachmentId {
+    fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentRole {
+    Runner,
+    Driver,
+    Consultant,
+    Observer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainAttachment {
+    pub attachment_id: AttachmentId,
+    pub subject: String,
+    pub role: AttachmentRole,
+    pub acknowledged_seq: u64,
+    pub connected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AttachmentCursorFile {
+    version: u32,
+    brain_id: BrainId,
+    cursors: HashMap<AttachmentId, u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct BrainMetadata {
     version: u32,
@@ -62,6 +98,14 @@ pub struct BrainEnvironment {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrainEventKind {
+    ClientAttached {
+        attachment_id: AttachmentId,
+        subject: String,
+        role: AttachmentRole,
+    },
+    ClientDetached {
+        attachment_id: AttachmentId,
+    },
     Prompt {
         text: String,
     },
@@ -122,6 +166,7 @@ pub struct BrainSnapshot {
     pub revision: u64,
     pub events: Vec<BrainEvent>,
     pub program_stack: Vec<BrainProgram>,
+    pub attachments: Vec<BrainAttachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -135,6 +180,7 @@ struct BrainState {
     brain_id: BrainId,
     events: Vec<BrainEvent>,
     program_stack: Vec<BrainProgram>,
+    attachments: HashMap<AttachmentId, BrainAttachment>,
     runtime_checkpoint: Option<RuntimeCheckpointState>,
     runtime_commit_count: u64,
     tx: broadcast::Sender<BrainEvent>,
@@ -154,6 +200,7 @@ impl BrainState {
             brain_id,
             events: Vec::new(),
             program_stack: Vec::new(),
+            attachments: HashMap::new(),
             runtime_checkpoint: None,
             runtime_commit_count: 0,
             tx,
@@ -169,6 +216,32 @@ impl BrainState {
 
     fn apply(&mut self, event: BrainEvent) {
         match &event.kind {
+            BrainEventKind::ClientAttached {
+                attachment_id,
+                subject,
+                role,
+            } => {
+                let acknowledged_seq = self
+                    .attachments
+                    .get(attachment_id)
+                    .map(|attachment| attachment.acknowledged_seq)
+                    .unwrap_or(0);
+                self.attachments.insert(
+                    *attachment_id,
+                    BrainAttachment {
+                        attachment_id: *attachment_id,
+                        subject: subject.clone(),
+                        role: *role,
+                        acknowledged_seq,
+                        connected: true,
+                    },
+                );
+            }
+            BrainEventKind::ClientDetached { attachment_id } => {
+                if let Some(attachment) = self.attachments.get_mut(attachment_id) {
+                    attachment.connected = false;
+                }
+            }
             BrainEventKind::Program { language, source } => {
                 self.program_stack.push(BrainProgram {
                     seq: event.seq,
@@ -322,7 +395,110 @@ impl SharedBrainStore {
             revision: state.events.last().map(|e| e.seq).unwrap_or(0),
             events: state.events.clone(),
             program_stack: state.program_stack.clone(),
+            attachments: sorted_attachments(&state.attachments),
         })
+    }
+
+    pub fn attach(
+        &self,
+        name: &str,
+        subject: &str,
+        role: AttachmentRole,
+        attachment_id: Option<AttachmentId>,
+    ) -> Result<BrainAttachment> {
+        let name = Self::validate_name(name)?;
+        let subject = subject.trim();
+        if subject.is_empty() || subject.len() > 128 || subject.chars().any(char::is_control) {
+            anyhow::bail!("attachment subject must be 1-128 printable characters");
+        }
+        let attachment_id = attachment_id.unwrap_or_else(AttachmentId::new);
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).expect("brain loaded above");
+        if let Some(existing) = state.attachments.get(&attachment_id) {
+            if existing.subject != subject || existing.role != role {
+                anyhow::bail!("attachment identity cannot change subject or role");
+            }
+        }
+        self.push_locked(
+            name,
+            state,
+            subject,
+            BrainEventKind::ClientAttached {
+                attachment_id,
+                subject: subject.to_string(),
+                role,
+            },
+        )?;
+        state
+            .attachments
+            .get(&attachment_id)
+            .cloned()
+            .context("attached client missing from Brain projection")
+    }
+
+    pub fn detach(&self, name: &str, attachment_id: AttachmentId) -> Result<()> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let subject = {
+            let brains = self.brains.read().expect("shared brain lock poisoned");
+            brains
+                .get(name)
+                .and_then(|state| state.attachments.get(&attachment_id))
+                .map(|attachment| attachment.subject.clone())
+                .context("unknown Brain attachment")?
+        };
+        self.push(
+            name,
+            &subject,
+            BrainEventKind::ClientDetached { attachment_id },
+        )?;
+        Ok(())
+    }
+
+    /// Persist a projection cursor without appending another numbered Brain
+    /// event. Otherwise acknowledging the acknowledgement event would create
+    /// an unbounded self-sustaining event stream.
+    pub fn acknowledge(
+        &self,
+        name: &str,
+        attachment_id: AttachmentId,
+        seq: u64,
+    ) -> Result<BrainAttachment> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).expect("brain loaded above");
+        let head = state.events.last().map(|event| event.seq).unwrap_or(0);
+        if seq > head {
+            anyhow::bail!("cannot acknowledge event {seq}; Brain head is {head}");
+        }
+        let previous = state
+            .attachments
+            .get(&attachment_id)
+            .context("unknown Brain attachment")?
+            .acknowledged_seq;
+        if seq < previous {
+            anyhow::bail!("attachment cursor cannot move backward from {previous} to {seq}");
+        }
+        state
+            .attachments
+            .get_mut(&attachment_id)
+            .expect("attachment checked above")
+            .acknowledged_seq = seq;
+        if let Err(error) = self.write_attachment_cursors(name, state) {
+            state
+                .attachments
+                .get_mut(&attachment_id)
+                .expect("attachment checked above")
+                .acknowledged_seq = previous;
+            return Err(error);
+        }
+        Ok(state
+            .attachments
+            .get(&attachment_id)
+            .expect("attachment checked above")
+            .clone())
     }
 
     /// Remove a Brain from the active namespace without destroying its log.
@@ -378,6 +554,16 @@ impl SharedBrainStore {
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains.get_mut(name).expect("brain loaded above");
+        self.push_locked(name, state, sender, kind)
+    }
+
+    fn push_locked(
+        &self,
+        name: &str,
+        state: &mut BrainState,
+        sender: &str,
+        kind: BrainEventKind,
+    ) -> Result<BrainEvent> {
         let event = BrainEvent {
             schema_version: BRAIN_EVENT_SCHEMA_VERSION,
             brain_id: state.brain_id,
@@ -614,11 +800,70 @@ impl SharedBrainStore {
             std::fs::create_dir_all(&directory)
                 .with_context(|| format!("create {}", directory.display()))?;
         }
+        let cursors = self.read_attachment_cursors(name, brain_id)?;
+        let mut state = BrainState::from_events(brain_id, events);
+        for attachment in state.attachments.values_mut() {
+            // A process restart disconnects every transport projection;
+            // reconnect appends a fresh ClientAttached event.
+            attachment.connected = false;
+        }
+        for (attachment_id, acknowledged_seq) in cursors {
+            if let Some(attachment) = state.attachments.get_mut(&attachment_id) {
+                attachment.acknowledged_seq = acknowledged_seq.min(
+                    state.events.last().map(|event| event.seq).unwrap_or(0),
+                );
+            }
+        }
         self.brains
             .write()
             .expect("shared brain lock poisoned")
             .entry(name.to_string())
-            .or_insert_with(|| BrainState::from_events(brain_id, events));
+            .or_insert(state);
+        Ok(())
+    }
+
+    fn read_attachment_cursors(
+        &self,
+        name: &str,
+        brain_id: BrainId,
+    ) -> Result<HashMap<AttachmentId, u64>> {
+        let Some(root) = &self.root else {
+            return Ok(HashMap::new());
+        };
+        let path = root.join(name).join("attachments.json");
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Ok(HashMap::new());
+        };
+        let file: AttachmentCursorFile = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse {}", path.display()))?;
+        if file.version != 1 || file.brain_id != brain_id {
+            anyhow::bail!("attachment cursor identity mismatch at {}", path.display());
+        }
+        Ok(file.cursors)
+    }
+
+    fn write_attachment_cursors(&self, name: &str, state: &BrainState) -> Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let file = AttachmentCursorFile {
+            version: 1,
+            brain_id: state.brain_id,
+            cursors: state
+                .attachments
+                .iter()
+                .map(|(id, attachment)| (*id, attachment.acknowledged_seq))
+                .collect(),
+        };
+        let directory = root.join(name);
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("create {}", directory.display()))?;
+        let path = directory.join("attachments.json");
+        let temporary = directory.join(format!(".attachments.{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&temporary, serde_json::to_vec_pretty(&file)?)
+            .with_context(|| format!("write {}", temporary.display()))?;
+        std::fs::rename(&temporary, &path)
+            .with_context(|| format!("commit {}", path.display()))?;
         Ok(())
     }
 
@@ -747,6 +992,14 @@ fn unix_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn sorted_attachments(
+    attachments: &HashMap<AttachmentId, BrainAttachment>,
+) -> Vec<BrainAttachment> {
+    let mut attachments = attachments.values().cloned().collect::<Vec<_>>();
+    attachments.sort_by_key(|attachment| attachment.attachment_id.0);
+    attachments
 }
 
 const fn initial_environment_generation() -> u64 {
@@ -902,6 +1155,91 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(ids.iter().all(|id| *id == ids[0]));
         assert_ne!(ids[0], BrainId::nil());
+    }
+
+    #[test]
+    fn attachment_cursor_is_monotonic_and_survives_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let head = store.snapshot("shared").unwrap().revision;
+        let acknowledged = store
+            .acknowledge("shared", attachment.attachment_id, head)
+            .unwrap();
+        assert_eq!(acknowledged.acknowledged_seq, head);
+        assert!(store
+            .acknowledge("shared", attachment.attachment_id, head + 1)
+            .is_err());
+        assert!(store
+            .acknowledge("shared", attachment.attachment_id, head - 1)
+            .is_err());
+        store.detach("shared", attachment.attachment_id).unwrap();
+
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restored = restarted
+            .snapshot("shared")
+            .unwrap()
+            .attachments
+            .into_iter()
+            .find(|candidate| candidate.attachment_id == attachment.attachment_id)
+            .unwrap();
+        assert_eq!(restored.acknowledged_seq, head);
+        assert!(!restored.connected);
+        let reattached = restarted
+            .attach(
+                "shared",
+                "alice",
+                AttachmentRole::Driver,
+                Some(attachment.attachment_id),
+            )
+            .unwrap();
+        assert!(reattached.connected);
+        assert_eq!(reattached.acknowledged_seq, head);
+        assert!(restarted
+            .attach(
+                "shared",
+                "alice",
+                AttachmentRole::Observer,
+                Some(attachment.attachment_id),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn concurrent_attach_cannot_rebind_one_identity() {
+        let store = Arc::new(SharedBrainStore::with_root("box.local", None));
+        let attachment_id = AttachmentId::new();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let attempts = [AttachmentRole::Driver, AttachmentRole::Observer]
+            .into_iter()
+            .map(|role| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.attach("shared", "alice", role, Some(attachment_id))
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = attempts
+            .into_iter()
+            .map(|attempt| attempt.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let snapshot = store.snapshot("shared").unwrap();
+        assert_eq!(snapshot.attachments.len(), 1);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind, BrainEventKind::ClientAttached { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
