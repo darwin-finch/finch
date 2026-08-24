@@ -184,8 +184,12 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   both lifecycles together. Every non-intrinsic awaited host boundary now re-resolves its concrete
   request against the ledger immediately before local dispatch or portable deferral, records the
   stable grant ID with execution/effect sequence once, and reuses that execute-once authorization
-  fact when an external result resumes. Still implement policy-driven revocation, persist policy
-  changes that occur outside a runtime commit, and complete the host adapters.
+  fact when an external result resumes. Named Brain runtimes now install an application-owned
+  authority sink: grant, revoke, denial, and host-authorization mutations atomically replace the
+  separate integrity-checked authority record immediately, even when no VM revision commits or the
+  surrounding run later rolls back. Persistence failure restores the prior in-memory ledger and
+  fails closed; archiving detaches the sink so retained runtime references cannot recreate the old
+  policy path. Still implement policy-driven revocation and complete the host adapters.
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their

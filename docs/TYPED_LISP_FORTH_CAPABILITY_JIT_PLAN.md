@@ -1053,6 +1053,15 @@ Persisted decisions store a typed selector, root identity, operation, scope, sou
 creator, timestamp, and revocation state. They never store only the display string. The UI provides
 searchable history and immediate revocation.
 
+Application-owned authority persistence is independent from VM transaction commits. A named Brain
+installs a sink that atomically replaces its separate integrity-checked authority record whenever a
+grant, revocation, denial, or host-authorization audit mutates the ledger. The mutation becomes
+visible in memory only if persistence succeeds; a sink failure restores the previous ledger and the
+host operation fails closed. Consequently an external effect remains audited even when its
+ProgramRun later rolls back, while a failed VM transaction cannot erase or manufacture authority.
+Archiving a Brain detaches this sink before removing the live runtime so a retained runtime handle
+cannot recreate the archived policy path.
+
 The VM's compact active `EffectSet` is only a fast execution guard. Immediately before an
 authorized non-intrinsic effect is dispatched locally or handed to a portable host, the Finch host
 reconstructs its deterministic request identity from `(execution_id, effect sequence)`, resolves it
