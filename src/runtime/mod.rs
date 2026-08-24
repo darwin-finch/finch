@@ -3770,6 +3770,60 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                             values: sheets.into_iter().map(TypedValue::String).collect(),
                         }]);
                     }
+                    Some("workbook-range") => {
+                        let [_, TypedValue::String(sheet), TypedValue::Int(start_row), TypedValue::Int(start_column), TypedValue::Int(row_count), TypedValue::Int(column_count)] =
+                            arguments.as_slice()
+                        else {
+                            return Err(host_binding_error(
+                                origin,
+                                "workbook-range requires path, sheet, start row, start column, row count, and column count",
+                            ));
+                        };
+                        let values = read_workbook_range(
+                            &path,
+                            sheet,
+                            *start_row,
+                            *start_column,
+                            *row_count,
+                            *column_count,
+                        )
+                        .map_err(|message| host_binding_error(origin, message))?;
+                        return Ok(vec![TypedValue::List {
+                            element_type: Type::list(Type::String),
+                            values: values
+                                .into_iter()
+                                .map(|row| TypedValue::List {
+                                    element_type: Type::String,
+                                    values: row.into_iter().map(TypedValue::String).collect(),
+                                })
+                                .collect(),
+                        }]);
+                    }
+                    Some("workbook-summary") => {
+                        let [_, TypedValue::String(sheet), TypedValue::Int(max_rows)] =
+                            arguments.as_slice()
+                        else {
+                            return Err(host_binding_error(
+                                origin,
+                                "workbook-summary requires a path, sheet name, and maximum data-row count",
+                            ));
+                        };
+                        let max_rows = usize::try_from(*max_rows).map_err(|_| {
+                            host_binding_error(
+                                origin,
+                                "workbook-summary maximum rows must be between 1 and 100000",
+                            )
+                        })?;
+                        if !(1..=100_000).contains(&max_rows) {
+                            return Err(host_binding_error(
+                                origin,
+                                "workbook-summary maximum rows must be between 1 and 100000",
+                            ));
+                        }
+                        let summary = summarize_workbook(&path, sheet, max_rows)
+                            .map_err(|message| host_binding_error(origin, message))?;
+                        return Ok(vec![TypedValue::Json(summary)]);
+                    }
                     Some("csv-open") => {
                         if arguments.len() != 1 {
                             return Err(host_binding_error(origin, "csv-open requires one path"));
@@ -4746,7 +4800,7 @@ fn read_workbook_rows(
     path: &Path,
     requested_sheet: Option<&str>,
 ) -> std::result::Result<Vec<Vec<String>>, String> {
-    use calamine::{open_workbook_auto, Data, Reader};
+    use calamine::{open_workbook_auto, Reader};
 
     const MAX_WORKBOOK_CELLS: usize = 10_000_000;
     let mut workbook = open_workbook_auto(path)
@@ -4775,22 +4829,161 @@ fn read_workbook_rows(
         }
         rows.push(
             row.iter()
-                .map(|cell| match cell {
-                    Data::Empty => String::new(),
-                    Data::String(value) => value.clone(),
-                    Data::Float(value) if value.fract() == 0.0 => {
-                        format!("{}", *value as i64)
-                    }
-                    Data::Float(value) => value.to_string(),
-                    Data::Int(value) => value.to_string(),
-                    Data::Bool(value) => value.to_string(),
-                    Data::Error(value) => format!("#ERR:{value:?}"),
-                    other => other.to_string(),
-                })
+                .map(workbook_cell_to_string)
                 .collect(),
         );
     }
     Ok(rows)
+}
+
+fn workbook_cell_to_string(cell: &calamine::Data) -> String {
+    use calamine::Data;
+
+    match cell {
+        Data::Empty => String::new(),
+        Data::String(value) => value.clone(),
+        Data::Float(value) if value.fract() == 0.0 => format!("{}", *value as i64),
+        Data::Float(value) => value.to_string(),
+        Data::Int(value) => value.to_string(),
+        Data::Bool(value) => value.to_string(),
+        Data::Error(value) => format!("#ERR:{value:?}"),
+        other => other.to_string(),
+    }
+}
+
+/// Materialize only a deliberately small rectangular projection into the VM.
+/// Calamine currently decodes the owning sheet first, so this bounds the
+/// language-visible result rather than claiming to be a streaming decoder.
+fn read_workbook_range(
+    path: &Path,
+    sheet: &str,
+    start_row: i64,
+    start_column: i64,
+    row_count: i64,
+    column_count: i64,
+) -> std::result::Result<Vec<Vec<String>>, String> {
+    const MAX_WORKBOOK_RANGE_CELLS: usize = 10_000;
+
+    let start_row = usize::try_from(start_row)
+        .map_err(|_| "workbook-range start row must be non-negative".to_string())?;
+    let start_column = usize::try_from(start_column)
+        .map_err(|_| "workbook-range start column must be non-negative".to_string())?;
+    let row_count = usize::try_from(row_count)
+        .map_err(|_| "workbook-range row count must be positive".to_string())?;
+    let column_count = usize::try_from(column_count)
+        .map_err(|_| "workbook-range column count must be positive".to_string())?;
+    if row_count == 0 || column_count == 0 {
+        return Err("workbook-range row and column counts must be positive".into());
+    }
+    let cells = row_count
+        .checked_mul(column_count)
+        .ok_or_else(|| "workbook-range cell count overflowed".to_string())?;
+    if cells > MAX_WORKBOOK_RANGE_CELLS {
+        return Err(format!(
+            "workbook-range exceeds the {MAX_WORKBOOK_RANGE_CELLS}-cell result limit"
+        ));
+    }
+
+    let rows = read_workbook_rows(path, Some(sheet))?;
+    Ok(rows
+        .iter()
+        .skip(start_row)
+        .take(row_count)
+        .map(|row| {
+            (start_column..start_column.saturating_add(column_count))
+                .map(|column| row.get(column).cloned().unwrap_or_default())
+                .collect()
+        })
+        .collect())
+}
+
+/// Produce the same bounded per-column facts as `csv-summary`, treating the
+/// first worksheet row as headers and never returning source rows.
+fn summarize_workbook(
+    path: &Path,
+    sheet: &str,
+    max_rows: usize,
+) -> std::result::Result<serde_json::Value, String> {
+    const MAX_WORKBOOK_COLUMNS: usize = 4096;
+
+    let rows = read_workbook_rows(path, Some(sheet))?;
+    let (headers, data_rows) = rows
+        .split_first()
+        .ok_or_else(|| "workbook-summary requires a header row".to_string())?;
+    if headers.len() > MAX_WORKBOOK_COLUMNS {
+        return Err(format!(
+            "workbook header exceeds the {MAX_WORKBOOK_COLUMNS}-column summary limit"
+        ));
+    }
+
+    #[derive(Default)]
+    struct ColumnSummary {
+        empty: u64,
+        non_empty: u64,
+        numeric: u64,
+        sum: f64,
+        min: Option<f64>,
+        max: Option<f64>,
+    }
+
+    let mut columns: Vec<ColumnSummary> =
+        (0..headers.len()).map(|_| ColumnSummary::default()).collect();
+    let sampled_rows = data_rows.len().min(max_rows);
+    for (row_index, row) in data_rows.iter().take(sampled_rows).enumerate() {
+        if row.len() > headers.len() {
+            return Err(format!(
+                "workbook data row {} has {} cells but the header declares {}",
+                row_index + 1,
+                row.len(),
+                headers.len()
+            ));
+        }
+        for (column, summary) in columns.iter_mut().enumerate() {
+            let field = row.get(column).map(String::as_str).unwrap_or("").trim();
+            if field.is_empty() {
+                summary.empty += 1;
+                continue;
+            }
+            summary.non_empty += 1;
+            if let Ok(value) = field.parse::<f64>() {
+                if value.is_finite() {
+                    summary.numeric += 1;
+                    summary.sum += value;
+                    summary.min = Some(summary.min.map_or(value, |current| current.min(value)));
+                    summary.max = Some(summary.max.map_or(value, |current| current.max(value)));
+                }
+            }
+        }
+    }
+
+    let columns = headers
+        .iter()
+        .zip(columns)
+        .enumerate()
+        .map(|(index, (name, summary))| {
+            let mean = (summary.numeric != 0)
+                .then(|| summary.sum / summary.numeric as f64)
+                .filter(|value| value.is_finite());
+            serde_json::json!({
+                "index": index,
+                "name": name,
+                "empty": summary.empty,
+                "non_empty": summary.non_empty,
+                "numeric": summary.numeric,
+                "min": summary.min,
+                "max": summary.max,
+                "mean": mean,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(serde_json::json!({
+        "sheet": sheet,
+        "headers": headers,
+        "sampled_rows": sampled_rows,
+        "truncated": data_rows.len() > sampled_rows,
+        "columns": columns,
+    }))
 }
 
 fn read_workbook_sheet_names(path: &Path) -> std::result::Result<Vec<String>, String> {
@@ -6400,6 +6593,21 @@ mod tests {
             sheet.write_string(0, 0, "answer").unwrap();
             sheet.write_number(0, 1, 42).unwrap();
         }
+        {
+            let sheet = workbook.add_worksheet();
+            sheet.set_name("Stats").unwrap();
+            sheet.write_string(0, 0, "name").unwrap();
+            sheet.write_string(0, 1, "score").unwrap();
+            sheet.write_string(0, 2, "note").unwrap();
+            sheet.write_string(1, 0, "Ada").unwrap();
+            sheet.write_number(1, 1, 10).unwrap();
+            sheet.write_string(1, 2, "ok").unwrap();
+            sheet.write_string(2, 0, "Bob").unwrap();
+            sheet.write_number(2, 1, 20).unwrap();
+            sheet.write_string(3, 0, "Cy").unwrap();
+            sheet.write_string(3, 1, "not-a-number").unwrap();
+            sheet.write_string(3, 2, "ok").unwrap();
+        }
         workbook.save(&workbook_path).unwrap();
         let canonical_workbook = workbook_path.canonicalize().unwrap();
         let canonical_workspace = std::env::current_dir().unwrap().canonicalize().unwrap();
@@ -6470,8 +6678,78 @@ mod tests {
             vec![ProgramValue::List(vec![
                 ProgramValue::String("First".into()),
                 ProgramValue::String("Data".into()),
+                ProgramValue::String("Stats".into()),
             ])]
         );
+
+        let expected_range = ProgramValue::List(vec![
+            ProgramValue::List(vec![
+                ProgramValue::String("Ada".into()),
+                ProgramValue::String("10".into()),
+            ]),
+            ProgramValue::List(vec![
+                ProgramValue::String("Bob".into()),
+                ProgramValue::String("20".into()),
+            ]),
+        ]);
+        let expected_summary = serde_json::json!({
+            "sheet": "Stats",
+            "headers": ["name", "score", "note"],
+            "sampled_rows": 2,
+            "truncated": true,
+            "columns": [
+                {"index": 0, "name": "name", "empty": 0, "non_empty": 2, "numeric": 0, "min": null, "max": null, "mean": null},
+                {"index": 1, "name": "score", "empty": 0, "non_empty": 2, "numeric": 2, "min": 10.0, "max": 20.0, "mean": 15.0},
+                {"index": 2, "name": "note", "empty": 1, "non_empty": 1, "numeric": 0, "min": null, "max": null, "mean": null}
+            ]
+        });
+        for (language, range_source, summary_source) in [
+            (
+                ProgramLanguage::Lisp,
+                format!(
+                    "(workbook-range (path \"{relative}\") \"Stats\" 1 0 2 2)"
+                ),
+                format!(
+                    "(workbook-summary (path \"{relative}\") \"Stats\" 2)"
+                ),
+            ),
+            (
+                ProgramLanguage::Forth,
+                format!(
+                    "\"{relative}\" path \"Stats\" 1 0 2 2 workbook-range"
+                ),
+                format!(
+                    "\"{relative}\" path \"Stats\" 2 workbook-summary"
+                ),
+            ),
+        ] {
+            for (source, expected) in [
+                (range_source, expected_range.clone()),
+                (summary_source, ProgramValue::Json(expected_summary.clone())),
+            ] {
+                let runtime = ProgramRuntime::new();
+                runtime
+                    .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                        crate::vm::FileOperation::Read,
+                        crate::vm::FileSelector::parse("./**").unwrap(),
+                    ))
+                    .unwrap();
+                let outcome = runtime
+                    .submit_typed_only(submission(
+                        language,
+                        &source,
+                        ExecutionEffect::WorkspaceRead,
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    outcome.status,
+                    ExecutionStatus::Completed,
+                    "{language:?} workbook aggregate failed: {outcome:#?}"
+                );
+                assert_eq!(outcome.values, vec![expected]);
+            }
+        }
     }
 
     #[tokio::test]

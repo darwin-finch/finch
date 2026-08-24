@@ -49,6 +49,8 @@ pub enum CoreHostBinding {
     WorkbookOpen,
     WorkbookSheetOpen,
     WorkbookSheets,
+    WorkbookRange,
+    WorkbookSummary,
     StreamNext,
     StreamClose,
     FileWrite,
@@ -131,6 +133,8 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "workbook-open" => CoreWordDocumentation { summary: "Open the first sheet of an authorized XLSX/XLS/ODS workbook as an opaque stream<list<string>>. Rows stay in the host cursor and enter the VM one at a time through stream-next.", lisp: "(workbook-open path)", forth: "path workbook-open", example: "(workbook-open (path \"report.xlsx\"))" },
         "workbook-sheet-open" => CoreWordDocumentation { summary: "Open one named sheet of an authorized XLSX/XLS/ODS workbook as an opaque stream<list<string>>.", lisp: "(workbook-sheet-open path sheet)", forth: "path sheet workbook-sheet-open", example: "(workbook-sheet-open (path \"report.xlsx\") \"Summary\")" },
         "workbook-sheets" => CoreWordDocumentation { summary: "List sheet names in an authorized XLSX/XLS/ODS workbook without exposing workbook contents.", lisp: "(workbook-sheets path)", forth: "path workbook-sheets", example: "(workbook-sheets (path \"report.xlsx\"))" },
+        "workbook-range" => CoreWordDocumentation { summary: "Return a bounded rectangular slice from one workbook sheet using zero-based row and column offsets. Row and column counts must be positive and their product must not exceed 10000 cells.", lisp: "(workbook-range path sheet start-row start-column row-count column-count)", forth: "path sheet start-row start-column row-count column-count workbook-range", example: "(workbook-range (path \"report.xlsx\") \"Data\" 1 0 20 6)" },
+        "workbook-summary" => CoreWordDocumentation { summary: "Treat the first row of one workbook sheet as headers, scan at most max_rows following rows, and return bounded JSON column statistics. The limit must be 1..100000.", lisp: "(workbook-summary path sheet max-rows)", forth: "path sheet max-rows workbook-summary", example: "(workbook-summary (path \"report.xlsx\") \"Data\" 10000)" },
         "stream-next" => CoreWordDocumentation { summary: "Advance an opaque stream<T> by at most one item and return some(T), or none at end of stream. It cannot forge or widen the source stream's authority.", lisp: "(stream-next stream)", forth: "stream stream-next", example: "(match-option (stream-next rows) (some row row) (none \"done\"))" },
         "stream-close" => CoreWordDocumentation { summary: "Close an opaque stream<T>, release its backing cursor or producer, and make future operations fail safely.", lisp: "(stream-close stream)", forth: "stream stream-close", example: "rows stream-close" },
         "file-write" | "host-file-write" => CoreWordDocumentation { summary: "Write bytes to an authorized refined path. This is an external mutation and requires an explicit write capability grant.", lisp: "(file-write path bytes)", forth: "path bytes file-write", example: "(file-write (path \"generated.txt\") (bytes \"hello\\n\"))" },
@@ -827,6 +831,43 @@ fn core_signatures() -> Vocabulary {
                 },
             ),
         ),
+        (
+            "workbook-range".into(),
+            capability(
+                vec![
+                    Type::Path(FileSelector::parse("./**").expect("valid workspace root")),
+                    Type::String,
+                    Type::Int,
+                    Type::Int,
+                    Type::Int,
+                    Type::Int,
+                ],
+                vec![Type::list(Type::list(Type::String))],
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileRead,
+                    selector: ResourceSelector::FileTemplate {
+                        template: path_template(),
+                    },
+                },
+            ),
+        ),
+        (
+            "workbook-summary".into(),
+            capability(
+                vec![
+                    Type::Path(FileSelector::parse("./**").expect("valid workspace root")),
+                    Type::String,
+                    Type::Int,
+                ],
+                vec![Type::Json],
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileRead,
+                    selector: ResourceSelector::FileTemplate {
+                        template: path_template(),
+                    },
+                },
+            ),
+        ),
         // Generic stream operations share the same bounded cursor contract
         // across file, CSV, and future workbook/producer backends. The
         // unscoped FileRead request is safely covered only by a path-scoped
@@ -1353,6 +1394,8 @@ static CORE_WORD_REGISTRY: Lazy<BTreeMap<String, CoreWordSpec>> = Lazy::new(|| {
                 "workbook-open" => CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookOpen),
                 "workbook-sheet-open" => CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookSheetOpen),
                 "workbook-sheets" => CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookSheets),
+                "workbook-range" => CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookRange),
+                "workbook-summary" => CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookSummary),
                 "stream-next" => CoreWordImplementation::HostEffect(CoreHostBinding::StreamNext),
                 "stream-close" => CoreWordImplementation::HostEffect(CoreHostBinding::StreamClose),
                 "file-write" | "host-file-write" => CoreWordImplementation::HostEffect(CoreHostBinding::FileWrite),
