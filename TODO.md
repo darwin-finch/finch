@@ -74,8 +74,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   `for`/`foreach` syntax may select an indexed, range, fiber, or collection-specific loop lowering,
   but selection must use public structural contracts and resolved word IDs so user-defined types
   and traversal functions can receive the same specialization/inlining as built-ins.
-- [ ] Generate every production word/function from one typed signature, effect, documentation, and
-  host-implementation registry.
+- [x] Generate every production core word from one typed signature, effect, documentation, and
+  host-implementation registry. `CoreWordSpec` is the immutable source consumed by frontend
+  discovery, the verifier, interpreter dispatch, and host-binding validation; user definitions
+  retain their own versioned typed contracts rather than pretending to be host primitives.
 - [x] Finish Lisp source maps: the reader retains structural spans and typed lowering preserves
   exact nested named-call operators/arguments, `begin`/`if`, definitions, `let`, lambdas,
   closure-call targets, typed matches, loops, deferred tasks, macro call-site → template
