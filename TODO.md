@@ -407,7 +407,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   per-runtime-snapshot owner leases: cloning a private transaction retains its reachable nested task
   handles, consuming the handle releases only that snapshot, failed transactions reclaim tasks they
   alone spawned, and the final release removes the tombstone or cooperatively cancels an unobserved
-  worker. Still define bounded retention for abandoned host suspensions and complete revision
+  worker. Private host suspensions are now hard-capped at 256 per `ProgramRuntime`; existing human
+  approvals are never silently evicted, while a newly suspending run at capacity is cancelled with
+  its complete structured outcome and resource cleanup. Still bind an explicit participant/time
+  expiry policy to the application event log and define compaction for complete revision
   checkpoints.
   If shared or cyclic language objects are later admitted, put them behind generation-checked
   managed handles and choose a checkpoint-aware tracing scheme from measured workloads; do not add
