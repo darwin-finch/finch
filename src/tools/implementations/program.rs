@@ -186,6 +186,21 @@ const SOURCE_SYNTAX: &[SourceSyntaxEntry] = &[
         description: "Lexical immutable bindings: (let ((name value) ...) body...).",
     },
     SourceSyntaxEntry {
+        name: "record",
+        languages: &["lisp", "forth"],
+        description: "Immutable heterogeneous typed record literal. Lisp: { :field value ... }; Co-Forth: { field: value ... }. Fields have statically known names and types.",
+    },
+    SourceSyntaxEntry {
+        name: "record-get",
+        languages: &["lisp", "forth"],
+        description: "Statically checked typed-record projection returning option<T>. Lisp: (record-get record \"field\"); Co-Forth: record \"field\" record-get. The field name must be a literal string.",
+    },
+    SourceSyntaxEntry {
+        name: "record-set",
+        languages: &["lisp", "forth"],
+        description: "Immutable statically checked typed-record field replacement. Lisp: (record-set record \"field\" value); Co-Forth: record value \"field\" record-set. It returns a replacement record and never mutates a shared value.",
+    },
+    SourceSyntaxEntry {
         name: ":",
         languages: &["forth"],
         description: "Persistent typed word definition: : name ( S inputs -- S outputs ! effects ) body ;.",
@@ -1123,6 +1138,25 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("managed JSON"));
+
+        let record_result: Value = serde_json::from_str(
+            &tool
+                .execute(json!({"query": "record-set"}), &context)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(record_result["matches"].as_array().unwrap().is_empty());
+        assert!(record_result["syntax_matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["name"] == "record-set"
+                    && entry["description"]
+                        .as_str()
+                        .is_some_and(|description| description.contains("never mutates"))
+            }));
     }
 
     #[tokio::test]
