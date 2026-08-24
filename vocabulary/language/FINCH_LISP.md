@@ -113,6 +113,17 @@ keys and values without dropping into untyped JSON:
   "value")) ; => 42
 ```
 
+External JSON remains `json`, rather than being silently coerced into a typed record. Its keys may
+contain spaces or other arbitrary text; access them with a string through `json-get`, or normalize
+the input into a string-keyed typed map when its schema is known:
+
+```lisp
+(unwrap (json-as-string
+  (unwrap (json-get
+    (result-unwrap (json-parse "{\"first name\":\"Ada\"}"))
+    "first name")))) ; => "Ada"
+```
+
 MemTree and scheduling are explicit effects. Scheduled work stores an immutable program reference,
 typed arguments, budgets, context references, and a revocable policy reference—not raw authority or
 an unvalidated Lisp string. A callback starts a fresh audited task and revalidates its environment

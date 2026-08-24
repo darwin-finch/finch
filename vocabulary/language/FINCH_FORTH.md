@@ -87,6 +87,14 @@ using the ordinary list and loop forms:
 map{ "answer" 42 }map map-entries 0 list-get "value" record-get unwrap  \ leaves 42
 ```
 
+External JSON remains `json`, rather than being silently coerced into a typed record. Its keys may
+contain spaces or other arbitrary text; access them with a string through `json-get`:
+
+```forth
+s"{\"first name\":\"Ada\"}" json-parse result-unwrap
+s"first name" json-get unwrap json-as-string unwrap  \ leaves "Ada"
+```
+
 `case` is a typed integer switch with no fallthrough. Each `of ... endof` arm and the optional
 `otherwise` arm must leave the same stack row. The selector is removed before an arm begins;
 `otherwise` is required whenever an unmatched case must produce values. This is structured branch

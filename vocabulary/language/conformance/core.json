@@ -66,6 +66,13 @@
       "expected_output": ""
     },
     {
+      "name": "json-object-key-with-space",
+      "forth": "s\"{\\\"first name\\\":\\\"Ada\\\"}\" json-parse result-unwrap s\"first name\" json-get unwrap json-as-string unwrap",
+      "lisp": "(unwrap (json-as-string (unwrap (json-get (result-unwrap (json-parse \"{\\\"first name\\\":\\\"Ada\\\"}\")) \"first name\"))))",
+      "expected_values": [{ "type": "string", "value": "Ada" }],
+      "expected_output": ""
+    },
+    {
       "name": "typed-record-construction-and-projection",
       "forth": "{ name: \"Ada\" age: 37 } \"age\" record-get unwrap",
       "lisp": "(unwrap (record-get { :name \"Ada\" :age 37 } \"age\"))",
