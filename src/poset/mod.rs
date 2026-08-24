@@ -195,6 +195,7 @@ impl Poset {
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.edges.clear();
+        self.next_id = 0;
     }
 
     pub fn topological_order(&self) -> Vec<usize> {
@@ -259,6 +260,17 @@ mod tests {
         let order = p.topological_order();
         assert_eq!(order[0], a);
         assert_eq!(order[1], b);
+    }
+
+    #[test]
+    fn clear_resets_plan_identity_space() {
+        let mut p = Poset::new();
+        p.add_node("old".to_string(), NodeKind::Task, NodeAuthor::User);
+        p.clear();
+
+        let id = p.add_node("new".to_string(), NodeKind::Task, NodeAuthor::User);
+        assert_eq!(id, 0);
+        assert_eq!(p.nodes.len(), 1);
     }
 
     #[test]

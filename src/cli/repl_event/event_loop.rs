@@ -114,7 +114,9 @@ pub(crate) fn resolve_provider_profile(
 /// Continuation data for a poset run that is waiting for user confirmation.
 struct PendingPosetRun {
     generator: Arc<dyn crate::generators::Generator>,
-    poset: Arc<tokio::sync::Mutex<crate::poset::Poset>>,
+    /// Immutable snapshot of exactly the plan shown in the approval dialog.
+    /// Subsequent edits to the live plan cannot change the approved execution.
+    poset: crate::poset::Poset,
     event_tx: tokio::sync::mpsc::UnboundedSender<ReplEvent>,
 }
 
@@ -1842,7 +1844,9 @@ impl EventLoop {
                                     let PendingPosetRun { generator, poset, event_tx } = pending;
                                     tokio::spawn(async move {
                                         let result = crate::poset::executor::execute_poset(
-                                            poset, generator, registry,
+                                            Arc::new(tokio::sync::Mutex::new(poset)),
+                                            generator,
+                                            registry,
                                         ).await;
                                         let _ = event_tx.send(super::events::ReplEvent::PosetComplete { result });
                                     });
@@ -6591,24 +6595,30 @@ Rules:\n\
 
     /// Handle `/pop` — remove the top item from the stack (undo last push).
     async fn handle_stack_pop(&mut self) -> Result<()> {
-        let mut stack = self.stack.lock().await;
-        if stack.is_empty() {
-            drop(stack);
+        let removed = self.poset.lock().await.pop();
+        let Some(removed) = removed else {
             self.output_manager
-                .write_info("📚 Stack is empty. Nothing to pop.");
+                .write_info("📚 Plan is empty. Nothing to pop.");
             self.render_tui().await?;
             return Ok(());
+        };
+
+        let mut stack = self.stack.lock().await;
+        if let Some(index) = stack.iter().rposition(|item| item == &removed.label) {
+            stack.remove(index);
         }
-        let item = stack.pop().unwrap();
-        let depth = stack.len();
+        let depth = self.poset.lock().await.nodes.len();
         drop(stack);
-        let preview = if item.len() > 60 {
-            format!("{}…", item.chars().take(60).collect::<String>())
+        let preview = if removed.label.len() > 60 {
+            format!("{}…", removed.label.chars().take(60).collect::<String>())
         } else {
-            item
+            removed.label
         };
         self.output_manager
-            .write_info(format!("📚 popped → \"{preview}\"   depth:{depth}"));
+            .write_info(format!(
+                "📚 removed W{} → \"{preview}\"   nodes:{depth}",
+                removed.id
+            ));
         self.render_tui().await
     }
 
@@ -6689,9 +6699,10 @@ Rules:\n\
     /// Handle `/stack clear` — drop all stack items and return panel to graph view.
     async fn handle_stack_clear(&mut self) -> Result<()> {
         let mut stack = self.stack.lock().await;
-        let count = stack.len();
+        let count = self.poset.lock().await.nodes.len();
         stack.clear();
         drop(stack);
+        self.poset.lock().await.clear();
         // Return panel to graph view so the user is back in normal chat mode.
         {
             let mut tui = self.tui_renderer.lock().await;
@@ -6792,7 +6803,7 @@ Rules:\n\
         let generator = self.model_selection.generator().await;
         self.pending_poset_run = Some(PendingPosetRun {
             generator,
-            poset: Arc::clone(&self.poset),
+            poset: self.poset.lock().await.clone(),
             event_tx: self.event_tx.clone(),
         });
 
