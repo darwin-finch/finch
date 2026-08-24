@@ -26,6 +26,22 @@ struct Token {
     end: usize,
 }
 
+/// The source-preserving Co-Forth module syntax tree. This is deliberately a
+/// frontend representation rather than typed IR: definition boundaries and
+/// body atoms are retained with their original byte spans, and lowering never
+/// serializes or reparses a definition body. Structured control/literal nodes
+/// can replace atoms incrementally without changing the IR boundary.
+#[derive(Debug, Clone)]
+struct ForthModuleAst {
+    definitions: Vec<ForthDefinitionAst>,
+    body: ForthBodyAst,
+}
+
+#[derive(Debug, Clone)]
+struct ForthBodyAst {
+    atoms: Vec<Token>,
+}
+
 #[derive(Debug, Clone)]
 enum TokenValue {
     Word(String),
@@ -239,11 +255,13 @@ pub fn compile_forth_with_functions(
     vocabulary: &Vocabulary,
     linked_functions: &BTreeMap<String, Function>,
 ) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
-    let (definitions, main_source) = extract_definitions(source_id, source)?;
+    let ast = parse_forth_module(source_id, source)?;
+    let definitions = ast.definitions;
     if definitions.is_empty() {
-        return compile_forth_body_with_functions(
+        return compile_forth_ast_body_with_functions(
             source_id,
             source,
+            &ast.body,
             initial_stack,
             vocabulary,
             linked_functions,
@@ -276,8 +294,9 @@ pub fn compile_forth_with_functions(
     }
     for definition in definitions {
         local_vocabulary.insert(definition.name.clone(), definition.signature.clone());
-        let compiled = compile_forth_body_with_locals(
+        let compiled = lower_forth_ast_body_with_locals(
             source_id,
+            source,
             &definition.body,
             definition.signature.input.values.clone(),
             &local_vocabulary,
@@ -337,25 +356,28 @@ pub fn compile_forth_with_functions(
         functions.insert(definition.name, function);
     }
 
-    compile_forth_body_with_functions(
+    compile_forth_ast_body_with_functions(
         source_id,
-        &main_source,
+        source,
+        &ast.body,
         initial_stack,
         &local_vocabulary,
         &functions,
     )
 }
 
-fn compile_forth_body_with_functions(
+fn compile_forth_ast_body_with_functions(
     source_id: &str,
     source: &str,
+    body: &ForthBodyAst,
     initial_stack: Vec<Type>,
     vocabulary: &Vocabulary,
     linked_functions: &BTreeMap<String, Function>,
 ) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
-    compile_forth_body_with_locals(
+    lower_forth_ast_body_with_locals(
         source_id,
         source,
+        body,
         initial_stack,
         vocabulary,
         linked_functions,
@@ -365,9 +387,10 @@ fn compile_forth_body_with_functions(
     )
 }
 
-fn compile_forth_body_with_locals(
+fn lower_forth_ast_body_with_locals(
     source_id: &str,
     source: &str,
+    body: &ForthBodyAst,
     initial_stack: Vec<Type>,
     vocabulary: &Vocabulary,
     linked_functions: &BTreeMap<String, Function>,
@@ -375,7 +398,7 @@ fn compile_forth_body_with_locals(
     captures: &[LocalBinding],
     expected_return: Option<&[Type]>,
 ) -> Result<VerifiedModule, Vec<VmDiagnostic>> {
-    let tokens = tokenize(source_id, source)?;
+    let tokens = &body.atoms;
     let mut stack = initial_stack.clone();
     let mut effects = EffectSet::pure();
     let mut suspension: Option<SuspensionSignature> = None;
@@ -471,13 +494,9 @@ fn compile_forth_body_with_locals(
                         &tokens[token_index + 1..pipe_index],
                         &origin,
                     )?;
-                    let body_start = tokens[pipe_index].end;
-                    let body_end = tokens[close_index].start;
-                    let mut masked = vec![b' '; source.len()];
-                    masked[body_start..body_end]
-                        .copy_from_slice(&source.as_bytes()[body_start..body_end]);
-                    let quote_source = String::from_utf8(masked)
-                        .expect("masking source bytes with spaces preserves UTF-8");
+                    let quote_body = ForthBodyAst {
+                        atoms: tokens[pipe_index + 1..close_index].to_vec(),
+                    };
 
                     // Locals shadow captures. Capturing all visible immutable
                     // bindings matches Lisp's deterministic initial lowering;
@@ -515,9 +534,10 @@ fn compile_forth_body_with_locals(
                         }
                     }
 
-                    let compiled = compile_forth_body_with_locals(
+                    let compiled = lower_forth_ast_body_with_locals(
                         source_id,
-                        &quote_source,
+                        source,
+                        &quote_body,
                         declared_signature.input.values.clone(),
                         vocabulary,
                         &available_functions,
@@ -2445,26 +2465,28 @@ fn merge_suspension_contract(
     Ok(())
 }
 
-struct ParsedDefinition {
+#[derive(Debug, Clone)]
+struct ForthDefinitionAst {
     name: String,
     documentation: Option<String>,
     signature: StackSignature,
     declares_pure: bool,
     locals: Vec<LocalBinding>,
-    body: String,
+    body: ForthBodyAst,
     origin: SourceOrigin,
 }
 
-fn extract_definitions(
+fn parse_forth_module(
     source_id: &str,
     source: &str,
-) -> Result<(Vec<ParsedDefinition>, String), Vec<VmDiagnostic>> {
+) -> Result<ForthModuleAst, Vec<VmDiagnostic>> {
     let tokens = tokenize(source_id, source)?;
     let mut definitions = Vec::new();
-    let mut erased = source.as_bytes().to_vec();
+    let mut main_atoms = Vec::new();
     let mut cursor = 0;
     while cursor < tokens.len() {
         if !token_is(&tokens[cursor], ":") {
+            main_atoms.push(tokens[cursor].clone());
             cursor += 1;
             continue;
         }
@@ -2534,29 +2556,24 @@ fn extract_definitions(
                 "nested word definitions are not allowed",
             )]);
         }
-        let body_start = tokens
-            .get(body_start_index)
-            .map_or(tokens[end].start, |token| token.start);
-        let body_end = tokens[end].start;
         let definition_end = tokens[end].end;
-        definitions.push(ParsedDefinition {
+        definitions.push(ForthDefinitionAst {
             name: name.clone(),
             documentation: forth_definition_documentation(source, definition_start),
             signature,
             declares_pure,
             locals,
-            body: source[body_start..body_end].to_string(),
+            body: ForthBodyAst {
+                atoms: tokens[body_start_index..end].to_vec(),
+            },
             origin: origin(source_id, source, definition_start, definition_end),
         });
-        for byte in &mut erased[definition_start..definition_end] {
-            if *byte != b'\n' {
-                *byte = b' ';
-            }
-        }
         cursor = end + 1;
     }
-    let main = String::from_utf8(erased).expect("erasing source preserves UTF-8 bytes");
-    Ok((definitions, main))
+    Ok(ForthModuleAst {
+        definitions,
+        body: ForthBodyAst { atoms: main_atoms },
+    })
 }
 
 /// Read a single public documentation line immediately preceding a typed
@@ -4032,6 +4049,26 @@ mod tests {
                 .start_line,
             1
         );
+    }
+
+    #[test]
+    fn definition_diagnostics_retain_original_module_spans() {
+        let source = "\\ module prelude\n\n: broken ( S -- S int ! pure )\n  \"oops\" 2 +\n;\n";
+        let errors = compile_forth(
+            "module-span.forth",
+            source,
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap_err();
+        assert_eq!(errors[0].code, "E-TYPE-002");
+        let span = errors[0]
+            .primary
+            .as_ref()
+            .and_then(|origin| origin.span.as_ref())
+            .expect("definition error retains its original module span");
+        assert_eq!(span.start_line, 4);
+        assert_eq!(&source[span.start_byte..span.end_byte], "+");
     }
 
     #[test]
