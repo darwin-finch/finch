@@ -200,6 +200,13 @@ async fn live_parity_finch_wire_programs() {
                 .await
                 .unwrap_or_else(|error| panic!("{name} wire request failed: {error}"))
                 .text();
+            finch::programs::corpus::capture_from_env(
+                name,
+                name,
+                "live_conformance",
+                finch::programs::corpus::WireCorpusAttempt::FirstPass,
+                &initial,
+            );
             match execute_wire_source(&initial).await {
                 Ok(output) if output == expected => {
                     first_pass += 1;
@@ -225,6 +232,13 @@ async fn live_parity_finch_wire_programs() {
                         .await
                         .unwrap_or_else(|error| panic!("{name} wire repair failed: {error}"))
                         .text();
+                    finch::programs::corpus::capture_from_env(
+                        name,
+                        name,
+                        "live_conformance",
+                        finch::programs::corpus::WireCorpusAttempt::Repair,
+                        &replacement,
+                    );
                     match execute_wire_source(&replacement).await {
                         Ok(output) if output == expected => repaired += 1,
                         Ok(output) => {
