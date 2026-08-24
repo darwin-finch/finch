@@ -382,6 +382,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Adapt discovered MCP client tools into versioned namespaced typed VM bindings with schema
   validation, managed JSON fallback, parameter-bounded `mcp.call` capability grants, and normal
   suspension/resume; keep MCP transport lifecycle host-owned rather than a VM subagent protocol.
+  The generic Lisp/Co-Forth `mcp-call` boundary now consumes `(server, tool, json)`, derives and
+  rechecks an exact server/tool selector, dispatches through the application-owned MCP client, and
+  returns managed `json`; a deterministic stdio fixture covers the real transport path. Still
+  generate versioned namespaced words from supported schemas, validate their results, bound and
+  provenance-tag third-party discovery metadata, and expose the same binding in named-Brain hosts.
 - [ ] Finish the persistent `ProgramRuntime` state model. Lisp and Co-Forth already share one
   persistent typed stack and dictionary, exposed by one inspection/revision boundary. Successful
   revisions now retain a serializable, reverified stack-and-definition checkpoint whenever they
