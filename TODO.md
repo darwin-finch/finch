@@ -166,11 +166,12 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Run the fixed protocol-conformance workload across every supported configured provider/model,
   publish sample size and recovery rates, and keep regressions as replayable fixtures. A live
   configured-Grok first-pass Lisp result proves the recorder path, not cross-provider conformance.
-  The ignored `live_parity_finch_wire_programs` suite now executes six fixed response, multiline-
-  quoting, arithmetic, recursive-definition, closure, and producer-fiber tasks through the real
-  typed runtime, performs at most one source-only repair with a 60-second per-call deadline, and
+  The ignored `live_parity_finch_wire_programs` suite now executes eight fixed response, multiline-
+  quoting, arithmetic, recursive-definition, closure, producer-fiber, loop, and typed-record tasks
+  through the real typed runtime, performs at most one source-only repair with a 60-second per-call
+  deadline, and
   prints source-free first-pass/repaired/terminal counts for every configured provider. On
-  2026-08-24 the configured Grok profile completed all 6 language-package tasks first-pass
+  2026-08-24 the configured Grok profile completed all 8 language-package tasks first-pass
   (0 repaired, 0 terminal); other provider/model profiles remain unmeasured. A BOOT-only trial
   passed the four basic tasks but emitted textual introspection requests for closures and fibers
   because that source-only fixture exposed neither tools nor the language definitions. Supplying
@@ -464,10 +465,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   multi-provider corpus, extend that compiler context to future module/import/package identities,
   add token/latency metadata, and expand the reproducible reports. The first source-free checked-in
   smoke artifact is `docs/conformance/2026-08-24-grok-code-fast-1.json`: its private captured
-  corpus replayed 9/9 programs successfully under manifest 1 / VM type system 5. That includes six
-  isolated language tasks, two turns sharing a committed typed word, and one deterministic repair
-  from raw prose plus the real structured diagnostic. Its nine submissions and one provider are
-  deliberately documented as insufficient to close this gate.
+  corpus replayed 11/11 programs successfully under manifest 1 / VM type system 5. That includes
+  eight isolated language tasks, two turns sharing a committed typed word, and one deterministic
+  repair from raw prose plus the real structured diagnostic. Its eleven submissions and one
+  provider are deliberately documented as insufficient to close this gate.
 
 ### Separate language/compiler research track — not a Brain convergence prerequisite
 
