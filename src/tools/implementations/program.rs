@@ -301,12 +301,25 @@ impl Tool for SearchVmVocabularyTool {
             .unwrap_or(25)
             .clamp(1, 100) as usize;
         let state = self.runtime.inspect().await?;
+        let exact_match = state
+            .typed_vocabulary
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(&query))
+            .cloned();
         let mut matching_words = state
             .typed_vocabulary
             .into_iter()
             .filter(|entry| core_word_matches(&entry.name, &query))
             .collect::<Vec<_>>();
-        matching_words.sort_by_key(|entry| name_match_rank(&entry.name, &query));
+        if let Some(exact_match) = exact_match {
+            // Symbolic names such as `*`, `+`, and `?` occur throughout other
+            // contracts and examples. Once an exact callable word exists,
+            // returning those documentation-only hits obscures the answer the
+            // model asked for and encourages needless shell fallbacks.
+            matching_words = vec![exact_match];
+        } else {
+            matching_words.sort_by_key(|entry| name_match_rank(&entry.name, &query));
+        }
         let matches = matching_words
             .into_iter()
             .take(limit)
@@ -464,12 +477,23 @@ impl Tool for SearchWordTool {
             .unwrap_or(25)
             .clamp(1, 100) as usize;
         let state = self.runtime.inspect().await?;
+        let exact_match = state
+            .typed_vocabulary
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(&query))
+            .cloned();
         let mut matching_words = state
             .typed_vocabulary
             .into_iter()
             .filter(|entry| core_word_matches(&entry.name, &query))
             .collect::<Vec<_>>();
-        matching_words.sort_by_key(|entry| name_match_rank(&entry.name, &query));
+        if let Some(exact_match) = exact_match {
+            // Exact symbolic queries are otherwise especially noisy: `*`,
+            // `+`, and `?` occur in many unrelated examples and signatures.
+            matching_words = vec![exact_match];
+        } else {
+            matching_words.sort_by_key(|entry| name_match_rank(&entry.name, &query));
+        }
         let core_matches = matching_words
             .into_iter()
             .take(limit)
@@ -1074,6 +1098,18 @@ mod tests {
         assert_eq!(contract["kind"], "core");
         assert_eq!(contract["name"], "file-slice");
         assert_eq!(contract["source"], Value::Null);
+
+        let operator: Value = serde_json::from_str(
+            &search
+                .execute(json!({"query": "*"}), &context)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let matches = operator["core_matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1, "exact symbolic lookup must not match every example");
+        assert_eq!(matches[0]["name"], "*");
+        assert_eq!(matches[0]["forth"], "a b *");
     }
 
     #[tokio::test]
