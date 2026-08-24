@@ -38,8 +38,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   byte stream once into span-carrying syntax/lowering events; macro expansion, name resolution,
   optimization, linking, and the independent security verifier may operate on those retained
   structures but must never rescan source, reparse generated text, or require C++-style iterative
-  parsing. Use declaration-before-use and explicit typed module interfaces where necessary;
-  mutually recursive definitions may be declared in an interface before their bodies. Keep the
+  parsing. Source order must not become a user-facing consequence of this rule: register every
+  top-level declaration skeleton during that one parse, then let the semantic scheduler resolve
+  forward references on demand. Require explicit signatures only for exported interfaces,
+  genuinely ambiguous inference, or dependency cycles that cannot otherwise become
+  `SignatureReady`; measure those cases in corpus replay. Keep the
   verifier as an independent semantic pass over IR—security verification is not source parsing.
 - [ ] Add a dependency-driven semantic scheduler over retained AST/module interfaces. Parse and
   register every declaration once, then advance each symbol or generic instantiation through

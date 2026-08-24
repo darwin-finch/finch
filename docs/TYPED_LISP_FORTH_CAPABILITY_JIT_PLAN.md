@@ -73,11 +73,14 @@ verification operate on retained structured data; none may rescan the source or 
 reparse it. The independent verifier remains mandatory because it proves the produced IR rather
 than interpreting source a second time.
 
-The grammar and declaration rules must make that constraint practical. Definitions are visible
-after declaration, and forward or mutually recursive calls use explicit typed declarations from
-the same module or an imported module interface. Macros are bounded structured transformations,
-not context-sensitive token reinterpretation. A parser must never need to guess and revisit an
-earlier token after discovering a later declaration.
+Source order is independent from this parsing constraint. During the one parse, the frontend
+registers every top-level declaration skeleton before semantic jobs require its body, so later
+definitions are valid forward references. The dependency scheduler resolves them on demand.
+Explicit signatures are required for exported module interfaces, genuinely ambiguous inference,
+or cycles that cannot otherwise reach `SignatureReady`—not merely because a callee appears later
+in the file. Macros are bounded structured transformations, not context-sensitive token
+reinterpretation. A parser never guesses and revisits an earlier token after discovering a later
+declaration; the retained AST and symbol registry carry that information into semantic analysis.
 
 Single-pass parsing does not mean emitting final IR directly from lexer tokens. Each frontend must
 produce an explicit, span-preserving syntax tree in that one source pass. Lisp already has the
