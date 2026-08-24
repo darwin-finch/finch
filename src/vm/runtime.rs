@@ -461,7 +461,19 @@ impl TypedRuntime {
         values: Vec<TypedValue>,
         handler: &mut H,
     ) -> TypedExecution {
-        self.resume_with_handler_inner(suspension, values, None, handler)
+        self.resume_with_handler_inner(suspension, values, None, false, handler)
+    }
+
+    /// Resume exactly the host call already captured by `suspension` after
+    /// the application has independently authorized its concrete request.
+    /// The authorization applies only to that pending boundary: subsequent
+    /// calls continue under this runtime's ordinary grant set.
+    pub(crate) fn resume_authorized_host_call_with_handler<H: CapabilityHandler>(
+        &mut self,
+        suspension: TypedSuspension,
+        handler: &mut H,
+    ) -> TypedExecution {
+        self.resume_with_handler_inner(suspension, Vec::new(), None, true, handler)
     }
 
     /// Acknowledge one already-journaled host effect with values supplied by
@@ -478,6 +490,7 @@ impl TypedRuntime {
             suspension,
             Vec::new(),
             Some((effect_sequence, values)),
+            false,
             handler,
         )
     }
@@ -487,6 +500,7 @@ impl TypedRuntime {
         suspension: TypedSuspension,
         values: Vec<TypedValue>,
         external_effect_result: Option<(u64, Vec<TypedValue>)>,
+        authorize_pending_host_call: bool,
         handler: &mut H,
     ) -> TypedExecution {
         let baseline = self.producer_fibers.clone();
@@ -495,6 +509,7 @@ impl TypedRuntime {
             suspension,
             values,
             external_effect_result,
+            authorize_pending_host_call,
             handler,
         );
         self.finish_producer_transaction(execution, baseline)
@@ -505,6 +520,7 @@ impl TypedRuntime {
         suspension: TypedSuspension,
         values: Vec<TypedValue>,
         external_effect_result: Option<(u64, Vec<TypedValue>)>,
+        authorize_pending_host_call: bool,
         handler: &mut H,
     ) -> TypedExecution {
         let TypedSuspension {
@@ -591,7 +607,7 @@ impl TypedRuntime {
                     );
                 }
                 let requested = EffectSet::from_requirement(call.requirement.clone());
-                if !self.grants.grants(&requested) {
+                if !authorize_pending_host_call && !self.grants.grants(&requested) {
                     return self.authorization_required(
                         module,
                         continuation,
@@ -632,7 +648,7 @@ impl TypedRuntime {
                     );
                 }
                 let requested = EffectSet::from_requirement(call.requirement.clone());
-                if !self.grants.grants(&requested) {
+                if !authorize_pending_host_call && !self.grants.grants(&requested) {
                     return self.authorization_required(
                         module,
                         continuation,
@@ -2459,6 +2475,45 @@ mod tests {
                 },
             ] if values == &vec![TypedValue::Bytes(b"contents".to_vec())]
         ));
+    }
+
+    #[test]
+    fn exact_authorization_resumes_only_the_pending_host_call() {
+        let mut runtime = TypedRuntime::new();
+        let mut host = RecordingHost::default();
+        let first = runtime.execute_with_handler(
+            ProgramLanguage::Lisp,
+            "allow-once.lisp",
+            "(begin (file-read (path \"Cargo.toml\")) (file-read (path \"Cargo.lock\")))",
+            1_000,
+            None,
+            &mut host,
+        );
+        assert!(matches!(
+            first.status,
+            TypedExecutionStatus::AuthorizationRequired { .. }
+        ));
+
+        let second = runtime.resume_authorized_host_call_with_handler(
+            first.suspension.expect("first file read must suspend"),
+            &mut host,
+        );
+        assert!(matches!(
+            second.status,
+            TypedExecutionStatus::AuthorizationRequired { .. }
+        ));
+        assert_eq!(second.effect_journal.len(), 2);
+        assert!(matches!(
+            second.effect_journal[0].state,
+            EffectJournalState::Acknowledged { .. }
+        ));
+        assert!(matches!(
+            second.effect_journal[1].state,
+            EffectJournalState::AwaitingApproval
+        ));
+        assert!(runtime.grants().0.iter().all(|requirement| {
+            requirement.capability != CapabilityKind::FileRead
+        }));
     }
 
     #[test]
