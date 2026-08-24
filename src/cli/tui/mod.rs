@@ -103,69 +103,6 @@ fn tilde_cwd() -> String {
     }
 }
 
-// ─── Co-Forth Forth source renderer ───────────────────────────────────────────
-
-/// Render the live typing words as arrow-connected vocabulary lines.
-///
-/// For each word found in the library, shows its definition snippet.
-/// Between consecutive recognised words, draws `word1 → word2`.
-/// Unknown words are shown in dim.
-#[allow(dead_code)]
-fn typing_words_to_lines(words: &[String], panel_w: usize, max_lines: usize) -> Vec<String> {
-    use crossterm::style::Stylize;
-    const ARROW: &str = " → ";
-
-    let lib = crate::coforth::Library::load();
-    let mut lines: Vec<String> = Vec::new();
-
-    // Build arrow chain line: word1 → word2 → word3
-    let mut chain = String::new();
-    for (i, word) in words.iter().enumerate() {
-        let key = word.to_lowercase();
-        let found = lib.lookup(&key).is_some();
-        if i > 0 {
-            chain.push_str(ARROW);
-        }
-        if found {
-            chain.push_str(&word.clone().bold().cyan().to_string());
-        } else {
-            chain.push_str(&word.clone().dim().to_string());
-        }
-    }
-    if !chain.is_empty() {
-        lines.push(chain);
-    }
-
-    // Per-word: definition snippet (first 40 chars)
-    for word in words {
-        if lines.len() >= max_lines {
-            break;
-        }
-        let key = word.to_lowercase();
-        if let Some(entry) = lib.lookup(&key) {
-            let def = entry
-                .definition
-                .chars()
-                .take(panel_w.saturating_sub(4))
-                .collect::<String>();
-            lines.push(format!("{}  {def}", word.clone().dim()));
-            // Show related words on next line if space
-            if lines.len() < max_lines && !entry.related.is_empty() {
-                let rel = entry
-                    .related
-                    .iter()
-                    .take(3)
-                    .map(|r| r.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                lines.push(format!("  {}", format!("↳ {rel}").dim()));
-            }
-        }
-    }
-
-    lines
-}
-
 /// Render a `Poset` as compact Forth source lines for the panel overlay.
 ///
 /// Each node becomes one word definition; predecessors are called first.
