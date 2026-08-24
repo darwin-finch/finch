@@ -69,7 +69,6 @@ pub enum Command {
     StackShow,         // /stack            — show current stack contents
     StackPop,          // /pop              — remove top item (undo last push)
     StackRun,          // /run              — execute full stack as one query
-    StackEval,         // /eval-each        — evaluate each stack item independently, show results
     StackClear,        // /stack clear      — drop all stack items
     StackProgram,      // /program          — switch panel to Forth source view
     StackView,         // /view             — switch panel to graph view (toggle)
@@ -173,7 +172,6 @@ impl Command {
             "/stack clear" | "/stack reset" => return Some(Command::StackClear),
             "/pop" => return Some(Command::StackPop),
             "/run" | "/execute" => return Some(Command::StackRun),
-            "/eval-each" | "/eval" => return Some(Command::StackEval),
             "/program" | "/words" | "/forth" => return Some(Command::StackProgram),
             "/view" | "/graph view" | "/poset" => return Some(Command::StackView),
             "/demo" | "/demo lang" => return Some(Command::StackDemo),
@@ -604,7 +602,6 @@ pub fn handle_command(
         | Command::StackShow
         | Command::StackPop
         | Command::StackRun
-        | Command::StackEval
         | Command::StackClear
         | Command::StackProgram
         | Command::StackView
@@ -1042,6 +1039,8 @@ mod tests {
             "/override love another feeling",
             "/undefine love",
             "/run love",
+            "/eval-each",
+            "/eval",
         ] {
             assert!(matches!(Command::parse(source), Some(Command::Help)));
         }

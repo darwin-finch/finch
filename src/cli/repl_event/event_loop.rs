@@ -2576,9 +2576,6 @@ Rules:\n\
                             }
                         }
                     }
-                    Command::StackEval => {
-                        self.handle_stack_eval().await?;
-                    }
                     Command::StackClear => {
                         self.handle_stack_clear().await?;
                     }
@@ -6619,46 +6616,6 @@ Rules:\n\
                 "📚 removed W{} → \"{preview}\"   nodes:{depth}",
                 removed.id
             ));
-        self.render_tui().await
-    }
-
-    /// `/eval-each` — run each stack item independently in a fresh VM clone and
-    /// display the result next to the program.  The stack is left unchanged so
-    /// items can be inspected, re-ordered, or re-run.
-    async fn handle_stack_eval(&mut self) -> Result<()> {
-        let items: Vec<String> = self.stack.lock().await.clone();
-        if items.is_empty() {
-            self.output_manager
-                .write_info("stack is empty — push some programs first".to_string());
-            return self.render_tui().await;
-        }
-
-        let sep = "─".repeat(60);
-        let mut lines = vec![sep.clone()];
-
-        for (i, prog) in items.iter().enumerate() {
-            // Each item gets a clean VM clone (same dict, empty stack) so state doesn't bleed.
-            let mut vm = self.forth_vm.clone_dict();
-            let result = match vm.exec(prog) {
-                Ok(out) => {
-                    let out = out.trim().to_string();
-                    let stack_top = vm.data_stack();
-                    if !out.is_empty() {
-                        out
-                    } else if !stack_top.is_empty() {
-                        let top: Vec<String> = stack_top.iter().map(|n| n.to_string()).collect();
-                        format!("( {} )", top.join("  "))
-                    } else {
-                        "ok".to_string()
-                    }
-                }
-                Err(e) => format!("error: {e}"),
-            };
-            lines.push(format!("[{i}] {prog:<40} → {result}"));
-        }
-
-        lines.push(sep);
-        self.output_manager.write_info(lines.join("\n"));
         self.render_tui().await
     }
 
