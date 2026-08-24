@@ -229,7 +229,26 @@ fn run_fiber(
             return;
         }
         step = match step {
-            VmStep::Yielded { continuation } => trampoline.run(continuation),
+            VmStep::Yielded {
+                value: TypedValue::Unit,
+                continuation,
+            } => trampoline.run(continuation),
+            VmStep::Yielded { value, .. } => {
+                finish(
+                    CpuFiberStatus::Failed,
+                    None,
+                    Some(VmDiagnostic::error(
+                        "E-YIELD-003",
+                        crate::vm::DiagnosticPhase::Interpretation,
+                        format!(
+                            "CPU task cannot discard yielded {}; use a producer fiber",
+                            value.value_type()
+                        ),
+                        Some(crate::vm::SourceOrigin::generated("yield")),
+                    )),
+                );
+                return;
+            }
             VmStep::Complete { stack } => {
                 finish(CpuFiberStatus::Completed, Some(stack), None);
                 return;

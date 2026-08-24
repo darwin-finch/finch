@@ -125,7 +125,8 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "proposal-open" => CoreWordDocumentation { summary: "Ask the host to open a human-editable artifact proposal. Approval may execute the edited artifact through its normal validator, return edited text for chat, or cancel; this word does not run a shell itself.", lisp: "(proposal-open language title source)", forth: "language title source proposal-open", example: "(proposal-open \"python\" \"Report\" \"print('hello')\\n\")" },
         "mem-recall" | "mem-store" => CoreWordDocumentation { summary: "Read matching session memory entries or store one text memory entry. Both use the host memory tree and require their respective memory capability.", lisp: "(mem-recall query), (mem-store text)", forth: "query mem-recall; text mem-store", example: "(mem-store \"tested release candidate\")" },
         "agent-spawn" | "agent-await" | "agent-poll" | "agent-cancel" => CoreWordDocumentation { summary: "Create or control a separate typed child-agent task. Agent tasks have their own stack, budget, ancestry, and attenuated grants; they are not fibers or shared-stack threads.", lisp: "(agent-spawn task), (agent-poll handle), (agent-await handle), (agent-cancel handle)", forth: "task agent-spawn; handle agent-poll; handle agent-await; handle agent-cancel", example: "(agent-poll (agent-spawn \"summarize recent test failures\"))" },
-        "yield" => CoreWordDocumentation { summary: "Cooperatively return the remaining VM frames to Finch's event-loop trampoline. It is stack-neutral and may occur repeatedly; it is not a first-class continuation or generator value.", lisp: "(yield)", forth: "yield", example: "(begin (say \"working...\") (yield) (say \"done\"))" },
+        "yield" => CoreWordDocumentation { summary: "Publish one typed value and suspend the exact VM continuation. Yielding unit is a cooperative timeslice; producer fibers consume other payload types.", lisp: "(yield value); (yield) is unit shorthand", forth: "value yield; use unit yield for a timeslice", example: "(begin (yield 42) (say \"resumed\"))" },
+        "unit" => CoreWordDocumentation { summary: "Push the unit value. It is useful when an operation needs an explicit no-information value, including unit yield.", lisp: "nil", forth: "unit", example: "unit yield" },
         "some" | "none" | "is-some" | "unwrap" => CoreWordDocumentation { summary: "Construct, test, or project typed option values. Prefer exhaustive match-option/if-some over unwrap when none is expected control flow.", lisp: "(some value), (none), (is-some option), (unwrap option)", forth: "value some; none; option is-some; option unwrap", example: "(match-option (some 42) (some n (say (int-to-string n))) (none (say \"missing\")))" },
         "ok" | "err" | "is-ok" | "result-unwrap" | "result-error" => CoreWordDocumentation { summary: "Construct, test, or project typed result values. Prefer exhaustive match-result/if-ok over projecting an unknown branch.", lisp: "(ok value), (err error), (is-ok result), (result-unwrap result)", forth: "value ok; error err; result is-ok; result result-unwrap", example: "(match-result (ok 42) (ok n (say (int-to-string n))) (err e (say e)))" },
         "network-connect" | "network-send" => CoreWordDocumentation { summary: "Open an approved network connection or send bytes over an existing opaque socket. The socket is not forgeable and calls remain capability-checked.", lisp: "(network-connect host port), (network-send socket bytes)", forth: "host port network-connect; socket bytes network-send", example: "(network-connect \"example.com\" 443)" },
@@ -203,6 +204,7 @@ fn host_path_template() -> FileSelectorTemplate {
 /// independent handwritten signature tables.
 fn core_signatures() -> Vocabulary {
     let a = Type::Variable("A".into());
+    let y = Type::Variable("Y".into());
     let int_binary = || pure(vec![Type::Int, Type::Int], vec![Type::Int]);
     let comparison = || pure(vec![Type::Int, Type::Int], vec![Type::Bool]);
     BTreeMap::from([
@@ -323,9 +325,20 @@ fn core_signatures() -> Vocabulary {
                 vec![Type::Option(Box::new(Type::Bool))],
             ),
         ),
-        // A control-only cooperative scheduling point. The source frontends
-        // lower this word to `Instruction::Yield`, not a normal core call.
-        ("yield".into(), pure(Vec::new(), Vec::new())),
+        // The single typed suspension primitive. A unit payload is a plain
+        // cooperative timeslice; other payload types are available to a
+        // producer/fiber host through the saved suspension record.
+        (
+            "yield".into(),
+            StackSignature {
+                type_parameters: vec!["Y".into()],
+                input: StackRow::polymorphic("S", vec![y]),
+                output: StackRow::polymorphic("S", Vec::new()),
+                effects: EffectSet::pure(),
+                control: ControlEffect::MaySuspend,
+            },
+        ),
+        ("unit".into(), pure(Vec::new(), vec![Type::Unit])),
         (
             "int-to-string".into(),
             pure(vec![Type::Int], vec![Type::String]),

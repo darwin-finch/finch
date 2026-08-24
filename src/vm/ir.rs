@@ -143,9 +143,13 @@ pub enum Instruction {
         input: Vec<Type>,
         output: Vec<Type>,
     },
-    /// Cooperatively return the implicit VM continuation to the event-loop
-    /// trampoline. This is not a user-visible first-class continuation.
-    Yield,
+    /// Publish one typed value and cooperatively return the implicit VM
+    /// continuation to the event-loop trampoline. This is the common
+    /// suspension primitive for timeslices (`unit`) and producer fibers; the
+    /// continuation itself is never exposed to source code.
+    Yield {
+        value_type: Type,
+    },
     /// Spawn a pure, zero-argument closure on the bounded CPU-fiber pool.
     /// The closure is popped and the runtime resumes this continuation with a
     /// typed task handle; it never shares the parent stack or frame.

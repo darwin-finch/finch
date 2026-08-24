@@ -2620,6 +2620,30 @@ impl Compiler<'_> {
                 origin
             },
         );
+        if word == "yield" && arguments.is_empty() {
+            // `(yield)` is only source sugar for yielding the ordinary unit
+            // value. The IR and scheduler still see the same typed payload
+            // as `(yield nil)` and Co-Forth `unit yield`.
+            builder.emit(
+                Instruction::Constant {
+                    value: TypedValue::Unit,
+                },
+                origin.clone(),
+            );
+            builder.emit(
+                Instruction::Yield {
+                    value_type: Type::Unit,
+                },
+                origin.clone(),
+            );
+            builder.emit(
+                Instruction::Constant {
+                    value: TypedValue::Unit,
+                },
+                origin,
+            );
+            return Ok(Type::Unit);
+        }
         let Some(signature) = self.vocabulary.get(word).cloned() else {
             return Err(vec![VmDiagnostic::error(
                 "E-LINK-002",
@@ -2651,10 +2675,16 @@ impl Compiler<'_> {
             .map_err(|diagnostic| vec![diagnostic])?;
         builder.effects = builder.effects.union(&signature.effects);
         if word == "yield" {
-            // Lisp expressions always produce a value. The underlying
-            // control instruction has no stack effect, so expose it as unit
-            // while keeping Co-Forth's `yield` stack-neutral.
-            builder.emit(Instruction::Yield, origin.clone());
+            // The argument is consumed as the typed yielded payload. Lisp
+            // remains expression-oriented, so resuming the one-way form
+            // evaluates to unit.
+            let value_type = concrete_signature
+                .input
+                .values
+                .last()
+                .cloned()
+                .expect("yield has one typed input");
+            builder.emit(Instruction::Yield { value_type }, origin.clone());
             builder.emit(
                 Instruction::Constant {
                     value: TypedValue::Unit,

@@ -289,10 +289,10 @@ event loop. `(task-cancel handle)` consumes a `cpu_fiber` handle and requests co
 cancellation; a worker observes that request at its next VM boundary. CPU task operations reject
 agent-task handles; use `agent-cancel` for child agents.
 
-`(yield)` is a cooperative statement expression. Finch records the remaining typed VM frames and
-returns control to its event loop as a saved suspension. A host must later resume that same
-execution; automatic requeueing is not implemented yet. It evaluates to `unit`; it is not a
-first-class continuation and does not terminate the program:
+`(yield value)` publishes one typed value, records the remaining typed VM frames, and returns
+control to its event loop as a saved suspension. `(yield)` is exact shorthand for `(yield nil)`,
+the cooperative-timeslice case. A host must later resume that same execution. It evaluates to
+`unit`; it is not a first-class continuation and does not terminate the program:
 
 ```lisp
 (begin
@@ -301,10 +301,10 @@ first-class continuation and does not terminate the program:
   (say "Finished."))
 ```
 
-`yield` is not a sequence generator. Use a bounded list for a known finite result or a typed
-`stream<T>` with `stream-next` / `stream-close` for host-backed iteration. Do not infer arbitrary
-generators or iterables from the legacy Co-Forth compatibility library; producer-backed streams
-remain a future typed extension.
+The typed suspension payload is the substrate for future first-class `fiber<Y,R>` producers. Use
+a bounded list for a known finite result or a typed `stream<T>` with `stream-next` / `stream-close`
+for currently implemented host-backed iteration. Do not borrow unverified generator state from
+the legacy Co-Forth compatibility library.
 
 `(vm-vocabulary)` returns the current typed word manifest for programmatic introspection.
 

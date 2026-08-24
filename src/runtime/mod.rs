@@ -340,7 +340,7 @@ struct PendingTypedExecution {
 
 /// UI-safe metadata for a daemon-owned typed continuation. The full frame is
 /// deliberately not exposed through ordinary client state inspection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingTypedExecutionInfo {
     pub execution_id: uuid::Uuid,
     pub input_revision: u64,
@@ -349,6 +349,15 @@ pub struct PendingTypedExecutionInfo {
     /// a concrete host capability result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_effect_sequence: Option<u64>,
+    /// Public payload of a typed `yield`. A unit timeslice appears as
+    /// `ProgramValue::Nil`; host-effect and task-join suspensions leave this
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yielded_value: Option<ProgramValue>,
+    /// Yield type is always inspectable even when the local payload (for
+    /// example a closure) has no portable `ProgramValue` representation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yielded_type: Option<Type>,
     pub reason: PendingTypedReason,
 }
 
@@ -534,7 +543,7 @@ impl ProgramRuntime {
                         budget: None,
                     }, grant_ceiling)
                     .await?;
-                // A stack-neutral yield is a local scheduling boundary, so a
+                // A unit-valued yield is a local scheduling boundary, so a
                 // callback can cooperatively slice CPU work without becoming
                 // a permanently parked task. Any other suspension needs the
                 // future daemon approval/I/O/message lifecycle; do not leave
@@ -542,8 +551,12 @@ impl ProgramRuntime {
                 // retries the source text.
                 while outcome.status == ExecutionStatus::Suspended
                     && matches!(
-                        runtime.pending_typed_execution(outcome.execution_id)?.map(|pending| pending.reason),
-                        Some(PendingTypedReason::Yielded)
+                        runtime.pending_typed_execution(outcome.execution_id)?,
+                        Some(PendingTypedExecutionInfo {
+                            reason: PendingTypedReason::Yielded,
+                            yielded_value: Some(ProgramValue::Nil),
+                            ..
+                        })
                     )
                 {
                     tokio::task::yield_now().await;
@@ -650,7 +663,21 @@ impl ProgramRuntime {
             .pending_typed
             .lock()
             .map_err(|_| anyhow::anyhow!("pending typed execution lock poisoned"))?;
-        Ok(pending.get(&execution_id).map(|pending| {
+        let Some(pending) = pending.get(&execution_id) else {
+            return Ok(None);
+        };
+        let yielded_type = pending
+            .suspension
+            .yielded_value
+            .as_ref()
+            .map(TypedValue::value_type);
+        let yielded_value = pending
+            .suspension
+            .yielded_value
+            .clone()
+            .map(typed_value)
+            .and_then(Result::ok);
+        Ok(Some({
             let resume_effect_sequence =
                 pending.suspension.pending_host_call.as_ref().and_then(|_| {
                     pending
@@ -686,6 +713,8 @@ impl ProgramRuntime {
                 input_revision: pending.input_revision,
                 manifest_generation: pending.context.manifest_generation,
                 resume_effect_sequence,
+                yielded_value,
+                yielded_type,
                 reason,
             }
         }))
@@ -4597,6 +4626,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_yield_payload_is_visible_without_exposing_the_continuation() {
+        let runtime = ProgramRuntime::new();
+        let yielded = runtime
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "42 yield 7",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(yielded.status, ExecutionStatus::Suspended);
+
+        let pending = runtime
+            .pending_typed_execution(yielded.execution_id)
+            .unwrap()
+            .expect("typed yield must retain its continuation");
+        assert_eq!(pending.reason, PendingTypedReason::Yielded);
+        assert_eq!(pending.yielded_value, Some(ProgramValue::Int(42)));
+        assert_eq!(pending.yielded_type, Some(Type::Int));
+
+        let completed = runtime
+            .resume_typed_execution(yielded.execution_id)
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ExecutionStatus::Completed);
+        assert_eq!(completed.values, vec![ProgramValue::Int(7)]);
+    }
+
+    #[tokio::test]
     async fn typed_capability_request_does_not_mutate_or_fallback() {
         let runtime = ProgramRuntime::new();
         let outcome = runtime
@@ -5757,7 +5815,7 @@ mod tests {
             .enqueue(ScheduledTask {
                 id: None,
                 scheduled_time: chrono::Utc::now(),
-                task: "yield 42".into(),
+                task: "unit yield 42".into(),
                 context: scheduled_vm_context(TypedRuntime::new().grants().clone()).unwrap(),
                 recurring: None,
                 status: TaskStatus::Pending,
@@ -5891,7 +5949,7 @@ mod tests {
             .await
             .unwrap();
         let suspended = runtime
-            .submit(submission(ProgramLanguage::Forth, "yield 9", ExecutionEffect::Pure))
+            .submit(submission(ProgramLanguage::Forth, "unit yield 9", ExecutionEffect::Pure))
             .await
             .unwrap();
         assert_eq!(suspended.status, ExecutionStatus::Suspended);
@@ -6053,7 +6111,7 @@ mod tests {
         let suspended = runtime
             .submit(submission(
                 ProgramLanguage::Forth,
-                "s\" before conflict\" say yield 1",
+                "s\" before conflict\" say unit yield 1",
                 ExecutionEffect::Pure,
             ))
             .await

@@ -557,7 +557,16 @@ impl<'a> Verifier<'a> {
                 *inferred_effects =
                     inferred_effects.union(&EffectSet::from_requirement(requirement.clone()));
             }
-            Instruction::Yield => {}
+            Instruction::Yield { value_type } => {
+                let found = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
+                if !value_type.accepts(&found) {
+                    return Err(VmDiagnostic::type_mismatch(
+                        value_type.clone(),
+                        found,
+                        Some(origin.clone()),
+                    ));
+                }
+            }
             Instruction::DeferCpu => {
                 let closure = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
                 let Type::Function {

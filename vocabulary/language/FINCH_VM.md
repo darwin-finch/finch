@@ -132,13 +132,14 @@ consumes a CPU task handle and requests cooperative cancellation at the worker's
 CPU task operations reject agent-task handles; agent coordination remains `agent-*` and is a
 separate protocol.
 
-`yield` is a stack-neutral control instruction. It returns the VM's remaining frames to the Finch
-event-loop trampoline as a saved `ProgramRun` suspension. The interactive provider-wire runner
-currently yields its Tokio task and resumes that exact execution automatically; all other hosts
-choose their own scheduling policy. It may occur more than once in one program; it is not an
-LLM-authored continuation value. A future generalization will let the same typed control effect
-publish a declared `Y` through `fiber<Y,R>` while preserving a declared resume type (initially
-`unit`); it will not add a second generator-only `yield` or hidden multiple-return protocol.
+`yield` consumes and publishes one typed value and returns the VM's remaining frames to the Finch
+event-loop trampoline as a saved `ProgramRun` suspension. `unit yield` / `(yield)` is the plain
+cooperative-timeslice case; the interactive provider-wire runner automatically resumes only that
+unit form. Other hosts choose their own scheduling policy and may inspect the payload. It may occur
+more than once in one program and does not expose an LLM-authored continuation value. A future
+`fiber<Y,R>` is a first-class handle over this same typed control effect, with a declared resume
+type (initially `unit`); Finch will not add a second generator-only `yield` or hidden multi-return
+protocol.
 
 It is not a lazy sequence generator. This revision has no `next`, `generator<T>`, or generic
 iterator protocol; do not borrow such words from the legacy Co-Forth compatibility library. Known

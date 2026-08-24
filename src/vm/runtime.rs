@@ -85,6 +85,10 @@ pub struct TypedExecution {
 pub struct TypedSuspension {
     pub module: VerifiedModule,
     pub continuation: VmContinuation,
+    /// Value published by the `yield` that created this suspension. `None`
+    /// identifies an await/join boundary rather than a producer suspension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yielded_value: Option<TypedValue>,
     pub effects: EffectSet,
     /// Events already emitted before this saved continuation. They are part of
     /// the execution journal and must not be repeated when a run resumes.
@@ -433,6 +437,7 @@ impl TypedRuntime {
         let TypedSuspension {
             module,
             continuation,
+            yielded_value: _,
             effects,
             pending_host_call,
             event_journal,
@@ -652,6 +657,7 @@ impl TypedRuntime {
             suspension: Some(TypedSuspension {
                 module,
                 continuation,
+                yielded_value: None,
                 effects,
                 event_journal,
                 effect_journal,
@@ -692,10 +698,14 @@ impl TypedRuntime {
     ) -> TypedExecution {
         loop {
             step = match step {
-                VmStep::Yielded { continuation } => {
+                VmStep::Yielded {
+                    value,
+                    continuation,
+                } => {
                     return self.suspended(
                         module,
                         effects,
+                        value,
                         continuation,
                         event_journal,
                         effect_journal,
@@ -786,6 +796,7 @@ impl TypedRuntime {
                             suspension: Some(TypedSuspension {
                                 module,
                                 continuation,
+                                yielded_value: None,
                                 effects,
                                 event_journal,
                                 effect_journal,
@@ -816,6 +827,7 @@ impl TypedRuntime {
                             suspension: Some(TypedSuspension {
                                 module,
                                 continuation,
+                                yielded_value: None,
                                 effects,
                                 event_journal,
                                 effect_journal,
@@ -1046,6 +1058,7 @@ impl TypedRuntime {
         &self,
         module: VerifiedModule,
         effects: EffectSet,
+        yielded_value: TypedValue,
         continuation: VmContinuation,
         event_journal: Vec<VmSideEffect>,
         effect_journal: Vec<EffectJournalEntry>,
@@ -1064,6 +1077,7 @@ impl TypedRuntime {
             suspension: Some(TypedSuspension {
                 module,
                 continuation,
+                yielded_value: Some(yielded_value),
                 effects,
                 event_journal,
                 effect_journal,
@@ -1096,6 +1110,7 @@ impl TypedRuntime {
             suspension: Some(TypedSuspension {
                 module,
                 continuation,
+                yielded_value: None,
                 effects,
                 event_journal,
                 effect_journal,

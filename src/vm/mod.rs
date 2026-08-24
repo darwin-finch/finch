@@ -43,5 +43,5 @@ pub use vocabulary::core_vocabulary;
 /// Version 2 adds `MakeMap` and its portable immutable typed-map value form.
 /// Old modules/checkpoints must be rejected and recompiled rather than being
 /// decoded under the new collection semantics.
-pub const VM_TYPE_SYSTEM_VERSION: u32 = 2;
+pub const VM_TYPE_SYSTEM_VERSION: u32 = 3;
 pub mod capability;

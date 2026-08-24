@@ -217,7 +217,7 @@ drop         forall A S. (S A -- S) ! pure
 +            forall S.   (S int int -- S int) ! pure
 file.read    forall R S. (S path<R> -- S bytes) ! {fs.read(R)}
 agent.await  forall T S. (S task<T> -- S result<T,agent-error>) ! {agent.await}
-yield        forall S.   (S -- S) ! pure  ; current cooperative timeslice boundary
+yield        forall Y S. (S Y -- S) ! pure ; typed suspension; unit is a timeslice
 ```
 
 The signature includes:
@@ -266,7 +266,7 @@ join fiber       : R             wait only for the terminal return
 
 The source program never writes a continuation. A fiber `yield value` may occur any number of
 times; the VM records remaining frames as an internal thunk and the event loop schedules it later.
-This must be a generalization of the current stack-neutral `yield`, not a second fiber-only
+This uses the same typed `yield` instruction as ordinary ProgramRuns, not a second fiber-only
 primitive: its function/fiber contract declares `Y` and the resume value (initially `unit`), and
 the scheduler records both in the same typed suspension record used by every `MaySuspend` word.
 If bidirectional generators become necessary, add `fiber<Y,Resume,R>` and give `yield` the typed
@@ -312,14 +312,15 @@ unsafe reflection prevent proof and require an explicit dynamic/unsafe boundary.
 
 ### No privileged collection or iteration overloads
 
-Surface convenience must never create a standard-library-only fast path. A future `for` form is a
-macro/template over a public structural range contract, conceptually `empty?`, `front`, and
-`pop-front` (or the equivalent `next` contract). A user-defined range supplies the same visible,
-typed words and is resolved to the same concrete word IDs as a built-in range. The optimizer may
-inline, specialize, fuse, or eliminate allocations after that resolution, but it may not recognize
-only `list`, `map`, or a compiler-owned iterator type while treating an equivalent user definition
-as dynamic dispatch. This makes a custom `foreach`, traversal, or adapter eligible for the same
-performance as syntax supplied by Finch.
+Surface convenience must never create a standard-library-only fast path. A future `for`/`foreach`
+form may be compiler-owned syntax that selects an indexed loop, range loop, fiber pull loop, or
+collection-specific loop during lowering. Each selection must be justified by a public structural
+contract, conceptually `empty?`, `front`, and `pop-front` (or the equivalent `next` contract). A
+user-defined range supplies the same visible typed words and resolves to the same concrete word IDs
+as a built-in range. The optimizer may inline, specialize, fuse, or eliminate allocations after
+that resolution, but it may not recognize only `list`, `map`, or a compiler-owned iterator type
+while treating an equivalent user definition as dynamic dispatch. A user-written `foreach`,
+traversal, or adapter must remain eligible for the same optimizations as syntax supplied by Finch.
 
 The exception is the deliberately small execution substrate: verified branch/suspend instructions,
 managed allocation, and authorized host calls. Those are represented by public typed words and
@@ -726,7 +727,7 @@ Fail(diagnostic)                discard uncommitted VM-local mutation
 be a compact frame object; for a durable Brain it must serialize as VM data rather than an opaque
 Rust closure. The event loop is the trampoline: it repeatedly invokes `Continue`/`Emit` thunks,
 projects emitted events to the shadow buffer, and stores `Await` continuations. The current
-interactive provider-wire runner automatically requeues only a stack-neutral `yield` after first
+interactive provider-wire runner automatically requeues only a unit-valued `yield` after first
 yielding its Tokio task; approval, timer, agent-completion, and host-I/O events require their
 explicit host lifecycle before they resume the saved thunk with a typed result. They never
 resubmit source text or mutate an LLM prompt.

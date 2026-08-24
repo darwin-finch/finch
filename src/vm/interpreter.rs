@@ -293,9 +293,11 @@ pub struct VmContinuation {
 /// One result from running the VM until its next observable boundary.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VmStep {
-    /// A cooperative timeslice boundary. The event loop reschedules this
-    /// internal continuation without exposing it to source programs.
+    /// A typed cooperative suspension. The event loop may reschedule a unit
+    /// yield as a timeslice or expose a non-unit value through a fiber/range
+    /// handle; the continuation itself is never exposed to source programs.
     Yielded {
+        value: TypedValue,
         continuation: VmContinuation,
     },
     Emit {
@@ -973,7 +975,26 @@ impl<'a> VmTrampoline<'a> {
                         continuation,
                     };
                 }
-                Instruction::Yield => return VmStep::Yielded { continuation },
+                Instruction::Yield { value_type } => {
+                    let Some(value) = continuation.stack.pop() else {
+                        return VmStep::Failed(self.underflow(&located.origin, &continuation));
+                    };
+                    let found = value.value_type();
+                    if !value_type.accepts(&found) {
+                        return VmStep::Failed(self.with_trace(
+                            VmDiagnostic::type_mismatch(
+                                value_type,
+                                found,
+                                Some(located.origin),
+                            ),
+                            &continuation,
+                        ));
+                    }
+                    return VmStep::Yielded {
+                        value,
+                        continuation,
+                    };
+                }
                 Instruction::DeferCpu => {
                     let Some(closure) = continuation.stack.pop() else {
                         return VmStep::Failed(self.underflow(&located.origin, &continuation));
@@ -1296,7 +1317,21 @@ impl<'a, H: CapabilityHandler> Interpreter<'a, H> {
         let mut step = trampoline.run(continuation);
         loop {
             step = match step {
-                VmStep::Yielded { continuation } => trampoline.run(continuation),
+                VmStep::Yielded {
+                    value: TypedValue::Unit,
+                    continuation,
+                } => trampoline.run(continuation),
+                VmStep::Yielded { value, .. } => {
+                    return Err(VmDiagnostic::error(
+                        "E-YIELD-002",
+                        DiagnosticPhase::Interpretation,
+                        format!(
+                            "synchronous execution cannot discard yielded {}",
+                            value.value_type()
+                        ),
+                        Some(SourceOrigin::generated("yield")),
+                    ));
+                }
                 VmStep::Emit {
                     effect,
                     continuation,
@@ -1781,6 +1816,7 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
             stack.push(TypedValue::Int(parsed));
         }
         "space" => stack.push(TypedValue::String(" ".into())),
+        "unit" => stack.push(TypedValue::Unit),
         // Source frontends lower `yield` to `Instruction::Yield`. Keeping a
         // no-op core implementation preserves compatibility for older cached
         // modules that encoded it as a normal call.
@@ -2367,14 +2403,18 @@ mod tests {
     fn source_yield_suspends_without_exposing_a_continuation_value() {
         let module = crate::vm::frontend::forth::compile_forth(
             "yield.forth",
-            "1 yield 2 +",
+            "1 unit yield 2 +",
             Vec::new(),
             &core_vocabulary(),
         )
         .unwrap();
         let trampoline = VmTrampoline::new(&module, &InterpreterConfig::default());
         let yielded = trampoline.run(trampoline.start(Vec::new()).unwrap());
-        let VmStep::Yielded { continuation } = yielded else {
+        let VmStep::Yielded {
+            value: TypedValue::Unit,
+            continuation,
+        } = yielded
+        else {
             panic!("yield must return control to the event loop");
         };
         assert_eq!(continuation.stack, vec![TypedValue::Int(1)]);
@@ -2388,13 +2428,16 @@ mod tests {
     fn lisp_yield_is_a_statement_expression_with_unit_type() {
         let module = crate::vm::frontend::lisp::compile_lisp(
             "yield.lisp",
-            "(begin (yield) (+ 1 2))",
+            "(begin (yield nil) (+ 1 2))",
             Vec::new(),
             &core_vocabulary(),
         )
         .unwrap();
         let trampoline = VmTrampoline::new(&module, &InterpreterConfig::default());
-        let VmStep::Yielded { continuation } =
+        let VmStep::Yielded {
+            value: TypedValue::Unit,
+            continuation,
+        } =
             trampoline.run(trampoline.start(Vec::new()).unwrap())
         else {
             panic!("Lisp yield must return control to the event loop");
@@ -2403,5 +2446,38 @@ mod tests {
         assert!(
             matches!(complete, VmStep::Complete { stack } if stack == vec![TypedValue::Int(3)])
         );
+    }
+
+    #[test]
+    fn both_frontends_publish_the_same_typed_yield_payload() {
+        let forth = crate::vm::frontend::forth::compile_forth(
+            "producer.forth",
+            "7 yield 8",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let lisp = crate::vm::frontend::lisp::compile_lisp(
+            "producer.lisp",
+            "(begin (yield 7) 8)",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+
+        for module in [&forth, &lisp] {
+            let trampoline = VmTrampoline::new(module, &InterpreterConfig::default());
+            let VmStep::Yielded {
+                value: TypedValue::Int(7),
+                continuation,
+            } = trampoline.run(trampoline.start(Vec::new()).unwrap())
+            else {
+                panic!("frontend must publish the typed integer payload");
+            };
+            assert!(matches!(
+                trampoline.run(continuation),
+                VmStep::Complete { stack } if stack == vec![TypedValue::Int(8)]
+            ));
+        }
     }
 }

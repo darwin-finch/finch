@@ -1841,7 +1841,13 @@ fn compile_forth_body_with_locals(
                         .map_err(|diagnostic| vec![diagnostic])?;
                     effects = effects.union(&signature.effects);
                     if word == "yield" {
-                        Instruction::Yield
+                        let value_type = concrete_signature
+                            .input
+                            .values
+                            .last()
+                            .cloned()
+                            .expect("yield has one typed input");
+                        Instruction::Yield { value_type }
                     } else if word == "output-open" {
                         Instruction::OutputOpen
                     } else if let Some(operation) = output_operation(&word) {

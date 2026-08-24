@@ -93,8 +93,12 @@ async fn resume_interactive_yields(
 ) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
     while outcome.status == crate::runtime::outcome::ExecutionStatus::Suspended
         && matches!(
-            runtime.pending_typed_execution(outcome.execution_id)?.map(|pending| pending.reason),
-            Some(crate::runtime::PendingTypedReason::Yielded)
+            runtime.pending_typed_execution(outcome.execution_id)?,
+            Some(crate::runtime::PendingTypedExecutionInfo {
+                reason: crate::runtime::PendingTypedReason::Yielded,
+                yielded_value: Some(crate::programs::ProgramValue::Nil),
+                ..
+            })
         )
     {
         // Do not spin a whole VM run inside the provider-response task. The

@@ -268,14 +268,14 @@ the current VM run if necessary rather than blocking the terminal. `task-cancel`
 and requests cooperative cancellation at its next worker VM boundary. CPU task words reject
 agent-task handles.
 
-`yield` is a stack-neutral cooperative scheduling point. It yields control to Finch's event loop
-as a saved suspension; a host must explicitly resume that execution at the next word. Finch does
-not yet automatically requeue yielded runs. It does not expose a continuation value or terminate
-the program. Use it between bounded phases when another host-owned event should run:
+`yield` consumes and publishes one typed value, then yields control to Finch's event loop as a
+saved suspension. A host must explicitly resume that execution at the next word. It does not
+expose a continuation value or terminate the program. Use `unit yield` for a plain cooperative
+timeslice; producer/fiber hosts may consume another yielded type:
 
 ```forth
 s" Searching…" say
-yield
+unit yield
 s" Finished." say
 ```
 

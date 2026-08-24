@@ -65,9 +65,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   must be structural requirements over explicitly imported, visible typed words—not nominal
   Rust-style trait implementations—and resolution must select one coherent candidate or diagnose
   ambiguity rather than escape through `dynamic`. No surface construct may receive privileged
-  overload resolution or optimization unavailable to a normal typed definition: `for`, range
-  adapters, and collection traversal must desugar through public structural contracts and resolved
-  word IDs, so a user-defined traversal can be specialized/inlined exactly like a built-in one.
+  overload resolution or optimization unavailable to a normal typed definition: compiler-owned
+  `for`/`foreach` syntax may select an indexed, range, fiber, or collection-specific loop lowering,
+  but selection must use public structural contracts and resolved word IDs so user-defined types
+  and traversal functions can receive the same specialization/inlining as built-ins.
 - [ ] Generate every production word/function from one typed signature, effect, documentation, and
   host-implementation registry.
 - [x] Finish Lisp source maps: the reader retains structural spans and typed lowering preserves
@@ -195,10 +196,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   bounded `stream-next -> option<T>` and `stream-close`, with
   ProgramRun ownership/generation checks, path-scoped capability propagation, concrete polymorphic
   host-result rows, and shared Lisp/Co-Forth lowering. File-line and CSV streams are the first
--  backends. The present stack-neutral `yield` is a cooperative suspension point only.
-- [ ] Generalize that same `yield` control effect for producer fibers rather than introducing a
-  second generator-only operation: a yielded typed value and declared typed resume value must be
-  recorded in the function/fiber contract; `defer` must expose the resulting `fiber<Y,R>` through
+  backends.
+- [ ] Complete first-class producer fibers on the shared typed `yield` control effect. `yield` now
+  publishes one typed value beside the exact serializable continuation, pending-run inspection
+  exposes it, and unit yields retain automatic cooperative-timeslice behavior. Still record the
+  declared resume value in the function/fiber contract and make `defer` expose `fiber<Y,R>` through
   ordinary typed `next`/`join` vocabulary words. `stream<T>` stays the range abstraction for
   cursor-backed data, while producer fibers supply user-defined ranges. No special multi-return,
   hidden iterator protocol, compiler-only map lookup rule, or untyped resumed value is permitted;
