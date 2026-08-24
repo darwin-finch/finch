@@ -184,6 +184,10 @@ without consuming a newer continuation. The terminal effect-journal state record
 as `acknowledged`, `denied`, or `cancelled`.
 Per-run effect observers receive an awaited request before authorization or local dispatch, so a
 host can persist or route that boundary without waiting for a synchronous adapter.
+An embedder may choose the portable deferred-host mode, in which every approved awaited request
+(file, process, network, proposal, and so on) suspends and must receive this correlated
+`VmResume`; Finch's compatibility submission mode still dispatches its installed host bindings
+synchronously except for editor proposals.
 Finch projects these events onto its reactive `WorkUnit`/shadow-buffer
 UI; another harness may instead use a browser, IDE, voice interface, or audit log. `say` is only a
 durable response-append event, never a direct terminal write. Rich replaceable/progress output will

@@ -86,6 +86,33 @@ pub enum VmResumeResponse {
 /// "active work unit".
 pub type TypedEffectSink = Arc<dyn Fn(VmEffectEnvelope) + Send + Sync>;
 
+/// Selects which awaited host calls leave the VM suspended for an external
+/// embedder. Emitted presentation effects such as `say` are deliberately not
+/// included: they have no host result row and therefore continue immediately.
+///
+/// `ProgramInvocations` preserves Finch's existing editor-proposal behavior.
+/// `AllAwaited` is the portable Runtime/Application boundary: an IDE, web
+/// host, or daemon can handle every approved host request and return a
+/// correlated [`VmResume`] without the VM knowing the host implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredHostEffects {
+    None,
+    ProgramInvocations,
+    AllAwaited,
+}
+
+impl DeferredHostEffects {
+    fn defers(self, effect: &VmSideEffect) -> bool {
+        match self {
+            Self::None => false,
+            Self::ProgramInvocations => {
+                effect.requirement.capability == crate::vm::CapabilityKind::ProgramInvoke
+            }
+            Self::AllAwaited => true,
+        }
+    }
+}
+
 /// Create a thread-safe, single-consumer adapter for portable VM effects.
 ///
 /// A `ProgramRuntime` may execute VM instructions on Tokio's blocking pool;
@@ -263,7 +290,7 @@ struct PendingTypedExecution {
     output_chunks: Vec<String>,
     side_effects: Vec<crate::vm::interpreter::HostSideEffect>,
     effect_sink: Option<TypedEffectSink>,
-    defer_program_invocations: bool,
+    deferred_host_effects: DeferredHostEffects,
 }
 
 /// UI-safe metadata for a daemon-owned typed continuation. The full frame is
@@ -980,7 +1007,7 @@ impl ProgramRuntime {
                         output_chunks: output_chunks.clone(),
                         side_effects: side_effects.clone(),
                         effect_sink: pending.effect_sink.clone(),
-                        defer_program_invocations: pending.defer_program_invocations,
+                        deferred_host_effects: pending.deferred_host_effects,
                     },
                 );
         }
@@ -1245,7 +1272,12 @@ impl ProgramRuntime {
         &self,
         submission: ProgramSubmission,
     ) -> Result<ExecutionOutcome> {
-        self.submit_as_with_optional_typed_effect_sink(submission, None, None, false)
+        self.submit_as_with_optional_typed_effect_sink(
+            submission,
+            None,
+            None,
+            DeferredHostEffects::None,
+        )
             .await
     }
 
@@ -1257,7 +1289,12 @@ impl ProgramRuntime {
         submission: ProgramSubmission,
         caller: Option<scheduler::AgentIdentity>,
     ) -> Result<ExecutionOutcome> {
-        self.submit_as_with_optional_typed_effect_sink(submission, caller, None, false)
+        self.submit_as_with_optional_typed_effect_sink(
+            submission,
+            caller,
+            None,
+            DeferredHostEffects::None,
+        )
             .await
     }
 
@@ -1269,8 +1306,13 @@ impl ProgramRuntime {
         caller: Option<scheduler::AgentIdentity>,
         effect_sink: TypedEffectSink,
     ) -> Result<ExecutionOutcome> {
-        self.submit_as_with_optional_typed_effect_sink(submission, caller, Some(effect_sink), false)
-            .await
+        self.submit_as_with_optional_typed_effect_sink(
+            submission,
+            caller,
+            Some(effect_sink),
+            DeferredHostEffects::None,
+        )
+        .await
     }
 
     /// Submit one ProgramRun with a presentation binding owned by the caller.
@@ -1295,8 +1337,32 @@ impl ProgramRuntime {
         submission: ProgramSubmission,
         effect_sink: TypedEffectSink,
     ) -> Result<ExecutionOutcome> {
-        self.submit_as_with_optional_typed_effect_sink(submission, None, Some(effect_sink), true)
-            .await
+        self.submit_as_with_optional_typed_effect_sink(
+            submission,
+            None,
+            Some(effect_sink),
+            DeferredHostEffects::ProgramInvocations,
+        )
+        .await
+    }
+
+    /// Submit with a portable host boundary for every awaited capability.
+    /// The caller receives each request through `effect_sink` and resumes the
+    /// exact `(execution_id, sequence)` later with [`VmResume`]. This is for
+    /// embedders which own filesystem, process, network, or UI operations;
+    /// ordinary Finch submissions should use the compatibility host bindings.
+    pub async fn submit_with_deferred_host_effects(
+        &self,
+        submission: ProgramSubmission,
+        effect_sink: TypedEffectSink,
+    ) -> Result<ExecutionOutcome> {
+        self.submit_as_with_optional_typed_effect_sink(
+            submission,
+            None,
+            Some(effect_sink),
+            DeferredHostEffects::AllAwaited,
+        )
+        .await
     }
 
     /// Equivalent to [`Self::submit_with_typed_effect_sink`] for a child agent
@@ -1324,7 +1390,7 @@ impl ProgramRuntime {
         submission: ProgramSubmission,
         caller: Option<scheduler::AgentIdentity>,
         effect_sink: Option<TypedEffectSink>,
-        defer_program_invocations: bool,
+        deferred_host_effects: DeferredHostEffects,
     ) -> Result<ExecutionOutcome> {
         // This is a per-session state transaction, not a process-wide
         // interpreter lock. Independent runtimes and child model loops remain
@@ -1376,7 +1442,7 @@ impl ProgramRuntime {
                 &submission.declared_capabilities,
                 caller.clone(),
                 effect_sink.clone(),
-                defer_program_invocations,
+                deferred_host_effects,
             )
             .await?;
         let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -1401,7 +1467,7 @@ impl ProgramRuntime {
                         output_chunks: execution.output_chunks.clone(),
                         side_effects: execution.side_effects.clone(),
                         effect_sink,
-                        defer_program_invocations,
+                        deferred_host_effects,
                     },
                 );
         }
@@ -1539,7 +1605,7 @@ impl ProgramRuntime {
         declared_capabilities: &[CapabilityRequirement],
         caller: Option<scheduler::AgentIdentity>,
         typed_effect_sink: Option<TypedEffectSink>,
-        defer_program_invocations: bool,
+        deferred_host_effects: DeferredHostEffects,
     ) -> Result<(TypedRuntime, crate::vm::TypedExecution)> {
         let automation = Arc::clone(&self.automation);
         let workspace_root = Arc::clone(&self.workspace_root);
@@ -1596,7 +1662,7 @@ impl ProgramRuntime {
                         output_sink,
                         typed_effect_sink,
                         schedule_queue,
-                        defer_program_invocations,
+                        deferred_host_effects,
                     );
                     let execution = runtime.execute_with_handler(
                         language,
@@ -1635,7 +1701,7 @@ impl ProgramRuntime {
             .expect("output sink lock poisoned")
             .clone();
         let typed_effect_sink = pending.effect_sink.clone();
-        let defer_program_invocations = pending.defer_program_invocations;
+        let deferred_host_effects = pending.deferred_host_effects;
         let schedule_queue = self
             .schedule_queue
             .read()
@@ -1671,7 +1737,7 @@ impl ProgramRuntime {
                         output_sink,
                         typed_effect_sink,
                         schedule_queue,
-                        defer_program_invocations,
+                        deferred_host_effects,
                     );
                     let execution = match external_effect_result {
                         Some((effect_sequence, values)) => runtime.resume_with_effect_result(
@@ -1707,7 +1773,7 @@ struct TypedHostHandler {
     output_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
     typed_effect_sink: Option<TypedEffectSink>,
     schedule_queue: Option<Arc<TaskQueue>>,
-    defer_program_invocations: bool,
+    deferred_host_effects: DeferredHostEffects,
 }
 
 impl TypedHostHandler {
@@ -1726,7 +1792,7 @@ impl TypedHostHandler {
         output_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
         typed_effect_sink: Option<TypedEffectSink>,
         schedule_queue: Option<Arc<TaskQueue>>,
-        defer_program_invocations: bool,
+        deferred_host_effects: DeferredHostEffects,
     ) -> Self {
         Self {
             automation,
@@ -1746,7 +1812,7 @@ impl TypedHostHandler {
             output_sink,
             typed_effect_sink,
             schedule_queue,
-            defer_program_invocations,
+            deferred_host_effects,
         }
     }
 
@@ -1911,8 +1977,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         // exact output row and sequence; the host resumes it later with the
         // accepted/chat/cancel value. Plain `submit` retains the existing
         // synchronous compatibility adapter while that UI is migrated.
-        self.defer_program_invocations
-            && effect.requirement.capability == crate::vm::CapabilityKind::ProgramInvoke
+        self.deferred_host_effects.defers(effect)
     }
 
     fn request_effect(
@@ -4468,6 +4533,116 @@ mod tests {
                 if matches!(values.as_slice(), [TypedValue::Option { .. }])
         ));
         assert!(receiver.try_recv().is_err(), "the VM must not redispatch the effect");
+    }
+
+    #[tokio::test]
+    async fn portable_host_boundary_can_defer_a_file_read_without_touching_the_host() {
+        let runtime = ProgramRuntime::new();
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("./**").unwrap(),
+            ))
+            .unwrap();
+        let (sink, receiver) = typed_effect_channel();
+        let pending = runtime
+            .submit_with_deferred_host_effects(
+                submission(
+                    ProgramLanguage::Lisp,
+                    "(file-read (path \"does-not-need-to-exist.txt\"))",
+                    ExecutionEffect::WorkspaceRead,
+                ),
+                sink,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.status, ExecutionStatus::Suspended);
+
+        let envelope = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("file-read effect envelope");
+        assert_eq!(envelope.execution_id, pending.execution_id);
+        assert_eq!(
+            envelope.effect.requirement.capability,
+            crate::vm::CapabilityKind::FileRead
+        );
+        assert_eq!(envelope.effect.output, vec![Type::Bytes]);
+
+        let completed = runtime
+            .resume_vm_effect(VmResume {
+                execution_id: envelope.execution_id,
+                sequence: envelope.effect.sequence,
+                response: VmResumeResponse::Result {
+                    values: vec![TypedValue::Bytes(b"embedder bytes".to_vec())],
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ExecutionStatus::Completed);
+        assert_eq!(
+            completed.values,
+            vec![ProgramValue::Bytes(b"embedder bytes".to_vec())]
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_host_boundary_retains_its_policy_across_multiple_resumes() {
+        let runtime = ProgramRuntime::new();
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("./**").unwrap(),
+            ))
+            .unwrap();
+        let (sink, receiver) = typed_effect_channel();
+        let pending = runtime
+            .submit_with_deferred_host_effects(
+                submission(
+                    ProgramLanguage::Lisp,
+                    "(begin (file-read (path \"first.txt\")) (file-read (path \"second.txt\")))",
+                    ExecutionEffect::WorkspaceRead,
+                ),
+                sink,
+            )
+            .await
+            .unwrap();
+        let first = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("first file-read effect");
+        assert_eq!(first.execution_id, pending.execution_id);
+
+        let still_pending = runtime
+            .resume_vm_effect(VmResume {
+                execution_id: first.execution_id,
+                sequence: first.effect.sequence,
+                response: VmResumeResponse::Result {
+                    values: vec![TypedValue::Bytes(b"first".to_vec())],
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(still_pending.status, ExecutionStatus::Suspended);
+        let second = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("second file-read effect");
+        assert_eq!(second.execution_id, first.execution_id);
+        assert_eq!(second.effect.sequence, first.effect.sequence + 1);
+
+        let completed = runtime
+            .resume_vm_effect(VmResume {
+                execution_id: second.execution_id,
+                sequence: second.effect.sequence,
+                response: VmResumeResponse::Result {
+                    values: vec![TypedValue::Bytes(b"second".to_vec())],
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ExecutionStatus::Completed);
+        assert_eq!(
+            completed.values,
+            vec![ProgramValue::Bytes(b"second".to_vec())]
+        );
     }
 
     #[tokio::test]

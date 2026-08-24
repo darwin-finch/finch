@@ -735,6 +735,11 @@ at-least-once transport safe while the host-effect adapter supplies exactly-once
 The per-run observer receives an awaited event when it enters the journal, before a local binding
 or approval decision, so an external event loop can own its presentation and later return the
 correlated result.
+The reference runtime offers both a compatibility policy (only editor proposals suspend) and a
+portable-host policy (every approved awaited capability suspends). The latter is the actual
+embedder seam: files, processes, network calls, and UI handle creation can be implemented by an
+IDE, web host, or daemon and returned through the same `VmResume` record rather than through a
+Finch-specific synchronous callback.
 
 UI output is a first-class family of these events, not an overloaded string channel. There is no
 global “active WorkUnit”: a `ProgramRun` receives a host-owned **default response port** when the
