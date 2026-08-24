@@ -567,6 +567,17 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   definitions. This first version resumes producers with `unit` and permits only pure closures;
   effectful autonomous work remains a separate task/agent protocol. Legacy Co-Forth generators
   remain outside typed-runtime vocabulary.
+- [ ] Converge producer fibers, future bidirectional coroutines, compiler semantic waits, and
+  scheduler-owned green tasks on one private `ResumableExecution<Y,Resume,R>` state machine. The
+  primitive owns verified frames, a private operand stack, locals/captures, PC, transaction/effect
+  prefix, and single-resumer lifecycle; suspension propagates through ordinary calls. Generalize
+  callable metadata from `yields<Y,unit>` to `yields<Y,Resume>` and `yield : Y -> Resume` without
+  making source programs routinely dynamic. `defer` must reify/transfer ownership of that same
+  execution record into a handle rather than implementing another continuation format. Keep
+  generator pull, explicit fiber call/yield, green scheduling, async event handling, actors, and
+  compiler `Needs(symbol,phase)` as inspectable library/host policies over the primitive. New
+  resumable executions get explicit arguments plus immutable captures and a private stack; shared
+  `cell`/atomic/mutex/channel resources remain an orthogonal, explicitly typed feature.
 - [ ] Make resource roots first-class capability objects. Workspace/project paths remain safely
   relative; an intentional full-machine grant is a separate audited host root, never ambient
   authority inferred from an absolute path string. `host-path` and distinct

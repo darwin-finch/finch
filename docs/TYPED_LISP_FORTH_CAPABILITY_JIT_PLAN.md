@@ -371,8 +371,24 @@ stream-next stream : option<T>  ; bounded pull; none means exhausted
 stream-close stream : unit      ; release cursor/cancel its producer
 ```
 
-`fiber<Y,R>` is the implemented cooperative producer over the same typed `yield` control effect,
-exposing a pullable sequence plus a final return:
+The semantic primitive is a **private resumable execution**, not a generator or scheduler policy:
+
+```text
+ResumableExecution<Y,Resume,R> = verified frames + private operand stack + locals/captures + PC
+                                 + transaction/effect prefix + lifecycle state
+```
+
+A coroutine function may create an instance of that state. Suspension propagates normally through
+the entire ordinary call chain until some boundary handles or reifies it. A generator is the
+`Resume = unit` pull contract; a fiber is an owned handle plus explicit call/yield policy; a green
+thread, async task, actor, or compiler semantic job is a scheduling/event policy over the same
+instance. None gets an independently implemented continuation format. Creating an independently
+resumable instance always starts a private stack from explicit arguments and immutable captures;
+normal calls remain the way to operate on the current stack. Shared `cell<T>`, atomics, mutexes, or
+channels are separate explicit memory resources, not implicit fiber communication.
+
+`fiber<Y,R>` is the currently implemented cooperative producer view over the shared typed `yield`
+control effect, exposing a pullable sequence plus a final return:
 
 ```text
 defer closure       : fiber<Y,R>                  create a pure producer and return immediately
@@ -383,19 +399,24 @@ fiber-cancel fiber  : unit                        make later use fail determinis
 ```
 
 The source program never writes a continuation. A fiber `yield value` may occur any number of
-times; the VM records remaining frames as an internal thunk and advances it through the
-runtime-owned producer registry.
+times; the VM records remaining frames as an internal resumable-execution record and advances it
+through the current owner. `defer` reifies/transfers ownership of that record into a handle; it must
+not clone or reconstruct generator semantics in a second scheduler implementation.
 This uses the same typed `yield` instruction as ordinary ProgramRuns, not a second fiber-only
 primitive: its function/fiber contract declares `Y` and the resume value (initially `unit`), and
 the scheduler records both in the same typed suspension record used by every `MaySuspend` word.
 Callable signatures and first-class closure types retain this as `yields<Y,unit>` metadata. The
 frontends infer it transitively from direct yields and calls, while the independent verifier derives
 it again from IR and rejects a function that hides or changes its suspension contract.
-If bidirectional generators become necessary, add `fiber<Y,Resume,R>` and give `yield` the typed
-stack effect `Y -> Resume`; do not silently use `dynamic` for resumed values. `defer`, `next`, and
-`join` are ordinary generated vocabulary bindings over that scheduler record, not syntax-level
-exceptions or a privileged multi-return convention. Cursor-backed `stream<T>` remains the simpler
-range abstraction; a producer fiber can be adapted to it through visible library code.
+The general form is `yield : Y -> Resume`, recorded as `yields<Y,Resume>` on every suspending
+callable. VM storage may use the ordinary tagged `TypedValue` representation, but source-facing
+wrappers statically establish `Y` and `Resume`; a raw boxed escape hatch must never make routine
+generator/coroutine code `dynamic`. `Resume = unit` is the present generator profile. A typed
+`require(name, phase) -> Symbol` can later yield a structured compiler request and receive the
+resolved symbol through the same channel. `defer`, `next`, `resume`, `join`, scheduler registration,
+and event-loop handling remain ordinary generated vocabulary/library policies over one runtime
+record, not privileged multi-return conventions. Cursor-backed `stream<T>` remains the simpler
+range abstraction; a resumable producer can be adapted to it through visible library code.
 
 Fibers are not the subagent protocol. A subagent is a separate child `ProgramRun`/agent turn with
 its own private stack, verified module, capability attenuation, budget, ancestry, event journal,
