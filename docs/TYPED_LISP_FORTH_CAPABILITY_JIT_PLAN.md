@@ -430,6 +430,10 @@ as a built-in range. The optimizer may inline, specialize, fuse, or eliminate al
 that resolution, but it may not recognize only `list`, `map`, or a compiler-owned iterator type
 while treating an equivalent user definition as dynamic dispatch. A user-written `foreach`,
 traversal, or adapter must remain eligible for the same optimizations as syntax supplied by Finch.
+There is one staged `foreach`, not a separate `static foreach`: when its range and pure body are
+compile-time values, bounded CTFE executes it; when the range is a runtime value, lowering emits the
+ordinary verified range loop. Partial evaluation may specialize known structure and leave residual
+runtime code, using the same public contracts in either stage.
 
 The exception is the deliberately small execution substrate: verified branch/suspend instructions,
 managed allocation, and authorized host calls. Those are represented by public typed words and
@@ -1379,6 +1383,27 @@ verifies and compiles it locally.
 - sanitizer/fuzz coverage for ABI and trap boundaries;
 - measurable improvement on representative hot vocabulary, not microbenchmarks alone;
 - automatic fallback to interpretation after compilation failure.
+
+### Later AOT compiler target
+
+After the interpreter contract and JIT differential gates are stable, the same verified pipeline
+may expose a separate `finchc` target. Pure programs may link a minimal runtime and produce ordinary
+standalone executables. Programs with host effects instead link the portable
+`VmSideEffect`/`VmResume` ABI and require a capability-providing embedder. Both modes consume the
+same span-preserving AST/parametric HIR, dependency scheduler, CTFE/monomorphization cache, verified
+stack IR, and source maps; there is no AOT-only source language or trusted model-authored CLIF.
+Host selection is explicit. A `none` profile rejects any inferred effect it cannot satisfy; a small
+terminal wrapper may project `session.emit` to stdout/stderr and implement a declared bounded host
+surface; portable or object/library output exposes or leaves unresolved the effect/resume shims for
+an embedder. The executable carries its inferred effect manifest. `say` always means the same
+`session.emit` effect—it never silently becomes a distinct native-print operation.
+
+Compile-time reflection should make immutable `type`, schema, syntax, symbol/module-reference, and
+constraint-evidence values available to pure bounded Finch functions. Generics, concepts,
+compile-time branching/traversal, derive operations, and hygienic macros must all use this one staged
+evaluation model. Generated definitions are structured syntax with expansion provenance and are
+verified normally; string mixins and overlapping special-purpose metaprogramming subsystems are not
+part of the design.
 
 ## Implementation work packages
 
