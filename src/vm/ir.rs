@@ -39,7 +39,45 @@ pub struct Function {
     pub locals: Vec<Type>,
     pub captures: Vec<Type>,
     pub entry: BlockId,
+    /// Encode blocks as a sequence rather than a JSON object with numeric
+    /// keys. This remains portable when a checkpoint is nested inside a
+    /// flattened/tagged event envelope, whose serde buffering otherwise
+    /// turns map keys into strings that cannot deserialize as `u32`.
+    #[serde(with = "block_map")]
     pub blocks: BTreeMap<BlockId, BasicBlock>,
+}
+
+mod block_map {
+    use super::{BasicBlock, BlockId};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S>(
+        blocks: &BTreeMap<BlockId, BasicBlock>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        blocks.values().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<BlockId, BasicBlock>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let blocks = Vec::<BasicBlock>::deserialize(deserializer)?;
+        let mut by_id = BTreeMap::new();
+        for block in blocks {
+            let id = block.id;
+            if by_id.insert(id, block).is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate basic block id {id}"
+                )));
+            }
+        }
+        Ok(by_id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
