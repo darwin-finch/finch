@@ -106,7 +106,12 @@ impl ClaudeProvider {
     async fn send_message_once(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let msg_request = self.to_message_request(request);
 
-        tracing::debug!("Sending request to Claude API: {:?}", msg_request);
+        tracing::debug!(
+            model = %msg_request.model,
+            messages = msg_request.messages.len(),
+            tools = msg_request.tools.as_ref().map_or(0, Vec::len),
+            "sending Claude request"
+        );
 
         let response = self
             .client
@@ -135,7 +140,13 @@ impl ClaudeProvider {
             .await
             .context("Failed to parse Claude API response")?;
 
-        tracing::debug!("Received response: {:?}", message_response);
+        tracing::debug!(
+            response_id = %message_response.id,
+            model = %message_response.model,
+            blocks = message_response.content.len(),
+            stop_reason = ?message_response.stop_reason,
+            "received Claude response"
+        );
 
         // Convert to ProviderResponse
         Ok(ProviderResponse {

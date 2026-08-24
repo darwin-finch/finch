@@ -205,7 +205,15 @@ impl GeminiProvider {
             GEMINI_BASE_URL, model, self.api_key
         );
 
-        tracing::debug!("Sending request to Gemini API: {:?}", gemini_request);
+        tracing::debug!(
+            model = %gemini_request.model,
+            messages = gemini_request.contents.len(),
+            tools = gemini_request
+                .tools
+                .as_ref()
+                .map_or(0, |tools| tools.iter().map(|tool| tool.function_declarations.len()).sum()),
+            "sending Gemini request"
+        );
 
         let response = self
             .client
@@ -233,7 +241,11 @@ impl GeminiProvider {
             .await
             .context("Failed to parse Gemini API response")?;
 
-        tracing::debug!("Received response: {:?}", gemini_response);
+        tracing::debug!(
+            model = %model,
+            candidates = gemini_response.candidates.len(),
+            "received Gemini response"
+        );
 
         self.parse_response(gemini_response, model)
     }

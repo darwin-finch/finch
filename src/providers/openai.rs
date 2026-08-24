@@ -419,7 +419,14 @@ impl OpenAIProvider {
         let openai_request = self.to_openai_request(request);
         let url = format!("{}/v1/chat/completions", self.base_url);
 
-        tracing::debug!("Sending request to OpenAI API: {:?}", openai_request);
+        tracing::debug!(
+            provider = %self.provider_name,
+            model = %openai_request.model,
+            messages = openai_request.messages.len(),
+            tools = openai_request.tools.as_ref().map_or(0, Vec::len),
+            stream = openai_request.stream,
+            "sending OpenAI-compatible request"
+        );
 
         let response = self
             .client
@@ -447,7 +454,13 @@ impl OpenAIProvider {
             .await
             .context("Failed to parse OpenAI API response")?;
 
-        tracing::debug!("Received response: {:?}", openai_response);
+        tracing::debug!(
+            provider = %self.provider_name,
+            response_id = %openai_response.id,
+            model = %openai_response.model,
+            choices = openai_response.choices.len(),
+            "received OpenAI-compatible response"
+        );
 
         self.parse_response(openai_response)
     }
