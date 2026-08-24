@@ -2418,20 +2418,17 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         if arguments.len() != 1 {
                             return Err(host_binding_error(origin, "file-hash requires one path"));
                         }
-                        let mut file = std::fs::File::open(path)
-                            .map_err(|error| host_binding_error(origin, error.to_string()))?;
-                        let mut hasher = Sha256::new();
-                        let mut buffer = [0_u8; 64 * 1024];
-                        loop {
-                            let read = file
-                                .read(&mut buffer)
-                                .map_err(|error| host_binding_error(origin, error.to_string()))?;
-                            if read == 0 {
-                                break;
-                            }
-                            hasher.update(&buffer[..read]);
+                        let digest = sha256_file(&path)
+                            .map_err(|message| host_binding_error(origin, message))?;
+                        return Ok(vec![TypedValue::String(hex_digest(&digest))]);
+                    }
+                    Some("tree-merkle") => {
+                        if arguments.len() != 1 {
+                            return Err(host_binding_error(origin, "tree-merkle requires one path"));
                         }
-                        return Ok(vec![TypedValue::String(format!("{:x}", hasher.finalize()))]);
+                        let digest = merkle_directory(&path)
+                            .map_err(|message| host_binding_error(origin, message))?;
+                        return Ok(vec![TypedValue::String(digest)]);
                     }
                     Some("file-slice") => {
                         let [_, TypedValue::Int(offset), TypedValue::Int(length)] =
@@ -3030,6 +3027,92 @@ fn host_binding_error(
         message,
         Some(origin.clone()),
     )
+}
+
+/// Hash a file in bounded chunks, keeping large inputs out of VM memory.
+fn sha256_file(path: &Path) -> std::result::Result<[u8; 32], String> {
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut output = [0_u8; 32];
+    output.copy_from_slice(&digest);
+    Ok(output)
+}
+
+fn hex_digest(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Compute a bounded, deterministic digest for a directory tree.  This is an
+/// inventory primitive: it deliberately rejects symlinks rather than trying
+/// to make a potentially escaping traversal appear safe.
+fn merkle_directory(root: &Path) -> std::result::Result<String, String> {
+    const MAX_TREE_MERKLE_ENTRIES: usize = 100_000;
+    let metadata = std::fs::symlink_metadata(root).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Err("tree-merkle rejects a symlink root".into());
+    }
+    if !metadata.is_dir() {
+        return Err("tree-merkle requires a directory path".into());
+    }
+
+    let mut hasher = Sha256::new();
+    let mut entries = 0;
+    merkle_walk(root, root, &mut hasher, &mut entries, MAX_TREE_MERKLE_ENTRIES)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn merkle_walk(
+    root: &Path,
+    directory: &Path,
+    hasher: &mut Sha256,
+    entries: &mut usize,
+    maximum_entries: usize,
+) -> std::result::Result<(), String> {
+    let mut paths = std::fs::read_dir(directory)
+        .map_err(|error| error.to_string())?
+        .map(|entry| entry.map(|entry| entry.path()).map_err(|error| error.to_string()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    paths.sort();
+
+    for path in paths {
+        *entries += 1;
+        if *entries > maximum_entries {
+            return Err(format!(
+                "tree-merkle exceeds the {maximum_entries}-entry traversal limit"
+            ));
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| error.to_string())?
+            .to_string_lossy();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("tree-merkle rejects symlink '{}'", relative));
+        }
+        if metadata.is_dir() {
+            hasher.update(b"directory\0");
+            hasher.update(relative.as_bytes());
+            hasher.update(b"\0");
+            merkle_walk(root, &path, hasher, entries, maximum_entries)?;
+        } else if metadata.is_file() {
+            hasher.update(b"file\0");
+            hasher.update(relative.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(sha256_file(&path)?);
+        } else {
+            return Err(format!("tree-merkle rejects unsupported entry '{}'", relative));
+        }
+    }
+    Ok(())
 }
 
 /// Read one UTF-8 line without allowing a malformed/hostile record to grow
@@ -3909,6 +3992,22 @@ mod tests {
             [ProgramValue::String(digest)]
                 if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
         ));
+    }
+
+    #[test]
+    fn tree_merkle_is_stable_and_changes_with_tree_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("tree");
+        std::fs::create_dir_all(tree.join("nested")).unwrap();
+        std::fs::write(tree.join("alpha.txt"), "alpha").unwrap();
+        std::fs::write(tree.join("nested").join("beta.txt"), "beta").unwrap();
+
+        let first = merkle_directory(&tree).unwrap();
+        assert_eq!(first.len(), 64);
+        assert_eq!(first, merkle_directory(&tree).unwrap());
+
+        std::fs::write(tree.join("nested").join("beta.txt"), "changed").unwrap();
+        assert_ne!(first, merkle_directory(&tree).unwrap());
     }
 
     #[tokio::test]

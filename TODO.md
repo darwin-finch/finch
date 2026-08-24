@@ -81,11 +81,13 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their
-  own large-file loops: workspace tree metadata, bounded file hash, host-computed directory Merkle
-  roots, file slices/line streams, CSV schema and bounded per-column summaries, then workbook
-  metadata/range cursors. Each contract must advertise result shape and byte/work bounds; bulk
-  materialization into a model-visible value must remain explicit so the VM can prefer aggregate or
-  streaming work without trusting a provider to make the economical choice unaided.
+  own large-file loops: workspace tree metadata, bounded file hash, and a bounded host-computed
+  directory Merkle root now exist; add CSV schema and bounded per-column summaries, then workbook
+  metadata/range cursors. Build security/integrity inspection from these explicit bounded facts
+  (inventory, metadata, hashes, rules/signatures, provenance), with any remediation remaining a
+  separately authorized proposal/effect. Each contract must advertise result shape and byte/work
+  bounds; bulk materialization into a model-visible value must remain explicit so the VM can prefer
+  aggregate or streaming work without trusting a provider to make the economical choice unaided.
 - [ ] Extend bounded `file-slice`/`file-size` and host-issued cursors with workbook cursors so large
   Excel workbooks can be processed incrementally without whole-file/string loading. Line cursors
   and bounded `csv-open`/`csv-next`/`csv-close` record cursors now cover UTF-8 CSV quoted-record

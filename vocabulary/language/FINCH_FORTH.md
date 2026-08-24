@@ -190,6 +190,10 @@ the next.
 
 `path file-hash` computes a lowercase SHA-256 digest without putting the file's bytes on the VM
 stack. Use it for exact comparison or as a leaf value in a higher-level tree/Merkle operation.
+`path tree-merkle` computes a deterministic SHA-256 digest over a directory subtree's sorted
+relative paths and file hashes, without materializing its contents. It is bounded to 100,000
+entries and rejects symlinks rather than following them. Use it as an inventory/change-detection
+fact; it is not by itself a malware verdict or permission to alter the tree.
 
 `host-path` is a separate, host-issued root type, never an absolute-path bypass. If the host has
 explicitly installed `root<host-machine>` and the user has approved a matching selector, use
