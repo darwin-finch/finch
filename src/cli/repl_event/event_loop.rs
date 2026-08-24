@@ -351,21 +351,12 @@ pub struct EventLoop {
     /// Stack state is cleared between evals; only the dictionary persists.
     forth_vm: crate::coforth::Forth,
 
-    /// Shared with TUI corner — updated after each eval if `check` is defined.
-    corner_output: Arc<std::sync::Mutex<Option<String>>>,
-
-    /// Internal rollback history for the legacy stack/poset interpreter.
-
     /// Incoming push messages from peers (via POST /v1/forth/push).
     push_rx: tokio::sync::broadcast::Receiver<String>,
 
     /// Incoming hash updates from peers (via POST /v1/forth/hash).
     /// Carries (room_id, key, value, from_name) tuples.
     hash_rx: tokio::sync::broadcast::Receiver<(String, String, String, String)>,
-
-    /// Word names auto-compiled from the vocabulary library (not user-authored).
-    /// Excluded from the vocab section sent to the AI so the prompt stays small.
-    auto_compiled_word_names: std::collections::HashSet<String>,
 
     /// Broadcast sender — pushes code to ALL peer event loops simultaneously.
     peer_tx: tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
@@ -822,9 +813,6 @@ impl EventLoop {
         tui_renderer.set_todo_list(Arc::clone(&todo_list));
         tui_renderer.set_stack(Arc::clone(&stack));
         tui_renderer.set_poset(Arc::clone(&poset));
-        // Share the corner Arc so the event loop can write to it without locking the TUI.
-        let corner_output = Arc::clone(&tui_renderer.corner);
-
         // Wrap TUI in Arc<Mutex> for shared access
         let tui_renderer = Arc::new(Mutex::new(tui_renderer));
 
@@ -962,11 +950,9 @@ impl EventLoop {
             stack,
             poset,
             plan_word: None,
-            forth_vm: crate::coforth::Library::precompiled_vm(),
-            corner_output,
+            forth_vm: crate::coforth::Forth::new(),
             push_rx: crate::server::handlers::PUSH_INBOX.subscribe(),
             hash_rx: crate::server::handlers::HASH_INBOX.subscribe(),
-            auto_compiled_word_names: std::collections::HashSet::new(),
             peer_tx,
             peer_inbox_tx,
             peer_inbox_rx,
@@ -1122,91 +1108,6 @@ impl EventLoop {
             )
             .await;
         }
-
-        // ── Boot JIT ──────────────────────────────────────────────────────────
-        // Every boot: JIT-compile ALL vocabulary words with Forth code into the
-        // VM dictionary as named colon definitions (`: word <code> ;`).
-        // This makes every vocab word callable directly from Forth.
-        //
-        // Definitions are loaded silently. Vocabulary is executable API, not
-        // startup presentation: verification, poems, and other `boot = true`
-        // definitions remain available as explicit words but must never write
-        // unexplained text into a user's conversational scrollback.
-        {
-            // Use the pre-built (cached) builtin defs — no TOML re-parse, no re-sort.
-            // User vocabulary/*.toml files are merged on top at runtime.
-            let builtin = crate::coforth::Library::builtin_defs();
-            // These definitions are ambient runtime vocabulary, not words authored in
-            // this conversation. Routing must keep that distinction or an ordinary
-            // sentence made entirely from dictionary words is silently executed.
-            self.auto_compiled_word_names
-                .extend(builtin.pairs.iter().map(|(word, _)| word.clone()));
-
-            // Load user vocabulary extensions on top of the builtins.
-            let lib = crate::coforth::Library::load();
-            let mut user_entries: Vec<_> = lib
-                .all_entries()
-                .into_iter()
-                .filter(|e| e.forth.is_some())
-                .filter(|e| !builtin.pairs.iter().any(|(w, _)| w == &e.word))
-                .collect();
-            user_entries.sort_by(|a, b| a.word.cmp(&b.word));
-
-            // Compile user vocabulary extensions (builtins are already in the precompiled VM).
-            let mut user_defs = String::new();
-            for entry in &user_entries {
-                let code = entry.forth.as_deref().unwrap_or("").trim();
-                // Skip self-referential entries (e.g. `forth = "boom"` for word `boom`).
-                // These are documentation stubs that say "this is a builtin" — compiling
-                // them as `: boom boom ;` creates infinite recursion.
-                if code == entry.word.as_str() {
-                    continue;
-                }
-                let jit_def = if code.trim_start().starts_with(':') {
-                    code.to_string()
-                } else {
-                    format!(": {} {} ;", entry.word, code)
-                };
-                user_defs.push_str(&jit_def);
-                user_defs.push('\n');
-                self.auto_compiled_word_names.insert(entry.word.clone());
-            }
-            if !user_defs.is_empty() {
-                let _ = self.forth_vm.exec_with_fuel(&user_defs, 0);
-            }
-
-            // Restore words learned in previous sessions (from daemon or file).
-            self.load_user_words().await;
-
-            // Poll daemon every 4s for vocab changes from other concurrent terminals.
-            self.spawn_vocab_poll();
-
-            // Do not execute legacy Co-Forth `boot.forth` at interactive
-            // startup. A startup program can emit arbitrary terminal text,
-            // mutate the compatibility VM, and race the shadow-buffer's first
-            // render. Legacy boot material remains available through the
-            // explicit `finch coforth` maintenance command; typed scheduled
-            // work is the supported autonomous startup mechanism.
-
-            self.render_tui().await.ok();
-
-            // Auto-discover peers on LAN in background — REPL stays responsive.
-            // When found, PeersDiscovered event arrives and we connect to each peer.
-            {
-                let event_tx = self.event_tx.clone();
-                tokio::spawn(async move {
-                    let peers = tokio::task::spawn_blocking(|| {
-                        crate::coforth::interpreter::run_peers_discover_pub(2000)
-                    })
-                    .await
-                    .unwrap_or_default();
-                    if !peers.is_empty() {
-                        let _ = event_tx.send(ReplEvent::PeersDiscovered(peers));
-                    }
-                });
-            }
-        }
-        // ─────────────────────────────────────────────────────────────────────
 
         // Wire TUI callbacks into the VM so words that call confirm" or select"
         // work in the explicit legacy subsystem as well as its internal calls.
@@ -5050,128 +4951,6 @@ Rules:\n\
                 .write_info(format!("W{a} or W{b} not found"));
         }
         self.render_tui().await
-    }
-
-    /// Load persisted user vocabulary.
-    /// Tries the running daemon first (canonical shared store), falls back to file.
-    async fn load_user_words(&mut self) {
-        let daemon_addr = crate::config::constants::DEFAULT_HTTP_ADDR;
-        let url = format!("http://{daemon_addr}/v1/forth/vocab");
-        let daemon_source = reqwest::Client::new()
-            .get(&url)
-            .timeout(std::time::Duration::from_millis(400))
-            .send()
-            .await
-            .ok()
-            .and_then(|r| {
-                // Use spawn_blocking to safely parse JSON — works on both
-                // current-thread and multi-thread runtimes (block_in_place panics
-                // on current-thread).
-                futures::executor::block_on(r.json::<serde_json::Value>()).ok()
-            })
-            .and_then(|v| v["source"].as_str().map(|s| s.to_owned()))
-            .filter(|s: &String| !s.is_empty());
-
-        let source = daemon_source.or_else(|| {
-            let path = dirs::home_dir().map(|mut p| {
-                p.push(".finch");
-                p.push("user_words.forth");
-                p
-            })?;
-            std::fs::read(path)
-                .ok()
-                .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', ""))
-                .filter(|s: &String| !s.is_empty())
-        });
-
-        if let Some(src) = source {
-            // Only load definitions for NEW words — never redefine anything already in the VM.
-            // This prevents AI-generated words from shadowing builtins, stdlib words, or
-            // Co-Forth vocabulary (e.g. `: over 3 5 over . ;` is recursive and breaks proofs).
-            let filtered: String = src
-                .lines()
-                .filter(|line| {
-                    let t = line.trim();
-                    if t.starts_with(':') {
-                        let word = t[1..].trim().split_whitespace().next().unwrap_or("");
-                        // Block if the word is already defined in the VM (any source).
-                        !self.forth_vm.word_exists(word)
-                    } else {
-                        true
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let _ = self.forth_vm.exec_with_fuel(&filtered, 0);
-            let count = self.forth_vm.dump_source().lines().count();
-            tracing::debug!("Loaded {} user word(s) from daemon/file", count);
-        }
-    }
-
-    /// Spawn a background task that polls the daemon for vocabulary changes made
-    /// in other concurrent terminal sessions.  When the version counter advances,
-    /// a VocabSync event is sent to the event loop so the new words are compiled in.
-    fn spawn_vocab_poll(&self) {
-        let tx = self.event_tx.clone();
-        tokio::spawn(async move {
-            let daemon_addr = crate::config::constants::DEFAULT_HTTP_ADDR;
-            let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_millis(600))
-                .build()
-            {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-
-            // Per-peer version tracking: (url → last_version)
-            let mut last_versions: std::collections::HashMap<String, u64> =
-                std::collections::HashMap::new();
-
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-
-                // Build list of vocab URLs to poll:
-                // 1. Local daemon (same-machine terminals)
-                // 2. Remote peers from the daemon's registry (machines sent to other people)
-                let mut urls: Vec<String> = vec![format!("http://{daemon_addr}/v1/forth/vocab")];
-                if let Ok(resp) = client
-                    .get(format!("http://{daemon_addr}/v1/registry/peers"))
-                    .send()
-                    .await
-                {
-                    if let Ok(peers) = resp.json::<Vec<serde_json::Value>>().await {
-                        for peer in &peers {
-                            if let Some(addr) = peer["addr"].as_str() {
-                                // Don't double-poll the local daemon.
-                                if addr != daemon_addr {
-                                    urls.push(format!("http://{addr}/v1/forth/vocab"));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                for url in &urls {
-                    if let Ok(resp) = client.get(url).send().await {
-                        if let Ok(val) = resp.json::<serde_json::Value>().await {
-                            let version = val["version"].as_u64().unwrap_or(0);
-                            let last = last_versions.entry(url.clone()).or_insert(0);
-                            if version > *last {
-                                *last = version;
-                                if let Some(src) = val["source"].as_str() {
-                                    if !src.is_empty() {
-                                        let _ =
-                                            tx.send(crate::cli::repl_event::ReplEvent::VocabSync(
-                                                src.to_owned(),
-                                            ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
     }
 
     /// `/vm` — dump the VM's user-defined words as Forth source.
