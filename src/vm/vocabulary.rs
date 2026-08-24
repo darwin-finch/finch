@@ -1039,6 +1039,23 @@ mod tests {
     }
 
     #[test]
+    fn registry_never_classifies_an_effectful_word_as_local_interpreter_code() {
+        for (name, spec) in core_word_registry() {
+            match spec.implementation {
+                CoreWordImplementation::Interpreter => assert!(
+                    spec.signature.effects.is_pure(),
+                    "interpreter word '{name}' must not hide an effect row"
+                ),
+                CoreWordImplementation::HostEffect(_) => assert!(
+                    !spec.signature.effects.is_pure(),
+                    "host-effect word '{name}' must declare an effect row"
+                ),
+                CoreWordImplementation::VmInstruction => {}
+            }
+        }
+    }
+
+    #[test]
     fn every_registered_core_word_has_a_specific_discovery_contract() {
         for name in core_vocabulary().keys() {
             let documentation = core_word_documentation(name);
