@@ -593,8 +593,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   authority inferred from an absolute path string. `host-path` and distinct
   `host-file-read`/`host-file-write` now require an explicitly installed host binding and recheck
   canonical containment at every call; keep workspace `path`/`file-read` structurally separate.
-  Still add project/task-output bindings, persisted approval/revocation lifecycle, and the host UI
-  for deliberately binding `/` as whole-machine scope.
+  Project and task-output bindings now have distinct typed path constructors and read/write words
+  over application-installed roots. Still persist the root-binding approval/revocation lifecycle
+  and add host UI for deliberately binding `/` as whole-machine scope.
 - [ ] Phase 0: route existing provider streaming through the portable VM side-effect journal and
   per-ProgramRun output-handle bindings; test replay/reconnect and concurrent WorkUnit projection,
   then publish the incompatibilities found by the non-executing `finch library audit-typed`
