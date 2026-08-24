@@ -414,7 +414,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   semiotic Co-Forth grammar, channel, POSIX/IPC, peer-demo, and stack-console interpreter call sites
   identified by `finch library audit-typed`. Until deletion, keep that implementation explicitly
   internal to those named subsystems: it is not a supported language, compatibility runtime, or
-  fallback, and no new public aliases may enter it.
+  fallback, and no new public aliases may enter it. The 2026-08-24 report-only baseline found
+  3,225 stored entries: 160 accepted, 29 missing, and 3,036 rejected (2,988 `E-LINK-002`, 31
+  `E-TYPE-002`, 12 `E-STACK-001`, and five other reader/signature failures). Preserve this baseline
+  for comparison; it is migration evidence, not a reason to make legacy execution public again.
 - [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
   tests, concurrency tests, and provider conformance tests. Manual configured-cloud smoke checks on
   2026-08-23 successfully executed provider-emitted Lisp `say`, Lisp arithmetic, and Co-Forth
