@@ -201,8 +201,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   compatibility execution now journals content-addressed typed checkpoints and restores them after
   daemon restart without replaying source or effects. A versioned `ProgramRuntimeArchive` now
   validates and restores the complete reducible revision lineage while excluding grants, pending
-  calls, and execute-once effects. Add application-owned durable archive storage, the managed heap,
-  and explicit host-handle restoration before treating every Brain run as restartable.
+  calls, and execute-once effects. `ProgramRuntimeArchiveStore` now atomically persists that archive
+  with a SHA-256 integrity envelope and restores it only after current-verifier validation, while
+  still refusing to persist authority or live handles. Bind the store to the converged application
+  lifecycle, then add the managed heap and explicit host-handle restoration before treating every
+  Brain run as restartable.
 - [ ] Complete revisioned private working snapshots and conflict-aware commits. A `ProgramRuntime`
   now executes each ProgramRun on a cloned stack/dictionary snapshot and gates only snapshot/commit;
   stale resume checks and losing post-resume commits return structured failed outcomes without
