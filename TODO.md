@@ -61,7 +61,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   `define-syntax` may be sugar for registering a `syntax -> syntax` CTFE function. Keep classic
   S-expressions as the canonical structural Lisp reader, while allowing a later lighter
   expression/indentation reader that immediately produces the identical syntax tree. Reader sugar
-  must disappear before expansion/elaboration and must not create a second semantic path.
+  must disappear before expansion/elaboration and must not create a second semantic path. Add
+  normalization conformance fixtures proving that each sugared program and its canonical
+  S-expression produce structurally identical `syntax` modulo spelling-specific source origins,
+  then identical elaborated HIR/IR. Do not brand or implement the notation as a third language.
 - [ ] Make ordered type/value parameter packs a normal part of source-defined generics. Pure bounded
   CTFE must be able to query pack length, index/destructure it, inspect each type/value pair, and use
   ordinary compile-time `foreach` to generate a concrete fixed-arity specialization or an explicit

@@ -799,7 +799,10 @@ human-facing Lisp spelling pay the full parenthesis cost. Later expression/inden
 may provide forms such as `foo(a, b + c)`, but the reader must convert each convenience spelling
 immediately into the same syntax tree before expansion or semantic analysis. Sugar never adds a
 second semantic construct, staging rule, or compiler lowering path. The property to preserve is
-syntax-as-ordinary-data, not a mandate that every surface syntax look homoiconic.
+syntax-as-ordinary-data, not a mandate that every surface syntax look homoiconic. Conformance tests
+must pair every convenience spelling with its canonical S-expression and prove structural syntax
+equivalence after ignoring spelling-specific source origins, followed by identical elaborated
+HIR/IR. This is reader notation, not a third `FinchScript` language or frontend.
 
 ## Common typed IR
 
