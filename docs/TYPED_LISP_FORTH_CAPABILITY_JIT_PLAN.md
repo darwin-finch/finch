@@ -1053,6 +1053,14 @@ Persisted decisions store a typed selector, root identity, operation, scope, sou
 creator, timestamp, and revocation state. They never store only the display string. The UI provides
 searchable history and immediate revocation.
 
+The VM's compact active `EffectSet` is only a fast execution guard. Immediately before an
+authorized non-intrinsic effect is dispatched locally or handed to a portable host, the Finch host
+reconstructs its deterministic request identity from `(execution_id, effect sequence)`, resolves it
+against the scoped ledger, and records the stable grant ID. A deferred host result refers back to
+that same authorization fact rather than consuming or auditing the grant a second time. If the
+ledger no longer supplies a matching active grant before dispatch, the host boundary fails closed
+even if a stale private runtime snapshot still contains the broader compact effect set.
+
 ### Transaction rule
 
 A persistent VM execution builds a delta. It commits stack/dictionary/heap changes only when:

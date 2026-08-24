@@ -181,9 +181,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   explicit task-scoped approval is the escalation path. Named Brain compatibility storage now
   persists and restores that separate authority record beside its content-addressed VM checkpoints;
   a missing record restores no grants, a tampered record fails closed, and archiving the Brain moves
-  both lifecycles together. Still implement policy-driven revocation, audit reuse at every actual
-  host boundary, persist policy changes that occur outside a runtime commit, and complete the host
-  adapters.
+  both lifecycles together. Every non-intrinsic awaited host boundary now re-resolves its concrete
+  request against the ledger immediately before local dispatch or portable deferral, records the
+  stable grant ID with execution/effect sequence once, and reuses that execute-once authorization
+  fact when an external result resumes. Still implement policy-driven revocation, persist policy
+  changes that occur outside a runtime commit, and complete the host adapters.
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their
