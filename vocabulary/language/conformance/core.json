@@ -45,6 +45,20 @@
       "expected_output": ""
     },
     {
+      "name": "immutable-map-literal-and-lookup",
+      "forth": "map{ s\" answer\" 42 s\" other\" 7 }map s\" answer\" map-get unwrap",
+      "lisp": "(unwrap (map-get (map \"answer\" 42 \"other\" 7) \"answer\"))",
+      "expected_values": [{ "type": "int", "value": 42 }],
+      "expected_output": ""
+    },
+    {
+      "name": "immutable-map-update",
+      "forth": "empty-map<string,int> s\" answer\" 42 map-set s\" answer\" map-get unwrap",
+      "lisp": "(unwrap (map-get (map-set (empty-map string int) \"answer\" 42) \"answer\"))",
+      "expected_values": [{ "type": "int", "value": 42 }],
+      "expected_output": ""
+    },
+    {
       "name": "metered-loop-exit",
       "forth": "begin true until 7",
       "lisp": "(begin (while false 1) 7)",
