@@ -87,7 +87,11 @@ access. Dynamic object traversal remains the explicit `json-*` boundary:
 
 ```lisp
 (unwrap (record-get { :name "Ada" :age 37 } "age")) ; => 37
+(unwrap (record-get (record-set { :name "Ada" :age 37 } "age" 38) "age")) ; => 38
 ```
+
+`record-set` creates a new record rather than mutating the original. Its field name is also a
+literal string, and the replacement must match the field's statically known type.
 
 MemTree and scheduling are explicit effects. Scheduled work stores an immutable program reference,
 typed arguments, budgets, context references, and a revocable policy reference—not raw authority or

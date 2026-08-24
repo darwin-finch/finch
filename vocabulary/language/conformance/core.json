@@ -66,6 +66,13 @@
       "expected_output": ""
     },
     {
+      "name": "immutable-typed-record-update",
+      "forth": "{ name: \"Ada\" age: 37 } 38 \"age\" record-set record-get:age unwrap",
+      "lisp": "(unwrap (record-get (record-set { :name \"Ada\" :age 37 } \"age\" 38) \"age\"))",
+      "expected_values": [{ "type": "int", "value": 38 }],
+      "expected_output": ""
+    },
+    {
       "name": "metered-loop-exit",
       "forth": "begin true until 7",
       "lisp": "(begin (while false 1) 7)",

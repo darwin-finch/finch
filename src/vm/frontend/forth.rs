@@ -508,6 +508,64 @@ fn compile_forth_body_with_locals(
                 token_index += 1;
                 continue;
             }
+            if word == "record-set" {
+                let Some(Token {
+                    value: TokenValue::String(field),
+                    ..
+                }) = tokens.get(token_index.wrapping_sub(1)) else {
+                    return Err(vec![control_error(
+                        "E-RECORD-007",
+                        "record-set requires a literal string field name immediately before it",
+                        origin,
+                    )]);
+                };
+                if stack.len() < 3 {
+                    return Err(vec![control_error(
+                        "E-RECORD-007",
+                        "record-set requires a typed record, replacement value, and literal field name",
+                        origin,
+                    )]);
+                }
+                let record_index = stack.len() - 3;
+                let Type::Record(fields) = &stack[record_index] else {
+                    return Err(vec![control_error(
+                        "E-RECORD-004",
+                        "record-set requires a typed record below the replacement value and field name",
+                        origin,
+                    )]);
+                };
+                let Some((_, expected)) = fields.iter().find(|(name, _)| name == field) else {
+                    return Err(vec![control_error(
+                        "E-RECORD-005",
+                        format!("record has no field '{field}'"),
+                        origin,
+                    )]);
+                };
+                let replacement = &stack[stack.len() - 2];
+                if expected != replacement {
+                    return Err(vec![VmDiagnostic::type_mismatch(
+                        expected.clone(), replacement.clone(), Some(origin),
+                    )]);
+                }
+                let record_type = fields.clone();
+                let value_type = expected.clone();
+                stack.pop();
+                stack.pop();
+                stack.pop();
+                stack.push(Type::Record(record_type.clone()));
+                emit(
+                    &mut blocks,
+                    current,
+                    Instruction::RecordSet {
+                        field: field.clone(),
+                        value_type,
+                        record_type,
+                    },
+                    origin,
+                );
+                token_index += 1;
+                continue;
+            }
             match word.as_str() {
                 "map{" => {
                     map_literals.push(MapLiteralFrame {
@@ -2519,6 +2577,19 @@ mod tests {
         )
         .expect_err("record fields are statically known");
         assert_eq!(invalid[0].code, "E-RECORD-005");
+
+        let updated = compile_forth(
+            "record-update.forth",
+            "{ name: \"Ada\" age: 37 } 38 \"age\" record-set record-get:age unwrap",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("record update should compile");
+        let mut stack = Vec::new();
+        Interpreter::new(&updated, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .expect("record update should execute");
+        assert_eq!(stack, vec![TypedValue::Int(38)]);
     }
 
     #[test]

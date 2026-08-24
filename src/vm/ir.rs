@@ -94,6 +94,15 @@ pub enum Instruction {
         field: String,
         value_type: Type,
     },
+    /// Immutably replace one statically named field and leave a new record
+    /// value. The field-name string stays on the stack for ordinary
+    /// concatenative calling convention, though the frontend has already
+    /// proven it matches `field`. This is not mutation of a shared object.
+    RecordSet {
+        field: String,
+        value_type: Type,
+        record_type: Vec<(String, Type)>,
+    },
     Dup,
     Drop,
     Swap,

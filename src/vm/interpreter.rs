@@ -531,6 +531,66 @@ impl<'a> VmTrampoline<'a> {
                     });
                     Ok(None)
                 }
+                Instruction::RecordSet {
+                    field,
+                    value_type: _,
+                    record_type: _,
+                } => {
+                    let Some(TypedValue::String(field_name)) = continuation.stack.pop() else {
+                        return VmStep::Failed(self.with_trace(
+                            VmDiagnostic::error(
+                                "E-RUNTIME-029",
+                                DiagnosticPhase::Interpretation,
+                                "record field update requires a field-name string",
+                                Some(located.origin),
+                            ),
+                            &continuation,
+                        ));
+                    };
+                    if field_name != field {
+                        return VmStep::Failed(self.with_trace(
+                            VmDiagnostic::error(
+                                "E-RUNTIME-030",
+                                DiagnosticPhase::Interpretation,
+                                format!("record update field '{field_name}' does not match verified field '{field}'"),
+                                Some(located.origin),
+                            ),
+                            &continuation,
+                        ));
+                    }
+                    let Some(value) = continuation.stack.pop() else {
+                        return VmStep::Failed(self.underflow(&located.origin, &continuation));
+                    };
+                    let Some(record) = continuation.stack.pop() else {
+                        return VmStep::Failed(self.underflow(&located.origin, &continuation));
+                    };
+                    let TypedValue::Record(mut fields) = record else {
+                        return VmStep::Failed(self.with_trace(
+                            VmDiagnostic::error(
+                                "E-RUNTIME-031",
+                                DiagnosticPhase::Interpretation,
+                                "record field update requires a typed record",
+                                Some(located.origin),
+                            ),
+                            &continuation,
+                        ));
+                    };
+                    let Some((_, existing)) = fields.iter_mut().find(|(name, _)| name == &field)
+                    else {
+                        return VmStep::Failed(self.with_trace(
+                            VmDiagnostic::error(
+                                "E-RUNTIME-032",
+                                DiagnosticPhase::Interpretation,
+                                format!("record has no field '{field}'"),
+                                Some(located.origin),
+                            ),
+                            &continuation,
+                        ));
+                    };
+                    *existing = value;
+                    continuation.stack.push(TypedValue::Record(fields));
+                    Ok(None)
+                }
                 Instruction::Dup => {
                     let Some(value) = continuation.stack.last().cloned() else {
                         return VmStep::Failed(self.underflow(&located.origin, &continuation));

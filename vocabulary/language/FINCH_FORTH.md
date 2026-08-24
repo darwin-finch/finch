@@ -62,7 +62,11 @@ typed option branch forms:
 
 ```forth
 { name: "Ada" age: 37 } record-get:age unwrap  \ leaves 37
+{ name: "Ada" age: 37 } 38 "age" record-set record-get:age unwrap  \ leaves 38
 ```
+
+`record-set` creates a new record; it does not mutate the original value. Its final field name is
+a literal string, and the replacement must have the field's statically known type.
 
 `case` is a typed integer switch with no fallthrough. Each `of ... endof` arm and the optional
 `otherwise` arm must leave the same stack row. The selector is removed before an arm begins;

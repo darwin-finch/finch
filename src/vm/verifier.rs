@@ -287,6 +287,62 @@ impl<'a> Verifier<'a> {
                 }
                 stack.push(Type::Option(Box::new(value_type.clone())));
             }
+            Instruction::RecordSet {
+                field,
+                value_type,
+                record_type,
+            } => {
+                let field_name = stack.pop().ok_or_else(|| underflow(origin, 3, 0))?;
+                if field_name != Type::String {
+                    return Err(VmDiagnostic::type_mismatch(
+                        Type::String,
+                        field_name,
+                        Some(origin.clone()),
+                    ));
+                }
+                let value = stack.pop().ok_or_else(|| underflow(origin, 3, 1))?;
+                if !value_type.accepts(&value) {
+                    return Err(VmDiagnostic::type_mismatch(
+                        value_type.clone(),
+                        value,
+                        Some(origin.clone()),
+                    ));
+                }
+                let record = stack.pop().ok_or_else(|| underflow(origin, 3, 2))?;
+                let Type::Record(fields) = record else {
+                    return Err(VmDiagnostic::error(
+                        "E-RECORD-008",
+                        DiagnosticPhase::Verification,
+                        "record field update requires a typed record and replacement value",
+                        Some(origin.clone()),
+                    ));
+                };
+                if &fields != record_type {
+                    return Err(VmDiagnostic::error(
+                        "E-RECORD-009",
+                        DiagnosticPhase::Verification,
+                        "record update has an inconsistent IR record type",
+                        Some(origin.clone()),
+                    ));
+                }
+                let Some((_, expected)) = fields.iter().find(|(name, _)| name == field) else {
+                    return Err(VmDiagnostic::error(
+                        "E-RECORD-005",
+                        DiagnosticPhase::Verification,
+                        format!("record has no field '{field}'"),
+                        Some(origin.clone()),
+                    ));
+                };
+                if expected != value_type {
+                    return Err(VmDiagnostic::error(
+                        "E-RECORD-006",
+                        DiagnosticPhase::Verification,
+                        format!("record field '{field}' has an inconsistent IR type"),
+                        Some(origin.clone()),
+                    ));
+                }
+                stack.push(Type::Record(record_type.clone()));
+            }
             Instruction::Dup => {
                 let value = stack
                     .last()

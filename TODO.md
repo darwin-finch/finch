@@ -19,7 +19,7 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   share immutable typed-map construction, key lookup/update, keys/length, serialization across the
   public runtime boundary, map-type unification, immutable heterogeneous record construction, and
   statically named option-valued field projection; still add structured patterns, map iteration,
-  and row-polymorphic record rules. The deliberate typed brace-record syntax is the only record
+  immutable static field update, and row-polymorphic record rules. The deliberate typed brace-record syntax is the only record
   source surface; `json-parse`/`json-get`/scalar option projections remain the safe boundary for
   arbitrary JSON objects rather than exposing the internal `TypedValue::Record` ABI ad hoc.
 - [ ] Extend the implemented typed option/result branches, type-directed Lisp `match`, and

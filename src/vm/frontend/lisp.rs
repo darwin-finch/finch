@@ -968,6 +968,11 @@ impl Compiler<'_> {
                 source_children.as_deref().and_then(|children| children.get(1..)),
                 builder,
             ),
+            "record-set" => self.compile_record_set(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+            ),
             _ if builder.resolve(operator).is_some() => {
                 self.compile_closure_call(
                     &items[0],
@@ -1361,6 +1366,72 @@ impl Compiler<'_> {
             self.origin("record-get"),
         );
         Ok(Type::Option(Box::new(value_type)))
+    }
+
+    /// Replace a statically named field by constructing a new typed record.
+    /// The original value is not mutated, so aliases and captured values retain
+    /// ordinary persistent-value semantics.
+    fn compile_record_set(
+        &mut self,
+        expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let [record, Val::Str(field), value] = expressions else {
+            return Err(vec![self.error(
+                "E-RECORD-007",
+                "record-set requires a record expression, literal field name string, and replacement value",
+            )]);
+        };
+        let Type::Record(fields) = self.compile_expression_at(
+            record,
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )? else {
+            return Err(vec![self.error(
+                "E-RECORD-004", "record-set requires a typed record",
+            )]);
+        };
+        let value_type = self.compile_expression_at(
+            value,
+            expression_sources.and_then(|sources| sources.get(2)),
+            builder,
+        )?;
+        // Co-Forth's public stack spelling is `record value "field"
+        // record-set`. Keep the ordinary Lisp argument order while lowering
+        // its compile-time-known field literal after the replacement value.
+        let field_type = self.compile_expression_at(
+            &expressions[1],
+            expression_sources.and_then(|sources| sources.get(1)),
+            builder,
+        )?;
+        if field_type != Type::String {
+            return Err(vec![self.error(
+                "E-RECORD-007", "record-set field name must be a literal string",
+            )]);
+        }
+        let Some((_, expected)) = fields.iter().find(|(name, _)| name == field) else {
+            return Err(vec![self.error(
+                "E-RECORD-005", format!("record has no field '{field}'"),
+            )]);
+        };
+        if expected != &value_type {
+            return Err(vec![VmDiagnostic::type_mismatch(
+                expected.clone(), value_type, Some(self.origin("record-set")),
+            )]);
+        }
+        builder.stack.pop();
+        builder.stack.pop();
+        builder.stack.pop();
+        builder.emit(
+            Instruction::RecordSet {
+                field: field.clone(),
+                value_type: expected.clone(),
+                record_type: fields.clone(),
+            },
+            self.origin("record-set"),
+        );
+        Ok(Type::Record(fields))
     }
 
     fn compile_let(
@@ -3015,6 +3086,11 @@ mod tests {
         )
         .expect_err("record fields are statically known");
         assert_eq!(missing[0].code, "E-RECORD-005");
+        assert_eq!(
+            run("(unwrap (record-get (record-set { :name \"Ada\" :age 37 } \"age\" 38) \"age\"))")
+                .unwrap(),
+            vec![TypedValue::Int(38)]
+        );
     }
 
     #[test]
