@@ -1061,6 +1061,8 @@ mod tests {
         assert!(prompt.contains("if-some ... else ... then"));
         assert!(prompt.contains(": factorial ( S int -- S int ! {} )"));
         assert!(prompt.contains("begin condition while ... repeat"));
+        assert!(prompt.contains("[1, 2, 3]"));
+        assert!(prompt.contains("{\"first name\":\"Ada\"}"));
         assert!(prompt.contains("Language packages: boot@FINCH-VM-TYPED/1#"));
         assert!(!prompt.contains(".\" response\""));
     }

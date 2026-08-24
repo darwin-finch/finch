@@ -51,6 +51,13 @@ form. For prose containing ordinary quotes or newlines, use the verbatim form
 `s"""text"""` (no escapes; it ends at the next `"""`). Use `if-some ... else ... then` or Lisp
 `match-option` to consume `option<T>` without speculative `unwrap` calls.
 
+Co-Forth collections are typed values, not JSON-by-default: `[1, 2, 3]` is a homogeneous
+`list<int>` (commas are optional); `{ name: "Ada" age: 37 }` is a fixed heterogeneous record; and
+`map{ "key" value }map` is a homogeneous runtime-keyed map. A pasted JSON object with quoted keys,
+such as `{"first name":"Ada"}`, is accepted directly and pushes managed `json`; use `json-get` or
+`json-as-map` rather than guessing a typed-record schema. Use `(list ...)`, `(map ...)`, and
+`{ :field value }` for the corresponding Lisp forms.
+
 Co-Forth can define reusable typed words directly. A definition must state its stack contract;
 `S` preserves the unknown caller stack below its inputs. Use `locals|` first in the body when a
 word has named inputs. Pure definitions use `! {}` and may recurse or mutually recurse in the
