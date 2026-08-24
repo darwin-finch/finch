@@ -37,6 +37,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   rule. Include common stack-error corrections rather than only error codes.
 - [ ] Generate every production word/function from one typed signature, effect, documentation, and
   host-implementation registry.
+- [ ] Refine Lisp source maps from the implemented exact enclosing top-level-form spans to exact
+  nested expression/token spans and macro-expansion ancestry. Do not regress to whole-submission
+  spans or invent locations by source-text searching.
 - [x] Make documentation a first-class field of typed Lisp/Co-Forth definitions and promotion
   records, not merely leading source comments. Preserve `; finch-doc:` / `\ finch-doc:` as a
   self-contained-script spelling, retain exact immutable version metadata, and converge provider

@@ -12,6 +12,17 @@ use crate::vm::verifier::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::ops::Range;
+
+/// A parsed top-level Lisp form paired with the exact source range that
+/// produced it.  The typed compiler currently preserves the enclosing form
+/// through macro expansion; nested expression/token provenance is a later,
+/// deliberately separate source-map refinement.
+#[derive(Debug, Clone)]
+struct SourceForm {
+    value: Val,
+    span: Range<usize>,
+}
 
 #[derive(Debug, Clone)]
 enum Binding {
@@ -170,6 +181,7 @@ struct Compiler<'a> {
     predeclared: BTreeMap<String, StackSignature>,
     functions: BTreeMap<String, Function>,
     next_lambda: u64,
+    current_span: Range<usize>,
 }
 
 /// Parse and compile Finch Lisp directly into the common typed stack IR. No
@@ -204,13 +216,24 @@ pub fn compile_lisp_with_functions(
             Some(source_origin(source_id, source, "<reader>")),
         )]
     })?;
+    let spans = top_level_form_spans(source)
+        .filter(|spans| spans.len() == parsed_expressions.len())
+        .unwrap_or_else(|| {
+        // The legacy reader is authoritative for acceptance.  Never reject a
+        // program merely because diagnostic decoration could not be derived;
+        // retain the previous whole-submission fallback in that exceptional
+        // case.
+        vec![0..source.len(); parsed_expressions.len()]
+    });
     let macros = collect_template_macros(source_id, source, &parsed_expressions)?;
     let mut expansion_budget = 128;
     let expressions = parsed_expressions
         .iter()
-        .filter(|expression| !is_macro_definition(expression))
-        .map(|expression| {
+        .zip(spans)
+        .filter(|(expression, _)| !is_macro_definition(expression))
+        .map(|(expression, span)| {
             expand_template_macros(source_id, source, expression, &macros, &mut expansion_budget)
+                .map(|value| SourceForm { value, span })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut compiler = Compiler {
@@ -220,18 +243,21 @@ pub fn compile_lisp_with_functions(
         predeclared: BTreeMap::new(),
         functions: BTreeMap::new(),
         next_lambda: 0,
+        current_span: 0..source.len(),
     };
     for expression in &expressions {
-        if is_definition(expression) {
-            compiler.predeclare_definition(expression)?;
+        compiler.current_span = expression.span.clone();
+        if is_definition(&expression.value) {
+            compiler.predeclare_definition(&expression.value)?;
         }
     }
     let mut executable = Vec::new();
     for expression in &expressions {
-        if is_definition(expression) {
-            compiler.compile_definition(expression)?;
+        compiler.current_span = expression.span.clone();
+        if is_definition(&expression.value) {
+            compiler.compile_definition(&expression.value)?;
         } else {
-            executable.push(expression);
+            executable.push(expression.clone());
         }
     }
     let mut builder = FunctionBuilder::new("main", initial_stack);
@@ -247,7 +273,8 @@ pub fn compile_lisp_with_functions(
         }
     } else {
         for (index, expression) in executable.iter().enumerate() {
-            compiler.compile_expression(expression, &mut builder)?;
+            compiler.current_span = expression.span.clone();
+            compiler.compile_expression(&expression.value, &mut builder)?;
             if index + 1 != executable.len() {
                 builder.stack.pop();
                 builder.emit(Instruction::Drop, compiler.origin("begin"));
@@ -489,7 +516,12 @@ fn macro_error(
 
 impl Compiler<'_> {
     fn origin(&self, word: impl Into<String>) -> SourceOrigin {
-        source_origin(self.source_id, self.source, word)
+        source_origin_in_range(
+            self.source_id,
+            self.source,
+            self.current_span.clone(),
+            word,
+        )
     }
 
     fn compile_expression(
@@ -2114,26 +2146,158 @@ fn split_type_arguments(source: &str) -> Option<Vec<&str>> {
 }
 
 fn source_origin(source_id: &str, source: &str, word: impl Into<String>) -> SourceOrigin {
-    let line_count = source.bytes().filter(|byte| *byte == b'\n').count() + 1;
-    let final_column = source
-        .rsplit_once('\n')
-        .map_or(source.chars().count() + 1, |(_, tail)| {
-            tail.chars().count() + 1
-        });
+    source_origin_in_range(source_id, source, 0..source.len(), word)
+}
+
+fn source_origin_in_range(
+    source_id: &str,
+    source: &str,
+    range: Range<usize>,
+    word: impl Into<String>,
+) -> SourceOrigin {
+    let range = range.start.min(source.len())..range.end.min(source.len()).max(range.start.min(source.len()));
+    let (start_line, start_column) = source_position(source, range.start);
+    let (end_line, end_column) = source_position(source, range.end);
     SourceOrigin {
         language: SourceLanguage::Lisp,
         span: Some(SourceSpan {
             source_id: source_id.to_string(),
-            start_byte: 0,
-            end_byte: source.len(),
-            start_line: 1,
-            start_column: 1,
-            end_line: line_count,
-            end_column: final_column,
+            start_byte: range.start,
+            end_byte: range.end,
+            start_line,
+            start_column,
+            end_line,
+            end_column,
         }),
         word: Some(word.into()),
         expansion: None,
     }
+}
+
+fn source_position(source: &str, byte: usize) -> (usize, usize) {
+    let prefix = &source[..byte];
+    let line = prefix.bytes().filter(|character| *character == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix.chars().count() + 1, |(_, tail)| tail.chars().count() + 1);
+    (line, column)
+}
+
+/// Return the source range for every top-level reader form.  This scanner is
+/// intentionally concerned only with form boundaries; the normal Lisp reader
+/// remains the parser and semantic authority.  It recognises the reader's
+/// strings, comments, quoting prefixes, JSON literals, and `$...$` forms so
+/// its result can safely decorate each parsed top-level expression.
+fn top_level_form_spans(source: &str) -> Option<Vec<Range<usize>>> {
+    let mut cursor = 0;
+    let mut forms = Vec::new();
+    while let Some(start) = skip_lisp_trivia(source, cursor) {
+        let end = scan_lisp_form(source, start)?;
+        forms.push(start..end);
+        cursor = end;
+    }
+    Some(forms)
+}
+
+fn skip_lisp_trivia(source: &str, mut cursor: usize) -> Option<usize> {
+    loop {
+        while let Some(character) = source[cursor..].chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            cursor += character.len_utf8();
+        }
+        if source[cursor..].starts_with(';') {
+            cursor += source[cursor..].find('\n').map_or(source.len() - cursor, |offset| offset);
+            continue;
+        }
+        if source[cursor..].starts_with("#|") {
+            let end = source[cursor + 2..].find("|#")?;
+            cursor += 2 + end + 2;
+            continue;
+        }
+        return (cursor < source.len()).then_some(cursor);
+    }
+}
+
+fn scan_lisp_form(source: &str, cursor: usize) -> Option<usize> {
+    let rest = &source[cursor..];
+    let character = rest.chars().next()?;
+    match character {
+        '\'' | '`' => scan_lisp_form(source, skip_lisp_trivia(source, cursor + 1)?),
+        ',' => {
+            let after_prefix = if rest.starts_with(",@") { cursor + 2 } else { cursor + 1 };
+            scan_lisp_form(source, skip_lisp_trivia(source, after_prefix)?)
+        }
+        '(' => scan_balanced_lisp_form(source, cursor, '(', ')'),
+        '[' => scan_balanced_lisp_form(source, cursor, '[', ']'),
+        '{' => scan_balanced_lisp_form(source, cursor, '{', '}'),
+        '"' => scan_lisp_string(source, cursor),
+        '$' => source[cursor + 1..].find('$').map(|offset| cursor + 1 + offset + 1),
+        ')' | ']' | '}' | ';' => None,
+        _ => {
+            let mut end = cursor;
+            while let Some(next) = source[end..].chars().next() {
+                if next.is_whitespace()
+                    || matches!(next, '(' | ')' | '"' | ';' | '\'' | '`' | ',')
+                {
+                    break;
+                }
+                end += next.len_utf8();
+            }
+            (end > cursor).then_some(end)
+        }
+    }
+}
+
+fn scan_lisp_string(source: &str, mut cursor: usize) -> Option<usize> {
+    cursor += 1; // opening quote
+    while let Some(character) = source[cursor..].chars().next() {
+        cursor += character.len_utf8();
+        match character {
+            '\\' => {
+                let escaped = source[cursor..].chars().next()?;
+                cursor += escaped.len_utf8();
+            }
+            '"' => return Some(cursor),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn scan_balanced_lisp_form(
+    source: &str,
+    mut cursor: usize,
+    open: char,
+    close: char,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    while let Some(character) = source[cursor..].chars().next() {
+        if character == '"' {
+            cursor = scan_lisp_string(source, cursor)?;
+            continue;
+        }
+        if character == ';' && open == '(' {
+            cursor += source[cursor..].find('\n').map_or(source.len() - cursor, |offset| offset);
+            continue;
+        }
+        if source[cursor..].starts_with("#|") && open == '(' {
+            let end = source[cursor + 2..].find("|#")?;
+            cursor += 2 + end + 2;
+            continue;
+        }
+        cursor += character.len_utf8();
+        if character == open {
+            depth += 1;
+        } else if character == close {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(cursor);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2565,5 +2729,43 @@ mod tests {
         )
         .expect_err("break must name an active loop");
         assert_eq!(errors[0].code, "E-LISP-012");
+    }
+
+    #[test]
+    fn preserves_the_enclosing_top_level_form_span_on_lisp_ir() {
+        let source = "; setup\n(say \"first\")\n(+ 2 3)";
+        let module = compile_lisp("spans.lisp", source, Vec::new(), &core_vocabulary()).unwrap();
+        let instructions = &module.module.functions["main"].blocks[&0].instructions;
+        let say = instructions
+            .iter()
+            .find(|located| matches!(
+                located.instruction,
+                Instruction::CapabilityRequest { ref requirement, .. }
+                    if requirement.capability == CapabilityKind::SessionEmit
+            ))
+            .expect("say lowers to an awaited effect");
+        let add = instructions
+            .iter()
+            .find(|located| matches!(located.instruction, Instruction::Call { ref function } if function == "+"))
+            .expect("addition call");
+        let say_span = say.origin.span.as_ref().expect("Lisp span");
+        let add_span = add.origin.span.as_ref().expect("Lisp span");
+        assert_eq!(say_span.source_id, "spans.lisp");
+        assert_eq!(&source[say_span.start_byte..say_span.end_byte], "(say \"first\")");
+        assert_eq!(&source[add_span.start_byte..add_span.end_byte], "(+ 2 3)");
+        assert_eq!((say_span.start_line, say_span.start_column), (2, 1));
+        assert_eq!((add_span.start_line, add_span.start_column), (3, 1));
+    }
+
+    #[test]
+    fn finds_top_level_forms_through_comments_quotes_and_json_literals() {
+        let source = "; lead\n'(say \"quoted\") #| ignored ( ) |#\n[1, {\"x\": \"y\"}]\n$2*x$";
+        let spans = top_level_form_spans(source).expect("reader-compatible top-level forms");
+        let forms = spans
+            .iter()
+            .map(|span| &source[span.clone()])
+            .collect::<Vec<_>>();
+        assert_eq!(forms, vec!["'(say \"quoted\")", "[1, {\"x\": \"y\"}]", "$2*x$"]);
+        assert_eq!(crate::lisp::reader::parse_str(source).unwrap().len(), spans.len());
     }
 }

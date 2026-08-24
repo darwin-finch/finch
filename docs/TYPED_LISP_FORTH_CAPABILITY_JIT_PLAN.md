@@ -146,8 +146,11 @@ branches, structured values, capability requests, suspension points, and returns
 third user-facing language and is not simply tokenized Forth text.
 
 Co-Forth source compiles almost directly to the IR. Lisp is parsed, macro-expanded, type-checked,
-closure-converted, and lowered by post-order traversal. Original source and spans remain attached
-to the resulting instructions.
+closure-converted, and lowered by post-order traversal. Each resulting Lisp instruction currently
+carries the exact span of its enclosing top-level source form (including source identity and
+line/column coordinates); macro-expanded instructions retain that caller-form provenance. Precise
+nested-expression and macro-template expansion chains remain a required source-map refinement,
+not a claim that a whole submission is an exact location.
 
 Users who explicitly enter Forth enter Co-Forth source text, for example `3 4 +` or a `:` word
 definition. Users who explicitly enter Lisp enter Lisp source text. Ordinary conversational text
