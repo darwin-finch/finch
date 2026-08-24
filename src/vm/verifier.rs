@@ -595,13 +595,83 @@ impl<'a> Verifier<'a> {
                     origin,
                 )?;
             }
+            Instruction::DeferFiber => {
+                let closure = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
+                let Type::Function {
+                    arguments,
+                    result,
+                    effects,
+                    suspension: Some(suspension),
+                } = closure
+                else {
+                    return Err(VmDiagnostic::error(
+                        "E-FIBER-021",
+                        DiagnosticPhase::Verification,
+                        "defer requires a typed yielding closure",
+                        Some(origin.clone()),
+                    ));
+                };
+                if !arguments.is_empty() || !effects.is_pure() {
+                    return Err(VmDiagnostic::error(
+                        "E-FIBER-022",
+                        DiagnosticPhase::Verification,
+                        "cooperative defer requires a pure zero-argument closure",
+                        Some(origin.clone()),
+                    ));
+                }
+                if *suspension.resume_type != Type::Unit {
+                    return Err(VmDiagnostic::error(
+                        "E-FIBER-023",
+                        DiagnosticPhase::Verification,
+                        "this runtime version supports only unit-resumed producer fibers",
+                        Some(origin.clone()),
+                    ));
+                }
+                stack.push(Type::Fiber(suspension.yield_type, result));
+            }
+            Instruction::NextFiber => {
+                let fiber = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
+                let Type::Fiber(yield_type, result_type) = fiber else {
+                    return Err(VmDiagnostic::error(
+                        "E-FIBER-024",
+                        DiagnosticPhase::Verification,
+                        "fiber-next requires fiber<Y,R>",
+                        Some(origin.clone()),
+                    ));
+                };
+                stack.push(Type::fiber_step(*yield_type, *result_type));
+            }
+            Instruction::JoinFiber => {
+                let fiber = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
+                let Type::Fiber(_, result_type) = fiber else {
+                    return Err(VmDiagnostic::error(
+                        "E-FIBER-025",
+                        DiagnosticPhase::Verification,
+                        "fiber-join requires fiber<Y,R>",
+                        Some(origin.clone()),
+                    ));
+                };
+                stack.push(*result_type);
+            }
+            Instruction::CancelFiber => {
+                let fiber = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
+                if !matches!(fiber, Type::Fiber(_, _)) {
+                    return Err(VmDiagnostic::error(
+                        "E-FIBER-026",
+                        DiagnosticPhase::Verification,
+                        "fiber-cancel requires fiber<Y,R>",
+                        Some(origin.clone()),
+                    ));
+                }
+                stack.push(Type::Unit);
+            }
             Instruction::DeferCpu => {
                 let closure = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
                 let Type::Function {
                     arguments,
                     result,
                     effects,
-                    ..
+                    suspension,
                 } = closure
                 else {
                     return Err(VmDiagnostic::error(
@@ -626,6 +696,18 @@ impl<'a> Verifier<'a> {
                         "defer-cpu requires a pure closure",
                         Some(origin.clone()),
                     ));
+                }
+                if let Some(suspension) = suspension {
+                    if *suspension.yield_type != Type::Unit
+                        || *suspension.resume_type != Type::Unit
+                    {
+                        return Err(VmDiagnostic::error(
+                            "E-YIELD-003",
+                            DiagnosticPhase::Verification,
+                            "CPU tasks may yield only unit timeslices; use defer for produced values",
+                            Some(origin.clone()),
+                        ));
+                    }
                 }
                 stack.push(Type::Task(result));
             }
@@ -877,6 +959,64 @@ fn unify(
         | (Type::Stream(expected), Type::Stream(found)) => {
             unify(expected, found, substitutions, origin)
         }
+        (
+            Type::Fiber(expected_yield, expected_result),
+            Type::Fiber(found_yield, found_result),
+        ) => {
+            unify(expected_yield, found_yield, substitutions, origin)?;
+            unify(expected_result, found_result, substitutions, origin)
+        }
+        (
+            Type::Function {
+                arguments: expected_arguments,
+                result: expected_result,
+                effects: expected_effects,
+                suspension: expected_suspension,
+            },
+            Type::Function {
+                arguments: found_arguments,
+                result: found_result,
+                effects: found_effects,
+                suspension: found_suspension,
+            },
+        ) => {
+            let non_suspending_subtype = matches!(
+                (expected_suspension, found_suspension),
+                (Some(expected), None)
+                    if *expected.yield_type == Type::Unit
+                        && *expected.resume_type == Type::Unit
+            );
+            if expected_arguments.len() != found_arguments.len()
+                || expected_effects != found_effects
+                || (expected_suspension.is_some() != found_suspension.is_some()
+                    && !non_suspending_subtype)
+            {
+                return Err(VmDiagnostic::type_mismatch(
+                    expected.clone(),
+                    found.clone(),
+                    Some(origin.clone()),
+                ));
+            }
+            for (expected, found) in expected_arguments.iter().zip(found_arguments) {
+                unify(expected, found, substitutions, origin)?;
+            }
+            unify(expected_result, found_result, substitutions, origin)?;
+            if let (Some(expected), Some(found)) = (expected_suspension, found_suspension) {
+                unify(
+                    &expected.yield_type,
+                    &found.yield_type,
+                    substitutions,
+                    origin,
+                )?;
+                unify(
+                    &expected.resume_type,
+                    &found.resume_type,
+                    substitutions,
+                    origin,
+                )?;
+            }
+            Ok(())
+        }
         (Type::Map(expected_key, expected_value), Type::Map(found_key, found_value)) => {
             unify(expected_key, found_key, substitutions, origin)?;
             unify(expected_value, found_value, substitutions, origin)
@@ -980,6 +1120,10 @@ fn substitute(ty: &Type, substitutions: &BTreeMap<String, Type>) -> Type {
                 .collect(),
         ),
         Type::Task(inner) => Type::Task(Box::new(substitute(inner, substitutions))),
+        Type::Fiber(yield_type, result_type) => Type::Fiber(
+            Box::new(substitute(yield_type, substitutions)),
+            Box::new(substitute(result_type, substitutions)),
+        ),
         Type::Stream(inner) => Type::Stream(Box::new(substitute(inner, substitutions))),
         Type::Function {
             arguments,

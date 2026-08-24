@@ -279,6 +279,21 @@ unit yield
 s" Finished." say
 ```
 
+A pure zero-argument yielding quotation becomes `fiber<Y,R>` with `defer`. `fiber-next` returns
+`result<Y,variant{end(R)}>`: `ok(Y)` is the next item and `err(end(R))` carries the terminal return.
+`fiber-join` discards remaining yields and returns `R`; `fiber-cancel` makes later use fail
+deterministically. Operations consume the handle, so duplicate it when it must remain available:
+
+```forth
+: numbers ( S -- S int ! infer ) 2 yield 3 yield 5 ;
+['] numbers defer
+dup fiber-next
+```
+
+Producer continuations survive VM checkpoints and their advancement is rolled back with a failed
+ProgramRun. This version resumes them with `unit` and permits only pure quotations. Host-backed
+lazy data remains `stream<T>` with `stream-next` and `stream-close`.
+
 `vm-vocabulary` returns the current serialized typed word manifest.
 
 JSON is a managed typed value, not a stringly authority channel. Parse untrusted text with

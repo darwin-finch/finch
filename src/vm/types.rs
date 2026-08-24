@@ -36,6 +36,9 @@ pub enum Type {
         suspension: Option<super::signature::SuspensionSignature>,
     },
     Task(Box<Type>),
+    /// A cooperatively scheduled closure that may publish `Y` values before
+    /// returning one terminal `R`. The continuation remains runtime-owned.
+    Fiber(Box<Type>, Box<Type>),
     /// An opaque, scheduler/host-owned lazy sequence. Advancing it is
     /// bounded and returns `option<T>`; source programs cannot manufacture a
     /// cursor from a string or share its backing state implicitly.
@@ -53,6 +56,13 @@ impl Type {
 
     pub fn result(ok: Type, error: Type) -> Self {
         Self::Result(Box::new(ok), Box::new(error))
+    }
+
+    pub fn fiber_step(yield_type: Type, result_type: Type) -> Self {
+        Self::result(
+            yield_type,
+            Self::Variant(vec![("end".into(), Some(result_type))]),
+        )
     }
 
     /// Non-binding compatibility. Type variables are bound by the verifier.
@@ -129,6 +139,9 @@ impl fmt::Display for Type {
                 Ok(())
             }
             Self::Task(result) => write!(f, "task<{result}>"),
+            Self::Fiber(yield_type, result_type) => {
+                write!(f, "fiber<{yield_type},{result_type}>")
+            }
             Self::Stream(element) => write!(f, "stream<{element}>"),
             Self::Resource(kind) => write!(f, "resource<{kind}>"),
             Self::Capability(kind) => write!(f, "capability<{kind}>"),
@@ -211,6 +224,13 @@ pub enum TypedValue {
         #[serde(default)]
         kind: TaskKind,
     },
+    /// A runtime-owned producer continuation. The UUID is an opaque lookup
+    /// key; the two types make every use independently verifiable.
+    Fiber {
+        id: String,
+        yield_type: Type,
+        result_type: Type,
+    },
     /// A host- or scheduler-owned lazy sequence. `kind` is checked by the
     /// host adapter; its opaque ID is not a file path or capability token.
     Stream {
@@ -280,6 +300,14 @@ impl TypedValue {
                 suspension: signature.suspension.clone(),
             },
             Self::Task { result_type, .. } => Type::Task(Box::new(result_type.clone())),
+            Self::Fiber {
+                yield_type,
+                result_type,
+                ..
+            } => Type::Fiber(
+                Box::new(yield_type.clone()),
+                Box::new(result_type.clone()),
+            ),
             Self::Stream { element_type, .. } => Type::Stream(Box::new(element_type.clone())),
             Self::Resource { kind, .. } => Type::Resource(kind.clone()),
             Self::Dynamic { .. } => Type::Dynamic,

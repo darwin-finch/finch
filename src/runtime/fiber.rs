@@ -283,6 +283,22 @@ fn run_fiber(
                 );
                 return;
             }
+            VmStep::SpawnFiber { origin, .. }
+            | VmStep::NextFiber { origin, .. }
+            | VmStep::JoinFiber { origin, .. }
+            | VmStep::CancelFiber { origin, .. } => {
+                finish(
+                    CpuFiberStatus::Failed,
+                    None,
+                    Some(VmDiagnostic::error(
+                        "E-FIBER-033",
+                        crate::vm::DiagnosticPhase::HostCall,
+                        "a CPU task cannot own or operate a cooperative producer",
+                        Some(origin),
+                    )),
+                );
+                return;
+            }
             VmStep::SpawnCpuFiber { origin, .. } => {
                 finish(
                     CpuFiberStatus::Failed,

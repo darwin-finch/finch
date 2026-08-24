@@ -150,6 +150,15 @@ pub enum Instruction {
     Yield {
         value_type: Type,
     },
+    /// Capture a zero-argument yielding closure as a runtime-owned
+    /// cooperative producer. Unlike `DeferCpu`, this starts no OS thread.
+    DeferFiber,
+    /// Advance one producer to a yielded value or terminal return.
+    NextFiber,
+    /// Advance a producer until its terminal return, discarding yields.
+    JoinFiber,
+    /// Remove a producer continuation and mark its opaque handle cancelled.
+    CancelFiber,
     /// Spawn a pure, zero-argument closure on the bounded CPU-fiber pool.
     /// The closure is popped and the runtime resumes this continuation with a
     /// typed task handle; it never shares the parent stack or frame.

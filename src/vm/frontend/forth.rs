@@ -1695,6 +1695,47 @@ fn compile_forth_body_with_locals(
                     let len = stack.len();
                     stack.swap(len - 1, len - 2);
                     Instruction::Swap
+                } else if word == "defer" {
+                    let closure = stack.pop().ok_or_else(|| {
+                        vec![VmDiagnostic::error(
+                            "E-FIBER-021",
+                            DiagnosticPhase::TypeInference,
+                            "defer requires a typed yielding quotation",
+                            Some(origin.clone()),
+                        )]
+                    })?;
+                    let Type::Function {
+                        arguments,
+                        result,
+                        effects: closure_effects,
+                        suspension: Some(closure_suspension),
+                    } = closure
+                    else {
+                        return Err(vec![VmDiagnostic::error(
+                            "E-FIBER-021",
+                            DiagnosticPhase::TypeInference,
+                            "defer requires a typed yielding quotation",
+                            Some(origin),
+                        )]);
+                    };
+                    if !arguments.is_empty() || !closure_effects.is_pure() {
+                        return Err(vec![VmDiagnostic::error(
+                            "E-FIBER-022",
+                            DiagnosticPhase::TypeInference,
+                            "cooperative defer requires a pure zero-argument quotation",
+                            Some(origin),
+                        )]);
+                    }
+                    if *closure_suspension.resume_type != Type::Unit {
+                        return Err(vec![VmDiagnostic::error(
+                            "E-FIBER-023",
+                            DiagnosticPhase::TypeInference,
+                            "this runtime version supports only unit-resumed producer fibers",
+                            Some(origin),
+                        )]);
+                    }
+                    stack.push(Type::Fiber(closure_suspension.yield_type, result));
+                    Instruction::DeferFiber
                 } else if word == "defer-cpu" {
                     let closure = stack.pop().ok_or_else(|| {
                         vec![VmDiagnostic::error(
@@ -1708,7 +1749,7 @@ fn compile_forth_body_with_locals(
                         arguments,
                         result,
                         effects: closure_effects,
-                        ..
+                        suspension: closure_suspension,
                     } = closure
                     else {
                         return Err(vec![VmDiagnostic::error(
@@ -1733,6 +1774,18 @@ fn compile_forth_body_with_locals(
                             "defer-cpu requires a pure closure",
                             Some(origin),
                         )]);
+                    }
+                    if let Some(closure_suspension) = closure_suspension {
+                        if *closure_suspension.yield_type != Type::Unit
+                            || *closure_suspension.resume_type != Type::Unit
+                        {
+                            return Err(vec![VmDiagnostic::error(
+                                "E-YIELD-003",
+                                DiagnosticPhase::TypeInference,
+                                "CPU tasks may yield only unit timeslices; use defer for produced values",
+                                Some(origin),
+                            )]);
+                        }
                     }
                     stack.push(Type::Task(result));
                     Instruction::DeferCpu
@@ -1793,6 +1846,63 @@ fn compile_forth_body_with_locals(
                     }
                     stack.push(Type::Unit);
                     Instruction::CancelCpuFiber
+                } else if word == "fiber-next" {
+                    let fiber = stack.pop().ok_or_else(|| {
+                        vec![VmDiagnostic::error(
+                            "E-FIBER-024",
+                            DiagnosticPhase::TypeInference,
+                            "fiber-next requires fiber<Y,R>",
+                            Some(origin.clone()),
+                        )]
+                    })?;
+                    let Type::Fiber(yield_type, result_type) = fiber else {
+                        return Err(vec![VmDiagnostic::error(
+                            "E-FIBER-024",
+                            DiagnosticPhase::TypeInference,
+                            "fiber-next requires fiber<Y,R>",
+                            Some(origin),
+                        )]);
+                    };
+                    stack.push(Type::fiber_step(*yield_type, *result_type));
+                    Instruction::NextFiber
+                } else if word == "fiber-join" {
+                    let fiber = stack.pop().ok_or_else(|| {
+                        vec![VmDiagnostic::error(
+                            "E-FIBER-025",
+                            DiagnosticPhase::TypeInference,
+                            "fiber-join requires fiber<Y,R>",
+                            Some(origin.clone()),
+                        )]
+                    })?;
+                    let Type::Fiber(_, result_type) = fiber else {
+                        return Err(vec![VmDiagnostic::error(
+                            "E-FIBER-025",
+                            DiagnosticPhase::TypeInference,
+                            "fiber-join requires fiber<Y,R>",
+                            Some(origin),
+                        )]);
+                    };
+                    stack.push(*result_type);
+                    Instruction::JoinFiber
+                } else if word == "fiber-cancel" {
+                    let fiber = stack.pop().ok_or_else(|| {
+                        vec![VmDiagnostic::error(
+                            "E-FIBER-026",
+                            DiagnosticPhase::TypeInference,
+                            "fiber-cancel requires fiber<Y,R>",
+                            Some(origin.clone()),
+                        )]
+                    })?;
+                    if !matches!(fiber, Type::Fiber(_, _)) {
+                        return Err(vec![VmDiagnostic::error(
+                            "E-FIBER-026",
+                            DiagnosticPhase::TypeInference,
+                            "fiber-cancel requires fiber<Y,R>",
+                            Some(origin),
+                        )]);
+                    }
+                    stack.push(Type::Unit);
+                    Instruction::CancelFiber
                 } else if word == "?" {
                     let Some(expected_return) = expected_return else {
                         return Err(vec![VmDiagnostic::error(

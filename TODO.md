@@ -197,18 +197,23 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   ProgramRun ownership/generation checks, path-scoped capability propagation, concrete polymorphic
   host-result rows, and shared Lisp/Co-Forth lowering. File-line and CSV streams are the first
   backends.
-- [ ] Complete first-class producer fibers on the shared typed `yield` control effect. `yield` now
+- [x] Complete first-class producer fibers on the shared typed `yield` control effect. `yield` now
   publishes one typed value beside the exact serializable continuation, pending-run inspection
   exposes it, and unit yields retain automatic cooperative-timeslice behavior. Callable and closure
   signatures now retain the inferred `yields<Y,unit>` contract, the independent verifier rejects a
   hidden or inconsistent suspension, and published words preserve it in vocabulary introspection.
-  Still make `defer` expose `fiber<Y,R>` through ordinary typed `next`/`join` vocabulary words.
-  `stream<T>` stays the range abstraction for
+  `defer` now exposes a pure, zero-argument yielding closure as `fiber<Y,R>` through ordinary
+  registry-backed `fiber-next`, `fiber-join`, and `fiber-cancel` words. `fiber-next` returns
+  `result<Y,variant{end(R)}>` (`ok(Y)` for a yield, `err(end(R))` for terminal return); the same
+  types and operations are available from Lisp and Co-Forth. Producer continuations and handles
+  survive VM checkpoints, participate in ProgramRun rollback, and retain deterministic completed,
+  failed, and cancelled states. `stream<T>` stays the range abstraction for
   cursor-backed data, while producer fibers supply user-defined ranges. No special multi-return,
   hidden iterator protocol, compiler-only map lookup rule, or untyped resumed value is permitted;
   all scheduler operations must come from the same typed registry/templates available to user
-  definitions. Legacy Co-Forth generators remain outside typed-runtime vocabulary until these
-  state, effect, suspension, cancellation, and serialization semantics are verified.
+  definitions. This first version resumes producers with `unit` and permits only pure closures;
+  effectful autonomous work remains a separate task/agent protocol. Legacy Co-Forth generators
+  remain outside typed-runtime vocabulary.
 - [ ] Make resource roots first-class capability objects. Workspace/project paths remain safely
   relative; an intentional full-machine grant is a separate audited host root, never ambient
   authority inferred from an absolute path string. `host-path` and distinct

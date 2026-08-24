@@ -301,10 +301,20 @@ the cooperative-timeslice case. A host must later resume that same execution. It
   (say "Finished."))
 ```
 
-The typed suspension payload is the substrate for future first-class `fiber<Y,R>` producers. Use
-a bounded list for a known finite result or a typed `stream<T>` with `stream-next` / `stream-close`
-for currently implemented host-backed iteration. Do not borrow unverified generator state from
-the legacy Co-Forth compatibility library.
+Use `(defer closure)` (or `(defer :fiber closure)`) to turn a pure zero-argument yielding closure
+into `fiber<Y,R>`. `(fiber-next fiber)` returns `ok(Y)` for the next yielded value, or
+`err(end(R))` after the closure returns. `(fiber-join fiber)` discards remaining yields and returns
+`R`; `(fiber-cancel fiber)` makes later use fail deterministically. Bind or otherwise retain the
+handle when advancing it because these operations consume their argument like ordinary functions:
+
+```lisp
+(let ((numbers (defer (lambda () (begin (yield 2) (yield 3) 5)))))
+  (list (fiber-next numbers) (fiber-next numbers) (fiber-next numbers)))
+```
+
+Producer continuations are checkpointable and ProgramRun-transactional. This version resumes them
+with `unit` and permits only pure closures. Use a bounded list for a known finite result or a typed
+`stream<T>` with `stream-next` / `stream-close` for host-backed iteration.
 
 `(vm-vocabulary)` returns the current typed word manifest for programmatic introspection.
 

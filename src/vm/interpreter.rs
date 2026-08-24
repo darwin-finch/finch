@@ -300,6 +300,26 @@ pub enum VmStep {
         value: TypedValue,
         continuation: VmContinuation,
     },
+    SpawnFiber {
+        closure: TypedValue,
+        origin: SourceOrigin,
+        continuation: VmContinuation,
+    },
+    NextFiber {
+        fiber: TypedValue,
+        origin: SourceOrigin,
+        continuation: VmContinuation,
+    },
+    JoinFiber {
+        fiber: TypedValue,
+        origin: SourceOrigin,
+        continuation: VmContinuation,
+    },
+    CancelFiber {
+        fiber: TypedValue,
+        origin: SourceOrigin,
+        continuation: VmContinuation,
+    },
     Emit {
         effect: VmSideEffect,
         continuation: VmContinuation,
@@ -995,6 +1015,46 @@ impl<'a> VmTrampoline<'a> {
                         continuation,
                     };
                 }
+                Instruction::DeferFiber => {
+                    let Some(closure) = continuation.stack.pop() else {
+                        return VmStep::Failed(self.underflow(&located.origin, &continuation));
+                    };
+                    return VmStep::SpawnFiber {
+                        closure,
+                        origin: located.origin,
+                        continuation,
+                    };
+                }
+                Instruction::NextFiber => {
+                    let Some(fiber) = continuation.stack.pop() else {
+                        return VmStep::Failed(self.underflow(&located.origin, &continuation));
+                    };
+                    return VmStep::NextFiber {
+                        fiber,
+                        origin: located.origin,
+                        continuation,
+                    };
+                }
+                Instruction::JoinFiber => {
+                    let Some(fiber) = continuation.stack.pop() else {
+                        return VmStep::Failed(self.underflow(&located.origin, &continuation));
+                    };
+                    return VmStep::JoinFiber {
+                        fiber,
+                        origin: located.origin,
+                        continuation,
+                    };
+                }
+                Instruction::CancelFiber => {
+                    let Some(fiber) = continuation.stack.pop() else {
+                        return VmStep::Failed(self.underflow(&located.origin, &continuation));
+                    };
+                    return VmStep::CancelFiber {
+                        fiber,
+                        origin: located.origin,
+                        continuation,
+                    };
+                }
                 Instruction::DeferCpu => {
                     let Some(closure) = continuation.stack.pop() else {
                         return VmStep::Failed(self.underflow(&located.origin, &continuation));
@@ -1390,6 +1450,17 @@ impl<'a, H: CapabilityHandler> Interpreter<'a, H> {
                     let values = self.handler.request(&requirement, arguments, &origin)?;
                     validate_host_result(&output, &values, &origin)?;
                     trampoline.resume(continuation, values)
+                }
+                VmStep::SpawnFiber { origin, .. }
+                | VmStep::NextFiber { origin, .. }
+                | VmStep::JoinFiber { origin, .. }
+                | VmStep::CancelFiber { origin, .. } => {
+                    return Err(VmDiagnostic::error(
+                        "E-FIBER-032",
+                        DiagnosticPhase::HostCall,
+                        "producer fibers require the typed runtime event loop",
+                        Some(origin),
+                    ));
                 }
                 VmStep::SpawnCpuFiber { origin, .. } => {
                     return Err(VmDiagnostic::error(
@@ -2222,13 +2293,14 @@ mod tests {
 
     #[test]
     fn every_pure_core_word_has_an_interpreter_implementation() {
-        let vocabulary = core_vocabulary();
-        for (name, signature) in vocabulary {
-            if !signature.effects.is_pure() {
+        for (name, spec) in crate::vm::vocabulary::core_word_registry() {
+            if spec.implementation
+                != crate::vm::vocabulary::CoreWordImplementation::Interpreter
+            {
                 continue;
             }
             let mut stack = Vec::new();
-            if let Err(error) = execute_core(&name, &mut stack) {
+            if let Err(error) = execute_core(name, &mut stack) {
                 assert_ne!(
                     error.code, "E-LINK-004",
                     "pure vocabulary word {name} has no interpreter implementation"

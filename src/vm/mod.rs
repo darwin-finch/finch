@@ -30,8 +30,9 @@ pub use interpreter::{
     VmTrampoline,
 };
 pub use runtime::{
-    EffectJournalEntry, EffectJournalState, PendingHostCall, TypedExecution, TypedExecutionStatus,
-    TypedRuntime, TypedRuntimeCheckpoint, TypedSuspension,
+    EffectJournalEntry, EffectJournalState, PendingHostCall, ProducerFiberRecord,
+    ProducerFiberState, TypedExecution, TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint,
+    TypedSuspension,
 };
 pub use signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
 pub use types::{TaskKind, Type, TypedValue};
@@ -40,8 +41,8 @@ pub use vocabulary::core_vocabulary;
 
 /// Version of the typed VM contract and serialized IR family.
 ///
-/// Version 4 adds typed yield/resume contracts to callable signatures. Old
-/// modules/checkpoints must be rejected and recompiled rather than decoding a
-/// closure while silently erasing its suspension behavior.
-pub const VM_TYPE_SYSTEM_VERSION: u32 = 4;
+/// Version 5 adds first-class `fiber<Y,R>` values, scheduler instructions,
+/// and serializable producer continuation records. Old modules/checkpoints
+/// must be rejected rather than interpreting opaque handles without owners.
+pub const VM_TYPE_SYSTEM_VERSION: u32 = 5;
 pub mod capability;

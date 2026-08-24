@@ -125,6 +125,12 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "proposal-open" => CoreWordDocumentation { summary: "Ask the host to open a human-editable artifact proposal. Approval may execute the edited artifact through its normal validator, return edited text for chat, or cancel; this word does not run a shell itself.", lisp: "(proposal-open language title source)", forth: "language title source proposal-open", example: "(proposal-open \"python\" \"Report\" \"print('hello')\\n\")" },
         "mem-recall" | "mem-store" => CoreWordDocumentation { summary: "Read matching session memory entries or store one text memory entry. Both use the host memory tree and require their respective memory capability.", lisp: "(mem-recall query), (mem-store text)", forth: "query mem-recall; text mem-store", example: "(mem-store \"tested release candidate\")" },
         "agent-spawn" | "agent-await" | "agent-poll" | "agent-cancel" => CoreWordDocumentation { summary: "Create or control a separate typed child-agent task. Agent tasks have their own stack, budget, ancestry, and attenuated grants; they are not fibers or shared-stack threads.", lisp: "(agent-spawn task), (agent-poll handle), (agent-await handle), (agent-cancel handle)", forth: "task agent-spawn; handle agent-poll; handle agent-await; handle agent-cancel", example: "(agent-poll (agent-spawn \"summarize recent test failures\"))" },
+        "defer" => CoreWordDocumentation { summary: "Turn a pure zero-argument yielding closure into a cooperative fiber<Y,R>. The runtime owns its private continuation and runs it only through fiber operations.", lisp: "(defer closure) or (defer :fiber closure)", forth: "['] producer defer", example: "(defer (lambda () (begin (yield 1) 2)))" },
+        "defer-cpu" => CoreWordDocumentation { summary: "Run a pure zero-argument non-producing closure on the bounded native worker pool and return task<R>.", lisp: "(defer :cpu closure) or (defer-cpu closure)", forth: "['] work defer-cpu", example: "(defer :cpu (lambda () (* 6 7)))" },
+        "fiber-next" => CoreWordDocumentation { summary: "Advance one cooperative producer. It returns ok(Y) for a yielded value or err(end(R)) for the terminal return.", lisp: "(fiber-next fiber)", forth: "fiber fiber-next", example: "(match-result (fiber-next producer) (ok value value) (err end end))" },
+        "fiber-join" => CoreWordDocumentation { summary: "Advance a cooperative producer through remaining yields and return its terminal R. It consumes no host thread.", lisp: "(fiber-join fiber)", forth: "fiber fiber-join", example: "producer fiber-join" },
+        "fiber-cancel" => CoreWordDocumentation { summary: "Cancel and consume a cooperative producer handle. The runtime retains a tombstone so later stale-handle use fails deterministically.", lisp: "(fiber-cancel fiber)", forth: "fiber fiber-cancel", example: "producer fiber-cancel" },
+        "task-poll" | "task-join" | "task-cancel" => CoreWordDocumentation { summary: "Inspect, join, or cooperatively cancel a scheduler-owned task<T>. CPU and agent task kinds remain distinct at runtime.", lisp: "(task-poll task), (task-join task), (task-cancel task)", forth: "task task-poll; task task-join; task task-cancel", example: "(task-join (defer :cpu (lambda () 42)))" },
         "yield" => CoreWordDocumentation { summary: "Publish one typed value and suspend the exact VM continuation. Yielding unit is a cooperative timeslice; producer fibers consume other payload types.", lisp: "(yield value); (yield) is unit shorthand", forth: "value yield; use unit yield for a timeslice", example: "(begin (yield 42) (say \"resumed\"))" },
         "unit" => CoreWordDocumentation { summary: "Push the unit value. It is useful when an operation needs an explicit no-information value, including unit yield.", lisp: "nil", forth: "unit", example: "unit yield" },
         "some" | "none" | "is-some" | "unwrap" => CoreWordDocumentation { summary: "Construct, test, or project typed option values. Prefer exhaustive match-option/if-some over unwrap when none is expected control flow.", lisp: "(some value), (none), (is-some option), (unwrap option)", forth: "value some; none; option is-some; option unwrap", example: "(match-option (some 42) (some n (say (int-to-string n))) (none (say \"missing\")))" },
@@ -339,6 +345,90 @@ fn core_signatures() -> Vocabulary {
                 control: ControlEffect::MaySuspend,
                 suspension: Some(SuspensionSignature::one_way(y)),
             },
+        ),
+        (
+            "defer".into(),
+            pure(
+                vec![Type::Function {
+                    arguments: Vec::new(),
+                    result: Box::new(Type::Variable("R".into())),
+                    effects: EffectSet::pure(),
+                    suspension: Some(SuspensionSignature::one_way(Type::Variable("Y".into()))),
+                }],
+                vec![Type::Fiber(
+                    Box::new(Type::Variable("Y".into())),
+                    Box::new(Type::Variable("R".into())),
+                )],
+            ),
+        ),
+        (
+            "defer-cpu".into(),
+            pure(
+                vec![Type::Function {
+                    arguments: Vec::new(),
+                    result: Box::new(Type::Variable("R".into())),
+                    effects: EffectSet::pure(),
+                    // A non-suspending closure is a valid subtype of this
+                    // contract; CPU workers also accept unit timeslices so
+                    // cancellation can be observed at a VM boundary.
+                    suspension: Some(SuspensionSignature::one_way(Type::Unit)),
+                }],
+                vec![Type::Task(Box::new(Type::Variable("R".into())))],
+            ),
+        ),
+        (
+            "fiber-next".into(),
+            pure(
+                vec![Type::Fiber(
+                    Box::new(Type::Variable("Y".into())),
+                    Box::new(Type::Variable("R".into())),
+                )],
+                vec![Type::fiber_step(
+                    Type::Variable("Y".into()),
+                    Type::Variable("R".into()),
+                )],
+            ),
+        ),
+        (
+            "fiber-join".into(),
+            pure(
+                vec![Type::Fiber(
+                    Box::new(Type::Variable("Y".into())),
+                    Box::new(Type::Variable("R".into())),
+                )],
+                vec![Type::Variable("R".into())],
+            ),
+        ),
+        (
+            "fiber-cancel".into(),
+            pure(
+                vec![Type::Fiber(
+                    Box::new(Type::Variable("Y".into())),
+                    Box::new(Type::Variable("R".into())),
+                )],
+                vec![Type::Unit],
+            ),
+        ),
+        (
+            "task-poll".into(),
+            pure(
+                vec![Type::Task(Box::new(Type::Variable("R".into())))],
+                vec![Type::Option(Box::new(Type::Variable("R".into())))],
+            ),
+        ),
+        (
+            "task-join".into(),
+            pure(
+                vec![Type::Task(Box::new(Type::Variable("R".into())))],
+                vec![Type::Variable("R".into())],
+            ),
+        ),
+        (
+            "task-cancel".into(),
+            pure(
+                vec![Type::Task(Box::new(Type::Variable("R".into())))],
+                vec![Type::Unit],
+            ),
         ),
         ("unit".into(), pure(Vec::new(), vec![Type::Unit])),
         (
@@ -996,6 +1086,14 @@ static CORE_WORD_REGISTRY: Lazy<BTreeMap<String, CoreWordSpec>> = Lazy::new(|| {
                 // suspension/output semantics cannot be reimplemented by a
                 // generic host-call path.
                 "yield"
+                | "defer"
+                | "defer-cpu"
+                | "fiber-next"
+                | "fiber-join"
+                | "fiber-cancel"
+                | "task-poll"
+                | "task-join"
+                | "task-cancel"
                 | "output-open"
                 | "output-append"
                 | "output-replace"

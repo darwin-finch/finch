@@ -13,6 +13,7 @@ use crate::runtime::fiber::CpuFiberScheduler;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// One durable, idempotently-addressable host-effect record. `effect` retains
 /// the portable request while `state` records whether the host has merely
@@ -96,6 +97,10 @@ pub struct TypedSuspension {
     pub event_journal: Vec<VmSideEffect>,
     #[serde(default)]
     pub effect_journal: Vec<EffectJournalEntry>,
+    /// Transactional producer state private to this suspended ProgramRun.
+    /// The authoritative runtime registry is unchanged until the run commits.
+    #[serde(default)]
+    pub producer_fibers: BTreeMap<String, ProducerFiberRecord>,
     /// A parent frame blocked on a bounded local CPU-fiber result. This is a
     /// scheduler wait, not a host capability request and never blocks the UI
     /// thread.
@@ -122,6 +127,27 @@ pub struct TypedRuntimeCheckpoint {
     /// version rather than copied into every checkpoint.
     #[serde(default)]
     pub functions: BTreeMap<String, Function>,
+    /// Cooperative producer continuations are VM state rather than host
+    /// resources, so they survive the same checkpoint as their opaque handles.
+    #[serde(default)]
+    pub producer_fibers: BTreeMap<String, ProducerFiberRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ProducerFiberState {
+    Ready { continuation: VmContinuation },
+    Completed { result: TypedValue },
+    Failed { diagnostic: VmDiagnostic },
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProducerFiberRecord {
+    pub module: VerifiedModule,
+    pub yield_type: Type,
+    pub result_type: Type,
+    pub state: ProducerFiberState,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -163,6 +189,7 @@ pub struct TypedRuntime {
     functions: BTreeMap<String, Function>,
     grants: EffectSet,
     cpu_fibers: Arc<CpuFiberScheduler>,
+    producer_fibers: BTreeMap<String, ProducerFiberRecord>,
 }
 
 impl Default for TypedRuntime {
@@ -193,6 +220,7 @@ impl TypedRuntime {
                 std::thread::available_parallelism()
                     .map_or(1, |parallelism| parallelism.get().saturating_sub(1).max(1)),
             )),
+            producer_fibers: BTreeMap::new(),
         }
     }
 
@@ -214,11 +242,16 @@ impl TypedRuntime {
     pub fn checkpoint(&self) -> Result<TypedRuntimeCheckpoint, VmDiagnostic> {
         for value in &self.stack {
             ensure_checkpointable(value)?;
+            validate_fiber_handle(value, &self.producer_fibers)?;
+        }
+        for record in self.producer_fibers.values() {
+            validate_producer_record(record, &self.producer_fibers)?;
         }
         Ok(TypedRuntimeCheckpoint {
             version: VM_TYPE_SYSTEM_VERSION,
             stack: self.stack.clone(),
             functions: self.functions.clone(),
+            producer_fibers: self.producer_fibers.clone(),
         })
     }
 
@@ -240,6 +273,23 @@ impl TypedRuntime {
         }
         for value in &checkpoint.stack {
             if let Err(diagnostic) = ensure_checkpointable(value) {
+                return Err(vec![diagnostic]);
+            }
+            if let Err(diagnostic) = validate_fiber_handle(value, &checkpoint.producer_fibers) {
+                return Err(vec![diagnostic]);
+            }
+        }
+        for (id, fiber) in &checkpoint.producer_fibers {
+            if fiber.module.module.version != VM_TYPE_SYSTEM_VERSION {
+                return Err(vec![VmDiagnostic::error(
+                    "E-CHECKPOINT-005",
+                    DiagnosticPhase::Linking,
+                    format!("producer fiber {id} uses an obsolete VM version"),
+                    None,
+                )]);
+            }
+            Verifier::new(&core_vocabulary()).verify(fiber.module.module.clone())?;
+            if let Err(diagnostic) = validate_producer_record(fiber, &checkpoint.producer_fibers) {
                 return Err(vec![diagnostic]);
             }
         }
@@ -271,6 +321,7 @@ impl TypedRuntime {
         runtime.stack = checkpoint.stack;
         runtime.vocabulary = vocabulary;
         runtime.functions = checkpoint.functions;
+        runtime.producer_fibers = checkpoint.producer_fibers;
         Ok(runtime)
     }
 
@@ -394,7 +445,9 @@ impl TypedRuntime {
             Ok(continuation) => continuation,
             Err(diagnostic) => return TypedExecution::failed(vec![diagnostic]),
         };
-        self.drive(module, continuation, handler)
+        let baseline = self.producer_fibers.clone();
+        let execution = self.drive(module, continuation, handler);
+        self.finish_producer_transaction(execution, baseline)
     }
 
     /// Continue a previously returned VM boundary. Callers retain this token
@@ -434,6 +487,24 @@ impl TypedRuntime {
         external_effect_result: Option<(u64, Vec<TypedValue>)>,
         handler: &mut H,
     ) -> TypedExecution {
+        let baseline = self.producer_fibers.clone();
+        self.producer_fibers = suspension.producer_fibers.clone();
+        let execution = self.resume_with_handler_working(
+            suspension,
+            values,
+            external_effect_result,
+            handler,
+        );
+        self.finish_producer_transaction(execution, baseline)
+    }
+
+    fn resume_with_handler_working<H: CapabilityHandler>(
+        &mut self,
+        suspension: TypedSuspension,
+        values: Vec<TypedValue>,
+        external_effect_result: Option<(u64, Vec<TypedValue>)>,
+        handler: &mut H,
+    ) -> TypedExecution {
         let TypedSuspension {
             module,
             continuation,
@@ -443,6 +514,7 @@ impl TypedRuntime {
             event_journal,
             mut effect_journal,
             pending_cpu_fiber,
+            producer_fibers: _,
         } = suspension;
         let values = if let Some(pending_cpu_fiber) = pending_cpu_fiber {
             if external_effect_result.is_some() {
@@ -661,6 +733,7 @@ impl TypedRuntime {
                 effects,
                 event_journal,
                 effect_journal,
+                producer_fibers: BTreeMap::new(),
                 pending_cpu_fiber: None,
                 pending_host_call: Some(call),
             }),
@@ -800,6 +873,7 @@ impl TypedRuntime {
                                 effects,
                                 event_journal,
                                 effect_journal,
+                                producer_fibers: BTreeMap::new(),
                                 pending_cpu_fiber: None,
                                 pending_host_call: Some(PendingHostCall {
                                     requirement: requirement.clone(),
@@ -831,6 +905,7 @@ impl TypedRuntime {
                                 effects,
                                 event_journal,
                                 effect_journal,
+                                producer_fibers: BTreeMap::new(),
                                 pending_cpu_fiber: None,
                                 pending_host_call: Some(PendingHostCall {
                                     requirement,
@@ -868,6 +943,112 @@ impl TypedRuntime {
                         },
                     );
                     trampoline.resume(continuation, values)
+                }
+                VmStep::SpawnFiber {
+                    closure,
+                    origin,
+                    continuation,
+                } => {
+                    let handle = match self.spawn_producer_fiber(
+                        module.clone(),
+                        closure,
+                        continuation.fuel,
+                        &origin,
+                    ) {
+                        Ok(handle) => handle,
+                        Err(diagnostic) => {
+                            return self.failed_from_drive(
+                                effects,
+                                diagnostic,
+                                event_journal,
+                                effect_journal,
+                                handler,
+                            )
+                        }
+                    };
+                    let trampoline = VmTrampoline::new(
+                        &module,
+                        &InterpreterConfig {
+                            fuel: continuation.fuel,
+                            grants: self.grants.clone(),
+                        },
+                    );
+                    trampoline.resume(continuation, vec![handle])
+                }
+                VmStep::NextFiber {
+                    fiber,
+                    origin,
+                    continuation,
+                } => {
+                    let value = match self.advance_producer_fiber(&fiber, false, &origin) {
+                        Ok(value) => value,
+                        Err(diagnostic) => {
+                            return self.failed_from_drive(
+                                effects,
+                                diagnostic,
+                                event_journal,
+                                effect_journal,
+                                handler,
+                            )
+                        }
+                    };
+                    let trampoline = VmTrampoline::new(
+                        &module,
+                        &InterpreterConfig {
+                            fuel: continuation.fuel,
+                            grants: self.grants.clone(),
+                        },
+                    );
+                    trampoline.resume(continuation, vec![value])
+                }
+                VmStep::JoinFiber {
+                    fiber,
+                    origin,
+                    continuation,
+                } => {
+                    let value = match self.advance_producer_fiber(&fiber, true, &origin) {
+                        Ok(value) => value,
+                        Err(diagnostic) => {
+                            return self.failed_from_drive(
+                                effects,
+                                diagnostic,
+                                event_journal,
+                                effect_journal,
+                                handler,
+                            )
+                        }
+                    };
+                    let trampoline = VmTrampoline::new(
+                        &module,
+                        &InterpreterConfig {
+                            fuel: continuation.fuel,
+                            grants: self.grants.clone(),
+                        },
+                    );
+                    trampoline.resume(continuation, vec![value])
+                }
+                VmStep::CancelFiber {
+                    fiber,
+                    origin,
+                    continuation,
+                } => {
+                    if let Err(diagnostic) = self.cancel_producer_fiber(&fiber, &origin) {
+                        return self.failed_from_drive(
+                            effects,
+                            diagnostic,
+                            event_journal,
+                            effect_journal,
+                            handler,
+                        );
+                    }
+                    let trampoline = VmTrampoline::new(
+                        &module,
+                        &InterpreterConfig {
+                            fuel: continuation.fuel,
+                            grants: self.grants.clone(),
+                        },
+                    );
+                    trampoline.resume(continuation, vec![TypedValue::Unit])
                 }
                 VmStep::SpawnCpuFiber {
                     closure,
@@ -1081,6 +1262,7 @@ impl TypedRuntime {
                 effects,
                 event_journal,
                 effect_journal,
+                producer_fibers: BTreeMap::new(),
                 pending_cpu_fiber: None,
                 pending_host_call: None,
             }),
@@ -1114,10 +1296,292 @@ impl TypedRuntime {
                 effects,
                 event_journal,
                 effect_journal,
+                producer_fibers: BTreeMap::new(),
                 pending_cpu_fiber: Some(pending_cpu_fiber),
                 pending_host_call: None,
             }),
         }
+    }
+
+    fn finish_producer_transaction(
+        &mut self,
+        mut execution: TypedExecution,
+        baseline: BTreeMap<String, ProducerFiberRecord>,
+    ) -> TypedExecution {
+        if execution.status == TypedExecutionStatus::Completed {
+            return execution;
+        }
+        let working = std::mem::replace(&mut self.producer_fibers, baseline);
+        if let Some(suspension) = execution.suspension.as_mut() {
+            suspension.producer_fibers = working;
+        }
+        execution
+    }
+
+    fn spawn_producer_fiber(
+        &mut self,
+        module: VerifiedModule,
+        closure: TypedValue,
+        fuel: u64,
+        origin: &SourceOrigin,
+    ) -> Result<TypedValue, VmDiagnostic> {
+        let TypedValue::Closure {
+            function,
+            captures,
+            signature,
+        } = closure
+        else {
+            return Err(VmDiagnostic::error(
+                "E-FIBER-021",
+                DiagnosticPhase::Interpretation,
+                "defer requires a typed yielding closure",
+                Some(origin.clone()),
+            ));
+        };
+        let Some(suspension) = &signature.suspension else {
+            return Err(VmDiagnostic::error(
+                "E-FIBER-021",
+                DiagnosticPhase::Interpretation,
+                "defer requires a closure with a declared yield contract",
+                Some(origin.clone()),
+            ));
+        };
+        if !signature.input.values.is_empty() || !signature.effects.is_pure() {
+            return Err(VmDiagnostic::error(
+                "E-FIBER-022",
+                DiagnosticPhase::Interpretation,
+                "cooperative defer requires a pure zero-argument closure",
+                Some(origin.clone()),
+            ));
+        }
+        if *suspension.resume_type != Type::Unit {
+            return Err(VmDiagnostic::error(
+                "E-FIBER-023",
+                DiagnosticPhase::Interpretation,
+                "this runtime version supports only unit-resumed producer fibers",
+                Some(origin.clone()),
+            ));
+        }
+        for capture in &captures {
+            ensure_checkpointable(capture)?;
+            validate_fiber_handle(capture, &self.producer_fibers)?;
+        }
+        let result_type = signature
+            .output
+            .values
+            .last()
+            .cloned()
+            .unwrap_or(Type::Unit);
+        let yield_type = (*suspension.yield_type).clone();
+        let trampoline = VmTrampoline::new(
+            &module,
+            &InterpreterConfig {
+                fuel,
+                grants: EffectSet::pure(),
+            },
+        );
+        let continuation = trampoline.start_function(&function, captures, Vec::new())?;
+        let id = Uuid::new_v4().to_string();
+        self.producer_fibers.insert(
+            id.clone(),
+            ProducerFiberRecord {
+                module,
+                yield_type: yield_type.clone(),
+                result_type: result_type.clone(),
+                state: ProducerFiberState::Ready { continuation },
+            },
+        );
+        Ok(TypedValue::Fiber {
+            id,
+            yield_type,
+            result_type,
+        })
+    }
+
+    fn advance_producer_fiber(
+        &mut self,
+        fiber: &TypedValue,
+        join: bool,
+        origin: &SourceOrigin,
+    ) -> Result<TypedValue, VmDiagnostic> {
+        let TypedValue::Fiber {
+            id,
+            yield_type,
+            result_type,
+        } = fiber
+        else {
+            return Err(VmDiagnostic::error(
+                if join { "E-FIBER-025" } else { "E-FIBER-024" },
+                DiagnosticPhase::Interpretation,
+                "producer operation requires fiber<Y,R>",
+                Some(origin.clone()),
+            ));
+        };
+        let mut record = self.producer_fibers.get(id).cloned().ok_or_else(|| {
+            VmDiagnostic::error(
+                "E-FIBER-027",
+                DiagnosticPhase::Interpretation,
+                format!("unknown producer fiber {id}"),
+                Some(origin.clone()),
+            )
+        })?;
+        if &record.yield_type != yield_type || &record.result_type != result_type {
+            return Err(VmDiagnostic::error(
+                "E-FIBER-028",
+                DiagnosticPhase::Interpretation,
+                "fiber handle types do not match its runtime record",
+                Some(origin.clone()),
+            ));
+        }
+        let mut continuation = match record.state.clone() {
+            ProducerFiberState::Ready { continuation } => continuation,
+            ProducerFiberState::Completed { result } => {
+                return Ok(if join {
+                    result
+                } else {
+                    fiber_returned(yield_type.clone(), result_type.clone(), result)
+                });
+            }
+            ProducerFiberState::Failed { diagnostic } => return Err(diagnostic),
+            ProducerFiberState::Cancelled => {
+                return Err(VmDiagnostic::error(
+                    "E-FIBER-029",
+                    DiagnosticPhase::Interpretation,
+                    "producer fiber was cancelled",
+                    Some(origin.clone()),
+                ));
+            }
+        };
+
+        loop {
+            let trampoline = VmTrampoline::new(
+                &record.module,
+                &InterpreterConfig {
+                    fuel: continuation.fuel,
+                    grants: EffectSet::pure(),
+                },
+            );
+            match trampoline.run(continuation) {
+                VmStep::Yielded {
+                    value,
+                    continuation: next,
+                } => {
+                    let found = value.value_type();
+                    if !yield_type.accepts(&found) {
+                        let diagnostic = VmDiagnostic::type_mismatch(
+                            yield_type.clone(),
+                            found,
+                            Some(origin.clone()),
+                        );
+                        record.state = ProducerFiberState::Failed {
+                            diagnostic: diagnostic.clone(),
+                        };
+                        self.producer_fibers.insert(id.clone(), record);
+                        return Err(diagnostic);
+                    }
+                    if join {
+                        continuation = next;
+                        continue;
+                    }
+                    record.state = ProducerFiberState::Ready { continuation: next };
+                    self.producer_fibers.insert(id.clone(), record);
+                    return Ok(fiber_yielded(
+                        yield_type.clone(),
+                        result_type.clone(),
+                        value,
+                    ));
+                }
+                VmStep::Complete { mut stack } => {
+                    if stack.len() != 1 {
+                        let diagnostic = VmDiagnostic::error(
+                            "E-FIBER-030",
+                            DiagnosticPhase::Interpretation,
+                            format!(
+                                "producer terminal frame returned {} values; expected one",
+                                stack.len()
+                            ),
+                            Some(origin.clone()),
+                        );
+                        record.state = ProducerFiberState::Failed {
+                            diagnostic: diagnostic.clone(),
+                        };
+                        self.producer_fibers.insert(id.clone(), record);
+                        return Err(diagnostic);
+                    }
+                    let result = stack.remove(0);
+                    let found = result.value_type();
+                    if !result_type.accepts(&found) {
+                        let diagnostic = VmDiagnostic::type_mismatch(
+                            result_type.clone(),
+                            found,
+                            Some(origin.clone()),
+                        );
+                        record.state = ProducerFiberState::Failed {
+                            diagnostic: diagnostic.clone(),
+                        };
+                        self.producer_fibers.insert(id.clone(), record);
+                        return Err(diagnostic);
+                    }
+                    record.state = ProducerFiberState::Completed {
+                        result: result.clone(),
+                    };
+                    self.producer_fibers.insert(id.clone(), record);
+                    return Ok(if join {
+                        result
+                    } else {
+                        fiber_returned(yield_type.clone(), result_type.clone(), result)
+                    });
+                }
+                VmStep::Failed(diagnostic) => {
+                    record.state = ProducerFiberState::Failed {
+                        diagnostic: diagnostic.clone(),
+                    };
+                    self.producer_fibers.insert(id.clone(), record);
+                    return Err(diagnostic);
+                }
+                step => {
+                    let diagnostic = VmDiagnostic::error(
+                        "E-FIBER-031",
+                        DiagnosticPhase::HostCall,
+                        format!(
+                            "pure producer reached unsupported scheduler boundary {}",
+                            producer_step_name(&step)
+                        ),
+                        Some(origin.clone()),
+                    );
+                    record.state = ProducerFiberState::Failed {
+                        diagnostic: diagnostic.clone(),
+                    };
+                    self.producer_fibers.insert(id.clone(), record);
+                    return Err(diagnostic);
+                }
+            }
+        }
+    }
+
+    fn cancel_producer_fiber(
+        &mut self,
+        fiber: &TypedValue,
+        origin: &SourceOrigin,
+    ) -> Result<(), VmDiagnostic> {
+        let TypedValue::Fiber { id, .. } = fiber else {
+            return Err(VmDiagnostic::error(
+                "E-FIBER-026",
+                DiagnosticPhase::Interpretation,
+                "fiber-cancel requires fiber<Y,R>",
+                Some(origin.clone()),
+            ));
+        };
+        let Some(record) = self.producer_fibers.get_mut(id) else {
+            return Err(VmDiagnostic::error(
+                "E-FIBER-027",
+                DiagnosticPhase::Interpretation,
+                format!("unknown producer fiber {id}"),
+                Some(origin.clone()),
+            ));
+        };
+        record.state = ProducerFiberState::Cancelled;
+        Ok(())
     }
 
     /// Return `None` while the worker is running, or the single typed terminal
@@ -1297,6 +1761,167 @@ impl TypedRuntime {
     }
 }
 
+fn fiber_end_type(result_type: Type) -> Type {
+    Type::Variant(vec![("end".into(), Some(result_type))])
+}
+
+fn fiber_yielded(
+    yield_type: Type,
+    result_type: Type,
+    value: TypedValue,
+) -> TypedValue {
+    TypedValue::Result {
+        ok_type: yield_type,
+        error_type: fiber_end_type(result_type),
+        is_ok: true,
+        value: Box::new(value),
+    }
+}
+
+fn fiber_returned(
+    yield_type: Type,
+    result_type: Type,
+    value: TypedValue,
+) -> TypedValue {
+    let error_type = fiber_end_type(result_type);
+    TypedValue::Result {
+        ok_type: yield_type,
+        error_type,
+        is_ok: false,
+        value: Box::new(TypedValue::Variant {
+            name: "end".into(),
+            value: Some(Box::new(value)),
+        }),
+    }
+}
+
+fn producer_step_name(step: &VmStep) -> &'static str {
+    match step {
+        VmStep::Yielded { .. } => "yield",
+        VmStep::Emit { .. } => "emit",
+        VmStep::Await { .. } => "await",
+        VmStep::SpawnFiber { .. } => "defer",
+        VmStep::NextFiber { .. } => "fiber-next",
+        VmStep::JoinFiber { .. } => "fiber-join",
+        VmStep::CancelFiber { .. } => "fiber-cancel",
+        VmStep::SpawnCpuFiber { .. } => "defer-cpu",
+        VmStep::PollCpuFiber { .. } => "task-poll",
+        VmStep::JoinCpuFiber { .. } => "task-join",
+        VmStep::CancelCpuFiber { .. } => "task-cancel",
+        VmStep::Complete { .. } => "return",
+        VmStep::Failed(_) => "failure",
+    }
+}
+
+fn validate_producer_record(
+    record: &ProducerFiberRecord,
+    registry: &BTreeMap<String, ProducerFiberRecord>,
+) -> Result<(), VmDiagnostic> {
+    match &record.state {
+        ProducerFiberState::Ready { continuation } => {
+            for value in &continuation.stack {
+                ensure_checkpointable(value)?;
+                validate_fiber_handle(value, registry)?;
+            }
+            for frame in &continuation.frames {
+                for value in frame.locals.iter().chain(&frame.captures) {
+                    ensure_checkpointable(value)?;
+                    validate_fiber_handle(value, registry)?;
+                }
+            }
+        }
+        ProducerFiberState::Completed { result } => {
+            ensure_checkpointable(result)?;
+            validate_fiber_handle(result, registry)?;
+            let found = result.value_type();
+            if !record.result_type.accepts(&found) {
+                return Err(VmDiagnostic::type_mismatch(
+                    record.result_type.clone(),
+                    found,
+                    None,
+                ));
+            }
+        }
+        ProducerFiberState::Failed { .. } | ProducerFiberState::Cancelled => {}
+    }
+    Ok(())
+}
+
+fn validate_fiber_handle(
+    value: &TypedValue,
+    registry: &BTreeMap<String, ProducerFiberRecord>,
+) -> Result<(), VmDiagnostic> {
+    match value {
+        TypedValue::Fiber {
+            id,
+            yield_type,
+            result_type,
+        } => {
+            let record = registry.get(id).ok_or_else(|| {
+                VmDiagnostic::error(
+                    "E-CHECKPOINT-006",
+                    DiagnosticPhase::Linking,
+                    format!("checkpoint contains an unknown producer fiber handle {id}"),
+                    None,
+                )
+            })?;
+            if &record.yield_type != yield_type || &record.result_type != result_type {
+                return Err(VmDiagnostic::error(
+                    "E-CHECKPOINT-007",
+                    DiagnosticPhase::Linking,
+                    format!("producer fiber handle {id} has inconsistent types"),
+                    None,
+                ));
+            }
+        }
+        TypedValue::List { values, .. } => {
+            for value in values {
+                validate_fiber_handle(value, registry)?;
+            }
+        }
+        TypedValue::Map { entries, .. } => {
+            for (key, value) in entries {
+                validate_fiber_handle(key, registry)?;
+                validate_fiber_handle(value, registry)?;
+            }
+        }
+        TypedValue::Option { value, .. }
+        | TypedValue::Variant { value, .. } => {
+            if let Some(value) = value {
+                validate_fiber_handle(value, registry)?;
+            }
+        }
+        TypedValue::Result { value, .. } | TypedValue::Dynamic { value, .. } => {
+            validate_fiber_handle(value, registry)?;
+        }
+        TypedValue::Record(fields) => {
+            for (_, value) in fields {
+                validate_fiber_handle(value, registry)?;
+            }
+        }
+        TypedValue::Closure { captures, .. } => {
+            for value in captures {
+                validate_fiber_handle(value, registry)?;
+            }
+        }
+        TypedValue::Unit
+        | TypedValue::Bool(_)
+        | TypedValue::Int(_)
+        | TypedValue::UInt(_)
+        | TypedValue::Float(_)
+        | TypedValue::Char(_)
+        | TypedValue::Symbol(_)
+        | TypedValue::String(_)
+        | TypedValue::Bytes(_)
+        | TypedValue::Json(_)
+        | TypedValue::Path { .. }
+        | TypedValue::Task { .. }
+        | TypedValue::Stream { .. }
+        | TypedValue::Resource { .. } => {}
+    }
+    Ok(())
+}
+
 fn ensure_checkpointable(value: &TypedValue) -> Result<(), VmDiagnostic> {
     match value {
         TypedValue::List { values, .. } => {
@@ -1343,6 +1968,7 @@ fn ensure_checkpointable(value: &TypedValue) -> Result<(), VmDiagnostic> {
                 None,
             ));
         }
+        TypedValue::Fiber { .. } => {}
         TypedValue::Stream { .. } | TypedValue::Resource { .. } => {
             return Err(VmDiagnostic::error(
                 "E-CHECKPOINT-003",
@@ -2136,6 +2762,225 @@ mod tests {
             crate::runtime::fiber::CpuFiberStatus::Completed
         );
         assert_eq!(result.result, Some(vec![TypedValue::Int(42)]));
+    }
+
+    #[test]
+    fn cooperative_fiber_yields_repeatedly_then_returns() {
+        let mut runtime = TypedRuntime::new();
+        let execution = runtime.execute(
+            ProgramLanguage::Lisp,
+            "producer.lisp",
+            "(let ((fiber (defer (lambda () (begin (yield 3) (yield 5) 8))))) \
+             (list (fiber-next fiber) (fiber-next fiber) (fiber-next fiber)))",
+            5_000,
+        );
+        assert_eq!(
+            execution.status,
+            TypedExecutionStatus::Completed,
+            "{:?}",
+            execution.diagnostics
+        );
+        let [TypedValue::List { values, .. }] = execution.values.as_slice() else {
+            panic!("three producer steps must be returned as one typed list");
+        };
+        assert!(matches!(
+            values.as_slice(),
+            [
+                TypedValue::Result { is_ok: true, value: first, .. },
+                TypedValue::Result { is_ok: true, value: second, .. },
+                TypedValue::Result { is_ok: false, value: end, .. },
+            ] if **first == TypedValue::Int(3)
+                && **second == TypedValue::Int(5)
+                && matches!(&**end, TypedValue::Variant { name, value: Some(value) }
+                    if name == "end" && **value == TypedValue::Int(8))
+        ));
+    }
+
+    #[test]
+    fn cooperative_fiber_join_discards_yields_and_returns_terminal_value() {
+        let mut runtime = TypedRuntime::new();
+        let execution = runtime.execute(
+            ProgramLanguage::Lisp,
+            "join.lisp",
+            "(fiber-join (defer (lambda () (begin (yield 1) (yield 2) 42))))",
+            5_000,
+        );
+        assert_eq!(execution.status, TypedExecutionStatus::Completed);
+        assert_eq!(execution.values, vec![TypedValue::Int(42)]);
+    }
+
+    #[test]
+    fn cooperative_fiber_handle_and_continuation_survive_checkpoint() {
+        let mut runtime = TypedRuntime::new();
+        let deferred = runtime.execute(
+            ProgramLanguage::Lisp,
+            "persist.lisp",
+            "(defer (lambda () (begin (yield 7) 9)))",
+            5_000,
+        );
+        assert_eq!(deferred.status, TypedExecutionStatus::Completed);
+        assert!(matches!(deferred.values.as_slice(), [TypedValue::Fiber { .. }]));
+
+        let checkpoint = runtime.checkpoint().expect("producer is VM-checkpointable");
+        let mut restored = TypedRuntime::from_checkpoint(checkpoint)
+            .expect("producer module and continuation reverify");
+        let next = restored.execute(
+            ProgramLanguage::Forth,
+            "next.forth",
+            "dup fiber-next",
+            5_000,
+        );
+        assert_eq!(next.status, TypedExecutionStatus::Completed);
+        assert!(matches!(
+            next.values.as_slice(),
+            [TypedValue::Fiber { .. }, TypedValue::Result { is_ok: true, value, .. }]
+                if **value == TypedValue::Int(7)
+        ));
+    }
+
+    #[test]
+    fn coforth_can_defer_and_advance_the_same_producer_protocol() {
+        let mut runtime = TypedRuntime::new();
+        let execution = runtime.execute(
+            ProgramLanguage::Forth,
+            "producer.forth",
+            ": producer ( S -- S int ! infer ) 4 yield 6 ; \
+             ['] producer defer dup fiber-next",
+            5_000,
+        );
+        assert_eq!(
+            execution.status,
+            TypedExecutionStatus::Completed,
+            "{:?}",
+            execution.diagnostics
+        );
+        assert!(matches!(
+            execution.values.as_slice(),
+            [TypedValue::Fiber { .. }, TypedValue::Result { is_ok: true, value, .. }]
+                if **value == TypedValue::Int(4)
+        ));
+    }
+
+    #[test]
+    fn failed_program_rolls_back_a_producer_advance() {
+        let mut runtime = TypedRuntime::new();
+        let deferred = runtime.execute(
+            ProgramLanguage::Lisp,
+            "rollback.lisp",
+            "(defer (lambda () (begin (yield 7) 9)))",
+            5_000,
+        );
+        assert_eq!(deferred.status, TypedExecutionStatus::Completed);
+
+        let failed = runtime.execute(
+            ProgramLanguage::Forth,
+            "failed-next.forth",
+            "dup fiber-next drop 1 0 /",
+            5_000,
+        );
+        assert_eq!(failed.status, TypedExecutionStatus::Failed);
+        assert!(matches!(runtime.stack(), [TypedValue::Fiber { .. }]));
+
+        let retried = runtime.execute(
+            ProgramLanguage::Forth,
+            "retry-next.forth",
+            "dup fiber-next",
+            5_000,
+        );
+        assert_eq!(retried.status, TypedExecutionStatus::Completed);
+        assert!(matches!(
+            retried.values.as_slice(),
+            [TypedValue::Fiber { .. }, TypedValue::Result { is_ok: true, value, .. }]
+                if **value == TypedValue::Int(7)
+        ));
+    }
+
+    #[test]
+    fn cancelled_producer_reports_a_stable_error_on_later_use() {
+        let mut runtime = TypedRuntime::new();
+        let deferred = runtime.execute(
+            ProgramLanguage::Lisp,
+            "cancel.lisp",
+            "(defer (lambda () (begin (yield 7) 9)))",
+            5_000,
+        );
+        assert_eq!(deferred.status, TypedExecutionStatus::Completed);
+
+        let cancelled = runtime.execute(
+            ProgramLanguage::Forth,
+            "cancel.forth",
+            "dup fiber-cancel drop",
+            5_000,
+        );
+        assert_eq!(cancelled.status, TypedExecutionStatus::Completed);
+        assert!(matches!(runtime.stack(), [TypedValue::Fiber { .. }]));
+
+        let next = runtime.execute(
+            ProgramLanguage::Forth,
+            "cancelled-next.forth",
+            "dup fiber-next",
+            5_000,
+        );
+        assert_eq!(next.status, TypedExecutionStatus::Failed);
+        assert_eq!(next.diagnostics[0].code, "E-FIBER-029");
+    }
+
+    #[test]
+    fn outer_suspension_carries_uncommitted_producer_state() {
+        let mut runtime = TypedRuntime::new();
+        let suspended = runtime.execute(
+            ProgramLanguage::Lisp,
+            "outer-yield.lisp",
+            "(let ((fiber (defer (lambda () (begin (yield 11) 13))))) \
+             (begin (yield) fiber))",
+            5_000,
+        );
+        assert_eq!(suspended.status, TypedExecutionStatus::Suspended);
+        assert!(runtime.stack().is_empty());
+        assert!(runtime.producer_fibers.is_empty());
+        let suspension = suspended.suspension.expect("saved outer continuation");
+        assert_eq!(suspension.producer_fibers.len(), 1);
+
+        let mut host = RuntimeCapabilities::default();
+        let resumed = runtime.resume_with_handler(suspension, Vec::new(), &mut host);
+        assert_eq!(resumed.status, TypedExecutionStatus::Completed);
+        assert!(matches!(resumed.values.as_slice(), [TypedValue::Fiber { .. }]));
+        assert_eq!(runtime.producer_fibers.len(), 1);
+
+        let next = runtime.execute(
+            ProgramLanguage::Forth,
+            "outer-next.forth",
+            "dup fiber-next",
+            5_000,
+        );
+        assert_eq!(next.status, TypedExecutionStatus::Completed);
+        assert!(matches!(
+            next.values.as_slice(),
+            [TypedValue::Fiber { .. }, TypedValue::Result { is_ok: true, value, .. }]
+                if **value == TypedValue::Int(11)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_rejects_a_forged_producer_handle() {
+        let mut runtime = TypedRuntime::new();
+        let execution = runtime.execute(
+            ProgramLanguage::Lisp,
+            "forged.lisp",
+            "(defer (lambda () (begin (yield 1) 2)))",
+            5_000,
+        );
+        assert_eq!(execution.status, TypedExecutionStatus::Completed);
+        let mut checkpoint = runtime.checkpoint().unwrap();
+        let [TypedValue::Fiber { id, .. }] = checkpoint.stack.as_mut_slice() else {
+            panic!("checkpoint contains one producer handle");
+        };
+        *id = Uuid::new_v4().to_string();
+        let errors = match TypedRuntime::from_checkpoint(checkpoint) {
+            Ok(_) => panic!("opaque fiber IDs must have matching serialized records"),
+            Err(errors) => errors,
+        };
+        assert_eq!(errors[0].code, "E-CHECKPOINT-006");
     }
 
     #[test]

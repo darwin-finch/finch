@@ -1030,6 +1030,24 @@ impl Compiler<'_> {
                 source_children.as_deref().and_then(|children| children.get(1..)),
                 builder,
             ),
+            "fiber-next" => self.compile_fiber_operation(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+                "fiber-next",
+            ),
+            "fiber-join" => self.compile_fiber_operation(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+                "fiber-join",
+            ),
+            "fiber-cancel" => self.compile_fiber_operation(
+                &items[1..],
+                source_children.as_deref().and_then(|children| children.get(1..)),
+                builder,
+                "fiber-cancel",
+            ),
             "list" => self.compile_list_value(&items[1..], builder),
             "empty-list" => self.compile_empty_list(&items[1..], builder),
             "map" => self.compile_map_value(&items[1..], builder),
@@ -1129,7 +1147,7 @@ impl Compiler<'_> {
             arguments,
             result,
             effects,
-            ..
+            suspension,
         } = closure_type
         else {
             return Err(vec![
@@ -1147,25 +1165,82 @@ impl Compiler<'_> {
                 self.error("E-FIBER-005", "defer-cpu requires a pure closure")
             ]);
         }
+        if let Some(suspension) = suspension {
+            if *suspension.yield_type != Type::Unit
+                || *suspension.resume_type != Type::Unit
+            {
+                return Err(vec![self.error(
+                    "E-YIELD-003",
+                    "CPU tasks may yield only unit timeslices; use defer for produced values",
+                )]);
+            }
+        }
         builder.stack.pop();
         builder.emit(Instruction::DeferCpu, self.origin("defer-cpu"));
         Ok(Type::Task(result))
     }
 
-    /// User-facing deferred-work form. Modes deliberately remain explicit so
-    /// an LLM chooses CPU work rather than accidentally treating an I/O wait
-    /// as a native thread. `:cpu` is the first supported mode; cooperative
-    /// and agent modes will lower to different scheduler instructions.
+    fn compile_defer_fiber(
+        &mut self,
+        expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        if expressions.len() != 1 {
+            return Err(vec![self.error(
+                "E-FIBER-021",
+                "defer requires exactly one zero-argument yielding closure",
+            )]);
+        }
+        let closure_type = self.compile_expression_at(
+            &expressions[0],
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )?;
+        let Type::Function {
+            arguments,
+            result,
+            effects,
+            suspension: Some(suspension),
+        } = closure_type
+        else {
+            return Err(vec![self.error(
+                "E-FIBER-021",
+                "defer requires a typed yielding closure; use defer :cpu for terminal CPU work",
+            )]);
+        };
+        if !arguments.is_empty() || !effects.is_pure() {
+            return Err(vec![self.error(
+                "E-FIBER-022",
+                "cooperative defer requires a pure zero-argument closure",
+            )]);
+        }
+        if *suspension.resume_type != Type::Unit {
+            return Err(vec![self.error(
+                "E-FIBER-023",
+                "this runtime version supports only unit-resumed producer fibers",
+            )]);
+        }
+        builder.stack.pop();
+        builder.emit(Instruction::DeferFiber, self.origin("defer"));
+        Ok(Type::Fiber(suspension.yield_type, result))
+    }
+
+    /// User-facing deferred-work form. Omitting a mode creates a cooperative
+    /// producer; `:cpu` explicitly requests the bounded native worker pool.
     fn compile_defer(
         &mut self,
         expressions: &[Val],
         expression_sources: Option<&[SpannedVal]>,
         builder: &mut FunctionBuilder,
     ) -> Result<Type, Vec<VmDiagnostic>> {
+        if expressions.len() == 1 {
+            return self.compile_defer_fiber(expressions, expression_sources, builder);
+        }
         if expressions.len() != 2 {
             return Err(vec![self.error(
                 "E-FIBER-003",
-                "defer requires a mode and exactly one closure",
+                "defer requires one closure, optionally preceded by :fiber or :cpu",
             )]);
         }
         match &expressions[0] {
@@ -1176,15 +1251,58 @@ impl Compiler<'_> {
                     builder,
                 )
             }
+            Val::Symbol(mode) if mode == ":fiber" => self.compile_defer_fiber(
+                &expressions[1..],
+                expression_sources.and_then(|sources| sources.get(1..)),
+                builder,
+            ),
             Val::Symbol(mode) => Err(vec![self.error(
                 "E-FIBER-019",
-                format!("unsupported defer mode '{mode}'; supported modes: :cpu"),
+                format!("unsupported defer mode '{mode}'; supported modes: :fiber, :cpu"),
             )]),
             _ => Err(vec![self.error(
                 "E-FIBER-019",
-                "defer mode must be a symbol such as :cpu",
+                "defer mode must be a symbol such as :fiber or :cpu",
             )]),
         }
+    }
+
+    fn compile_fiber_operation(
+        &mut self,
+        expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
+        builder: &mut FunctionBuilder,
+        operation: &str,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        if expressions.len() != 1 {
+            return Err(vec![self.error(
+                "E-FIBER-024",
+                format!("{operation} requires exactly one fiber<Y,R>"),
+            )]);
+        }
+        let fiber_type = self.compile_expression_at(
+            &expressions[0],
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )?;
+        let Type::Fiber(yield_type, result_type) = fiber_type else {
+            return Err(vec![self.error(
+                "E-FIBER-024",
+                format!("{operation} requires fiber<Y,R>"),
+            )]);
+        };
+        builder.stack.pop();
+        let (instruction, result) = match operation {
+            "fiber-next" => (
+                Instruction::NextFiber,
+                Type::fiber_step((*yield_type).clone(), (*result_type).clone()),
+            ),
+            "fiber-join" => (Instruction::JoinFiber, *result_type),
+            "fiber-cancel" => (Instruction::CancelFiber, Type::Unit),
+            _ => unreachable!("known fiber operation"),
+        };
+        builder.emit(instruction, self.origin(operation));
+        Ok(result)
     }
 
     fn compile_cpu_task_operation(
@@ -3188,6 +3306,10 @@ fn parse_generic_type(name: &str) -> Option<Type> {
         "list" => one().map(Type::list),
         "option" => one().map(|inner| Type::Option(Box::new(inner))),
         "task" => one().map(|inner| Type::Task(Box::new(inner))),
+        "fiber" if arguments.len() == 2 => Some(Type::Fiber(
+            Box::new(parse_type_name(arguments[0]).ok()?),
+            Box::new(parse_type_name(arguments[1]).ok()?),
+        )),
         "stream" => one().map(|inner| Type::Stream(Box::new(inner))),
         "resource" => (arguments.len() == 1).then(|| Type::Resource(arguments[0].to_string())),
         "capability" => (arguments.len() == 1).then(|| Type::Capability(arguments[0].to_string())),
@@ -3851,6 +3973,10 @@ mod tests {
         assert_eq!(
             parse_type_name("stream<list<string>>").unwrap(),
             Type::Stream(Box::new(Type::list(Type::String)))
+        );
+        assert_eq!(
+            parse_type_name("fiber<int,string>").unwrap(),
+            Type::Fiber(Box::new(Type::Int), Box::new(Type::String))
         );
         assert_eq!(
             parse_type_name("record{name:string,meta:map<string,list<int>>}").unwrap(),

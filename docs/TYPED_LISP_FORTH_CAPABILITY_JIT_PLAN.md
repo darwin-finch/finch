@@ -254,18 +254,20 @@ stream-next stream : option<T>  ; bounded pull; none means exhausted
 stream-close stream : unit      ; release cursor/cancel its producer
 ```
 
-A future `fiber<Y,R>` is a scheduled producer that exposes the same typed `yield` control effect
-as a pullable sequence plus a final return:
+`fiber<Y,R>` is the implemented cooperative producer over the same typed `yield` control effect,
+exposing a pullable sequence plus a final return:
 
 ```text
-defer f(args...) : fiber<Y,R>    schedule f and return immediately
-yield value      : unit          publish one Y and continue when rescheduled
-next fiber       : result<Y,end<R>>
-join fiber       : R             wait only for the terminal return
+defer closure       : fiber<Y,R>                  create a pure producer and return immediately
+yield value         : unit                        publish one Y and continue when advanced
+fiber-next fiber    : result<Y,variant{end(R)}>  ok(Y), or err(end(R)) at terminal return
+fiber-join fiber    : R                           discard yields and advance to terminal return
+fiber-cancel fiber  : unit                        make later use fail deterministically
 ```
 
 The source program never writes a continuation. A fiber `yield value` may occur any number of
-times; the VM records remaining frames as an internal thunk and the event loop schedules it later.
+times; the VM records remaining frames as an internal thunk and advances it through the
+runtime-owned producer registry.
 This uses the same typed `yield` instruction as ordinary ProgramRuns, not a second fiber-only
 primitive: its function/fiber contract declares `Y` and the resume value (initially `unit`), and
 the scheduler records both in the same typed suspension record used by every `MaySuspend` word.

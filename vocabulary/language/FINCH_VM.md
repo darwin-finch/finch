@@ -139,14 +139,14 @@ unit form. Other hosts choose their own scheduling policy and may inspect the pa
 more than once in one program and does not expose an LLM-authored continuation value. A callable
 that can publish values advertises `yields<Y,unit>` after its ordinary stack/effect signature.
 That metadata is serialized with function and closure types, composes through calls, and is checked
-again against IR; it describes control flow, not authority. A future
-`fiber<Y,R>` is a first-class handle over this same typed control effect, with a declared resume
-type (initially `unit`); Finch will not add a second generator-only `yield` or hidden multi-return
-protocol.
-
-It is not a lazy sequence generator. This revision has no `next`, `generator<T>`, or generic
-iterator protocol; do not borrow such words from the legacy Co-Forth compatibility library. Known
-finite values use typed lists and host-backed iteration uses explicit cursor resources.
+again against IR; it describes control flow, not authority. `fiber<Y,R>` is a first-class,
+checkpointable handle over this same typed control effect, with a declared resume type (currently
+`unit`). `fiber-next` returns an ordinary `result<Y,variant{end(R)}>`; `fiber-join` discards yielded
+values to obtain `R`, and `fiber-cancel` leaves a deterministic cancelled state. Producer registry
+changes are part of the ProgramRun transaction, so a failed outer program cannot consume a yield.
+Finch does not add a second generator-only `yield` or hidden multi-return protocol. Known finite
+values use typed lists, host-backed iteration uses explicit cursor resources, and user-defined lazy
+producers use fibers.
 
 `vm-vocabulary` is a pure VM inspection operation that returns the current serialized typed
 vocabulary. Use it (or the external `get_vm_state` tool) instead of guessing callable names.
