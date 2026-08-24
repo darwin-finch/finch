@@ -84,6 +84,18 @@ pub struct GrantSet {
 }
 
 impl GrantSet {
+    pub fn active_global_requirements(
+        &self,
+        now_unix_ms: u64,
+    ) -> impl Iterator<Item = &CapabilityRequirement> {
+        self.grants
+            .iter()
+            .filter(move |grant| {
+                grant.is_active(now_unix_ms) && matches!(grant.scope, GrantScope::Global)
+            })
+            .map(|grant| &grant.requirement)
+    }
+
     pub fn authorize(
         &self,
         request: &CapabilityRequest,
@@ -106,6 +118,97 @@ impl GrantSet {
         };
         grant.revoked_at_unix_ms = Some(now_unix_ms);
         true
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityAuditAction {
+    Granted,
+    Revoked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityAuditEntry {
+    pub sequence: u64,
+    pub grant_id: Uuid,
+    pub action: CapabilityAuditAction,
+    pub requirement: CapabilityRequirement,
+    pub at_unix_ms: u64,
+    pub actor: String,
+}
+
+/// Application-owned authority records. This ledger is serializable beside a
+/// Brain or session event log, but deliberately never enters a VM checkpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityLedger {
+    pub grants: GrantSet,
+    pub audit: Vec<CapabilityAuditEntry>,
+    #[serde(default)]
+    next_sequence: u64,
+}
+
+impl CapabilityLedger {
+    pub fn grant_global(
+        &mut self,
+        requirement: CapabilityRequirement,
+        policy_hash: impl Into<String>,
+        actor: impl Into<String>,
+        now_unix_ms: u64,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let actor = actor.into();
+        self.grants.grants.push(CapabilityGrant {
+            id,
+            requirement: requirement.clone(),
+            scope: GrantScope::Global,
+            policy_hash: policy_hash.into(),
+            created_by: actor.clone(),
+            created_at_unix_ms: now_unix_ms,
+            expires_at_unix_ms: None,
+            revoked_at_unix_ms: None,
+        });
+        self.record(id, CapabilityAuditAction::Granted, requirement, now_unix_ms, actor);
+        id
+    }
+
+    pub fn revoke(&mut self, grant_id: Uuid, actor: impl Into<String>, now_unix_ms: u64) -> bool {
+        let requirement = self
+            .grants
+            .grants
+            .iter()
+            .find(|grant| grant.id == grant_id)
+            .map(|grant| grant.requirement.clone());
+        if !self.grants.revoke(grant_id, now_unix_ms) {
+            return false;
+        }
+        self.record(
+            grant_id,
+            CapabilityAuditAction::Revoked,
+            requirement.expect("a revoked grant was found before mutation"),
+            now_unix_ms,
+            actor.into(),
+        );
+        true
+    }
+
+    fn record(
+        &mut self,
+        grant_id: Uuid,
+        action: CapabilityAuditAction,
+        requirement: CapabilityRequirement,
+        at_unix_ms: u64,
+        actor: String,
+    ) {
+        self.audit.push(CapabilityAuditEntry {
+            sequence: self.next_sequence,
+            grant_id,
+            action,
+            requirement,
+            at_unix_ms,
+            actor,
+        });
+        self.next_sequence += 1;
     }
 }
 
@@ -280,5 +383,51 @@ mod tests {
         let prompt = ApprovalPrompt::for_request(request(requirement.clone()));
         assert_eq!(prompt.exact, requirement);
         assert_eq!(prompt.suggested_patterns.len(), 1);
+    }
+
+    #[test]
+    fn ledger_persists_grant_identity_revocation_and_audit_order() {
+        let requirement = CapabilityRequirement::file(
+            FileOperation::Read,
+            FileSelector::parse("./src/**").unwrap(),
+        );
+        let mut ledger = CapabilityLedger::default();
+        let id = ledger.grant_global(requirement.clone(), "policy", "user", 10);
+        ledger.grants.grants.push(CapabilityGrant {
+            id: Uuid::new_v4(),
+            requirement: CapabilityRequirement::file(
+                FileOperation::Write,
+                FileSelector::parse("./project-only/**").unwrap(),
+            ),
+            scope: GrantScope::Project {
+                project_id: "project".into(),
+            },
+            policy_hash: "policy".into(),
+            created_by: "user".into(),
+            created_at_unix_ms: 10,
+            expires_at_unix_ms: None,
+            revoked_at_unix_ms: None,
+        });
+        assert_eq!(
+            ledger
+                .grants
+                .active_global_requirements(11)
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![requirement]
+        );
+        assert!(ledger.revoke(id, "user", 12));
+        assert!(ledger
+            .grants
+            .active_global_requirements(13)
+            .next()
+            .is_none());
+        assert_eq!(ledger.audit.len(), 2);
+        assert_eq!(ledger.audit[0].sequence, 0);
+        assert_eq!(ledger.audit[1].sequence, 1);
+        assert_eq!(ledger.audit[1].action, CapabilityAuditAction::Revoked);
+
+        let encoded = serde_json::to_string(&ledger).unwrap();
+        assert_eq!(serde_json::from_str::<CapabilityLedger>(&encoded).unwrap(), ledger);
     }
 }

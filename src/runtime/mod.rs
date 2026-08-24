@@ -11,8 +11,8 @@ use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramValue};
 use crate::scheduling::{ScheduledTask, TaskQueue, TaskScheduler, TaskStatus};
 use crate::vm::{
     ApprovalPrompt, CapabilityRequest, CapabilityRequirement, EffectSet, SourceOrigin, Type,
-    TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint, TypedSuspension, TypedValue,
-    VmDiagnostic, VmSideEffect,
+    CapabilityLedger, TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint, TypedSuspension,
+    TypedValue, VmDiagnostic, VmSideEffect,
 };
 use crate::vm::vocabulary::{core_word_spec, CoreHostBinding, CoreWordImplementation};
 use anyhow::{bail, Result};
@@ -271,6 +271,10 @@ pub struct ProgramRuntime {
     /// opening one. New stream backends belong in `HostStreamBackend`, not in
     /// a parallel registry with a second ownership lifecycle.
     streams: Arc<Mutex<HashMap<String, HostStream>>>,
+    /// Host authority is application state, separate from reducible VM
+    /// checkpoints. Stable grant IDs and audit events can be persisted beside
+    /// a Brain/session log, while only the active requirements enter a run.
+    capability_ledger: Mutex<CapabilityLedger>,
     schedule_queue: RwLock<Option<Arc<TaskQueue>>>,
     agent_scheduler: RwLock<Weak<scheduler::AgentScheduler>>,
     /// Daemon-owned typed continuations keyed by the execution id visible in
@@ -450,6 +454,7 @@ impl ProgramRuntime {
             network: Arc::new(Mutex::new(HashMap::new())),
             output_handles: Arc::new(Mutex::new(HashMap::new())),
             streams: Arc::new(Mutex::new(HashMap::new())),
+            capability_ledger: Mutex::new(CapabilityLedger::default()),
             schedule_queue: RwLock::new(None),
             agent_scheduler: RwLock::new(Weak::new()),
             pending_typed: Mutex::new(HashMap::new()),
@@ -590,11 +595,68 @@ impl ProgramRuntime {
 
     /// Grant a typed capability after an approval decision. A saved typed
     /// execution rechecks this structured grant when it is resumed.
-    pub fn grant_typed_capability(&self, requirement: CapabilityRequirement) -> Result<()> {
+    pub fn grant_typed_capability(&self, requirement: CapabilityRequirement) -> Result<uuid::Uuid> {
+        let now = unix_time_ms();
+        let grant_id = self
+            .capability_ledger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?
+            .grant_global(requirement.clone(), "local-runtime", "local-user", now);
         self.typed
             .lock()
             .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?
             .grant(requirement);
+        Ok(grant_id)
+    }
+
+    /// Revoke one recorded grant by stable identity. Pending and future runs
+    /// observe the rebuilt active set at their next verified boundary.
+    pub fn revoke_typed_capability(&self, grant_id: uuid::Uuid) -> Result<bool> {
+        let revoked = self
+            .capability_ledger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?
+            .revoke(grant_id, "local-user", unix_time_ms());
+        if revoked {
+            self.refresh_active_grants()?;
+        }
+        Ok(revoked)
+    }
+
+    pub fn capability_ledger(&self) -> Result<CapabilityLedger> {
+        Ok(self
+            .capability_ledger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?
+            .clone())
+    }
+
+    /// Restore host-owned authority records independently of a VM checkpoint.
+    pub fn restore_capability_ledger(&self, ledger: CapabilityLedger) -> Result<()> {
+        *self
+            .capability_ledger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))? = ledger;
+        self.refresh_active_grants()
+    }
+
+    fn refresh_active_grants(&self) -> Result<()> {
+        let now = unix_time_ms();
+        let ledger = self
+            .capability_ledger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?;
+        let grants = ledger
+            .grants
+            .active_global_requirements(now)
+            .cloned()
+            .fold(TypedRuntime::intrinsic_grants(), |grants, requirement| {
+                grants.union(&EffectSet::from_requirement(requirement))
+            });
+        self.typed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?
+            .set_grants(grants);
         Ok(())
     }
 
@@ -1133,6 +1195,7 @@ impl ProgramRuntime {
         // mutation. Ordinary interactive runs see an approval granted while
         // they were suspended. A scheduled callback instead retains its
         // creation-time ceiling so elapsed time cannot expand authority.
+        self.refresh_active_grants()?;
         let mut resumed_runtime = pending.working_runtime.clone();
         if let Some(grant_ceiling) = &pending.grant_ceiling {
             resumed_runtime.set_grants(grant_ceiling.clone());
@@ -1615,6 +1678,7 @@ impl ProgramRuntime {
             // state privately and therefore does not serialize unrelated
             // ProgramRuns behind a persistent runtime mutex.
             let _submission = self.submission_gate.lock().await;
+            self.refresh_active_grants()?;
             let generation = self.manifest_generation();
             if submission.manifest_generation != generation {
                 bail!(
@@ -3501,6 +3565,14 @@ impl Default for ProgramRuntime {
     }
 }
 
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
 fn truncate_output(mut output: String, max_bytes: usize) -> String {
     if output.len() <= max_bytes {
         return output;
@@ -4970,6 +5042,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capability_ledger_restores_and_revokes_runtime_authority_by_id() {
+        let requirement = crate::vm::CapabilityRequirement::file(
+            crate::vm::FileOperation::Read,
+            crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+        );
+        let request = || {
+            submission(
+                ProgramLanguage::Lisp,
+                "(file-read (path \"Cargo.toml\"))",
+                ExecutionEffect::WorkspaceRead,
+            )
+        };
+        let runtime = ProgramRuntime::new();
+        let grant_id = runtime
+            .grant_typed_capability(requirement.clone())
+            .unwrap();
+        let ledger = runtime.capability_ledger().unwrap();
+        assert_eq!(ledger.grants.grants[0].id, grant_id);
+        assert_eq!(ledger.audit.len(), 1);
+        assert_eq!(runtime.submit(request()).await.unwrap().status, ExecutionStatus::Completed);
+
+        let restored = ProgramRuntime::new();
+        restored.restore_capability_ledger(ledger).unwrap();
+        assert_eq!(restored.submit(request()).await.unwrap().status, ExecutionStatus::Completed);
+        assert!(restored.revoke_typed_capability(grant_id).unwrap());
+        let denied = restored.submit(request()).await.unwrap();
+        assert_eq!(denied.status, ExecutionStatus::AuthorizationRequired);
+        let ledger = restored.capability_ledger().unwrap();
+        assert_eq!(ledger.audit.len(), 2);
+        assert_eq!(
+            ledger.audit[1].action,
+            crate::vm::CapabilityAuditAction::Revoked
+        );
+    }
+
+    #[tokio::test]
     async fn typed_memory_host_reads_and_writes_through_attached_memtree() {
         let database = tempfile::NamedTempFile::new().unwrap();
         let memory = Arc::new(
@@ -5620,7 +5728,7 @@ mod tests {
             }
         });
         let runtime = ProgramRuntime::new();
-        runtime
+        let original_grant = runtime
             .grant_typed_capability(crate::vm::CapabilityRequirement {
                 capability: crate::vm::CapabilityKind::NetworkConnect,
                 selector: crate::vm::ResourceSelector::Network {
@@ -5642,19 +5750,16 @@ mod tests {
         // The static socket operation can be invoked with any network grant,
         // but the host must check the socket's actual endpoint rather than
         // treating the opaque resource as ambient authority.
+        assert!(runtime.revoke_typed_capability(original_grant).unwrap());
         runtime
-            .typed
-            .lock()
-            .unwrap()
-            .set_grants(EffectSet::from_requirement(
-                crate::vm::CapabilityRequirement {
-                    capability: crate::vm::CapabilityKind::NetworkConnect,
-                    selector: crate::vm::ResourceSelector::Network {
-                        host: "example.test".into(),
-                        ports: vec![port],
-                    },
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::NetworkConnect,
+                selector: crate::vm::ResourceSelector::Network {
+                    host: "example.test".into(),
+                    ports: vec![port],
                 },
-            ));
+            })
+            .unwrap();
         let sent = runtime
             .submit(submission(
                 ProgramLanguage::Forth,

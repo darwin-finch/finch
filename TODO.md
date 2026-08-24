@@ -118,7 +118,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   remain previewable/auditable. The portable-host submission policy can now suspend every approved awaited
   capability (not just editor proposals) for an external implementation; typed scheduled callbacks
   now persist a versioned creation-time grant ceiling and cannot acquire approvals granted later.
-  Durable approvals, revocation policy, and complete host adapters remain.
+  Global runtime grants now receive stable IDs in a serializable host-owned `CapabilityLedger`;
+  grant/revoke audit events are ordered, revocation and expiry rebuild the VM's active authority at
+  submission/resume boundaries, and VM checkpoints still contain no authority. Scoped approval
+  issuance/authorization audit, durable application storage, policy-driven revocation, and complete
+  host adapters remain.
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their

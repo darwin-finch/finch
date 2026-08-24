@@ -200,22 +200,13 @@ impl Default for TypedRuntime {
 
 impl TypedRuntime {
     pub fn new() -> Self {
-        let response = CapabilityRequirement {
-            capability: CapabilityKind::SessionEmit,
-            selector: super::effects::ResourceSelector::None,
-        };
-        let vm_read = CapabilityRequirement {
-            capability: CapabilityKind::VmRead,
-            selector: super::effects::ResourceSelector::None,
-        };
         Self {
             stack: Vec::new(),
             vocabulary: core_vocabulary(),
             functions: BTreeMap::new(),
             // Producing the requested assistant response is part of the
             // session contract, not an ambient host permission.
-            grants: EffectSet::from_requirement(response)
-                .union(&EffectSet::from_requirement(vm_read)),
+            grants: Self::intrinsic_grants(),
             cpu_fibers: Arc::new(CpuFiberScheduler::new(
                 std::thread::available_parallelism()
                     .map_or(1, |parallelism| parallelism.get().saturating_sub(1).max(1)),
@@ -327,6 +318,17 @@ impl TypedRuntime {
 
     pub fn grants(&self) -> &EffectSet {
         &self.grants
+    }
+
+    pub fn intrinsic_grants() -> EffectSet {
+        EffectSet::from_requirement(CapabilityRequirement {
+            capability: CapabilityKind::SessionEmit,
+            selector: super::effects::ResourceSelector::None,
+        })
+        .union(&EffectSet::from_requirement(CapabilityRequirement {
+            capability: CapabilityKind::VmRead,
+            selector: super::effects::ResourceSelector::None,
+        }))
     }
 
     pub fn set_grants(&mut self, grants: EffectSet) {
