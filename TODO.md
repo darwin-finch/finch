@@ -52,12 +52,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   must remain a statically inspectable contract, not a runtime dynamic escape hatch.
 - [ ] Generate every production word/function from one typed signature, effect, documentation, and
   host-implementation registry.
-- [ ] Finish Lisp source maps: the reader now retains structural spans and typed lowering preserves
+- [x] Finish Lisp source maps: the reader retains structural spans and typed lowering preserves
   exact nested named-call operators/arguments, `begin`/`if`, definitions, `let`, lambdas,
-  closure-call targets, typed matches, loops, deferred tasks, and macro call-site → template
-  ancestry. Still preserve individual caller-argument spans when a macro substitutes them into a
-  generated template. Do not regress to whole-submission spans or invent locations by source-text
-  searching.
+  closure-call targets, typed matches, loops, deferred tasks, macro call-site → template
+  ancestry, and exact caller-argument spans through macro substitution. Do not regress to
+  whole-submission spans or invent locations by source-text searching.
 - [x] Make documentation a first-class field of typed Lisp/Co-Forth definitions and promotion
   records, not merely leading source comments. Preserve `; finch-doc:` / `\ finch-doc:` as a
   self-contained-script spelling, retain exact immutable version metadata, and converge provider
