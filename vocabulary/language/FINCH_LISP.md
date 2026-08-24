@@ -28,6 +28,7 @@ The ordinary response is `(say "Hello")`. Pure and compound examples:
 (when-positive (> 3 2) 42)
 (define (singleton (x : int)) : list<int> (list x))
 (list-get (list 4 8 15 16) 2)
+(list-get (list-append (list 4 8) 15) 2)
 (file-read (path "Cargo.toml"))
 (file-write (path "generated/result.bin") data)
 ```

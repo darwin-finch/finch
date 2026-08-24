@@ -1880,6 +1880,34 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
                 })?;
             stack.push(value);
         }
+        "list-append" => {
+            let value = pop(stack)?;
+            let list = pop(stack)?;
+            let TypedValue::List {
+                element_type,
+                mut values,
+            } = list
+            else {
+                return Err(VmDiagnostic::error(
+                    "E-RUNTIME-034",
+                    DiagnosticPhase::Interpretation,
+                    "list-append requires a typed list followed by one value",
+                    Some(origin),
+                ));
+            };
+            if !element_type.accepts(&value.value_type()) {
+                return Err(VmDiagnostic::type_mismatch(
+                    element_type,
+                    value.value_type(),
+                    Some(SourceOrigin::generated(name)),
+                ));
+            }
+            values.push(value);
+            stack.push(TypedValue::List {
+                element_type,
+                values,
+            });
+        }
         "map-get" => {
             let key = pop(stack)?;
             let map = pop(stack)?;

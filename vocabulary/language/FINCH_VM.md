@@ -169,6 +169,11 @@ and never grants ambient mutable `self` access. Arbitrary JSON object keys—inc
 spaces—remain at the `json-get` or string-keyed-map boundary rather than being silently coerced
 into typed record fields.
 
+Typed lists are homogeneous immutable values: Lisp spells construction `(list value ...)` and
+Co-Forth spells `list{ value ... }list`. `list-append` consumes a list and matching element and
+returns a replacement list; `list-get` and `list-length` inspect it. Empty list literals require
+an explicit element type and are therefore intentionally not inferred by either source form.
+
 Lisp symbols are identifiers, not strings: `'name` is quoted data (equivalent to `(quote name)`),
 whereas `(say "name")` contains text. Co-Forth uses bare tokens for executable dictionary words;
 `'name` produces a typed symbol value and `['] word execute` passes an execution token as data.

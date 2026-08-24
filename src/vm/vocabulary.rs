@@ -128,7 +128,7 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "schedule-create" => CoreWordDocumentation { summary: "Create a capability-bound scheduled event using a callback descriptor and time. Scheduled work never gains new authority when it fires.", lisp: "(schedule-create callback when)", forth: "callback when schedule-create", example: "(schedule-create \"daily-summary\" 1770000000)" },
         "vm-vocabulary" => CoreWordDocumentation { summary: "Return the serialized current typed vocabulary. Use the external search_vm_vocabulary/describe_vm_word tools for compact targeted discovery.", lisp: "(vm-vocabulary)", forth: "vm-vocabulary", example: "(say (vm-vocabulary))" },
         "automation-availability" | "automation-displays" | "automation-windows" | "automation-click" | "automation-type" => CoreWordDocumentation { summary: "Inspect or operate desktop automation through the host adapter. Availability and every concrete target remain capability-checked at the execution boundary.", lisp: "(automation-availability), (automation-click x y button count), (automation-type text delay)", forth: "automation-availability; x y button count automation-click; text delay automation-type", example: "(automation-availability)" },
-        "list-length" | "list-get" => CoreWordDocumentation { summary: "Return a typed list's length or one element at a zero-based integer index.", lisp: "(list-length items), (list-get items index)", forth: "items list-length; items index list-get", example: "(list-get (list 4 8 15 16) 2)" },
+        "list-length" | "list-get" | "list-append" => CoreWordDocumentation { summary: "Inspect or immutably extend a homogeneous typed list. list-append returns a replacement list and never mutates a shared value.", lisp: "(list-length items), (list-get items index), (list-append items value)", forth: "items list-length; items index list-get; items value list-append", example: "(list-get (list-append (list 4 8) 15) 2)" },
         "map-get" | "map-set" | "map-keys" | "map-entries" | "map-length" => CoreWordDocumentation { summary: "Inspect or immutably update a typed map. map-get returns option<V>; map-set returns a replacement map; map-entries returns insertion-ordered key/value typed records. None mutates a shared value.", lisp: "(map-get map key), (map-set map key value), (map-keys map), (map-entries map), (map-length map)", forth: "map key map-get; map key value map-set; map map-keys; map map-entries; map map-length", example: "(unwrap (record-get (list-get (map-entries (map \"answer\" 42)) 0) \"value\"))" },
         "str-cat" | "bytes" | "int-to-string" | "atoi" | "space" => CoreWordDocumentation { summary: "Pure text/byte conversion helpers. str-cat preserves both inputs exactly; say adds no formatting of its own.", lisp: "(str-cat left right), (bytes text), (int-to-string n), (atoi text), (space)", forth: "left right str-cat; text bytes; n int-to-string; text atoi; space", example: "s\"answer: \" 42 int-to-string str-cat say" },
         "json-parse" | "json-stringify" | "json-get" | "json-index" | "json-keys" | "json-as-string" | "json-as-int" | "json-as-float" | "json-as-bool" => CoreWordDocumentation { summary: "Pure managed JSON operations. json-parse returns result<json,string>; field/index lookup and scalar projections return options rather than coercing or treating text as authority. json-keys returns an empty typed list for a non-object.", lisp: "(json-parse text), (json-get value field), (json-index value index), (json-keys value), (json-as-string value), (json-as-int value), (json-as-float value), (json-as-bool value)", forth: "text json-parse; json field json-get; json index json-index; json json-keys; json json-as-string|json-as-int|json-as-float|json-as-bool", example: "s\" {\\\"answer\\\":42}\" json-parse result-unwrap s\" answer\" json-get unwrap json-as-int unwrap" },
@@ -567,6 +567,13 @@ fn core_signatures() -> Vocabulary {
         (
             "list-get".into(),
             pure(vec![Type::list(a.clone()), Type::Int], vec![a.clone()]),
+        ),
+        (
+            "list-append".into(),
+            pure(
+                vec![Type::list(a.clone()), a.clone()],
+                vec![Type::list(a.clone())],
+            ),
         ),
         (
             "map-get".into(),

@@ -302,6 +302,16 @@ map{ s" answer" 42 s" other" 7 }map
 s" answer" map-get unwrap
 ```
 
+Typed lists are likewise immutable. Use `list{` / `}list` around one or more homogeneous values;
+`list-append` returns a replacement list rather than changing the original. An empty list has no
+inferable element type, so it needs an explicit typed-empty constructor (not yet part of this
+surface):
+
+```forth
+list{ 1 2 }list 3 list-append
+2 list-get                 \ leaves 3
+```
+
 `say` is a stack-neutral response effect: it consumes its string and leaves no value on the
 stack. Consecutive `say` calls compose directly; do not add `drop` after one:
 

@@ -203,7 +203,12 @@ const SOURCE_SYNTAX: &[SourceSyntaxEntry] = &[
     SourceSyntaxEntry {
         name: "list",
         languages: &["lisp"],
-        description: "Homogeneous immutable typed list literal: (list value ...). All elements must share one inferred type; use list-get and list-length to inspect it.",
+        description: "Homogeneous immutable typed list literal: (list value ...). All elements must share one inferred type; use list-get, list-length, or list-append to inspect or extend it.",
+    },
+    SourceSyntaxEntry {
+        name: "list{",
+        languages: &["forth"],
+        description: "Homogeneous immutable Co-Forth typed list literal: list{ value ... }list. All elements must share one inferred type; list-append returns a replacement list.",
     },
     SourceSyntaxEntry {
         name: "map",
@@ -1192,6 +1197,19 @@ mod tests {
                         .as_array()
                         .is_some_and(|languages| languages.iter().any(|language| language == "forth"))
             }));
+
+        let list_result: Value = serde_json::from_str(
+            &tool
+                .execute(json!({"query": "list{"}), &context)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(list_result["syntax_matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "list{"));
     }
 
     #[tokio::test]

@@ -52,6 +52,13 @@
       "expected_output": ""
     },
     {
+      "name": "immutable-list-literal-and-append",
+      "forth": "list{ 1 2 }list 3 list-append 2 list-get",
+      "lisp": "(list-get (list-append (list 1 2) 3) 2)",
+      "expected_values": [{ "type": "int", "value": 3 }],
+      "expected_output": ""
+    },
+    {
       "name": "immutable-map-update",
       "forth": "empty-map<string,int> s\" answer\" 42 map-set s\" answer\" map-get unwrap",
       "lisp": "(unwrap (map-get (map-set (empty-map string int) \"answer\" 42) \"answer\"))",
