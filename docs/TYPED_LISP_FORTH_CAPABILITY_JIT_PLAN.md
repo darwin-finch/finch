@@ -217,7 +217,7 @@ drop         forall A S. (S A -- S) ! pure
 +            forall S.   (S int int -- S int) ! pure
 file.read    forall R S. (S path<R> -- S bytes) ! {fs.read(R)}
 agent.await  forall T S. (S task<T> -- S result<T,agent-error>) ! {agent.await}
-yield        forall S.   (S -- S) ! pure  ; cooperative timeslice boundary
+yield        forall S.   (S -- S) ! pure  ; current cooperative timeslice boundary
 ```
 
 The signature includes:
@@ -254,8 +254,8 @@ stream-next stream : option<T>  ; bounded pull; none means exhausted
 stream-close stream : unit      ; release cursor/cancel its producer
 ```
 
-A future `fiber<Y,R>` is a scheduled producer that separates a progress stream from a final
-return:
+A future `fiber<Y,R>` is a scheduled producer that exposes the same typed `yield` control effect
+as a pullable sequence plus a final return:
 
 ```text
 defer f(args...) : fiber<Y,R>    schedule f and return immediately
@@ -266,11 +266,14 @@ join fiber       : R             wait only for the terminal return
 
 The source program never writes a continuation. A fiber `yield value` may occur any number of
 times; the VM records remaining frames as an internal thunk and the event loop schedules it later.
-This is distinct from the existing stack-neutral `yield`, which is only a cooperative ProgramRun
-timeslice boundary and publishes no iterator item. The initial producer implementation keeps
-resumption one-way (`unit`) and uses explicit typed inbox/message operations for replies. If
-bidirectional generators become necessary, add `fiber<Y,Resume,R>` and give producer-yield the
-stack/type effect `Y -> Resume`; do not silently use `dynamic` for resumed values.
+This must be a generalization of the current stack-neutral `yield`, not a second fiber-only
+primitive: its function/fiber contract declares `Y` and the resume value (initially `unit`), and
+the scheduler records both in the same typed suspension record used by every `MaySuspend` word.
+If bidirectional generators become necessary, add `fiber<Y,Resume,R>` and give `yield` the typed
+stack effect `Y -> Resume`; do not silently use `dynamic` for resumed values. `defer`, `next`, and
+`join` are ordinary generated vocabulary bindings over that scheduler record, not syntax-level
+exceptions or a privileged multi-return convention. Cursor-backed `stream<T>` remains the simpler
+range abstraction; a producer fiber can be adapted to it through visible library code.
 
 Fibers are not the subagent protocol. A subagent is a separate child `ProgramRun`/agent turn with
 its own private stack, verified module, capability attenuation, budget, ancestry, event journal,

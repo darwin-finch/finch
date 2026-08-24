@@ -188,14 +188,20 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   suspends the parent VM continuation rather than blocking the event loop; CPU fibers reject
   effects and never share their parent stack. Repeatedly-yielding fibers remain separate from
   subagents, and bidirectional resume remains deferred until a concrete need exists.
-- [x] Implement a typed lazy sequence protocol separately from scheduler `yield`: host-backed
-  `stream<T>` handles now provide bounded `stream-next -> option<T>` and `stream-close`, with
+- [x] Implement a typed lazy sequence protocol: host-backed `stream<T>` handles now provide
+  bounded `stream-next -> option<T>` and `stream-close`, with
   ProgramRun ownership/generation checks, path-scoped capability propagation, concrete polymorphic
   host-result rows, and shared Lisp/Co-Forth lowering. File-line and CSV streams are the first
-  backends. Scheduler `yield` remains control-only for fibers; a future user-defined
-  `generator`/`produce` construct must lower to a private resumable range state machine rather
-  than overload fiber yield. Legacy Co-Forth generators remain outside typed-runtime vocabulary
-  until their state, effects, and suspension semantics are verified.
+-  backends. The present stack-neutral `yield` is a cooperative suspension point only.
+- [ ] Generalize that same `yield` control effect for producer fibers rather than introducing a
+  second generator-only operation: a yielded typed value and declared typed resume value must be
+  recorded in the function/fiber contract; `defer` must expose the resulting `fiber<Y,R>` through
+  ordinary typed `next`/`join` vocabulary words. `stream<T>` stays the range abstraction for
+  cursor-backed data, while producer fibers supply user-defined ranges. No special multi-return,
+  hidden iterator protocol, compiler-only map lookup rule, or untyped resumed value is permitted;
+  all scheduler operations must come from the same typed registry/templates available to user
+  definitions. Legacy Co-Forth generators remain outside typed-runtime vocabulary until these
+  state, effect, suspension, cancellation, and serialization semantics are verified.
 - [ ] Make resource roots first-class capability objects. Workspace/project paths remain safely
   relative; an intentional full-machine grant is a separate audited host root, never ambient
   authority inferred from an absolute path string. `host-path` and distinct

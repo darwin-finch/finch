@@ -136,8 +136,9 @@ separate protocol.
 event-loop trampoline as a saved `ProgramRun` suspension. The interactive provider-wire runner
 currently yields its Tokio task and resumes that exact execution automatically; all other hosts
 choose their own scheduling policy. It may occur more than once in one program; it is not an
-LLM-authored continuation value. Future `fiber<yield,return>`
-handles will expose repeated yielded values separately from terminal task joins.
+LLM-authored continuation value. A future generalization will let the same typed control effect
+publish a declared `Y` through `fiber<Y,R>` while preserving a declared resume type (initially
+`unit`); it will not add a second generator-only `yield` or hidden multiple-return protocol.
 
 It is not a lazy sequence generator. This revision has no `next`, `generator<T>`, or generic
 iterator protocol; do not borrow such words from the legacy Co-Forth compatibility library. Known
