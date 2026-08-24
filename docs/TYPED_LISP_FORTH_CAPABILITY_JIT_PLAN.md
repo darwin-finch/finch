@@ -737,6 +737,15 @@ bounded CTFE should make routine code feel as direct as Python or JavaScript whi
 static, optimizable execution path. Do not achieve convenience by silently inserting `dynamic`,
 unchecked coercions, or an interpreter-only fallback.
 
+Inference is deliberately directional rather than global Hindley-Milner constraint solving. An
+initializer or literal establishes a local binding's type; subsequent calls check that known type
+against their parameter contracts. For example, `let foo = 3; bar(foo)` with `bar : string -> ...`
+must diagnose the argument at `bar(foo)`, not infer `foo` backward as `string` and blame `3`.
+Generic type/value arguments are inferred forward from the supplied arguments into one bounded
+specialization. Expected result types may select among already-valid results but must not rewrite
+earlier bindings or cause distant diagnostic locations. This keeps inference incremental, fast,
+and explainable to both humans and models.
+
 ### Lowering
 
 The frontend performs:
@@ -744,8 +753,7 @@ The frontend performs:
 1. parse with exact source spans;
 2. hygienic macro expansion in a restricted compile-time environment;
 3. name resolution and lexical binding;
-4. Hindley-Milner-style local inference plus explicit effect rows and practical subtyping/refinement
-   checks where needed;
+4. directional local inference plus explicit effect rows and practical subtyping/refinement checks;
 5. desugaring of `let`, `begin`, `if`, pattern matching, and named functions;
 6. closure conversion and capture analysis;
 7. post-order lowering into typed stack blocks;

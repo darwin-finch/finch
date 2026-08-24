@@ -16,7 +16,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   introducing routine `dynamic`, implicit unsafe coercions, or a slower alternate execution path.
   Require annotations only at genuinely ambiguous, recursive-interface, module/API, refinement,
   capability-selector, and FFI boundaries. Track annotation density, first-pass model success,
-  compile latency, and diagnostic locality in the cross-provider corpus.
+  compile latency, and diagnostic locality in the cross-provider corpus. Inference must be
+  directional and bounded: an initializer establishes a binding's type, then later uses are checked
+  against it. Never propagate an expected callee/result type backward to reinterpret an established
+  binding or blame its initializer; generic substitution flows forward from supplied arguments.
 - [x] Fix startup rendering ownership: the live event loop projects its header through
   `OutputManager`, puts notices in the status bar, silently loads vocabulary, and never executes
   legacy boot scripts at interactive startup. Startup diagnostics and suggestions must continue to
