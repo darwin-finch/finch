@@ -1402,6 +1402,22 @@ Co-Forth must expose that same typed semantic surface even when Lisp is the more
 frontend. Maintain a corpus of equivalent application-sized programs to measure source size,
 required annotations, diagnostic quality, and generated IR as features land.
 
+### Eventual self-hosting
+
+Once retained syntax/HIR, the semantic scheduler, CTFE, modules, and AOT ABI are stable, the
+frontend and most semantic jobs may themselves be ordinary bounded Finch programs. Rust and other
+embedders call that compiler through a small versioned typed service interface; an AOT build may
+also export a C-compatible `libfinch_compiler` facade generated from the same declarations used by
+ordinary FFI. Keep the reader framing, artifact loader, verifier, effect boundary, and minimal
+runtime as a deliberately small stage-0 trusted implementation rather than requiring an existing
+self-hosted compiler to validate arbitrary input.
+
+Bootstrap reproducibility is mandatory. Check in a content-addressed verified compiler artifact,
+use stage 0 to compile the Finch compiler source into stage 1, use stage 1 to produce stage 2, and
+require normalized stage-1/stage-2 IR or native artifacts to agree. Record compiler source, module
+graph, runtime ABI, target, and dependency hashes. Self-hosting must not introduce a privileged AST,
+type, CTFE, or code-generation path unavailable to the inspectable language modules it exercises.
+
 ### Later AOT compiler target
 
 After the interpreter contract and JIT differential gates are stable, the same verified pipeline
