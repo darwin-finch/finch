@@ -234,8 +234,12 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   bare final-message string. Child schedulers no longer expose direct Read/Glob/Grep or direct
   agent-control tools: they retain typed `submit_program` plus read-only discovery, and use the
   bounded structural `tree-list`/`file-*`/`agent-*` vocabulary under the child grant ceiling.
-  Still add explicit starting-context references/hashes and capability-subset requests, and audit
-  remaining root/provider legacy model-selection/tool entry points before closing this gate.
+  `agent-spawn-with` now accepts bounded typed `{kind,id,sha256}` context references and poll/await
+  expose a deterministic starting-context hash bound to task/background/budgets, ancestry, selected
+  provider/model, VM revision/generation, references, and inherited grants. Still resolve those
+  references through a host artifact store with byte-for-digest verification, add explicit
+  capability-subset requests, and audit remaining root/provider legacy model-selection/tool entry
+  points before closing this gate.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their
   own large-file loops: workspace tree metadata, bounded file hash, a bounded host-computed
   directory Merkle root, and bounded host-computed CSV header/per-column summaries now exist; add workbook
