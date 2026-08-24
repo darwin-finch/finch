@@ -3144,6 +3144,8 @@ fn compact_braced_type_end(source: &str, start: usize) -> Option<usize> {
 fn parameterized_type_end(source: &str, start: usize) -> Option<usize> {
     let remainder = source.get(start..)?;
     let known_prefix = [
+        "empty-list<",
+        "empty-map<",
         "list<",
         "map<",
         "option<",
@@ -4404,6 +4406,28 @@ mod tests {
             .execute(&mut stack)
             .unwrap();
         assert_eq!(stack, vec![TypedValue::Int(42)]);
+    }
+
+    #[test]
+    fn retains_nested_type_arguments_in_empty_collections() {
+        let module = compile_forth(
+            "input.forth",
+            "empty-list<resource<capability-grant>>",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .unwrap();
+        let mut stack = Vec::new();
+        Interpreter::new(&module, DenyCapabilities, InterpreterConfig::default())
+            .execute(&mut stack)
+            .unwrap();
+        assert_eq!(
+            stack,
+            vec![TypedValue::List {
+                element_type: Type::Resource("capability-grant".into()),
+                values: Vec::new(),
+            }]
+        );
     }
 
     #[test]
