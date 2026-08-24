@@ -254,8 +254,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   atomic snapshot/live subscription, attached clients render typed source and output distinctly,
   and one per-Brain daemon turn lane serializes concurrent consoles against the authoritative VM
   revision. A two-console test on 2026-08-24 also passed restart/checkpoint restoration and a real
-  configured-Grok prompt. Durable per-client acknowledgement cursors and scoped participant roles
-  remain separate items below.
+  configured-Grok prompt. A subsequent live Grok test preserved an invalid first Lisp program and
+  its `E-TYPE-006` result, accepted exactly one source-only correction, produced the expected value,
+  and restored the shared definition after another daemon restart. Durable per-client
+  acknowledgement cursors and scoped participant roles remain separate items below.
 - [ ] After the VM gate, launch each local active Brain runner in a named `tmux` session by default
   on Unix. Keep the daemon as a durable event-log/coordinator with no workspace, accessibility, or
   credential handles; the master frontend runner is the only environment authority. Recover only
