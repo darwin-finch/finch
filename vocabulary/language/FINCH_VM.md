@@ -32,7 +32,7 @@ Prefer Lisp for model-authored programs with branching, bindings, closures, or m
 stack pipeline. Co-Forth is the compact, incrementally bufferable alternative:
 
 ```forth
-s"Your response to the human" say
+"Your response to the human" say
 ```
 
 Use a larger program only when computation, memory, automation, scheduling, or child agents are
@@ -197,7 +197,8 @@ directly, never through a shell, and requires an explicit `process.run` capabili
 the complete buffered response remains available in the execution result. It appends its text
 exactly: it adds neither a space nor a newline. Use multiple `say` operations for progressive UI
 updates only, and include separators in the text yourself (for example,
-`s"result: " say 2 3 + int-to-string say s"\n" say`). There is no separate streaming language.
+`"result: " say 2 3 + int-to-string say "\n" say`). `s"..."` remains an equivalent
+Forth-compatible spelling. There is no separate streaming language.
 
 At the execution boundary, chunks are represented as ordered typed side-effect events. A session
 may render, buffer, inspect, test, or reject those events; the VM does not require the UI to mutate

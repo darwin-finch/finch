@@ -38,19 +38,20 @@ to its own rendering model and validates handle ownership/generation before proj
 The provider wire protocol has a deliberately cheap dispatch rule: a response whose first
 non-whitespace byte is `(` is Finch Lisp; every other response is Co-Forth. The dispatcher does
 not guess from prose and the provider prompt says that user-visible prose must be emitted by a VM
-operation such as `s"hello" say`, never written outside the program. Empty responses and Markdown
+operation such as `"hello" say`, never written outside the program. Empty responses and Markdown
 fences are explicit malformed-wire diagnostics with corrective guidance, not accidental Co-Forth
 words. An explicit `language` field in a stored script/tool submission overrides this compact
 streaming discriminator. Co-Forth is therefore the natural streaming form: the receiver can parse
 and render complete tokens while waiting for later tokens, whereas Lisp remains preferable when
 nested structure makes the leading `(` worth it.
 
-`s"text"` is the short escaped-string literal in Co-Forth. It has no implicit leading space:
-both `s"text"` and conventional `s" text"` produce `text` because the one delimiter whitespace is
-consumed. Spacing belongs in the literal or is composed explicitly (for example `space`, `str-cat`,
-or separate `say` events). `s"""..."""` is the raw multiline/prose literal: it preserves its
-contents verbatim until the next triple quote, avoiding fragile quote escaping in user-visible
-text. Co-Forth uses `\\` line comments. Parenthesized Co-Forth comments are allowed only after a
+Bare `"text"` is the preferred short escaped-string literal in Co-Forth. `s"text"` remains a
+Forth-compatible equivalent and has no implicit leading space: both `s"text"` and conventional
+`s" text"` produce `text` because the one delimiter whitespace is consumed. Spacing belongs in
+the literal or is composed explicitly (for example `space`, `str-cat`, or separate `say` events).
+`"""..."""` is the preferred raw multiline/prose literal; compatible `s"""..."""` also works.
+It preserves its contents verbatim until the next triple quote, avoiding fragile quote escaping in
+user-visible text. Co-Forth uses `\\` line comments. Parenthesized Co-Forth comments are allowed only after a
 Co-Forth token: at the start of a wire response, `(` selects Lisp. The normative language definition
 must give exact escaping and raw-delimiter examples.
 
