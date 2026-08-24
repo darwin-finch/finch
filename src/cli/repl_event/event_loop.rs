@@ -3015,31 +3015,6 @@ Rules:\n\
             }
         };
 
-        // Shared brains — pull context contributed by all sessions/peers.
-        let enriched = if chat_only {
-            enriched
-        } else {
-            let daemon_addr = crate::config::constants::DEFAULT_HTTP_ADDR;
-            let shared_ctx: Option<String> = reqwest::Client::new()
-                .get(format!("http://{daemon_addr}/v1/brains/shared/shared"))
-                .timeout(std::time::Duration::from_millis(300))
-                .send()
-                .await
-                .ok()
-                .and_then(|r| {
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(r.json::<serde_json::Value>())
-                    })
-                    .ok()
-                })
-                .and_then(|v| v["context"].as_str().map(|s| s.to_owned()))
-                .filter(|s| !s.trim().is_empty());
-            match shared_ctx {
-                Some(ctx) => format!("{enriched}\n\n---\n[Shared brain context:\n{ctx}]"),
-                None => enriched,
-            }
-        };
-
         // Send query to the LLM worker loop (no tools for chat_only word-push responses)
         let _ = self.llm_tx.send(LlmRequest::Query {
             id: query_id,
