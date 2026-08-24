@@ -5198,6 +5198,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_forth_s_quote_pushes_text_without_emitting_it() {
+        let runtime = ProgramRuntime::new();
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "s\" retained value\"",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, ExecutionStatus::Completed);
+        assert_eq!(outcome.backend, ExecutionBackend::TypedVm);
+        assert_eq!(
+            outcome.values,
+            vec![crate::programs::ProgramValue::String("retained value".into())]
+        );
+        assert!(outcome.output.is_empty());
+        assert!(outcome.side_effects.is_empty());
+        assert!(outcome.effect_journal.is_empty());
+    }
+
+    #[tokio::test]
     async fn typed_forth_cr_is_an_explicit_session_emit_newline() {
         let runtime = ProgramRuntime::new();
         let outcome = runtime
