@@ -147,11 +147,16 @@ typed snapshot record with `task-id`, `agent-id`, `status`, `task`, `role`, `pro
 `agent-id`, `status`, `final-message`, `diagnostics`, `turns`, `elapsed-ms`, `provider-model`, and
 `depth`; programs never need to parse scheduler JSON or scrape a final-message string.
 `agent-cancel` requests cancellation. `agent-spawn-with` accepts one exact typed record with
-`task`, `role`, `background`, `provider`, `model`, `max-turns`, `timeout-ms`, and
-`max-output-bytes` fields. Empty
+`task`, `role`, `background`, `provider`, `model`, `context-refs`, `max-turns`, `timeout-ms`, and
+`max-output-bytes` fields. Each context reference is `{kind:string,id:string,sha256:string}`; the
+list is bounded to 64 entries and each digest must be 64 hexadecimal digits. Empty
 background/provider/model strings mean no override; all budgets are positive and host-bounded.
 Provider/model names go through the scheduler's configured-profile resolver rather than capturing
-the frontend's current provider. Scheduler ancestry and ownership are checked for every operation.
+the frontend's current provider. Poll and await expose `starting-context-hash`, a deterministic
+digest bound to the task, role, background, budgets, parent ancestry, selected provider/model, VM
+revision/manifest generation, declared references, and inherited grant ceiling. A reference digest
+identifies expected content; a future artifact resolver must verify bytes before materializing them.
+Scheduler ancestry and ownership are checked for every operation.
 Child providers receive `submit_program` plus read-only language/VM discovery tools. Filesystem and
 nested-agent work must use verified `tree-list`/`file-*`/`agent-*` words through that submission;
 the scheduler does not expose direct Read/Glob/Grep or direct agent-control tools that bypass the

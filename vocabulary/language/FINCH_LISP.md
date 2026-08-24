@@ -366,13 +366,20 @@ bounded parent-authored background, provider/model selection, or tighter budgets
   :background "focus on typed effects"
   :provider ""
   :model ""
+  :context-refs (list {
+    :kind "artifact"
+    :id "failure-log"
+    :sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" })
   :max-turns 4
   :timeout-ms 60000
   :max-output-bytes 65536 })
 ```
 
 Roles are `general`, `explore`, `research`, or `code`. Empty background/provider/model strings
-mean no override. An unavailable explicit provider/model fails before a child task is created.
+mean no override. Use `(empty-list record{kind:string,id:string,sha256:string})` when there are no
+context references. References and the effective `starting-context-hash` make child inputs
+auditable; the host must still resolve referenced artifacts and verify their declared digests. An
+unavailable explicit provider/model fails before a child task is created.
 
 `(defer :cpu (lambda () expression))` starts a pure zero-argument closure on a bounded private CPU
 worker and returns `task<T>`. Captures are immutable snapshots, not references to the parent stack.

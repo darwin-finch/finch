@@ -303,6 +303,7 @@ same structured spawn contract is available without a frontend special case:
   background: "focus on typed effects"
   provider: ""
   model: ""
+  context-refs: empty-list<record{kind:string,id:string,sha256:string}>
   max-turns: 4
   timeout-ms: 60000
   max-output-bytes: 65536
@@ -310,8 +311,10 @@ same structured spawn contract is available without a frontend special case:
 ```
 
 Roles are `general`, `explore`, `research`, or `code`; empty background/provider/model strings mean
-no override. Budgets are positive and host-bounded, and unavailable explicit model selection fails
-before the scheduler creates a task.
+no override. Context references are bounded `{kind,id,sha256}` descriptors and poll/await expose the
+effective `starting-context-hash`; an artifact host must verify referenced bytes against those
+digests before materializing them. Budgets are positive and host-bounded, and unavailable explicit
+model selection fails before the scheduler creates a task.
 
 For CPU-bound pure closures, `['] zero-argument-word defer-cpu` starts a private worker and leaves
 `task<T>`. `task-poll` replaces it with `option<T>`; `task-join` replaces it with `T`, suspending
