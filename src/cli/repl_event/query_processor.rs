@@ -248,7 +248,8 @@ async fn execute_wire_with_single_repair(
         generator.model_name(),
         "interactive",
     );
-    crate::programs::corpus::capture_from_env(
+    crate::programs::corpus::capture_with_runtime_from_env(
+        runtime,
         generator.name(),
         generator.model_name(),
         "interactive",
@@ -341,7 +342,8 @@ async fn execute_wire_with_single_repair(
     output_unit.set_complete();
 
     let repaired_source = raw_wire_source(&repair.text);
-    crate::programs::corpus::capture_from_env(
+    crate::programs::corpus::capture_with_runtime_from_env(
+        runtime,
         generator.name(),
         generator.model_name(),
         "interactive",

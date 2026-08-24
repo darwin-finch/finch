@@ -248,6 +248,15 @@ pub struct VmStateSnapshot {
     pub granted_capabilities: Vec<CapabilityRequirement>,
 }
 
+/// Reducible language context needed to compile a captured provider program
+/// without retaining the live operand stack or any host authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramCompilerContext {
+    pub manifest_generation: u64,
+    pub revision: u64,
+    pub functions: std::collections::BTreeMap<String, crate::vm::ir::Function>,
+}
+
 /// An immutable in-memory checkpoint at a successful VM commit boundary.
 /// External effects stay in their per-run journals; this contains only
 /// reducible typed VM state for inspection and later durable persistence.
@@ -2160,6 +2169,20 @@ impl ProgramRuntime {
 
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
+    }
+
+    /// Snapshot only source-language linking context for report-only replay.
+    /// Stack values, grants, pending effects, and host resources are excluded.
+    pub fn compiler_context(&self) -> Result<ProgramCompilerContext> {
+        let typed = self
+            .typed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?;
+        Ok(ProgramCompilerContext {
+            manifest_generation: self.manifest_generation(),
+            revision: self.revision(),
+            functions: typed.functions().clone(),
+        })
     }
 
     /// Atomically install a private working VM only when the state it was

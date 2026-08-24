@@ -369,6 +369,7 @@ async fn execute_named_brain_prompt(
     );
     let snapshot = server.shared_brains().snapshot(name)?;
     ensure_named_brain_environment(server, &snapshot)?;
+    let compiler_runtime = server.shared_brains().program_runtime(name)?;
     let system = format!(
         "{}\n\nYou are attached to Finch brain {name}. Its sole execution environment is {}:{}.\n\
              Reply only with one raw executable Finch Lisp or Co-Forth wire program. All user-facing prose must be emitted with say.\n\
@@ -400,7 +401,8 @@ async fn execute_named_brain_prompt(
         if source.is_empty() {
             anyhow::bail!("provider returned no Finch wire program");
         }
-        crate::programs::corpus::capture_from_env(
+        crate::programs::corpus::capture_with_runtime_from_env(
+            &compiler_runtime,
             provider.name(),
             provider.default_model(),
             "named_brain",

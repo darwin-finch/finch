@@ -16,7 +16,8 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use crate::vm::frontend::{compile_forth, compile_lisp};
+use crate::vm::frontend::forth::compile_forth_with_functions;
+use crate::vm::frontend::lisp::compile_lisp_with_functions;
 
 pub const WIRE_CORPUS_FORMAT_VERSION: u32 = 1;
 pub const WIRE_CORPUS_PATH_ENV: &str = "FINCH_WIRE_CORPUS_PATH";
@@ -33,7 +34,7 @@ pub enum WireCorpusAttempt {
 /// This record is intentionally source-bearing and therefore separate from
 /// normal metrics. It contains no user prompt, tool result, credential, or VM
 /// output. Users still control whether and where it is written.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireCorpusEntry {
     pub format_version: u32,
     pub manifest_protocol_version: u32,
@@ -45,6 +46,8 @@ pub struct WireCorpusEntry {
     pub attempt: WireCorpusAttempt,
     pub source_sha256: String,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiler_context: Option<crate::runtime::ProgramCompilerContext>,
 }
 
 impl WireCorpusEntry {
@@ -67,7 +70,16 @@ impl WireCorpusEntry {
             attempt,
             source_sha256: hex::encode(Sha256::digest(source.as_bytes())),
             source,
+            compiler_context: None,
         }
+    }
+
+    pub fn with_compiler_context(
+        mut self,
+        compiler_context: crate::runtime::ProgramCompilerContext,
+    ) -> Self {
+        self.compiler_context = Some(compiler_context);
+        self
     }
 }
 
@@ -134,6 +146,29 @@ pub fn capture_from_env(
     }
 }
 
+pub fn capture_with_runtime_from_env(
+    runtime: &crate::runtime::ProgramRuntime,
+    provider: &str,
+    model: &str,
+    surface: &str,
+    attempt: WireCorpusAttempt,
+    source: &str,
+) {
+    let Some(logger) = WireCorpusLogger::from_env() else {
+        return;
+    };
+    let mut entry = WireCorpusEntry::new(provider, model, surface, attempt, source);
+    match runtime.compiler_context() {
+        Ok(context) => entry = entry.with_compiler_context(context),
+        Err(error) => {
+            tracing::warn!("failed to snapshot provider corpus compiler context: {error}")
+        }
+    }
+    if let Err(error) = logger.append(&entry) {
+        tracing::warn!("failed to append opt-in provider wire corpus: {error}");
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireCorpusCounts {
     pub total: usize,
@@ -180,7 +215,6 @@ impl WireCorpusCounts {
 pub fn audit(path: &Path) -> Result<WireCorpusAudit> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("open wire corpus {}", path.display()))?;
-    let vocabulary = crate::vm::core_vocabulary();
     let mut audit = WireCorpusAudit {
         format_version: WIRE_CORPUS_FORMAT_VERSION,
         ..WireCorpusAudit::default()
@@ -216,6 +250,15 @@ pub fn audit(path: &Path) -> Result<WireCorpusAudit> {
         *audit.source_versions.entry(source_version).or_default() += 1;
 
         let key = format!("{}/{}", entry.provider, entry.model);
+        let mut vocabulary = crate::vm::core_vocabulary();
+        let linked_functions = entry
+            .compiler_context
+            .as_ref()
+            .map(|context| context.functions.clone())
+            .unwrap_or_default();
+        for (name, function) in &linked_functions {
+            vocabulary.insert(name.clone(), function.signature.clone());
+        }
         let language = ProgramLanguage::infer_wire_source(&entry.source);
         if let Ok(language) = language {
             audit.counts.record_language(language);
@@ -229,12 +272,20 @@ pub fn audit(path: &Path) -> Result<WireCorpusAudit> {
             .map_err(|error| error.to_string())
             .and_then(|language| {
                 let verified = match language {
-                    ProgramLanguage::Forth => {
-                        compile_forth("wire-corpus.forth", &entry.source, Vec::new(), &vocabulary)
-                    }
-                    ProgramLanguage::Lisp => {
-                        compile_lisp("wire-corpus.lisp", &entry.source, Vec::new(), &vocabulary)
-                    }
+                    ProgramLanguage::Forth => compile_forth_with_functions(
+                        "wire-corpus.forth",
+                        &entry.source,
+                        Vec::new(),
+                        &vocabulary,
+                        &linked_functions,
+                    ),
+                    ProgramLanguage::Lisp => compile_lisp_with_functions(
+                        "wire-corpus.lisp",
+                        &entry.source,
+                        Vec::new(),
+                        &vocabulary,
+                        &linked_functions,
+                    ),
                 };
                 verified.map(|_| ()).map_err(|diagnostics| {
                     diagnostics
@@ -318,5 +369,44 @@ mod tests {
         )
         .unwrap();
         assert!(audit(&path).unwrap_err().to_string().contains("hash check"));
+    }
+
+    #[tokio::test]
+    async fn replay_uses_captured_promoted_word_context_without_execution() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let outcome = runtime
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: ProgramLanguage::Lisp,
+                source_id: Some("corpus-context.lisp".to_string()),
+                source: "(define (double (n : int)) (* n 2))".to_string(),
+                intent: "prepare corpus compiler context".to_string(),
+                effect: crate::programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Completed
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("contextual.jsonl");
+        let entry = WireCorpusEntry::new(
+            "xai",
+            "grok",
+            "interactive",
+            WireCorpusAttempt::FirstPass,
+            "(say (int-to-string (double 21)))",
+        )
+        .with_compiler_context(runtime.compiler_context().unwrap());
+        WireCorpusLogger::new(&path).append(&entry).unwrap();
+
+        let report = audit(&path).unwrap();
+        assert_eq!(report.counts.accepted, 1);
+        assert_eq!(report.counts.rejected, 0);
     }
 }

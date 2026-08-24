@@ -2116,7 +2116,8 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
             &guard,
         )
         .await?;
-    finch::programs::corpus::capture_from_env(
+    finch::programs::corpus::capture_with_runtime_from_env(
+        &program_runtime,
         "daemon",
         "daemon-selected",
         "one_shot",
@@ -2164,7 +2165,8 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
                     &guard,
                 )
                 .await?;
-            finch::programs::corpus::capture_from_env(
+            finch::programs::corpus::capture_with_runtime_from_env(
+                &program_runtime,
                 "daemon",
                 "daemon-selected",
                 "one_shot",
@@ -2191,7 +2193,8 @@ async fn run_query(query: &str, cloud_only: bool, show_program: bool) -> Result<
                     &guard,
                 )
                 .await?;
-            finch::programs::corpus::capture_from_env(
+            finch::programs::corpus::capture_with_runtime_from_env(
+                &program_runtime,
                 "daemon",
                 "daemon-selected",
                 "one_shot",
@@ -2287,7 +2290,8 @@ async fn run_query_teacher_only(
         // as though it were an ordinary chat response.
         if !response.has_tool_uses() {
             let source = response.text();
-            finch::programs::corpus::capture_from_env(
+            finch::programs::corpus::capture_with_runtime_from_env(
+                &program_runtime,
                 &provider,
                 &model,
                 "one_shot",
