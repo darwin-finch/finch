@@ -20,7 +20,7 @@ use crate::vm::{
 };
 use crate::vm::vocabulary::{
     agent_task_result_type, agent_task_snapshot_type, agent_task_spec_type, core_word_spec,
-    CoreHostBinding, CoreWordImplementation,
+    tree_entry_type, tree_listing_type, CoreHostBinding, CoreWordImplementation,
 };
 use anyhow::{bail, Context, Result};
 use automation::AutomationBroker;
@@ -29,7 +29,8 @@ use context::{ExecutionBudget, ExecutionContext};
 use outcome::{ExecutionBackend, ExecutionOutcome, ExecutionStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -3606,6 +3607,40 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                             .map_err(|message| host_binding_error(origin, message))?;
                         return Ok(vec![TypedValue::String(hex_digest(&digest))]);
                     }
+                    Some("tree-list") => {
+                        let [_, TypedValue::Int(max_entries)] = arguments.as_slice() else {
+                            return Err(host_binding_error(
+                                origin,
+                                "tree-list requires a directory path and maximum entry count",
+                            ));
+                        };
+                        let max_entries = usize::try_from(*max_entries).map_err(|_| {
+                            host_binding_error(
+                                origin,
+                                "tree-list maximum entries must be between 1 and 100000",
+                            )
+                        })?;
+                        if !(1..=100_000).contains(&max_entries) {
+                            return Err(host_binding_error(
+                                origin,
+                                "tree-list maximum entries must be between 1 and 100000",
+                            ));
+                        }
+                        let (entries, truncated) = list_directory_tree(&path, max_entries)
+                            .map_err(|message| host_binding_error(origin, message))?;
+                        let value = TypedValue::Record(vec![
+                            (
+                                "entries".into(),
+                                TypedValue::List {
+                                    element_type: tree_entry_type(),
+                                    values: entries,
+                                },
+                            ),
+                            ("truncated".into(), TypedValue::Bool(truncated)),
+                        ]);
+                        debug_assert_eq!(value.value_type(), tree_listing_type());
+                        return Ok(vec![value]);
+                    }
                     Some("tree-merkle") => {
                         if arguments.len() != 1 {
                             return Err(host_binding_error(origin, "tree-merkle requires one path"));
@@ -4277,6 +4312,97 @@ fn sha256_file(path: &Path) -> std::result::Result<[u8; 32], String> {
 
 fn hex_digest(digest: &[u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Return the lexicographically first bounded slice of a directory tree.
+///
+/// The priority queue makes traversal order independent of host `read_dir`
+/// order while retaining a strict memory/entry bound. Symlinks are rejected
+/// instead of followed so an authorized workspace selector cannot escape
+/// through mutable filesystem topology after verification.
+fn list_directory_tree(
+    root: &Path,
+    maximum_entries: usize,
+) -> std::result::Result<(Vec<TypedValue>, bool), String> {
+    const MAX_SCANNED_DIRECTORY_ENTRIES: usize = 100_000;
+    let metadata = std::fs::symlink_metadata(root).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Err("tree-list rejects a symlink root".into());
+    }
+    if !metadata.is_dir() {
+        return Err("tree-list requires a directory path".into());
+    }
+
+    let mut pending = BinaryHeap::new();
+    let mut scanned = 0;
+    enqueue_directory_entries(
+        root,
+        root,
+        &mut pending,
+        &mut scanned,
+        MAX_SCANNED_DIRECTORY_ENTRIES,
+    )?;
+    let mut entries = Vec::with_capacity(maximum_entries.min(pending.len()));
+
+    while entries.len() < maximum_entries {
+        let Some(Reverse((relative, path))) = pending.pop() else {
+            break;
+        };
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("tree-list rejects symlink '{relative}'"));
+        }
+        let (kind, size) = if metadata.is_dir() {
+            enqueue_directory_entries(
+                root,
+                &path,
+                &mut pending,
+                &mut scanned,
+                MAX_SCANNED_DIRECTORY_ENTRIES,
+            )?;
+            ("directory", 0)
+        } else if metadata.is_file() {
+            let size = i64::try_from(metadata.len())
+                .map_err(|_| format!("tree-list file '{relative}' is too large to represent"))?;
+            ("file", size)
+        } else {
+            return Err(format!(
+                "tree-list rejects unsupported entry '{relative}'"
+            ));
+        };
+        entries.push(TypedValue::Record(vec![
+            ("path".into(), TypedValue::String(relative)),
+            ("kind".into(), TypedValue::String(kind.into())),
+            ("size".into(), TypedValue::Int(size)),
+        ]));
+    }
+    Ok((entries, !pending.is_empty()))
+}
+
+fn enqueue_directory_entries(
+    root: &Path,
+    directory: &Path,
+    pending: &mut BinaryHeap<Reverse<(String, PathBuf)>>,
+    scanned: &mut usize,
+    maximum_scanned_entries: usize,
+) -> std::result::Result<(), String> {
+    for entry in std::fs::read_dir(directory).map_err(|error| error.to_string())? {
+        *scanned += 1;
+        if *scanned > maximum_scanned_entries {
+            return Err(format!(
+                "tree-list exceeds the {maximum_scanned_entries} scanned-entry limit"
+            ));
+        }
+        let path = entry.map_err(|error| error.to_string())?.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| error.to_string())?
+            .to_str()
+            .ok_or_else(|| "tree-list cannot represent a non-UTF-8 path".to_string())?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        pending.push(Reverse((relative, path)));
+    }
+    Ok(())
 }
 
 /// Compute a bounded, deterministic digest for a directory tree.  This is an
@@ -5778,6 +5904,79 @@ mod tests {
 
         std::fs::write(tree.join("nested").join("beta.txt"), "changed").unwrap();
         assert_ne!(first, merkle_directory(&tree).unwrap());
+    }
+
+    #[test]
+    fn tree_list_is_sorted_bounded_and_structural() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("a-dir")).unwrap();
+        std::fs::write(root.path().join("z.txt"), "z").unwrap();
+        std::fs::write(root.path().join("a-dir").join("b.txt"), "beta").unwrap();
+        std::fs::write(root.path().join("a.txt"), "alpha").unwrap();
+
+        let (entries, truncated) = list_directory_tree(root.path(), 3).unwrap();
+        assert!(truncated);
+        assert_eq!(entries.len(), 3);
+        let paths = entries
+            .iter()
+            .map(|entry| match entry {
+                TypedValue::Record(fields) => fields
+                    .iter()
+                    .find_map(|(name, value)| {
+                        (name == "path").then_some(value).and_then(|value| match value {
+                            TypedValue::String(path) => Some(path.as_str()),
+                            _ => None,
+                        })
+                    })
+                    .expect("tree entry path"),
+                _ => panic!("tree-list must return records"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["a-dir", "a-dir/b.txt", "a.txt"]);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.value_type() == tree_entry_type()));
+    }
+
+    #[tokio::test]
+    async fn typed_tree_list_has_identical_lisp_and_forth_results() {
+        let mut results = Vec::new();
+        for (language, source) in [
+            (
+                ProgramLanguage::Lisp,
+                "(tree-list (path \"src/vm\") 5)",
+            ),
+            (
+                ProgramLanguage::Forth,
+                "s\"src/vm\" path 5 tree-list",
+            ),
+        ] {
+            let runtime = ProgramRuntime::new();
+            runtime
+                .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                    crate::vm::FileOperation::Read,
+                    crate::vm::FileSelector::parse("./**").unwrap(),
+                ))
+                .unwrap();
+            let outcome = runtime
+                .submit_typed_only(submission(
+                    language,
+                    source,
+                    ExecutionEffect::WorkspaceRead,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(outcome.status, ExecutionStatus::Completed);
+            assert!(matches!(
+                outcome.values.as_slice(),
+                [ProgramValue::Record(fields)]
+                    if fields.iter().any(|(name, value)| {
+                        name == "truncated" && value == &ProgramValue::Bool(true)
+                    })
+            ));
+            results.push(outcome.values);
+        }
+        assert_eq!(results[0], results[1]);
     }
 
     #[tokio::test]
