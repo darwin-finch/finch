@@ -445,7 +445,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   creating a `ProgramRuntime` or executing effects. Still collect and freeze a representative
   multi-provider corpus, retain exact provider/model rather than only an interactive profile name,
   preserve the relevant vocabulary/module context for submissions that call promoted words, add
-  token/latency metadata, and publish the first reproducible report.
+  token/latency metadata, and expand the reproducible reports. The first source-free checked-in
+  smoke artifact is `docs/conformance/2026-08-24-grok-code-fast-1.json`: its private captured
+  corpus replayed 3/3 programs successfully under manifest 1 / VM type system 5. Its three tasks
+  and one provider are deliberately documented as insufficient to close this gate.
 
 ### Separate language/compiler research track — not a Brain convergence prerequisite
 
