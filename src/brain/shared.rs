@@ -386,15 +386,19 @@ impl SharedBrainStore {
             .expect("shared brain lock poisoned")
             .get(name)
             .and_then(|state| state.runtime_checkpoint.clone());
-        let runtime = Arc::new(match checkpoint {
-            Some(checkpoint) => {
-                crate::runtime::ProgramRuntime::from_checkpoint_at_revision(
-                    self.read_runtime_checkpoint(name, &checkpoint.checkpoint_sha256)?,
-                    checkpoint.durable_revision,
-                )?
-            }
+        let mut runtime = match checkpoint {
+            Some(checkpoint) => crate::runtime::ProgramRuntime::from_checkpoint_at_revision(
+                self.read_runtime_checkpoint(name, &checkpoint.checkpoint_sha256)?,
+                checkpoint.durable_revision,
+            )?,
             None => crate::runtime::ProgramRuntime::new(),
-        });
+        };
+        if let Some(authority_store) = self.runtime_authority_store(name) {
+            authority_store
+                .restore_into(&mut runtime)
+                .with_context(|| format!("restore authority for named Brain '{name}'"))?;
+        }
+        let runtime = Arc::new(runtime);
         let mut runtimes = self
             .runtimes
             .write()
@@ -432,6 +436,11 @@ impl SharedBrainStore {
             .write()
             .expect("shared brain checkpoint lock poisoned")
             .insert(checkpoint_sha256.clone(), checkpoint);
+        if let Some(authority_store) = self.runtime_authority_store(name) {
+            authority_store
+                .save(runtime)
+                .with_context(|| format!("persist authority for named Brain '{name}'"))?;
+        }
         self.push(
             name,
             "daemon",
@@ -505,6 +514,21 @@ impl SharedBrainStore {
         std::fs::rename(&temporary, &path)
             .with_context(|| format!("commit {}", path.display()))?;
         Ok(())
+    }
+
+    /// Return the host-policy record associated with this named Brain. This
+    /// path is deliberately neither content-addressed nor part of a VM
+    /// checkpoint: restoring executable state alone must never restore
+    /// authority.
+    fn runtime_authority_store(
+        &self,
+        name: &str,
+    ) -> Option<crate::runtime::archive_store::ProgramRuntimeAuthorityStore> {
+        self.root.as_ref().map(|root| {
+            crate::runtime::archive_store::ProgramRuntimeAuthorityStore::new(
+                root.join(name).join("authority.json"),
+            )
+        })
     }
 
     fn ensure_loaded(&self, name: &str) -> Result<()> {
@@ -804,6 +828,134 @@ mod tests {
         );
         assert_eq!(outcome.values, vec![crate::programs::ProgramValue::Int(49)]);
         assert_eq!(outcome.output_revision, committed_revision + 1);
+    }
+
+    #[tokio::test]
+    async fn named_brain_restores_scoped_authority_from_its_separate_policy_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let runtime = store.program_runtime("brain").unwrap();
+        let session_id = runtime.capability_session_id();
+        let grant_id = runtime
+            .issue_typed_capability(
+                crate::vm::CapabilityRequirement {
+                    capability: crate::vm::CapabilityKind::ProcessRun,
+                    selector: crate::vm::ResourceSelector::None,
+                },
+                crate::vm::GrantScope::Session { session_id },
+                "test-user",
+                None,
+            )
+            .unwrap();
+        let outcome = runtime
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Forth,
+                source_id: Some("brain:event:1".into()),
+                source: "42".into(),
+                intent: "create a durable revision".into(),
+                effect: crate::programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        store
+            .commit_runtime("brain", 1, outcome.output_revision, &runtime)
+            .unwrap();
+
+        let authority_path = temp.path().join("brain/authority.json");
+        assert!(authority_path.exists());
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restored = restarted.program_runtime("brain").unwrap();
+        assert_eq!(restored.capability_session_id(), session_id);
+        let ledger = restored.capability_ledger().unwrap();
+        assert_eq!(ledger.grants.grants.len(), 1);
+        assert_eq!(ledger.grants.grants[0].id, grant_id);
+        assert!(matches!(
+            ledger.grants.grants[0].scope,
+            crate::vm::GrantScope::Session { session_id: restored_id } if restored_id == session_id
+        ));
+        assert_eq!(ledger.audit.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn named_brain_checkpoint_without_authority_record_restores_without_grants() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let runtime = store.program_runtime("brain").unwrap();
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::ProcessRun,
+                selector: crate::vm::ResourceSelector::None,
+            })
+            .unwrap();
+        let outcome = runtime
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Forth,
+                source_id: None,
+                source: "7".into(),
+                intent: "checkpoint without authority".into(),
+                effect: crate::programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        store
+            .commit_runtime("brain", 1, outcome.output_revision, &runtime)
+            .unwrap();
+        std::fs::remove_file(temp.path().join("brain/authority.json")).unwrap();
+
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restored = restarted.program_runtime("brain").unwrap();
+        assert_eq!(restored.revision(), outcome.output_revision);
+        assert!(restored
+            .capability_ledger()
+            .unwrap()
+            .grants
+            .grants
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn named_brain_rejects_a_tampered_authority_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let runtime = store.program_runtime("brain").unwrap();
+        let outcome = runtime
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Forth,
+                source_id: None,
+                source: "1".into(),
+                intent: "persist authority envelope".into(),
+                effect: crate::programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        store
+            .commit_runtime("brain", 1, outcome.output_revision, &runtime)
+            .unwrap();
+        let authority_path = temp.path().join("brain/authority.json");
+        let mut authority: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&authority_path).unwrap()).unwrap();
+        authority["authority"]["project_id"] = serde_json::json!("tampered-project");
+        std::fs::write(&authority_path, serde_json::to_vec(&authority).unwrap()).unwrap();
+
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let error = restarted
+            .program_runtime("brain")
+            .err()
+            .expect("tampered authority must fail closed");
+        assert!(error.to_string().contains("restore authority"));
+        assert!(format!("{error:#}").contains("integrity check"));
     }
 
     #[tokio::test]
