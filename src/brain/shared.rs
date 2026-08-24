@@ -102,8 +102,16 @@ pub enum BrainWireMessage {
 struct BrainState {
     events: Vec<BrainEvent>,
     program_stack: Vec<BrainProgram>,
-    runtime_checkpoint: Option<(u64, String)>,
+    runtime_checkpoint: Option<RuntimeCheckpointState>,
+    runtime_commit_count: u64,
     tx: broadcast::Sender<BrainEvent>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeCheckpointState {
+    request_seq: u64,
+    durable_revision: u64,
+    checkpoint_sha256: String,
 }
 
 impl BrainState {
@@ -113,6 +121,7 @@ impl BrainState {
             events: Vec::new(),
             program_stack: Vec::new(),
             runtime_checkpoint: None,
+            runtime_commit_count: 0,
             tx,
         };
         for event in events {
@@ -137,17 +146,28 @@ impl BrainState {
                 }
             }
             BrainEventKind::RuntimeCommitted {
+                request_seq,
                 runtime_revision,
                 checkpoint_sha256,
-                ..
             } => {
-                if self
+                self.runtime_commit_count += 1;
+                let durable_revision = self
                     .runtime_checkpoint
                     .as_ref()
-                    .is_none_or(|(current, _)| runtime_revision >= current)
-                {
-                    self.runtime_checkpoint =
-                        Some((*runtime_revision, checkpoint_sha256.clone()));
+                    .map(|checkpoint| checkpoint.durable_revision)
+                    .unwrap_or(0)
+                    .max(*runtime_revision)
+                    .max(self.runtime_commit_count);
+                if self.runtime_checkpoint.as_ref().is_none_or(|current| {
+                    request_seq >= &current.request_seq
+                }) {
+                    self.runtime_checkpoint = Some(RuntimeCheckpointState {
+                        request_seq: *request_seq,
+                        durable_revision,
+                        checkpoint_sha256: checkpoint_sha256.clone(),
+                    });
+                } else if let Some(current) = self.runtime_checkpoint.as_mut() {
+                    current.durable_revision = durable_revision;
                 }
             }
             BrainEventKind::Prompt { .. } | BrainEventKind::Result { .. } => {}
@@ -328,10 +348,10 @@ impl SharedBrainStore {
             .get(name)
             .and_then(|state| state.runtime_checkpoint.clone());
         let runtime = Arc::new(match checkpoint {
-            Some((runtime_revision, checkpoint_sha256)) => {
+            Some(checkpoint) => {
                 crate::runtime::ProgramRuntime::from_checkpoint_at_revision(
-                    self.read_runtime_checkpoint(name, &checkpoint_sha256)?,
-                    runtime_revision,
+                    self.read_runtime_checkpoint(name, &checkpoint.checkpoint_sha256)?,
+                    checkpoint.durable_revision,
                 )?
             }
             None => crate::runtime::ProgramRuntime::new(),
@@ -757,6 +777,94 @@ mod tests {
                 crate::programs::ProgramValue::Int(2),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_restart_revision_reset_keeps_the_latest_request_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let submit = |source: &str, revision| crate::runtime::ProgramSubmission {
+            language: crate::programs::ProgramLanguage::Forth,
+            source_id: None,
+            source: source.into(),
+            intent: "legacy revision migration".into(),
+            effect: crate::programs::ExecutionEffect::Pure,
+            declared_capabilities: Vec::new(),
+            manifest_generation: runtime.manifest_generation(),
+            expected_revision: Some(revision),
+            budget: None,
+        };
+        let first = runtime
+            .submit_typed_only(submit(
+                ": square ( S n:int -- S int ! pure ) n n * ;",
+                0,
+            ))
+            .await
+            .unwrap();
+        store
+            .commit_runtime("brain", 1, first.output_revision, &runtime)
+            .unwrap();
+        let second = runtime
+            .submit_typed_only(submit("1 drop", first.output_revision))
+            .await
+            .unwrap();
+        store
+            .commit_runtime("brain", 2, second.output_revision, &runtime)
+            .unwrap();
+
+        // ProgramRuntime::from_checkpoint historically reset its local
+        // revision. Simulate an old daemon adding newer state as revision 1.
+        let checkpoint = runtime
+            .revision_history()
+            .unwrap()
+            .last()
+            .and_then(|snapshot| snapshot.checkpoint.clone())
+            .unwrap();
+        let legacy_restarted = crate::runtime::ProgramRuntime::from_checkpoint(checkpoint).unwrap();
+        let legacy_commit = legacy_restarted
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Forth,
+                source_id: None,
+                source: ": cube ( S n:int -- S int ! pure ) n n * n * ;".into(),
+                intent: "new state after legacy restart".into(),
+                effect: crate::programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: legacy_restarted.manifest_generation(),
+                expected_revision: Some(0),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(legacy_commit.output_revision, 1);
+        store
+            .commit_runtime(
+                "brain",
+                3,
+                legacy_commit.output_revision,
+                &legacy_restarted,
+            )
+            .unwrap();
+
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restored = restarted.program_runtime("brain").unwrap();
+        assert_eq!(restored.revision(), 3);
+        let called = restored
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Lisp,
+                source_id: None,
+                source: "(cube 4)".into(),
+                intent: "call latest migrated definition".into(),
+                effect: crate::programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: restored.manifest_generation(),
+                expected_revision: Some(3),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(called.values, vec![crate::programs::ProgramValue::Int(64)]);
+        assert_eq!(called.output_revision, 4);
     }
 
     #[test]
