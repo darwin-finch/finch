@@ -156,8 +156,14 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   submission/resume boundaries, and VM checkpoints still contain no authority. The ledger now
   validates issuance for every declared scope, records source-free authorization decisions in the
   same total order, and atomically consumes a matching `once` grant after its first successful
-  decision. Wire those scoped decisions into each ProgramRun's host-owned identity/effect boundary;
-  durable application storage, policy-driven revocation, and complete host adapters remain.
+  decision. Each private ProgramRun now derives reusable authority from its exact task, session,
+  project, and policy identity; exact grants never enter ambient runtime authority. Approval prompts
+  have deterministic execution/effect-bound IDs and preserve child ancestry. The atomic
+  `resolve_typed_approval` path revalidates the retained prompt, issues the selected scope, audits
+  allow/deny, consumes `once`, resumes only that pending boundary, and rejects stale or forged UI
+  actions before they can create reusable authority. Still bind this API to the application dialog,
+  persist Brain-owned scope identity and ledger state, implement availability/policy-driven
+  revocation and child attenuation, and complete the host adapters.
 - [ ] Bind files, native tools, processes, network, automation, MemTree, schedules, response output,
   and agent fork/join/model selection through typed VM primitives.
 - [ ] Define a compact, discoverable data-work vocabulary before asking models to synthesize their
