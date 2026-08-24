@@ -40,9 +40,9 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   host-implementation registry.
 - [ ] Finish Lisp source maps: the reader now retains structural spans and typed lowering preserves
   exact nested named-call operators/arguments, `begin`/`if`, definitions, `let`, lambdas,
-  closure-call targets, typed matches, and loops. Still thread those spans through deferred-task
-  special forms and macro-expansion ancestry. Do not regress to whole-submission spans or invent
-  locations by source-text searching.
+  closure-call targets, typed matches, loops, and deferred tasks. Still attach macro-expansion
+  ancestry to generated forms. Do not regress to whole-submission spans or invent locations by
+  source-text searching.
 - [x] Make documentation a first-class field of typed Lisp/Co-Forth definitions and promotion
   records, not merely leading source comments. Preserve `; finch-doc:` / `\ finch-doc:` as a
   self-contained-script spelling, retain exact immutable version metadata, and converge provider
