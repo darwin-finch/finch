@@ -32,7 +32,7 @@ pub use messages::{
     ProgressMessage, StaticMessage, StreamingResponseMessage, ToolExecutionMessage,
     UserQueryMessage,
 };
-pub use output_manager::OutputManager;
+pub use output_manager::{OutputManager, VmOutputProjection};
 pub use repl::{Repl, ReplMode};
 pub use setup_wizard::show_setup_wizard;
 pub use status_bar::{StatusBar, StatusLine, StatusLineType};

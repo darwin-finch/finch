@@ -1962,6 +1962,20 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         &mut self,
         effect: &VmSideEffect,
     ) -> std::result::Result<(), VmDiagnostic> {
+        // `output-open` is unusual among awaited host effects in the
+        // synchronous Finch adapter.  The adapter immediately issues a
+        // program-owned handle and projects a `Ui::Create` event with this
+        // effect's sequence below in `request_effect`.  Forwarding the
+        // preceding request as well would give one client projection two
+        // different events at the same `(execution_id, sequence)`: it would
+        // advance its cursor for the no-op request and then discard Create as
+        // a duplicate.  A portable deferred host, in contrast, owns handle
+        // issuance and must receive the original request.
+        let synchronous_output_open = effect.origin.word.as_deref() == Some("output-open")
+            && !self.deferred_host_effects.defers(effect);
+        if synchronous_output_open {
+            return Ok(());
+        }
         if let Some(sink) = &self.typed_effect_sink {
             sink(VmEffectEnvelope {
                 execution_id: self.execution_id,
@@ -5075,8 +5089,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn output_open_projects_a_create_event_before_later_updates() {
+    async fn synchronous_output_open_projects_one_sequence_ordered_create_event() {
         let runtime = ProgramRuntime::new();
+        let output_manager = Arc::new(crate::cli::OutputManager::default());
+        output_manager.disable_stdout();
+        let response = output_manager.start_work_unit("VM program output");
+        response.set_program_output();
+        let projection = crate::cli::VmOutputProjection::new(
+            Arc::clone(&output_manager),
+            Arc::clone(&response),
+        );
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink: TypedEffectSink = {
             let events = Arc::clone(&events);
@@ -5098,33 +5120,20 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.status, ExecutionStatus::Completed);
         let events = events.lock().unwrap();
-        let create_index = events
-            .iter()
-            .position(|effect| {
-                matches!(
-                    &effect.effect.event,
-                    crate::vm::interpreter::HostSideEffect::Ui {
-                        operation: crate::vm::interpreter::UiOperation::Create,
-                        ..
-                    }
-                )
-            })
-            .expect("output-open must project a UI create event");
-        let request_index = events
-            .iter()
-            .position(|effect| {
-                matches!(
-                    &effect.effect.event,
-                    crate::vm::interpreter::HostSideEffect::Request { .. }
-                )
-            })
-            .expect("output-open must retain its portable host request");
-        assert!(
-            request_index < create_index,
-            "the durable host request must be journaled before its host-created UI projection"
+        assert_eq!(
+            events
+                .iter()
+                .map(|envelope| envelope.effect.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "one visible event must exist for each UI sequence"
         );
+        assert!(events.iter().all(|effect| !matches!(
+            effect.effect.event,
+            crate::vm::interpreter::HostSideEffect::Request { .. }
+        )));
         assert!(matches!(
-            events.get(create_index).map(|effect| &effect.effect.event),
+            events.first().map(|effect| &effect.effect.event),
             Some(crate::vm::interpreter::HostSideEffect::Ui {
                 operation: crate::vm::interpreter::UiOperation::Create,
                 text: Some(title),
@@ -5139,6 +5148,18 @@ mod tests {
                 ..
             })
         ));
+        for event in events.iter() {
+            assert!(
+                projection.project_envelope(event),
+                "the UI projection must not discard a same-sequence create event"
+            );
+        }
+        let messages = output_manager.get_messages();
+        assert_eq!(messages.len(), 2, "response port plus output handle");
+        assert_eq!(messages[1].status(), crate::cli::messages::MessageStatus::Complete);
+        assert!(messages[1]
+            .format(&crate::config::ColorScheme::default())
+            .contains("download"));
     }
 
     #[tokio::test]
@@ -5167,7 +5188,10 @@ mod tests {
         let events = events.lock().unwrap();
         assert!(matches!(
             events.first().map(|effect| &effect.effect.event),
-            Some(crate::vm::interpreter::HostSideEffect::Request { .. })
+            Some(crate::vm::interpreter::HostSideEffect::Ui {
+                operation: crate::vm::interpreter::UiOperation::Create,
+                ..
+            })
         ));
         assert!(events.iter().any(|effect| matches!(
             &effect.effect.event,
