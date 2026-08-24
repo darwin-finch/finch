@@ -132,8 +132,8 @@ immutable signature/documentation/implementation registry, and the broker has a 
 promoted vocabulary still needs the same registry migration. Named Brain storage now restores its
 integrity-checked host authority record separately from content-addressed VM checkpoints, so a
 checkpoint copied without that record confers no grants. Policy mutation persistence outside Brain
-runtime commits, policy-driven revocation, complete host adapters, and provider conformance remain
-unfinished.
+runtime commits is now immediate and fail-closed through an application-owned authority sink.
+Policy-driven revocation, complete host adapters, and provider conformance remain unfinished.
 
 The target removes those explicit migration APIs after conformance parity and gives interpreted
 and JIT execution the same verified IR, transaction, and error behavior.
