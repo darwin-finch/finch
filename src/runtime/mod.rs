@@ -307,7 +307,7 @@ pub struct ProgramRuntime {
     /// Host authority is application state, separate from reducible VM
     /// checkpoints. Stable grant IDs and audit events can be persisted beside
     /// a Brain/session log, while only the active requirements enter a run.
-    capability_ledger: Mutex<CapabilityLedger>,
+    capability_ledger: Arc<Mutex<CapabilityLedger>>,
     schedule_queue: RwLock<Option<Arc<TaskQueue>>>,
     agent_scheduler: RwLock<Weak<scheduler::AgentScheduler>>,
     /// Daemon-owned typed continuations keyed by the execution id visible in
@@ -555,7 +555,7 @@ impl ProgramRuntime {
             network: Arc::new(Mutex::new(HashMap::new())),
             output_handles: Arc::new(Mutex::new(HashMap::new())),
             streams: Arc::new(Mutex::new(HashMap::new())),
-            capability_ledger: Mutex::new(CapabilityLedger::default()),
+            capability_ledger: Arc::new(Mutex::new(CapabilityLedger::default())),
             schedule_queue: RwLock::new(None),
             agent_scheduler: RwLock::new(Weak::new()),
             pending_typed: Mutex::new(HashMap::new()),
@@ -1360,7 +1360,7 @@ impl ProgramRuntime {
         actor: impl Into<String>,
     ) -> Result<ExecutionOutcome> {
         let actor = actor.into();
-        let (pending, effect_sequence, exact_once, denied) = {
+        let (pending, effect_sequence, denied) = {
             let _submission = self.submission_gate.lock().await;
             let mut pending_runs = self
                 .pending_typed
@@ -1400,7 +1400,7 @@ impl ProgramRuntime {
             let context = self.authorization_context_for(pending.caller.as_ref());
             let denied = matches!(&choice, ApprovalChoice::Deny);
 
-            let exact_once = if denied {
+            if denied {
                 self.capability_ledger
                     .lock()
                     .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?
@@ -1410,16 +1410,14 @@ impl ProgramRuntime {
                         actor.clone(),
                         context.now_unix_ms,
                     );
-                false
             } else {
-                let (requirement, scope, exact_once) = match choice {
+                let (requirement, scope) = match choice {
                     ApprovalChoice::Deny => unreachable!("denial handled above"),
                     ApprovalChoice::AllowOnce => (
                         prompt.exact.clone(),
                         GrantScope::Once {
                             request_id: prompt.request.id,
                         },
-                        true,
                     ),
                     ApprovalChoice::AllowTask => {
                         let task_id = pending
@@ -1431,25 +1429,19 @@ impl ProgramRuntime {
                                     "task-scoped approval requires a child task identity"
                                 )
                             })?;
-                        (
-                            prompt.exact.clone(),
-                            GrantScope::Task { task_id },
-                            false,
-                        )
+                        (prompt.exact.clone(), GrantScope::Task { task_id })
                     }
                     ApprovalChoice::AllowSession => (
                         prompt.exact.clone(),
                         GrantScope::Session {
                             session_id: self.session_id,
                         },
-                        false,
                     ),
                     ApprovalChoice::AllowProjectExact => (
                         prompt.exact.clone(),
                         GrantScope::Project {
                             project_id: self.project_id.clone(),
                         },
-                        false,
                     ),
                     ApprovalChoice::AllowProjectPattern { requirement } => {
                         if !requirement.covers(&prompt.exact) {
@@ -1460,14 +1452,9 @@ impl ProgramRuntime {
                             GrantScope::Project {
                                 project_id: self.project_id.clone(),
                             },
-                            false,
                         )
                     }
-                    ApprovalChoice::AllowGlobal => (
-                        prompt.exact.clone(),
-                        GrantScope::Global,
-                        false,
-                    ),
+                    ApprovalChoice::AllowGlobal => (prompt.exact.clone(), GrantScope::Global),
                 };
                 let mut ledger = self
                     .capability_ledger
@@ -1484,17 +1471,16 @@ impl ProgramRuntime {
                     )
                     .map_err(anyhow::Error::msg)?;
                 if !matches!(
-                    ledger.authorize(&prompt.request, &context, actor.clone()),
+                    ledger.grants.authorize(&prompt.request, &context),
                     AuthorizationDecision::Allowed { .. }
                 ) {
                     bail!("new capability grant did not authorize its exact request");
                 }
-                exact_once
-            };
+            }
             let pending = pending_runs
                 .remove(&prompt.request.execution_id)
                 .expect("approval target was validated while holding the pending lock");
-            (pending, effect_sequence, exact_once, denied)
+            (pending, effect_sequence, denied)
         };
 
         if denied {
@@ -1510,7 +1496,7 @@ impl ProgramRuntime {
             pending,
             Some(effect_sequence),
             None,
-            exact_once,
+            true,
         )
         .await
     }
@@ -2253,6 +2239,7 @@ impl ProgramRuntime {
                 submission.language,
                 &source_id,
                 &submission.source,
+                &submission.intent,
                 &context,
                 &submission.declared_capabilities,
                 caller.clone(),
@@ -2424,6 +2411,7 @@ impl ProgramRuntime {
         language: ProgramLanguage,
         source_id: &str,
         source: &str,
+        intent: &str,
         context: &ExecutionContext,
         declared_capabilities: &[CapabilityRequirement],
         caller: Option<scheduler::AgentIdentity>,
@@ -2451,13 +2439,20 @@ impl ProgramRuntime {
             .read()
             .expect("agent scheduler lock poisoned")
             .upgrade()
-            .map(|scheduler| agent_vm::AgentVmBinding::new(&scheduler, caller));
+            .map(|scheduler| agent_vm::AgentVmBinding::new(&scheduler, caller.clone()));
         let source = source.to_string();
         let source_id = source_id.to_string();
         let declared = (!declared_capabilities.is_empty())
             .then(|| EffectSet(declared_capabilities.iter().cloned().collect()));
         let fuel = context.budget.forth_fuel.min(u64::MAX as usize) as u64;
         let execution_id = context.execution_id;
+        let authorization = HostAuthorizationAudit {
+            ledger: Arc::clone(&self.capability_ledger),
+            context: self.authorization_context_for(caller.as_ref()),
+            reason: intent.to_string(),
+            program_hash: hash_program_source(&source),
+            agent_ancestry: agent_ancestry(caller.as_ref()),
+        };
         let (runtime, execution) = tokio::task::spawn_blocking(move || {
                     let vocabulary = serde_json::to_string(runtime.vocabulary())
                         .unwrap_or_else(|_| "[]".to_string());
@@ -2476,6 +2471,7 @@ impl ProgramRuntime {
                         output_handles,
                         streams,
                         execution_id,
+                        authorization,
                         grants,
                         typed_effect_sink,
                         schedule_queue,
@@ -2528,6 +2524,13 @@ impl ProgramRuntime {
             .map(|scheduler| agent_vm::AgentVmBinding::new(&scheduler, pending.caller.clone()));
         let suspension = pending.suspension.clone();
         let execution_id = pending.context.execution_id;
+        let authorization = HostAuthorizationAudit {
+            ledger: Arc::clone(&self.capability_ledger),
+            context: self.authorization_context_for(pending.caller.as_ref()),
+            reason: pending.intent.clone(),
+            program_hash: hash_program_source(&pending.source),
+            agent_ancestry: agent_ancestry(pending.caller.as_ref()),
+        };
         let (runtime, execution) = tokio::task::spawn_blocking(move || {
                     let vocabulary = serde_json::to_string(runtime.vocabulary())
                         .unwrap_or_else(|_| "[]".to_string());
@@ -2546,6 +2549,7 @@ impl ProgramRuntime {
                         output_handles,
                         streams,
                         execution_id,
+                        authorization,
                         grants,
                         typed_effect_sink,
                         schedule_queue,
@@ -2583,10 +2587,19 @@ struct TypedHostHandler {
     output_handles: Arc<Mutex<HashMap<String, OutputHandleRecord>>>,
     streams: Arc<Mutex<HashMap<String, HostStream>>>,
     execution_id: uuid::Uuid,
+    authorization: HostAuthorizationAudit,
     network_grants: EffectSet,
     typed_effect_sink: Option<TypedEffectSink>,
     schedule_queue: Option<Arc<TaskQueue>>,
     deferred_host_effects: DeferredHostEffects,
+}
+
+struct HostAuthorizationAudit {
+    ledger: Arc<Mutex<CapabilityLedger>>,
+    context: AuthorizationContext,
+    reason: String,
+    program_hash: String,
+    agent_ancestry: Vec<uuid::Uuid>,
 }
 
 impl TypedHostHandler {
@@ -2601,6 +2614,7 @@ impl TypedHostHandler {
         output_handles: Arc<Mutex<HashMap<String, OutputHandleRecord>>>,
         streams: Arc<Mutex<HashMap<String, HostStream>>>,
         execution_id: uuid::Uuid,
+        authorization: HostAuthorizationAudit,
         network_grants: EffectSet,
         typed_effect_sink: Option<TypedEffectSink>,
         schedule_queue: Option<Arc<TaskQueue>>,
@@ -2620,6 +2634,7 @@ impl TypedHostHandler {
             output_handles,
             streams,
             execution_id,
+            authorization,
             network_grants,
             typed_effect_sink,
             schedule_queue,
@@ -2769,6 +2784,64 @@ impl TypedHostHandler {
 }
 
 impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
+    fn authorize_awaited_effect(
+        &mut self,
+        effect: &VmSideEffect,
+    ) -> std::result::Result<(), VmDiagnostic> {
+        let requested = EffectSet::from_requirement(effect.requirement.clone());
+        if TypedRuntime::intrinsic_grants().grants(&requested) {
+            return Ok(());
+        }
+        let arguments = match &effect.event {
+            crate::vm::interpreter::HostSideEffect::Request { arguments } => arguments.clone(),
+            _ => {
+                return Err(VmDiagnostic::error(
+                    "E-HOST-002",
+                    crate::vm::DiagnosticPhase::HostCall,
+                    "VM await boundary did not carry a host request",
+                    Some(effect.origin.clone()),
+                ));
+            }
+        };
+        let request_key = format!("effect:{}", effect.sequence);
+        let request = CapabilityRequest {
+            id: uuid::Uuid::new_v5(&self.execution_id, request_key.as_bytes()),
+            execution_id: self.execution_id,
+            effect_sequence: Some(effect.sequence),
+            requirement: effect.requirement.clone(),
+            arguments,
+            reason: self.authorization.reason.clone(),
+            origin: effect.origin.clone(),
+            agent_ancestry: self.authorization.agent_ancestry.clone(),
+            program_hash: self.authorization.program_hash.clone(),
+        };
+        let mut ledger = self.authorization.ledger.lock().map_err(|_| {
+            host_binding_error(&effect.origin, "capability ledger lock poisoned")
+        })?;
+        let decision = ledger.recorded_authorization(&request).unwrap_or_else(|| {
+            ledger.authorize(
+                &request,
+                &self.authorization.context,
+                "typed-host-boundary",
+            )
+        });
+        match decision {
+            AuthorizationDecision::Allowed { .. } => Ok(()),
+            AuthorizationDecision::ApprovalRequired => Err(VmDiagnostic::error(
+                "E-CAP-006",
+                crate::vm::DiagnosticPhase::HostCall,
+                "capability was revoked, expired, or outside its approved scope at the host boundary",
+                Some(effect.origin.clone()),
+            )),
+            AuthorizationDecision::Denied { reason } => Err(VmDiagnostic::error(
+                "E-CAP-006",
+                crate::vm::DiagnosticPhase::HostCall,
+                format!("capability is denied at the host boundary: {reason}"),
+                Some(effect.origin.clone()),
+            )),
+        }
+    }
+
     fn observe_awaited_effect(
         &mut self,
         effect: &VmSideEffect,
@@ -4189,21 +4262,8 @@ fn approval_prompts(
     suspension: Option<&TypedSuspension>,
     caller: Option<&scheduler::AgentIdentity>,
 ) -> Vec<ApprovalPrompt> {
-    let mut hasher = DefaultHasher::new();
-    source.hash(&mut hasher);
-    let program_hash = format!("{:016x}", hasher.finish());
-    let agent_ancestry = caller.map_or_else(Vec::new, |caller| {
-        let mut ancestry = vec![caller.root_agent_id];
-        if let Some(parent) = caller.parent_agent_id {
-            if !ancestry.contains(&parent) {
-                ancestry.push(parent);
-            }
-        }
-        if !ancestry.contains(&caller.agent_id) {
-            ancestry.push(caller.agent_id);
-        }
-        ancestry
-    });
+    let program_hash = hash_program_source(source);
+    let agent_ancestry = agent_ancestry(caller);
     if let Some(call) = suspension.and_then(|suspension| suspension.pending_host_call.as_ref()) {
         let effect_sequence = suspension
             .and_then(|suspension| suspension.event_journal.last())
@@ -4252,6 +4312,27 @@ fn approval_prompts(
             })
         })
         .collect()
+}
+
+fn hash_program_source(source: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn agent_ancestry(caller: Option<&scheduler::AgentIdentity>) -> Vec<uuid::Uuid> {
+    caller.map_or_else(Vec::new, |caller| {
+        let mut ancestry = vec![caller.root_agent_id];
+        if let Some(parent) = caller.parent_agent_id {
+            if !ancestry.contains(&parent) {
+                ancestry.push(parent);
+            }
+        }
+        if !ancestry.contains(&caller.agent_id) {
+            ancestry.push(caller.agent_id);
+        }
+        ancestry
+    })
 }
 
 fn typed_values(values: Vec<TypedValue>) -> Result<Vec<ProgramValue>> {
@@ -5060,6 +5141,18 @@ mod tests {
         let reused = runtime.submit(source()).await.unwrap();
         assert_eq!(reused.status, ExecutionStatus::Completed);
         assert!(reused.approval_prompts.is_empty());
+        let ledger = runtime.capability_ledger().unwrap();
+        let grant_id = ledger.grants.grants[0].id;
+        assert_eq!(ledger.authorization_audit.len(), 2);
+        assert!(ledger.authorization_audit.iter().all(|entry| matches!(
+            entry.decision,
+            AuthorizationDecision::Allowed { grant_id: used } if used == grant_id
+        )));
+        assert_ne!(
+            ledger.authorization_audit[0].execution_id,
+            ledger.authorization_audit[1].execution_id,
+            "each actual host boundary keeps its owning ProgramRun identity"
+        );
     }
 
     #[tokio::test]
@@ -6370,7 +6463,7 @@ mod tests {
     #[tokio::test]
     async fn portable_host_boundary_retains_its_policy_across_multiple_resumes() {
         let runtime = ProgramRuntime::new();
-        runtime
+        let grant_id = runtime
             .grant_typed_capability(crate::vm::CapabilityRequirement::file(
                 crate::vm::FileOperation::Read,
                 crate::vm::FileSelector::parse("./**").unwrap(),
@@ -6425,6 +6518,20 @@ mod tests {
             completed.values,
             vec![ProgramValue::Bytes(b"second".to_vec())]
         );
+        let ledger = runtime.capability_ledger().unwrap();
+        assert_eq!(ledger.authorization_audit.len(), 2);
+        assert_eq!(
+            ledger
+                .authorization_audit
+                .iter()
+                .map(|entry| entry.effect_sequence)
+                .collect::<Vec<_>>(),
+            vec![Some(first.effect.sequence), Some(second.effect.sequence)]
+        );
+        assert!(ledger.authorization_audit.iter().all(|entry| matches!(
+            entry.decision,
+            AuthorizationDecision::Allowed { grant_id: used } if used == grant_id
+        )));
     }
 
     #[tokio::test]

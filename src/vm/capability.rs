@@ -201,6 +201,26 @@ pub struct CapabilityLedger {
 }
 
 impl CapabilityLedger {
+    /// Return the decision already recorded for this exact effect boundary.
+    /// A portable host may authorize before deferring and later deliver the
+    /// result through a separate resume call; that resume must not consume a
+    /// once grant or append a second authorization fact.
+    pub fn recorded_authorization(
+        &self,
+        request: &CapabilityRequest,
+    ) -> Option<AuthorizationDecision> {
+        self.authorization_audit
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.request_id == request.id
+                    && entry.execution_id == request.execution_id
+                    && entry.effect_sequence == request.effect_sequence
+                    && entry.requirement == request.requirement
+            })
+            .map(|entry| entry.decision.clone())
+    }
+
     pub fn issue(
         &mut self,
         requirement: CapabilityRequirement,

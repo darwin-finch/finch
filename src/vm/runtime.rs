@@ -618,6 +618,30 @@ impl TypedRuntime {
                         handler,
                     );
                 }
+                let Some(effect) = event_journal.last().cloned() else {
+                    return self.failed_from_drive(
+                        effects,
+                        VmDiagnostic::error(
+                            "E-RESUME-006",
+                            DiagnosticPhase::HostCall,
+                            "a pending host result has no correlated effect journal entry",
+                            Some(call.origin),
+                        ),
+                        event_journal,
+                        effect_journal,
+                        handler,
+                    );
+                };
+                if let Err(diagnostic) = handler.authorize_awaited_effect(&effect) {
+                    fail_last(&mut effect_journal, diagnostic.clone());
+                    return self.failed_from_drive(
+                        effects,
+                        diagnostic,
+                        event_journal,
+                        effect_journal,
+                        handler,
+                    );
+                }
                 if let Err(diagnostic) =
                     super::interpreter::validate_host_result(&call.output, &values, &call.origin)
                 {
@@ -659,8 +683,32 @@ impl TypedRuntime {
                         handler,
                     );
                 }
+                let Some(effect) = event_journal.last().cloned() else {
+                    return self.failed_from_drive(
+                        effects,
+                        VmDiagnostic::error(
+                            "E-RESUME-006",
+                            DiagnosticPhase::HostCall,
+                            "a pending host call has no correlated effect journal entry",
+                            Some(call.origin),
+                        ),
+                        event_journal,
+                        effect_journal,
+                        handler,
+                    );
+                };
+                if let Err(diagnostic) = handler.authorize_awaited_effect(&effect) {
+                    fail_last(&mut effect_journal, diagnostic.clone());
+                    return self.failed_from_drive(
+                        effects,
+                        diagnostic,
+                        event_journal,
+                        effect_journal,
+                        handler,
+                    );
+                }
                 match handler
-                    .request(&call.requirement, call.arguments, &call.origin)
+                    .request_effect(&effect)
                     .and_then(|values| {
                         super::interpreter::validate_host_result(
                             &call.output,
@@ -859,18 +907,18 @@ impl TypedRuntime {
                         effect: effect.clone(),
                         state: EffectJournalState::Proposed,
                     });
-                    if let Err(diagnostic) = handler.observe_awaited_effect(&effect) {
-                        fail_last(&mut effect_journal, diagnostic.clone());
-                        return self.failed_from_drive(
-                            effects,
-                            diagnostic,
-                            event_journal,
-                            effect_journal,
-                            handler,
-                        );
-                    }
                     let requested = EffectSet::from_requirement(requirement.clone());
                     if !self.grants.grants(&requested) {
+                        if let Err(diagnostic) = handler.observe_awaited_effect(&effect) {
+                            fail_last(&mut effect_journal, diagnostic.clone());
+                            return self.failed_from_drive(
+                                effects,
+                                diagnostic,
+                                event_journal,
+                                effect_journal,
+                                handler,
+                            );
+                        }
                         awaiting_last(&mut effect_journal);
                         return TypedExecution {
                             status: TypedExecutionStatus::AuthorizationRequired {
@@ -901,6 +949,26 @@ impl TypedRuntime {
                                 }),
                             }),
                         };
+                    }
+                    if let Err(diagnostic) = handler.authorize_awaited_effect(&effect) {
+                        fail_last(&mut effect_journal, diagnostic.clone());
+                        return self.failed_from_drive(
+                            effects,
+                            diagnostic,
+                            event_journal,
+                            effect_journal,
+                            handler,
+                        );
+                    }
+                    if let Err(diagnostic) = handler.observe_awaited_effect(&effect) {
+                        fail_last(&mut effect_journal, diagnostic.clone());
+                        return self.failed_from_drive(
+                            effects,
+                            diagnostic,
+                            event_journal,
+                            effect_journal,
+                            handler,
+                        );
                     }
                     if handler.defer_awaited_effect(&effect) {
                         if let Some(entry) = effect_journal.last_mut() {

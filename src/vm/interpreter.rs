@@ -142,6 +142,14 @@ pub trait CapabilityHandler {
         Ok(())
     }
 
+    /// Revalidate and attribute authority for one concrete effect boundary.
+    /// The VM's compact `EffectSet` is a fast verifier/runtime guard; an
+    /// application host can use this hook to resolve the actual stable grant,
+    /// record reuse, and notice revocation immediately before dispatch.
+    fn authorize_awaited_effect(&mut self, _effect: &VmSideEffect) -> Result<(), VmDiagnostic> {
+        Ok(())
+    }
+
     /// Return true when this host wants an already-authorized effect to stay
     /// pending for an external event loop rather than executing it
     /// synchronously. The VM retains the verified continuation and the host
