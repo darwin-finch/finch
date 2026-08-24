@@ -311,6 +311,15 @@ impl SharedBrainStore {
         } else {
             None
         };
+        if let Some(runtime) = self
+            .runtimes
+            .read()
+            .expect("shared brain runtime lock poisoned")
+            .get(name)
+            .cloned()
+        {
+            runtime.clear_authority_sink()?;
+        }
         self.brains
             .write()
             .expect("shared brain lock poisoned")
@@ -397,6 +406,8 @@ impl SharedBrainStore {
             authority_store
                 .restore_into(&mut runtime)
                 .with_context(|| format!("restore authority for named Brain '{name}'"))?;
+            let sink_store = authority_store.clone();
+            runtime.set_authority_sink(Arc::new(move |state| sink_store.save_state(state)))?;
         }
         let runtime = Arc::new(runtime);
         let mut runtimes = self
@@ -731,11 +742,30 @@ mod tests {
         store
             .push("old", "alice", BrainEventKind::Prompt { text: "hi".into() })
             .unwrap();
+        let retained_runtime = store.program_runtime("old").unwrap();
+        retained_runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::ProcessRun,
+                selector: crate::vm::ResourceSelector::None,
+            })
+            .unwrap();
 
         let archive = store.archive("old").unwrap().unwrap();
         assert!(!store.list().unwrap().contains(&"old".to_string()));
         assert!(!root.join("old").exists());
         assert!(archive.join("events.jsonl").exists());
+        assert!(archive.join("authority.json").exists());
+
+        retained_runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::MemoryRead,
+                selector: crate::vm::ResourceSelector::None,
+            })
+            .unwrap();
+        assert!(
+            !root.join("old").exists(),
+            "a retained runtime must not recreate its archived authority path"
+        );
     }
 
     #[tokio::test]
@@ -878,6 +908,136 @@ mod tests {
             crate::vm::GrantScope::Session { session_id: restored_id } if restored_id == session_id
         ));
         assert_eq!(ledger.audit.len(), 1);
+    }
+
+    #[test]
+    fn named_brain_persists_grants_and_revocation_without_a_vm_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let runtime = store.program_runtime("brain").unwrap();
+        let grant_id = runtime
+            .issue_typed_capability(
+                crate::vm::CapabilityRequirement {
+                    capability: crate::vm::CapabilityKind::ProcessRun,
+                    selector: crate::vm::ResourceSelector::None,
+                },
+                crate::vm::GrantScope::Session {
+                    session_id: runtime.capability_session_id(),
+                },
+                "test-user",
+                None,
+            )
+            .unwrap();
+
+        let after_grant = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restored = after_grant.program_runtime("brain").unwrap();
+        assert_eq!(restored.capability_ledger().unwrap().grants.grants[0].id, grant_id);
+
+        runtime.revoke_typed_capability(grant_id).unwrap();
+        let after_revoke = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restored = after_revoke.program_runtime("brain").unwrap();
+        let ledger = restored.capability_ledger().unwrap();
+        assert!(ledger.grants.grants[0].revoked_at_unix_ms.is_some());
+        assert_eq!(ledger.audit.len(), 2);
+        assert!(matches!(
+            ledger.audit[1].action,
+            crate::vm::CapabilityAuditAction::Revoked
+        ));
+    }
+
+    #[tokio::test]
+    async fn named_brain_persists_denial_without_a_vm_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let runtime = store.program_runtime("brain").unwrap();
+        let pending = runtime
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Lisp,
+                source_id: None,
+                source: "(file-read (path \"Cargo.toml\"))".into(),
+                intent: "test durable denial".into(),
+                effect: crate::programs::ExecutionEffect::WorkspaceRead,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        let denied = runtime
+            .resolve_typed_approval(
+                &pending.approval_prompts[0],
+                crate::vm::ApprovalChoice::Deny,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            denied.status,
+            crate::runtime::outcome::ExecutionStatus::Failed
+        );
+
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restored = restarted.program_runtime("brain").unwrap();
+        assert!(matches!(
+            restored
+                .capability_ledger()
+                .unwrap()
+                .authorization_audit
+                .last()
+                .map(|entry| &entry.decision),
+            Some(crate::vm::AuthorizationDecision::Denied { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn named_brain_persists_host_authorization_even_when_the_run_rolls_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let runtime = store.program_runtime("brain").unwrap();
+        let grant_id = runtime
+            .issue_typed_capability(
+                crate::vm::CapabilityRequirement::file(
+                    crate::vm::FileOperation::Read,
+                    crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+                ),
+                crate::vm::GrantScope::Session {
+                    session_id: runtime.capability_session_id(),
+                },
+                "test-user",
+                None,
+            )
+            .unwrap();
+        let failed = runtime
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Forth,
+                source_id: None,
+                source: "s\"Cargo.toml\" path file-read drop 1 0 /".into(),
+                intent: "read then fail".into(),
+                effect: crate::programs::ExecutionEffect::WorkspaceRead,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            failed.status,
+            crate::runtime::outcome::ExecutionStatus::Failed
+        );
+        assert_eq!(runtime.revision(), 0, "failed VM state must roll back");
+
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let ledger = restarted
+            .program_runtime("brain")
+            .unwrap()
+            .capability_ledger()
+            .unwrap();
+        assert!(matches!(
+            ledger.authorization_audit.last().map(|entry| &entry.decision),
+            Some(crate::vm::AuthorizationDecision::Allowed { grant_id: used }) if *used == grant_id
+        ));
     }
 
     #[tokio::test]

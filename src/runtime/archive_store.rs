@@ -156,7 +156,10 @@ impl ProgramRuntimeAuthorityStore {
         self.save_state(runtime.authority_state()?)
     }
 
-    fn save_state(&self, authority: ProgramRuntimeAuthorityState) -> Result<()> {
+    /// Validate and atomically replace an application-supplied authority
+    /// snapshot. This is the sink used by named Brain policy mutations; it
+    /// never reads reducible VM state or a VM checkpoint.
+    pub fn save_state(&self, authority: ProgramRuntimeAuthorityState) -> Result<()> {
         validate_authority_state(authority.clone())?;
         let authority_bytes = serde_json::to_vec(&authority)?;
         let stored = StoredRuntimeAuthority {

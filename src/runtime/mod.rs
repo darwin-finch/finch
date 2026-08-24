@@ -19,7 +19,7 @@ use crate::vm::{
     TypedSuspension, TypedValue, VmDiagnostic, VmSideEffect,
 };
 use crate::vm::vocabulary::{core_word_spec, CoreHostBinding, CoreWordImplementation};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use automation::AutomationBroker;
 use automation::AutomationRequest;
 use context::{ExecutionBudget, ExecutionContext};
@@ -257,6 +257,13 @@ pub struct VmRevisionSnapshot {
 pub const PROGRAM_RUNTIME_ARCHIVE_VERSION: u32 = 1;
 pub const PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION: u32 = 1;
 
+/// Application-owned persistence hook for host authority. The callback is
+/// supplied a complete immutable snapshot and must not call back into the
+/// originating `ProgramRuntime`; named Brain storage uses it for one atomic
+/// replace of the separate authority record.
+pub type ProgramRuntimeAuthoritySink =
+    Arc<dyn Fn(ProgramRuntimeAuthorityState) -> Result<()> + Send + Sync>;
+
 /// Versioned reducible state for a persistent shared VM. Authority, live host
 /// handles, pending external calls, and execute-once effect records belong to
 /// the application journal and are intentionally absent.
@@ -308,6 +315,7 @@ pub struct ProgramRuntime {
     /// checkpoints. Stable grant IDs and audit events can be persisted beside
     /// a Brain/session log, while only the active requirements enter a run.
     capability_ledger: Arc<Mutex<CapabilityLedger>>,
+    authority_sink: Arc<RwLock<Option<ProgramRuntimeAuthoritySink>>>,
     schedule_queue: RwLock<Option<Arc<TaskQueue>>>,
     agent_scheduler: RwLock<Weak<scheduler::AgentScheduler>>,
     /// Daemon-owned typed continuations keyed by the execution id visible in
@@ -556,6 +564,7 @@ impl ProgramRuntime {
             output_handles: Arc::new(Mutex::new(HashMap::new())),
             streams: Arc::new(Mutex::new(HashMap::new())),
             capability_ledger: Arc::new(Mutex::new(CapabilityLedger::default())),
+            authority_sink: Arc::new(RwLock::new(None)),
             schedule_queue: RwLock::new(None),
             agent_scheduler: RwLock::new(Weak::new()),
             pending_typed: Mutex::new(HashMap::new()),
@@ -797,11 +806,8 @@ impl ProgramRuntime {
         actor: impl Into<String>,
         expires_at_unix_ms: Option<u64>,
     ) -> Result<uuid::Uuid> {
-        let grant_id = self
-            .capability_ledger
-            .lock()
-            .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?
-            .issue(
+        self.mutate_authority(|ledger| {
+            ledger.issue(
                 requirement,
                 scope,
                 LOCAL_CAPABILITY_POLICY_HASH,
@@ -809,9 +815,8 @@ impl ProgramRuntime {
                 unix_time_ms(),
                 expires_at_unix_ms,
             )
-            .map_err(anyhow::Error::msg)?;
-        self.refresh_active_grants()?;
-        Ok(grant_id)
+            .map_err(anyhow::Error::msg)
+        })
     }
 
     pub fn capability_session_id(&self) -> uuid::Uuid {
@@ -825,15 +830,9 @@ impl ProgramRuntime {
     /// Revoke one recorded grant by stable identity. Pending and future runs
     /// observe the rebuilt active set at their next verified boundary.
     pub fn revoke_typed_capability(&self, grant_id: uuid::Uuid) -> Result<bool> {
-        let revoked = self
-            .capability_ledger
-            .lock()
-            .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?
-            .revoke(grant_id, "local-user", unix_time_ms());
-        if revoked {
-            self.refresh_active_grants()?;
-        }
-        Ok(revoked)
+        self.mutate_authority(|ledger| {
+            Ok(ledger.revoke(grant_id, "local-user", unix_time_ms()))
+        })
     }
 
     pub fn capability_ledger(&self) -> Result<CapabilityLedger> {
@@ -851,6 +850,75 @@ impl ProgramRuntime {
             project_id: self.project_id.clone(),
             ledger: self.capability_ledger()?,
         })
+    }
+
+    /// Install application persistence for subsequent authority mutations.
+    /// Restoring VM state never installs this hook implicitly.
+    pub fn set_authority_sink(&self, sink: ProgramRuntimeAuthoritySink) -> Result<()> {
+        *self
+            .authority_sink
+            .write()
+            .map_err(|_| anyhow::anyhow!("authority sink lock poisoned"))? = Some(sink);
+        Ok(())
+    }
+
+    /// Disconnect an archived/detached runtime from its former policy file.
+    pub fn clear_authority_sink(&self) -> Result<()> {
+        *self
+            .authority_sink
+            .write()
+            .map_err(|_| anyhow::anyhow!("authority sink lock poisoned"))? = None;
+        Ok(())
+    }
+
+    /// Apply one ledger mutation and durably publish the resulting host
+    /// authority before exposing it to a ProgramRun. A failed sink restores
+    /// the previous in-memory ledger and active compact grants.
+    fn mutate_authority<T>(
+        &self,
+        mutation: impl FnOnce(&mut CapabilityLedger) -> Result<T>,
+    ) -> Result<T> {
+        let sink = self
+            .authority_sink
+            .read()
+            .map_err(|_| anyhow::anyhow!("authority sink lock poisoned"))?
+            .clone();
+        let (result, previous) = {
+            let mut ledger = self
+                .capability_ledger
+                .lock()
+                .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?;
+            let previous = ledger.clone();
+            let result = mutation(&mut ledger)?;
+            if let Some(sink) = &sink {
+                let state = ProgramRuntimeAuthorityState {
+                    format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
+                    session_id: self.session_id,
+                    project_id: self.project_id.clone(),
+                    ledger: ledger.clone(),
+                };
+                if let Err(error) = sink(state) {
+                    *ledger = previous;
+                    return Err(error).context("persist ProgramRuntime authority mutation");
+                }
+            }
+            (result, previous)
+        };
+        if let Err(error) = self.refresh_active_grants() {
+            if let Ok(mut ledger) = self.capability_ledger.lock() {
+                *ledger = previous.clone();
+            }
+            if let Some(sink) = sink {
+                let _ = sink(ProgramRuntimeAuthorityState {
+                    format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
+                    session_id: self.session_id,
+                    project_id: self.project_id.clone(),
+                    ledger: previous,
+                });
+            }
+            return Err(error);
+        }
+        Ok(result)
     }
 
     /// Restore authority only before this runtime is shared with concurrent
@@ -1401,15 +1469,15 @@ impl ProgramRuntime {
             let denied = matches!(&choice, ApprovalChoice::Deny);
 
             if denied {
-                self.capability_ledger
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?
-                    .deny(
+                self.mutate_authority(|ledger| {
+                    ledger.deny(
                         &prompt.request,
                         "denied by user",
                         actor.clone(),
                         context.now_unix_ms,
                     );
+                    Ok(())
+                })?;
             } else {
                 let (requirement, scope) = match choice {
                     ApprovalChoice::Deny => unreachable!("denial handled above"),
@@ -1456,12 +1524,8 @@ impl ProgramRuntime {
                     }
                     ApprovalChoice::AllowGlobal => (prompt.exact.clone(), GrantScope::Global),
                 };
-                let mut ledger = self
-                    .capability_ledger
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?;
-                ledger
-                    .issue(
+                self.mutate_authority(|ledger| {
+                    ledger.issue(
                         requirement,
                         scope,
                         LOCAL_CAPABILITY_POLICY_HASH,
@@ -1470,12 +1534,14 @@ impl ProgramRuntime {
                         None,
                     )
                     .map_err(anyhow::Error::msg)?;
-                if !matches!(
-                    ledger.grants.authorize(&prompt.request, &context),
-                    AuthorizationDecision::Allowed { .. }
-                ) {
-                    bail!("new capability grant did not authorize its exact request");
-                }
+                    if !matches!(
+                        ledger.grants.authorize(&prompt.request, &context),
+                        AuthorizationDecision::Allowed { .. }
+                    ) {
+                        bail!("new capability grant did not authorize its exact request");
+                    }
+                    Ok(())
+                })?;
             }
             let pending = pending_runs
                 .remove(&prompt.request.execution_id)
@@ -2448,6 +2514,11 @@ impl ProgramRuntime {
         let execution_id = context.execution_id;
         let authorization = HostAuthorizationAudit {
             ledger: Arc::clone(&self.capability_ledger),
+            sink: self
+                .authority_sink
+                .read()
+                .map_err(|_| anyhow::anyhow!("authority sink lock poisoned"))?
+                .clone(),
             context: self.authorization_context_for(caller.as_ref()),
             reason: intent.to_string(),
             program_hash: hash_program_source(&source),
@@ -2526,6 +2597,11 @@ impl ProgramRuntime {
         let execution_id = pending.context.execution_id;
         let authorization = HostAuthorizationAudit {
             ledger: Arc::clone(&self.capability_ledger),
+            sink: self
+                .authority_sink
+                .read()
+                .map_err(|_| anyhow::anyhow!("authority sink lock poisoned"))?
+                .clone(),
             context: self.authorization_context_for(pending.caller.as_ref()),
             reason: pending.intent.clone(),
             program_hash: hash_program_source(&pending.source),
@@ -2596,6 +2672,7 @@ struct TypedHostHandler {
 
 struct HostAuthorizationAudit {
     ledger: Arc<Mutex<CapabilityLedger>>,
+    sink: Option<ProgramRuntimeAuthoritySink>,
     context: AuthorizationContext,
     reason: String,
     program_hash: String,
@@ -2818,13 +2895,37 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         let mut ledger = self.authorization.ledger.lock().map_err(|_| {
             host_binding_error(&effect.origin, "capability ledger lock poisoned")
         })?;
-        let decision = ledger.recorded_authorization(&request).unwrap_or_else(|| {
+        let recorded = ledger.recorded_authorization(&request);
+        let previous = recorded.is_none().then(|| ledger.clone());
+        let decision = recorded.unwrap_or_else(|| {
             ledger.authorize(
                 &request,
                 &self.authorization.context,
                 "typed-host-boundary",
             )
         });
+        if let (Some(previous), Some(sink)) = (previous, &self.authorization.sink) {
+            let Some(project_id) = self.authorization.context.project_id.clone() else {
+                *ledger = previous;
+                return Err(host_binding_error(
+                    &effect.origin,
+                    "host authorization has no project identity",
+                ));
+            };
+            let state = ProgramRuntimeAuthorityState {
+                format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
+                session_id: self.authorization.context.session_id,
+                project_id,
+                ledger: ledger.clone(),
+            };
+            if let Err(error) = sink(state) {
+                *ledger = previous;
+                return Err(host_binding_error(
+                    &effect.origin,
+                    format!("persist host authorization audit: {error:#}"),
+                ));
+            }
+        }
         match decision {
             AuthorizationDecision::Allowed { .. } => Ok(()),
             AuthorizationDecision::ApprovalRequired => Err(VmDiagnostic::error(
@@ -6069,6 +6170,43 @@ mod tests {
             ledger.audit[1].action,
             crate::vm::CapabilityAuditAction::Revoked
         );
+    }
+
+    #[test]
+    fn failed_authority_sink_rolls_back_a_new_grant() {
+        let runtime = ProgramRuntime::new();
+        runtime
+            .set_authority_sink(Arc::new(|_| {
+                Err(anyhow::anyhow!("simulated authority storage failure"))
+            }))
+            .unwrap();
+        let requirement = CapabilityRequirement {
+            capability: CapabilityKind::ProcessRun,
+            selector: crate::vm::ResourceSelector::None,
+        };
+        let error = runtime
+            .issue_typed_capability(
+                requirement.clone(),
+                GrantScope::Session {
+                    session_id: runtime.capability_session_id(),
+                },
+                "test-user",
+                None,
+            )
+            .expect_err("a grant must not survive failed durable policy storage");
+        assert!(format!("{error:#}").contains("simulated authority storage failure"));
+        assert!(runtime
+            .capability_ledger()
+            .unwrap()
+            .grants
+            .grants
+            .is_empty());
+        assert!(!runtime
+            .typed
+            .lock()
+            .unwrap()
+            .grants()
+            .grants(&EffectSet::from_requirement(requirement)));
     }
 
     #[tokio::test]
