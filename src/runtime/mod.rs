@@ -12,9 +12,10 @@ pub mod scheduler;
 use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramValue};
 use crate::scheduling::{ScheduledTask, TaskQueue, TaskScheduler, TaskStatus};
 use crate::vm::{
-    ApprovalPrompt, AuthorizationContext, CapabilityLedger, CapabilityRequest,
-    CapabilityRequirement, EffectSet, GrantScope, SourceOrigin, Type, TypedExecutionStatus,
-    TypedRuntime, TypedRuntimeCheckpoint, TypedSuspension, TypedValue, VmDiagnostic, VmSideEffect,
+    ApprovalChoice, ApprovalPrompt, AuthorizationContext, AuthorizationDecision,
+    CapabilityLedger, CapabilityRequest, CapabilityRequirement, EffectSet, GrantScope,
+    SourceOrigin, Type, TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint,
+    TypedSuspension, TypedValue, VmDiagnostic, VmSideEffect,
 };
 use crate::vm::vocabulary::{core_word_spec, CoreHostBinding, CoreWordImplementation};
 use anyhow::{bail, Result};
@@ -777,13 +778,7 @@ impl ProgramRuntime {
         &self,
         caller: Option<&scheduler::AgentIdentity>,
     ) -> Result<EffectSet> {
-        let context = AuthorizationContext {
-            now_unix_ms: unix_time_ms(),
-            task_id: caller.map(|caller| caller.task_id),
-            session_id: self.session_id,
-            project_id: Some(self.project_id.clone()),
-            policy_hash: LOCAL_CAPABILITY_POLICY_HASH.into(),
-        };
+        let context = self.authorization_context_for(caller);
         let ledger = self
             .capability_ledger
             .lock()
@@ -795,6 +790,19 @@ impl ProgramRuntime {
             .fold(TypedRuntime::intrinsic_grants(), |grants, requirement| {
                 grants.union(&EffectSet::from_requirement(requirement))
             }))
+    }
+
+    fn authorization_context_for(
+        &self,
+        caller: Option<&scheduler::AgentIdentity>,
+    ) -> AuthorizationContext {
+        AuthorizationContext {
+            now_unix_ms: unix_time_ms(),
+            task_id: caller.map(|caller| caller.task_id),
+            session_id: self.session_id,
+            project_id: Some(self.project_id.clone()),
+            policy_hash: LOCAL_CAPABILITY_POLICY_HASH.into(),
+        }
     }
 
     fn release_output_handles(&self, execution_id: uuid::Uuid) -> Result<()> {
@@ -1169,6 +1177,172 @@ impl ProgramRuntime {
         self.deny_pending_typed_execution(execution_id, pending, reason)
     }
 
+    /// Apply one user approval decision to the exact prompt emitted for a
+    /// suspended ProgramRun. The prompt is reconstructed from the retained
+    /// continuation before any authority is issued, preventing stale or
+    /// forged UI data from widening a different request.
+    pub async fn resolve_typed_approval(
+        &self,
+        prompt: &ApprovalPrompt,
+        choice: ApprovalChoice,
+        actor: impl Into<String>,
+    ) -> Result<ExecutionOutcome> {
+        let actor = actor.into();
+        let (pending, effect_sequence, exact_once, denied) = {
+            let _submission = self.submission_gate.lock().await;
+            let mut pending_runs = self
+                .pending_typed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("pending typed execution lock poisoned"))?;
+            let pending = pending_runs
+                .get(&prompt.request.execution_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no resumable typed execution {}",
+                        prompt.request.execution_id
+                    )
+                })?;
+            let call = pending
+                .suspension
+                .pending_host_call
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("typed execution is not awaiting authorization"))?;
+            let expected = approval_prompts(
+                prompt.request.execution_id,
+                std::slice::from_ref(&call.requirement),
+                &pending.source,
+                &pending.intent,
+                Some(&pending.suspension),
+                pending.caller.as_ref(),
+            )
+            .into_iter()
+            .next()
+            .expect("a pending host call creates one approval prompt");
+            if &expected != prompt {
+                bail!("stale or forged capability approval prompt");
+            }
+            let effect_sequence = prompt
+                .request
+                .effect_sequence
+                .ok_or_else(|| anyhow::anyhow!("a runtime approval requires an effect sequence"))?;
+            let context = self.authorization_context_for(pending.caller.as_ref());
+            let denied = matches!(&choice, ApprovalChoice::Deny);
+
+            let exact_once = if denied {
+                self.capability_ledger
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?
+                    .deny(
+                        &prompt.request,
+                        "denied by user",
+                        actor.clone(),
+                        context.now_unix_ms,
+                    );
+                false
+            } else {
+                let (requirement, scope, exact_once) = match choice {
+                    ApprovalChoice::Deny => unreachable!("denial handled above"),
+                    ApprovalChoice::AllowOnce => (
+                        prompt.exact.clone(),
+                        GrantScope::Once {
+                            request_id: prompt.request.id,
+                        },
+                        true,
+                    ),
+                    ApprovalChoice::AllowTask => {
+                        let task_id = pending
+                            .caller
+                            .as_ref()
+                            .map(|caller| caller.task_id)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "task-scoped approval requires a child task identity"
+                                )
+                            })?;
+                        (
+                            prompt.exact.clone(),
+                            GrantScope::Task { task_id },
+                            false,
+                        )
+                    }
+                    ApprovalChoice::AllowSession => (
+                        prompt.exact.clone(),
+                        GrantScope::Session {
+                            session_id: self.session_id,
+                        },
+                        false,
+                    ),
+                    ApprovalChoice::AllowProjectExact => (
+                        prompt.exact.clone(),
+                        GrantScope::Project {
+                            project_id: self.project_id.clone(),
+                        },
+                        false,
+                    ),
+                    ApprovalChoice::AllowProjectPattern { requirement } => {
+                        if !requirement.covers(&prompt.exact) {
+                            bail!("project approval pattern does not cover the exact request");
+                        }
+                        (
+                            requirement,
+                            GrantScope::Project {
+                                project_id: self.project_id.clone(),
+                            },
+                            false,
+                        )
+                    }
+                    ApprovalChoice::AllowGlobal => (
+                        prompt.exact.clone(),
+                        GrantScope::Global,
+                        false,
+                    ),
+                };
+                let mut ledger = self
+                    .capability_ledger
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?;
+                ledger
+                    .issue(
+                        requirement,
+                        scope,
+                        LOCAL_CAPABILITY_POLICY_HASH,
+                        actor.clone(),
+                        context.now_unix_ms,
+                        None,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                if !matches!(
+                    ledger.authorize(&prompt.request, &context, actor.clone()),
+                    AuthorizationDecision::Allowed { .. }
+                ) {
+                    bail!("new capability grant did not authorize its exact request");
+                }
+                exact_once
+            };
+            let pending = pending_runs
+                .remove(&prompt.request.execution_id)
+                .expect("approval target was validated while holding the pending lock");
+            (pending, effect_sequence, exact_once, denied)
+        };
+
+        if denied {
+            return self.deny_pending_typed_execution(
+                prompt.request.execution_id,
+                pending,
+                "denied by user".into(),
+            );
+        }
+        self.refresh_active_grants()?;
+        self.resume_removed_typed_execution(
+            prompt.request.execution_id,
+            pending,
+            Some(effect_sequence),
+            None,
+            exact_once,
+        )
+        .await
+    }
+
     /// Resume a typed execution that previously yielded or awaited approval.
     /// The execution id is stable across the pause; source is never submitted
     /// again. A revision mismatch deliberately invalidates the saved frame,
@@ -1177,7 +1351,7 @@ impl ProgramRuntime {
         &self,
         execution_id: uuid::Uuid,
     ) -> Result<ExecutionOutcome> {
-        self.resume_typed_execution_inner(execution_id, None, None)
+        self.resume_typed_execution_inner(execution_id, None, None, false)
             .await
     }
 
@@ -1189,7 +1363,7 @@ impl ProgramRuntime {
         execution_id: uuid::Uuid,
         effect_sequence: u64,
     ) -> Result<ExecutionOutcome> {
-        self.resume_typed_execution_inner(execution_id, Some(effect_sequence), None)
+        self.resume_typed_execution_inner(execution_id, Some(effect_sequence), None, false)
             .await
     }
 
@@ -1203,7 +1377,12 @@ impl ProgramRuntime {
         effect_sequence: u64,
         values: Vec<TypedValue>,
     ) -> Result<ExecutionOutcome> {
-        self.resume_typed_execution_inner(execution_id, Some(effect_sequence), Some(values))
+        self.resume_typed_execution_inner(
+            execution_id,
+            Some(effect_sequence),
+            Some(values),
+            false,
+        )
             .await
     }
 
@@ -1244,6 +1423,7 @@ impl ProgramRuntime {
         execution_id: uuid::Uuid,
         expected_effect_sequence: Option<u64>,
         external_effect_result: Option<Vec<TypedValue>>,
+        authorize_pending_host_call: bool,
     ) -> Result<ExecutionOutcome> {
         // Serialize only removal of this continuation from the pending table.
         // The private working VM then resumes without blocking unrelated
@@ -1283,6 +1463,24 @@ impl ProgramRuntime {
                 .remove(&execution_id)
                 .ok_or_else(|| anyhow::anyhow!("no resumable typed execution {execution_id}"))?
         };
+        self.resume_removed_typed_execution(
+            execution_id,
+            pending,
+            expected_effect_sequence,
+            external_effect_result,
+            authorize_pending_host_call,
+        )
+        .await
+    }
+
+    async fn resume_removed_typed_execution(
+        &self,
+        execution_id: uuid::Uuid,
+        pending: PendingTypedExecution,
+        expected_effect_sequence: Option<u64>,
+        external_effect_result: Option<Vec<TypedValue>>,
+        authorize_pending_host_call: bool,
+    ) -> Result<ExecutionOutcome> {
         let started = Instant::now();
         if pending.context.manifest_generation != self.manifest_generation() {
             self.release_output_handles(execution_id)?;
@@ -1344,6 +1542,7 @@ impl ProgramRuntime {
                 resumed_runtime,
                 &pending,
                 external_effect_result,
+                authorize_pending_host_call,
             )
             .await?;
         let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -2129,6 +2328,7 @@ impl ProgramRuntime {
         mut runtime: TypedRuntime,
         pending: &PendingTypedExecution,
         external_effect_result: Option<(u64, Vec<TypedValue>)>,
+        authorize_pending_host_call: bool,
     ) -> Result<(TypedRuntime, crate::vm::TypedExecution)> {
         let automation = Arc::clone(&self.automation);
         let workspace_root = Arc::clone(&self.workspace_root);
@@ -2186,6 +2386,8 @@ impl ProgramRuntime {
                             values,
                             &mut handler,
                         ),
+                        None if authorize_pending_host_call => runtime
+                            .resume_authorized_host_call_with_handler(suspension, &mut handler),
                         None => runtime.resume_with_handler(suspension, Vec::new(), &mut handler),
                     };
                     (runtime, execution)
@@ -4523,6 +4725,133 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.status, ExecutionStatus::AuthorizationRequired);
+    }
+
+    #[tokio::test]
+    async fn allow_once_resumes_exactly_one_runtime_effect() {
+        let runtime = ProgramRuntime::new();
+        let first = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(begin (file-read (path \"Cargo.toml\")) (file-read (path \"Cargo.lock\")))",
+                ExecutionEffect::WorkspaceRead,
+            ))
+            .await
+            .unwrap();
+        let first_prompt = first.approval_prompts[0].clone();
+        let second = runtime
+            .resolve_typed_approval(
+                &first_prompt,
+                ApprovalChoice::AllowOnce,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status, ExecutionStatus::AuthorizationRequired);
+        assert_ne!(
+            second.approval_prompts[0].request.id,
+            first_prompt.request.id
+        );
+
+        let ledger = runtime.capability_ledger().unwrap();
+        let once = ledger
+            .grants
+            .grants
+            .iter()
+            .find(|grant| {
+                matches!(
+                    grant.scope,
+                    GrantScope::Once { request_id }
+                        if request_id == first_prompt.request.id
+                )
+            })
+            .expect("allow-once records an exact grant");
+        assert!(once.consumed_at_unix_ms.is_some());
+        assert!(matches!(
+            ledger.authorization_audit.last().map(|entry| &entry.decision),
+            Some(AuthorizationDecision::Allowed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_approval_is_reused_only_after_exact_prompt_validation() {
+        let runtime = ProgramRuntime::new();
+        let source = || {
+            submission(
+                ProgramLanguage::Lisp,
+                "(file-read (path \"Cargo.toml\"))",
+                ExecutionEffect::WorkspaceRead,
+            )
+        };
+        let pending = runtime.submit(source()).await.unwrap();
+        let mut forged = pending.approval_prompts[0].clone();
+        forged.request.id = uuid::Uuid::new_v4();
+        assert!(runtime
+            .resolve_typed_approval(&forged, ApprovalChoice::AllowSession, "test-user")
+            .await
+            .is_err());
+        assert!(runtime
+            .pending_typed_execution(pending.execution_id)
+            .unwrap()
+            .is_some());
+        assert!(runtime
+            .capability_ledger()
+            .unwrap()
+            .grants
+            .grants
+            .is_empty());
+
+        let approved = runtime
+            .resolve_typed_approval(
+                &pending.approval_prompts[0],
+                ApprovalChoice::AllowSession,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved.status, ExecutionStatus::Completed);
+        let reused = runtime.submit(source()).await.unwrap();
+        assert_eq!(reused.status, ExecutionStatus::Completed);
+        assert!(reused.approval_prompts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn denied_approval_is_audited_and_discards_the_continuation() {
+        let runtime = ProgramRuntime::new();
+        let pending = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(file-read (path \"Cargo.toml\"))",
+                ExecutionEffect::WorkspaceRead,
+            ))
+            .await
+            .unwrap();
+        let denied = runtime
+            .resolve_typed_approval(
+                &pending.approval_prompts[0],
+                ApprovalChoice::Deny,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status, ExecutionStatus::Failed);
+        assert!(matches!(
+            denied.effect_journal.last().map(|entry| &entry.state),
+            Some(crate::vm::EffectJournalState::Denied)
+        ));
+        assert!(runtime
+            .pending_typed_execution(pending.execution_id)
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            runtime
+                .capability_ledger()
+                .unwrap()
+                .authorization_audit
+                .last()
+                .map(|entry| &entry.decision),
+            Some(AuthorizationDecision::Denied { .. })
+        ));
     }
 
     #[tokio::test]

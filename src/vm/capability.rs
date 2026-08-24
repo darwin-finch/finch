@@ -308,6 +308,31 @@ impl CapabilityLedger {
         decision
     }
 
+    pub fn deny(
+        &mut self,
+        request: &CapabilityRequest,
+        reason: impl Into<String>,
+        actor: impl Into<String>,
+        now_unix_ms: u64,
+    ) -> AuthorizationDecision {
+        let decision = AuthorizationDecision::Denied {
+            reason: reason.into(),
+        };
+        let sequence = self.take_sequence();
+        self.authorization_audit
+            .push(CapabilityAuthorizationAuditEntry {
+                sequence,
+                request_id: request.id,
+                execution_id: request.execution_id,
+                effect_sequence: request.effect_sequence,
+                requirement: request.requirement.clone(),
+                decision: decision.clone(),
+                at_unix_ms: now_unix_ms,
+                actor: actor.into(),
+            });
+        decision
+    }
+
     pub fn revoke(&mut self, grant_id: Uuid, actor: impl Into<String>, now_unix_ms: u64) -> bool {
         let requirement = self
             .grants
