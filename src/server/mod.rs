@@ -199,20 +199,6 @@ impl AgentServer {
 
         tracing::info!("Training worker spawned");
 
-        // Spawn IRC-like binary channel server on HTTP port + 1 (e.g. 8000 → 8001).
-        // Peers connect over TCP to JOIN channels, YIELD code, and trigger EXEC.
-        // Shares the same registry as the HTTP handlers and Forth words.
-        let channel_port: u16 = addr.port().saturating_add(1);
-        let channel_registry = std::sync::Arc::clone(&crate::server::handlers::CHANNEL_REGISTRY);
-        tokio::spawn(async move {
-            if let Err(e) =
-                crate::coforth::irc_proto::start_channel_server(channel_port, channel_registry)
-                    .await
-            {
-                tracing::warn!("channel server exited: {e}");
-            }
-        });
-
         // Background task: expire stale registry entries every 30 seconds.
         let registry = std::sync::Arc::clone(&crate::server::handlers::REGISTRY);
         tokio::spawn(async move {

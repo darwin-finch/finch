@@ -1,11 +1,11 @@
-/// Peer authentication token for the Co-Forth daemon.
+/// Peer authentication token for legacy peer-administration endpoints.
 ///
 /// Generated once at first daemon start, stored in `~/.finch/peer_token`,
 /// and reused across restarts.  Broadcast in the mDNS TXT record so that
 /// auto-discovered machines receive it automatically.
 ///
-/// Required on the dangerous endpoints: /v1/exec, /v1/forth/eval, /v1/forth/define.
-/// The header name is `X-Finch-Token`.
+/// This token does not grant typed ProgramRuntime or named-Brain authority. The
+/// header name is `X-Finch-Token`.
 pub const HEADER: &str = "x-finch-token";
 
 /// Load the peer token from `~/.finch/peer_token`, creating it if it doesn't exist.

@@ -95,7 +95,6 @@ impl EventHandler {
             ReplEvent::PosetComplete { .. } => {}
             ReplEvent::LispResult { .. } => {}
             ReplEvent::PeersDiscovered(_) => {}
-            ReplEvent::VocabSync(_) => {}
             ReplEvent::PeerMessage { .. } => {}
             ReplEvent::RemoteBrainMessage { .. } => {}
             ReplEvent::RemoteBrainError { .. }

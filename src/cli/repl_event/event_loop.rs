@@ -343,13 +343,6 @@ pub struct EventLoop {
     /// Stack state is cleared between evals; only the dictionary persists.
     forth_vm: crate::coforth::Forth,
 
-    /// Incoming push messages from peers (via POST /v1/forth/push).
-    push_rx: tokio::sync::broadcast::Receiver<String>,
-
-    /// Incoming hash updates from peers (via POST /v1/forth/hash).
-    /// Carries (room_id, key, value, from_name) tuples.
-    hash_rx: tokio::sync::broadcast::Receiver<(String, String, String, String)>,
-
     /// Broadcast sender — pushes code to ALL peer event loops simultaneously.
     peer_tx: tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
 
@@ -891,8 +884,6 @@ impl EventLoop {
             poset,
             plan_word: None,
             forth_vm: crate::coforth::Forth::new(),
-            push_rx: crate::server::handlers::PUSH_INBOX.subscribe(),
-            hash_rx: crate::server::handlers::HASH_INBOX.subscribe(),
             peer_tx,
             peer_inbox_tx,
             peer_inbox_rx,
@@ -1210,7 +1201,6 @@ impl EventLoop {
                         ReplEvent::LispResult { result: Ok(_) } => "LispResult(ok)",
                         ReplEvent::LispResult { result: Err(_) } => "LispResult(err)",
                         ReplEvent::PeersDiscovered(_) => "PeersDiscovered",
-                        ReplEvent::VocabSync(_) => "VocabSync",
                         ReplEvent::PeerMessage { .. } => "PeerMessage",
                         ReplEvent::RemoteBrainMessage { .. } => "RemoteBrainMessage",
                         ReplEvent::RemoteBrainError { .. } => "RemoteBrainError",
@@ -1392,59 +1382,6 @@ impl EventLoop {
                         };
                         self.handle_feedback_command(weight, rating, None).await?;
                         tracing::debug!("[EVENT_LOOP] Quick feedback recorded: {}", label);
-                    }
-
-                    // Drain incoming push messages from peers.
-                    // Feed each one through handle_stack_push so either side
-                    // (local human or local AI) can respond symmetrically.
-                    let mut incoming: Vec<String> = Vec::new();
-                    loop {
-                        match self.push_rx.try_recv() {
-                            Ok(msg) => incoming.push(msg),
-                            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-                            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => break,
-                            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
-                        }
-                    }
-                    for msg in incoming {
-                        use crossterm::style::Stylize;
-                        let display = format!("{}  {}", "←".dark_grey(), msg.as_str().white());
-                        self.output_manager.write_info(display);
-
-                        if let Err(e) = self.handle_stack_push(msg).await {
-                            tracing::warn!("Failed to handle incoming push: {e}");
-                        }
-                    }
-
-                    // Drain incoming hash updates from peers.
-                    // Apply each to the local VM's room hash.
-                    loop {
-                        match self.hash_rx.try_recv() {
-                            Ok((room_id, key, value, from)) => {
-                                let room = self.forth_vm.rooms.entry(room_id.clone()).or_default();
-                                const DEL: &str = "\x00del\x00";
-                                if value == DEL {
-                                    room.hash.remove(&key);
-                                } else {
-                                    room.hash.insert(key.clone(), value.clone());
-                                }
-                                // If not currently in any room, auto-join this one
-                                if self.forth_vm.current_room.is_none() {
-                                    self.forth_vm.current_room = Some(room_id.clone());
-                                }
-                                use crossterm::style::Stylize;
-                                let label = if from.is_empty() { "peer".to_string() } else { from };
-                                self.output_manager.write_info(format!(
-                                    "  {}  {}{}{}  {}",
-                                    label.as_str().cyan(),
-                                    key.as_str().dark_grey(),
-                                    " ← ".dark_grey(),
-                                    if value == DEL { "(deleted)".dark_grey().to_string() } else { value.as_str().white().to_string() },
-                                    room_id.chars().take(8).collect::<String>().as_str().dark_grey(),
-                                ));
-                            }
-                            Err(_) => break,
-                        }
                     }
 
                     // Don't spam logs, but good to know the loop is alive
@@ -3164,28 +3101,6 @@ Rules:\n\
                 self.output_manager
                     .write_info(text.as_str().cyan().to_string());
                 self.render_tui().await?;
-            }
-
-            ReplEvent::VocabSync(source) => {
-                // Another terminal defined new words — compile them into this session's VM.
-                // Apply the synchronized legacy source without rebroadcasting it.
-                let before = self.forth_vm.dump_source().lines().count();
-                let _ = self.forth_vm.exec_with_fuel(&source, 0);
-                let after = self.forth_vm.dump_source().lines().count();
-                let new_count = after.saturating_sub(before);
-                if new_count > 0 {
-                    use crossterm::style::Stylize;
-                    self.output_manager.write_info(
-                        format!(
-                            "  {} word{} synced from another session",
-                            new_count,
-                            if new_count == 1 { "" } else { "s" }
-                        )
-                        .dark_grey()
-                        .to_string(),
-                    );
-                    self.render_tui().await?;
-                }
             }
 
             ReplEvent::ShowDialog {
