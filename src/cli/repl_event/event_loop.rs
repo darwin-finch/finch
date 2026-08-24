@@ -2555,6 +2555,9 @@ Rules:\n\
                     Command::Brains => {
                         self.handle_brains_list().await?;
                     }
+                    Command::BrainArchive(name) => {
+                        self.handle_brain_archive(name).await?;
+                    }
                     Command::Graph => {
                         self.handle_graph_command().await?;
                     }

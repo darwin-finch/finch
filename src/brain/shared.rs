@@ -287,6 +287,45 @@ impl SharedBrainStore {
         })
     }
 
+    /// Remove a Brain from the active namespace without destroying its log.
+    /// Persistent state is moved beside the store into `brains-archive`.
+    pub fn archive(&self, name: &str) -> Result<Option<PathBuf>> {
+        let name = Self::validate_name(name)?;
+        let archived_to = if let Some(root) = &self.root {
+            let source = root.join(name);
+            if source.exists() {
+                let archive_root = root
+                    .parent()
+                    .map(|parent| parent.join("brains-archive"))
+                    .unwrap_or_else(|| root.join("archive"));
+                std::fs::create_dir_all(&archive_root)
+                    .with_context(|| format!("create {}", archive_root.display()))?;
+                let destination = archive_root.join(format!("{name}-{}", unix_millis()));
+                std::fs::rename(&source, &destination).with_context(|| {
+                    format!("archive {} as {}", source.display(), destination.display())
+                })?;
+                Some(destination)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.brains
+            .write()
+            .expect("shared brain lock poisoned")
+            .remove(name);
+        self.runtimes
+            .write()
+            .expect("shared brain runtime lock poisoned")
+            .remove(name);
+        self.execution_locks
+            .write()
+            .expect("shared brain execution-lock map poisoned")
+            .remove(name);
+        Ok(archived_to)
+    }
+
     pub fn push(&self, name: &str, sender: &str, kind: BrainEventKind) -> Result<BrainEvent> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
@@ -658,6 +697,21 @@ mod tests {
         let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
         assert_eq!(restarted.list().unwrap(), vec!["quiet-brain"]);
         assert_eq!(restarted.snapshot("quiet-brain").unwrap().revision, 0);
+    }
+
+    #[test]
+    fn archive_removes_a_brain_but_preserves_its_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("brains");
+        let store = SharedBrainStore::with_root("box.local", Some(root.clone()));
+        store
+            .push("old", "alice", BrainEventKind::Prompt { text: "hi".into() })
+            .unwrap();
+
+        let archive = store.archive("old").unwrap().unwrap();
+        assert!(!store.list().unwrap().contains(&"old".to_string()));
+        assert!(!root.join("old").exists());
+        assert!(archive.join("events.jsonl").exists());
     }
 
     #[tokio::test]

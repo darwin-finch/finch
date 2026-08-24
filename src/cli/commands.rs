@@ -57,6 +57,7 @@ pub enum Command {
     LicenseRemove,           // /license remove
     // Durable Brain sessions
     Brains,                        // /brains — list named, detachable sessions
+    BrainArchive(String),          // /brain archive <name>
     BrainAttach(String),           // /brain attach <name@machine[:port]>
     BrainDetach,                   // /brain detach
     BrainPassword(Option<String>), // /brain password [new-password]
@@ -437,6 +438,12 @@ impl Command {
                 return Some(Command::BrainAttach(target.to_string()));
             }
         }
+        if let Some(rest) = trimmed.strip_prefix("/brain archive ") {
+            let name = rest.trim();
+            if !name.is_empty() {
+                return Some(Command::BrainArchive(name.to_string()));
+            }
+        }
         if let Some(rest) = trimmed.strip_prefix("/brain password ") {
             let password = rest.trim();
             if !password.is_empty() {
@@ -715,6 +722,7 @@ pub fn handle_command(
         ),
         // Brain commands are handled directly in REPL
         Command::Brains
+        | Command::BrainArchive(_)
         | Command::BrainAttach(_)
         | Command::BrainDetach
         | Command::BrainPassword(_) => Ok(CommandOutput::Status(
@@ -936,6 +944,7 @@ pub fn format_help() -> String {
          {cyan}  /brain list{reset}        List named Brain sessions ({gray}/brains{reset} also works)\n\
          {cyan}  /brain attach <name>[@machine]{reset} Attach locally or to a remote Brain\n\
          {cyan}  /brain detach{reset}      Return to this console's home Brain\n\
+         {cyan}  /brain archive <name>{reset} Remove an inactive Brain but preserve its log\n\
          {cyan}  /brain password [new]{reset} Show or rotate the local brain credential\n\
          {reset}\n\
          {gray}  A Brain is one durable session; agents and scheduled work are runs within it.{reset}\n\n\
@@ -1117,6 +1126,10 @@ mod tests {
         ));
         assert!(matches!(Command::parse("/brain list"), Some(Command::Brains)));
         assert!(matches!(Command::parse("/brain ls"), Some(Command::Brains)));
+        assert!(matches!(
+            Command::parse("/brain archive old-project"),
+            Some(Command::BrainArchive(name)) if name == "old-project"
+        ));
         assert!(matches!(
             Command::parse("/brain investigate flaky tests"),
             Some(Command::Help)

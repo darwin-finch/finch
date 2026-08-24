@@ -297,6 +297,45 @@ impl EventLoop {
         self.render_tui().await
     }
 
+    async fn handle_brain_archive(&mut self, name: String) -> Result<()> {
+        let active_name = self
+            .active_remote_brain
+            .as_ref()
+            .map(|client| client.target.brain.as_str())
+            .unwrap_or(self.session_label.as_str());
+        if name == active_name {
+            self.output_manager
+                .write_info("detach from or switch away from a Brain before archiving it");
+            return self.render_tui().await;
+        }
+        let Some(base) = self.daemon_base_url.as_deref() else {
+            self.output_manager.write_info("⚠️  Daemon not connected.");
+            return self.render_tui().await;
+        };
+        match reqwest::Client::new()
+            .delete(format!("{base}/v1/brains/named/{name}"))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                let body: serde_json::Value = response.json().await.unwrap_or_default();
+                let destination = body["archived_to"]
+                    .as_str()
+                    .unwrap_or("in-memory archive");
+                self.output_manager
+                    .write_info(format!("archived Brain {name} → {destination}"));
+            }
+            Ok(response) => self.output_manager.write_info(format!(
+                "could not archive Brain {name}: {}",
+                response.text().await.unwrap_or_default()
+            )),
+            Err(error) => self
+                .output_manager
+                .write_info(format!("could not archive Brain {name}: {error}")),
+        }
+        self.render_tui().await
+    }
+
     /// Handle `/brain cancel <name-or-id>`.
     async fn handle_brain_cancel(&mut self, name_or_id: String) -> Result<()> {
         let Some(ipc) = self.ipc() else {

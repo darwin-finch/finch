@@ -76,7 +76,9 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         .route("/v1/brains/named", get(list_named_brains))
         .route(
             "/v1/brains/named/:name",
-            get(get_named_brain).post(push_named_brain_event),
+            get(get_named_brain)
+                .post(push_named_brain_event)
+                .delete(archive_named_brain),
         )
         .route("/v1/brains/named/:name/ws", get(watch_named_brain))
         .route(
@@ -228,6 +230,34 @@ async fn get_named_brain(
         .snapshot(&name)
         .map(Json)
         .map_err(|error| AppError(error).into_response())
+}
+
+#[derive(Debug, Serialize)]
+struct ArchiveNamedBrainResponse {
+    name: String,
+    archived_to: Option<String>,
+}
+
+async fn archive_named_brain(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<ArchiveNamedBrainResponse>, Response> {
+    check_brain_access(&server, addr, &headers).await?;
+    let execution_lock = server
+        .shared_brains()
+        .execution_lock(&name)
+        .map_err(|error| AppError(error).into_response())?;
+    let _turn = execution_lock.lock_owned().await;
+    let archived_to = server
+        .shared_brains()
+        .archive(&name)
+        .map_err(|error| AppError(error).into_response())?;
+    Ok(Json(ArchiveNamedBrainResponse {
+        name,
+        archived_to: archived_to.map(|path| path.display().to_string()),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
