@@ -220,7 +220,7 @@ pub struct EventLoop {
     feedback_logger: Option<FeedbackLogger>,
 
     /// Metrics logger — reads from ~/.finch/metrics/ for /metrics command
-    metrics_logger: Option<crate::metrics::MetricsLogger>,
+    metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
 
     /// Memory system for semantic recall across sessions
     memory_system: Option<Arc<crate::memory::MemorySystem>>,
@@ -1280,7 +1280,8 @@ impl EventLoop {
             feedback_logger: FeedbackLogger::new().ok(),
             metrics_logger: dirs::home_dir()
                 .map(|h| h.join(".finch").join("metrics"))
-                .and_then(|p| crate::metrics::MetricsLogger::new(p).ok()),
+                .and_then(|p| crate::metrics::MetricsLogger::new(p).ok())
+                .map(Arc::new),
             memory_system,
             session_label,
             session_uuid: Uuid::new_v4(),
@@ -1656,6 +1657,7 @@ impl EventLoop {
                 self.context_recall_k,
                 self.enable_summarization,
                 self.auto_compact_enabled,
+                self.metrics_logger.clone(),
             );
             tokio::spawn(llm_loop.run());
         }

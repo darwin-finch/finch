@@ -194,6 +194,17 @@ struct WireExecution {
     response: String,
 }
 
+fn record_wire_metric(
+    logger: Option<&crate::metrics::MetricsLogger>,
+    metric: &crate::metrics::WireAdherenceMetric,
+) {
+    if let Some(logger) = logger {
+        if let Err(error) = logger.log_wire(metric) {
+            tracing::warn!("failed to record provider wire adherence: {error}");
+        }
+    }
+}
+
 /// Execute one provider wire response and, for a safe rejected program, ask
 /// the same model for precisely one source-level correction.  Each source and
 /// each output owns a separate WorkUnit, so the failed program never vanishes
@@ -205,7 +216,13 @@ async fn execute_wire_with_single_repair(
     generator: Arc<dyn Generator>,
     messages: &[crate::claude::Message],
     source: String,
+    metrics_logger: Option<&crate::metrics::MetricsLogger>,
 ) -> WireExecution {
+    let mut metric = crate::metrics::WireAdherenceMetric::first_pass(
+        generator.name(),
+        generator.name(),
+        "interactive",
+    );
     let output_unit = output_manager.start_work_unit("VM program output");
     output_unit.set_program_output();
     let initial = execute_direct_wire_response(
@@ -219,6 +236,12 @@ async fn execute_wire_with_single_repair(
 
     let (diagnostic, repairable) = match initial {
         Ok(outcome) if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {
+            if outcome.output.is_empty() {
+                metric.first_pass_valid = false;
+                metric.failure_class = Some(crate::metrics::WireFailureClass::MissingOutputEffect);
+                metric.terminal_failure = true;
+            }
+            record_wire_metric(metrics_logger, &metric);
             output_unit.set_complete();
             return WireExecution {
                 source_for_history: source,
@@ -239,14 +262,21 @@ async fn execute_wire_with_single_repair(
         }
     };
 
+    metric.first_pass_valid = false;
+    metric.failure_class = Some(crate::programs::classify_wire_failure(&source, &diagnostic));
+    metric.diagnostic_code = crate::programs::wire_diagnostic_code(&diagnostic);
+
     output_unit.append_response(&format!("VM wire error: {diagnostic}"));
     if !repairable {
+        metric.terminal_failure = true;
+        record_wire_metric(metrics_logger, &metric);
         output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
             response: diagnostic,
         };
     }
+    metric.repair_attempted = true;
 
     // Keep the rejected result visibly live while the bounded corrective
     // inference runs. Previously a plain output WorkUnit showed only the
@@ -259,6 +289,8 @@ async fn execute_wire_with_single_repair(
     let repair = generator.generate(repair_messages, None).await;
     output_unit.set_transient_status(None);
     let Ok(repair) = repair else {
+        metric.terminal_failure = true;
+        record_wire_metric(metrics_logger, &metric);
         output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
@@ -266,6 +298,8 @@ async fn execute_wire_with_single_repair(
         };
     };
     if !repair.tool_uses.is_empty() || repair.text.trim().is_empty() {
+        metric.terminal_failure = true;
+        record_wire_metric(metrics_logger, &metric);
         output_unit.set_complete();
         return WireExecution {
             source_for_history: source,
@@ -294,6 +328,13 @@ async fn execute_wire_with_single_repair(
     .await
     {
         Ok(outcome) if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {
+            metric.repaired_successfully = !outcome.output.is_empty();
+            metric.terminal_failure = outcome.output.is_empty();
+            if outcome.output.is_empty() {
+                metric.failure_class =
+                    Some(crate::metrics::WireFailureClass::MissingOutputEffect);
+            }
+            record_wire_metric(metrics_logger, &metric);
             repair_output_unit.set_complete();
             WireExecution {
                 source_for_history: repaired_source,
@@ -308,6 +349,8 @@ async fn execute_wire_with_single_repair(
                 .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
             repair_output_unit.append_response(&format!("VM wire error: {detail}"));
             repair_output_unit.set_complete();
+            metric.terminal_failure = true;
+            record_wire_metric(metrics_logger, &metric);
             WireExecution {
                 source_for_history: repaired_source,
                 response: detail,
@@ -317,6 +360,8 @@ async fn execute_wire_with_single_repair(
             let detail = format!("VM wire error: {error}");
             repair_output_unit.append_response(&detail);
             repair_output_unit.set_complete();
+            metric.terminal_failure = true;
+            record_wire_metric(metrics_logger, &metric);
             WireExecution {
                 source_for_history: repaired_source,
                 response: detail,
@@ -627,6 +672,7 @@ pub(crate) async fn process_query_with_tools(
     tool_call_history: Arc<
         RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>,
     >,
+    wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
 ) {
     tracing::debug!(
         "process_query_with_tools starting for query_id: {:?}",
@@ -927,6 +973,7 @@ pub(crate) async fn process_query_with_tools(
                     Arc::clone(&generator),
                     &messages,
                     wire_source.clone(),
+                    wire_metrics_logger.as_deref(),
                 )
                 .await;
                 let response = wire_execution.response;
@@ -1066,6 +1113,7 @@ pub(crate) async fn process_query_with_tools(
                 Arc::clone(&generator),
                 &messages,
                 wire_source.clone(),
+                wire_metrics_logger.as_deref(),
             )
             .await;
             let rendered_response = wire_execution.response;
@@ -1558,6 +1606,8 @@ mod tests {
         });
         let source = raw_wire_source("```lisp\n(say \"must not run\")\n```");
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let metrics_dir = tempfile::tempdir().unwrap();
+        let metrics = crate::metrics::MetricsLogger::new(metrics_dir.path().to_path_buf()).unwrap();
 
         let execution = execute_wire_with_single_repair(
             &runtime,
@@ -1566,6 +1616,7 @@ mod tests {
             generator.clone(),
             &[crate::claude::Message::user("reply")],
             source.clone(),
+            Some(&metrics),
         )
         .await;
 
@@ -1587,6 +1638,17 @@ mod tests {
         assert_eq!(projected, 1, "the repaired say must cross the event bus");
         assert_eq!(execution.source_for_history, "(say \"repaired\")");
         assert_eq!(execution.response, "repaired");
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let recorded = metrics.read_wire_metrics(&today).unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(!recorded[0].first_pass_valid);
+        assert_eq!(
+            recorded[0].failure_class,
+            Some(crate::metrics::WireFailureClass::MarkdownFence)
+        );
+        assert!(recorded[0].repair_attempted);
+        assert!(recorded[0].repaired_successfully);
+        assert!(!recorded[0].terminal_failure);
         let messages = output.get_messages();
         assert_eq!(
             messages.len(),

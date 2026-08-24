@@ -70,6 +70,7 @@ pub struct LlmLoop {
     context_recall_k: usize,
     enable_summarization: bool,
     auto_compact_enabled: bool,
+    wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
 }
 
 impl LlmLoop {
@@ -107,6 +108,7 @@ impl LlmLoop {
         context_recall_k: usize,
         enable_summarization: bool,
         auto_compact_enabled: bool,
+        wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
     ) -> Self {
         Self {
             llm_rx,
@@ -136,6 +138,7 @@ impl LlmLoop {
             context_recall_k,
             enable_summarization,
             auto_compact_enabled,
+            wire_metrics_logger,
         }
     }
 
@@ -196,6 +199,7 @@ impl LlmLoop {
         let recall_k = self.context_recall_k;
         let enable_summarization = self.enable_summarization;
         let auto_compact_enabled = self.auto_compact_enabled;
+        let wire_metrics_logger = self.wire_metrics_logger.clone();
         // Always use the capable cloud model for summarisation, regardless of routing.
         let summary_gen = Arc::clone(&claude_gen);
         let tool_call_history = Arc::clone(&self.tool_call_history);
@@ -231,6 +235,7 @@ impl LlmLoop {
                 auto_compact_enabled,
                 summary_gen,
                 tool_call_history,
+                wire_metrics_logger,
             )
             .await;
 
