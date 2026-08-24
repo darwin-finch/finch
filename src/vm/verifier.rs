@@ -1,7 +1,7 @@
 use super::diagnostic::{DiagnosticPhase, SourceOrigin, VmDiagnostic};
 use super::effects::{CapabilityRequirement, EffectSet};
 use super::ir::{BlockId, Function, Instruction, Module};
-use super::signature::{StackRow, StackSignature};
+use super::signature::{StackRow, StackSignature, SuspensionSignature};
 use super::types::Type;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -12,6 +12,7 @@ pub type Vocabulary = BTreeMap<String, StackSignature>;
 pub struct VerifiedFunction {
     pub name: String,
     pub inferred_effects: EffectSet,
+    pub inferred_suspension: Option<SuspensionSignature>,
     pub entry_stack: Vec<Type>,
     pub block_stacks: BTreeMap<BlockId, Vec<Type>>,
 }
@@ -90,6 +91,7 @@ impl<'a> Verifier<'a> {
         let mut block_stacks = BTreeMap::from([(function.entry, entry_stack.clone())]);
         let mut queue = VecDeque::from([function.entry]);
         let mut inferred_effects = EffectSet::pure();
+        let mut inferred_suspension = None;
         let mut diagnostics = Vec::new();
 
         while let Some(block_id) = queue.pop_front() {
@@ -121,6 +123,7 @@ impl<'a> Verifier<'a> {
                     function,
                     module_functions,
                     &mut inferred_effects,
+                    &mut inferred_suspension,
                 );
                 match result {
                     Ok(successors) => {
@@ -164,10 +167,23 @@ impl<'a> Verifier<'a> {
             diagnostics.push(diagnostic);
         }
 
+        if function.signature.suspension != inferred_suspension {
+            diagnostics.push(VmDiagnostic::error(
+                "E-YIELD-005",
+                DiagnosticPhase::Verification,
+                format!(
+                    "function '{}' declares suspension {:?}, but its body requires {:?}",
+                    function.name, function.signature.suspension, inferred_suspension
+                ),
+                None,
+            ));
+        }
+
         if diagnostics.is_empty() {
             Ok(VerifiedFunction {
                 name: function.name.clone(),
                 inferred_effects,
+                inferred_suspension,
                 entry_stack,
                 block_stacks,
             })
@@ -185,6 +201,7 @@ impl<'a> Verifier<'a> {
         function: &Function,
         module_functions: &BTreeMap<String, Function>,
         inferred_effects: &mut EffectSet,
+        inferred_suspension: &mut Option<SuspensionSignature>,
     ) -> Result<Vec<BlockId>, VmDiagnostic> {
         match instruction {
             Instruction::Constant { value } => stack.push(value.value_type()),
@@ -477,6 +494,7 @@ impl<'a> Verifier<'a> {
                             .unwrap_or(Type::Unit),
                     ),
                     effects: signature.effects.clone(),
+                    suspension: signature.suspension.clone(),
                 });
             }
             Instruction::Call { function: callee } => {
@@ -492,31 +510,36 @@ impl<'a> Verifier<'a> {
                             Some(origin.clone()),
                         )
                     })?;
+                let concrete = instantiate_signature_types(signature, stack, origin)?;
                 apply_signature(signature, stack, origin)?;
                 *inferred_effects = inferred_effects.union(&signature.effects);
+                merge_suspension(inferred_suspension, concrete.suspension.as_ref(), origin)?;
             }
             Instruction::CallClosure { signature } => {
                 let closure = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
-                if !matches!(closure, Type::Function { .. } | Type::Dynamic) {
+                let expected_closure = Type::Function {
+                    arguments: signature.input.values.clone(),
+                    result: Box::new(
+                        signature
+                            .output
+                            .values
+                            .last()
+                            .cloned()
+                            .unwrap_or(Type::Unit),
+                    ),
+                    effects: signature.effects.clone(),
+                    suspension: signature.suspension.clone(),
+                };
+                if closure != expected_closure && closure != Type::Dynamic {
                     return Err(VmDiagnostic::type_mismatch(
-                        Type::Function {
-                            arguments: signature.input.values.clone(),
-                            result: Box::new(
-                                signature
-                                    .output
-                                    .values
-                                    .last()
-                                    .cloned()
-                                    .unwrap_or(Type::Unit),
-                            ),
-                            effects: signature.effects.clone(),
-                        },
+                        expected_closure,
                         closure,
                         Some(origin.clone()),
                     ));
                 }
                 apply_signature(signature, stack, origin)?;
                 *inferred_effects = inferred_effects.union(&signature.effects);
+                merge_suspension(inferred_suspension, signature.suspension.as_ref(), origin)?;
             }
             Instruction::OutputOpen => {
                 let found = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
@@ -566,6 +589,11 @@ impl<'a> Verifier<'a> {
                         Some(origin.clone()),
                     ));
                 }
+                merge_suspension(
+                    inferred_suspension,
+                    Some(&SuspensionSignature::one_way(value_type.clone())),
+                    origin,
+                )?;
             }
             Instruction::DeferCpu => {
                 let closure = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
@@ -573,6 +601,7 @@ impl<'a> Verifier<'a> {
                     arguments,
                     result,
                     effects,
+                    ..
                 } = closure
                 else {
                     return Err(VmDiagnostic::error(
@@ -799,6 +828,12 @@ pub(crate) fn instantiate_signature_types(
         },
         effects: signature.effects.clone(),
         control: signature.control.clone(),
+        suspension: signature.suspension.as_ref().map(|suspension| {
+            SuspensionSignature {
+                yield_type: Box::new(substitute(&suspension.yield_type, &substitutions)),
+                resume_type: Box::new(substitute(&suspension.resume_type, &substitutions)),
+            }
+        }),
     })
 }
 
@@ -950,6 +985,7 @@ fn substitute(ty: &Type, substitutions: &BTreeMap<String, Type>) -> Type {
             arguments,
             result,
             effects,
+            suspension,
         } => Type::Function {
             arguments: arguments
                 .iter()
@@ -957,6 +993,10 @@ fn substitute(ty: &Type, substitutions: &BTreeMap<String, Type>) -> Type {
                 .collect(),
             result: Box::new(substitute(result, substitutions)),
             effects: effects.clone(),
+            suspension: suspension.as_ref().map(|suspension| SuspensionSignature {
+                yield_type: Box::new(substitute(&suspension.yield_type, substitutions)),
+                resume_type: Box::new(substitute(&suspension.resume_type, substitutions)),
+            }),
         },
         _ => ty.clone(),
     }
@@ -1017,6 +1057,32 @@ fn merge_stack(
             diagnostics.push(diagnostic);
         }
     }
+}
+
+fn merge_suspension(
+    current: &mut Option<SuspensionSignature>,
+    incoming: Option<&SuspensionSignature>,
+    origin: &SourceOrigin,
+) -> Result<(), VmDiagnostic> {
+    let Some(incoming) = incoming else {
+        return Ok(());
+    };
+    if let Some(current) = current {
+        if current != incoming {
+            return Err(VmDiagnostic::error(
+                "E-YIELD-004",
+                DiagnosticPhase::Verification,
+                format!(
+                    "one callable cannot yield incompatible types {} and {}",
+                    current.yield_type, incoming.yield_type
+                ),
+                Some(origin.clone()),
+            ));
+        }
+    } else {
+        *current = Some(incoming.clone());
+    }
+    Ok(())
 }
 
 fn underflow(origin: &SourceOrigin, expected: usize, found: usize) -> VmDiagnostic {
@@ -1129,6 +1195,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_yield_hidden_from_the_callable_contract() {
+        let signature = StackSignature::pure(
+            StackRow::closed(Vec::new()),
+            StackRow::closed(vec![Type::Int]),
+        );
+        let module = Module::single(function(
+            signature,
+            vec![
+                Instruction::Constant {
+                    value: TypedValue::Int(1),
+                },
+                Instruction::Yield {
+                    value_type: Type::Int,
+                },
+                Instruction::Constant {
+                    value: TypedValue::Int(2),
+                },
+                Instruction::Return,
+            ],
+        ));
+        let errors = Verifier::new(&core_vocabulary())
+            .verify(module)
+            .expect_err("verified IR cannot hide a suspension boundary");
+        assert!(errors.iter().any(|error| error.code == "E-YIELD-005"));
+    }
+
+    #[test]
     fn rejects_undeclared_capability_effect() {
         let signature = StackSignature {
             type_parameters: Vec::new(),
@@ -1136,6 +1229,7 @@ mod tests {
             output: StackRow::closed(vec![Type::Unit]),
             effects: EffectSet::pure(),
             control: ControlEffect::Returns,
+            suspension: None,
         };
         let requirement = CapabilityRequirement::file(
             FileOperation::Write,
@@ -1235,6 +1329,7 @@ mod tests {
                 output: StackRow::closed(vec![Type::Unit]),
                 effects: effects.clone(),
                 control: ControlEffect::MaySuspend,
+                suspension: None,
             },
             locals: Vec::new(),
             captures: Vec::new(),
@@ -1266,6 +1361,7 @@ mod tests {
                 output: StackRow::closed(vec![Type::Unit]),
                 effects: effects.clone(),
                 control: ControlEffect::MaySuspend,
+                suspension: None,
             },
             locals: Vec::new(),
             captures: Vec::new(),

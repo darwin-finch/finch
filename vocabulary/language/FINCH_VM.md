@@ -136,7 +136,10 @@ separate protocol.
 event-loop trampoline as a saved `ProgramRun` suspension. `unit yield` / `(yield)` is the plain
 cooperative-timeslice case; the interactive provider-wire runner automatically resumes only that
 unit form. Other hosts choose their own scheduling policy and may inspect the payload. It may occur
-more than once in one program and does not expose an LLM-authored continuation value. A future
+more than once in one program and does not expose an LLM-authored continuation value. A callable
+that can publish values advertises `yields<Y,unit>` after its ordinary stack/effect signature.
+That metadata is serialized with function and closure types, composes through calls, and is checked
+again against IR; it describes control flow, not authority. A future
 `fiber<Y,R>` is a first-class handle over this same typed control effect, with a declared resume
 type (initially `unit`); Finch will not add a second generator-only `yield` or hidden multi-return
 protocol.

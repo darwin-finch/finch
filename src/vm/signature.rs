@@ -51,6 +51,29 @@ pub enum ControlEffect {
     NeverReturns,
 }
 
+/// Typed contract for a callable that may cooperatively suspend.
+///
+/// `yield_type` is published to the fiber's consumer. `resume_type` is the
+/// value supplied when execution continues. The first protocol version is
+/// one-way, so source frontends infer `unit` for `resume_type`, but retaining
+/// it in the contract avoids a later incompatible function-type change.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub struct SuspensionSignature {
+    pub yield_type: Box<Type>,
+    pub resume_type: Box<Type>,
+}
+
+impl SuspensionSignature {
+    pub fn one_way(yield_type: Type) -> Self {
+        Self {
+            yield_type: Box::new(yield_type),
+            resume_type: Box::new(Type::Unit),
+        }
+    }
+}
+
 /// Complete contract for a callable word or function.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StackSignature {
@@ -59,6 +82,8 @@ pub struct StackSignature {
     pub output: StackRow,
     pub effects: EffectSet,
     pub control: ControlEffect,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspension: Option<SuspensionSignature>,
 }
 
 impl StackSignature {
@@ -69,6 +94,7 @@ impl StackSignature {
             output,
             effects: EffectSet::pure(),
             control: ControlEffect::Returns,
+            suspension: None,
         }
     }
 }
@@ -79,7 +105,15 @@ impl fmt::Display for StackSignature {
             f,
             "( {} -- {} ! {} )",
             self.input, self.output, self.effects
-        )
+        )?;
+        if let Some(suspension) = &self.suspension {
+            write!(
+                f,
+                " yields<{},{}>",
+                suspension.yield_type, suspension.resume_type
+            )?;
+        }
+        Ok(())
     }
 }
 

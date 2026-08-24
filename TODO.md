@@ -199,9 +199,11 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   backends.
 - [ ] Complete first-class producer fibers on the shared typed `yield` control effect. `yield` now
   publishes one typed value beside the exact serializable continuation, pending-run inspection
-  exposes it, and unit yields retain automatic cooperative-timeslice behavior. Still record the
-  declared resume value in the function/fiber contract and make `defer` expose `fiber<Y,R>` through
-  ordinary typed `next`/`join` vocabulary words. `stream<T>` stays the range abstraction for
+  exposes it, and unit yields retain automatic cooperative-timeslice behavior. Callable and closure
+  signatures now retain the inferred `yields<Y,unit>` contract, the independent verifier rejects a
+  hidden or inconsistent suspension, and published words preserve it in vocabulary introspection.
+  Still make `defer` expose `fiber<Y,R>` through ordinary typed `next`/`join` vocabulary words.
+  `stream<T>` stays the range abstraction for
   cursor-backed data, while producer fibers supply user-defined ranges. No special multi-return,
   hidden iterator protocol, compiler-only map lookup rule, or untyped resumed value is permitted;
   all scheduler operations must come from the same typed registry/templates available to user

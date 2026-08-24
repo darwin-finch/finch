@@ -6,7 +6,7 @@ use crate::vm::diagnostic::{
 use crate::vm::effects::{CapabilityKind, CapabilityRequirement, EffectSet, ResourceSelector};
 use crate::vm::interpreter::UiOperation;
 use crate::vm::ir::{BasicBlock, BlockId, Function, Instruction, LocatedInstruction, Module};
-use crate::vm::signature::{ControlEffect, StackRow, StackSignature};
+use crate::vm::signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
 use crate::vm::types::{Type, TypedValue};
 use crate::vm::verifier::{
     apply_signature_types, instantiate_signature_types, VerifiedModule, Verifier, Vocabulary,
@@ -62,6 +62,7 @@ struct FunctionBuilder {
     stack: Vec<Type>,
     input: Vec<Type>,
     effects: EffectSet,
+    suspension: Option<SuspensionSignature>,
     /// The enclosing definition's result contract, when it opted into
     /// early-result propagation. Top-level forms and closures intentionally
     /// have none: `try` must not manufacture a hidden dynamic return path.
@@ -88,6 +89,7 @@ impl FunctionBuilder {
             stack: input.clone(),
             input,
             effects: EffectSet::pure(),
+            suspension: None,
             return_result: None,
         }
     }
@@ -112,6 +114,32 @@ impl FunctionBuilder {
             instruction,
             origin,
         });
+    }
+
+    fn merge_suspension(
+        &mut self,
+        incoming: Option<&SuspensionSignature>,
+        origin: &SourceOrigin,
+    ) -> Result<(), Vec<VmDiagnostic>> {
+        let Some(incoming) = incoming else {
+            return Ok(());
+        };
+        if let Some(current) = &self.suspension {
+            if current != incoming {
+                return Err(vec![VmDiagnostic::error(
+                    "E-YIELD-004",
+                    DiagnosticPhase::TypeInference,
+                    format!(
+                        "one callable cannot yield incompatible types {} and {}",
+                        current.yield_type, incoming.yield_type
+                    ),
+                    Some(origin.clone()),
+                )]);
+            }
+        } else {
+            self.suspension = Some(incoming.clone());
+        }
+        Ok(())
     }
 
     fn new_block(&mut self) -> BlockId {
@@ -168,7 +196,12 @@ impl FunctionBuilder {
                 input: StackRow::polymorphic("S", self.input),
                 output: StackRow::polymorphic("S", output),
                 effects: self.effects,
-                control: ControlEffect::Returns,
+                control: if self.suspension.is_some() {
+                    ControlEffect::MaySuspend
+                } else {
+                    ControlEffect::Returns
+                },
+                suspension: self.suspension,
             },
             locals: self.locals,
             captures: self.captures,
@@ -877,6 +910,7 @@ impl Compiler<'_> {
                 .clone()
                 .unwrap_or_else(EffectSet::pure),
             control: ControlEffect::Returns,
+            suspension: None,
         };
         self.vocabulary
             .insert(definition.name.to_string(), signature.clone());
@@ -1095,6 +1129,7 @@ impl Compiler<'_> {
             arguments,
             result,
             effects,
+            ..
         } = closure_type
         else {
             return Err(vec![
@@ -2592,6 +2627,7 @@ impl Compiler<'_> {
             arguments,
             result: Box::new(result_type),
             effects: signature.effects,
+            suspension: signature.suspension,
         })
     }
 
@@ -2636,6 +2672,10 @@ impl Compiler<'_> {
                 },
                 origin.clone(),
             );
+            builder.merge_suspension(
+                Some(&SuspensionSignature::one_way(Type::Unit)),
+                &origin,
+            )?;
             builder.emit(
                 Instruction::Constant {
                     value: TypedValue::Unit,
@@ -2674,6 +2714,7 @@ impl Compiler<'_> {
         apply_signature_types(&signature, &mut builder.stack, &origin)
             .map_err(|diagnostic| vec![diagnostic])?;
         builder.effects = builder.effects.union(&signature.effects);
+        builder.merge_suspension(concrete_signature.suspension.as_ref(), &origin)?;
         if word == "yield" {
             // The argument is consumed as the typed yielded payload. Lisp
             // remains expression-oriented, so resuming the one-way form
@@ -2749,6 +2790,7 @@ impl Compiler<'_> {
             arguments: expected,
             result,
             effects,
+            suspension,
         } = closure_type
         else {
             return Err(vec![
@@ -2770,12 +2812,18 @@ impl Compiler<'_> {
             input: StackRow::polymorphic("S", expected),
             output: StackRow::polymorphic("S", vec![(*result).clone()]),
             effects: effects.clone(),
-            control: ControlEffect::Returns,
+            control: if suspension.is_some() {
+                ControlEffect::MaySuspend
+            } else {
+                ControlEffect::Returns
+            },
+            suspension: suspension.clone(),
         };
         builder.stack.pop();
         apply_signature_types(&signature, &mut builder.stack, &self.origin("call"))
             .map_err(|diagnostic| vec![diagnostic])?;
         builder.effects = builder.effects.union(&effects);
+        builder.merge_suspension(suspension.as_ref(), &self.origin("call"))?;
         builder.emit(
             Instruction::CallClosure {
                 signature: signature.clone(),
@@ -3858,6 +3906,47 @@ mod tests {
             .instructions
             .iter()
             .any(|operation| matches!(operation.instruction, Instruction::DeferCpu)));
+    }
+
+    #[test]
+    fn lambda_type_retains_its_typed_suspension_contract() {
+        let module = compile_lisp(
+            "producer.lisp",
+            "(lambda () (begin (yield 1) 2))",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("yielding Lisp closure compiles");
+        let lambda = module
+            .module
+            .functions
+            .values()
+            .find(|function| function.name.starts_with("lambda$"))
+            .expect("lowered lambda function");
+        assert_eq!(
+            lambda.signature.suspension,
+            Some(SuspensionSignature::one_way(Type::Int))
+        );
+        assert_eq!(lambda.signature.control, ControlEffect::MaySuspend);
+        assert!(matches!(
+            module.module.functions["main"].signature.output.values.as_slice(),
+            [Type::Function {
+                suspension: Some(SuspensionSignature { yield_type, resume_type }),
+                ..
+            }] if **yield_type == Type::Int && **resume_type == Type::Unit
+        ));
+    }
+
+    #[test]
+    fn callable_rejects_incompatible_yield_types() {
+        let errors = compile_lisp(
+            "mixed-yield.lisp",
+            "(lambda () (begin (yield 1) (yield \"two\") 2))",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect_err("one producer must have one stable yield type");
+        assert!(errors.iter().any(|error| error.code == "E-YIELD-004"));
     }
 
     #[test]

@@ -32,6 +32,8 @@ pub enum Type {
         arguments: Vec<Type>,
         result: Box<Type>,
         effects: super::effects::EffectSet,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suspension: Option<super::signature::SuspensionSignature>,
     },
     Task(Box<Type>),
     /// An opaque, scheduler/host-owned lazy sequence. Advancing it is
@@ -107,6 +109,7 @@ impl fmt::Display for Type {
                 arguments,
                 result,
                 effects,
+                suspension,
             } => {
                 f.write_str("fn(")?;
                 for (index, argument) in arguments.iter().enumerate() {
@@ -115,7 +118,15 @@ impl fmt::Display for Type {
                     }
                     write!(f, "{argument}")?;
                 }
-                write!(f, ")->{result}!{effects}")
+                write!(f, ")->{result}!{effects}")?;
+                if let Some(suspension) = suspension {
+                    write!(
+                        f,
+                        " yields<{},{}>",
+                        suspension.yield_type, suspension.resume_type
+                    )?;
+                }
+                Ok(())
             }
             Self::Task(result) => write!(f, "task<{result}>"),
             Self::Stream(element) => write!(f, "stream<{element}>"),
@@ -266,6 +277,7 @@ impl TypedValue {
                         .unwrap_or(Type::Unit),
                 ),
                 effects: signature.effects.clone(),
+                suspension: signature.suspension.clone(),
             },
             Self::Task { result_type, .. } => Type::Task(Box::new(result_type.clone())),
             Self::Stream { element_type, .. } => Type::Stream(Box::new(element_type.clone())),

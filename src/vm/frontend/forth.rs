@@ -4,7 +4,7 @@ use crate::vm::diagnostic::{
 use crate::vm::effects::EffectSet;
 use crate::vm::interpreter::UiOperation;
 use crate::vm::ir::{BasicBlock, Function, Instruction, LocatedInstruction, Module};
-use crate::vm::signature::{ControlEffect, StackRow, StackSignature};
+use crate::vm::signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
 use crate::vm::types::{Type, TypedValue};
 use crate::vm::verifier::{
     apply_signature_types, instantiate_signature_types, VerifiedModule, Verifier, Vocabulary,
@@ -219,6 +219,12 @@ pub fn compile_forth_with_functions(
         function.documentation = definition.documentation;
         function.signature = definition.signature;
         function.signature.effects = verified.inferred_effects.clone();
+        function.signature.suspension = verified.inferred_suspension.clone();
+        function.signature.control = if function.signature.suspension.is_some() {
+            ControlEffect::MaySuspend
+        } else {
+            ControlEffect::Returns
+        };
         local_vocabulary.insert(definition.name.clone(), function.signature.clone());
         functions.insert(definition.name, function);
     }
@@ -262,6 +268,7 @@ fn compile_forth_body_with_locals(
     let tokens = tokenize(source_id, source)?;
     let mut stack = initial_stack.clone();
     let mut effects = EffectSet::pure();
+    let mut suspension: Option<SuspensionSignature> = None;
     let mut blocks = BTreeMap::from([(
         0,
         BasicBlock {
@@ -372,6 +379,7 @@ fn compile_forth_body_with_locals(
                             .unwrap_or(Type::Unit),
                     ),
                     effects: signature.effects.clone(),
+                    suspension: signature.suspension.clone(),
                 });
                 emit(
                     &mut blocks,
@@ -391,6 +399,7 @@ fn compile_forth_body_with_locals(
                     arguments,
                     result,
                     effects: closure_effects,
+                    suspension: closure_suspension,
                 } = stack.pop().ok_or_else(|| {
                     vec![control_error(
                         "E-STACK-001",
@@ -410,7 +419,12 @@ fn compile_forth_body_with_locals(
                     input: StackRow::polymorphic("S", arguments),
                     output: StackRow::polymorphic("S", vec![(*result).clone()]),
                     effects: closure_effects.clone(),
-                    control: ControlEffect::Returns,
+                    control: if closure_suspension.is_some() {
+                        ControlEffect::MaySuspend
+                    } else {
+                        ControlEffect::Returns
+                    },
+                    suspension: closure_suspension.clone(),
                 };
                 apply_signature_types(&signature, &mut stack, &origin)
                     .map_err(|diagnostic| vec![diagnostic])?;
@@ -1694,6 +1708,7 @@ fn compile_forth_body_with_locals(
                         arguments,
                         result,
                         effects: closure_effects,
+                        ..
                     } = closure
                     else {
                         return Err(vec![VmDiagnostic::error(
@@ -1840,6 +1855,11 @@ fn compile_forth_body_with_locals(
                     apply_signature_types(signature, &mut stack, &origin)
                         .map_err(|diagnostic| vec![diagnostic])?;
                     effects = effects.union(&signature.effects);
+                    merge_suspension_contract(
+                        &mut suspension,
+                        concrete_signature.suspension.as_ref(),
+                        &origin,
+                    )?;
                     if word == "yield" {
                         let value_type = concrete_signature
                             .input
@@ -1937,7 +1957,12 @@ fn compile_forth_body_with_locals(
                     .unwrap_or_else(|| stack.clone()),
             ),
             effects,
-            control: ControlEffect::Returns,
+            control: if suspension.is_some() {
+                ControlEffect::MaySuspend
+            } else {
+                ControlEffect::Returns
+            },
+            suspension,
         },
         locals: locals.iter().map(|local| local.ty.clone()).collect(),
         captures: Vec::new(),
@@ -1961,6 +1986,32 @@ fn output_operation(word: &str) -> Option<UiOperation> {
         "output-fail" => Some(UiOperation::Fail),
         _ => None,
     }
+}
+
+fn merge_suspension_contract(
+    current: &mut Option<SuspensionSignature>,
+    incoming: Option<&SuspensionSignature>,
+    origin: &SourceOrigin,
+) -> Result<(), Vec<VmDiagnostic>> {
+    let Some(incoming) = incoming else {
+        return Ok(());
+    };
+    if let Some(current) = current {
+        if current != incoming {
+            return Err(vec![VmDiagnostic::error(
+                "E-YIELD-004",
+                DiagnosticPhase::TypeInference,
+                format!(
+                    "one callable cannot yield incompatible types {} and {}",
+                    current.yield_type, incoming.yield_type
+                ),
+                Some(origin.clone()),
+            )]);
+        }
+    } else {
+        *current = Some(incoming.clone());
+    }
+    Ok(())
 }
 
 struct ParsedDefinition {
@@ -2141,6 +2192,7 @@ fn parse_definition_signature(
             output: StackRow::polymorphic("S", output),
             effects: EffectSet::pure(),
             control: ControlEffect::Returns,
+            suspension: None,
         },
         declares_pure,
         locals,
@@ -3630,5 +3682,29 @@ mod tests {
             .execute(&mut stack)
             .expect("typed Co-Forth executes JSON float access");
         assert_eq!(stack, vec![TypedValue::Float(3.5)]);
+    }
+
+    #[test]
+    fn published_word_retains_its_typed_suspension_contract() {
+        let module = compile_forth(
+            "producer.forth",
+            ": producer ( S -- S int ! infer ) 1 yield 2 ; ['] producer",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect("yielding Co-Forth definition compiles");
+        let signature = &module.module.functions["producer"].signature;
+        assert_eq!(
+            signature.suspension,
+            Some(SuspensionSignature::one_way(Type::Int))
+        );
+        assert_eq!(signature.control, ControlEffect::MaySuspend);
+        assert!(matches!(
+            module.module.functions["main"].signature.output.values.as_slice(),
+            [Type::Function {
+                suspension: Some(SuspensionSignature { yield_type, resume_type }),
+                ..
+            }] if **yield_type == Type::Int && **resume_type == Type::Unit
+        ));
     }
 }

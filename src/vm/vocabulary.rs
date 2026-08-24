@@ -3,7 +3,7 @@ use super::effects::{
     FileSelectorTemplatePart, NetworkSelectorTemplate, ProcessSelectorTemplate,
     ProgramSelectorTemplate, ResourceRoot, ResourceSelector,
 };
-use super::signature::{ControlEffect, StackRow, StackSignature};
+use super::signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
 use super::types::Type;
 use super::verifier::Vocabulary;
 use once_cell::sync::Lazy;
@@ -161,6 +161,7 @@ fn capability(
         output: StackRow::polymorphic("S", output),
         effects: EffectSet::from_requirement(requirement),
         control: ControlEffect::MaySuspend,
+        suspension: None,
     }
 }
 
@@ -332,10 +333,11 @@ fn core_signatures() -> Vocabulary {
             "yield".into(),
             StackSignature {
                 type_parameters: vec!["Y".into()],
-                input: StackRow::polymorphic("S", vec![y]),
+                input: StackRow::polymorphic("S", vec![y.clone()]),
                 output: StackRow::polymorphic("S", Vec::new()),
                 effects: EffectSet::pure(),
                 control: ControlEffect::MaySuspend,
+                suspension: Some(SuspensionSignature::one_way(y)),
             },
         ),
         ("unit".into(), pure(Vec::new(), vec![Type::Unit])),

@@ -33,15 +33,15 @@ pub use runtime::{
     EffectJournalEntry, EffectJournalState, PendingHostCall, TypedExecution, TypedExecutionStatus,
     TypedRuntime, TypedRuntimeCheckpoint, TypedSuspension,
 };
-pub use signature::{ControlEffect, StackRow, StackSignature};
+pub use signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
 pub use types::{TaskKind, Type, TypedValue};
 pub use verifier::{VerifiedFunction, VerifiedModule, Verifier, Vocabulary};
 pub use vocabulary::core_vocabulary;
 
 /// Version of the typed VM contract and serialized IR family.
 ///
-/// Version 2 adds `MakeMap` and its portable immutable typed-map value form.
-/// Old modules/checkpoints must be rejected and recompiled rather than being
-/// decoded under the new collection semantics.
-pub const VM_TYPE_SYSTEM_VERSION: u32 = 3;
+/// Version 4 adds typed yield/resume contracts to callable signatures. Old
+/// modules/checkpoints must be rejected and recompiled rather than decoding a
+/// closure while silently erasing its suspension behavior.
+pub const VM_TYPE_SYSTEM_VERSION: u32 = 4;
 pub mod capability;

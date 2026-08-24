@@ -269,6 +269,9 @@ times; the VM records remaining frames as an internal thunk and the event loop s
 This uses the same typed `yield` instruction as ordinary ProgramRuns, not a second fiber-only
 primitive: its function/fiber contract declares `Y` and the resume value (initially `unit`), and
 the scheduler records both in the same typed suspension record used by every `MaySuspend` word.
+Callable signatures and first-class closure types retain this as `yields<Y,unit>` metadata. The
+frontends infer it transitively from direct yields and calls, while the independent verifier derives
+it again from IR and rejects a function that hides or changes its suspension contract.
 If bidirectional generators become necessary, add `fiber<Y,Resume,R>` and give `yield` the typed
 stack effect `Y -> Resume`; do not silently use `dynamic` for resumed values. `defer`, `next`, and
 `join` are ordinary generated vocabulary bindings over that scheduler record, not syntax-level
