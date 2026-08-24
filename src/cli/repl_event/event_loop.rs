@@ -493,59 +493,6 @@ fn silent_remark(code: &str) -> String {
     REMARKS[idx].to_string()
 }
 
-/// Detect a markdown code fence in the input.
-/// Returns `Some((language, code))` if the input is a fenced code block,
-/// e.g. "```javascript\nfoo()\n```" → ("javascript", "foo()").
-/// Also handles bare fences (no language tag) and prefix-style: "js: code".
-fn extract_code_fence(input: &str) -> Option<(String, String)> {
-    // ``` lang \n code \n ```
-    if input.starts_with("```") {
-        let inner = input.trim_start_matches('`');
-        let (lang_line, rest) = inner.split_once('\n').unwrap_or(("", inner));
-        let lang = lang_line.trim().to_string();
-        let code = rest.trim_end_matches('`').trim().to_string();
-        if !code.is_empty() {
-            return Some((lang, code));
-        }
-    }
-    // lang: code  (single-line prefix style — e.g. "js: x => x+1")
-    let prefix_langs = [
-        "js",
-        "javascript",
-        "python",
-        "py",
-        "rust",
-        "ts",
-        "typescript",
-        "go",
-        "java",
-        "ruby",
-        "rb",
-        "c",
-        "cpp",
-        "bash",
-        "sh",
-        "sql",
-        "html",
-        "css",
-        "swift",
-        "kotlin",
-        "php",
-        "lua",
-        "r",
-        "haskell",
-    ];
-    for lang in &prefix_langs {
-        if let Some(code) = input.strip_prefix(&format!("{lang}:")) {
-            let code = code.trim().to_string();
-            if !code.is_empty() {
-                return Some((lang.to_string(), code));
-            }
-        }
-    }
-    None
-}
-
 /// When the user defines a new word, occasionally observe what it seems to do.
 /// Returns Some(remark) ~30% of the time when the definition is interesting.
 fn definition_observation(name: &str, body: &str) -> Option<String> {
@@ -2551,13 +2498,6 @@ Rules:\n\
                     input.trim().to_string(),
                 )
                 .await;
-        }
-
-        // Foreign code block: ``` lang ... ``` (or bare ```)
-        // The user posts code in any language — we send back a better machine.
-        if let Some((lang, code)) = extract_code_fence(input.trim()) {
-            self.output_manager.write_user(input.clone());
-            return self.handle_foreign_code(lang, code).await;
         }
 
         // `push <message>` — send plain text to all peers.
@@ -5174,94 +5114,6 @@ Rules:\n\
 
         self.tui_renderer.lock().await.poset_panel_mode =
             crate::cli::tui::PosetPanelMode::Graph;
-        self.render_tui().await
-    }
-
-    /// Handle `push <message>` — send plain text to all peers.
-    /// No approval dialog. No Forth visible to the user.
-    /// Someone posted code in a foreign language (JS, Python, etc.) wrapped in
-    /// a code fence.  Send it back as a better machine.
-    /// The response could be anything — improved JS, a Forth translation, a mix.
-    /// If it contains Forth definitions, compile them. Otherwise just show it.
-    async fn handle_foreign_code(&mut self, lang: String, code: String) -> Result<()> {
-        use crossterm::style::Stylize;
-        let lang_display = if lang.is_empty() {
-            "code".to_string()
-        } else {
-            lang.clone()
-        };
-        self.output_manager.write_info(
-            format!("← {} received.", lang_display)
-                .dark_grey()
-                .to_string(),
-        );
-
-        let prompt = format!(
-            "Two programmers exchange machines. The first programmer sent this {} code:\n\n\
-             ```{}\n{}\n```\n\n\
-             Send back a better machine. It can be:\n\
-             - Improved {lang_display} (fix bugs, apply idioms)\n\
-             - A Forth translation (`: word ... ;`) if that captures it cleanly\n\
-             - Both — improved code plus a Forth word that wraps it\n\
-             Show the machine. One line saying what changed. Nothing else.",
-            if lang.is_empty() {
-                "code".to_string()
-            } else {
-                lang.clone()
-            },
-            lang,
-            code,
-        );
-
-        let response = {
-            let gen = self.model_selection.generator().await;
-            match gen
-                .generate(
-                    vec![crate::claude::Message {
-                        role: "user".to_string(),
-                        content: vec![crate::claude::ContentBlock::Text { text: prompt }],
-                    }],
-                    None,
-                )
-                .await
-            {
-                Ok(r) => r.text,
-                Err(e) => return Err(e),
-            }
-        };
-
-        // Does the response contain Forth definitions? Compile them.
-        let has_forth = response.contains(": ") && response.contains(" ;");
-        if has_forth {
-            // Extract and compile any Forth definitions; show the rest as prose.
-            let (forth_parts, prose_parts): (Vec<&str>, Vec<&str>) =
-                response.lines().partition(|line| {
-                    let t = line.trim();
-                    t.starts_with(':') || t.starts_with("prove-all") || t.starts_with('\\')
-                });
-            let prose = prose_parts.join("\n").trim().to_string();
-            let forth = forth_parts.join("\n").trim().to_string();
-            if !prose.is_empty() {
-                self.output_manager
-                    .write_info(format!("→  {}", prose.as_str().white()));
-            }
-            if !forth.is_empty() {
-                self.output_manager
-                    .write_info(format!("→  {}", forth.as_str().cyan()));
-                self.handle_legacy_forth_eval_inner(forth, false).await?;
-            }
-        } else {
-            // Not Forth — just show the better machine as-is.
-            let cleaned = response
-                .trim()
-                .trim_start_matches("```")
-                .trim_end_matches("```")
-                .trim()
-                .to_string();
-            self.output_manager
-                .write_info(format!("→  {}", cleaned.as_str().cyan()));
-        }
-
         self.render_tui().await
     }
 
