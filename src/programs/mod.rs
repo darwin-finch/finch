@@ -1059,6 +1059,8 @@ mod tests {
         assert!(prompt.contains("s\"response\" say"));
         assert!(prompt.contains("s\"\"\"text\"\"\""));
         assert!(prompt.contains("if-some ... else ... then"));
+        assert!(prompt.contains(": factorial ( S int -- S int ! {} )"));
+        assert!(prompt.contains("begin condition while ... repeat"));
         assert!(prompt.contains("Language packages: boot@FINCH-VM-TYPED/1#"));
         assert!(!prompt.contains(".\" response\""));
     }

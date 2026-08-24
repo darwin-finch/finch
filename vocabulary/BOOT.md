@@ -51,6 +51,24 @@ form. For prose containing ordinary quotes or newlines, use the verbatim form
 `s"""text"""` (no escapes; it ends at the next `"""`). Use `if-some ... else ... then` or Lisp
 `match-option` to consume `option<T>` without speculative `unwrap` calls.
 
+Co-Forth can define reusable typed words directly. A definition must state its stack contract;
+`S` preserves the unknown caller stack below its inputs. Use `locals|` first in the body when a
+word has named inputs. Pure definitions use `! {}` and may recurse or mutually recurse in the
+same program; use `! infer` when the body intentionally has inferred effects:
+
+```forth
+: factorial ( S int -- S int ! {} )
+  locals| n |
+  n 1 <= if 1 else n n 1 - factorial * then
+;
+6 factorial int-to-string say
+```
+
+Use structured loops rather than invented jump words: `begin condition while ... repeat` repeats
+while the boolean condition is true, and `begin ... condition until` repeats until it is true.
+`begin: label` permits only the verified named forms `break label` and `continue label`; both must
+preserve that loop's declared stack shape.
+
 Co-Forth source is incrementally bufferable because words are read left-to-right; submit it at an
 explicit program boundary. Lisp source is submitted after its delimiters balance. Each `say`
 still emits a chunk as it executes.
