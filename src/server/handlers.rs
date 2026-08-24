@@ -192,10 +192,20 @@ struct NamedBrainListEntry {
 
 async fn list_named_brains(
     State(server): State<Arc<AgentServer>>,
-) -> Result<Json<Vec<NamedBrainListEntry>>, AppError> {
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<NamedBrainListEntry>>, Response> {
+    check_brain_access(&server, addr, &headers).await?;
     let mut result = Vec::new();
-    for name in server.shared_brains().list()? {
-        let snapshot = server.shared_brains().snapshot(&name)?;
+    for name in server
+        .shared_brains()
+        .list()
+        .map_err(|error| AppError(error).into_response())?
+    {
+        let snapshot = server
+            .shared_brains()
+            .snapshot(&name)
+            .map_err(|error| AppError(error).into_response())?;
         result.push(NamedBrainListEntry {
             name,
             environment: snapshot.environment,
