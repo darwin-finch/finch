@@ -62,8 +62,6 @@ MCP: /mcp list  /mcp tools [server]  /mcp refresh  /mcp reload
 
 Persona: /persona  /persona select <name>  /persona show
 
-Discovery: /machines  /discover
-
 Patterns: /patterns  /patterns add  /patterns rm <id>  /patterns clear
 
 Feedback: /critical [note]  /medium [note]  /good [note]
@@ -71,15 +69,10 @@ Feedback: /critical [note]  /medium [note]  /good [note]
 
 Typed Co-Forth: /forth <expr>
 Execution-plan prototype: /push <text>  /pop  /run  /program  /stack  /stack clear
-  /chain W1 W2  /forget W1  /dup W1  /swap W1 W2  /share  /box-diff
+  /chain W1 W2  /forget W1  /dup W1  /swap W1 W2
 
-
-Channels: /join #channel  /part #channel  /say #channel <msg>
-
-Peers/Rooms: /connect <host:port>  /disconnect <name>
-  /room  /room new  /room list  /room add <addr>  /room remove <addr>
-
-Brains: /brain <task>  /brains  /brain cancel <name>
+Brains: /brain list  /brain attach <name>[@machine]  /brain detach
+  /brain archive <name>  /brain password [new]  /brains
 
 Other: /plan [task]  /graph  /setup  /license  /license activate <key>  /accept  /reject
   /ask <query>  /self-fix

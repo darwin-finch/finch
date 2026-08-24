@@ -592,11 +592,6 @@ pub fn format_help() -> String {
          {reset}\n\
          {gray}  What are personas?{reset} Customize AI behavior and personality.\n\
          {gray}  Built-in:{reset} default, expert-coder, teacher, analyst, creative, researcher\n\n\
-         {yellow_bold}🔍 Service Discovery:{reset}\n\
-         {cyan}  /machines{reset}          List known peer machines on the LAN\n\
-         {cyan}  /discover{reset}          Scan LAN for new Finch daemons (mDNS)\n\
-         {reset}\n\
-         {gray}  Uses mDNS/Bonjour to find remote Finch instances for distributed GPU access.{reset}\n\n\
          {yellow_bold}🔒 Tool Confirmation Patterns:{reset}\n\
          {cyan}  /patterns{reset}          List all saved confirmation patterns\n\
          {cyan}  /patterns add{reset}      Add a new pattern (interactive wizard)\n\
@@ -655,8 +650,8 @@ pub fn format_help() -> String {
          {gray}  The current stack/poset panel is an experimental review surface.\n\
          /run presents the assembled dependency plan before execution.{reset}\n\n\
          {yellow_bold}🔀 Diff Proposal Flow:{reset}\n\
-         {gray}  Peers (AI or remote) propose diffs in the room. You argue back in chat.{reset}\n\
-         {gray}  When you're satisfied, accept or reject:{reset}\n\
+         {gray}  Finch can retain a proposed change for review before applying it.{reset}\n\
+         {gray}  Accept or reject the pending proposal:{reset}\n\
          {cyan}  /accept{reset}            Apply the most recent pending diff\n\
          {cyan}  /accept <prefix>{reset}   Apply the diff whose id starts with prefix\n\
          {cyan}  /reject [reason]{reset}   Reject the most recent pending diff\n\

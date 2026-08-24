@@ -29,8 +29,6 @@ pub enum CommandCategory {
     Patterns,
     Feedback,
     Memory,
-    Discovery,
-    Channel,
 }
 
 impl fmt::Display for CommandCategory {
@@ -43,8 +41,6 @@ impl fmt::Display for CommandCategory {
             CommandCategory::Patterns => write!(f, "🔒 Tool Patterns"),
             CommandCategory::Feedback => write!(f, "🎓 Feedback"),
             CommandCategory::Memory => write!(f, "💾 Memory"),
-            CommandCategory::Discovery => write!(f, "🔍 Discovery"),
-            CommandCategory::Channel => write!(f, "💬 Channel"),
         }
     }
 }
@@ -310,34 +306,6 @@ impl CommandRegistry {
                     description: "Mark response as good example (1x weight)",
                     category: CommandCategory::Feedback,
                 },
-
-                // Discovery Commands
-                CommandSpec {
-                    name: "/discover",
-                    params: None,
-                    description: "Discover Finch daemons on local network",
-                    category: CommandCategory::Discovery,
-                },
-
-                // Channel Commands
-                CommandSpec {
-                    name: "/join",
-                    params: Some("<#channel>"),
-                    description: "Join a channel",
-                    category: CommandCategory::Channel,
-                },
-                CommandSpec {
-                    name: "/part",
-                    params: Some("<#channel>"),
-                    description: "Leave a channel",
-                    category: CommandCategory::Channel,
-                },
-                CommandSpec {
-                    name: "/say",
-                    params: Some("<#channel> <message>"),
-                    description: "Send a message to a channel",
-                    category: CommandCategory::Channel,
-                },
             ],
         }
     }
@@ -436,5 +404,19 @@ mod tests {
         };
 
         assert_eq!(cmd_no_params.full_syntax(), "/clear");
+    }
+
+    #[test]
+    fn removed_peer_and_channel_commands_are_not_suggested() {
+        let registry = CommandRegistry::new();
+        for removed in ["/discover", "/join", "/part", "/say", "/connect", "/room"] {
+            assert!(
+                registry
+                    .all_commands()
+                    .iter()
+                    .all(|command| command.name != removed),
+                "removed command {removed} remains in autocomplete"
+            );
+        }
     }
 }
