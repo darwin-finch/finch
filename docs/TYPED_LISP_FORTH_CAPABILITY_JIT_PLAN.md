@@ -763,10 +763,25 @@ It does not construct `"3 4 2 * +"` and re-enter the Forth text parser.
 
 ### Macros
 
-Macros run before runtime capability checking and receive syntax objects, not ambient host access.
-Macro expansion must have its own fuel, recursion, and allocation limits. Expansion provenance maps
+Do not create a privileged second macro language. A macro is an ordinary pure, bounded Finch CTFE
+function whose contract is `syntax -> syntax` (or a richer typed syntax/context/result record when
+needed). The same staged evaluator used for compile-time `if`, `foreach`, generics, concepts, and
+derivation executes it. Convenient declarations such as `define-syntax` may remain reader sugar for
+defining/registering such a function, but may not acquire separate evaluation semantics.
+
+Syntax values are not bare lists. They retain source origin, expansion ancestry, lexical scope
+marks, and stable module/symbol identity. Public syntax constructors and projections preserve those
+properties so ordinary structural Finch code can be hygienic without receiving ambient host access.
+Macro execution has explicit fuel, recursion, and allocation limits. Expansion provenance maps
 generated forms back to both macro invocation and macro definition. A macro cannot hide effects:
 the expanded IR is what the verifier analyzes.
+
+Classic S-expressions remain one exact, canonical structural reader, not a requirement that every
+human-facing Lisp spelling pay the full parenthesis cost. Later expression/indentation/call sugar
+may provide forms such as `foo(a, b + c)`, but the reader must convert each convenience spelling
+immediately into the same syntax tree before expansion or semantic analysis. Sugar never adds a
+second semantic construct, staging rule, or compiler lowering path. The property to preserve is
+syntax-as-ordinary-data, not a mandate that every surface syntax look homoiconic.
 
 ## Common typed IR
 
