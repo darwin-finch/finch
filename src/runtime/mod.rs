@@ -929,13 +929,39 @@ impl ProgramRuntime {
             .capability_ledger
             .lock()
             .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?;
-        Ok(ledger
+        let reusable = ledger
             .grants
             .active_requirements_for(&context)
             .cloned()
             .fold(TypedRuntime::intrinsic_grants(), |grants, requirement| {
                 grants.union(&EffectSet::from_requirement(requirement))
-            }))
+            });
+        let Some(caller) = caller else {
+            return Ok(reusable);
+        };
+
+        // Session/project/global authority is inherited only within the
+        // child's creation-time ceiling. Keep either representable side of a
+        // covering pair so a later broad replacement can preserve an older
+        // narrow ceiling without widening it (and vice versa).
+        let task_grants = ledger
+            .grants
+            .grants
+            .iter()
+            .filter(|grant| {
+                grant.is_active(context.now_unix_ms)
+                    && grant.policy_hash == context.policy_hash
+                    && matches!(
+                        grant.scope,
+                        GrantScope::Task { task_id } if task_id == caller.task_id
+                    )
+            })
+            .map(|grant| grant.requirement.clone())
+            .fold(EffectSet::pure(), |grants, requirement| {
+                grants.union(&EffectSet::from_requirement(requirement))
+            });
+        let inherited = attenuate_effects(&reusable, &caller.grant_ceiling);
+        Ok(inherited.union(&task_grants))
     }
 
     fn authorization_context_for(
@@ -4085,6 +4111,21 @@ fn unix_time_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+fn attenuate_effects(current: &EffectSet, ceiling: &EffectSet) -> EffectSet {
+    let mut attenuated = TypedRuntime::intrinsic_grants();
+    for requirement in &current.0 {
+        if ceiling.grants(&EffectSet::from_requirement(requirement.clone())) {
+            attenuated = attenuated.union(&EffectSet::from_requirement(requirement.clone()));
+        }
+    }
+    for requirement in &ceiling.0 {
+        if current.grants(&EffectSet::from_requirement(requirement.clone())) {
+            attenuated = attenuated.union(&EffectSet::from_requirement(requirement.clone()));
+        }
+    }
+    attenuated
+}
+
 fn truncate_output(mut output: String, max_bytes: usize) -> String {
     if output.len() <= max_bytes {
         return output;
@@ -4755,6 +4796,7 @@ mod tests {
             provider_model: "test-provider".into(),
             vm_revision: 0,
             manifest_generation: runtime.manifest_generation(),
+            grant_ceiling: EffectSet::pure(),
         };
         let request = submission(
             ProgramLanguage::Lisp,
@@ -4820,6 +4862,7 @@ mod tests {
             provider_model: "test-provider".into(),
             vm_revision: runtime.revision(),
             manifest_generation: runtime.manifest_generation(),
+            grant_ceiling: EffectSet::pure(),
         };
         let source = || {
             submission(
@@ -4843,6 +4886,64 @@ mod tests {
             unrelated.status,
             ExecutionStatus::AuthorizationRequired
         );
+    }
+
+    #[tokio::test]
+    async fn child_grant_ceiling_blocks_later_ambient_expansion_but_allows_task_approval() {
+        let runtime = ProgramRuntime::new();
+        let task_id = uuid::Uuid::new_v4();
+        let child = scheduler::AgentIdentity {
+            agent_id: uuid::Uuid::new_v4(),
+            task_id,
+            parent_agent_id: None,
+            root_agent_id: uuid::Uuid::new_v4(),
+            depth: 0,
+            provider_model: "test-provider".into(),
+            vm_revision: runtime.revision(),
+            manifest_generation: runtime.manifest_generation(),
+            grant_ceiling: runtime.effective_grants_for(None).unwrap(),
+        };
+        let requirement = crate::vm::CapabilityRequirement::file(
+            crate::vm::FileOperation::Read,
+            crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+        );
+        runtime
+            .issue_typed_capability(
+                requirement.clone(),
+                GrantScope::Session {
+                    session_id: runtime.capability_session_id(),
+                },
+                "test-user",
+                None,
+            )
+            .unwrap();
+        let source = || {
+            submission(
+                ProgramLanguage::Lisp,
+                "(file-read (path \"Cargo.toml\"))",
+                ExecutionEffect::WorkspaceRead,
+            )
+        };
+
+        let ambient = runtime
+            .submit_as(source(), Some(child.clone()))
+            .await
+            .unwrap();
+        assert_eq!(ambient.status, ExecutionStatus::AuthorizationRequired);
+        runtime
+            .cancel_typed_execution(ambient.execution_id)
+            .unwrap();
+
+        runtime
+            .issue_typed_capability(
+                requirement,
+                GrantScope::Task { task_id },
+                "test-user",
+                None,
+            )
+            .unwrap();
+        let explicitly_approved = runtime.submit_as(source(), Some(child)).await.unwrap();
+        assert_eq!(explicitly_approved.status, ExecutionStatus::Completed);
     }
 
     #[tokio::test]

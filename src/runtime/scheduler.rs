@@ -10,6 +10,7 @@ use crate::tools::implementations::{
 use crate::tools::permissions::{PermissionCheck, PermissionManager};
 use crate::tools::registry::Tool;
 use crate::tools::types::ToolContext;
+use crate::vm::EffectSet;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -172,6 +173,11 @@ pub struct AgentIdentity {
     pub provider_model: String,
     pub vm_revision: u64,
     pub manifest_generation: u64,
+    /// Inherited authority fixed when this child is created. Later
+    /// session/project/global grants cannot silently widen a live child;
+    /// an exact task-scoped user approval remains an explicit escalation.
+    #[serde(default)]
+    pub grant_ceiling: EffectSet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +285,7 @@ impl AgentScheduler {
         }
         let task_id = Uuid::new_v4();
         let agent_id = Uuid::new_v4();
+        let grant_ceiling = self.runtime.effective_grants_for(parent)?;
         let identity = AgentIdentity {
             agent_id,
             task_id,
@@ -288,6 +295,7 @@ impl AgentScheduler {
             provider_model: provider.name().to_string(),
             vm_revision: self.runtime.revision(),
             manifest_generation: self.runtime.manifest_generation(),
+            grant_ceiling,
         };
         let snapshot = AgentTaskSnapshot {
             identity: identity.clone(),
