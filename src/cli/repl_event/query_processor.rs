@@ -1340,6 +1340,8 @@ mod tests {
         assert!(text.contains("## Mandatory response shape"));
         assert!(text.contains("Default to Lisp"));
         assert!(text.contains("otherwise treats the source as Forth"));
+        assert!(text.contains("(define (factorial (n : int)) : int"));
+        assert!(text.contains("\"response\" say"));
         assert!(text.contains("s\"response\" say"));
         assert!(!text.contains(".\" response\""));
         assert!(messages[1].content[0].as_text().is_some_and(|text| text == "add two numbers"));
