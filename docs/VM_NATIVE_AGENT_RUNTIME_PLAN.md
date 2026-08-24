@@ -42,7 +42,7 @@ the shared program identity, manifest, tagged values, and effect model described
 Expose a compact set of native function tools through every provider adapter:
 
 ```text
-submit_program(language, source, intent, expected_effects?, manifest_generation?)
+submit_program(language?, source, intent, declared_capabilities?, manifest_generation?)
 invoke_program(program_ref, arguments, expected_effects?, manifest_generation?)
 search_vocabulary(query, language?, capability?, limit?)
 inspect_program(program_ref, include_source?, include_tests?)

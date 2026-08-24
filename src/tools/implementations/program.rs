@@ -730,11 +730,6 @@ impl Tool for SubmitProgramTool {
                     "type": "string",
                     "description": "Short description used for audit and UI presentation"
                 },
-                "effect": {
-                    "type": "string",
-                    "enum": ["pure", "vm_read", "vm_write", "workspace_read", "workspace_write", "external_read", "external_write", "destructive", "unclassified"],
-                    "description": "Declared upper bound; typed capability inference remains authoritative"
-                },
                 "declared_capabilities": {
                     "type": "array",
                     "items": { "type": "object" },
@@ -754,7 +749,6 @@ impl Tool for SubmitProgramTool {
             required: vec![
                 "source".to_string(),
                 "intent".to_string(),
-                "effect".to_string(),
                 "manifest_generation".to_string(),
             ],
         }
@@ -776,11 +770,6 @@ impl Tool for SubmitProgramTool {
             .as_str()
             .context("submit_program: missing intent")?
             .to_string();
-        let effect = ExecutionEffect::from_str(
-            input["effect"]
-                .as_str()
-                .context("submit_program: missing effect")?,
-        )?;
         let manifest_generation = input["manifest_generation"]
             .as_u64()
             .context("submit_program: missing manifest_generation")?;
@@ -797,7 +786,9 @@ impl Tool for SubmitProgramTool {
             source_id: Some(format!("tool-submission.{}", language.as_str())),
             source,
             intent,
-            effect,
+            // Compatibility/audit field only. Concrete verified requirements
+            // are the submission's authority contract.
+            effect: ExecutionEffect::Unclassified,
             declared_capabilities,
             manifest_generation,
             expected_revision,
@@ -1275,6 +1266,9 @@ mod tests {
     async fn tool_round_trips_structured_forth_result() {
         let runtime = Arc::new(ProgramRuntime::new());
         let tool = SubmitProgramTool::new(runtime);
+        let schema = tool.input_schema();
+        assert!(!schema.properties.as_object().unwrap().contains_key("effect"));
+        assert!(!schema.required.iter().any(|field| field == "effect"));
         let context = ToolContext {
             conversation: None,
             save_models: None,
@@ -1293,7 +1287,6 @@ mod tests {
                     "language": "forth",
                     "source": "20 22 +",
                     "intent": "add",
-                    "effect": "pure",
                     "manifest_generation": 1
                 }),
                 &context,
@@ -1328,7 +1321,6 @@ mod tests {
                     json!({
                         "source": "20 22 +",
                         "intent": "add",
-                        "effect": "pure",
                         "manifest_generation": 1
                     }),
                     &context,
@@ -1346,7 +1338,6 @@ mod tests {
                     json!({
                         "source": "  (+ 3 4)",
                         "intent": "add with Lisp",
-                        "effect": "pure",
                         "manifest_generation": 1
                     }),
                     &context,
@@ -1388,7 +1379,6 @@ mod tests {
                     // the shared provider runtime.
                     "source": ": legacy-double 2 * ;",
                     "intent": "define a word",
-                    "effect": "vm_write",
                     "manifest_generation": 1
                 }),
                 &context,
@@ -1430,7 +1420,6 @@ mod tests {
                 "language": "lisp",
                 "source": "(begin (say \"first\") (say \" second\"))",
                 "intent": "stream a response",
-                "effect": "pure",
                 "manifest_generation": 1
             }),
             &context,

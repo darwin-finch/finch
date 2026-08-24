@@ -206,7 +206,8 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   conservatively `unclassified`, while explicit typed registry metadata survives independently of
   source. The outer provider tool gate no longer trusts a submitted coarse `ExecutionEffect`:
   every `submit_program` enters the typed broker, whose verified requirements and grants are the
-  sole host-authority decision.
+  sole host-authority decision. The provider envelope no longer exposes that redundant coarse
+  field; optional exact `declared_capabilities` remains a checked upper-bound assertion.
 - [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
   tests, concurrency tests, and provider conformance tests. Manual configured-cloud smoke checks on
   2026-08-23 successfully executed provider-emitted Lisp `say`, Lisp arithmetic, and Co-Forth
