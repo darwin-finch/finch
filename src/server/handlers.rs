@@ -1734,11 +1734,13 @@ async fn handle_file_put(
 mod named_brain_provider_context_tests {
     use super::*;
     use crate::brain::shared::{
-        BrainEnvironment, BrainEvent, BrainEventKind, BrainSnapshot, ProgramLanguage,
+        BrainEnvironment, BrainEvent, BrainEventKind, BrainId, BrainSnapshot, ProgramLanguage,
     };
 
     fn event(seq: u64, sender: &str, kind: BrainEventKind) -> BrainEvent {
         BrainEvent {
+            schema_version: 2,
+            brain_id: BrainId(uuid::Uuid::nil()),
             seq,
             environment_generation: 1,
             sender: sender.into(),
@@ -1750,6 +1752,7 @@ mod named_brain_provider_context_tests {
     #[test]
     fn brain_history_remains_conversation_data_not_system_text() {
         let snapshot = BrainSnapshot {
+            brain_id: BrainId(uuid::Uuid::nil()),
             name: "shared".into(),
             environment: BrainEnvironment {
                 machine: "box.local".into(),

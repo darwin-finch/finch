@@ -15,6 +15,31 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 2;
+const BRAIN_METADATA_VERSION: u32 = 1;
+
+/// Stable identity of one durable Brain. Names are mutable human aliases;
+/// this ID is what future runs, attachments, cursors, and grants reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BrainId(pub uuid::Uuid);
+
+impl BrainId {
+    fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+
+    fn nil() -> Self {
+        Self(uuid::Uuid::nil())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BrainMetadata {
+    version: u32,
+    brain_id: BrainId,
+    created_ms: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,6 +90,12 @@ pub enum BrainEventKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrainEvent {
+    /// Version of this durable event envelope. Old logs deserialize as v1 and
+    /// are projected into the owning Brain's stable identity while loading.
+    #[serde(default = "legacy_brain_event_schema_version")]
+    pub schema_version: u32,
+    #[serde(default = "BrainId::nil")]
+    pub brain_id: BrainId,
     pub seq: u64,
     /// Binds this event to the exact environment revision in which it ran.
     #[serde(default = "initial_environment_generation")]
@@ -85,6 +116,7 @@ pub struct BrainProgram {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrainSnapshot {
+    pub brain_id: BrainId,
     pub name: String,
     pub environment: BrainEnvironment,
     pub revision: u64,
@@ -100,6 +132,7 @@ pub enum BrainWireMessage {
 }
 
 struct BrainState {
+    brain_id: BrainId,
     events: Vec<BrainEvent>,
     program_stack: Vec<BrainProgram>,
     runtime_checkpoint: Option<RuntimeCheckpointState>,
@@ -115,16 +148,20 @@ struct RuntimeCheckpointState {
 }
 
 impl BrainState {
-    fn from_events(events: Vec<BrainEvent>) -> Self {
+    fn from_events(brain_id: BrainId, events: Vec<BrainEvent>) -> Self {
         let (tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let mut state = Self {
+            brain_id,
             events: Vec::new(),
             program_stack: Vec::new(),
             runtime_checkpoint: None,
             runtime_commit_count: 0,
             tx,
         };
-        for event in events {
+        for mut event in events {
+            if event.brain_id == BrainId::nil() {
+                event.brain_id = brain_id;
+            }
             state.apply(event);
         }
         state
@@ -279,6 +316,7 @@ impl SharedBrainStore {
         let brains = self.brains.read().expect("shared brain lock poisoned");
         let state = brains.get(name).expect("brain loaded above");
         Ok(BrainSnapshot {
+            brain_id: state.brain_id,
             name: name.to_string(),
             environment: self.environment.clone(),
             revision: state.events.last().map(|e| e.seq).unwrap_or(0),
@@ -341,6 +379,8 @@ impl SharedBrainStore {
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains.get_mut(name).expect("brain loaded above");
         let event = BrainEvent {
+            schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+            brain_id: state.brain_id,
             seq: state.events.last().map(|e| e.seq + 1).unwrap_or(1),
             environment_generation: self.environment.generation,
             sender: sender.trim().to_string(),
@@ -551,7 +591,22 @@ impl SharedBrainStore {
         {
             return Ok(());
         }
+        let brain_id = self.load_or_create_metadata(name)?.brain_id;
         let events = self.read_events(name)?;
+        for event in &events {
+            if event.schema_version > BRAIN_EVENT_SCHEMA_VERSION {
+                anyhow::bail!(
+                    "Brain '{name}' contains unsupported event schema version {}",
+                    event.schema_version
+                );
+            }
+            if event.brain_id != BrainId::nil() && event.brain_id != brain_id {
+                anyhow::bail!(
+                    "Brain '{name}' event #{} belongs to a different Brain identity",
+                    event.seq
+                );
+            }
+        }
         // Preserve an empty named Brain across daemon restarts, even before
         // its first conversational event is appended.
         if let Some(root) = &self.root {
@@ -563,8 +618,61 @@ impl SharedBrainStore {
             .write()
             .expect("shared brain lock poisoned")
             .entry(name.to_string())
-            .or_insert_with(|| BrainState::from_events(events));
+            .or_insert_with(|| BrainState::from_events(brain_id, events));
         Ok(())
+    }
+
+    fn load_or_create_metadata(&self, name: &str) -> Result<BrainMetadata> {
+        let Some(root) = &self.root else {
+            return Ok(BrainMetadata {
+                version: BRAIN_METADATA_VERSION,
+                brain_id: BrainId::new(),
+                created_ms: unix_millis(),
+            });
+        };
+        let directory = root.join(name);
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("create {}", directory.display()))?;
+        let path = directory.join("metadata.json");
+        if path.exists() {
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("read {}", path.display()))?;
+            let metadata: BrainMetadata = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse {}", path.display()))?;
+            if metadata.version != BRAIN_METADATA_VERSION || metadata.brain_id == BrainId::nil() {
+                anyhow::bail!("unsupported or invalid Brain metadata at {}", path.display());
+            }
+            return Ok(metadata);
+        }
+        let metadata = BrainMetadata {
+            version: BRAIN_METADATA_VERSION,
+            brain_id: BrainId::new(),
+            created_ms: unix_millis(),
+        };
+        let encoded = serde_json::to_vec_pretty(&metadata)?;
+        let temporary = directory.join(format!(".metadata.{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&temporary, encoded)
+            .with_context(|| format!("write {}", temporary.display()))?;
+        // A rename can replace a winner on Unix. Linking the fully written
+        // temporary file creates the final name only if it is still absent,
+        // so concurrent daemon starts cannot split one alias into two IDs.
+        match std::fs::hard_link(&temporary, &path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&temporary);
+                Ok(metadata)
+            }
+            Err(_error) if path.exists() => {
+                let _ = std::fs::remove_file(&temporary);
+                let bytes = std::fs::read(&path)
+                    .with_context(|| format!("read {} after metadata race", path.display()))?;
+                serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse {} after metadata race", path.display()))
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&temporary);
+                Err(error).with_context(|| format!("commit {}", path.display()))
+            }
+        }
     }
 
     fn load_all(&self) -> Result<()> {
@@ -642,6 +750,10 @@ fn unix_millis() -> u64 {
 }
 
 const fn initial_environment_generation() -> u64 {
+    1
+}
+
+const fn legacy_brain_event_schema_version() -> u32 {
     1
 }
 
@@ -727,11 +839,69 @@ mod tests {
     fn empty_named_brain_remains_listed_after_restart() {
         let temp = tempfile::tempdir().unwrap();
         let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
-        store.snapshot("quiet-brain").unwrap();
+        let original = store.snapshot("quiet-brain").unwrap();
 
         let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
         assert_eq!(restarted.list().unwrap(), vec!["quiet-brain"]);
-        assert_eq!(restarted.snapshot("quiet-brain").unwrap().revision, 0);
+        let restored = restarted.snapshot("quiet-brain").unwrap();
+        assert_eq!(restored.revision, 0);
+        assert_eq!(restored.brain_id, original.brain_id);
+        assert_ne!(restored.brain_id, BrainId::nil());
+        assert!(temp.path().join("quiet-brain/metadata.json").exists());
+    }
+
+    #[test]
+    fn legacy_events_are_projected_into_the_persisted_brain_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("legacy");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("events.jsonl"),
+            r#"{"seq":1,"environment_generation":1,"sender":"alice","created_ms":0,"kind":"prompt","text":"hello"}
+"#,
+        )
+        .unwrap();
+
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let snapshot = store.snapshot("legacy").unwrap();
+        assert_ne!(snapshot.brain_id, BrainId::nil());
+        assert_eq!(snapshot.events[0].schema_version, 1);
+        assert_eq!(snapshot.events[0].brain_id, snapshot.brain_id);
+
+        let appended = store
+            .push(
+                "legacy",
+                "bob",
+                BrainEventKind::Prompt {
+                    text: "again".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(appended.schema_version, BRAIN_EVENT_SCHEMA_VERSION);
+        assert_eq!(appended.brain_id, snapshot.brain_id);
+    }
+
+    #[test]
+    fn concurrent_metadata_creation_converges_on_one_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let workers = (0..8)
+            .map(|_| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    SharedBrainStore::with_root("box.local", Some(root))
+                        .snapshot("shared")
+                        .unwrap()
+                        .brain_id
+                })
+            })
+            .collect::<Vec<_>>();
+        let ids = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        assert_ne!(ids[0], BrainId::nil());
     }
 
     #[test]
