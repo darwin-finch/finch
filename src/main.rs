@@ -61,6 +61,11 @@ struct Args {
     #[arg(long = "forth", short = 'f')]
     forth: Option<String>,
 
+    /// Evaluate a typed Finch Lisp expression directly through the shared VM
+    /// (no AI, no REPL, and no legacy evaluator fallback).
+    #[arg(long = "lisp", short = 'l')]
+    lisp: Option<String>,
+
     /// Execute a self-contained Finch Lisp or Co-Forth script through the
     /// shared typed runtime. This is the shebang target for `#!/path/to/finch
     /// --exec` and never falls back to legacy language evaluators.
@@ -68,7 +73,7 @@ struct Args {
     exec_script: Option<PathBuf>,
 
     /// Print the structured typed-runtime outcome for `--exec` or direct
-    /// `--forth` source.
+    /// `--forth`/`--lisp` source.
     #[arg(long)]
     json: bool,
 
@@ -558,6 +563,13 @@ mod script_tests {
         assert!(args.json);
     }
 
+    #[test]
+    fn direct_lisp_json_arguments_parse_as_a_typed_invocation() {
+        let args = Args::try_parse_from(["finch", "--lisp", "(+ 1 2)", "--json"]).unwrap();
+        assert_eq!(args.lisp.as_deref(), Some("(+ 1 2)"));
+        assert!(args.json);
+    }
+
     #[tokio::test]
     async fn executable_script_uses_the_typed_runtime_and_rejects_legacy_only_forth() {
         let script = tempfile::NamedTempFile::new().unwrap();
@@ -845,8 +857,17 @@ async fn main() -> Result<()> {
         .await;
     }
 
+    if let Some(lisp_expr) = &args.lisp {
+        return run_direct_typed_source_with_json(
+            finch::programs::ProgramLanguage::Lisp,
+            lisp_expr,
+            args.json,
+        )
+        .await;
+    }
+
     if args.json {
-        anyhow::bail!("--json requires --exec <SCRIPT> or --forth <SOURCE>");
+        anyhow::bail!("--json requires --exec <SCRIPT>, --forth <SOURCE>, or --lisp <SOURCE>");
     }
 
     // Check for piped input BEFORE initializing anything else
