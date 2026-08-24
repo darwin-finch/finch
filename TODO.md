@@ -138,10 +138,10 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   and generation checks, and journal-first projection into concurrent shadow-buffer WorkUnits. Provider
   wire effects and the provider `submit_program` tool now cross the client's ordered REPL event bus
   before any WorkUnit mutation, and explicitly entered typed programs run as background ProgramRuns
-  whose completion returns through that same loop. Client projections reject duplicates and retain
-  a gapped in-memory `(execution_id, sequence)` suffix until its prefix arrives, but this is only a
-  live reconnect guard; still replace the
-  remaining direct compatibility projections with durable application-journal/replay support.
+  whose completion returns through that same loop. The process-wide string-only output callback has
+  been removed; live output is now exclusively a per-run typed `(execution_id, sequence)` envelope.
+  Client projections reject duplicates and retain a gapped in-memory suffix until its prefix arrives,
+  but this is only a live reconnect guard; durable application-journal/replay support remains.
 - [ ] Complete the application-owned policy for cooperative typed-VM `yield`: the interactive
   provider-wire runner now yields its Tokio task and automatically resumes only an exact
   `PendingTypedReason::Yielded` continuation. General daemon/frontend scheduling still needs

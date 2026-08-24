@@ -271,7 +271,6 @@ pub struct ProgramRuntime {
     /// opening one. New stream backends belong in `HostStreamBackend`, not in
     /// a parallel registry with a second ownership lifecycle.
     streams: Arc<Mutex<HashMap<String, HostStream>>>,
-    output_sink: RwLock<Option<Arc<dyn Fn(String) + Send + Sync>>>,
     schedule_queue: RwLock<Option<Arc<TaskQueue>>>,
     agent_scheduler: RwLock<Weak<scheduler::AgentScheduler>>,
     /// Daemon-owned typed continuations keyed by the execution id visible in
@@ -451,7 +450,6 @@ impl ProgramRuntime {
             network: Arc::new(Mutex::new(HashMap::new())),
             output_handles: Arc::new(Mutex::new(HashMap::new())),
             streams: Arc::new(Mutex::new(HashMap::new())),
-            output_sink: RwLock::new(None),
             schedule_queue: RwLock::new(None),
             agent_scheduler: RwLock::new(Weak::new()),
             pending_typed: Mutex::new(HashMap::new()),
@@ -502,12 +500,6 @@ impl ProgramRuntime {
     /// second memory database or an ambient memory authority.
     pub fn attach_memory(&self, memory: Arc<crate::memory::MemorySystem>) {
         *self.memory.write().expect("memory binding lock poisoned") = Some(memory);
-    }
-
-    /// Install a live output sink for typed `say` chunks. The ordinary
-    /// submission result still contains the complete buffered output.
-    pub fn set_typed_output_sink(&self, sink: Option<Arc<dyn Fn(String) + Send + Sync>>) {
-        *self.output_sink.write().expect("output sink lock poisoned") = sink;
     }
 
     pub fn attach_schedule_queue(&self, queue: Arc<TaskQueue>) {
@@ -1850,11 +1842,6 @@ impl ProgramRuntime {
         let network = Arc::clone(&self.network);
         let output_handles = Arc::clone(&self.output_handles);
         let streams = Arc::clone(&self.streams);
-        let output_sink = self
-            .output_sink
-            .read()
-            .expect("output sink lock poisoned")
-            .clone();
         let schedule_queue = self
             .schedule_queue
             .read()
@@ -1891,7 +1878,6 @@ impl ProgramRuntime {
                         streams,
                         execution_id,
                         grants,
-                        output_sink,
                         typed_effect_sink,
                         schedule_queue,
                         deferred_host_effects,
@@ -1927,11 +1913,6 @@ impl ProgramRuntime {
         let network = Arc::clone(&self.network);
         let output_handles = Arc::clone(&self.output_handles);
         let streams = Arc::clone(&self.streams);
-        let output_sink = self
-            .output_sink
-            .read()
-            .expect("output sink lock poisoned")
-            .clone();
         let typed_effect_sink = pending.effect_sink.clone();
         let deferred_host_effects = pending.deferred_host_effects;
         let schedule_queue = self
@@ -1966,7 +1947,6 @@ impl ProgramRuntime {
                         streams,
                         execution_id,
                         grants,
-                        output_sink,
                         typed_effect_sink,
                         schedule_queue,
                         deferred_host_effects,
@@ -2002,7 +1982,6 @@ struct TypedHostHandler {
     streams: Arc<Mutex<HashMap<String, HostStream>>>,
     execution_id: uuid::Uuid,
     network_grants: EffectSet,
-    output_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
     typed_effect_sink: Option<TypedEffectSink>,
     schedule_queue: Option<Arc<TaskQueue>>,
     deferred_host_effects: DeferredHostEffects,
@@ -2021,7 +2000,6 @@ impl TypedHostHandler {
         streams: Arc<Mutex<HashMap<String, HostStream>>>,
         execution_id: uuid::Uuid,
         network_grants: EffectSet,
-        output_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
         typed_effect_sink: Option<TypedEffectSink>,
         schedule_queue: Option<Arc<TaskQueue>>,
         deferred_host_effects: DeferredHostEffects,
@@ -2041,7 +2019,6 @@ impl TypedHostHandler {
             streams,
             execution_id,
             network_grants,
-            output_sink,
             typed_effect_sink,
             schedule_queue,
             deferred_host_effects,
@@ -2930,9 +2907,6 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
             crate::vm::interpreter::HostSideEffect::Emit { text } => {
                 self.output.push_str(text);
                 self.output_chunks.push(text.clone());
-                if let Some(sink) = &self.output_sink {
-                    sink(text.clone());
-                }
             }
             crate::vm::interpreter::HostSideEffect::Ui {
                 target, operation, ..
@@ -3012,15 +2986,6 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         Ok(())
     }
 
-    fn emit(&mut self, chunk: &str) {
-        self.side_effects
-            .push(crate::vm::interpreter::HostSideEffect::Emit {
-                text: chunk.to_string(),
-            });
-        if let Some(sink) = &self.output_sink {
-            sink(chunk.to_string());
-        }
-    }
 }
 
 impl TypedHostHandler {
@@ -5454,7 +5419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_output_sink_keeps_legacy_proposal_projection_synchronous() {
+    async fn typed_effect_sink_projects_proposal_request() {
         let runtime = ProgramRuntime::new();
         runtime
             .grant_typed_capability(crate::vm::CapabilityRequirement {
@@ -5709,21 +5674,35 @@ mod tests {
     #[tokio::test]
     async fn typed_say_emits_stream_chunks_and_buffers_result() {
         let runtime = ProgramRuntime::new();
-        let chunks = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink_chunks = Arc::clone(&chunks);
-        runtime.set_typed_output_sink(Some(Arc::new(move |chunk| {
-            sink_chunks.lock().unwrap().push(chunk);
-        })));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink_events = Arc::clone(&events);
         let outcome = runtime
-            .submit(submission(
-                ProgramLanguage::Forth,
-                "s\" first\" say s\" second\" say",
-                ExecutionEffect::VmRead,
-            ))
+            .submit_with_typed_effect_sink(
+                submission(
+                    ProgramLanguage::Forth,
+                    "s\" first\" say s\" second\" say",
+                    ExecutionEffect::VmRead,
+                ),
+                Arc::new(move |event| sink_events.lock().unwrap().push(event)),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.output, "firstsecond");
-        assert_eq!(&*chunks.lock().unwrap(), &["first", "second"]);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].execution_id, outcome.execution_id);
+        assert_eq!(events[0].effect.sequence, 0);
+        assert_eq!(events[1].effect.sequence, 1);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| match &event.effect.event {
+                    crate::vm::interpreter::HostSideEffect::Emit { text } => text.as_str(),
+                    other => panic!("expected emit event, found {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
         assert_eq!(outcome.output_chunks, vec!["first", "second"]);
         assert_eq!(
             outcome.side_effects,
