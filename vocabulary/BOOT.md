@@ -73,6 +73,17 @@ same program; use `! infer` when the body intentionally has inferred effects:
 6 factorial int-to-string say
 ```
 
+Lisp uses typed named parameters. Put the return type after the header when a definition is
+recursive; the definition is then available while its body compiles. A leading string in a
+definition body is documentation, not a runtime string value:
+
+```lisp
+(define (factorial (n : int)) : int
+  "Return n factorial for non-negative n."
+  (if (<= n 1) 1 (* n (factorial (- n 1)))))
+(say (int-to-string (factorial 6)))
+```
+
 Use structured loops rather than invented jump words: `begin condition while ... repeat` repeats
 while the boolean condition is true, and `begin ... condition until` repeats until it is true.
 `begin: label` permits only the verified named forms `break label` and `continue label`; both must
