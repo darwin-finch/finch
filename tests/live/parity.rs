@@ -202,7 +202,7 @@ async fn live_parity_finch_wire_programs() {
                 .text();
             finch::programs::corpus::capture_from_env(
                 name,
-                name,
+                provider.default_model(),
                 "live_conformance",
                 finch::programs::corpus::WireCorpusAttempt::FirstPass,
                 &initial,
@@ -234,7 +234,7 @@ async fn live_parity_finch_wire_programs() {
                         .text();
                     finch::programs::corpus::capture_from_env(
                         name,
-                        name,
+                        provider.default_model(),
                         "live_conformance",
                         finch::programs::corpus::WireCorpusAttempt::Repair,
                         &replacement,
