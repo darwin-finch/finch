@@ -235,6 +235,11 @@ explicitly installed `root<host-machine>` and the user has approved a matching s
 `s" var/log/system.log" host-path host-file-read`. Workspace `file-read` and `file-write` reject
 that value at verification time; bind `/` only for an intentional whole-machine grant.
 
+Application-installed project and task-output roots remain distinct as well:
+`s" src/main.rs" project-path project-file-read` and
+`s" report.txt" task-output-path s" done" bytes task-output-file-write`. A path from one root
+cannot be passed to another root's file word, and binding a root never grants file authority.
+
 For UTF-8 line-oriented files, `file-lines-open` returns a host-issued `stream<string>` and
 `stream-next` returns `option<string>` one bounded line at a time (1 MiB maximum line);
 `stream-close` releases it early. The stream is owned by its ProgramRun and cannot be forged or

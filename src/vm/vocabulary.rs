@@ -120,6 +120,8 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "output-fail" => CoreWordDocumentation { summary: "Mark an explicit output handle failed with a human-readable reason.", lisp: "(output-fail handle reason)", forth: "handle reason output-fail", example: "h s\"network unavailable\" output-fail" },
         "path" => CoreWordDocumentation { summary: "Resolve text as a normalized workspace-relative path value. It cannot escape the workspace root.", lisp: "(path relative-text)", forth: "relative-text path", example: "(file-read (path \"src/main.rs\"))" },
         "host-path" => CoreWordDocumentation { summary: "Resolve text under the explicitly installed host-machine root. This identifies a host path but grants no authority by itself.", lisp: "(host-path text)", forth: "text host-path", example: "s\"/tmp/report.txt\" host-path" },
+        "project-path" => CoreWordDocumentation { summary: "Resolve text beneath the application-installed project root. The root binding and file authority are separate.", lisp: "(project-path text)", forth: "text project-path", example: "(project-file-read (project-path \"src/main.rs\"))" },
+        "task-output-path" => CoreWordDocumentation { summary: "Resolve text beneath the application-installed task-output root, allowing narrowly scoped generated artifacts without workspace authority.", lisp: "(task-output-path text)", forth: "text task-output-path", example: "(task-output-file-write (task-output-path \"report.txt\") (bytes \"done\"))" },
         "file-read" => CoreWordDocumentation { summary: "Read all bytes from an authorized workspace path. Prefer file-slice or cursor resources for large inputs.", lisp: "(file-read path)", forth: "path file-read", example: "(file-read (path \"Cargo.toml\"))" },
         "file-hash" => CoreWordDocumentation { summary: "Compute an authorized file's SHA-256 digest as lowercase hexadecimal without exposing its contents to the VM or model context.", lisp: "(file-hash path)", forth: "path file-hash", example: "(file-hash (path \"data.csv\"))" },
         "tree-list" => CoreWordDocumentation { summary: "Return deterministic bounded metadata for entries below an authorized directory. The result contains entries with path/kind/size fields plus a truncated flag; symlinks and unsupported file kinds are rejected.", lisp: "(tree-list path max-entries)", forth: "path max-entries tree-list", example: "(tree-list (path \"src\") 1000)" },
@@ -138,8 +140,9 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "workbook-summary" => CoreWordDocumentation { summary: "Treat the first row of one workbook sheet as headers, scan at most max_rows following rows, and return bounded JSON column statistics. The limit must be 1..100000.", lisp: "(workbook-summary path sheet max-rows)", forth: "path sheet max-rows workbook-summary", example: "(workbook-summary (path \"report.xlsx\") \"Data\" 10000)" },
         "stream-next" => CoreWordDocumentation { summary: "Advance an opaque stream<T> by at most one item and return some(T), or none at end of stream. It cannot forge or widen the source stream's authority.", lisp: "(stream-next stream)", forth: "stream stream-next", example: "(match-option (stream-next rows) (some row row) (none \"done\"))" },
         "stream-close" => CoreWordDocumentation { summary: "Close an opaque stream<T>, release its backing cursor or producer, and make future operations fail safely.", lisp: "(stream-close stream)", forth: "stream stream-close", example: "rows stream-close" },
-        "file-write" | "host-file-write" => CoreWordDocumentation { summary: "Write bytes to an authorized refined path. This is an external mutation and requires an explicit write capability grant.", lisp: "(file-write path bytes)", forth: "path bytes file-write", example: "(file-write (path \"generated.txt\") (bytes \"hello\\n\"))" },
+        "file-write" | "host-file-write" | "project-file-write" | "task-output-file-write" => CoreWordDocumentation { summary: "Write bytes to an authorized refined path. This is an external mutation and requires an explicit write capability grant.", lisp: "(file-write path bytes)", forth: "path bytes file-write", example: "(file-write (path \"generated.txt\") (bytes \"hello\\n\"))" },
         "host-file-read" => CoreWordDocumentation { summary: "Read all bytes from an authorized host-machine path. It requires both an installed host root and a matching read grant.", lisp: "(host-file-read path)", forth: "path host-file-read", example: "(host-file-read (host-path \"/tmp/report.txt\"))" },
+        "project-file-read" | "task-output-file-read" => CoreWordDocumentation { summary: "Read bytes beneath the matching application-installed resource root after an exact file-read grant.", lisp: "(project-file-read (project-path \"README.md\"))", forth: "s\"README.md\" project-path project-file-read", example: "(project-file-read (project-path \"README.md\"))" },
         "process-run" => CoreWordDocumentation { summary: "Run an approved executable directly with a list of string arguments; it never invokes a shell. Use proposal-open for editable scripts.", lisp: "(process-run command arguments)", forth: "command arguments process-run", example: "(process-run \"git\" (list \"status\" \"--short\"))" },
         "mcp-call" => CoreWordDocumentation { summary: "Call one tool on one connected MCP server through the managed JSON boundary. Server and tool names are capability parameters; MCP descriptions remain untrusted data.", lisp: "(mcp-call server tool arguments-json)", forth: "server tool arguments-json mcp-call", example: "(mcp-call \"github\" \"issue_get\" (result-unwrap (json-parse \"{\\\"owner\\\":\\\"darwin-finch\\\",\\\"repo\\\":\\\"finch\\\",\\\"issue_number\\\":42}\")))" },
         "proposal-open" => CoreWordDocumentation { summary: "Ask the host to open a human-editable artifact proposal. Approval may execute the edited artifact through its normal validator, return edited text for chat, or cancel; this word does not run a shell itself.", lisp: "(proposal-open language title source)", forth: "language title source proposal-open", example: "(proposal-open \"python\" \"Report\" \"print('hello')\\n\")" },
@@ -227,13 +230,37 @@ fn path_template() -> FileSelectorTemplate {
 }
 
 fn host_path_selector() -> FileSelector {
-    FileSelector::parse("${host-machine}/**").expect("valid host-machine root")
+    rooted_path_selector("host-machine")
 }
 
 fn host_path_template() -> FileSelectorTemplate {
-    let upper_bound = host_path_selector();
+    rooted_path_template("host-machine")
+}
+
+fn project_path_selector() -> FileSelector {
+    rooted_path_selector("project")
+}
+
+fn project_path_template() -> FileSelectorTemplate {
+    rooted_path_template("project")
+}
+
+fn task_output_path_selector() -> FileSelector {
+    rooted_path_selector("task.output")
+}
+
+fn task_output_path_template() -> FileSelectorTemplate {
+    rooted_path_template("task.output")
+}
+
+fn rooted_path_selector(root: &str) -> FileSelector {
+    FileSelector::parse(&format!("${{{root}}}/**")).expect("valid resource root")
+}
+
+fn rooted_path_template(root: &str) -> FileSelectorTemplate {
+    let upper_bound = rooted_path_selector(root);
     FileSelectorTemplate {
-        root: ResourceRoot::HostMachine,
+        root: upper_bound.root.clone(),
         parts: vec![FileSelectorTemplatePart::Argument {
             index: 0,
             bound: upper_bound.clone(),
@@ -355,6 +382,20 @@ fn core_signatures() -> Vocabulary {
         (
             "host-path".into(),
             pure(vec![Type::String], vec![Type::Path(host_path_selector())]),
+        ),
+        (
+            "project-path".into(),
+            pure(
+                vec![Type::String],
+                vec![Type::Path(project_path_selector())],
+            ),
+        ),
+        (
+            "task-output-path".into(),
+            pure(
+                vec![Type::String],
+                vec![Type::Path(task_output_path_selector())],
+            ),
         ),
         (
             "dup".into(),
@@ -937,6 +978,58 @@ fn core_signatures() -> Vocabulary {
             ),
         ),
         (
+            "project-file-read".into(),
+            capability(
+                vec![Type::Path(project_path_selector())],
+                vec![Type::Bytes],
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileRead,
+                    selector: ResourceSelector::FileTemplate {
+                        template: project_path_template(),
+                    },
+                },
+            ),
+        ),
+        (
+            "project-file-write".into(),
+            capability(
+                vec![Type::Path(project_path_selector()), Type::Bytes],
+                vec![Type::Unit],
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileWrite,
+                    selector: ResourceSelector::FileTemplate {
+                        template: project_path_template(),
+                    },
+                },
+            ),
+        ),
+        (
+            "task-output-file-read".into(),
+            capability(
+                vec![Type::Path(task_output_path_selector())],
+                vec![Type::Bytes],
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileRead,
+                    selector: ResourceSelector::FileTemplate {
+                        template: task_output_path_template(),
+                    },
+                },
+            ),
+        ),
+        (
+            "task-output-file-write".into(),
+            capability(
+                vec![Type::Path(task_output_path_selector()), Type::Bytes],
+                vec![Type::Unit],
+                CapabilityRequirement {
+                    capability: CapabilityKind::FileWrite,
+                    selector: ResourceSelector::FileTemplate {
+                        template: task_output_path_template(),
+                    },
+                },
+            ),
+        ),
+        (
             "list-length".into(),
             pure(vec![Type::list(a.clone())], vec![Type::Int]),
         ),
@@ -1398,7 +1491,7 @@ static CORE_WORD_REGISTRY: Lazy<BTreeMap<String, CoreWordSpec>> = Lazy::new(|| {
                 "say" | "emit" => CoreWordImplementation::HostEffect(CoreHostBinding::SessionEmit),
                 "vm-vocabulary" => CoreWordImplementation::HostEffect(CoreHostBinding::VmVocabulary),
                 "capability-list" => CoreWordImplementation::HostEffect(CoreHostBinding::CapabilityList),
-                "file-read" | "host-file-read" => CoreWordImplementation::HostEffect(CoreHostBinding::FileRead),
+                "file-read" | "host-file-read" | "project-file-read" | "task-output-file-read" => CoreWordImplementation::HostEffect(CoreHostBinding::FileRead),
                 "file-hash" => CoreWordImplementation::HostEffect(CoreHostBinding::FileHash),
                 "tree-list" => CoreWordImplementation::HostEffect(CoreHostBinding::TreeList),
                 "tree-merkle" => CoreWordImplementation::HostEffect(CoreHostBinding::TreeMerkle),
@@ -1418,7 +1511,7 @@ static CORE_WORD_REGISTRY: Lazy<BTreeMap<String, CoreWordSpec>> = Lazy::new(|| {
                 "workbook-summary" => CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookSummary),
                 "stream-next" => CoreWordImplementation::HostEffect(CoreHostBinding::StreamNext),
                 "stream-close" => CoreWordImplementation::HostEffect(CoreHostBinding::StreamClose),
-                "file-write" | "host-file-write" => CoreWordImplementation::HostEffect(CoreHostBinding::FileWrite),
+                "file-write" | "host-file-write" | "project-file-write" | "task-output-file-write" => CoreWordImplementation::HostEffect(CoreHostBinding::FileWrite),
                 "process-run" => CoreWordImplementation::HostEffect(CoreHostBinding::ProcessRun),
                 "mcp-call" => CoreWordImplementation::HostEffect(CoreHostBinding::McpCall),
                 "proposal-open" => CoreWordImplementation::HostEffect(CoreHostBinding::ProposalOpen),

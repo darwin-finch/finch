@@ -343,16 +343,14 @@ pub struct ProgramRuntime {
     manifest_generation: AtomicU64,
     submission_gate: tokio::sync::Mutex<()>,
     automation: Arc<AutomationBroker>,
-    workspace_root: Arc<PathBuf>,
+    /// Application-owned filesystem roots. A root binding only establishes
+    /// where a refined path resolves; capability grants remain mandatory for
+    /// every operation beneath it.
+    resource_roots: Arc<RwLock<BTreeMap<crate::vm::ResourceRoot, Arc<PathBuf>>>>,
     /// Identity used to evaluate reusable capability scopes. It is host-owned
     /// policy state, not part of reducible VM checkpoints.
     session_id: uuid::Uuid,
     project_id: String,
-    /// Optional host-wide resource root. Installing this binding makes
-    /// `path<host-machine>` calls available to the host adapter, but conveys
-    /// no authority by itself: typed `file.read`/`file.write` grants are
-    /// still checked for every call.
-    host_machine_root: Arc<RwLock<Option<Arc<PathBuf>>>>,
     memory: RwLock<Option<Arc<crate::memory::MemorySystem>>>,
     /// Host-owned MCP transport. Installing it makes configured servers
     /// callable but never grants authority to any server or tool.
@@ -625,10 +623,12 @@ impl ProgramRuntime {
             manifest_generation: AtomicU64::new(1),
             submission_gate: tokio::sync::Mutex::new(()),
             automation,
-            workspace_root: Arc::new(workspace_root),
+            resource_roots: Arc::new(RwLock::new(BTreeMap::from([(
+                crate::vm::ResourceRoot::Workspace,
+                Arc::new(workspace_root),
+            )]))),
             session_id: uuid::Uuid::new_v4(),
             project_id,
-            host_machine_root: Arc::new(RwLock::new(None)),
             memory: RwLock::new(None),
             mcp_client: RwLock::new(None),
             host_vocabulary: RwLock::new(BTreeMap::new()),
@@ -665,16 +665,13 @@ impl ProgramRuntime {
         use crate::runtime::automation::AutomationState;
         use crate::vm::{ResourceRoot, ResourceSelector};
 
-        let root_availability = |root: &ResourceRoot| match root {
-            ResourceRoot::Workspace => CapabilityAvailability::Available,
-            ResourceRoot::HostMachine => match self.host_machine_root.read() {
-                Ok(root) if root.is_some() => CapabilityAvailability::Available,
-                Ok(_) => CapabilityAvailability::Disabled,
-                Err(_) => CapabilityAvailability::Degraded {
-                    reason: "host-machine root binding lock poisoned".into(),
-                },
+        let root_availability = |root: &ResourceRoot| match self.resource_roots.read() {
+            Ok(roots) if roots.contains_key(root) => CapabilityAvailability::Available,
+            Ok(_) if matches!(root, ResourceRoot::Named(_)) => CapabilityAvailability::Unsupported,
+            Ok(_) => CapabilityAvailability::Disabled,
+            Err(_) => CapabilityAvailability::Degraded {
+                reason: "resource-root binding lock poisoned".into(),
             },
-            _ => CapabilityAvailability::Unsupported,
         };
         match requirement.capability {
             CapabilityKind::SessionEmit | CapabilityKind::VmRead => {
@@ -812,25 +809,57 @@ impl ProgramRuntime {
     /// selector before a typed program can use it. Bind `/` only when the
     /// user intentionally wants whole-machine scope.
     pub fn bind_host_machine_root(&self, root: impl Into<PathBuf>) -> Result<()> {
+        self.bind_resource_root(crate::vm::ResourceRoot::HostMachine, root)
+    }
+
+    /// Install an application-selected project root. This is distinct from
+    /// the current workspace so a host can expose a narrower or broader
+    /// project tree without changing process current-directory semantics.
+    pub fn bind_project_root(&self, root: impl Into<PathBuf>) -> Result<()> {
+        self.bind_resource_root(crate::vm::ResourceRoot::Project, root)
+    }
+
+    /// Install the output directory assigned to this task/session. Programs
+    /// can receive write authority here without receiving workspace writes.
+    pub fn bind_task_output_root(&self, root: impl Into<PathBuf>) -> Result<()> {
+        self.bind_resource_root(crate::vm::ResourceRoot::TaskOutput, root)
+    }
+
+    fn bind_resource_root(
+        &self,
+        kind: crate::vm::ResourceRoot,
+        root: impl Into<PathBuf>,
+    ) -> Result<()> {
         let root = root.into().canonicalize()?;
         if !root.is_dir() {
-            bail!("host-machine root is not a directory: {}", root.display());
+            bail!("{kind} root is not a directory: {}", root.display());
         }
-        *self
-            .host_machine_root
+        self.resource_roots
             .write()
-            .map_err(|_| anyhow::anyhow!("host-machine root binding lock poisoned"))? =
-            Some(Arc::new(root));
+            .map_err(|_| anyhow::anyhow!("resource-root binding lock poisoned"))?
+            .insert(kind, Arc::new(root));
         Ok(())
     }
 
     /// Remove the host binding. Pending executions recheck this at their next
     /// host call, so revocation takes effect without widening workspace paths.
     pub fn clear_host_machine_root(&self) -> Result<()> {
-        *self
-            .host_machine_root
+        self.clear_resource_root(&crate::vm::ResourceRoot::HostMachine)
+    }
+
+    pub fn clear_project_root(&self) -> Result<()> {
+        self.clear_resource_root(&crate::vm::ResourceRoot::Project)
+    }
+
+    pub fn clear_task_output_root(&self) -> Result<()> {
+        self.clear_resource_root(&crate::vm::ResourceRoot::TaskOutput)
+    }
+
+    fn clear_resource_root(&self, kind: &crate::vm::ResourceRoot) -> Result<()> {
+        self.resource_roots
             .write()
-            .map_err(|_| anyhow::anyhow!("host-machine root binding lock poisoned"))? = None;
+            .map_err(|_| anyhow::anyhow!("resource-root binding lock poisoned"))?
+            .remove(kind);
         Ok(())
     }
 
@@ -2897,8 +2926,7 @@ impl ProgramRuntime {
         deferred_host_effects: DeferredHostEffects,
     ) -> Result<(TypedRuntime, crate::vm::TypedExecution)> {
         let automation = Arc::clone(&self.automation);
-        let workspace_root = Arc::clone(&self.workspace_root);
-        let host_machine_root = Arc::clone(&self.host_machine_root);
+        let resource_roots = Arc::clone(&self.resource_roots);
         let memory = self
             .memory
             .read()
@@ -2963,8 +2991,7 @@ impl ProgramRuntime {
                     let grants = runtime.grants().clone();
                     let mut handler = TypedHostHandler::new(
                         Arc::clone(&automation),
-                        Arc::clone(&workspace_root),
-                        Arc::clone(&host_machine_root),
+                        Arc::clone(&resource_roots),
                         scheduler,
                         memory,
                         mcp_client,
@@ -3002,8 +3029,7 @@ impl ProgramRuntime {
         authorize_pending_host_call: bool,
     ) -> Result<(TypedRuntime, crate::vm::TypedExecution)> {
         let automation = Arc::clone(&self.automation);
-        let workspace_root = Arc::clone(&self.workspace_root);
-        let host_machine_root = Arc::clone(&self.host_machine_root);
+        let resource_roots = Arc::clone(&self.resource_roots);
         let memory = self
             .memory
             .read()
@@ -3066,8 +3092,7 @@ impl ProgramRuntime {
                     let grants = runtime.grants().clone();
                     let mut handler = TypedHostHandler::new(
                         Arc::clone(&automation),
-                        Arc::clone(&workspace_root),
-                        Arc::clone(&host_machine_root),
+                        Arc::clone(&resource_roots),
                         scheduler,
                         memory,
                         mcp_client,
@@ -3103,8 +3128,7 @@ impl ProgramRuntime {
 
 struct TypedHostHandler {
     automation: Arc<AutomationBroker>,
-    workspace_root: Arc<PathBuf>,
-    host_machine_root: Arc<RwLock<Option<Arc<PathBuf>>>>,
+    resource_roots: Arc<RwLock<BTreeMap<crate::vm::ResourceRoot, Arc<PathBuf>>>>,
     output: String,
     output_chunks: Vec<String>,
     side_effects: Vec<crate::vm::interpreter::HostSideEffect>,
@@ -3137,8 +3161,7 @@ struct HostAuthorizationAudit {
 impl TypedHostHandler {
     fn new(
         automation: Arc<AutomationBroker>,
-        workspace_root: Arc<PathBuf>,
-        host_machine_root: Arc<RwLock<Option<Arc<PathBuf>>>>,
+        resource_roots: Arc<RwLock<BTreeMap<crate::vm::ResourceRoot, Arc<PathBuf>>>>,
         scheduler: Option<agent_vm::AgentVmBinding>,
         memory: Option<Arc<crate::memory::MemorySystem>>,
         mcp_client: Option<Arc<crate::tools::mcp::McpClient>>,
@@ -3156,8 +3179,7 @@ impl TypedHostHandler {
     ) -> Self {
         Self {
             automation,
-            workspace_root,
-            host_machine_root,
+            resource_roots,
             output: String::new(),
             output_chunks: Vec::new(),
             side_effects: Vec::new(),
@@ -4820,21 +4842,18 @@ impl TypedHostHandler {
         selector: &crate::vm::FileSelector,
         relative: &str,
     ) -> std::result::Result<PathBuf, String> {
-        let root = match selector.root {
-            crate::vm::ResourceRoot::Workspace => Arc::clone(&self.workspace_root),
-            crate::vm::ResourceRoot::HostMachine => self
-                .host_machine_root
-                .read()
-                .map_err(|_| "host-machine root binding lock poisoned".to_string())?
-                .clone()
-                .ok_or_else(|| "host-machine root is not installed by this host".to_string())?,
-            _ => {
-                return Err(format!(
-                    "file selector root '{}' is unavailable to this host binding",
+        let root = self
+            .resource_roots
+            .read()
+            .map_err(|_| "resource-root binding lock poisoned".to_string())?
+            .get(&selector.root)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "file selector root '{}' is not installed by this host",
                     selector.root
-                ));
-            }
-        };
+                )
+            })?;
         secure_resource_path(&root, selector, relative)
     }
 }
@@ -9976,6 +9995,66 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             completed.values,
             vec![ProgramValue::Bytes(b"host-only".to_vec())]
         );
+    }
+
+    #[tokio::test]
+    async fn project_and_task_output_roots_are_typed_independent_bindings() {
+        let project = tempfile::tempdir().unwrap();
+        let task_output = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("input.txt"), b"project-data").unwrap();
+        let runtime = ProgramRuntime::new();
+        runtime.bind_project_root(project.path()).unwrap();
+        runtime.bind_task_output_root(task_output.path()).unwrap();
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("${project}/**").unwrap(),
+            ))
+            .unwrap();
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Write,
+                crate::vm::FileSelector::parse("${task.output}/**").unwrap(),
+            ))
+            .unwrap();
+
+        let read = runtime
+            .submit_typed_only(submission(
+                ProgramLanguage::Lisp,
+                "(project-file-read (project-path \"input.txt\"))",
+                ExecutionEffect::WorkspaceRead,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(read.status, ExecutionStatus::Completed);
+        assert_eq!(read.values, vec![ProgramValue::Bytes(b"project-data".to_vec())]);
+
+        let write = runtime
+            .submit_typed_only(submission(
+                ProgramLanguage::Forth,
+                "s\" result.txt\" task-output-path s\" task-data\" bytes task-output-file-write",
+                ExecutionEffect::WorkspaceWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(write.status, ExecutionStatus::Completed);
+        assert_eq!(
+            std::fs::read(task_output.path().join("result.txt")).unwrap(),
+            b"task-data"
+        );
+
+        let crossed = runtime
+            .submit_typed_only(submission(
+                ProgramLanguage::Forth,
+                "s\" input.txt\" project-path task-output-file-read",
+                ExecutionEffect::WorkspaceRead,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(crossed.status, ExecutionStatus::Failed);
+        assert!(crossed.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("project") && diagnostic.contains("task.output")
+        }));
     }
 
     #[tokio::test]

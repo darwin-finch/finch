@@ -2154,7 +2154,7 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
             }
             stack.push(*value);
         }
-        "path" | "host-path" => {
+        "path" | "host-path" | "project-path" | "task-output-path" => {
             let value = pop(stack)?;
             let TypedValue::String(relative) = value else {
                 return Err(VmDiagnostic::error(
@@ -2164,10 +2164,11 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
                     Some(origin),
                 ));
             };
-            let selector_source = if name == "host-path" {
-                "${host-machine}/**"
-            } else {
-                "./**"
+            let selector_source = match name {
+                "host-path" => "${host-machine}/**",
+                "project-path" => "${project}/**",
+                "task-output-path" => "${task.output}/**",
+                _ => "./**",
             };
             let selector =
                 super::effects::FileSelector::parse(selector_source).map_err(|error| {

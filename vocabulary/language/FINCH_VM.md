@@ -343,6 +343,13 @@ grant: the concrete `file.read(${host-machine}/...)` or `file.write(${host-machi
 capability must still be approved, and the host canonicalizes containment again on every call.
 Ordinary `path` / `file-read` never widen to this root.
 
+Hosts may also install `root<project>` and `root<task.output>` independently of the process
+workspace. `project-path` is accepted only by `project-file-read` / `project-file-write`, while
+`task-output-path` is accepted only by `task-output-file-read` / `task-output-file-write`. This
+lets a task receive, for example, project-read plus task-output-write without receiving workspace
+write or whole-machine authority. Root installation still grants nothing; every concrete file
+operation is checked against its own selector.
+
 `file-size(path)` and `file-slice(path, offset, length)` share the same refined `file.read(path)`
 requirement. A slice is bounded (currently 8 MiB maximum per call) and may be shorter at EOF, so
 large CSV/text/binary processing can keep only a bounded window in VM memory.

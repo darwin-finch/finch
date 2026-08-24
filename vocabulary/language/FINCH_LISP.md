@@ -282,6 +282,11 @@ approval before execution.
 the user grants the concrete file selector. It is not an absolute-string escape hatch; ordinary
 workspace file words cannot consume it.
 
+`project-path` and `task-output-path` similarly produce distinct refined types for optional
+application-installed roots. Use `project-file-read` / `project-file-write` and
+`task-output-file-read` / `task-output-file-write` respectively. This permits narrow policies such
+as project-read plus task-output-write, and the verifier rejects mixing paths between roots.
+
 For large text, CSV, or binary files, use `(file-size path)` and `(file-slice path offset length)`
 instead of `(file-read path)`. A slice returns at most the requested range (currently capped at
 8 MiB per call), with a shorter final value at EOF. Keep the byte offset in a lexical binding and
