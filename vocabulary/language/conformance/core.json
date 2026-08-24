@@ -66,6 +66,20 @@
       "expected_output": ""
     },
     {
+      "name": "structured-list-match-cons",
+      "forth": "[ 4 8 ] list-uncons if-some \"head\" record-get unwrap else 0 then",
+      "lisp": "(match (list 4 8) (empty 0) (cons head tail (begin tail head)))",
+      "expected_values": [{ "type": "int", "value": 4 }],
+      "expected_output": ""
+    },
+    {
+      "name": "structured-list-match-empty",
+      "forth": "empty-list<int> list-uncons if-some drop 0 else 42 then",
+      "lisp": "(match (empty-list int) (empty 42) (cons head tail (begin tail head)))",
+      "expected_values": [{ "type": "int", "value": 42 }],
+      "expected_output": ""
+    },
+    {
       "name": "explicit-typed-empty-list",
       "forth": "empty-list<int> 3 list-append 0 list-get",
       "lisp": "(list-get (list-append (empty-list int) 3) 0)",

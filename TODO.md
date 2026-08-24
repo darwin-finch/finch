@@ -28,18 +28,18 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   insertion-ordered `map-entries` iteration through typed key/value records, homogeneous typed-list
   construction/immutable append in both frontends, direct pasted Co-Forth JSON-object literals,
   explicit `json-as-map -> option<map<string,json>>` normalization, and total statically checked
-  Lisp record-subset destructuring lowered to shared `record-get`/local IR; still add list/variant
-  patterns and row-polymorphic record rules. The deliberate typed brace-record syntax is the only record
+  Lisp record-subset and exhaustive list destructuring lowered to shared public words/branch/local
+  IR; still add variant patterns and row-polymorphic record rules. The deliberate typed brace-record syntax is the only record
   source surface; `json-parse`/`json-get`/scalar option projections remain the safe boundary for
   arbitrary JSON objects rather than exposing the internal `TypedValue::Record` ABI ad hoc.
 - [ ] Extend the implemented typed option/result branches, type-directed Lisp `match`, and
   no-fallthrough integer Co-Forth `case` to richer structured patterns plus expression-valued
   named `break` after the loop verifier is generalized to check each target's declared result
   stack row. Total record subset patterns now bind statically present fields through ordinary
-  shared projection/local operations, and polymorphic `list-uncons` provides both frontends the
-  ordinary `option<record{head:A,tail:list<A>}>` decomposition primitive for list patterns. Simple
-  named stack-preserving `break`/`continue` already lower to verified loop edges; do not add
-  unrestricted jumps or C-style fallthrough switches.
+  shared projection/local operations. Exhaustive Lisp `empty`/`cons` patterns lower through the
+  public polymorphic `list-uncons`, option branches, record projection, and locals that Co-Forth can
+  compose directly. Simple named stack-preserving `break`/`continue` already lower to verified loop
+  edges; do not add unrestricted jumps or C-style fallthrough switches.
 - [x] Add explicit typed result propagation after branch forms are stable: Lisp `try` and
   Co-Forth `?` early-return an `err` only from a function whose sole declared output is a
   compatible `result<T,E>`. The verifier checks the cold return edge, the interpreter unwinds the

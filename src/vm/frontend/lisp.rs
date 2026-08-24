@@ -2039,6 +2039,9 @@ impl Compiler<'_> {
                 (Some(first), Some(second)) if first == "ok" && second == "err" => {
                     return self.compile_match_result(expressions, expression_sources, builder);
                 }
+                (Some(first), Some(second)) if first == "empty" && second == "cons" => {
+                    return self.compile_list_match(expressions, expression_sources, builder);
+                }
                 _ => {}
             }
         }
@@ -2158,8 +2161,27 @@ impl Compiler<'_> {
             self.origin("match/record"),
         );
 
+        let scope = self.bind_record_fields(record_local, &record_fields, parsed, builder);
+
+        builder.scopes.push(scope);
+        let body_sources = expression_sources
+            .and_then(|sources| sources.get(1))
+            .and_then(|source| Self::source_list_children(source, arm_items))
+            .and_then(|sources| sources.get(2..));
+        let result = self.compile_begin(body, body_sources, builder);
+        builder.scopes.pop();
+        result
+    }
+
+    fn bind_record_fields(
+        &self,
+        record_local: u32,
+        record_fields: &[(String, Type)],
+        bindings: Vec<(String, String, Type)>,
+        builder: &mut FunctionBuilder,
+    ) -> HashMap<String, Binding> {
         let mut scope = HashMap::new();
-        for (field, binding, field_type) in parsed {
+        for (field, binding, field_type) in bindings {
             if binding == "_" {
                 continue;
             }
@@ -2169,7 +2191,7 @@ impl Compiler<'_> {
                 },
                 self.origin(format!("match/record/{field}")),
             );
-            builder.stack.push(Type::Record(record_fields.clone()));
+            builder.stack.push(Type::Record(record_fields.to_vec()));
             builder.emit(
                 Instruction::Constant {
                     value: TypedValue::String(field.clone()),
@@ -2209,15 +2231,177 @@ impl Compiler<'_> {
                 },
             );
         }
+        scope
+    }
 
+    /// Total list decomposition built from the public polymorphic
+    /// `list-uncons` word. The non-empty arm receives immutable head/tail
+    /// bindings; both arms are verified with the same branch merge rules as
+    /// `match-option`.
+    fn compile_list_match(
+        &mut self,
+        expressions: &[Val],
+        expression_sources: Option<&[SpannedVal]>,
+        builder: &mut FunctionBuilder,
+    ) -> Result<Type, Vec<VmDiagnostic>> {
+        let [list_expression, empty_arm, cons_arm] = expressions else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-013",
+                "list match requires (empty body...) and (cons head tail body...) arms",
+            )]);
+        };
+        let Type::List(element_type) = self.compile_expression_at(
+            list_expression,
+            expression_sources.and_then(|sources| sources.first()),
+            builder,
+        )? else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-013",
+                "empty/cons patterns require a typed list value",
+            )]);
+        };
+        let pair_fields = vec![
+            ("head".into(), (*element_type).clone()),
+            ("tail".into(), Type::list((*element_type).clone())),
+        ];
+        builder.stack.pop();
+        builder.emit(
+            Instruction::Call {
+                function: "list-uncons".into(),
+            },
+            self.origin("match/list-uncons"),
+        );
+        builder
+            .stack
+            .push(Type::Option(Box::new(Type::Record(pair_fields.clone()))));
+
+        let Val::List(empty_items) = empty_arm else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-013",
+                "list match's first arm must be (empty body...)",
+            )]);
+        };
+        let [Val::Symbol(empty_marker), empty_body @ ..] = empty_items.as_slice() else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-013",
+                "list match's first arm must be (empty body...)",
+            )]);
+        };
+        if empty_marker != "empty" || empty_body.is_empty() {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-013",
+                "list match's first arm must be (empty body...)",
+            )]);
+        }
+
+        let Val::List(cons_items) = cons_arm else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-013",
+                "list match's second arm must be (cons head tail body...)",
+            )]);
+        };
+        let [Val::Symbol(cons_marker), Val::Symbol(head), Val::Symbol(tail), cons_body @ ..] =
+            cons_items.as_slice()
+        else {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-013",
+                "list match's second arm must be (cons head tail body...)",
+            )]);
+        };
+        if cons_marker != "cons" || cons_body.is_empty() || (head == tail && head != "_") {
+            return Err(vec![self.error(
+                "E-LISP-MATCH-013",
+                "list match requires distinct head/tail bindings (or _) and a non-empty body",
+            )]);
+        }
+
+        builder.stack.pop();
+        let branch_stack = builder.stack.clone();
+        builder.emit(Instruction::Dup, self.origin("match/list-test"));
+        builder.emit(
+            Instruction::Call {
+                function: "is-some".into(),
+            },
+            self.origin("match/list-test"),
+        );
+        let cons_block = builder.new_block();
+        let empty_block = builder.new_block();
+        let merge_block = builder.new_block();
+        builder.emit(
+            Instruction::Branch {
+                then_block: cons_block,
+                else_block: empty_block,
+            },
+            self.origin("match/list-test"),
+        );
+
+        builder.switch_to(cons_block, branch_stack.clone());
+        builder.emit(
+            Instruction::Call {
+                function: "unwrap".into(),
+            },
+            self.origin("match/list-cons"),
+        );
+        builder.stack.push(Type::Record(pair_fields.clone()));
+        let pair_local = builder.allocate_local(Type::Record(pair_fields.clone()));
+        builder.stack.pop();
+        builder.emit(
+            Instruction::LocalSet { index: pair_local },
+            self.origin("match/list-cons"),
+        );
+        let scope = self.bind_record_fields(
+            pair_local,
+            &pair_fields,
+            vec![
+                ("head".into(), head.clone(), (*element_type).clone()),
+                (
+                    "tail".into(),
+                    tail.clone(),
+                    Type::list((*element_type).clone()),
+                ),
+            ],
+            builder,
+        );
         builder.scopes.push(scope);
-        let body_sources = expression_sources
-            .and_then(|sources| sources.get(1))
-            .and_then(|source| Self::source_list_children(source, arm_items))
-            .and_then(|sources| sources.get(2..));
-        let result = self.compile_begin(body, body_sources, builder);
+        let cons_sources = expression_sources
+            .and_then(|sources| sources.get(2))
+            .and_then(|source| Self::source_list_children(source, cons_items))
+            .and_then(|sources| sources.get(3..));
+        let cons_type = self.compile_begin(cons_body, cons_sources, builder)?;
         builder.scopes.pop();
-        result
+        builder.stack.push(cons_type.clone());
+        let cons_stack = builder.stack.clone();
+        builder.emit(
+            Instruction::Jump {
+                target: merge_block,
+            },
+            self.origin("match/list-cons-end"),
+        );
+
+        builder.switch_to(empty_block, branch_stack);
+        builder.emit(Instruction::Drop, self.origin("match/list-empty"));
+        let empty_sources = expression_sources
+            .and_then(|sources| sources.get(1))
+            .and_then(|source| Self::source_list_children(source, empty_items))
+            .and_then(|sources| sources.get(1..));
+        let empty_type = self.compile_begin(empty_body, empty_sources, builder)?;
+        builder.stack.push(empty_type.clone());
+        let empty_stack = builder.stack.clone();
+        if cons_type != empty_type || cons_stack != empty_stack {
+            return Err(vec![VmDiagnostic::type_mismatch(
+                cons_type,
+                empty_type,
+                Some(self.origin("match/list")),
+            )]);
+        }
+        builder.emit(
+            Instruction::Jump {
+                target: merge_block,
+            },
+            self.origin("match/list-empty-end"),
+        );
+        builder.switch_to(merge_block, empty_stack);
+        Ok(builder.stack.pop().expect("list match leaves a value"))
     }
 
     /// Compile the non-dynamic literal subset of `match`.
@@ -4016,6 +4200,25 @@ mod tests {
             run("(is-some (list-uncons (empty-list int)))").unwrap(),
             vec![TypedValue::Bool(false)]
         );
+        assert_eq!(
+            run("(match (list 4 8) (empty 0) (cons head tail (+ head (list-length tail))))")
+                .unwrap(),
+            vec![TypedValue::Int(5)]
+        );
+        assert_eq!(
+            run("(match (empty-list int) (empty 42) (cons head tail (begin tail head)))")
+                .unwrap(),
+            vec![TypedValue::Int(42)]
+        );
+
+        let mismatched_arms = compile_lisp(
+            "list-pattern.lisp",
+            "(match (list 1) (empty \"empty\") (cons head tail head))",
+            Vec::new(),
+            &core_vocabulary(),
+        )
+        .expect_err("list pattern arms must merge to one type");
+        assert!(mismatched_arms.iter().any(|error| error.code == "E-TYPE-002"));
     }
 
     #[test]
@@ -4515,6 +4718,7 @@ mod tests {
             "(match-option (some 1) (some value missing) (none 0))",
             "(match-result (ok 1) (ok value missing) (err problem 0))",
             "(match { :age 1 } (record ((age years)) missing))",
+            "(match (list 1) (empty 0) (cons head tail missing))",
             "(while true missing)",
         ] {
             let errors = compile_lisp("patterns.lisp", source, Vec::new(), &core_vocabulary())

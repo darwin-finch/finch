@@ -112,12 +112,22 @@ a field without binding it:
 ```
 
 This is syntax over the same `record-get` plus typed-local operations available in Co-Forth; it is
-not a Lisp-only runtime matcher. Strings, lists, and arbitrary JSON have no general pattern matcher
-yet: use their explicit typed operations rather than falling back to a dynamic dispatcher.
+not a Lisp-only runtime matcher. A typed list has an exhaustive `empty`/`cons` pair. The `cons` arm
+binds its head and immutable tail:
 
-`list-uncons` is the safe shared decomposition primitive for lists. It returns `none` for an empty
-list or `some(record{head:A,tail:list<A>})`, avoiding an exception or a language-special
-multi-return while richer list-pattern syntax is built on top:
+```lisp
+(match (list 4 8)
+  (empty 0)
+  (cons head tail (+ head (list-length tail)))) ; => 5
+```
+
+This lowers through `list-uncons`, option branching, record projection, and locals. Strings and
+arbitrary JSON have no general pattern matcher yet: use their explicit typed operations rather than
+falling back to a dynamic dispatcher.
+
+`list-uncons` is the safe shared decomposition primitive beneath that syntax. It returns `none` for
+an empty list or `some(record{head:A,tail:list<A>})`, avoiding an exception or a language-special
+multi-return:
 
 ```lisp
 (match-option (list-uncons (list 4 8))

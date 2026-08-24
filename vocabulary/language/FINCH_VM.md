@@ -211,6 +211,9 @@ intentionally not inferred by either source form: use `(empty-list type)` in Lis
 `list-uncons` consumes `list<A>` and returns `option<record{head:A,tail:list<A>}>`, giving both
 frontends a safe ordinary-word basis for list patterns and range-style traversal without
 compiler-only multiple returns.
+Lisp `(match items (empty ...) (cons head tail ...))` is an exhaustive surface spelling over that
+word, the shared option branch, record projection, and typed locals. Co-Forth composes those same
+public words with `if-some ... else ... then`.
 
 Lisp symbols are identifiers, not strings: `'name` is quoted data (equivalent to `(quote name)`),
 whereas `(say "name")` contains text. Co-Forth uses bare tokens for executable dictionary words;
