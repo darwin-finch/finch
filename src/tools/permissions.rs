@@ -171,14 +171,12 @@ impl PermissionManager {
             return PermissionCheck::Allow;
         }
 
-        // Pure and VM-local programs do not cross a host-effect boundary. External
-        // program effects continue through the configured/default approval rule.
-        if tool_name == "submit_program"
-            && matches!(
-                input.get("effect").and_then(Value::as_str),
-                Some("pure" | "vm_read" | "vm_write")
-            )
-        {
+        // Entering the typed broker is not itself authority. The verifier derives
+        // concrete capability requirements from the program and the runtime
+        // suspends on any requirement that is not granted. Never trust the
+        // provider-supplied coarse `effect` label at this outer compatibility
+        // boundary.
+        if tool_name == "submit_program" {
             return PermissionCheck::Allow;
         }
 
@@ -230,15 +228,9 @@ impl PermissionManager {
             | "poll_agent"
             | "cancel_agent" => PermissionCheck::Allow,
 
-            // Pure and VM-local programs cannot cross a host-effect boundary.
-            "submit_program"
-                if matches!(
-                    input.get("effect").and_then(Value::as_str),
-                    Some("pure" | "vm_read" | "vm_write")
-                ) =>
-            {
-                PermissionCheck::Allow
-            }
+            // The typed broker, not this compatibility tool gate, authorizes
+            // every concrete host effect inferred from a submitted program.
+            "submit_program" => PermissionCheck::Allow,
 
             // Write/edit/patch: must surface as diff proposal in the room
             // The caller (peer loop) is responsible for converting Allow here into
@@ -472,15 +464,10 @@ fn is_readonly_bash(command: &str) -> bool {
 /// the compatibility boundary while provider-native tools are still exposed.
 pub fn legacy_tool_effect(tool_name: &str, input: &Value) -> ExecutionEffect {
     match tool_name.to_ascii_lowercase().as_str() {
-        // Transitional adapter: ordinary provider turns still invoke the
-        // typed VM through a tool call. Preserve the program's declared upper
-        // bound so pure/VM-local work is not treated as an unclassified shell
-        // operation by the legacy approval gate.
-        "submit_program" => input
-            .get("effect")
-            .and_then(Value::as_str)
-            .and_then(|effect| effect.parse().ok())
-            .unwrap_or(ExecutionEffect::Unclassified),
+        // Transitional adapter only: invoking the typed broker is VM-local.
+        // The program's model-supplied coarse effect label is deliberately
+        // ignored; verified capability requirements govern host authority.
+        "submit_program" => ExecutionEffect::VmWrite,
         "get_vm_state"
         | "get_language_definition"
         | "search_vm_vocabulary"
@@ -847,18 +834,32 @@ mod tests {
     }
 
     #[test]
-    fn typed_program_submission_preserves_its_declared_effect() {
+    fn typed_program_submission_ignores_untrusted_coarse_effect() {
         assert_eq!(
             legacy_tool_effect("submit_program", &serde_json::json!({"effect": "pure"})),
-            ExecutionEffect::Pure
+            ExecutionEffect::VmWrite
         );
         assert_eq!(
             legacy_tool_effect(
                 "submit_program",
-                &serde_json::json!({"effect": "workspace_read"})
+                &serde_json::json!({"effect": "destructive"})
             ),
-            ExecutionEffect::WorkspaceRead
+            ExecutionEffect::VmWrite
         );
+    }
+
+    #[test]
+    fn typed_program_always_enters_the_capability_broker_without_outer_approval() {
+        let manager = PermissionManager::new();
+        for effect in ["pure", "workspace_write", "destructive", "invented"] {
+            assert!(matches!(
+                manager.check_tool_use(
+                    "submit_program",
+                    &serde_json::json!({"effect": effect})
+                ),
+                PermissionCheck::Allow
+            ));
+        }
     }
 
     #[test]
