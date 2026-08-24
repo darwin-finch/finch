@@ -65,6 +65,17 @@ impl Type {
         )
     }
 
+    /// Result of observing a CPU task without consuming its only handle.
+    /// Keeping the handle in the result makes a poll followed by a later poll,
+    /// join, or cancellation expressible in both Lisp and Co-Forth without
+    /// relying on hidden borrowing semantics or multiple-result special cases.
+    pub fn task_poll(result_type: Type) -> Self {
+        Self::Record(vec![
+            ("task".into(), Self::Task(Box::new(result_type.clone()))),
+            ("value".into(), Self::Option(Box::new(result_type))),
+        ])
+    }
+
     /// Non-binding compatibility. Type variables are bound by the verifier.
     pub fn accepts(&self, actual: &Type) -> bool {
         self == actual

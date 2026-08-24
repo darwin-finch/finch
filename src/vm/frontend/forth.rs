@@ -2158,7 +2158,7 @@ fn lower_forth_ast_body_with_locals(
                             Some(origin),
                         )]);
                     };
-                    stack.push(Type::Option(result));
+                    stack.push(Type::task_poll(*result));
                     Instruction::PollCpuFiber
                 } else if word == "task-join" {
                     let task = stack.pop().ok_or_else(|| {

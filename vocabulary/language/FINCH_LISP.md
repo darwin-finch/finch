@@ -398,8 +398,9 @@ creation-time ceiling.
 
 `(defer :cpu (lambda () expression))` starts a pure zero-argument closure on a bounded private CPU
 worker and returns `task<T>`. Captures are immutable snapshots, not references to the parent stack.
-Within Lisp, bind that handle normally and use `(task-poll handle)` for `option<T>` or
-`(task-join handle)` for `T`; a running join suspends the VM continuation rather than blocking the
+Within Lisp, bind that handle normally and use `(task-poll handle)` for
+`record{task:task<T>,value:option<T>}` or `(task-join handle)` for `T`. The poll record preserves the
+handle explicitly for a later poll/join/cancel; a running join suspends the VM continuation rather than blocking the
 event loop. `(task-cancel handle)` consumes a `cpu_fiber` handle and requests cooperative
 cancellation; a worker observes that request at its next VM boundary. CPU task operations reject
 agent-task handles; use `agent-cancel` for child agents.

@@ -149,7 +149,7 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "fiber-next" => CoreWordDocumentation { summary: "Advance one cooperative producer. It returns ok(Y) for a yielded value or err(end(R)) for the terminal return.", lisp: "(fiber-next fiber)", forth: "fiber fiber-next", example: "(match-result (fiber-next producer) (ok value value) (err end end))" },
         "fiber-join" => CoreWordDocumentation { summary: "Advance a cooperative producer through remaining yields and return its terminal R. It consumes no host thread.", lisp: "(fiber-join fiber)", forth: "fiber fiber-join", example: "producer fiber-join" },
         "fiber-cancel" => CoreWordDocumentation { summary: "Cancel and consume a cooperative producer handle. The runtime retains a tombstone so later stale-handle use fails deterministically.", lisp: "(fiber-cancel fiber)", forth: "fiber fiber-cancel", example: "producer fiber-cancel" },
-        "task-poll" | "task-join" | "task-cancel" => CoreWordDocumentation { summary: "Inspect, join, or cooperatively cancel a scheduler-owned task<T>. CPU and agent task kinds remain distinct at runtime.", lisp: "(task-poll task), (task-join task), (task-cancel task)", forth: "task task-poll; task task-join; task task-cancel", example: "(task-join (defer :cpu (lambda () 42)))" },
+        "task-poll" | "task-join" | "task-cancel" => CoreWordDocumentation { summary: "Inspect, join, or cooperatively cancel a scheduler-owned task<T>. Poll returns record{task:task<T>,value:option<T>} so observing a running task never destroys the handle needed to poll, join, or cancel it later. CPU and agent task kinds remain distinct at runtime.", lisp: "(task-poll task), (task-join task), (task-cancel task)", forth: "task task-poll; task task-join; task task-cancel", example: "(task-join (record-get (task-poll (defer :cpu (lambda () 42))) \"task\"))" },
         "yield" => CoreWordDocumentation { summary: "Publish one typed value and suspend the exact VM continuation. Yielding unit is a cooperative timeslice; producer fibers consume other payload types.", lisp: "(yield value); (yield) is unit shorthand", forth: "value yield; use unit yield for a timeslice", example: "(begin (yield 42) (say \"resumed\"))" },
         "unit" => CoreWordDocumentation { summary: "Push the unit value. It is useful when an operation needs an explicit no-information value, including unit yield.", lisp: "nil", forth: "unit", example: "unit yield" },
         "some" | "none" | "is-some" | "unwrap" => CoreWordDocumentation { summary: "Construct, test, or project typed option values. Prefer exhaustive match-option/if-some over unwrap when none is expected control flow.", lisp: "(some value), (none), (is-some option), (unwrap option)", forth: "value some; none; option is-some; option unwrap", example: "(match-option (some 42) (some n (say (int-to-string n))) (none (say \"missing\")))" },
@@ -523,7 +523,7 @@ fn core_signatures() -> Vocabulary {
             "task-poll".into(),
             pure(
                 vec![Type::Task(Box::new(Type::Variable("R".into())))],
-                vec![Type::Option(Box::new(Type::Variable("R".into())))],
+                vec![Type::task_poll(Type::Variable("R".into()))],
             ),
         ),
         (

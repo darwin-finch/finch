@@ -1383,6 +1383,10 @@ impl TypedRuntime {
                             )
                         }
                     };
+                    let poll = TypedValue::Record(vec![
+                        ("task".into(), task),
+                        ("value".into(), value),
+                    ]);
                     let trampoline = VmTrampoline::new(
                         &module,
                         &InterpreterConfig {
@@ -1390,7 +1394,7 @@ impl TypedRuntime {
                             grants: self.grants.clone(),
                         },
                     );
-                    trampoline.resume(continuation, vec![value])
+                    trampoline.resume(continuation, vec![poll])
                 }
                 VmStep::JoinCpuFiber {
                     task,
@@ -3473,7 +3477,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_cpu_task_polls_as_some_of_its_declared_type() {
+    fn completed_cpu_task_poll_preserves_handle_and_typed_result() {
         let mut runtime = TypedRuntime::new();
         let deferred = runtime.execute(
             ProgramLanguage::Lisp,
@@ -3493,11 +3497,34 @@ mod tests {
         assert_eq!(polled.status, TypedExecutionStatus::Completed);
         assert_eq!(
             polled.values,
-            vec![TypedValue::Option {
-                inner_type: Type::Int,
-                value: Some(Box::new(TypedValue::Int(9))),
-            }]
+            vec![TypedValue::Record(vec![
+                (
+                    "task".into(),
+                    TypedValue::Task {
+                        id: id.clone(),
+                        result_type: Type::Int,
+                        kind: crate::vm::types::TaskKind::CpuFiber,
+                    },
+                ),
+                (
+                    "value".into(),
+                    TypedValue::Option {
+                        inner_type: Type::Int,
+                        value: Some(Box::new(TypedValue::Int(9))),
+                    },
+                ),
+            ])]
         );
+        assert_eq!(runtime.cpu_fibers.scheduler.retained_count(), 1);
+
+        let joined = runtime.execute(
+            ProgramLanguage::Forth,
+            "poll-join.forth",
+            "\"task\" record-get unwrap task-join",
+            1_000,
+        );
+        assert_eq!(joined.status, TypedExecutionStatus::Completed);
+        assert_eq!(joined.values, vec![TypedValue::Int(9)]);
         assert_eq!(runtime.cpu_fibers.scheduler.retained_count(), 0);
     }
 

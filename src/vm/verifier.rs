@@ -784,7 +784,7 @@ impl<'a> Verifier<'a> {
                         Some(origin.clone()),
                     ));
                 };
-                stack.push(Type::Option(result));
+                stack.push(Type::task_poll(*result));
             }
             Instruction::JoinCpuFiber => {
                 let task = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;

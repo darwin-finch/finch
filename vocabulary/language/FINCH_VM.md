@@ -173,8 +173,10 @@ child's typed grant ceiling.
 
 Pure zero-argument closures may use `(defer :cpu (lambda () ...))` to run on Finch's bounded local
 worker pool. It returns `task<T>` with an explicit `cpu_fiber` owner kind; captured values are
-immutable snapshots and the worker has a private stack/frame set. `task-poll` has type `task<T> -> option<T>` and never
-blocks. `task-join` has type `task<T> -> T`; if the worker is still running it preserves the parent
+immutable snapshots and the worker has a private stack/frame set. `task-poll` has type
+`task<T> -> record{task:task<T>,value:option<T>}` and never blocks. Returning the handle makes a
+later poll, join, or cancellation explicit without a hidden borrow or a privileged multiple return.
+`task-join` has type `task<T> -> T`; if the worker is still running it preserves the parent
 continuation as a scheduler suspension instead of blocking the UI/event loop. `task-cancel`
 consumes a CPU task handle and requests cooperative cancellation at the worker's next VM boundary.
 CPU task operations reject agent-task handles; agent coordination remains `agent-*` and is a

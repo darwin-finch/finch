@@ -332,7 +332,9 @@ requirement metadata are not authority. The compact `task agent-spawn` form deli
 the caller's whole creation-time ceiling.
 
 For CPU-bound pure closures, `['] zero-argument-word defer-cpu` starts a private worker and leaves
-`task<T>`. `task-poll` replaces it with `option<T>`; `task-join` replaces it with `T`, suspending
+`task<T>`. `task-poll` replaces it with
+`record{task:task<T>,value:option<T>}`; project `task` for a later poll/join/cancel and `value` to
+inspect the nonblocking result. `task-join` replaces a task handle with `T`, suspending
 the current VM run if necessary rather than blocking the terminal. `task-cancel` consumes a handle
 and requests cooperative cancellation at its next worker VM boundary. CPU task words reject
 agent-task handles.

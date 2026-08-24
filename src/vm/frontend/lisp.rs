@@ -1405,7 +1405,11 @@ impl Compiler<'_> {
             },
             self.origin(name),
         );
-        Ok(if join { *result } else { Type::Option(result) })
+        Ok(if join {
+            *result
+        } else {
+            Type::task_poll(*result)
+        })
     }
 
     fn compile_cpu_task_cancel(
