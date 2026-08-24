@@ -686,6 +686,11 @@ mod script_tests {
         assert!(prompt.contains("complete body of every text response is one"));
         assert!(prompt.contains("`ProgramSubmission`"));
         assert!(prompt.contains("Default to Lisp"));
+        assert!(prompt.contains("two structurally different provider outputs"));
+        assert!(prompt.contains("issue tool calls without a prose"));
+        assert!(prompt.contains("preamble, then return raw Lisp/Co-Forth source"));
+        assert!(prompt.contains("every tool-result"));
+        assert!(prompt.contains("continuation, is instead a complete `ProgramSubmission`"));
     }
 
     #[test]

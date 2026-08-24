@@ -13,9 +13,12 @@ use super::{
     Generator, GeneratorCapabilities, GeneratorResponse, ResponseMetadata, StreamChunk, ToolUse,
 };
 
-pub const CODING_SYSTEM_PROMPT: &str = "You are Finch, an expert software engineering \
-assistant. You work directly in the user's codebase and execute tasks autonomously using \
-tools — like a senior engineer pairing at the terminal.
+pub const CODING_SYSTEM_PROMPT: &str = "You are the software-engineering reasoning provider inside \
+Finch. You are not the Finch application or terminal UI, and you do not impersonate either one. \
+Use the host tools Finch exposes to inspect and modify the user's codebase autonomously, like a \
+senior engineer pairing at the terminal. A transport-specific execution/output contract may follow \
+this coding policy; when present, it controls the complete text-response channel while provider-native \
+tool calls remain structurally separate.
 
 ## Tools
 
@@ -30,11 +33,7 @@ use edit instead.
 - **bash** — Run shell commands only when no structured tool exists: builds, tests, git,
   formatters, or a purpose-built command. Never use `cat` to read, `grep` to search, `find` to
   locate files, or shell redirection to write files; use `read`, `grep`, `glob`, `edit`, or `write`
-  instead. Shell stdout is not a Finch VM transport: never use bash/printf/echo/heredocs to emit
-  or test Lisp or Co-Forth source. Text-only provider responses are executed by Finch as VM wire
-  programs; communicate prose through Lisp/Forth `say`, not raw assistant text. For ordinary
-  replies and pure calculations, emit the wire program immediately—do not inspect the VM or search
-  the repository merely to learn how to call `say`.
+  instead. Shell stdout is never a substitute for the transport's final response channel.
 - **web_fetch** — Fetch documentation, crate pages, GitHub issues, etc.
 
 ## Approach
@@ -227,6 +226,14 @@ mod tests {
         assert!(CODING_SYSTEM_PROMPT.contains("Never use `cat` to read"));
         assert!(CODING_SYSTEM_PROMPT.contains("`grep` to search"));
         assert!(CODING_SYSTEM_PROMPT.contains("`read`, `grep`, `glob`, `edit`, or `write`"));
+    }
+
+    #[test]
+    fn coding_prompt_does_not_impersonate_the_finch_application() {
+        assert!(CODING_SYSTEM_PROMPT.contains("reasoning provider inside Finch"));
+        assert!(CODING_SYSTEM_PROMPT.contains("not the Finch application or terminal UI"));
+        assert!(CODING_SYSTEM_PROMPT.contains("tool calls remain structurally separate"));
+        assert!(!CODING_SYSTEM_PROMPT.starts_with("You are Finch"));
     }
 
     #[test]
