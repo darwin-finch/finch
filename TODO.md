@@ -166,11 +166,16 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Run the fixed protocol-conformance workload across every supported configured provider/model,
   publish sample size and recovery rates, and keep regressions as replayable fixtures. A live
   configured-Grok first-pass Lisp result proves the recorder path, not cross-provider conformance.
-  The ignored `live_parity_finch_wire_programs` suite now executes three fixed response/arithmetic/
-  definition tasks through the real typed runtime, performs at most one source-only repair, and
+  The ignored `live_parity_finch_wire_programs` suite now executes six fixed response, multiline-
+  quoting, arithmetic, recursive-definition, closure, and producer-fiber tasks through the real
+  typed runtime, performs at most one source-only repair with a 60-second per-call deadline, and
   prints source-free first-pass/repaired/terminal counts for every configured provider. On
-  2026-08-24 the configured Grok profile completed all 3 tasks first-pass (0 repaired, 0 terminal),
-  including a recursive factorial definition; other provider/model profiles remain unmeasured.
+  2026-08-24 the configured Grok profile completed all 6 language-package tasks first-pass
+  (0 repaired, 0 terminal); other provider/model profiles remain unmeasured. A BOOT-only trial
+  passed the four basic tasks but emitted textual introspection requests for closures and fibers
+  because that source-only fixture exposed neither tools nor the language definitions. Supplying
+  the canonical VM/Lisp/Forth package made both advanced cases pass; preserve that distinction
+  rather than misclassifying a missing test affordance as a model or VM failure.
   Expand the fixed matrix to ordinary and quoted/multiline responses, calculation, introspection,
   bounded file effects, approval/denial, loops, closures, fibers, malformed-wire repair, and
   unknown-word recovery. Preserve provider/model and runtime/language-package versions, sample
@@ -447,7 +452,7 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   preserve the relevant vocabulary/module context for submissions that call promoted words, add
   token/latency metadata, and expand the reproducible reports. The first source-free checked-in
   smoke artifact is `docs/conformance/2026-08-24-grok-code-fast-1.json`: its private captured
-  corpus replayed 3/3 programs successfully under manifest 1 / VM type system 5. Its three tasks
+  corpus replayed 6/6 programs successfully under manifest 1 / VM type system 5. Its six tasks
   and one provider are deliberately documented as insufficient to close this gate.
 
 ### Separate language/compiler research track — not a Brain convergence prerequisite

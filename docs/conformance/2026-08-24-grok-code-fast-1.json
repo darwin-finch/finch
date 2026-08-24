@@ -2,40 +2,40 @@
   "evidence": {
     "captured_at": "2026-08-24",
     "fixture": "tests/live/parity.rs::live_parity_finch_wire_programs",
-    "runtime_commit": "a45510b2",
+    "runtime_commit": "46610556",
     "capture": "FINCH_WIRE_CORPUS_PATH=<private-jsonl>",
     "replay": "finch wire-corpus audit <private-jsonl> --json",
     "source_retained_in_repository": false,
     "limitations": [
       "Only one configured provider/model was available.",
-      "The fixture contains three response/arithmetic/recursive-definition tasks.",
+      "The fixture contains six response, quoting, arithmetic, recursion, closure, and producer-fiber tasks.",
       "This is a smoke baseline, not a broad provider-compliance claim."
     ]
   },
   "report": {
     "format_version": 1,
     "counts": {
-      "total": 3,
-      "accepted": 3,
+      "total": 6,
+      "accepted": 6,
       "rejected": 0,
       "forth": 0,
-      "lisp": 3,
+      "lisp": 6,
       "diagnostics": {},
       "failure_classes": {}
     },
     "by_provider_model": {
       "grok/grok-code-fast-1": {
-        "total": 3,
-        "accepted": 3,
+        "total": 6,
+        "accepted": 6,
         "rejected": 0,
         "forth": 0,
-        "lisp": 3,
+        "lisp": 6,
         "diagnostics": {},
         "failure_classes": {}
       }
     },
     "source_versions": {
-      "manifest-1/vm-5": 3
+      "manifest-1/vm-5": 6
     }
   }
 }
