@@ -91,23 +91,27 @@ fixtures should exist, but JIT optimization remains a later performance project.
 `src/brain/shared.rs` is the strongest current persistence foundation. It owns named Brain event
 logs, environment binding, revisions, program-stack projection, subscriptions, and JSONL recovery.
 
-### `BrainRegistry`
+### Removed legacy daemon registry
 
-`src/server/brain_registry.rs` owns ephemeral daemon runs, names, status, pending question/plan
-oneshots, text logs, and final summaries. It also contains a second legacy shared-context map that
-overlaps `SharedBrainStore`.
+The ephemeral `BrainRegistry`, its `daemon_brain` task loop, global shared-context map, HTTP routes,
+Cap'n Proto operations, and frontend polling lifecycle were removed on 2026-08-24. They represented
+background tasks as a second kind of Brain and silently mixed speculative summaries across sessions.
+Future autonomous work enters the authoritative named Brain as a `BrainRun`; the old protocol is not
+a compatibility boundary.
 
 ### `BrainSession`
 
-`src/brain/mod.rs` is a client-side speculative typing worker. It owns cancellation, writes a local
-`brain_context`, and separately posts a summary to a daemon HTTP endpoint. This is a Brain run and
-client projection, not another authoritative Brain.
+`src/brain/mod.rs` is still a client-side speculative typing worker. It owns cancellation and writes
+a local `brain_context`, but no longer publishes that context into a global daemon bucket. This must
+become a speculative `BrainRun` and client projection after the shared-VM gate; it is not another
+authoritative Brain.
 
 ### Transport-specific lifecycle paths
 
-HTTP handlers, the Cap'n Proto IPC server, daemon clients, remote HTTP/WebSocket attachment, and
-in-process callers currently duplicate parts of spawn/list/get/respond/cancel behavior. They should
-be adapters over one service.
+Named-Brain HTTP/WebSocket attachment and local frontend registration currently address the one
+durable namespace. The ordinary frontend/daemon Cap'n Proto channel still lacks typed Brain event,
+cursor, lease, and effect-resume operations; those should become adapters over one service after the
+VM gate rather than reviving transport-owned spawn/list/respond lifecycles.
 
 The named-Brain HTTP compatibility handler no longer replays the accumulated program stack through
 the old Co-Forth or native Lisp evaluators. Program events and raw provider-wire responses enter one
@@ -330,16 +334,16 @@ Exit: every current state transition has one canonical event representation.
 ### B2: Unified authoritative store
 
 - Evolve `SharedBrainStore` into `BrainStore`/`BrainAggregate` storage.
-- Move daemon run state and final summaries out of parallel registry fields.
-- Delete `BrainRegistry`'s legacy shared-context map after migrating its callers.
+- Add daemon-coordinated run state and final-summary events directly to the aggregate; do not revive
+  the removed parallel registry.
 - Persist typed VM checkpoint/delta references alongside committed programs.
 
 Exit: one store reconstructs Brain and run projections after restart.
 
 ### B3: Unified run supervisor
 
-- Replace daemon `BrainEntry` tasks and client `BrainSession` ownership with `BrainRun` records plus a
-  daemon-side supervisor.
+- Replace client `BrainSession` ownership with `BrainRun` records plus a daemon-side coordinator and
+  environment-runner supervisor.
 - Model speculative typing as a cancellable run in the currently attached Brain.
 - Route questions, plans, approvals, model selection, subagents, and scheduled callbacks by IDs.
 
@@ -351,7 +355,8 @@ Exit: every background activity has identical lifecycle and ancestry semantics.
 - Version the Cap'n Proto frontend/daemon schema for typed Brain events, attachment cursors, run
   outcomes, and VM effect/resume correlation; eliminate its JSON-shaped lifecycle payloads.
 - Convert HTTP, WebSocket, Cap'n Proto, daemon client, remote client, and embedded mode into adapters.
-- Remove duplicated route/IPC spawn orchestration.
+- Keep the removed legacy route/IPC spawn orchestration absent while adding only the canonical
+  event/cursor/run service.
 
 Exit: the transport conformance suite produces equivalent events and outcomes.
 
