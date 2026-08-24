@@ -96,15 +96,19 @@ Keep that pipeline deliberately short:
 
 ```text
 source bytes -- one reader/parser pass --> frontend AST
-frontend AST -- one post-order semantic lowering --> typed stack IR
+frontend AST --> declarations + typed module interfaces
+frontend AST -- elaboration/expansion --> parametric HIR (only where required)
+elaborated AST/HIR -- instantiation + post-order lowering --> typed stack IR
 typed stack IR -- independent security verification --> executable module
 ```
 
-Shared lowering helpers enforce Lisp/Co-Forth parity without requiring a generic intermediate tree
-for its own sake. Introduce a shared HIR only when a concrete transformation genuinely needs a
-frontend-neutral structured representation before stack lowering; it must not become an excuse for
-a succession of mandatory compiler passes. Optimization may traverse retained IR and never changes
-the one-pass source contract.
+Shared lowering helpers enforce Lisp/Co-Forth parity without requiring an intermediate tree for its
+own sake. Source-defined generics and compile-time templates are the concrete feature that can
+justify one small shared parametric HIR: a concrete typed runtime instruction stream is too late to
+retain generic parameters, constraints, an unresolved reusable body, module-interface references,
+and expansion provenance. The HIR may instead be an explicitly elaborated AST if no separate node
+family is useful. It must not become an excuse for a succession of mandatory compiler passes.
+Optimization may traverse retained IR and never changes the one-pass source contract.
 
 Modules are compilation units, never textual includes. A module has an immutable identity, typed
 imports and exports, a namespace, a compiled interface, IR, source map, and content hash. Importing
@@ -291,6 +295,16 @@ The signature includes:
 - control-flow behavior such as return, throw, or suspend;
 - a capability/effect row;
 - optional determinism, allocation, and numeric-overflow properties useful to optimization.
+
+The implementation currently represents type variables in `Type::Variable`, records quantified
+names in `StackSignature::type_parameters`, and substitutes a generic word signature against the
+caller's concrete stack suffix. That is enough for polymorphic primitives and simple generic calls;
+it is not yet a complete source-defined generic/template system. Such definitions must remain in a
+parametric elaborated representation while their bodies, constraints, module references, and
+source/expansion origins are checked. Lowering may preserve a verified quantified function in IR or
+monomorphize a concrete instance when representation or optimization requires it, but the
+interpreter-facing module must never guess a template by reparsing source. Lisp and Co-Forth expose
+the same facility and lower equivalent instantiations to equivalent stack IR.
 
 ### Shared scheduled-execution substrate
 

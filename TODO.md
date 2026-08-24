@@ -38,9 +38,14 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   with structured Co-Forth AST nodes for definitions' signatures, control flow, literals, and
   calls. Then perform one post-order semantic lowering into
   the shared IR; lower syntactic sugar and bounded macro rewrites over AST nodes without serializing
-  or reparsing source. Do not add a chain of incidental HIR passes: add a shared HIR only if a
-  concrete cross-frontend transformation cannot be expressed cleanly by shared AST-to-IR lowering
-  helpers. Preserve every original and expansion span through the final IR.
+  or reparsing source. Source-defined generics and compile-time templates are now the concrete case
+  that may require one small shared parametric HIR (or equivalently elaborated AST): retain generic
+  parameters, constraints, unresolved bodies, module-interface references, and expansion origins
+  until instantiation, then emit verified stack IR. Current `Type::Variable`/`StackSignature`
+  substitution is sufficient for polymorphic core-word calls but does not by itself define a
+  general user template system. Specify and test this boundary in both frontends before claiming
+  generics/templates complete. Do not turn it into a chain of incidental HIR passes. Preserve every
+  original and expansion span through the final IR.
 - [ ] Generalize the managed JSON boundary into first-class typed records/maps. Both frontends now
   share immutable typed-map construction, key lookup/update, keys/length, serialization across the
   public runtime boundary, map-type unification, immutable heterogeneous record construction, and
