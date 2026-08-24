@@ -277,6 +277,10 @@ pub struct VmRevisionSnapshot {
 
 pub const PROGRAM_RUNTIME_ARCHIVE_VERSION: u32 = 1;
 pub const PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION: u32 = 1;
+/// Full reducible checkpoints are intentionally expensive. Retain a bounded
+/// recent lineage in memory and in the ordinary archive; an application that
+/// needs older history owns it in its durable event/checkpoint store.
+pub const MAX_RETAINED_VM_REVISIONS: usize = 256;
 /// Hard per-runtime bound for private transactional continuations. Existing
 /// approvals/yields are never silently evicted: once full, the newly
 /// suspending run is cancelled with a structured outcome so the application
@@ -290,14 +294,23 @@ pub const MAX_PENDING_TYPED_EXECUTIONS: usize = 256;
 pub type ProgramRuntimeAuthoritySink =
     Arc<dyn Fn(ProgramRuntimeAuthorityState) -> Result<()> + Send + Sync>;
 
-/// Versioned reducible state for a persistent shared VM. Authority, live host
-/// handles, pending external calls, and execute-once effect records belong to
-/// the application journal and are intentionally absent.
+/// Versioned bounded window of reducible state for a persistent shared VM.
+/// Authority, live host handles, pending external calls, execute-once effect
+/// records, and older application-owned history are intentionally absent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgramRuntimeArchive {
     pub format_version: u32,
+    /// First revision retained in this bounded checkpoint window. Archives
+    /// written before this field existed omit it and deserialize as zero;
+    /// their first snapshot remains authoritative for compatibility.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub base_revision: u64,
     pub current_revision: u64,
     pub revisions: Vec<VmRevisionSnapshot>,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Host-owned authority state persisted beside, never inside, the reducible
@@ -505,9 +518,10 @@ impl ProgramRuntime {
         Ok(runtime)
     }
 
-    /// Restore a complete reducible revision lineage. The current revision
-    /// must carry a checkpoint; historical entries may retain only metadata
-    /// when their application-owned handles were not serializable.
+    /// Restore a retained reducible revision window. The current revision must
+    /// carry a checkpoint; historical entries may retain only metadata when
+    /// their application-owned handles were not serializable. Older revisions
+    /// may live in the application event/checkpoint store before `base_revision`.
     pub fn from_archive(archive: ProgramRuntimeArchive) -> Result<Self> {
         if archive.format_version != PROGRAM_RUNTIME_ARCHIVE_VERSION {
             bail!(
@@ -525,6 +539,17 @@ impl ProgramRuntime {
             .any(|window| window[0].revision >= window[1].revision)
         {
             bail!("ProgramRuntime archive revisions are not strictly increasing");
+        }
+        let first_revision = archive
+            .revisions
+            .first()
+            .expect("a non-empty archive has a first revision")
+            .revision;
+        if archive.base_revision != 0 && archive.base_revision != first_revision {
+            bail!(
+                "ProgramRuntime archive begins at revision {first_revision}, not declared base revision {}",
+                archive.base_revision
+            );
         }
         let current = archive
             .revisions
@@ -2264,16 +2289,21 @@ impl ProgramRuntime {
         let checkpoint = working_runtime.checkpoint();
         *typed = working_runtime;
         let revision = self.revision.fetch_add(1, Ordering::AcqRel) + 1;
-        self.revision_history
+        let mut history = self
+            .revision_history
             .lock()
-            .map_err(|_| anyhow::anyhow!("revision history lock poisoned"))?
-            .push(VmRevisionSnapshot {
-                revision,
-                stack: typed.stack().to_vec(),
-                vocabulary: typed.vocabulary().keys().cloned().collect(),
-                checkpoint: checkpoint.as_ref().ok().cloned(),
-                checkpoint_diagnostic: checkpoint.err().map(|diagnostic| diagnostic.to_string()),
-            });
+            .map_err(|_| anyhow::anyhow!("revision history lock poisoned"))?;
+        history.push(VmRevisionSnapshot {
+            revision,
+            stack: typed.stack().to_vec(),
+            vocabulary: typed.vocabulary().keys().cloned().collect(),
+            checkpoint: checkpoint.as_ref().ok().cloned(),
+            checkpoint_diagnostic: checkpoint.err().map(|diagnostic| diagnostic.to_string()),
+        });
+        let excess = history.len().saturating_sub(MAX_RETAINED_VM_REVISIONS);
+        if excess != 0 {
+            history.drain(..excess);
+        }
         Ok(revision)
     }
 
@@ -2309,6 +2339,10 @@ impl ProgramRuntime {
         }
         Ok(ProgramRuntimeArchive {
             format_version: PROGRAM_RUNTIME_ARCHIVE_VERSION,
+            base_revision: revisions
+                .first()
+                .expect("revision history was checked as non-empty")
+                .revision,
             current_revision,
             revisions,
         })
@@ -9092,6 +9126,74 @@ mod tests {
         assert_eq!(history[1].revision, 1);
         assert_eq!(history[1].stack, vec![TypedValue::Int(7)]);
         assert!(history[1].checkpoint.is_some());
+    }
+
+    #[tokio::test]
+    async fn revision_history_is_a_bounded_restorable_window() {
+        let runtime = ProgramRuntime::new();
+        let commit_count = MAX_RETAINED_VM_REVISIONS as u64 + 4;
+        for _ in 0..commit_count {
+            let outcome = runtime
+                .submit(submission(
+                    ProgramLanguage::Forth,
+                    "1 drop",
+                    ExecutionEffect::Pure,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(outcome.status, ExecutionStatus::Completed);
+        }
+
+        let history = runtime.revision_history().unwrap();
+        assert_eq!(history.len(), MAX_RETAINED_VM_REVISIONS);
+        assert_eq!(history.first().unwrap().revision, 5);
+        assert_eq!(history.last().unwrap().revision, commit_count);
+        let archive = runtime.archive().unwrap();
+        assert_eq!(archive.base_revision, 5);
+        assert_eq!(archive.current_revision, commit_count);
+
+        let mut mismatched = archive.clone();
+        mismatched.base_revision = 4;
+        assert!(ProgramRuntime::from_archive(mismatched)
+            .err()
+            .expect("mismatched base revision must fail")
+            .to_string()
+            .contains("not declared base revision 4"));
+
+        let restored = ProgramRuntime::from_archive(archive.clone()).unwrap();
+        assert_eq!(restored.revision(), commit_count);
+        assert_eq!(
+            restored.revision_history().unwrap().len(),
+            MAX_RETAINED_VM_REVISIONS
+        );
+        let next = restored
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "1 drop",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next.output_revision, commit_count + 1);
+        assert_eq!(
+            restored
+                .revision_history()
+                .unwrap()
+                .first()
+                .unwrap()
+                .revision,
+            6
+        );
+
+        // Version-1 archives written before `base_revision` existed remain
+        // loadable even when their lineage began from an application-owned
+        // nonzero checkpoint.
+        let mut legacy_json = serde_json::to_value(archive).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("base_revision");
+        ProgramRuntime::from_archive(serde_json::from_value(legacy_json).unwrap()).unwrap();
     }
 
     #[tokio::test]
