@@ -934,6 +934,7 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
             *request_seq,
             approval_id,
             decision.clone(),
+            mutation,
         )?;
         return Ok(BrainSubmissionOutcome {
             accepted,
@@ -1497,7 +1498,13 @@ fn commit_named_brain_approval_decision(
     request_seq: u64,
     approval_id: &str,
     decision: serde_json::Value,
+    mutation: Option<crate::brain::store::BrainMutationReceipt>,
 ) -> anyhow::Result<crate::brain::store::BrainEvent> {
+    if let Some(receipt) = mutation.as_ref() {
+        if let Some(replayed) = store.replay_mutation(name, receipt)? {
+            return Ok(replayed);
+        }
+    }
     let snapshot = store.snapshot(name)?;
     let claimed = approvals.claim(
         snapshot.brain_id,
@@ -1526,11 +1533,15 @@ fn commit_named_brain_approval_decision(
         .iter()
         .find(|run| run.request_seq == request_seq)
         .map(|run| run.run_id);
-    let persisted = match correlated_run {
-        Some(run_id) => store.push_for_run(name, &attachment.subject, run_id, kind),
-        None => store.push(name, &attachment.subject, kind),
+    let accepted = match mutation {
+        Some(receipt) => store.push_idempotent(name, &attachment.subject, kind, receipt)
+            .map(|append| append.event),
+        None => match correlated_run {
+            Some(run_id) => store.push_for_run(name, &attachment.subject, run_id, kind),
+            None => store.push(name, &attachment.subject, kind),
+        },
     };
-    let accepted = match persisted {
+    let accepted = match accepted {
         Ok(accepted) => accepted,
         Err(error) => {
             claimed.fail(error.to_string());
@@ -2565,10 +2576,7 @@ async fn execute_remote_brain_command(
             return remote_brain_error(request_id, "conflict", "Brain mutation identity is stale");
         }
         let journals_created_identity = match &command.kind {
-            BrainRemoteCommandKind::Submit(kind) => !matches!(
-                kind,
-                crate::brain::store::BrainEventKind::ApprovalDecided { .. }
-            ),
+            BrainRemoteCommandKind::Submit(_) => true,
             BrainRemoteCommandKind::RequestRunnerHandoff { .. }
             | BrainRemoteCommandKind::CreateSchedule { .. } => true,
             _ => false,
@@ -4496,6 +4504,7 @@ mod handler_tests {
             request_seq,
             "approval-1",
             decision.clone(),
+            None,
         )
         .unwrap();
         assert!(matches!(
@@ -4607,6 +4616,7 @@ mod handler_tests {
             request_seq,
             "approval-1",
             serde_json::json!({"choice": "approve_once"}),
+            None,
         )
         .is_err());
         let claimed = approvals

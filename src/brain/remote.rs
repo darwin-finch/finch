@@ -344,7 +344,20 @@ pub struct RemoteBrainClient {
     websocket_connector: Option<tokio_tungstenite::Connector>,
     attachment: Option<BrainAttachment>,
     connection: std::sync::Arc<tokio::sync::Mutex<Option<RemoteBrainConnection>>>,
-    retryable_mutations: std::sync::Arc<tokio::sync::Mutex<HashMap<String, uuid::Uuid>>>,
+}
+
+/// Caller-owned immutable identity for one durable mutation. Persist this
+/// value before sending when retry must survive connection or process loss.
+/// Bearer and connection authority are intentionally excluded and are freshly
+/// validated on every attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainMutationHandle {
+    pub idempotency_key: uuid::Uuid,
+    pub brain_id: BrainId,
+    pub attachment_id: AttachmentId,
+    pub expected_revision: u64,
+    pub environment_generation: u64,
+    pub command_sha256: String,
 }
 
 #[derive(Clone)]
@@ -376,7 +389,7 @@ struct RemoteBrainConnection {
 
 struct RemoteBrainRequest {
     kind: crate::ipc::brain_codec::BrainRemoteCommandKind,
-    mutation_id: Option<uuid::Uuid>,
+    mutation: Option<crate::ipc::brain_codec::BrainRemoteMutation>,
     response:
         oneshot::Sender<std::result::Result<crate::ipc::brain_codec::BrainRemoteReply, String>>,
 }
@@ -401,7 +414,6 @@ impl RemoteBrainClient {
             websocket_connector: None,
             attachment: None,
             connection: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-            retryable_mutations: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -458,7 +470,6 @@ impl RemoteBrainClient {
             websocket_connector,
             attachment: None,
             connection: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-            retryable_mutations: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -1010,6 +1021,25 @@ impl RemoteBrainClient {
         }
     }
 
+    pub async fn prepare_push_mutation(&self, kind: &BrainEventKind) -> Result<BrainMutationHandle> {
+        self.prepare_mutation(&crate::ipc::brain_codec::BrainRemoteCommandKind::Submit(kind.clone())).await
+    }
+
+    /// Retry-safe submission using a caller-persisted immutable envelope.
+    pub async fn push_with_handle(
+        &self,
+        kind: BrainEventKind,
+        handle: &BrainMutationHandle,
+    ) -> Result<()> {
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+        match self.send_remote_command_with_handle(
+            BrainRemoteCommandKind::Submit(kind), Some(handle)
+        ).await? {
+            BrainRemoteReply::Submitted { .. } => Ok(()),
+            reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
+        }
+    }
+
     pub async fn acknowledge(&mut self, seq: u64) -> Result<()> {
         use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
@@ -1209,7 +1239,6 @@ impl RemoteBrainClient {
         let connection = self.connection.clone();
         tokio::spawn(async move {
             let mut next_request_id = 1_u64;
-            let mut mutation_context: Option<(BrainId, u64, u64)> = None;
             let mut pending = HashMap::<
                 u64,
                 oneshot::Sender<std::result::Result<BrainRemoteReply, String>>,
@@ -1226,26 +1255,9 @@ impl RemoteBrainClient {
                         };
                         let request_id = next_request_id;
                         next_request_id = next_request_id.checked_add(1).unwrap_or(1);
-                        let mutation = match request.mutation_id {
-                            Some(idempotency_key) => {
-                                let Some((brain_id, expected_revision, environment_generation)) = mutation_context else {
-                                    let _ = request.response.send(Err(
-                                        "remote Brain snapshot has not established mutation preconditions".into(),
-                                    ));
-                                    continue;
-                                };
-                                Some(crate::ipc::brain_codec::BrainRemoteMutation {
-                                    brain_id,
-                                    expected_revision,
-                                    environment_generation,
-                                    idempotency_key,
-                                })
-                            }
-                            None => None,
-                        };
                         let envelope = BrainRemoteEnvelope::Command(BrainRemoteCommand {
                             request_id,
-                            mutation,
+                            mutation: request.mutation,
                             kind: request.kind,
                         });
                         let encoded = match crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope) {
@@ -1274,22 +1286,6 @@ impl RemoteBrainClient {
                             tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
                                 match crate::ipc::brain_codec::decode_brain_remote_envelope(&bytes) {
                                     Ok(BrainRemoteEnvelope::Projection(message)) => {
-                                        match &message {
-                                            BrainWireMessage::Snapshot { brain } => {
-                                                mutation_context = Some((
-                                                    brain.brain_id,
-                                                    brain.revision,
-                                                    brain.environment.generation,
-                                                ));
-                                            }
-                                            BrainWireMessage::Event { event } => {
-                                                mutation_context = Some((
-                                                    event.brain_id,
-                                                    event.seq,
-                                                    event.environment_generation,
-                                                ));
-                                            }
-                                        }
                                         if event_tx.send(message).is_err() {
                                             break;
                                         }
@@ -1341,6 +1337,39 @@ impl RemoteBrainClient {
         &self,
         kind: crate::ipc::brain_codec::BrainRemoteCommandKind,
     ) -> Result<crate::ipc::brain_codec::BrainRemoteReply> {
+        let durable = !matches!(
+            &kind,
+            crate::ipc::brain_codec::BrainRemoteCommandKind::Acknowledge(_)
+                | crate::ipc::brain_codec::BrainRemoteCommandKind::Detach
+        );
+        let handle = if durable { Some(self.prepare_mutation(&kind).await?) } else { None };
+        self.send_remote_command_with_handle(kind, handle.as_ref()).await
+    }
+
+    async fn prepare_mutation(
+        &self,
+        kind: &crate::ipc::brain_codec::BrainRemoteCommandKind,
+    ) -> Result<BrainMutationHandle> {
+        let attachment = self.attachment.as_ref()
+            .context("client is not attached to a Brain")?;
+        // A fresh canonical snapshot avoids deriving the next precondition
+        // from asynchronously delivered projection ordering.
+        let snapshot = self.snapshot().await?;
+        Ok(BrainMutationHandle {
+            idempotency_key: uuid::Uuid::new_v4(),
+            brain_id: snapshot.brain_id,
+            attachment_id: attachment.attachment_id,
+            expected_revision: snapshot.revision,
+            environment_generation: snapshot.environment.generation,
+            command_sha256: crate::ipc::brain_codec::brain_remote_command_fingerprint(kind)?,
+        })
+    }
+
+    async fn send_remote_command_with_handle(
+        &self,
+        kind: crate::ipc::brain_codec::BrainRemoteCommandKind,
+        handle: Option<&BrainMutationHandle>,
+    ) -> Result<crate::ipc::brain_codec::BrainRemoteReply> {
         let connection = self
             .connection
             .lock()
@@ -1352,35 +1381,36 @@ impl RemoteBrainClient {
             crate::ipc::brain_codec::BrainRemoteCommandKind::Acknowledge(_)
                 | crate::ipc::brain_codec::BrainRemoteCommandKind::Detach
         );
-        let fingerprint = durable
-            .then(|| crate::ipc::brain_codec::brain_remote_command_fingerprint(&kind))
-            .transpose()?;
-        let mutation_id = match &fingerprint {
-            Some(fingerprint) => Some(
-                self.retryable_mutations
-                    .lock()
-                    .await
-                    .remove(fingerprint)
-                    .unwrap_or_else(uuid::Uuid::new_v4),
-            ),
+        anyhow::ensure!(durable == handle.is_some(),
+            "durable and connection-lifecycle commands require distinct retry semantics");
+        let mutation = match handle {
+            Some(handle) => {
+                let attachment = self.attachment.as_ref()
+                    .context("client is not attached to a Brain")?;
+                anyhow::ensure!(handle.attachment_id == attachment.attachment_id,
+                    "Brain mutation handle belongs to a different attachment");
+                anyhow::ensure!(handle.command_sha256
+                    == crate::ipc::brain_codec::brain_remote_command_fingerprint(&kind)?,
+                    "Brain mutation handle was reused with a different command");
+                Some(crate::ipc::brain_codec::BrainRemoteMutation {
+                    brain_id: handle.brain_id,
+                    expected_revision: handle.expected_revision,
+                    environment_generation: handle.environment_generation,
+                    idempotency_key: handle.idempotency_key,
+                })
+            }
             None => None,
         };
         let (response_tx, response_rx) = oneshot::channel();
         if connection
             .commands
             .send(RemoteBrainRequest {
-                mutation_id,
+                mutation,
                 kind,
                 response: response_tx,
             })
             .is_err()
         {
-            if let (Some(fingerprint), Some(mutation_id)) = (fingerprint.as_ref(), mutation_id) {
-                self.retryable_mutations
-                    .lock()
-                    .await
-                    .insert(fingerprint.clone(), mutation_id);
-            }
             anyhow::bail!("remote Brain connection closed");
         }
         let response = match response_rx.await {
@@ -1389,14 +1419,6 @@ impl RemoteBrainClient {
                 "remote Brain connection closed before replying"
             )),
         };
-        if response.is_err() {
-            if let (Some(fingerprint), Some(mutation_id)) = (fingerprint.as_ref(), mutation_id) {
-                self.retryable_mutations
-                    .lock()
-                    .await
-                    .insert(fingerprint.clone(), mutation_id);
-            }
-        }
         response
     }
 
@@ -2024,6 +2046,27 @@ mod tests {
             15 * 60 * 1_000,
             now,
         ));
+    }
+
+    #[test]
+    fn mutation_handle_round_trips_for_process_restart_and_distinguishes_identical_calls() {
+        let base = BrainMutationHandle {
+            idempotency_key: uuid::Uuid::new_v4(),
+            brain_id: BrainId(uuid::Uuid::new_v4()),
+            attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            expected_revision: 17,
+            environment_generation: 4,
+            command_sha256: "same-command".into(),
+        };
+        let restored: BrainMutationHandle =
+            serde_json::from_str(&serde_json::to_string(&base).unwrap()).unwrap();
+        assert_eq!(restored, base);
+        let concurrent = BrainMutationHandle {
+            idempotency_key: uuid::Uuid::new_v4(),
+            ..base.clone()
+        };
+        assert_ne!(concurrent.idempotency_key, base.idempotency_key);
+        assert_eq!(concurrent.command_sha256, base.command_sha256);
     }
 
     #[test]
@@ -3576,8 +3619,19 @@ mod tests {
 
         let mut first_events = client.watch().await.unwrap();
         assert_eq!(first_events.recv().await, Some(BrainWireMessage::Event { event: projected.clone() }));
+        let kind = crate::ipc::brain_codec::BrainRemoteCommandKind::Submit(
+            BrainEventKind::Prompt { text: "once".into() }
+        );
+        let handle = BrainMutationHandle {
+            idempotency_key: uuid::Uuid::new_v4(),
+            brain_id,
+            attachment_id: attachment.attachment_id,
+            expected_revision: projected.seq,
+            environment_generation: projected.environment_generation,
+            command_sha256: crate::ipc::brain_codec::brain_remote_command_fingerprint(&kind).unwrap(),
+        };
         assert!(client
-            .push(BrainEventKind::Prompt { text: "once".into() })
+            .send_remote_command_with_handle(kind.clone(), Some(&handle))
             .await
             .is_err());
         while client.connection.lock().await.is_some() {
@@ -3587,7 +3641,7 @@ mod tests {
         let mut second_events = client.watch().await.unwrap();
         assert!(second_events.recv().await.is_some());
         client
-            .push(BrainEventKind::Prompt { text: "once".into() })
+            .send_remote_command_with_handle(kind, Some(&handle))
             .await
             .unwrap();
         fixture.await.unwrap();

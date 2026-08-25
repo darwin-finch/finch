@@ -2418,6 +2418,30 @@ impl BrainStore {
         self.push_idempotent_locked(name, state, sender, kind, receipt)
     }
 
+    /// Resolve an exact durable replay without applying a new transition.
+    /// Authorization remains the caller's responsibility on every attempt.
+    pub fn replay_mutation(
+        &self,
+        name: &str,
+        receipt: &BrainMutationReceipt,
+    ) -> Result<Option<BrainEvent>> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brains = self.brains.read().expect("shared brain lock poisoned");
+        let state = brains.get(name).context("Brain was removed concurrently")?;
+        let Some(event) = state.events.iter().find(|event| {
+            event.mutation.as_ref().is_some_and(|recorded| {
+                recorded.attachment_id == receipt.attachment_id
+                    && recorded.mutation_id == receipt.mutation_id
+            })
+        }) else {
+            return Ok(None);
+        };
+        anyhow::ensure!(event.mutation.as_ref() == Some(receipt),
+            "Brain mutation idempotency key was reused with a different command or precondition");
+        Ok(Some(event.clone()))
+    }
+
     fn push_idempotent_locked(
         &self,
         name: &str,
