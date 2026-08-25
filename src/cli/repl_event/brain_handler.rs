@@ -68,12 +68,20 @@ impl EventLoop {
         let event_tx = self.event_tx.clone();
         let subject = self.participant_subject.clone();
         let environment = snapshot.environment;
+        let epoch = self
+            .runner_renewal_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let renewal_epoch = self.runner_renewal_epoch.clone();
         tokio::task::spawn_local(async move {
             let mut had_lease = initial_had_lease;
             loop {
                 tokio::select! {
                     _ = event_tx.closed() => break,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+                }
+                if renewal_epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+                    break;
                 }
                 match ipc
                     .brain_acquire_runner(&snapshot.name, &subject, &environment, lease_id, 30_000)
@@ -86,7 +94,9 @@ impl EventLoop {
                         // also repairs a dropped Cap'n Proto callback without
                         // pretending that lease ownership alone means the
                         // runner is reachable.
-                        let _ = event_tx.send(ReplEvent::HomeRunnerLeaseStatus {
+                        let _ = event_tx.send(ReplEvent::RunnerLeaseStatus {
+                            brain: snapshot.name.clone(),
+                            epoch,
                             lease_id: Some(lease.lease_id),
                             detail: if had_lease {
                                 "lease renewed".into()
@@ -112,7 +122,9 @@ impl EventLoop {
                         };
                         let handed_off = inspected_handoff == Some(true);
                         if had_lease {
-                            let _ = event_tx.send(ReplEvent::HomeRunnerLeaseStatus {
+                            let _ = event_tx.send(ReplEvent::RunnerLeaseStatus {
+                                brain: snapshot.name.clone(),
+                                epoch,
                                 lease_id: None,
                                 detail: if handed_off {
                                     "runner lease handed off to another frontend".into()
@@ -202,12 +214,17 @@ impl EventLoop {
     /// established at startup. The daemon still expires crashed runners, but
     /// an ordinary `/quit` must make callback availability exact immediately.
     async fn release_home_brain_presence(&mut self) {
-        if let (Some(ipc), Some(lease_id)) =
-            (self.ipc_client.as_ref(), self.home_runner_lease_id.take())
+        self.runner_renewal_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let (Some(ipc), Some(brain), Some(lease_id)) = (
+            self.ipc_client.as_ref(),
+            self.runner_brain.take(),
+            self.home_runner_lease_id.take(),
+        )
         {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                ipc.brain_release_runner(&self.session_label, lease_id),
+                ipc.brain_release_runner(&brain, lease_id),
             )
             .await
             {

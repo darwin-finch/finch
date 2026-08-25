@@ -180,10 +180,13 @@ pub enum ReplEvent {
     RemoteBrainDisconnected {
         target: String,
     },
-    /// The expiring lease for this console's home Brain was renewed, lost, or
+    /// The expiring lease served by this frontend was renewed, lost, or
     /// reacquired. A renewed lease is not considered active until the event
-    /// loop has also registered its Cap'n Proto runner callback.
-    HomeRunnerLeaseStatus {
+    /// loop has also registered its Cap'n Proto runner callback. `epoch`
+    /// prevents a stopped home-renewal task from overwriting a later handoff.
+    RunnerLeaseStatus {
+        brain: String,
+        epoch: u64,
         lease_id: Option<crate::brain::shared::RunnerLeaseId>,
         detail: String,
     },

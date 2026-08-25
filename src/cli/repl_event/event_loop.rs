@@ -296,6 +296,11 @@ pub struct EventLoop {
     /// home Brain. The UI never infers runner status from local process role.
     home_runner_lease_active: bool,
     home_runner_lease_id: Option<crate::brain::shared::RunnerLeaseId>,
+    /// Exact Brain currently served by this frontend's ProgramRuntime. This
+    /// starts as the home Brain but may change through an addressed handoff.
+    runner_brain: Option<String>,
+    /// Invalidates background renewal tasks when runner ownership moves.
+    runner_renewal_epoch: Arc<std::sync::atomic::AtomicU64>,
 
     /// Last runner-registration failure shown to the user. Lease renewal is
     /// periodic, so identical transport failures must not spam scrollback.
@@ -1014,6 +1019,8 @@ impl EventLoop {
             home_brain: None,
             home_runner_lease_active: false,
             home_runner_lease_id: None,
+            runner_brain: None,
+            runner_renewal_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_home_runner_error: None,
             daemon_base_url,
             llm_tx,
@@ -1059,6 +1066,9 @@ impl EventLoop {
             .and_then(|state| state.as_ref().ok())
             .copied();
         self.home_runner_lease_active = self.home_runner_lease_id.is_some();
+        self.runner_brain = self
+            .home_runner_lease_active
+            .then(|| self.session_label.clone());
         let home_runner_error = home_runner_state
             .as_ref()
             .and_then(|state| state.as_ref().err())
@@ -1279,7 +1289,7 @@ impl EventLoop {
                         ReplEvent::RemoteBrainMessage { .. } => "RemoteBrainMessage",
                         ReplEvent::RemoteBrainError { .. } => "RemoteBrainError",
                         ReplEvent::RemoteBrainDisconnected { .. } => "RemoteBrainDisconnected",
-                        ReplEvent::HomeRunnerLeaseStatus { .. } => "HomeRunnerLeaseStatus",
+                        ReplEvent::RunnerLeaseStatus { .. } => "RunnerLeaseStatus",
                         ReplEvent::NamedBrainProgramRequested(_) => "NamedBrainProgramRequested",
                         ReplEvent::NamedBrainTurnRequested(_) => "NamedBrainTurnRequested",
                     };
@@ -3237,11 +3247,23 @@ Rules:\n\
                     self.render_tui().await?;
                 }
             }
-            ReplEvent::HomeRunnerLeaseStatus { lease_id, detail } => {
+            ReplEvent::RunnerLeaseStatus {
+                brain,
+                epoch,
+                lease_id,
+                detail,
+            } => {
+                if epoch
+                    != self
+                        .runner_renewal_epoch
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Ok(());
+                }
                 let registration = match (lease_id, self.ipc_client.as_ref()) {
                     (Some(lease_id), Some(ipc)) => match ipc
                         .register_brain_runner(
-                            &self.session_label,
+                            &brain,
                             lease_id,
                             self.event_tx.clone(),
                         )
@@ -3264,6 +3286,7 @@ Rules:\n\
                 let active = registration.is_ok();
                 self.home_runner_lease_active = active;
                 self.home_runner_lease_id = if active { lease_id } else { None };
+                self.runner_brain = active.then_some(brain.clone());
                 let registration_error = registration.err();
                 if self.active_remote_brain.is_none() {
                     if self.home_brain.is_some() {
@@ -3272,7 +3295,7 @@ Rules:\n\
                         self.status_bar.update_line(
                             crate::cli::status_bar::StatusLineType::SessionLabel,
                             if active {
-                                format!("◆ brain: {} · runner", self.session_label)
+                                format!("◆ brain: {} · runner", brain)
                             } else {
                                 format!("◆ brain: {} · home · no runner lease", self.session_label)
                             },
@@ -3315,7 +3338,9 @@ Rules:\n\
     }
 
     fn dispatch_named_brain_program(&self, request: crate::server::RunnerProgramRequest) {
-        if request.brain != self.session_label || !self.home_runner_lease_active {
+        if self.runner_brain.as_deref() != Some(request.brain.as_str())
+            || !self.home_runner_lease_active
+        {
             let _ = request.response_tx.send(Err(format!(
                 "frontend does not hold the runner lease for named Brain '{}'",
                 request.brain
@@ -3389,7 +3414,9 @@ Rules:\n\
         &mut self,
         request: crate::server::RunnerTurnRequest,
     ) -> Result<()> {
-        if request.brain != self.session_label || !self.home_runner_lease_active {
+        if self.runner_brain.as_deref() != Some(request.brain.as_str())
+            || !self.home_runner_lease_active
+        {
             let _ = request.response_tx.send(Err(crate::server::RunnerTurnError {
                 message: format!(
                     "frontend does not hold the runner lease for named Brain '{}'",
@@ -4259,7 +4286,9 @@ Rules:\n\
             .attachment()
             .map(|attachment| format!("{:?}", attachment.role).to_lowercase())
             .unwrap_or_else(|| "detached".into());
-        let role = if self.selected_brain_is_home() && self.home_runner_lease_active {
+        let role = if self.home_runner_lease_active
+            && self.runner_brain.as_deref() == Some(client.target.brain.as_str())
+        {
             format!("runner · {role}")
         } else {
             format!(
