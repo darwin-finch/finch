@@ -76,10 +76,12 @@ impl IpcClient {
             let _ = rpc_system.await;
         });
 
-        Ok(Self {
+        let client = Self {
             client,
             _rpc_handle: std::rc::Rc::new(handle),
-        })
+        };
+        client.verify_protocol_compatibility().await?;
+        Ok(client)
     }
 
     // -----------------------------------------------------------------------
@@ -560,7 +562,15 @@ impl IpcClient {
     pub async fn ping(&self) -> Result<String> {
         let req = self.client.ping_request();
         let reply = req.send().promise.await?;
-        Ok(reply.get()?.get_version()?.to_str()?.to_string())
+        let response = reply.get()?;
+        ensure_compatible_protocol(response.get_protocol_version())?;
+        Ok(response.get_version()?.to_str()?.to_string())
+    }
+
+    async fn verify_protocol_compatibility(&self) -> Result<()> {
+        let req = self.client.ping_request();
+        let reply = req.send().promise.await?;
+        ensure_compatible_protocol(reply.get()?.get_protocol_version())
     }
 
     /// Register this frontend as the callback for its current named-Brain
@@ -658,6 +668,15 @@ fn map_runner_registration_error(error: capnp::Error) -> anyhow::Error {
     } else {
         anyhow::Error::new(error)
     }
+}
+
+fn ensure_compatible_protocol(protocol_version: u32) -> Result<()> {
+    anyhow::ensure!(
+        protocol_version == crate::ipc::IPC_PROTOCOL_VERSION,
+        "the running Finch daemon uses IPC protocol {protocol_version}, but this frontend requires {}; restart the daemon with the rebuilt Finch binary",
+        crate::ipc::IPC_PROTOCOL_VERSION,
+    );
+    Ok(())
 }
 
 struct BrainRunnerImpl {
@@ -1484,6 +1503,15 @@ fn read_query_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipc_protocol_handshake_accepts_only_the_current_generation() {
+        ensure_compatible_protocol(crate::ipc::IPC_PROTOCOL_VERSION).unwrap();
+
+        let error = ensure_compatible_protocol(0).unwrap_err().to_string();
+        assert!(error.contains("restart the daemon"));
+        assert!(error.contains("protocol 0"));
+    }
 
     struct BlockingBrainRunner {
         started: std::cell::RefCell<

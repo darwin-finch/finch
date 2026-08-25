@@ -103,6 +103,7 @@ pub struct Repl {
     daemon_client: Option<Arc<crate::client::DaemonClient>>,
     // IPC client — Cap'n Proto channel to the daemon (preferred over daemon_client)
     ipc_client: Option<crate::ipc::IpcClient>,
+    daemon_ipc_error: Option<String>,
     // Teacher session with context optimization
     teacher_session: Arc<RwLock<TeacherSession>>,
     // Provider management (for runtime switching)
@@ -681,6 +682,7 @@ impl Repl {
             claude_client,
             daemon_client,
             ipc_client: None, // Set after construction via set_ipc_client()
+            daemon_ipc_error: None,
             teacher_session,
             available_providers,
             available_teachers,
@@ -739,6 +741,15 @@ impl Repl {
     /// Set the IPC client for daemon communication (must be called inside a LocalSet).
     pub fn set_ipc_client(&mut self, client: crate::ipc::IpcClient) {
         self.ipc_client = Some(client);
+        self.daemon_ipc_error = None;
+    }
+
+    /// Retain a daemon IPC bootstrap failure until the TUI owns the screen, so
+    /// it appears once as an actionable startup diagnostic rather than being
+    /// cleared with pre-TUI process output.
+    pub fn set_daemon_ipc_error(&mut self, error: impl Into<String>) {
+        self.ipc_client = None;
+        self.daemon_ipc_error = Some(error.into());
     }
 
     /// Try to connect to daemon (non-blocking, returns None if not available)
@@ -1747,6 +1758,7 @@ impl Repl {
             Arc::clone(&self.local_generator),
             Arc::clone(&self.tokenizer),
             self.ipc_client.take(),
+            self.daemon_ipc_error.take(),
             mode,
             self.memory_system.clone(),
             self.session_label.clone(),

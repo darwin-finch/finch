@@ -1589,6 +1589,9 @@ impl finch_daemon::Server for FinchDaemonImpl {
         mut results: finch_daemon::PingResults,
     ) -> Promise<(), capnp::Error> {
         results.get().set_version(env!("CARGO_PKG_VERSION"));
+        results
+            .get()
+            .set_protocol_version(crate::ipc::IPC_PROTOCOL_VERSION);
         Promise::ok(())
     }
 }

@@ -26,3 +26,9 @@ pub use client::IpcClient;
 pub use events::{EventBus, QueuedEvent};
 pub use server::start_ipc_server;
 pub use transport::DAEMON_SOCK_PATH;
+
+/// Compatibility generation for the frontend/daemon Cap'n Proto contract.
+/// Increment this whenever a change requires both processes to come from the
+/// same build generation. Older daemons leave the added ping field at zero,
+/// so new frontends fail before acquiring Brain identities or callbacks.
+pub const IPC_PROTOCOL_VERSION: u32 = 1;

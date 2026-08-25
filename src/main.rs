@@ -1187,10 +1187,13 @@ async fn main() -> Result<()> {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            // Try IPC connection to the daemon socket (non-blocking).
-            // If it fails (daemon not running), we just skip it.
-            if let Ok(ipc) = finch::ipc::IpcClient::connect().await {
-                repl.set_ipc_client(ipc);
+            // Establish and version-check the IPC channel before the TUI
+            // creates any Brain attachment or runner identity. Preserve a
+            // failure for the startup projection instead of silently entering
+            // a half-connected Brain state.
+            match finch::ipc::IpcClient::connect().await {
+                Ok(ipc) => repl.set_ipc_client(ipc),
+                Err(error) => repl.set_daemon_ipc_error(error.to_string()),
             }
             repl.run_event_loop(args.initial_prompt).await
         })

@@ -222,6 +222,7 @@ pub struct EventLoop {
     /// IPC client — Cap'n Proto channel to the daemon.
     /// Must live inside a tokio LocalSet (capnp-rpc !Send).
     ipc_client: Option<crate::ipc::IpcClient>,
+    daemon_ipc_error: Option<String>,
 
     /// REPL mode (Normal, Planning, Executing)
     mode: Arc<RwLock<ReplMode>>,
@@ -1087,6 +1088,7 @@ impl EventLoop {
         local_generator: Arc<RwLock<LocalGenerator>>,
         tokenizer: Arc<TextTokenizer>,
         ipc_client: Option<crate::ipc::IpcClient>,
+        daemon_ipc_error: Option<String>,
         mode: Arc<RwLock<ReplMode>>,
         memory_system: Option<Arc<crate::memory::MemorySystem>>,
         session_label: String,
@@ -1246,6 +1248,7 @@ impl EventLoop {
             pending_approvals: Arc::new(RwLock::new(std::collections::HashMap::new())),
             pending_vm_approval: None,
             ipc_client,
+            daemon_ipc_error,
             mode,
             plan_content,
             memtree_console,
@@ -1358,6 +1361,10 @@ impl EventLoop {
             &cwd,
             &self.session_label,
         ));
+        if let Some(error) = self.daemon_ipc_error.take() {
+            self.output_manager
+                .write_info(format!("Brain daemon unavailable: {error}"));
+        }
         if let Some(error) = home_runner_error {
             self.output_manager.write_info(format!(
                 "{}: runner unavailable: {}",

@@ -1418,7 +1418,7 @@ interface FinchDaemon {
                   receiver    :StreamReceiver) -> ();
 
   # Health.
-  ping @2 () -> (version :Text);
+  ping @2 () -> (version :Text, protocolVersion :UInt32);
 
   # Co-Forth: send a program, get back the stack.
   # The request IS the sentence.  The response IS the result.
