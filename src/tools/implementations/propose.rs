@@ -31,14 +31,17 @@ pub enum ProposalDecision {
 /// Read a reserved Finch action directive without interpreting ordinary
 /// comments (including Git's instructional comments).
 pub fn parse_proposal_decision(content: &str) -> ProposalDecision {
-    let action = content.lines().find_map(|line| {
-        let trimmed = line.trim();
-        let directive = trimmed
-            .strip_prefix("# finch:")
-            .or_else(|| trimmed.strip_prefix("\\ finch:"))
-            .or_else(|| trimmed.strip_prefix(";; finch:"))?;
-        directive.trim().strip_prefix("action=")
-    });
+    let action = content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let directive = trimmed
+                .strip_prefix("# finch:")
+                .or_else(|| trimmed.strip_prefix("\\ finch:"))
+                .or_else(|| trimmed.strip_prefix(";; finch:"))?;
+            directive.trim().strip_prefix("action=")
+        })
+        .last();
     match action {
         Some("cancel") => ProposalDecision::Cancel,
         Some("chat") => ProposalDecision::Chat {
@@ -340,6 +343,10 @@ fn build_artifact(description: &str, code: &str, comment_prefix: &str, executabl
     } else {
         String::new()
     };
+    out.push_str(comment_prefix);
+    out.push_str(" Finch proposal: save and quit to accept; set action=cancel to reject or action=chat to request changes.\n");
+    out.push_str(comment_prefix);
+    out.push_str(" finch: action=execute\n");
     for line in description.lines() {
         out.push_str(comment_prefix);
         out.push(' ');
@@ -393,7 +400,10 @@ pub async fn propose_forth_in_editor(description: &str, code: &str) -> Result<Op
         return Ok(Some(code.to_string()));
     }
 
-    let header: String = description.lines().map(|l| format!("\\ {l}\n")).collect();
+    let mut header = String::from(
+        "\\ Finch proposal: save and quit to accept; set action=cancel to reject or action=chat to request changes.\n\\ finch: action=execute\n",
+    );
+    header.extend(description.lines().map(|line| format!("\\ {line}\n")));
     let content = format!("{header}\n{code}");
     let tui_mode = crate::is_tui_active();
 
@@ -538,6 +548,24 @@ mod tests {
     }
 
     #[test]
+    fn last_proposal_directive_is_the_users_final_decision() {
+        assert_eq!(
+            parse_proposal_decision(
+                "# finch: action=execute\necho dangerous\n# finch: action=cancel\n"
+            ),
+            ProposalDecision::Cancel
+        );
+    }
+
+    #[test]
+    fn generated_shell_proposal_exposes_all_review_actions() {
+        let artifact = build_script("Inspect files", "find . -type f");
+        assert!(artifact.contains("# finch: action=execute\n"));
+        assert!(artifact.contains("action=cancel to reject"));
+        assert!(artifact.contains("action=chat to request changes"));
+    }
+
+    #[test]
     fn ordinary_git_comments_do_not_control_proposal() {
         assert!(matches!(
             parse_proposal_decision("# Please enter the commit message\necho hi"),
@@ -548,7 +576,9 @@ mod tests {
     #[test]
     fn lisp_artifacts_receive_lisp_comment_headers() {
         let artifact = build_artifact("Explain intent", "(say \"ok\")", ";;", false);
-        assert!(artifact.starts_with(";; Explain intent\n"));
+        assert!(artifact.starts_with(";; Finch proposal:"));
+        assert!(artifact.contains(";; finch: action=execute\n"));
+        assert!(artifact.contains(";; Explain intent\n"));
         assert!(!artifact.starts_with("#!/bin/bash"));
     }
 
