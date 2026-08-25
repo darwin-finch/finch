@@ -615,7 +615,8 @@ impl RemoteBrainClient {
     pub async fn revoke_delegated_credential(&self, credential: &str) -> Result<()> {
         #[derive(Serialize)]
         struct Revoke<'a> {
-            credential: &'a str,
+            credential: Option<&'a str>,
+            invitation: Option<&'a str>,
         }
 
         let target = super::credential::decode_unverified_credential_claims(credential)?;
@@ -633,12 +634,56 @@ impl RemoteBrainClient {
         self.http
             .delete(self.target.delegated_credential_url(target.credential_id))
             .bearer_auth(authorization)
-            .json(&Revoke { credential })
+            .json(&Revoke {
+                credential: Some(credential),
+                invitation: None,
+            })
             .send()
             .await
             .context("could not reach Brain credential revocation endpoint")?
             .error_for_status()
             .context("Brain credential revocation rejected")?;
+        Ok(())
+    }
+
+    /// Revoke a signed invitation descended from this controller. The stable
+    /// invitation ID is also the redeemed credential ID, so the same action
+    /// works before redemption and invalidates an already redeemed bearer.
+    pub async fn revoke_delegated_invitation(&self, invitation: &str) -> Result<()> {
+        #[derive(Serialize)]
+        struct Revoke<'a> {
+            credential: Option<&'a str>,
+            invitation: Option<&'a str>,
+        }
+
+        let (target, _) =
+            super::credential::verify_portable_invitation(invitation, unix_epoch_millis())?;
+        let (authorization, delegator) = self.delegation_authorization().await?;
+        let delegator = delegator.context(
+            "delegated revocation requires a scoped controlling credential",
+        )?;
+        anyhow::ensure!(
+            target.brain_id == delegator.brain_id
+                && target.brain == delegator.brain
+                && target.environment_generation == delegator.environment_generation
+                && target.delegation_chain.contains(&delegator.credential_id),
+            "a controlling credential may revoke only its own descendants"
+        );
+        self.http
+            .delete(
+                self.target
+                    .delegated_credential_url(target.invitation_id),
+            )
+            .bearer_auth(authorization)
+            .json(&Revoke {
+                credential: None,
+                invitation: Some(invitation),
+            })
+            .send()
+            .await
+            .context("could not reach Brain invitation revocation endpoint")?
+            .error_for_status()
+            .context("Brain invitation revocation rejected")?;
         Ok(())
     }
 
@@ -2339,7 +2384,7 @@ mod tests {
             .await
             .unwrap();
         assert!(authority.verify(&child_token, unix_epoch_millis()).is_err());
-        let (_, invitation) = controller
+        let (invitation_token, invitation) = controller
             .issue_invitation_with_scopes(
                 AttachmentRole::Observer,
                 Some(default_participant_scopes(AttachmentRole::Observer)),
@@ -2357,6 +2402,48 @@ mod tests {
             default_participant_scopes(AttachmentRole::Observer)
         );
         assert!(default_invitation.expires_ms - default_invitation.issued_ms <= 10_000);
+
+        let (before_redemption, _) = controller
+            .issue_invitation(AttachmentRole::Observer, Some(10_000))
+            .await
+            .unwrap();
+        controller
+            .revoke_delegated_invitation(&before_redemption)
+            .await
+            .unwrap();
+        let revoked_before =
+            RemoteBrainClient::new_with_invitation(target.clone(), before_redemption).unwrap();
+        assert!(revoked_before
+            .redeem_invitation("revoked-before")
+            .await
+            .is_err());
+
+        let (after_redemption, _) = controller
+            .issue_invitation(AttachmentRole::Observer, Some(10_000))
+            .await
+            .unwrap();
+        let redeemed =
+            RemoteBrainClient::new_with_invitation(target.clone(), after_redemption.clone())
+                .unwrap();
+        redeemed
+            .redeem_invitation("revoked-after")
+            .await
+            .unwrap();
+        let redeemed_token = redeemed
+            .credential
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .token
+            .clone();
+        controller
+            .revoke_delegated_invitation(&after_redemption)
+            .await
+            .unwrap();
+        assert!(authority
+            .verify(&redeemed_token, unix_epoch_millis())
+            .is_err());
 
         let control = [BrainCredentialScope::BrainControl]
             .into_iter()
@@ -2400,6 +2487,22 @@ mod tests {
                 .status(),
             reqwest::StatusCode::FORBIDDEN
         );
+        assert_eq!(
+            sibling
+                .http
+                .delete(
+                    sibling
+                        .target
+                        .delegated_credential_url(invitation.invitation_id),
+                )
+                .bearer_auth(&sibling_token)
+                .json(&serde_json::json!({"invitation": invitation_token}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
         let parent_token = controller
             .credential
             .lock()
@@ -2412,8 +2515,31 @@ mod tests {
             sibling
                 .http
                 .delete(sibling.target.delegated_credential_url(parent.credential_id))
-                .bearer_auth(sibling_token)
+                .bearer_auth(&sibling_token)
                 .json(&serde_json::json!({"credential": parent_token}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        let controller_invitation_claims =
+            super::super::credential::verify_portable_invitation(
+                &controller_invitation,
+                unix_epoch_millis(),
+            )
+            .unwrap()
+            .0;
+        assert_eq!(
+            sibling
+                .http
+                .delete(
+                    sibling
+                        .target
+                        .delegated_credential_url(controller_invitation_claims.invitation_id),
+                )
+                .bearer_auth(&sibling_token)
+                .json(&serde_json::json!({"invitation": controller_invitation.clone()}))
                 .send()
                 .await
                 .unwrap()

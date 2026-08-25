@@ -455,6 +455,18 @@ impl BrainCredentialAuthority {
         Ok(claims)
     }
 
+    /// Verify a signed invitation as stable descendant proof even after it
+    /// has been redeemed. This creates no authority and deliberately skips
+    /// only the single-use redemption-state check performed by
+    /// [`Self::inspect_invitation`].
+    pub(crate) fn verify_invitation_descendant_proof(
+        &self,
+        token: &str,
+        now_ms: u64,
+    ) -> Result<BrainInvitationClaims> {
+        self.decode_invitation(token, now_ms)
+    }
+
     /// Atomically bind one invitation to a participant and mint the ordinary
     /// credential used by every later attachment operation. A retry by the
     /// same subject returns that exact credential (including after restart),
@@ -647,11 +659,18 @@ impl BrainCredentialAuthority {
         if public_key != self.invitation_signer.public_key_bytes() {
             anyhow::bail!("Brain invitation was issued by a different node identity");
         }
+        // The portable verifier tolerates bounded endpoint clock skew. The
+        // issuing authority owns this clock, so redemption and inspection
+        // retain the invitation's exact validity interval.
+        if now_ms < claims.issued_ms || now_ms >= claims.expires_ms {
+            anyhow::bail!("Brain invitation is outside its validity interval");
+        }
         let revoked = self
             .revoked
             .lock()
             .expect("Brain credential revocation lock poisoned");
-        if claims
+        if revoked.contains(&claims.invitation_id)
+            || claims
             .delegation_chain
             .iter()
             .any(|ancestor| revoked.contains(ancestor))
