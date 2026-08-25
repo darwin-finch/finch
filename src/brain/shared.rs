@@ -680,7 +680,7 @@ impl SharedBrainStore {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
         let brains = self.brains.read().expect("shared brain lock poisoned");
-        let state = brains.get(name).expect("brain loaded above");
+        let state = brains.get(name).context("Brain was removed concurrently")?;
         Ok(BrainSnapshot {
             brain_id: state.brain_id,
             name: name.to_string(),
@@ -742,7 +742,7 @@ impl SharedBrainStore {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
-        let state = brains.get_mut(name).expect("brain loaded above");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         let current = state
             .runs
             .get(&run_id)
@@ -788,7 +788,7 @@ impl SharedBrainStore {
         let now = unix_millis();
         let expires_ms = now.saturating_add(ttl_ms);
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
-        let state = brains.get_mut(name).expect("brain loaded above");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         if let Some(current) = state
             .runner_lease
             .clone()
@@ -831,7 +831,7 @@ impl SharedBrainStore {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
-        let state = brains.get_mut(name).expect("brain loaded above");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         let current = state
             .runner_lease
             .as_ref()
@@ -870,7 +870,7 @@ impl SharedBrainStore {
         self.ensure_loaded(name)?;
         let now = unix_millis();
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
-        let state = brains.get_mut(name).expect("brain loaded above");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         let current = state
             .runner_lease
             .as_ref()
@@ -935,7 +935,7 @@ impl SharedBrainStore {
         self.ensure_loaded(name)?;
         let now = unix_millis();
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
-        let state = brains.get_mut(name).expect("brain loaded above");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         let handoff = state
             .runner_handoff
             .as_ref()
@@ -987,7 +987,7 @@ impl SharedBrainStore {
         let sender = validate_participant_subject("handoff canceller", sender)?;
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
-        let state = brains.get_mut(name).expect("brain loaded above");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         if !state
             .runner_handoff
             .as_ref()
@@ -1013,7 +1013,7 @@ impl SharedBrainStore {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
-        let state = brains.get_mut(name).expect("brain loaded above");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         let Some(current) = state.runner_handoff.as_ref() else {
             return Ok(false);
         };
@@ -1038,7 +1038,7 @@ impl SharedBrainStore {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
-        let state = brains.get_mut(name).expect("brain loaded above");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         let Some(current) = state.runner_lease.as_ref() else {
             return Ok(false);
         };
@@ -1070,7 +1070,7 @@ impl SharedBrainStore {
         let connection_id = ConnectionId::new();
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
-        let state = brains.get_mut(name).expect("brain loaded above");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         if let Some(existing) = state.attachments.get(&attachment_id) {
             if existing.subject != subject || existing.role != role {
                 anyhow::bail!("attachment identity cannot change subject or role");
@@ -1109,7 +1109,7 @@ impl SharedBrainStore {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
-        let state = brains.get_mut(name).expect("brain loaded above");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         let attachment = state
             .attachments
             .get(&attachment_id)
@@ -1152,7 +1152,7 @@ impl SharedBrainStore {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
-        let state = brains.get_mut(name).expect("brain loaded above");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         let Some(attachment) = state.attachments.get_mut(&attachment_id) else {
             return Ok(false);
         };
@@ -1172,7 +1172,7 @@ impl SharedBrainStore {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
-        let state = brains.get_mut(name).expect("brain loaded above");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         let attachment = state
             .attachments
             .get(&attachment_id)
@@ -1214,7 +1214,7 @@ impl SharedBrainStore {
             // Otherwise a concurrent attach could recreate a live participant
             // between the check and deletion of the provisional directory.
             let mut brains = self.brains.write().expect("shared brain lock poisoned");
-            let state = brains.get(name).expect("brain loaded above");
+            let state = brains.get(name).context("Brain was removed concurrently")?;
             let has_substantive_history = state.events.iter().any(|event| {
                 matches!(
                     event.kind,
@@ -1298,7 +1298,7 @@ impl SharedBrainStore {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
-        let state = brains.get_mut(name).expect("brain loaded above");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         let head = state.events.last().map(|event| event.seq).unwrap_or(0);
         if seq > head {
             anyhow::bail!("cannot acknowledge event {seq}; Brain head is {head}");
@@ -1386,7 +1386,7 @@ impl SharedBrainStore {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
-        let state = brains.get_mut(name).expect("brain loaded above");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         self.push_locked(name, state, sender, kind)
     }
 
@@ -1431,7 +1431,11 @@ impl SharedBrainStore {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
         let brains = self.brains.read().expect("shared brain lock poisoned");
-        Ok(brains.get(name).expect("brain loaded above").tx.subscribe())
+        Ok(brains
+            .get(name)
+            .context("Brain was removed concurrently")?
+            .tx
+            .subscribe())
     }
 
     /// Return the one live typed runtime for a named Brain, restoring its
