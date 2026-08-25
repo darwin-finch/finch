@@ -5,6 +5,23 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 [`docs/SHARED_PROGRAM_RUNTIME_PLAN.md`](docs/SHARED_PROGRAM_RUNTIME_PLAN.md), and
 [`docs/BRAIN_CONVERGENCE_PLAN.md`](docs/BRAIN_CONVERGENCE_PLAN.md).
 
+## Setup wizard persistence and navigation
+
+- [x] Preserve the ordered unified provider list when reopening and saving setup, including local
+  models such as Qwen used as non-primary/tool providers; never reconstruct the screen from the
+  cloud-only legacy `teachers` projection.
+- [ ] Persist edited persona boot/system prompts as user overrides, reload them in the wizard, and
+  make the live REPL honor the selected override. Keep the system-prompt behavior distinct from a
+  merely cosmetic response style.
+- [ ] Use one setup-result-to-config mapping for first-run setup, `finch setup`, and `/setup`; cover
+  GUI automation, daemon-only mode, network advertisement, LAN discovery, persona, and memory
+  status-line count with round-trip tests.
+- [ ] Allow saving the accumulated settings from every wizard screen instead of only the final
+  screen. Make Escape unwind the current editor/dialog/screen first; cancelling the entire wizard
+  must be a distinct action and must confirm before discarding unsaved changes.
+- [ ] Dogfood Finch with the ChatGPT Sol profile after the wizard fixes land; verify provider
+  selection, prompt override, settings reload, and visible memory status lines.
+
 ## Typed Lisp/Co-Forth VM — working substrate and ongoing language evolution
 
 The product-critical Brain entry gate passed on 2026-08-24: both frontends lower directly to the
