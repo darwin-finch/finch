@@ -1139,6 +1139,29 @@ struct BrainScheduleDue {
   grantCeiling   @9 :List(CapabilityRequirement);
 }
 
+enum BrainTaskStatus {
+  pending    @0;
+  inProgress @1;
+  completed  @2;
+}
+
+enum BrainTaskPriority {
+  high   @0;
+  medium @1;
+  low    @2;
+}
+
+struct BrainTask {
+  id       @0 :Text;
+  content  @1 :Text;
+  status   @2 :BrainTaskStatus;
+  priority @3 :BrainTaskPriority;
+}
+
+struct BrainTaskList {
+  tasks @0 :List(BrainTask);
+}
+
 struct BrainEvent {
   schemaVersion        @0 :UInt32;
   brainId              @1 :Text;
@@ -1169,6 +1192,7 @@ struct BrainEvent {
     effectRecorded         @25 :BrainEffectRecorded;
     scheduleChanged        @26 :BrainSchedule;
     scheduleDue            @27 :BrainScheduleDue;
+    taskListReplaced       @28 :BrainTaskList;
   }
 }
 
@@ -1187,6 +1211,7 @@ struct BrainSnapshot {
   runnerHandoff    @11 :BrainRunnerHandoff;
   schedules        @12 :List(BrainSchedule);
   pendingScheduleDues @13 :List(BrainScheduleDue);
+  tasks           @14 :List(BrainTask);
 }
 
 struct BrainWireMessage {
@@ -1270,6 +1295,7 @@ struct BrainSubmission {
     programPopped   @2 :UInt64;
     approvalDecided @3 :BrainApprovalDecided;
     participantMessage @4 :Text;
+    taskListReplaced @5 :BrainTaskList;
   }
 }
 
