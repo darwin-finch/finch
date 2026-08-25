@@ -787,8 +787,11 @@ still blocks the corresponding Brain phase until it is unified.
   in one process, while keeping the daemon cursor authoritative. The client stores only the opaque
   attachment ID, keyed by durable Brain ID plus console slot/subject/role; the daemon still owns the
   role, connection generation, and acknowledged cursor and rejects concurrent rebinding.
-- [ ] Expire or clean up an attachment that REST-attaches but crashes before its WebSocket activates,
-  without advancing its cursor or allowing a stale connection to detach a later reconnect.
+- [x] Expire or clean up an attachment that REST-attaches but crashes before its WebSocket activates,
+  without advancing its cursor or allowing a stale connection to detach a later reconnect. REST
+  attachment now creates a 15-second pending reservation; only the exact WebSocket activation emits
+  `ClientAttached`, concurrent identity reuse fails closed, and expiry clears only the matching
+  pending connection without moving its durable acknowledgement cursor or Brain revision.
 - [ ] Add remote brain creation while preserving the invariant that one environment is an
   indivisible machine/workspace authority boundary.
 - [ ] Treat the global brain password as a local/bootstrap credential only. Mint scoped, revocable,

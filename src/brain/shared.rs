@@ -632,15 +632,61 @@ impl SharedBrainStore {
             if existing.subject != subject || existing.role != role {
                 anyhow::bail!("attachment identity cannot change subject or role");
             }
+            if existing.connected || existing.connection_id.is_some() {
+                anyhow::bail!("Brain attachment already has a live or pending connection");
+            }
         }
+        let acknowledged_seq = state
+            .attachments
+            .get(&attachment_id)
+            .map(|attachment| attachment.acknowledged_seq)
+            .unwrap_or(0);
+        let attachment = BrainAttachment {
+            attachment_id,
+            subject: subject.to_string(),
+            role,
+            acknowledged_seq,
+            connected: false,
+            connection_id: Some(connection_id),
+        };
+        state.attachments.insert(attachment_id, attachment.clone());
+        Ok(attachment)
+    }
+
+    /// Promote an exact pending REST reservation into the live transport
+    /// projection. Only this transition writes `ClientAttached`; abandoned
+    /// reservations therefore never look like connected participants in the
+    /// canonical event log.
+    pub fn activate_connection(
+        &self,
+        name: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+    ) -> Result<BrainAttachment> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).expect("brain loaded above");
+        let attachment = state
+            .attachments
+            .get(&attachment_id)
+            .context("unknown Brain attachment")?;
+        if attachment.connection_id != Some(connection_id) {
+            anyhow::bail!("Brain attachment connection is no longer current");
+        }
+        if attachment.connected {
+            anyhow::bail!("Brain attachment transport is already active");
+        }
+        let subject = attachment.subject.clone();
+        let role = attachment.role;
         self.push_locked(
             name,
             state,
-            subject,
+            &subject,
             BrainEventKind::ClientAttached {
                 attachment_id,
                 connection_id,
-                subject: subject.to_string(),
+                subject: subject.clone(),
                 role,
             },
         )?;
@@ -648,7 +694,30 @@ impl SharedBrainStore {
             .attachments
             .get(&attachment_id)
             .cloned()
-            .context("attached client missing from Brain projection")
+            .context("activated client missing from Brain projection")
+    }
+
+    /// Clear an abandoned pending connection without advancing the Brain log
+    /// or its durable acknowledgement cursor. A timer for an older reservation
+    /// cannot affect a later connection because both opaque IDs must match.
+    pub fn expire_pending_connection(
+        &self,
+        name: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+    ) -> Result<bool> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).expect("brain loaded above");
+        let Some(attachment) = state.attachments.get_mut(&attachment_id) else {
+            return Ok(false);
+        };
+        if attachment.connected || attachment.connection_id != Some(connection_id) {
+            return Ok(false);
+        }
+        attachment.connection_id = None;
+        Ok(true)
     }
 
     pub fn detach(
@@ -667,6 +736,14 @@ impl SharedBrainStore {
             .context("unknown Brain attachment")?;
         if attachment.connection_id != Some(connection_id) {
             anyhow::bail!("Brain attachment connection is no longer current");
+        }
+        if !attachment.connected {
+            state
+                .attachments
+                .get_mut(&attachment_id)
+                .expect("attachment checked above")
+                .connection_id = None;
+            return Ok(());
         }
         let subject = attachment.subject.clone();
         self.push_locked(
@@ -1711,6 +1788,13 @@ mod tests {
         let attachment = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
+        let attachment = store
+            .activate_connection(
+                "shared",
+                attachment.attachment_id,
+                attachment.connection_id.unwrap(),
+            )
+            .unwrap();
         let head = store.snapshot("shared").unwrap().revision;
         let connection_id = attachment.connection_id.unwrap();
         let acknowledged = store
@@ -1759,8 +1843,16 @@ mod tests {
                 Some(attachment.attachment_id),
             )
             .unwrap();
-        assert!(reattached.connected);
+        assert!(!reattached.connected);
         assert_eq!(reattached.acknowledged_seq, head);
+        let reattached = restarted
+            .activate_connection(
+                "shared",
+                reattached.attachment_id,
+                reattached.connection_id.unwrap(),
+            )
+            .unwrap();
+        assert!(reattached.connected);
         assert!(restarted
             .attach(
                 "shared",
@@ -1794,6 +1886,14 @@ mod tests {
 
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let winner = results.into_iter().find_map(Result::ok).unwrap();
+        store
+            .activate_connection(
+                "shared",
+                winner.attachment_id,
+                winner.connection_id.unwrap(),
+            )
+            .unwrap();
         let snapshot = store.snapshot("shared").unwrap();
         assert_eq!(snapshot.attachments.len(), 1);
         assert_eq!(
@@ -1812,12 +1912,29 @@ mod tests {
         let first = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
+        store
+            .activate_connection(
+                "shared",
+                first.attachment_id,
+                first.connection_id.unwrap(),
+            )
+            .unwrap();
+        store
+            .detach("shared", first.attachment_id, first.connection_id.unwrap())
+            .unwrap();
         let second = store
             .attach(
                 "shared",
                 "alice",
                 AttachmentRole::Driver,
                 Some(first.attachment_id),
+            )
+            .unwrap();
+        store
+            .activate_connection(
+                "shared",
+                second.attachment_id,
+                second.connection_id.unwrap(),
             )
             .unwrap();
 
@@ -1845,6 +1962,61 @@ mod tests {
                 second.connection_id.unwrap(),
             )
             .is_ok());
+    }
+
+    #[test]
+    fn abandoned_attachment_reservation_expires_without_advancing_cursor_or_log() {
+        let store = SharedBrainStore::with_root("box.local", None);
+        let first = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let first_connection = first.connection_id.unwrap();
+        assert!(!first.connected);
+        assert_eq!(store.snapshot("shared").unwrap().revision, 0);
+        assert!(store
+            .attach(
+                "shared",
+                "alice",
+                AttachmentRole::Driver,
+                Some(first.attachment_id),
+            )
+            .is_err());
+
+        assert!(store
+            .expire_pending_connection("shared", first.attachment_id, first_connection)
+            .unwrap());
+        let second = store
+            .attach(
+                "shared",
+                "alice",
+                AttachmentRole::Driver,
+                Some(first.attachment_id),
+            )
+            .unwrap();
+        assert_eq!(second.acknowledged_seq, 0);
+        assert_eq!(store.snapshot("shared").unwrap().revision, 0);
+        assert!(!store
+            .expire_pending_connection("shared", first.attachment_id, first_connection)
+            .unwrap());
+
+        let active = store
+            .activate_connection(
+                "shared",
+                second.attachment_id,
+                second.connection_id.unwrap(),
+            )
+            .unwrap();
+        assert!(active.connected);
+        assert!(!store
+            .expire_pending_connection(
+                "shared",
+                second.attachment_id,
+                second.connection_id.unwrap(),
+            )
+            .unwrap());
+        let snapshot = store.snapshot("shared").unwrap();
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(snapshot.attachments[0].acknowledged_seq, 0);
     }
 
     #[test]

@@ -220,6 +220,8 @@ struct AttachNamedBrainRequest {
     attachment_id: Option<crate::brain::shared::AttachmentId>,
 }
 
+const PENDING_BRAIN_ATTACHMENT_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
 async fn attach_named_brain(
     State(server): State<Arc<AgentServer>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -237,7 +239,7 @@ async fn attach_named_brain(
         )
             .into_response());
     }
-    server
+    let attachment = server
         .shared_brains()
         .attach(
             &name,
@@ -245,8 +247,23 @@ async fn attach_named_brain(
             request.role,
             request.attachment_id,
         )
-        .map(Json)
-        .map_err(brain_state_conflict)
+        .map_err(brain_state_conflict)?;
+    let store = server.shared_brains().clone();
+    let pending_name = name.clone();
+    let attachment_id = attachment.attachment_id;
+    let connection_id = attachment
+        .connection_id
+        .expect("new Brain attachment has a pending connection");
+    tokio::spawn(async move {
+        tokio::time::sleep(PENDING_BRAIN_ATTACHMENT_TTL).await;
+        if store
+            .expire_pending_connection(&pending_name, attachment_id, connection_id)
+            .unwrap_or(false)
+        {
+            let _ = store.remove_if_unused(&pending_name);
+        }
+    });
+    Ok(Json(attachment))
 }
 
 #[derive(Debug, Deserialize)]
@@ -960,7 +977,7 @@ async fn watch_named_brain(
     let connection_id = crate::brain::shared::ConnectionId(connection.connection_id);
     server
         .shared_brains()
-        .require_connection(&name, attachment_id, connection_id)
+        .activate_connection(&name, attachment_id, connection_id)
         .map_err(|error| AppError(error).into_response())?;
     // Subscribe before taking the snapshot. Events appended after the
     // snapshot revision then wait in this receiver and are sent immediately
