@@ -246,7 +246,7 @@ async fn attach_named_brain(
             request.attachment_id,
         )
         .map(Json)
-        .map_err(|error| AppError(error).into_response())
+        .map_err(brain_state_conflict)
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,7 +272,7 @@ async fn acknowledge_named_brain(
             request.seq,
         )
         .map(Json)
-        .map_err(|error| AppError(error).into_response())
+        .map_err(brain_state_conflict)
 }
 
 async fn detach_named_brain(
@@ -289,8 +289,16 @@ async fn detach_named_brain(
             crate::brain::shared::AttachmentId(attachment_id),
             crate::brain::shared::ConnectionId(connection_id),
         )
-        .map_err(|error| AppError(error).into_response())?;
+        .map_err(brain_state_conflict)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn brain_state_conflict(error: anyhow::Error) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]
