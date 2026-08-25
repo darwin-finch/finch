@@ -165,6 +165,42 @@ impl AgentServer {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_brain_protocol_test(
+        store: crate::brain::store::BrainStore,
+        credentials: crate::brain::credential::BrainCredentialAuthority,
+        password: String,
+        state_root: &std::path::Path,
+    ) -> Result<Self> {
+        let generator_state = Arc::new(RwLock::new(GeneratorState::Initializing));
+        let bootstrap_loader = Arc::new(BootstrapLoader::new(generator_state.clone(), None));
+        let (training_tx, training_rx) = tokio::sync::mpsc::unbounded_channel();
+        Ok(Self {
+            claude_client: Arc::new(ClaudeClient::new("brain-protocol-test".into())?),
+            providers: Vec::new(),
+            router: Arc::new(RwLock::new(Router::new(
+                crate::models::ThresholdRouter::default(),
+            ))),
+            metrics_logger: Arc::new(MetricsLogger::new(state_root.join("metrics"))?),
+            config: ServerConfig { brain_password: password.clone(), ..ServerConfig::default() },
+            local_generator: Arc::new(RwLock::new(LocalGenerator::default())),
+            bootstrap_loader,
+            generator_state,
+            training_coordinator: Arc::new(TrainingCoordinator::with_queue_path(
+                8, 8, false, state_root.join("training.jsonl"),
+            )),
+            training_tx: Arc::new(training_tx),
+            training_rx: std::sync::Mutex::new(Some(training_rx)),
+            brain_store: store,
+            brain_runners: BrainRunnerBroker::default(),
+            brain_approvals: BrainApprovalBroker::default(),
+            brain_credentials: credentials,
+            mcp_servers: std::collections::HashMap::new(),
+            mcp_client: tokio::sync::OnceCell::new(),
+            brain_password: Arc::new(RwLock::new(password)),
+        })
+    }
+
     /// Create a new agent server.
     ///
     /// `providers` is the ordered list of cloud providers from `[[providers]]` config.

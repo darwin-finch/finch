@@ -3819,6 +3819,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn production_server_deduplicates_lost_replies_across_daemon_restarts() {
+        use crate::brain::store::{BrainEventKind, BrainRunKind, BrainScheduleDeliveryPolicy,
+            ProgramLanguage};
+
+        async fn start(
+            root: &std::path::Path,
+            credentials: crate::brain::credential::BrainCredentialAuthority,
+        ) -> (RemoteBrainTarget, tokio::task::JoinHandle<()>) {
+            let store = crate::brain::store::BrainStore::with_root(
+                "box.local", Some(root.to_path_buf()),
+            );
+            store.snapshot("shared").unwrap();
+            let server = std::sync::Arc::new(crate::server::AgentServer::for_brain_protocol_test(
+                store, credentials, "test-password".into(), root,
+            ).unwrap());
+            let app = crate::server::handlers::create_remote_brain_router(server);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                ).await.unwrap();
+            });
+            (RemoteBrainTarget {
+                brain: "shared".into(), machine: "box.local".into(),
+                address: address.to_string(), secure: false,
+            }, task)
+        }
+
+        async fn attach(
+            target: RemoteBrainTarget,
+            attachment_id: Option<AttachmentId>,
+        ) -> (RemoteBrainClient, mpsc::UnboundedReceiver<BrainWireMessage>, BrainAttachment) {
+            let mut client = RemoteBrainClient::new(target, "test-password").unwrap();
+            let attachment = client.attach(
+                "alice", AttachmentRole::Driver, attachment_id,
+            ).await.unwrap();
+            let mut events = client.watch().await.unwrap();
+            assert!(matches!(events.recv().await, Some(BrainWireMessage::Snapshot { .. })));
+            (client, events, attachment)
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = crate::brain::credential::BrainCredentialAuthority::ephemeral([83; 32]);
+        let (target, daemon) = start(temp.path(), credentials.clone()).await;
+        let (client, events, attachment) = attach(target, None).await;
+        let prompt = BrainEventKind::Prompt { text: "exactly once".into() };
+        let handle = client.prepare_push_mutation(&prompt).await.unwrap();
+        crate::server::handlers::drop_next_remote_brain_reply_after_commit();
+        assert!(client.push_with_handle(prompt.clone(), &handle).await.is_err());
+        drop(events);
+        daemon.abort();
+
+        let (target, daemon) = start(temp.path(), credentials.clone()).await;
+        let (client, events, rebound) = attach(target, Some(attachment.attachment_id)).await;
+        assert_eq!(rebound.attachment_id, handle.attachment_id);
+        client.push_with_handle(prompt.clone(), &handle).await.unwrap();
+        let snapshot = client.snapshot().await.unwrap();
+        assert_eq!(snapshot.events.iter().filter(|event| {
+            event.mutation.as_ref().is_some_and(|receipt| receipt.mutation_id == handle.idempotency_key)
+        }).count(), 1);
+        assert_eq!(snapshot.events.iter().filter(|event| matches!(event.kind,
+            BrainEventKind::Prompt { ref text } if text == "exactly once")).count(), 1);
+        assert_eq!(snapshot.runs.iter().filter(|run| run.kind == BrainRunKind::Interactive
+            && run.request_seq == snapshot.events.iter().find(|event| {
+                event.mutation.as_ref().is_some_and(|receipt| receipt.mutation_id == handle.idempotency_key)
+            }).unwrap().seq).count(), 1);
+
+        assert!(client.push_with_handle(
+            BrainEventKind::Prompt { text: "conflict".into() }, &handle,
+        ).await.unwrap_err().to_string().contains("different command"));
+        let mut stale = handle.clone();
+        stale.expected_revision += 1;
+        assert!(client.push_with_handle(prompt, &stale).await.is_err());
+
+        let source = "(define (scheduled) : int 1)".to_string();
+        let ceiling = crate::vm::EffectSet::default();
+        let schedule_handle = client.prepare_create_schedule_mutation(
+            ProgramLanguage::Lisp, &source, &ceiling, 50_000, None,
+            BrainScheduleDeliveryPolicy::Coalesce,
+        ).await.unwrap();
+        crate::server::handlers::drop_next_remote_brain_reply_after_commit();
+        assert!(client.create_schedule_with_handle(
+            ProgramLanguage::Lisp, source.clone(), ceiling.clone(), 50_000, None,
+            BrainScheduleDeliveryPolicy::Coalesce, &schedule_handle,
+        ).await.is_err());
+        drop(events);
+        daemon.abort();
+
+        let (target, daemon) = start(temp.path(), credentials).await;
+        let (client, _events, _) = attach(target, Some(attachment.attachment_id)).await;
+        let schedule = client.create_schedule_with_handle(
+            ProgramLanguage::Lisp, source, ceiling, 50_000, None,
+            BrainScheduleDeliveryPolicy::Coalesce, &schedule_handle,
+        ).await.unwrap();
+        let snapshot = client.snapshot().await.unwrap();
+        assert_eq!(snapshot.schedules.iter().filter(|item| {
+            item.schedule_id == schedule.schedule_id
+        }).count(), 1);
+        assert_eq!(snapshot.events.iter().filter(|event| {
+            event.mutation.as_ref().is_some_and(|receipt| {
+                receipt.mutation_id == schedule_handle.idempotency_key
+            })
+        }).count(), 1);
+        daemon.abort();
+    }
+
+    #[tokio::test]
     async fn remote_initialization_client_uses_narrowed_websocket_authority() {
         use axum::{
             extract::{Path, Query, State, WebSocketUpgrade},

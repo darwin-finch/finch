@@ -18,6 +18,15 @@ use crate::claude::{ContentBlock, Message};
 #[derive(Clone, Copy)]
 struct RestrictedBrainListener;
 
+#[cfg(test)]
+static DROP_NEXT_REMOTE_BRAIN_REPLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn drop_next_remote_brain_reply_after_commit() {
+    DROP_NEXT_REMOTE_BRAIN_REPLY.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Create the main application router
 pub fn create_router(server: Arc<AgentServer>) -> Router {
     use super::feedback_handler::{handle_feedback, handle_training_status};
@@ -3110,6 +3119,13 @@ async fn watch_named_brain(
                         let Ok(encoded) = crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope) else {
                             break;
                         };
+                        #[cfg(test)]
+                        if DROP_NEXT_REMOTE_BRAIN_REPLY.swap(
+                            false,
+                            std::sync::atomic::Ordering::SeqCst,
+                        ) {
+                            break;
+                        }
                         if socket.send(WsMessage::Binary(encoded.into())).await.is_err() {
                             break;
                         }
