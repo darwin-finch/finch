@@ -59,6 +59,7 @@ pub enum Command {
     BrainSay(String),              // /say <text> — relay without scheduling an LLM turn
     BrainWho,                      // /who — list connected Brain participants
     BrainWhois(String),            // /whois <subject> — inspect public Brain presence
+    BrainCreate(String),           // /brain create <name>[@machine]
     BrainArchive(String),          // /brain archive <name>
     BrainAttach(String),           // /brain attach <name@machine[:port]>
     BrainDetach,                   // /brain detach
@@ -277,6 +278,12 @@ impl Command {
             let target = rest.trim();
             if !target.is_empty() {
                 return Some(Command::BrainAttach(target.to_string()));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/brain create ") {
+            let target = rest.trim();
+            if !target.is_empty() {
+                return Some(Command::BrainCreate(target.to_string()));
             }
         }
         if let Some(rest) = trimmed.strip_prefix("/brain cancel ") {
@@ -549,6 +556,7 @@ pub fn handle_command(
         | Command::BrainSay(_)
         | Command::BrainWho
         | Command::BrainWhois(_)
+        | Command::BrainCreate(_)
         | Command::BrainArchive(_)
         | Command::BrainAttach(_)
         | Command::BrainDetach
@@ -725,6 +733,7 @@ pub fn format_help() -> String {
          {cyan}  /say <text>{reset}         Relay text without invoking the model\n\
          {cyan}  /who{reset}                List connected participants in this Brain\n\
          {cyan}  /whois <subject>{reset}    Show public presence for one participant\n\
+         {cyan}  /brain create <name>[@machine]{reset} Create an empty Brain in that environment\n\
          {cyan}  /brain attach <name>[@machine]{reset} Attach locally or to a remote Brain\n\
          {cyan}  /brain detach{reset}      Return to this console's home Brain\n\
          {cyan}  /brain handoff <subject>{reset} Request an addressed runner transfer\n\
@@ -1025,6 +1034,10 @@ mod tests {
 
     #[test]
     fn parses_named_brain_attachment_commands() {
+        assert!(matches!(
+            Command::parse("/brain create review@workstation.local"),
+            Some(Command::BrainCreate(target)) if target == "review@workstation.local"
+        ));
         assert!(matches!(
             Command::parse("/brain attach finch@workstation.local"),
             Some(Command::BrainAttach(target)) if target == "finch@workstation.local"

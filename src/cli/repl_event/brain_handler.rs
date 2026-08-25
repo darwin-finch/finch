@@ -424,6 +424,31 @@ impl EventLoop {
         self.render_tui().await
     }
 
+    async fn handle_brain_create(&mut self, target: String) -> Result<()> {
+        let target = if target.contains('@') {
+            crate::brain::remote::RemoteBrainTarget::parse(&target)?
+        } else {
+            let base = self
+                .daemon_base_url
+                .as_deref()
+                .context("local daemon is unavailable")?;
+            crate::brain::remote::RemoteBrainTarget::local(&target, base)?
+        };
+        let password = crate::config::load_config()
+            .map(|config| config.server.brain_password)
+            .unwrap_or_default();
+        let client = crate::brain::remote::RemoteBrainClient::new(target.clone(), password)?;
+        let snapshot = client.create().await?;
+        self.output_manager.write_info(format!(
+            "created {} in {}:{} (generation {})",
+            target.display_name(),
+            snapshot.environment.machine,
+            snapshot.environment.workspace.display(),
+            snapshot.environment.generation,
+        ));
+        self.render_tui().await
+    }
+
     async fn handle_brain_run_cancel(&mut self, prefix: String) -> Result<()> {
         let prefix = prefix.trim().to_ascii_lowercase();
         anyhow::ensure!(prefix.len() >= 4, "run id prefix must contain at least 4 characters");

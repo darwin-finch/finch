@@ -2129,6 +2129,13 @@ Rules:\n\
                     Command::BrainAttach(target) => {
                         self.handle_brain_attach(target).await?;
                     }
+                    Command::BrainCreate(target) => {
+                        if let Err(error) = self.handle_brain_create(target).await {
+                            self.output_manager
+                                .write_info(format!("brain create: {error}"));
+                            self.render_tui().await?;
+                        }
+                    }
                     Command::BrainRuns => {
                         self.handle_brain_runs().await?;
                     }
