@@ -2,8 +2,8 @@ use crate::brain::store::{
     AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
     BrainEvent, BrainEventKind, BrainId, BrainProgram, BrainRun, BrainRunKind, BrainRunStatus,
     BrainRunnerHandoff, BrainRunnerLease, BrainSchedule, BrainScheduleDeliveryPolicy,
-    BrainScheduleDue, BrainSnapshot, BrainWireMessage, ConnectionId, ProgramLanguage, RunId,
-    RunnerHandoffId, RunnerLeaseId, ScheduleId,
+    BrainScheduleDue, BrainScheduleModuleIdentity, BrainSnapshot, BrainWireMessage, ConnectionId,
+    ProgramLanguage, RunId, RunnerHandoffId, RunnerLeaseId, ScheduleId,
 };
 use crate::brain::tasks::{BrainTask, BrainTaskPriority, BrainTaskStatus};
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_approval_audience};
@@ -1144,6 +1144,12 @@ pub(crate) fn encode_schedule(
         policy.set_max_catch_up(*max_catch_up);
         policy.set_expires_after_ms(*expires_after_ms);
     }
+    if let Some(identity) = &schedule.module_identity {
+        builder.set_has_module_identity(true);
+        builder.set_module_name(&identity.module);
+        builder.set_module_revision(identity.module_revision);
+        builder.set_module_source_sha256(&identity.source_sha256);
+    }
     builder.set_active(schedule.active);
 }
 
@@ -1178,6 +1184,16 @@ pub(crate) fn decode_schedule(
             .get_has_interval_ms()
             .then(|| reader.get_interval_ms()),
         delivery_policy,
+        module_identity: reader
+            .get_has_module_identity()
+            .then(|| -> anyhow::Result<_> {
+                Ok(BrainScheduleModuleIdentity {
+                    module: text(reader.get_module_name()?)?,
+                    module_revision: reader.get_module_revision(),
+                    source_sha256: text(reader.get_module_source_sha256()?)?,
+                })
+            })
+            .transpose()?,
         active: reader.get_active(),
     })
 }
@@ -1942,6 +1958,11 @@ mod tests {
             next_due_ms: 500,
             interval_ms: Some(100),
             delivery_policy: BrainScheduleDeliveryPolicy::Coalesce,
+            module_identity: Some(BrainScheduleModuleIdentity {
+                module: "finch.brain.initialization".into(),
+                module_revision: 1,
+                source_sha256: "reviewed-digest".into(),
+            }),
             active: true,
         };
         let envelopes = vec![
@@ -2078,6 +2099,7 @@ mod tests {
                 max_catch_up: 2,
                 expires_after_ms: 60_000,
             },
+            module_identity: None,
             active: true,
         };
         let pending_due = BrainScheduleDue {

@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 11;
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 12;
 const BRAIN_METADATA_VERSION: u32 = 1;
 const BRAIN_INITIALIZATION_VERSION: u32 = 1;
 const DEFAULT_INITIALIZATION_MODULE: &str = "finch.brain.initialization";
@@ -217,6 +217,15 @@ pub struct BrainInitialization {
     pub capability_budget: crate::vm::EffectSet,
 }
 
+/// Durable, non-authority-bearing identity for a reviewed module scheduled by
+/// the Brain itself. Public schedule creation never accepts this marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainScheduleModuleIdentity {
+    pub module: String,
+    pub module_revision: u32,
+    pub source_sha256: String,
+}
+
 impl BrainInitialization {
     fn reviewed_default(brain_id: BrainId) -> Self {
         Self {
@@ -246,6 +255,14 @@ impl BrainInitialization {
         anyhow::ensure!(self == &Self::reviewed_default(brain_id),
             "Brain initialization contract is not the reviewed built-in module");
         Ok(())
+    }
+
+    fn module_identity(&self) -> BrainScheduleModuleIdentity {
+        BrainScheduleModuleIdentity {
+            module: self.module.clone(),
+            module_revision: self.module_revision,
+            source_sha256: self.source_sha256.clone(),
+        }
     }
 }
 
@@ -281,6 +298,11 @@ pub struct BrainSchedule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_ms: Option<u64>,
     pub delivery_policy: BrainScheduleDeliveryPolicy,
+    /// Set only by trusted, reviewed Brain-module scheduling paths. This is
+    /// persisted so source-equivalent public schedules cannot impersonate or
+    /// suppress the module.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_identity: Option<BrainScheduleModuleIdentity>,
     pub active: bool,
 }
 
@@ -905,9 +927,14 @@ impl BrainStore {
             .context("Brain initialization was removed concurrently")
     }
 
-    /// Idempotently journal initialization as a one-shot schedule. The
-    /// ordinary scheduler creates the explicit `BrainRun`, and the runner is
-    /// limited to the reviewed contract's capability ceiling.
+    /// Idempotently journal initialization as a one-shot schedule.
+    ///
+    /// An active or delivered-but-nonterminal attempt is returned unchanged.
+    /// A successfully completed attempt remains idempotently complete. A
+    /// schedule cancelled before delivery, or an attempt whose run failed or
+    /// was cancelled, is retried with a new schedule ID. The ordinary
+    /// scheduler creates the explicit `BrainRun`, and the runner is limited to
+    /// the reviewed contract's capability ceiling.
     pub fn schedule_initialization(
         &self,
         name: &str,
@@ -925,13 +952,37 @@ impl BrainStore {
             "initialization scheduler does not own the initiating attachment");
         anyhow::ensure!(matches!(attachment.role, AttachmentRole::Runner | AttachmentRole::Driver),
             "attachment role cannot schedule Brain initialization");
-        if let Some(existing) = state.schedules.values().find(|schedule| {
-            schedule.language == initialization.language
-                && schedule.source == initialization.source
-                && schedule.grant_ceiling == initialization.capability_budget
-                && schedule.interval_ms.is_none()
-        }) {
-            return Ok(existing.clone());
+        let module_identity = initialization.module_identity();
+        let mut seen_attempts = std::collections::HashSet::new();
+        let attempt_ids = state.events.iter().rev().filter_map(|event| match &event.kind {
+            BrainEventKind::ScheduleChanged { schedule }
+                if schedule.module_identity.as_ref() == Some(&module_identity)
+                    && seen_attempts.insert(schedule.schedule_id) =>
+            {
+                Some(schedule.schedule_id)
+            }
+            _ => None,
+        }).collect::<Vec<_>>();
+        for schedule_id in attempt_ids {
+            let existing = state.schedules.get(&schedule_id)
+                .expect("module schedule event was projected")
+                .clone();
+            if existing.active {
+                return Ok(existing);
+            }
+            let run_status = state.events.iter().rev().find_map(|event| match &event.kind {
+                BrainEventKind::ScheduleDue { due }
+                    if due.schedule_id == existing.schedule_id =>
+                {
+                    state.runs.get(&due.run.run_id).map(|run| run.status)
+                }
+                _ => None,
+            });
+            if run_status.is_some_and(|status| {
+                !matches!(status, BrainRunStatus::Failed | BrainRunStatus::Cancelled)
+            }) {
+                return Ok(existing);
+            }
         }
         let schedule = BrainSchedule {
             schedule_id: ScheduleId::new(),
@@ -943,6 +994,7 @@ impl BrainStore {
             next_due_ms,
             interval_ms: None,
             delivery_policy: BrainScheduleDeliveryPolicy::Coalesce,
+            module_identity: Some(module_identity),
             active: true,
         };
         self.push_locked(name, state, sender, BrainEventKind::ScheduleChanged {
@@ -1006,6 +1058,7 @@ impl BrainStore {
             next_due_ms,
             interval_ms,
             delivery_policy,
+            module_identity: None,
             active: true,
         };
         self.push_locked(
@@ -3455,6 +3508,170 @@ mod tests {
         assert!(snapshot.events.iter().all(|event| !matches!(
             event.kind, BrainEventKind::EffectRecorded { .. }
         )));
+    }
+
+    #[test]
+    fn public_source_collision_cannot_claim_initialization_identity() {
+        let store = BrainStore::with_root("box.local", None);
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let contract = store.initialization("shared").unwrap();
+        let active_ordinary = store
+            .create_schedule(
+                "shared",
+                "alice",
+                attachment.attachment_id,
+                contract.language,
+                contract.source.clone(),
+                contract.capability_budget.clone(),
+                50,
+                None,
+                BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        let cancelled_ordinary = store
+            .create_schedule(
+                "shared",
+                "alice",
+                attachment.attachment_id,
+                contract.language,
+                contract.source.clone(),
+                contract.capability_budget.clone(),
+                60,
+                None,
+                BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        assert!(store
+            .cancel_schedule("shared", "alice", cancelled_ordinary.schedule_id)
+            .unwrap());
+        let delivered_ordinary = store
+            .create_schedule(
+                "shared",
+                "alice",
+                attachment.attachment_id,
+                contract.language,
+                contract.source.clone(),
+                contract.capability_budget.clone(),
+                5,
+                None,
+                BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        assert_eq!(store.queue_due_schedules("shared", 5).unwrap().len(), 1);
+        assert!(!store
+            .inspect_schedule("shared", delivered_ordinary.schedule_id)
+            .unwrap()
+            .unwrap()
+            .active);
+        assert_eq!(active_ordinary.module_identity, None);
+        assert_eq!(cancelled_ordinary.module_identity, None);
+        assert_eq!(delivered_ordinary.module_identity, None);
+
+        let initialization = store
+            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .unwrap();
+        assert_ne!(initialization.schedule_id, active_ordinary.schedule_id);
+        assert_ne!(initialization.schedule_id, cancelled_ordinary.schedule_id);
+        assert_ne!(initialization.schedule_id, delivered_ordinary.schedule_id);
+        assert_eq!(
+            initialization.module_identity,
+            Some(contract.module_identity())
+        );
+        assert_eq!(store.snapshot("shared").unwrap().schedules.len(), 4);
+    }
+
+    #[test]
+    fn cancelled_or_failed_initialization_attempt_is_retried() {
+        let store = BrainStore::with_root("box.local", None);
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let cancelled = store
+            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .unwrap();
+        assert!(store
+            .cancel_schedule("shared", "alice", cancelled.schedule_id)
+            .unwrap());
+        let retry = store
+            .schedule_initialization("shared", "alice", attachment.attachment_id, 20)
+            .unwrap();
+        assert_ne!(retry.schedule_id, cancelled.schedule_id);
+
+        let run = store.queue_due_schedules("shared", 20).unwrap().remove(0);
+        store
+            .transition_run(
+                "shared",
+                "daemon:runner",
+                run.run_id,
+                BrainRunStatus::Failed,
+                Some("retryable initialization failure".into()),
+            )
+            .unwrap();
+        let second_retry = store
+            .schedule_initialization("shared", "alice", attachment.attachment_id, 30)
+            .unwrap();
+        assert_ne!(second_retry.schedule_id, retry.schedule_id);
+        assert!(second_retry.active);
+    }
+
+    #[test]
+    fn delivered_or_completed_initialization_is_idempotent_across_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let schedule = store
+            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .unwrap();
+        let run = store.queue_due_schedules("shared", 10).unwrap().remove(0);
+        let delivered = store
+            .schedule_initialization("shared", "alice", attachment.attachment_id, 20)
+            .unwrap();
+        assert_eq!(delivered.schedule_id, schedule.schedule_id);
+        store
+            .transition_run(
+                "shared",
+                "daemon:runner",
+                run.run_id,
+                BrainRunStatus::Running,
+                None,
+            )
+            .unwrap();
+        store
+            .transition_run(
+                "shared",
+                "daemon:runner",
+                run.run_id,
+                BrainRunStatus::Completed,
+                None,
+            )
+            .unwrap();
+        drop(store);
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let reattached = restarted
+            .attach(
+                "shared",
+                "alice",
+                AttachmentRole::Driver,
+                Some(attachment.attachment_id),
+            )
+            .unwrap();
+        restarted
+            .activate_connection(
+                "shared",
+                reattached.attachment_id,
+                reattached.connection_id.unwrap(),
+            )
+            .unwrap();
+        let completed = restarted
+            .schedule_initialization("shared", "alice", attachment.attachment_id, 30)
+            .unwrap();
+        assert_eq!(completed.schedule_id, schedule.schedule_id);
+        assert_eq!(restarted.snapshot("shared").unwrap().schedules.len(), 1);
     }
 
     #[tokio::test]
