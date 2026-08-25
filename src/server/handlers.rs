@@ -2499,6 +2499,7 @@ pub(crate) fn execute_authorized_remote_initialization(
     connection_id: crate::brain::store::ConnectionId,
     request_id: u64,
     next_due_ms: u64,
+    mutation: Option<crate::brain::store::BrainMutationReceipt>,
 ) -> crate::ipc::brain_codec::BrainRemoteReply {
     use crate::brain::credential::BrainCredentialScope;
     use crate::ipc::brain_codec::BrainRemoteReply;
@@ -2521,11 +2522,12 @@ pub(crate) fn execute_authorized_remote_initialization(
             "Brain credential participant no longer matches this attachment",
         );
     }
-    match lifecycle.schedule_initialization(
+    match lifecycle.schedule_initialization_with_receipt(
         name,
         attachment_id,
         connection_id,
         next_due_ms,
+        mutation,
     ) {
         Ok(schedule) => BrainRemoteReply::InitializationScheduled {
             request_id,
@@ -2581,7 +2583,8 @@ async fn execute_remote_brain_command(
             | BrainRemoteCommandKind::CreateSchedule { .. }
             | BrainRemoteCommandKind::CancelRunnerHandoff(_)
             | BrainRemoteCommandKind::CancelRun(_)
-            | BrainRemoteCommandKind::CancelSchedule(_) => true,
+            | BrainRemoteCommandKind::CancelSchedule(_)
+            | BrainRemoteCommandKind::ScheduleInitialization { .. } => true,
             _ => false,
         };
         // Target-addressed cancellations and initialization scheduling are
@@ -2985,6 +2988,7 @@ async fn execute_remote_brain_command(
                 connection_id,
                 request_id,
                 next_due_ms,
+                mutation_receipt,
             )
         }
     }

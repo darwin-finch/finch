@@ -1332,6 +1332,31 @@ impl RemoteBrainClient {
         }
     }
 
+    pub async fn prepare_schedule_initialization_mutation(
+        &self,
+        next_due_ms: u64,
+    ) -> Result<BrainMutationHandle> {
+        self.prepare_mutation(
+            &crate::ipc::brain_codec::BrainRemoteCommandKind::ScheduleInitialization {
+                next_due_ms,
+            },
+        ).await
+    }
+
+    pub async fn schedule_initialization_with_handle(
+        &self,
+        next_due_ms: u64,
+        handle: &BrainMutationHandle,
+    ) -> Result<super::store::BrainSchedule> {
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+        match self.send_remote_command_with_handle(
+            BrainRemoteCommandKind::ScheduleInitialization { next_due_ms }, Some(handle),
+        ).await? {
+            BrainRemoteReply::InitializationScheduled { schedule, .. } => Ok(schedule),
+            reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
+        }
+    }
+
     pub async fn disconnect(&self) -> Result<()> {
         use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
@@ -3816,6 +3841,13 @@ mod tests {
             connection_id: uuid::Uuid,
         }
 
+        async fn snapshot_route(
+            State(fixture): State<Fixture>,
+            Path(name): Path<String>,
+        ) -> axum::Json<BrainSnapshot> {
+            axum::Json(fixture.lifecycle.snapshot(&name).unwrap())
+        }
+
         async fn websocket(
             State(fixture): State<Fixture>,
             headers: HeaderMap,
@@ -3874,6 +3906,7 @@ mod tests {
                             connection_id,
                             request_id,
                             next_due_ms,
+                            None,
                         ),
                         _ => break,
                     };
@@ -3942,6 +3975,7 @@ mod tests {
         let (consultant_token, consultant_claims) = bind(&consultant);
 
         let app = Router::new()
+            .route("/v1/brains/named/:name", get(snapshot_route))
             .route("/v1/brains/named/:name/ws", get(websocket))
             .with_state(Fixture {
                 lifecycle,

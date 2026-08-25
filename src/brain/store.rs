@@ -1102,10 +1102,40 @@ impl BrainStore {
         connection_id: ConnectionId,
         next_due_ms: u64,
     ) -> Result<BrainSchedule> {
+        self.schedule_initialization_with_receipt(
+            name, initiating_attachment_id, connection_id, next_due_ms, None,
+        )
+    }
+
+    pub fn schedule_initialization_with_receipt(
+        &self,
+        name: &str,
+        initiating_attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        next_due_ms: u64,
+        mutation: Option<BrainMutationReceipt>,
+    ) -> Result<BrainSchedule> {
         let name = Self::validate_name(name)?;
         let initialization = self.initialization(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        if let Some(receipt) = mutation.as_ref() {
+            if let Some(existing) = state.events.iter().find(|event| {
+                event.mutation.as_ref().is_some_and(|recorded| {
+                    recorded.attachment_id == receipt.attachment_id
+                        && recorded.mutation_id == receipt.mutation_id
+                })
+            }) {
+                anyhow::ensure!(existing.mutation.as_ref() == Some(receipt),
+                    "Brain mutation idempotency key was reused with a different command or precondition");
+                let BrainEventKind::ScheduleChanged { schedule } = &existing.kind else {
+                    anyhow::bail!("replayed mutation outcome is not an initialization schedule");
+                };
+                anyhow::ensure!(schedule.module_identity.is_some(),
+                    "replayed schedule is not Brain initialization");
+                return Ok(schedule.clone());
+            }
+        }
         let attachment = state.attachments.get(&initiating_attachment_id)
             .context("initialization scheduler attachment does not exist")?;
         anyhow::ensure!(
@@ -1134,6 +1164,10 @@ impl BrainStore {
                 .clone();
             initialization.validate_schedule(&existing)?;
             if existing.active {
+                if let Some(receipt) = mutation {
+                    self.push_idempotent_locked(name, state, &sender,
+                        BrainEventKind::ScheduleChanged { schedule: existing.clone() }, receipt)?;
+                }
                 return Ok(existing);
             }
             let run_status = state.events.iter().rev().find_map(|event| match &event.kind {
@@ -1152,6 +1186,10 @@ impl BrainStore {
                         | BrainRunStatus::Interrupted
                 )
             }) {
+                if let Some(receipt) = mutation {
+                    self.push_idempotent_locked(name, state, &sender,
+                        BrainEventKind::ScheduleChanged { schedule: existing.clone() }, receipt)?;
+                }
                 return Ok(existing);
             }
         }
@@ -1169,9 +1207,11 @@ impl BrainStore {
             active: true,
         };
         initialization.validate_schedule(&schedule)?;
-        self.push_locked(name, state, &sender, BrainEventKind::ScheduleChanged {
-            schedule: schedule.clone(),
-        })?;
+        let kind = BrainEventKind::ScheduleChanged { schedule: schedule.clone() };
+        match mutation {
+            Some(receipt) => { self.push_idempotent_locked(name, state, &sender, kind, receipt)?; }
+            None => { self.push_locked(name, state, &sender, kind)?; }
+        }
         Ok(schedule)
     }
 

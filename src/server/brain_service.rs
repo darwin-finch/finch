@@ -101,6 +101,19 @@ impl BrainLifecycleService {
         )
     }
 
+    pub fn schedule_initialization_with_receipt(
+        &self,
+        brain: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        next_due_ms: u64,
+        receipt: Option<crate::brain::store::BrainMutationReceipt>,
+    ) -> Result<BrainSchedule> {
+        self.store.schedule_initialization_with_receipt(
+            brain, attachment_id, connection_id, next_due_ms, receipt,
+        )
+    }
+
     pub fn list(&self) -> Result<Vec<String>> {
         self.store.list()
     }
