@@ -2327,12 +2327,18 @@ mod tests {
             ipc.brain_detach(&local_brain, &local_ack).await.unwrap();
             let local_snapshot = ipc.brain_snapshot(&local_brain).await.unwrap();
 
-            let target =
-                RemoteBrainTarget::parse(&format!("{remote_brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}"))
-                    .unwrap();
-            let mut remote = RemoteBrainClient::new(target, "loopback").unwrap();
+            let daemon_address = crate::config::constants::DEFAULT_DAEMON_ADDR;
+            let owner_password = crate::config::load_config().unwrap().server.brain_password;
+            let target = RemoteBrainTarget::local(&remote_brain, daemon_address).unwrap();
+            let owner = RemoteBrainClient::new(target.clone(), owner_password.clone()).unwrap();
+            owner.create().await.unwrap();
+            let (invitation, _) = owner
+                .issue_invitation(AttachmentRole::Driver, Some(60_000))
+                .await
+                .unwrap();
+            let mut remote = RemoteBrainClient::new_with_invitation(target, invitation).unwrap();
             remote
-                .attach("conformance@localhost", AttachmentRole::Driver, None)
+                .attach_invited_persistent("conformance@localhost", "conformance-live")
                 .await
                 .unwrap();
             let mut remote_events = remote.watch().await.unwrap();
@@ -2375,16 +2381,13 @@ mod tests {
 
             drop(local_events);
             drop(remote_events);
-            for brain in [&local_brain, &remote_brain] {
-                let target =
-                    RemoteBrainTarget::parse(&format!("{brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}"))
-                        .unwrap();
-                RemoteBrainClient::new(target, "loopback")
-                    .unwrap()
-                    .archive("conformance@localhost")
-                    .await
-                    .unwrap();
-            }
+            owner.archive("conformance@localhost").await.unwrap();
+            let local_target = RemoteBrainTarget::local(&local_brain, daemon_address).unwrap();
+            RemoteBrainClient::new(local_target, owner_password)
+                .unwrap()
+                .archive("conformance@localhost")
+                .await
+                .unwrap();
         }));
     }
 
@@ -2425,11 +2428,16 @@ mod tests {
                 .await
                 .unwrap();
 
-            let target = RemoteBrainTarget::parse(&format!(
-                "{brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}"
-            ))
+            let target = RemoteBrainTarget::local(
+                &brain,
+                crate::config::constants::DEFAULT_DAEMON_ADDR,
+            )
             .unwrap();
-            let mut controller = RemoteBrainClient::new(target, "loopback").unwrap();
+            let password = crate::config::load_config()
+                .unwrap()
+                .server
+                .brain_password;
+            let mut controller = RemoteBrainClient::new(target, password).unwrap();
             controller
                 .authorize_runner_handoff_control(
                     "codex-control@localhost",
@@ -2467,7 +2475,9 @@ mod tests {
             controller
                 .http
                 .delete(format!(
-                    "http://127.0.0.1:{DEFAULT_BRAIN_PORT}/v1/brains/credentials/{controller_credential_id}"
+                    "{}://{}/v1/brains/credentials/{controller_credential_id}",
+                    controller.target.http_scheme(),
+                    controller.target.address,
                 ))
                 .send()
                 .await
