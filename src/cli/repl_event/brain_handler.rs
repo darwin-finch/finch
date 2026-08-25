@@ -4,6 +4,54 @@
 // no client-local speculative Brain session: background work must enter the
 // canonical service as a correlated BrainRun.
 
+fn normalize_environment_machine(machine: &str) -> String {
+    let machine = machine.trim();
+    if machine.contains('.') {
+        machine.to_string()
+    } else {
+        format!("{machine}.local")
+    }
+}
+
+fn verify_frontend_environment(
+    expected: &crate::brain::shared::BrainEnvironment,
+    actual_machine: &str,
+    actual_workspace: &std::path::Path,
+) -> Result<()> {
+    let actual_workspace = actual_workspace
+        .canonicalize()
+        .unwrap_or_else(|_| actual_workspace.to_path_buf());
+    let expected_workspace = expected
+        .workspace
+        .canonicalize()
+        .unwrap_or_else(|_| expected.workspace.clone());
+    anyhow::ensure!(
+        normalize_environment_machine(actual_machine)
+            == normalize_environment_machine(&expected.machine),
+        "frontend machine does not match the Brain environment (expected {}, found {})",
+        expected.machine,
+        actual_machine
+    );
+    anyhow::ensure!(
+        actual_workspace == expected_workspace,
+        "frontend workspace does not match the Brain environment (expected {}, found {})",
+        expected_workspace.display(),
+        actual_workspace.display()
+    );
+    Ok(())
+}
+
+fn verify_local_frontend_environment(
+    expected: &crate::brain::shared::BrainEnvironment,
+) -> Result<()> {
+    let machine = hostname::get()
+        .ok()
+        .and_then(|value| value.into_string().ok())
+        .context("could not identify the frontend machine")?;
+    let workspace = std::env::current_dir().context("could not identify the frontend workspace")?;
+    verify_frontend_environment(expected, &machine, &workspace)
+}
+
 impl EventLoop {
     /// Update the vocabulary panel from partially typed input. This is local
     /// presentation only and never starts provider or workspace work.
@@ -35,6 +83,7 @@ impl EventLoop {
             return Ok(None);
         };
         let snapshot = ipc.brain_snapshot(&self.session_label).await?;
+        verify_local_frontend_environment(&snapshot.environment)?;
         let initial = ipc
             .brain_acquire_runner(
                 &self.session_label,
@@ -564,6 +613,7 @@ impl EventLoop {
         let selected_target = selected.target.clone();
         let snapshot = selected.snapshot().await?;
         let handoff = Self::selected_handoff(&snapshot, requested.as_deref())?;
+        verify_local_frontend_environment(&snapshot.environment)?;
         anyhow::ensure!(
             handoff.target_subject == self.runner_subject,
             "runner handoff is addressed to {}, not this frontend ({})",
@@ -682,5 +732,32 @@ impl EventLoop {
         ));
         self.update_remote_brain_status(true);
         self.render_tui().await
+    }
+}
+
+#[cfg(test)]
+mod brain_handler_tests {
+    use super::*;
+
+    #[test]
+    fn frontend_environment_requires_the_exact_machine_and_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let expected = crate::brain::shared::BrainEnvironment {
+            machine: "workstation.local".into(),
+            workspace: temp.path().to_path_buf(),
+            generation: 1,
+        };
+        verify_frontend_environment(&expected, "workstation", temp.path()).unwrap();
+
+        let wrong_machine = verify_frontend_environment(&expected, "other", temp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_machine.contains("machine does not match"));
+
+        let other = tempfile::tempdir().unwrap();
+        let wrong_workspace = verify_frontend_environment(&expected, "workstation", other.path())
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_workspace.contains("workspace does not match"));
     }
 }
