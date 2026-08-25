@@ -881,8 +881,10 @@ still blocks the corresponding Brain phase until it is unified.
   hostname and canonical workspace exactly match the Brain environment. A live daemon test transfers
   a registered runner, revokes the requesting controller before its next command, proves only a
   freshly authorized driver and the target callback receive the next ProgramRun, and observes the
-  correlated durable result. Close the remaining scope-specific hostile/replay cases before
-  completing this least-privilege milestone.
+  correlated durable result. The transport-neutral submission gate now also rejects consultant
+  prompts before they can append an event or create a run; consultants contribute relay-only
+  `ParticipantMessage` context unless separately granted approval authority. Close the remaining
+  scope-specific hostile/replay cases before completing this least-privilege milestone.
 - [ ] Revisit shared channels only after the Brain event log, runner lease, and participant-role
   model are complete. The eventual channel should be a threaded/multi-participant projection of a
   Brain: people and models share one durable conversation, while programs run only on the remote
