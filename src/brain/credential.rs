@@ -10,7 +10,7 @@ use hmac::{Hmac, Mac};
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -250,7 +250,29 @@ struct RevocationFile {
 #[derive(Debug, Serialize, Deserialize)]
 struct ConsumedInvitationFile {
     version: u32,
+    #[serde(default)]
     invitation_ids: BTreeSet<uuid::Uuid>,
+    #[serde(default)]
+    redemptions: BTreeMap<uuid::Uuid, InvitationRedemption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InvitationRedemption {
+    subject: String,
+}
+
+#[derive(Debug, Default)]
+struct ConsumedInvitations {
+    /// Invitations consumed before retry-safe redemption was introduced.
+    legacy_burned: BTreeSet<uuid::Uuid>,
+    redemptions: BTreeMap<uuid::Uuid, InvitationRedemption>,
+}
+
+impl ConsumedInvitations {
+    fn is_consumed(&self, invitation_id: uuid::Uuid) -> bool {
+        self.legacy_burned.contains(&invitation_id)
+            || self.redemptions.contains_key(&invitation_id)
+    }
 }
 
 #[derive(Clone)]
@@ -258,7 +280,7 @@ pub struct BrainCredentialAuthority {
     signing_key: Arc<[u8; 32]>,
     revoked: Arc<Mutex<BTreeSet<uuid::Uuid>>>,
     revocations_path: Option<Arc<PathBuf>>,
-    consumed_invitations: Arc<Mutex<BTreeSet<uuid::Uuid>>>,
+    consumed_invitations: Arc<Mutex<ConsumedInvitations>>,
     consumed_invitations_path: Option<Arc<PathBuf>>,
 }
 
@@ -289,7 +311,7 @@ impl BrainCredentialAuthority {
             signing_key: Arc::new(signing_key),
             revoked: Arc::new(Mutex::new(BTreeSet::new())),
             revocations_path: None,
-            consumed_invitations: Arc::new(Mutex::new(BTreeSet::new())),
+            consumed_invitations: Arc::new(Mutex::new(ConsumedInvitations::default())),
             consumed_invitations_path: None,
         }
     }
@@ -391,16 +413,17 @@ impl BrainCredentialAuthority {
             .consumed_invitations
             .lock()
             .expect("Brain invitation lock poisoned")
-            .contains(&claims.invitation_id)
+            .is_consumed(claims.invitation_id)
         {
             anyhow::bail!("Brain invitation has already been redeemed");
         }
         Ok(claims)
     }
 
-    /// Atomically burn one invitation and mint the ordinary participant
-    /// credential used by every later attachment operation. Concurrent or
-    /// post-restart replays fail before producing a second credential.
+    /// Atomically bind one invitation to a participant and mint the ordinary
+    /// credential used by every later attachment operation. A retry by the
+    /// same subject returns that exact credential (including after restart),
+    /// while a different subject can never receive a second grant.
     pub fn redeem_invitation(
         &self,
         token: &str,
@@ -415,28 +438,27 @@ impl BrainCredentialAuthority {
             .consumed_invitations
             .lock()
             .expect("Brain invitation lock poisoned");
-        if consumed.contains(&invitation.invitation_id) {
-            anyhow::bail!("Brain invitation has already been redeemed");
+        if consumed.legacy_burned.contains(&invitation.invitation_id) {
+            anyhow::bail!("Brain invitation was redeemed before retry-safe recovery was available");
         }
-        let credential = self.issue(
-            BrainCredentialRequest {
-                issuer: invitation.issuer.clone(),
+        if let Some(redemption) = consumed.redemptions.get(&invitation.invitation_id) {
+            if redemption.subject != subject {
+                anyhow::bail!("Brain invitation has already been redeemed by another participant");
+            }
+            let claims = invitation_credential_claims(&invitation, subject);
+            return Ok((self.sign(&claims)?, claims));
+        }
+        let claims = invitation_credential_claims(&invitation, subject);
+        let credential = self.sign(&claims)?;
+        consumed.redemptions.insert(
+            invitation.invitation_id,
+            InvitationRedemption {
                 subject: subject.to_string(),
-                brain_id: invitation.brain_id,
-                brain: invitation.brain.clone(),
-                environment_generation: invitation.environment_generation,
-                role: invitation.role,
-                scopes: invitation.scopes.clone(),
-                delegation_chain: invitation.delegation_chain.clone(),
-                ttl_ms: invitation.expires_ms - now_ms,
             },
-            now_ms,
-        )?;
-        let claims = self.verify(&credential, now_ms)?;
-        consumed.insert(invitation.invitation_id);
+        );
         if let Some(path) = &self.consumed_invitations_path {
             if let Err(error) = persist_consumed_invitations(path, &consumed) {
-                consumed.remove(&invitation.invitation_id);
+                consumed.redemptions.remove(&invitation.invitation_id);
                 return Err(error);
             }
         }
@@ -722,7 +744,32 @@ fn persist_revocations(path: &Path, revoked: &BTreeSet<uuid::Uuid>) -> Result<()
     Ok(())
 }
 
-fn load_consumed_invitations(path: &Path) -> Result<BTreeSet<uuid::Uuid>> {
+fn invitation_credential_claims(
+    invitation: &BrainInvitationClaims,
+    subject: &str,
+) -> BrainCredentialClaims {
+    BrainCredentialClaims {
+        version: CREDENTIAL_VERSION,
+        // The invitation ID is already a random, domain-separated authority
+        // identity. Reusing it here makes retry reconstruction deterministic
+        // without persisting a bearer token at rest.
+        credential_id: invitation.invitation_id,
+        issuer: invitation.issuer.clone(),
+        subject: subject.to_string(),
+        brain_id: invitation.brain_id,
+        brain: invitation.brain.clone(),
+        environment_generation: invitation.environment_generation,
+        role: invitation.role,
+        scopes: invitation.scopes.clone(),
+        attachment_id: None,
+        connection_id: None,
+        delegation_chain: invitation.delegation_chain.clone(),
+        issued_ms: invitation.issued_ms,
+        expires_ms: invitation.expires_ms,
+    }
+}
+
+fn load_consumed_invitations(path: &Path) -> Result<ConsumedInvitations> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let file: ConsumedInvitationFile = serde_json::from_slice(&bytes)
@@ -733,20 +780,26 @@ fn load_consumed_invitations(path: &Path) -> Result<BTreeSet<uuid::Uuid>> {
                     file.version
                 );
             }
-            Ok(file.invitation_ids)
+            Ok(ConsumedInvitations {
+                legacy_burned: file.invitation_ids,
+                redemptions: file.redemptions,
+            })
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ConsumedInvitations::default())
+        }
         Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
     }
 }
 
 fn persist_consumed_invitations(
     path: &Path,
-    consumed: &BTreeSet<uuid::Uuid>,
+    consumed: &ConsumedInvitations,
 ) -> Result<()> {
     let file = ConsumedInvitationFile {
         version: CREDENTIAL_VERSION,
-        invitation_ids: consumed.clone(),
+        invitation_ids: consumed.legacy_burned.clone(),
+        redemptions: consumed.redemptions.clone(),
     };
     let encoded = serde_json::to_vec_pretty(&file)?;
     let parent = path
@@ -1037,6 +1090,11 @@ mod tests {
         assert_eq!(claims.expires_ms, invitation_claims.expires_ms);
         assert_eq!(authority.verify(&credential, 10_200).unwrap(), claims);
         assert!(authority.inspect_invitation(&invitation, 10_200).is_err());
+        let (retried, retried_claims) = authority
+            .redeem_invitation(&invitation, "bob@desktop.local", 10_200)
+            .unwrap();
+        assert_eq!(retried, credential);
+        assert_eq!(retried_claims, claims);
         assert!(authority
             .redeem_invitation(&invitation, "mallory@box.local", 10_200)
             .is_err());
@@ -1049,11 +1107,16 @@ mod tests {
         let (invitation, _) = authority
             .issue_invitation(invitation_request(10_000), 10_000)
             .unwrap();
-        authority
+        let (credential, claims) = authority
             .redeem_invitation(&invitation, "bob@desktop.local", 10_100)
             .unwrap();
 
         let restarted = BrainCredentialAuthority::load_or_create(temp.path()).unwrap();
+        let (retried, retried_claims) = restarted
+            .redeem_invitation(&invitation, "bob@desktop.local", 10_200)
+            .unwrap();
+        assert_eq!(retried, credential);
+        assert_eq!(retried_claims, claims);
         assert!(restarted
             .redeem_invitation(&invitation, "mallory@box.local", 10_200)
             .is_err());
