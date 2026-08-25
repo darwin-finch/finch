@@ -47,12 +47,30 @@ impl ClaudeClient {
         // predates named providers and always carries a Claude-oriented model
         // field, so forwarding it would override Grok/OpenAI/etc. configuration.
         let model = self.provider.default_model();
-        let mut provider_req = ProviderRequest::new(request.messages.clone())
+        // The event-driven frontend expresses request-local persona and VM
+        // context as system-role messages. Collapse those into the provider's
+        // native system field so Anthropic-compatible APIs never receive an
+        // invalid system role in `messages`, while OpenAI-compatible providers
+        // still get exactly one leading system instruction.
+        let mut system_parts = request.system.iter().cloned().collect::<Vec<_>>();
+        let mut messages = Vec::with_capacity(request.messages.len());
+        for message in &request.messages {
+            if message.role == "system" {
+                let text = message.text_content();
+                if !text.trim().is_empty() {
+                    system_parts.push(text);
+                }
+            } else {
+                messages.push(message.clone());
+            }
+        }
+
+        let mut provider_req = ProviderRequest::new(messages)
             .with_model(model)
             .with_max_tokens(request.max_tokens);
 
-        if let Some(system) = &request.system {
-            provider_req = provider_req.with_system(system.clone());
+        if !system_parts.is_empty() {
+            provider_req = provider_req.with_system(system_parts.join("\n\n"));
         }
 
         if let Some(tools) = &request.tools {
@@ -134,5 +152,29 @@ mod tests {
         let converted = client.to_provider_request(&request);
 
         assert_eq!(converted.model, "grok-code-fast-1");
+    }
+
+    #[test]
+    fn request_system_messages_reach_native_provider_system_field_once() {
+        let client = ClaudeClient::with_provider(Box::new(ConfiguredProvider));
+        let request = MessageRequest::with_context(vec![
+            crate::claude::Message::with_content(
+                "system",
+                vec![crate::claude::ContentBlock::text(
+                    "SELECTED PERSONA\n\n## Finch VM wire protocol\nWIRE",
+                )],
+            ),
+            crate::claude::Message::user("Hello"),
+        ])
+        .with_system("PROVIDER BOOT");
+
+        let converted = client.to_provider_request(&request);
+
+        assert_eq!(converted.messages.len(), 1);
+        assert_eq!(converted.messages[0].role, "user");
+        let system = converted.system.expect("native system prompt");
+        assert!(system.contains("PROVIDER BOOT"));
+        assert!(system.contains("SELECTED PERSONA"));
+        assert_eq!(system.matches("## Finch VM wire protocol").count(), 1);
     }
 }

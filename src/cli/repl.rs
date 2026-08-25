@@ -1753,6 +1753,7 @@ impl Repl {
         // Create EventLoop with all dependencies
         let mut event_loop = EventLoop::new(
             Arc::clone(&self.conversation),
+            Arc::clone(&self.active_persona),
             claude_gen,
             qwen_gen,
             Arc::new(self.router.clone()),

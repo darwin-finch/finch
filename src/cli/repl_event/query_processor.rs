@@ -861,6 +861,7 @@ pub(crate) async fn process_query_with_tools(
         RwLock<std::collections::HashMap<Uuid, std::collections::HashMap<String, u32>>>,
     >,
     wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
+    persona_system_prompt: String,
 ) {
     tracing::debug!(
         "process_query_with_tools starting for query_id: {:?}",
@@ -912,7 +913,9 @@ pub(crate) async fn process_query_with_tools(
             let window = apply_sliding_window(all_msgs, max_verbatim);
             let compactor =
                 crate::cli::conversation_compactor::ConversationCompactor::new(summary_gen);
-            compactor.compact(&dropped, window).await
+            compactor
+                .compact_with_system(&dropped, window, Some(persona_system_prompt.clone()))
+                .await
         } else {
             apply_sliding_window(all_msgs, max_verbatim)
         };
@@ -951,6 +954,7 @@ pub(crate) async fn process_query_with_tools(
                 .unwrap_or_else(|_| fallback_vm_manifest()),
             None => fallback_vm_manifest(),
         };
+        inject_persona_system_prompt(&mut msgs, persona_system_prompt);
         inject_vm_manifest(&mut msgs, &manifest);
         msgs
     };
@@ -1392,6 +1396,21 @@ fn should_stream_responses(streaming_enabled: bool, provider_supports_streaming:
     streaming_enabled && provider_supports_streaming
 }
 
+fn inject_persona_system_prompt(
+    messages: &mut Vec<crate::claude::Message>,
+    persona_system_prompt: String,
+) {
+    messages.insert(
+        0,
+        crate::claude::Message {
+            role: "system".to_string(),
+            content: vec![ContentBlock::Text {
+                text: persona_system_prompt,
+            }],
+        },
+    );
+}
+
 fn inject_vm_manifest(
     messages: &mut Vec<crate::claude::Message>,
     manifest: &crate::programs::VmManifest,
@@ -1627,6 +1646,46 @@ mod tests {
         assert!(!should_stream_responses(false, true));
         assert!(!should_stream_responses(true, false));
         assert!(!should_stream_responses(false, false));
+    }
+
+    #[test]
+    fn persona_is_request_local_and_owns_one_system_instruction() {
+        let original = vec![crate::claude::Message::user("hello")];
+        let mut request = original.clone();
+
+        inject_persona_system_prompt(&mut request, "CUSTOM PERSONA".into());
+        assert!(inject_vm_manifest(&mut request, &fallback_vm_manifest()));
+
+        assert_eq!(original.len(), 1, "canonical conversation was not mutated");
+        assert_eq!(
+            request.iter().filter(|message| message.role == "system").count(),
+            1
+        );
+        let system = request[0].text_content();
+        assert!(system.contains("CUSTOM PERSONA"));
+        assert_eq!(system.matches("## Finch VM wire protocol").count(), 1);
+    }
+
+    #[test]
+    fn next_request_uses_newly_selected_or_reloaded_persona() {
+        let mut custom = crate::config::Persona::default();
+        custom.behavior.system_prompt = "CUSTOM OVERRIDE CONTENT".into();
+        let reloaded = crate::config::Persona::load_builtin("analyst").unwrap();
+
+        let mut custom_request = vec![crate::claude::Message::user("first")];
+        inject_persona_system_prompt(&mut custom_request, custom.to_system_message());
+        let mut reloaded_request = vec![crate::claude::Message::user("second")];
+        inject_persona_system_prompt(&mut reloaded_request, reloaded.to_system_message());
+
+        assert!(custom_request[0]
+            .text_content()
+            .contains("CUSTOM OVERRIDE CONTENT"));
+        assert!(reloaded_request[0]
+            .text_content()
+            .contains(&reloaded.behavior.system_prompt));
+        assert!(!reloaded_request[0]
+            .text_content()
+            .contains("CUSTOM OVERRIDE CONTENT"));
     }
 
     #[tokio::test]

@@ -47,11 +47,23 @@ impl ConversationCompactor {
     /// `window`.  Returns `window` unchanged if `dropped` is empty or if
     /// the summarisation call fails.
     pub async fn compact(&self, dropped: &[Message], window: Vec<Message>) -> Vec<Message> {
+        self.compact_with_system(dropped, window, None).await
+    }
+
+    /// Compact while applying request-local system context to the summarizer.
+    /// The system message is sent to the provider but never copied into the
+    /// returned conversation window.
+    pub async fn compact_with_system(
+        &self,
+        dropped: &[Message],
+        window: Vec<Message>,
+        system: Option<String>,
+    ) -> Vec<Message> {
         if dropped.is_empty() {
             return window;
         }
 
-        match self.summarize(dropped).await {
+        match self.summarize(dropped, system).await {
             Ok(summary) => inject_summary_prefix(summary, window),
             Err(e) => {
                 tracing::warn!("Conversation summarisation failed, keeping window as-is: {e}");
@@ -61,7 +73,7 @@ impl ConversationCompactor {
     }
 
     /// Call the generator to produce a concise summary of `messages`.
-    async fn summarize(&self, messages: &[Message]) -> Result<String> {
+    async fn summarize(&self, messages: &[Message], system: Option<String>) -> Result<String> {
         let conversation_text = format_messages_for_summary(messages);
         let prompt = format!(
             "Summarise the following conversation history concisely (2-5 sentences). \
@@ -69,7 +81,14 @@ impl ConversationCompactor {
              to continue the conversation naturally:\n\n{conversation_text}"
         );
 
-        let req = vec![Message::user(prompt)];
+        let mut req = Vec::with_capacity(2);
+        if let Some(system) = system {
+            req.push(Message::with_content(
+                "system",
+                vec![ContentBlock::text(system)],
+            ));
+        }
+        req.push(Message::user(prompt));
         let resp = self.generator.generate(req, None).await?;
         Ok(resp.text.trim().to_string())
     }
