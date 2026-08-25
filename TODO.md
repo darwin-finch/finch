@@ -1167,6 +1167,15 @@ still blocks the corresponding Brain phase until it is unified.
   rotation. Keep consumption, retry identity, revocation, attenuation, and attachment binding as
   durable capability state. Version both envelope forms and test downgrade, key rotation, endpoint
   substitution, invite theft/racing, and cross-node replay.
+- [ ] Make `/brain invite` publish the actual certificate-valid TLS collaboration endpoint, not the
+  loopback plaintext daemon address used to mint the invitation. Include the configured TLS port,
+  prefer the daemon's `.local` machine identity (or another hostname covered by the embedded
+  certificate), and refuse to print a recipient command when remote collaboration/listener
+  configuration is disabled or unreachable. Keep hostname verification enabled, surface safe
+  connect/TLS diagnostics from `/brain join`, and cover the generated command plus live-style
+  redemption with regression tests. Keep `/brain attach NAME` on the existing local Cap'n Proto
+  socket (never loopback HTTP/password bootstrap), reserve remote attachment for
+  `/brain join NAME@MACHINE[:PORT] INVITE`, and show that specific usage for incomplete joins.
 - [ ] Enforce least privilege independently for event visibility, prompt/program submission,
   approval, control-lease ownership, workspace effects, environment changes, credential minting,
   and distributed inference. mDNS advertisement and discovery now use an authority-free metadata
