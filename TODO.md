@@ -197,18 +197,6 @@ still blocks the corresponding Brain phase until it is unified.
   unit cannot pretend those commits or effects rolled back. Incomplete Lisp forms and incomplete
   Co-Forth definitions/control regions remain visible source only and never execute. Preserve an
   explicit single-language mode for self-contained scripts, conformance fixtures, and diagnostics.
-- [ ] Explore the original IRC-like token stream as a separate protocol/language frontend, not as
-  Co-Forth reader sugar or an assumed-compatible ProgramSubmission mode. It is a pushdown
-  transducer: every token is handled by the current parser-frame stack and may mutate that stack,
-  schedule an action/effect, or retain a continuation whose meaning depends on following tokens.
-  Thus postfix Co-Forth `"Hello" say` materializes a value before selecting an effect, while stream
-  syntax such as `SAY #channel "Hello"` lets `SAY` install a frame first and potentially consume the
-  payload incrementally for that destination. Define programmable typed token/frame handlers,
-  nesting, bounded lookahead, recovery, and per-transition verification/capability/commit semantics;
-  a never-ending stream cannot rely on whole-program verification. It may share typed values,
-  vocabulary metadata, host effects, and some IR operations with Lisp/Co-Forth without sharing
-  their parsing semantics. An LLM may inspect, explain, or explicitly propose unknown meanings,
-  but must not become the trusted parser for already-defined transitions.
 - [x] Add one bounded provider-wire repair turn for reader/type/capability diagnostics. Preserve the
   rejected source and its diagnostic as journaled program/output WorkUnits, send the structured
   error plus exact source back to the same provider, and render any replacement as a new program
@@ -759,11 +747,6 @@ still blocks the corresponding Brain phase until it is unified.
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work
   must be separately scheduled/approved BrainRuns. Do not revive the legacy mutable
   `boot = true` Co-Forth registry as an ambient startup hook.
-- [ ] After the VM gate, design an optional reviewed **semantic-convergence corpus** for a Brain:
-  versioned examples, equivalences, claims, and executable proofs that document how human/LLM
-  symbols acquire shared meaning. It may inform a provider manifest and be refined through
-  explicit proposals, but it must never silently redefine core words or execute as ambient boot
-  poetry.
 - [x] Add the first per-Brain runner lease and participant-role substrate. Attachments persist as
   `runner`, `driver`, `consultant`, or `observer`; remote attachment creation cannot mint runners;
   roles constrain submission; and the status/list projections report the authoritative role and
