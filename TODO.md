@@ -786,14 +786,17 @@ still blocks the corresponding Brain phase until it is unified.
   immediately, accepts a decision only from that attachment, persists the decision before resuming
   the runner, and deduplicates the final lifecycle flush.
 - [ ] Complete Brain control and approval ownership above that substrate. Put the role and approval
-  audience on every permission/proposal view and add scoped participant credentials. ProgramRuns
+  audience on every permission/proposal view. ProgramRuns
   now execute on the leased frontend. Each approval request now carries the daemon-selected
   initiating attachment ID, subject, actual participant role, Brain identity, and environment
   generation through Cap'n Proto into tool, VM-capability, and editor-backed proposal views; the
   daemon rejects a runner that substitutes that audience before journaling it. The exact addressed
   console now presents the ordinary tool/VM dialog and returns its structured decision through the
-  canonical log; disconnect/cancellation fails the suspended continuation closed. Still authorize
-  participants with scoped credentials and define explicit delegation and handoff semantics.
+  canonical log; disconnect/cancellation fails the suspended continuation closed. Remote clients
+  now bootstrap into signed, expiring, revocable credentials bound to Brain ID, environment
+  generation, subject, role, and independent scopes; every ordinary route rechecks that live
+  audience and the exact attachment identity. Still define explicit delegation and handoff
+  semantics.
 - [x] Persist a frontend attachment identity across frontend process restarts, not merely reconnects
   in one process, while keeping the daemon cursor authoritative. The client stores only the opaque
   attachment ID, keyed by durable Brain ID plus console slot/subject/role; the daemon still owns the
@@ -805,10 +808,13 @@ still blocks the corresponding Brain phase until it is unified.
   pending connection without moving its durable acknowledgement cursor or Brain revision.
 - [ ] Add remote brain creation while preserving the invariant that one environment is an
   indivisible machine/workspace authority boundary.
-- [ ] Treat the global brain password as a local/bootstrap credential only. Mint scoped, revocable,
+- [x] Treat the global brain password as a local/bootstrap credential only. Mint scoped, revocable,
   expiring participant credentials containing subject, audience, brain, environment generation,
   and permitted roles. Initial scopes: `brain:read`, `brain:submit`, `brain:approve`,
-  `brain:control`, `environment:execute`, `environment:admin`, and `compute:submit`.
+  `brain:control`, `environment:execute`, `environment:admin`, and `compute:submit`. A daemon-owned
+  random signing secret and revocation ledger survive restart; the password is accepted only by
+  authenticated discovery/bootstrap/administration routes, and the client refreshes its scoped
+  credential without reverting ordinary operations to the password.
 - [ ] Enforce least privilege independently for event visibility, prompt/program submission,
   approval, control-lease ownership, workspace effects, environment changes, credential minting,
   and distributed inference. Never advertise credentials in mDNS discovery records.
