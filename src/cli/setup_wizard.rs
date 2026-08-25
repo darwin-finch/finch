@@ -251,6 +251,9 @@ pub enum ModelConfig {
         execution: ExecutionTarget,
         inference_provider: InferenceProvider,
         enabled: bool,
+        /// Original profile metadata that the local-model editor does not
+        /// expose yet (stable name, repository, and resolved model path).
+        persisted: Option<ProviderEntry>,
     },
     Remote {
         provider: String,
@@ -301,6 +304,39 @@ impl ModelConfig {
     }
 }
 
+/// Convert a persisted provider profile into the wizard's editable model form.
+/// Local providers live only in the unified provider list, not the legacy
+/// `teachers` projection.
+fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
+    match provider {
+        ProviderEntry::Local {
+            inference_provider,
+            execution_target,
+            model_family,
+            model_size,
+            enabled,
+            ..
+        } => Some(ModelConfig::Local {
+            family: *model_family,
+            size: *model_size,
+            execution: *execution_target,
+            inference_provider: *inference_provider,
+            enabled: *enabled,
+            persisted: Some(provider.clone()),
+        }),
+        _ => provider.to_teacher_entry().map(|teacher| ModelConfig::Remote {
+            provider: teacher.provider.clone(),
+            name: teacher
+                .name
+                .clone()
+                .unwrap_or_else(|| teacher.provider.clone()),
+            api_key: teacher.api_key,
+            model: teacher.model.unwrap_or_default(),
+            enabled: true,
+        }),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PersonaInfo {
     slug: String, // Key used to load the persona (e.g. "expert-coder")
@@ -338,43 +374,48 @@ impl WizardState {
             SectionState::Themes { selected_theme },
         );
 
-        // Models section - unified Backend + Teachers
-        let primary_model = if let Some(config) = existing_config {
-            if config.backend.enabled {
-                // Local model is primary
-                ModelConfig::Local {
-                    family: config.backend.model_family,
-                    size: config.backend.model_size,
-                    execution: config.backend.execution_target,
-                    inference_provider: config.backend.inference_provider,
-                    enabled: true,
+        // The ordered unified provider list is authoritative and includes
+        // local secondary models. The legacy teachers projection does not.
+        let mut configured_models: Vec<ModelConfig> = existing_config
+            .map(|config| {
+                config
+                    .providers
+                    .iter()
+                    .filter_map(model_config_from_provider)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Compatibility for Config values constructed from the old split
+        // backend/teachers fields by tests or older callers.
+        if configured_models.is_empty() {
+            if let Some(config) = existing_config {
+                if config.backend.enabled {
+                    configured_models.push(ModelConfig::Local {
+                        family: config.backend.model_family,
+                        size: config.backend.model_size,
+                        execution: config.backend.execution_target,
+                        inference_provider: config.backend.inference_provider,
+                        enabled: true,
+                        persisted: None,
+                    });
                 }
-            } else if let Some(teacher) = config.active_teacher() {
-                // Remote API is primary
-                ModelConfig::Remote {
-                    provider: teacher.provider.clone(),
-                    name: teacher
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| teacher.provider.clone()),
-                    api_key: teacher.api_key.clone(),
-                    model: teacher.model.clone().unwrap_or_default(),
-                    enabled: true,
-                }
-            } else {
-                // Default: remote Claude - try to auto-detect key
-                let detected_key = detect_anthropic_api_key()
-                    .or_else(detect_xai_api_key)
-                    .unwrap_or_default();
-                ModelConfig::Remote {
-                    provider: "claude".to_string(),
-                    name: "claude".to_string(),
-                    api_key: detected_key,
-                    model: String::new(),
-                    enabled: true,
-                }
+                configured_models.extend(config.teachers.iter().map(|teacher| {
+                    ModelConfig::Remote {
+                        provider: teacher.provider.clone(),
+                        name: teacher
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| teacher.provider.clone()),
+                        api_key: teacher.api_key.clone(),
+                        model: teacher.model.clone().unwrap_or_default(),
+                        enabled: true,
+                    }
+                }));
             }
-        } else {
+        }
+
+        let primary_model = if configured_models.is_empty() {
             // Default: remote Claude - try to auto-detect key
             let detected_key = detect_anthropic_api_key()
                 .or_else(detect_xai_api_key)
@@ -386,23 +427,11 @@ impl WizardState {
                 model: String::new(),
                 enabled: true,
             }
+        } else {
+            configured_models.remove(0)
         };
 
-        let tool_models: Vec<ModelConfig> = existing_config
-            .map(|c| {
-                c.teachers
-                    .iter()
-                    .skip(1) // Skip first teacher (that's the primary)
-                    .map(|t| ModelConfig::Remote {
-                        provider: t.provider.clone(),
-                        name: t.name.clone().unwrap_or_else(|| t.provider.clone()),
-                        api_key: t.api_key.clone(),
-                        model: t.model.clone().unwrap_or_default(),
-                        enabled: true,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let tool_models = configured_models;
 
         sections.insert(
             WizardSection::Models,
@@ -1344,6 +1373,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     execution,
                                     inference_provider,
                                     enabled: true,
+                                    persisted: None,
                                 };
                                 *selected_idx = 0;
                             } else {
@@ -1353,6 +1383,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     execution,
                                     inference_provider,
                                     enabled: true,
+                                    persisted: None,
                                 });
                                 *selected_idx = tool_models.len();
                             }
@@ -2084,35 +2115,58 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         }
     }
 
-    // Build unified providers list from the same models
-    let mut providers: Vec<ProviderEntry> = Vec::new();
-    for t in &teachers {
-        providers.push(ProviderEntry::from_teacher_entry(t));
-    }
-    if backend_enabled {
-        use crate::config::BackendConfig;
-        let backend = BackendConfig {
-            enabled: true,
-            inference_provider,
-            execution_target,
-            model_family,
-            model_size,
-            model_repo: None,
-            ..Default::default()
-        };
-        let local_name = format!(
-            "local-{}-{}",
-            model_family.name().to_ascii_lowercase().replace(' ', "-"),
-            model_size
-                .to_size_string(model_family)
-                .to_ascii_lowercase()
-                .replace(' ', "-")
-        );
-        providers.push(ProviderEntry::from_backend_config(
-            &backend,
-            Some(local_name),
-        ));
-    }
+    // Rebuild the unified provider list in the exact order shown. Remote
+    // models have already been normalized in `teachers`; local models must be
+    // emitted directly because they have no teacher representation.
+    let mut remote_entries = teachers.iter().map(ProviderEntry::from_teacher_entry);
+    let providers: Vec<ProviderEntry> = std::iter::once(&primary_model)
+        .chain(tool_models.iter())
+        .enumerate()
+        .filter_map(|(index, model)| match model {
+            ModelConfig::Remote { enabled, .. } if index == 0 || *enabled => {
+                remote_entries.next()
+            }
+            ModelConfig::Remote { .. } => None,
+            ModelConfig::Local {
+                family,
+                size,
+                execution,
+                inference_provider,
+                enabled,
+                persisted,
+            } => {
+                let (name, model_repo, model_path) = match persisted {
+                    Some(ProviderEntry::Local {
+                        name,
+                        model_repo,
+                        model_path,
+                        ..
+                    }) => (name.clone(), model_repo.clone(), model_path.clone()),
+                    _ => (
+                        Some(format!(
+                            "local-{}-{}",
+                            family.name().to_ascii_lowercase().replace(' ', "-"),
+                            size.to_size_string(*family)
+                                .to_ascii_lowercase()
+                                .replace(' ', "-")
+                        )),
+                        None,
+                        None,
+                    ),
+                };
+                Some(ProviderEntry::Local {
+                    inference_provider: *inference_provider,
+                    execution_target: *execution,
+                    model_family: *family,
+                    model_size: *size,
+                    model_repo,
+                    model_path,
+                    enabled: *enabled,
+                    name,
+                })
+            }
+        })
+        .collect();
 
     Ok(SetupResult {
         active_theme,
@@ -4431,6 +4485,7 @@ mod tests {
                 execution: ExecutionTarget::Cpu,
                 inference_provider: InferenceProvider::Onnx,
                 enabled: true,
+                persisted: None,
             };
         }
         let result = build_setup_result(&state).unwrap();
@@ -4470,6 +4525,7 @@ mod tests {
             execution: ExecutionTarget::Cpu,
             inference_provider: InferenceProvider::Onnx,
             enabled: true,
+            persisted: None,
         };
         if let ModelConfig::Local {
             inference_provider, ..
@@ -4505,5 +4561,70 @@ mod tests {
         } else {
             panic!("expected Local primary when backend is enabled");
         }
+    }
+
+    #[test]
+    fn test_cloud_primary_keeps_local_qwen_as_tool_model_on_reopen() {
+        use crate::config::{Config, ProviderEntry};
+
+        let original = Config::with_providers(vec![
+            ProviderEntry::Grok {
+                api_key: "xai-test-key".to_string(),
+                model: Some("grok-code-fast-1".to_string()),
+                name: Some("grok-code-fast-1".to_string()),
+            },
+            ProviderEntry::Local {
+                inference_provider: InferenceProvider::Onnx,
+                execution_target: ExecutionTarget::CoreML,
+                model_family: ModelFamily::Qwen2,
+                model_size: ModelSize::Small,
+                model_repo: Some("onnx-community/Qwen2.5-Coder-3B-Instruct".to_string()),
+                model_path: Some("/models/qwen-coder".into()),
+                enabled: true,
+                name: Some("local-qwen".to_string()),
+            },
+        ]);
+
+        let state = WizardState::new(Some(&original));
+        assert!(matches!(
+            get_primary(&state),
+            Some(ModelConfig::Remote { provider, .. }) if provider == "grok"
+        ));
+        assert!(matches!(
+            get_tool_models(&state).as_slice(),
+            [ModelConfig::Local {
+                family: ModelFamily::Qwen2,
+                size: ModelSize::Small,
+                execution: ExecutionTarget::CoreML,
+                ..
+            }]
+        ));
+
+        let saved = build_setup_result(&state).unwrap();
+        assert_eq!(saved.providers.len(), 2);
+        assert!(matches!(saved.providers[0], ProviderEntry::Grok { .. }));
+        assert!(matches!(
+            saved.providers[1],
+            ProviderEntry::Local {
+                model_family: ModelFamily::Qwen2,
+                model_size: ModelSize::Small,
+                execution_target: ExecutionTarget::CoreML,
+                model_repo: Some(ref repo),
+                model_path: Some(ref path),
+                name: Some(ref name),
+                ..
+            } if repo == "onnx-community/Qwen2.5-Coder-3B-Instruct"
+                && path == &std::path::PathBuf::from("/models/qwen-coder")
+                && name == "local-qwen"
+        ));
+
+        let reopened = WizardState::new(Some(&Config::with_providers(saved.providers)));
+        assert!(matches!(
+            get_tool_models(&reopened).as_slice(),
+            [ModelConfig::Local {
+                family: ModelFamily::Qwen2,
+                ..
+            }]
+        ));
     }
 }
