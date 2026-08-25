@@ -14,7 +14,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use crate::ipc::brain_codec::{
     decode_approval_audience, decode_brain_submission, decode_environment, encode_approval_audience,
     encode_attachment, encode_brain_submission_outcome, encode_event, encode_runner_handoff,
-    encode_run, encode_runner_lease, encode_snapshot,
+    encode_run, encode_runner_lease, encode_schedule, encode_snapshot,
 };
 use crate::ipc::checkpoint_codec::{decode_checkpoint, encode_checkpoint};
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_service, finch_daemon};
@@ -750,6 +750,140 @@ impl brain_service::Server for BrainRpcService {
         })
     }
 
+    fn create_schedule(
+        &mut self,
+        params: brain_service::CreateScheduleParams,
+        mut results: brain_service::CreateScheduleResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let connection_id = match parse_connection_id(params.get_connection_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        if let Err(error) = self.runners.require_connection_attachment(
+            self.connection_id,
+            &brain,
+            attachment_id,
+            connection_id,
+        ) {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        let language = match params.get_language() {
+            Ok(language) => program_language_from_capnp(language),
+            Err(error) => return Promise::err(error.into()),
+        };
+        let source = pry!(params.get_source()).to_str().unwrap_or("").to_string();
+        let grant_ceiling = match params
+            .get_grant_ceiling()
+            .map_err(anyhow::Error::from)
+            .and_then(crate::ipc::checkpoint_codec::decode_effects)
+        {
+            Ok(effects) => effects,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let policy = match params.get_policy() {
+            Ok(policy) => match policy.get_kind() {
+                Ok(finch_ipc_capnp::BrainSchedulePolicyKind::Coalesce) => {
+                    crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce
+                }
+                Ok(finch_ipc_capnp::BrainSchedulePolicyKind::BoundedCatchUp) => {
+                    crate::brain::store::BrainScheduleDeliveryPolicy::BoundedCatchUp {
+                        max_catch_up: policy.get_max_catch_up(),
+                        expires_after_ms: policy.get_expires_after_ms(),
+                    }
+                }
+                Err(error) => return Promise::err(error.into()),
+            },
+            Err(error) => return Promise::err(error),
+        };
+        let schedule = match self.lifecycle.create_schedule(
+            &brain,
+            attachment_id,
+            connection_id,
+            language,
+            source,
+            grant_ceiling,
+            params.get_next_due_ms(),
+            params
+                .get_has_interval_ms()
+                .then(|| params.get_interval_ms()),
+            policy,
+        ) {
+            Ok(schedule) => schedule,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        encode_schedule(results.get().init_schedule(), &schedule);
+        Promise::ok(())
+    }
+
+    fn inspect_schedule(
+        &mut self,
+        params: brain_service::InspectScheduleParams,
+        mut results: brain_service::InspectScheduleResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let schedule_id = match parse_schedule_id(params.get_schedule_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        match self.lifecycle.inspect_schedule(&brain, schedule_id) {
+            Ok(Some(schedule)) => {
+                results.get().set_found(true);
+                encode_schedule(results.get().init_schedule(), &schedule);
+                Promise::ok(())
+            }
+            Ok(None) => Promise::ok(()),
+            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+        }
+    }
+
+    fn cancel_schedule(
+        &mut self,
+        params: brain_service::CancelScheduleParams,
+        mut results: brain_service::CancelScheduleResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let connection_id = match parse_connection_id(params.get_connection_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let schedule_id = match parse_schedule_id(params.get_schedule_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        if let Err(error) = self.runners.require_connection_attachment(
+            self.connection_id,
+            &brain,
+            attachment_id,
+            connection_id,
+        ) {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        match self.lifecycle.cancel_schedule(
+            &brain,
+            attachment_id,
+            connection_id,
+            schedule_id,
+        ) {
+            Ok(cancelled) => {
+                results.get().set_cancelled(cancelled);
+                Promise::ok(())
+            }
+            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+        }
+    }
+
     fn claim_runner_identity(
         &mut self,
         params: brain_service::ClaimRunnerIdentityParams,
@@ -793,6 +927,15 @@ fn parse_run_id(
     let value = value?.to_str()?;
     uuid::Uuid::parse_str(value)
         .map(crate::brain::store::RunId)
+        .map_err(|error| capnp::Error::failed(error.to_string()))
+}
+
+fn parse_schedule_id(
+    value: capnp::Result<capnp::text::Reader<'_>>,
+) -> Result<crate::brain::store::ScheduleId, capnp::Error> {
+    let value = value?.to_str()?;
+    uuid::Uuid::parse_str(value)
+        .map(crate::brain::store::ScheduleId)
         .map_err(|error| capnp::Error::failed(error.to_string()))
 }
 

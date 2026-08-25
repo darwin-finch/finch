@@ -944,7 +944,7 @@ pub(super) fn decode_run(
     })
 }
 
-fn encode_schedule(
+pub(crate) fn encode_schedule(
     mut builder: finch_ipc_capnp::brain_schedule::Builder<'_>,
     schedule: &BrainSchedule,
 ) {
@@ -977,7 +977,7 @@ fn encode_schedule(
     builder.set_active(schedule.active);
 }
 
-fn decode_schedule(
+pub(crate) fn decode_schedule(
     reader: finch_ipc_capnp::brain_schedule::Reader<'_>,
 ) -> anyhow::Result<BrainSchedule> {
     let policy = reader.get_delivery_policy()?;

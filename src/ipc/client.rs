@@ -14,8 +14,8 @@ use crate::claude::{ContentBlock, Message};
 use crate::generators::StreamChunk;
 use crate::ipc::brain_codec::{
     decode_approval_audience, decode_attachment, decode_brain_wire_reader, decode_event,
-    decode_run, decode_runner_handoff, decode_runner_lease, decode_snapshot, encode_approval_audience,
-    encode_brain_submission, encode_environment,
+    decode_run, decode_runner_handoff, decode_runner_lease, decode_schedule, decode_snapshot,
+    encode_approval_audience, encode_brain_submission, encode_environment,
 };
 use crate::ipc::checkpoint_codec::{decode_checkpoint, encode_checkpoint};
 use crate::ipc::schema::finch_ipc_capnp::{
@@ -205,6 +205,107 @@ impl IpcClient {
         }
         let reply = request.send().promise.await?;
         decode_run(reply.get()?.get_run()?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn brain_create_schedule(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::store::BrainAttachment,
+        language: crate::brain::store::ProgramLanguage,
+        source: &str,
+        grant_ceiling: &crate::vm::EffectSet,
+        next_due_ms: u64,
+        interval_ms: Option<u64>,
+        delivery_policy: &crate::brain::store::BrainScheduleDeliveryPolicy,
+    ) -> Result<crate::brain::store::BrainSchedule> {
+        let connection_id = attachment
+            .connection_id
+            .context("Brain attachment has no live connection")?;
+        let service = self.brain_service().await?;
+        let mut request = service.create_schedule_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_attachment_id(&attachment.attachment_id.0.to_string());
+            params.set_connection_id(&connection_id.0.to_string());
+            params.set_language(match language {
+                crate::brain::store::ProgramLanguage::Forth => {
+                    finch_ipc_capnp::ProgramLanguage::Forth
+                }
+                crate::brain::store::ProgramLanguage::Lisp => {
+                    finch_ipc_capnp::ProgramLanguage::Lisp
+                }
+            });
+            params.set_source(source);
+            crate::ipc::checkpoint_codec::encode_effects(
+                params
+                    .reborrow()
+                    .init_grant_ceiling(grant_ceiling.0.len() as u32),
+                grant_ceiling,
+            );
+            params.set_next_due_ms(next_due_ms);
+            if let Some(interval_ms) = interval_ms {
+                params.set_has_interval_ms(true);
+                params.set_interval_ms(interval_ms);
+            }
+            let mut policy = params.reborrow().init_policy();
+            match delivery_policy {
+                crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce => {
+                    policy.set_kind(finch_ipc_capnp::BrainSchedulePolicyKind::Coalesce)
+                }
+                crate::brain::store::BrainScheduleDeliveryPolicy::BoundedCatchUp {
+                    max_catch_up,
+                    expires_after_ms,
+                } => {
+                    policy.set_kind(finch_ipc_capnp::BrainSchedulePolicyKind::BoundedCatchUp);
+                    policy.set_max_catch_up(*max_catch_up);
+                    policy.set_expires_after_ms(*expires_after_ms);
+                }
+            }
+        }
+        let reply = request.send().promise.await?;
+        decode_schedule(reply.get()?.get_schedule()?)
+    }
+
+    pub async fn brain_inspect_schedule(
+        &self,
+        brain: &str,
+        schedule_id: crate::brain::store::ScheduleId,
+    ) -> Result<Option<crate::brain::store::BrainSchedule>> {
+        let service = self.brain_service().await?;
+        let mut request = service.inspect_schedule_request();
+        request.get().set_brain(brain);
+        request.get().set_schedule_id(&schedule_id.0.to_string());
+        let reply = request.send().promise.await?;
+        let reply = reply.get()?;
+        reply
+            .get_found()
+            .then(|| reply.get_schedule())
+            .transpose()?
+            .map(decode_schedule)
+            .transpose()
+    }
+
+    pub async fn brain_cancel_schedule(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::store::BrainAttachment,
+        schedule_id: crate::brain::store::ScheduleId,
+    ) -> Result<bool> {
+        let connection_id = attachment
+            .connection_id
+            .context("Brain attachment has no live connection")?;
+        let service = self.brain_service().await?;
+        let mut request = service.cancel_schedule_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_attachment_id(&attachment.attachment_id.0.to_string());
+            params.set_connection_id(&connection_id.0.to_string());
+            params.set_schedule_id(&schedule_id.0.to_string());
+        }
+        Ok(request.send().promise.await?.get()?.get_cancelled())
     }
 
     pub async fn brain_attach(

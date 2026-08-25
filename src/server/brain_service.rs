@@ -9,8 +9,9 @@ use tokio::sync::broadcast;
 
 use crate::brain::store::{
     AttachmentId, AttachmentRole, BrainAttachment, BrainEnvironment, BrainEvent, BrainEventKind,
-    BrainRun, BrainRunKind, BrainRunStatus, BrainRunnerHandoff, BrainRunnerLease, BrainSnapshot,
-    ConnectionId, RunId, RunnerHandoffId, RunnerLeaseId, BrainStore,
+    BrainRun, BrainRunKind, BrainRunStatus, BrainRunnerHandoff, BrainRunnerLease, BrainSchedule,
+    BrainScheduleDeliveryPolicy, BrainSnapshot, BrainStore, ConnectionId, ProgramLanguage, RunId,
+    RunnerHandoffId, RunnerLeaseId, ScheduleId,
 };
 
 use super::{handlers, AgentServer, BrainApprovalBroker, BrainRunnerBroker};
@@ -116,6 +117,61 @@ impl BrainLifecycleService {
 
     pub fn inspect_run(&self, brain: &str, run_id: RunId) -> Result<BrainRun> {
         self.store.inspect_run(brain, run_id)
+    }
+
+    pub fn inspect_schedule(
+        &self,
+        brain: &str,
+        schedule_id: ScheduleId,
+    ) -> Result<Option<BrainSchedule>> {
+        self.store.inspect_schedule(brain, schedule_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_schedule(
+        &self,
+        brain: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        language: ProgramLanguage,
+        source: String,
+        grant_ceiling: crate::vm::EffectSet,
+        next_due_ms: u64,
+        interval_ms: Option<u64>,
+        delivery_policy: BrainScheduleDeliveryPolicy,
+    ) -> Result<BrainSchedule> {
+        let attachment = self.connection(brain, attachment_id, connection_id)?;
+        ensure!(
+            attachment.role == AttachmentRole::Driver,
+            "only a Brain driver can create a schedule"
+        );
+        self.store.create_schedule(
+            brain,
+            &attachment.subject,
+            attachment_id,
+            language,
+            source,
+            grant_ceiling,
+            next_due_ms,
+            interval_ms,
+            delivery_policy,
+        )
+    }
+
+    pub fn cancel_schedule(
+        &self,
+        brain: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        schedule_id: ScheduleId,
+    ) -> Result<bool> {
+        let attachment = self.connection(brain, attachment_id, connection_id)?;
+        ensure!(
+            attachment.role == AttachmentRole::Driver,
+            "only a Brain driver can cancel a schedule"
+        );
+        self.store
+            .cancel_schedule(brain, &attachment.subject, schedule_id)
     }
 
     pub fn attach(
@@ -619,6 +675,83 @@ mod tests {
             .attach("shared", "runner", AttachmentRole::Runner, None)
             .unwrap_err();
         assert!(error.to_string().contains("runner lease"));
+    }
+
+    #[tokio::test]
+    async fn schedule_lifecycle_requires_a_driver_and_preserves_the_grant_ceiling() {
+        let service = service();
+        let driver = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let driver_connection = driver.connection_id.unwrap();
+        let _driver_watch = service
+            .watch("shared", driver.attachment_id, driver_connection)
+            .unwrap();
+        let observer = service
+            .attach("shared", "eve", AttachmentRole::Observer, None)
+            .unwrap();
+        let observer_connection = observer.connection_id.unwrap();
+        let _observer_watch = service
+            .watch("shared", observer.attachment_id, observer_connection)
+            .unwrap();
+        let grant_ceiling = crate::vm::EffectSet(std::collections::BTreeSet::from([
+            crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::VmRead,
+                selector: crate::vm::ResourceSelector::None,
+            },
+        ]));
+
+        assert!(service
+            .create_schedule(
+                "shared",
+                observer.attachment_id,
+                observer_connection,
+                ProgramLanguage::Lisp,
+                "(say \"no\")".into(),
+                grant_ceiling.clone(),
+                100,
+                None,
+                BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .is_err());
+
+        let created = service
+            .create_schedule(
+                "shared",
+                driver.attachment_id,
+                driver_connection,
+                ProgramLanguage::Lisp,
+                "(say \"later\")".into(),
+                grant_ceiling.clone(),
+                100,
+                Some(50),
+                BrainScheduleDeliveryPolicy::BoundedCatchUp {
+                    max_catch_up: 2,
+                    expires_after_ms: 1_000,
+                },
+            )
+            .unwrap();
+        assert_eq!(created.created_by, "alice");
+        assert_eq!(created.grant_ceiling, grant_ceiling);
+        assert_eq!(
+            service
+                .inspect_schedule("shared", created.schedule_id)
+                .unwrap(),
+            Some(created.clone())
+        );
+        assert!(service
+            .cancel_schedule(
+                "shared",
+                driver.attachment_id,
+                driver_connection,
+                created.schedule_id,
+            )
+            .unwrap());
+        assert!(!service
+            .inspect_schedule("shared", created.schedule_id)
+            .unwrap()
+            .unwrap()
+            .active);
     }
 
     #[tokio::test]

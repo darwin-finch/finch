@@ -1304,6 +1304,25 @@ interface BrainService {
   # connection before acquiring or accepting a lease. The claim disappears
   # with the connection and cannot be replayed by another local client.
   claimRunnerIdentity @13 (subject :Text) -> ();
+
+  createSchedule @14 (brain :Text,
+                      attachmentId :Text,
+                      connectionId :Text,
+                      language :ProgramLanguage,
+                      source :Text,
+                      grantCeiling :List(CapabilityRequirement),
+                      nextDueMs :UInt64,
+                      hasIntervalMs :Bool,
+                      intervalMs :UInt64,
+                      policy :BrainScheduleDeliveryPolicy) -> (schedule :BrainSchedule);
+
+  inspectSchedule @15 (brain :Text, scheduleId :Text) ->
+                      (found :Bool, schedule :BrainSchedule);
+
+  cancelSchedule @16 (brain :Text,
+                      attachmentId :Text,
+                      connectionId :Text,
+                      scheduleId :Text) -> (cancelled :Bool);
 }
 
 # ---------------------------------------------------------------------------
