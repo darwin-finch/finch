@@ -140,24 +140,12 @@ pub(crate) fn suspend_terminal_for_editor() {
     // Finch renders on the terminal's primary screen so conversation history
     // remains useful shell scrollback. Give full-screen editors a disposable
     // screen even when the selected editor does not enter one itself.
-    execute!(
-        std::io::stdout(),
-        terminal::EnterAlternateScreen,
-        terminal::Clear(terminal::ClearType::All),
-        cursor::MoveTo(0, 0),
-    )
-    .ok();
+    enter_editor_screen(&mut std::io::stdout()).ok();
     std::io::stdout().flush().ok();
 }
 
 pub(crate) fn resume_terminal_after_editor() {
-    execute!(
-        std::io::stdout(),
-        terminal::LeaveAlternateScreen,
-        cursor::Show,
-        ResetColor,
-    )
-    .ok();
+    leave_editor_screen(&mut std::io::stdout()).ok();
     terminal::enable_raw_mode().ok();
     execute!(
         std::io::stdout(),
@@ -169,6 +157,130 @@ pub(crate) fn resume_terminal_after_editor() {
     .ok();
     crate::request_tui_rebuild();
     crate::set_editor_active(false);
+}
+
+fn enter_editor_screen(writer: &mut impl std::io::Write) -> std::io::Result<()> {
+    execute!(
+        writer,
+        terminal::EnterAlternateScreen,
+        terminal::Clear(terminal::ClearType::All),
+        cursor::MoveTo(0, 0),
+    )
+}
+
+fn leave_editor_screen(writer: &mut impl std::io::Write) -> std::io::Result<()> {
+    // Always issue the matching leave, even when a full-screen child emitted
+    // its own enter/leave pair. Alternate screens do not stack on common
+    // terminals, so the child's leave may already have selected the primary
+    // screen; this final idempotent leave still guarantees Finch does not
+    // resume rendering into an alternate screen.
+    execute!(
+        writer,
+        terminal::LeaveAlternateScreen,
+        cursor::Show,
+        ResetColor,
+    )
+}
+
+trait EditorTerminalControl: Send + Sync + 'static {
+    fn set_editor_active(&self, active: bool);
+    fn suspend(&self);
+    fn restore(&self, terminal_was_suspended: bool);
+}
+
+#[derive(Clone, Copy)]
+struct ProductionTerminalControl;
+
+impl EditorTerminalControl for ProductionTerminalControl {
+    fn set_editor_active(&self, active: bool) {
+        crate::set_editor_active(active);
+    }
+
+    fn suspend(&self) {
+        suspend_terminal_for_editor();
+    }
+
+    fn restore(&self, terminal_was_suspended: bool) {
+        if terminal_was_suspended {
+            resume_terminal_after_editor();
+        } else {
+            // The render loop may have skipped a frame while the handoff was
+            // pending even though the terminal itself was never mutated.
+            crate::request_tui_rebuild();
+            crate::set_editor_active(false);
+        }
+    }
+}
+
+struct TerminalRestorer<C: EditorTerminalControl> {
+    control: C,
+    terminal_was_suspended: bool,
+}
+
+impl<C: EditorTerminalControl> TerminalRestorer<C> {
+    fn new(control: C) -> Self {
+        control.set_editor_active(true);
+        Self {
+            control,
+            terminal_was_suspended: false,
+        }
+    }
+
+    fn suspend(&mut self) {
+        // Arm the full restore before the first terminal mutation. A panic in
+        // the terminal writer must still release the editor gate.
+        self.terminal_was_suspended = true;
+        self.control.suspend();
+    }
+}
+
+impl<C: EditorTerminalControl> Drop for TerminalRestorer<C> {
+    fn drop(&mut self) {
+        self.control.restore(self.terminal_was_suspended);
+    }
+}
+
+async fn run_editor_lifecycle<C, F, T>(
+    tui_mode: bool,
+    grace_period: Duration,
+    control: C,
+    editor_work: F,
+) -> Result<T>
+where
+    C: EditorTerminalControl,
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    if !tui_mode {
+        return spawn_blocking(editor_work).await?;
+    }
+
+    // Construct the guard before the only async cancellation point. Dropping
+    // this future during the grace period releases the gate and redraws once.
+    let mut restore = TerminalRestorer::new(control);
+    tokio::time::sleep(grace_period).await;
+    restore.suspend();
+
+    spawn_blocking(move || {
+        let _restore = restore;
+        editor_work()
+    })
+    .await?
+}
+
+#[cfg(test)]
+impl<T: EditorTerminalControl> EditorTerminalControl for std::sync::Arc<T> {
+    fn set_editor_active(&self, active: bool) {
+        (**self).set_editor_active(active);
+    }
+
+    fn suspend(&self) {
+        (**self).suspend();
+    }
+
+    fn restore(&self, terminal_was_suspended: bool) {
+        (**self).restore(terminal_was_suspended);
+    }
 }
 
 /// Split the conventional `$VISUAL`/`$EDITOR` form without involving a shell.
@@ -230,6 +342,39 @@ pub(crate) fn run_editor(path: &Path) -> Result<std::process::ExitStatus> {
         .status()?)
 }
 
+fn edit_artifact(
+    content: &str,
+    suffix: &str,
+    executable: bool,
+    comment_prefix: &str,
+    editor: impl FnOnce(&Path) -> Result<std::process::ExitStatus>,
+) -> Result<Option<String>> {
+    let mut tmp = Builder::new().prefix("finch_").suffix(suffix).tempfile()?;
+
+    tmp.write_all(content.as_bytes())?;
+    tmp.flush()?;
+    let path = tmp.path().to_owned();
+
+    #[cfg(unix)]
+    if executable {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms)?;
+    }
+
+    if !editor(&path)?.success() {
+        return Ok(None);
+    }
+
+    let modified = std::fs::read_to_string(&path)?;
+    let has_source = modified.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.is_empty() && !line.trim_start().starts_with(comment_prefix)
+    });
+    Ok(has_source.then_some(modified))
+}
+
 /// Write `script` to a temp `.sh` file, open `$EDITOR`, read back the result.
 ///
 /// Returns `Some(script)` if the user saved a non-empty file, `None` if they
@@ -263,80 +408,13 @@ async fn propose_in_editor_with_suffix(
     let script = build_artifact(description, code, comment_prefix, executable);
     let tui_mode = crate::is_tui_active();
 
-    if tui_mode {
-        // Gate the render loop so it won't write crossterm sequences while the
-        // editor has the terminal.
-        crate::set_editor_active(true);
-        // Give any in-flight render one tick (33 ms) to finish.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // The terminal restore runs inside spawn_blocking so that disable/enable
-    // raw mode are always paired even if the closure returns early via `?`.
-    spawn_blocking(move || {
-        // RAII: restore terminal state no matter how the closure exits.
-        struct TerminalRestorer {
-            tui_mode: bool,
-        }
-        impl Drop for TerminalRestorer {
-            fn drop(&mut self) {
-                if self.tui_mode {
-                    resume_terminal_after_editor();
-                }
-            }
-        }
-        let _restore = TerminalRestorer { tui_mode };
-
-        if tui_mode {
-            // Flush any pending TUI output before handing the terminal to the editor.
-            suspend_terminal_for_editor();
-        }
-
-        // Preserve the artifact language for editor syntax highlighting.
-        let mut tmp = Builder::new().prefix("finch_").suffix(suffix).tempfile()?;
-
-        tmp.write_all(script.as_bytes())?;
-        tmp.flush()?;
-
-        let path = tmp.path().to_owned();
-
-        // Make shell artifacts executable so the user can test them directly
-        // in a terminal. Other proposal kinds are intentionally only data.
-        #[cfg(unix)]
-        if executable {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path)?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms)?;
-        }
-
-        // Open the editor.  Fall back to vi if $EDITOR is not set.
-        // $VISUAL is the POSIX full-screen editor variable (preferred for diff editors).
-        // Fall back to $EDITOR, then vi.
-        let status = run_editor(&path)?;
-
-        if !status.success() {
-            // Editor exited non-zero — treat as abort.
-            return Ok(None);
-        }
-
-        // Read back whatever the user left in the file.
-        let modified = std::fs::read_to_string(&path)?;
-
-        // Keep if any non-comment, non-blank lines remain.
-        let executable_content = modified
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
-            .count();
-
-        if executable_content == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(modified))
-        }
-        // _restore drops here: enable_raw_mode + set_editor_active(false)
-    })
-    .await?
+    run_editor_lifecycle(
+        tui_mode,
+        Duration::from_millis(50),
+        ProductionTerminalControl,
+        move || edit_artifact(&script, suffix, executable, comment_prefix, run_editor),
+    )
+    .await
 }
 
 /// Format the English description + code as a commented shell script.
@@ -424,59 +502,13 @@ pub async fn propose_forth_in_editor(description: &str, code: &str) -> Result<Op
     let content = format!("{header}\n{code}");
     let tui_mode = crate::is_tui_active();
 
-    if tui_mode {
-        crate::set_editor_active(true);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    spawn_blocking(move || {
-        struct TerminalRestorer {
-            tui_mode: bool,
-        }
-        impl Drop for TerminalRestorer {
-            fn drop(&mut self) {
-                if self.tui_mode {
-                    resume_terminal_after_editor();
-                }
-            }
-        }
-        let _restore = TerminalRestorer { tui_mode };
-
-        if tui_mode {
-            suspend_terminal_for_editor();
-        }
-
-        let mut tmp = Builder::new()
-            .prefix("finch_")
-            .suffix(".forth")
-            .tempfile()?;
-
-        tmp.write_all(content.as_bytes())?;
-        tmp.flush()?;
-        let path = tmp.path().to_owned();
-
-        // $VISUAL is the POSIX full-screen editor variable (preferred for diff editors).
-        // Fall back to $EDITOR, then vi.
-        let status = run_editor(&path)?;
-
-        if !status.success() {
-            return Ok(None);
-        }
-
-        let modified = std::fs::read_to_string(&path)?;
-        let executable = modified
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('\\') && !l.trim().is_empty())
-            .count();
-
-        if executable == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(modified))
-        }
-        // _restore drops here
-    })
-    .await?
+    run_editor_lifecycle(
+        tui_mode,
+        Duration::from_millis(50),
+        ProductionTerminalControl,
+        move || edit_artifact(&content, ".forth", false, "\\", run_editor),
+    )
+    .await
 }
 
 /// Run a shell script string via `bash -c`.
@@ -501,6 +533,81 @@ pub fn run_script(script: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    static LIFECYCLE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Debug, Default)]
+    struct LifecycleCounts {
+        gate_enabled: usize,
+        gate_disabled: usize,
+        suspends: usize,
+        restores: usize,
+        rebuilds: usize,
+    }
+
+    #[derive(Default)]
+    struct TestTerminalControl {
+        counts: Mutex<LifecycleCounts>,
+        output: Mutex<Vec<u8>>,
+    }
+
+    impl EditorTerminalControl for TestTerminalControl {
+        fn set_editor_active(&self, active: bool) {
+            let mut counts = self.counts.lock().unwrap();
+            if active {
+                counts.gate_enabled += 1;
+            } else {
+                counts.gate_disabled += 1;
+            }
+            crate::set_editor_active(active);
+        }
+
+        fn suspend(&self) {
+            self.counts.lock().unwrap().suspends += 1;
+            enter_editor_screen(&mut *self.output.lock().unwrap()).unwrap();
+        }
+
+        fn restore(&self, terminal_was_suspended: bool) {
+            let mut counts = self.counts.lock().unwrap();
+            counts.restores += 1;
+            counts.rebuilds += 1;
+            counts.gate_disabled += 1;
+            drop(counts);
+            if terminal_was_suspended {
+                leave_editor_screen(&mut *self.output.lock().unwrap()).unwrap();
+            }
+            crate::request_tui_rebuild();
+            crate::set_editor_active(false);
+        }
+    }
+
+    fn reset_terminal_globals() {
+        crate::set_editor_active(false);
+        crate::take_tui_rebuild();
+    }
+
+    fn assert_restored_once(control: &TestTerminalControl, suspended: bool) {
+        let counts = control.counts.lock().unwrap();
+        assert_eq!(counts.gate_enabled, 1);
+        assert_eq!(counts.gate_disabled, 1);
+        assert_eq!(counts.suspends, usize::from(suspended));
+        assert_eq!(counts.restores, 1);
+        assert_eq!(counts.rebuilds, 1);
+        drop(counts);
+        assert!(!crate::is_editor_active());
+        assert!(crate::take_tui_rebuild());
+        assert!(!crate::take_tui_rebuild());
+    }
+
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
 
     #[test]
     fn test_build_script_adds_comment_header() {
@@ -534,6 +641,141 @@ mod tests {
     #[test]
     fn test_split_editor_command_rejects_unclosed_quote() {
         assert!(split_editor_command("vi 'unfinished").is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lifecycle_restores_after_every_fake_full_screen_editor_outcome() {
+        use nix::libc;
+        use std::os::unix::process::ExitStatusExt;
+
+        #[derive(Clone, Copy)]
+        enum Outcome {
+            Success,
+            Empty,
+            Nonzero,
+            Signal,
+            LaunchError,
+        }
+
+        let _serial = LIFECYCLE_TEST_LOCK.lock().unwrap();
+        for outcome in [
+            Outcome::Success,
+            Outcome::Empty,
+            Outcome::Nonzero,
+            Outcome::Signal,
+            Outcome::LaunchError,
+        ] {
+            reset_terminal_globals();
+            let control = Arc::new(TestTerminalControl::default());
+            let child = Arc::clone(&control);
+            let result =
+                run_editor_lifecycle(true, Duration::ZERO, Arc::clone(&control), move || {
+                    edit_artifact("before\n", ".txt", false, "#", |path| {
+                        if matches!(outcome, Outcome::LaunchError) {
+                            anyhow::bail!("fake editor launch failed");
+                        }
+                        if matches!(outcome, Outcome::Signal) {
+                            // A real full-screen child can die before its
+                            // terminal cleanup handler runs. Emit only the
+                            // child's enter sequence, then terminate the shell
+                            // itself so ExitStatus carries an actual signal.
+                            let output = std::process::Command::new("/bin/sh")
+                                .args(["-c", r#"printf '\033[?1049h'; kill -TERM $$"#])
+                                .output()?;
+                            assert_eq!(output.status.signal(), Some(libc::SIGTERM));
+                            child.output.lock().unwrap().extend(output.stdout);
+                            return Ok(output.status);
+                        }
+                        {
+                            let mut output = child.output.lock().unwrap();
+                            execute!(&mut *output, terminal::EnterAlternateScreen)?;
+                            execute!(&mut *output, terminal::LeaveAlternateScreen)?;
+                        }
+                        match outcome {
+                            Outcome::Success => {
+                                std::fs::write(path, "after\n")?;
+                                Ok(exit_status(0))
+                            }
+                            Outcome::Empty => {
+                                std::fs::write(path, "# review only\n\n")?;
+                                Ok(exit_status(0))
+                            }
+                            Outcome::Nonzero => Ok(exit_status(7)),
+                            Outcome::Signal | Outcome::LaunchError => unreachable!(),
+                        }
+                    })
+                })
+                .await;
+
+            match outcome {
+                Outcome::Success => assert_eq!(result.unwrap().as_deref(), Some("after\n")),
+                Outcome::Empty | Outcome::Nonzero | Outcome::Signal => {
+                    assert_eq!(result.unwrap(), None)
+                }
+                Outcome::LaunchError => {
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("fake editor launch failed"))
+                }
+            }
+            assert_restored_once(&control, true);
+
+            let output = String::from_utf8(control.output.lock().unwrap().clone()).unwrap();
+            let child_started = !matches!(outcome, Outcome::LaunchError);
+            let child_left_screen =
+                !matches!(outcome, Outcome::LaunchError | Outcome::Signal);
+            assert_eq!(
+                output.matches("\x1b[?1049h").count(),
+                1 + usize::from(child_started)
+            );
+            assert_eq!(
+                output.matches("\x1b[?1049l").count(),
+                1 + usize::from(child_left_screen)
+            );
+            assert!(output.rfind("\x1b[?1049l").unwrap() > output.rfind("\x1b[?1049h").unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_real_grace_period_releases_gate_without_terminal_restore() {
+        let _serial = LIFECYCLE_TEST_LOCK.lock().unwrap();
+        reset_terminal_globals();
+        let control = Arc::new(TestTerminalControl::default());
+        let editor_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&editor_calls);
+        let task_control = Arc::clone(&control);
+        let task = tokio::spawn(async move {
+            run_editor_lifecycle(true, Duration::from_millis(50), task_control, move || {
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(crate::is_editor_active());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert_eq!(editor_calls.load(Ordering::SeqCst), 0);
+        assert_restored_once(&control, false);
+        assert!(control.output.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocking_editor_panic_after_handoff_still_restores_once() {
+        let _serial = LIFECYCLE_TEST_LOCK.lock().unwrap();
+        reset_terminal_globals();
+        let control = Arc::new(TestTerminalControl::default());
+        let result: Result<()> =
+            run_editor_lifecycle(true, Duration::ZERO, Arc::clone(&control), || {
+                panic!("fake editor panic")
+            })
+            .await;
+
+        assert!(result.unwrap_err().to_string().contains("panicked"));
+        assert_restored_once(&control, true);
     }
 
     #[test]
