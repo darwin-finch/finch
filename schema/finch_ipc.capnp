@@ -120,6 +120,631 @@ struct JsonField {
   value @1 :JsonValue;
 }
 
+# ---------------------------------------------------------------------------
+# Portable typed-runtime checkpoints
+# ---------------------------------------------------------------------------
+
+# This is reducible VM state only. Host handles, grants, sockets, processes,
+# and approval authority are never represented by this schema.
+struct TypedRuntimeCheckpoint {
+  version        @0 :UInt32;
+  stack          @1 :List(TypedValue);
+  functions      @2 :List(NamedFunction);
+  producerFibers @3 :List(NamedProducerFiber);
+}
+
+struct NamedFunction {
+  name     @0 :Text;
+  function @1 :VmFunction;
+}
+
+struct NamedProducerFiber {
+  id     @0 :Text;
+  record @1 :ProducerFiberRecord;
+}
+
+enum TaskKind {
+  agent    @0;
+  cpuFiber @1;
+}
+
+struct TypedValue {
+  union {
+    unit       @0 :Void;
+    boolValue  @1 :Bool;
+    intValue   @2 :Int64;
+    uintValue  @3 :UInt64;
+    floatValue @4 :Float64;
+    charValue  @5 :UInt32;
+    symbol     @6 :Text;
+    string     @7 :Text;
+    bytes      @8 :Data;
+    json       @9 :JsonValue;
+    path       @10 :PathValue;
+    list       @11 :ListValue;
+    map        @12 :MapValue;
+    option     @13 :OptionValue;
+    result     @14 :ResultValue;
+    record     @15 :List(NamedTypedValue);
+    variant    @16 :VariantValue;
+    closure    @17 :ClosureValue;
+    task       @18 :TaskValue;
+    fiber      @19 :FiberValue;
+    stream     @20 :StreamValue;
+    resource   @21 :ResourceValue;
+    dynamicValue @22 :DynamicValue;
+  }
+}
+
+struct PathValue {
+  selector @0 :FileSelector;
+  relative @1 :Text;
+}
+
+struct ListValue {
+  elementType @0 :TypedType;
+  values      @1 :List(TypedValue);
+}
+
+struct MapValue {
+  keyType   @0 :TypedType;
+  valueType @1 :TypedType;
+  entries   @2 :List(TypedMapEntry);
+}
+
+struct TypedMapEntry {
+  key   @0 :TypedValue;
+  value @1 :TypedValue;
+}
+
+struct OptionValue {
+  innerType @0 :TypedType;
+  hasValue  @1 :Bool;
+  value     @2 :TypedValue;
+}
+
+struct ResultValue {
+  okType    @0 :TypedType;
+  errorType @1 :TypedType;
+  isOk      @2 :Bool;
+  value     @3 :TypedValue;
+}
+
+struct NamedTypedValue {
+  name  @0 :Text;
+  value @1 :TypedValue;
+}
+
+struct VariantValue {
+  name     @0 :Text;
+  hasValue @1 :Bool;
+  value    @2 :TypedValue;
+}
+
+struct ClosureValue {
+  function  @0 :Text;
+  captures  @1 :List(TypedValue);
+  signature @2 :StackSignature;
+}
+
+struct TaskValue {
+  id         @0 :Text;
+  resultType @1 :TypedType;
+  kind       @2 :TaskKind;
+}
+
+struct FiberValue {
+  id         @0 :Text;
+  yieldType  @1 :TypedType;
+  resultType @2 :TypedType;
+}
+
+struct StreamValue {
+  id          @0 :Text;
+  elementType @1 :TypedType;
+  kind        @2 :Text;
+  generation  @3 :UInt64;
+}
+
+struct ResourceValue {
+  kind       @0 :Text;
+  handle     @1 :Text;
+  generation @2 :UInt64;
+}
+
+struct DynamicValue {
+  runtimeType @0 :TypedType;
+  value       @1 :TypedValue;
+}
+
+struct TypedType {
+  union {
+    unit       @0 :Void;
+    boolType   @1 :Void;
+    intType    @2 :Void;
+    uintType   @3 :Void;
+    floatType  @4 :Void;
+    charType   @5 :Void;
+    symbolType @6 :Void;
+    stringType @7 :Void;
+    bytesType  @8 :Void;
+    jsonType   @9 :Void;
+    path       @10 :FileSelector;
+    list       @11 :TypedType;
+    map        @12 :MapType;
+    option     @13 :TypedType;
+    result     @14 :ResultType;
+    record     @15 :List(TypedField);
+    variant    @16 :List(TypedVariant);
+    function   @17 :FunctionType;
+    task       @18 :TypedType;
+    fiber      @19 :FiberType;
+    stream     @20 :TypedType;
+    resource   @21 :Text;
+    capability @22 :Text;
+    variable   @23 :Text;
+    dynamicType @24 :Void;
+  }
+}
+
+struct MapType {
+  key   @0 :TypedType;
+  value @1 :TypedType;
+}
+
+struct ResultType {
+  ok    @0 :TypedType;
+  error @1 :TypedType;
+}
+
+struct FiberType {
+  yieldType  @0 :TypedType;
+  resultType @1 :TypedType;
+}
+
+struct TypedField {
+  name @0 :Text;
+  type @1 :TypedType;
+}
+
+struct TypedVariant {
+  name       @0 :Text;
+  hasPayload @1 :Bool;
+  payload    @2 :TypedType;
+}
+
+struct FunctionType {
+  arguments     @0 :List(TypedType);
+  result        @1 :TypedType;
+  effects       @2 :List(CapabilityRequirement);
+  hasSuspension @3 :Bool;
+  suspension    @4 :SuspensionSignature;
+}
+
+enum ResourceRootKind {
+  workspace   @0;
+  project     @1;
+  taskOutput  @2;
+  hostMachine @3;
+  named       @4;
+}
+
+struct ResourceRoot {
+  kind @0 :ResourceRootKind;
+  name @1 :Text;
+}
+
+struct FileSelector {
+  root    @0 :ResourceRoot;
+  pattern @1 :Text;
+}
+
+struct FileSelectorTemplate {
+  root       @0 :ResourceRoot;
+  parts      @1 :List(FileSelectorTemplatePart);
+  upperBound @2 :FileSelector;
+}
+
+struct FileSelectorTemplatePart {
+  union {
+    literal  @0 :Text;
+    argument @1 :FileSelectorTemplateArgument;
+  }
+}
+
+struct FileSelectorTemplateArgument {
+  index @0 :UInt64;
+  bound @1 :FileSelector;
+}
+
+struct NetworkSelectorTemplate {
+  hostArgument @0 :UInt64;
+  portArgument @1 :UInt64;
+  allowedHosts @2 :List(Text);
+  allowedPorts @3 :List(UInt16);
+}
+
+struct ProcessSelectorTemplate {
+  executableArgument @0 :UInt64;
+  allowedExecutables @1 :List(Text);
+}
+
+struct ProgramSelectorTemplate {
+  languageArgument @0 :UInt64;
+  allowedLanguages @1 :List(Text);
+}
+
+struct McpSelectorTemplate {
+  serverArgument @0 :UInt64;
+  toolArgument   @1 :UInt64;
+  allowedServers @2 :List(Text);
+  allowedTools   @3 :List(Text);
+}
+
+enum CapabilityKind {
+  vmRead            @0;
+  vmWrite           @1;
+  fileRead          @2;
+  fileWrite         @3;
+  networkConnect    @4;
+  automationInspect @5;
+  automationWrite   @6;
+  agentSpawn        @7;
+  agentAwait        @8;
+  agentPoll         @9;
+  agentCancel       @10;
+  processRun        @11;
+  sessionEmit       @12;
+  memoryRead        @13;
+  memoryWrite       @14;
+  memoryConsolidate @15;
+  scheduleCreate    @16;
+  scheduleRead      @17;
+  scheduleManage    @18;
+  programInvoke     @19;
+  mcpCall           @20;
+  unsafeMemory      @21;
+}
+
+struct CapabilityRequirement {
+  capability @0 :CapabilityKind;
+  selector   @1 :ResourceSelector;
+}
+
+struct ResourceSelector {
+  union {
+    none            @0 :Void;
+    file            @1 :FileSelector;
+    fileTemplate    @2 :FileSelectorTemplate;
+    networkTemplate @3 :NetworkSelectorTemplate;
+    network         @4 :NetworkSelector;
+    automation      @5 :AutomationSelector;
+    agent           @6 :AgentSelector;
+    process         @7 :List(Text);
+    processTemplate @8 :ProcessSelectorTemplate;
+    program         @9 :List(Text);
+    programTemplate @10 :ProgramSelectorTemplate;
+    mcp             @11 :McpSelector;
+    mcpTemplate     @12 :McpSelectorTemplate;
+    memory          @13 :MemorySelector;
+    schedule        @14 :ScheduleSelector;
+  }
+}
+
+struct NetworkSelector {
+  host  @0 :Text;
+  ports @1 :List(UInt16);
+}
+
+struct AutomationSelector {
+  hasApplication @0 :Bool;
+  application    @1 :Text;
+}
+
+struct AgentSelector {
+  providers   @0 :List(Text);
+  maxDepth    @1 :UInt16;
+  maxChildren @2 :UInt16;
+}
+
+struct McpSelector {
+  server @0 :Text;
+  tool   @1 :Text;
+}
+
+struct MemorySelector {
+  tree @0 :Text;
+  path @1 :Text;
+}
+
+struct ScheduleSelector {
+  hasPolicy @0 :Bool;
+  policy    @1 :Text;
+}
+
+enum ControlEffect {
+  returns      @0;
+  mayThrow     @1;
+  maySuspend   @2;
+  neverReturns @3;
+}
+
+struct StackRow {
+  hasTail @0 :Bool;
+  tail    @1 :Text;
+  values  @2 :List(TypedType);
+}
+
+struct SuspensionSignature {
+  yieldType  @0 :TypedType;
+  resumeType @1 :TypedType;
+}
+
+struct StackSignature {
+  typeParameters @0 :List(Text);
+  input          @1 :StackRow;
+  output         @2 :StackRow;
+  effects        @3 :List(CapabilityRequirement);
+  control        @4 :ControlEffect;
+  hasSuspension  @5 :Bool;
+  suspension     @6 :SuspensionSignature;
+}
+
+enum SourceLanguage {
+  forth    @0;
+  lisp     @1;
+  finchIr  @2;
+  native   @3;
+  provider @4;
+}
+
+struct SourceSpan {
+  sourceId    @0 :Text;
+  startByte   @1 :UInt64;
+  endByte     @2 :UInt64;
+  startLine   @3 :UInt64;
+  startColumn @4 :UInt64;
+  endLine     @5 :UInt64;
+  endColumn   @6 :UInt64;
+}
+
+struct SourceOrigin {
+  language     @0 :SourceLanguage;
+  hasSpan      @1 :Bool;
+  span         @2 :SourceSpan;
+  hasWord      @3 :Bool;
+  word         @4 :Text;
+  hasExpansion @5 :Bool;
+  expansion    @6 :SourceOrigin;
+}
+
+enum UiOperation {
+  create   @0;
+  append   @1;
+  replace  @2;
+  status   @3;
+  progress @4;
+  complete @5;
+  fail     @6;
+}
+
+struct VmFunction {
+  name             @0 :Text;
+  hasDocumentation @1 :Bool;
+  documentation    @2 :Text;
+  signature        @3 :StackSignature;
+  locals           @4 :List(TypedType);
+  captures         @5 :List(TypedType);
+  entry            @6 :UInt32;
+  blocks           @7 :List(BasicBlock);
+}
+
+struct BasicBlock {
+  id           @0 :UInt32;
+  instructions @1 :List(LocatedInstruction);
+}
+
+struct LocatedInstruction {
+  instruction @0 :Instruction;
+  origin      @1 :SourceOrigin;
+}
+
+struct Instruction {
+  union {
+    constant          @0 :TypedValue;
+    makeList          @1 :CountedType;
+    makeMap           @2 :CountedMapType;
+    makeRecord        @3 :List(TypedField);
+    makeVariant       @4 :VariantInstruction;
+    variantGet        @5 :VariantInstruction;
+    recordGet         @6 :RecordGetInstruction;
+    recordSet         @7 :RecordSetInstruction;
+    dup               @8 :Void;
+    drop              @9 :Void;
+    swap              @10 :Void;
+    localGet          @11 :UInt32;
+    localSet          @12 :UInt32;
+    captureGet        @13 :UInt32;
+    makeClosure       @14 :MakeClosureInstruction;
+    call              @15 :Text;
+    callClosure       @16 :StackSignature;
+    capabilityRequest @17 :CapabilityInstruction;
+    outputOpen        @18 :Void;
+    uiEffect          @19 :UiInstruction;
+    yield             @20 :TypedType;
+    deferFiber        @21 :Void;
+    nextFiber         @22 :Void;
+    joinFiber         @23 :Void;
+    cancelFiber       @24 :Void;
+    deferCpu          @25 :Void;
+    pollCpuFiber      @26 :Void;
+    joinCpuFiber      @27 :Void;
+    cancelCpuFiber    @28 :Void;
+    propagateResult   @29 :ResultType;
+    jump              @30 :UInt32;
+    branch            @31 :BranchInstruction;
+    returnInstruction @32 :Void;
+    trap              @33 :Text;
+  }
+}
+
+struct CountedType {
+  type  @0 :TypedType;
+  count @1 :UInt32;
+}
+
+struct CountedMapType {
+  keyType   @0 :TypedType;
+  valueType @1 :TypedType;
+  count     @2 :UInt32;
+}
+
+struct VariantInstruction {
+  variants       @0 :List(TypedVariant);
+  tag            @1 :Text;
+  hasPayloadType @2 :Bool;
+  payloadType    @3 :TypedType;
+}
+
+struct RecordGetInstruction {
+  field     @0 :Text;
+  valueType @1 :TypedType;
+}
+
+struct RecordSetInstruction {
+  field      @0 :Text;
+  valueType  @1 :TypedType;
+  recordType @2 :List(TypedField);
+}
+
+struct MakeClosureInstruction {
+  function     @0 :Text;
+  captureCount @1 :UInt32;
+  signature    @2 :StackSignature;
+}
+
+struct CapabilityInstruction {
+  requirement @0 :CapabilityRequirement;
+  input       @1 :List(TypedType);
+  output      @2 :List(TypedType);
+}
+
+struct UiInstruction {
+  operation @0 :UiOperation;
+  input     @1 :List(TypedType);
+  output    @2 :List(TypedType);
+}
+
+struct BranchInstruction {
+  thenBlock @0 :UInt32;
+  elseBlock @1 :UInt32;
+}
+
+struct VmModule {
+  version   @0 :UInt32;
+  name      @1 :Text;
+  entry     @2 :Text;
+  functions @3 :List(NamedFunction);
+}
+
+struct VerifiedFunction {
+  name                  @0 :Text;
+  inferredEffects       @1 :List(CapabilityRequirement);
+  hasInferredSuspension @2 :Bool;
+  inferredSuspension    @3 :SuspensionSignature;
+  entryStack            @4 :List(TypedType);
+  blockStacks           @5 :List(BlockStack);
+}
+
+struct BlockStack {
+  block @0 :UInt32;
+  stack @1 :List(TypedType);
+}
+
+struct VerifiedModule {
+  module    @0 :VmModule;
+  functions @1 :List(VerifiedFunction);
+}
+
+struct VmFrame {
+  function    @0 :Text;
+  block       @1 :UInt32;
+  instruction @2 :UInt64;
+  stackBase   @3 :UInt64;
+  outputArity @4 :UInt64;
+  outputTypes @5 :List(TypedType);
+  locals      @6 :List(TypedValue);
+  captures    @7 :List(TypedValue);
+}
+
+struct VmContinuation {
+  stack              @0 :List(TypedValue);
+  frames             @1 :List(VmFrame);
+  fuel               @2 :UInt64;
+  nextEffectSequence @3 :UInt64;
+}
+
+enum Severity {
+  note    @0;
+  warning @1;
+  error   @2;
+}
+
+enum DiagnosticPhase {
+  reader            @0;
+  macroExpansion    @1;
+  nameResolution    @2;
+  typeInference     @3;
+  verification      @4;
+  linking           @5;
+  authorization     @6;
+  availability      @7;
+  approval          @8;
+  interpretation    @9;
+  hostCall          @10;
+  nativeExecution   @11;
+  transactionCommit @12;
+  childExecution    @13;
+  cancellation      @14;
+  resourceLimit     @15;
+}
+
+struct VmDiagnostic {
+  code            @0 :Text;
+  severity        @1 :Severity;
+  phase           @2 :DiagnosticPhase;
+  message         @3 :Text;
+  hasPrimary      @4 :Bool;
+  primary         @5 :SourceOrigin;
+  related         @6 :List(SourceOrigin);
+  expectedTypes   @7 :List(TypedType);
+  foundTypes      @8 :List(TypedType);
+  expectedEffects @9 :List(CapabilityRequirement);
+  foundEffects    @10 :List(CapabilityRequirement);
+  hasCapability   @11 :Bool;
+  capability      @12 :CapabilityRequirement;
+  trace           @13 :List(Text);
+  hints           @14 :List(Text);
+  hasCause        @15 :Bool;
+  cause           @16 :VmDiagnostic;
+}
+
+struct ProducerFiberRecord {
+  module     @0 :VerifiedModule;
+  yieldType  @1 :TypedType;
+  resultType @2 :TypedType;
+  state      @3 :ProducerFiberState;
+}
+
+struct ProducerFiberState {
+  union {
+    ready     @0 :VmContinuation;
+    completed @1 :TypedValue;
+    failed    @2 :VmDiagnostic;
+    cancelled @3 :Void;
+  }
+}
+
 struct BrainProgramRequest {
   brain      @0 :Text;
   requestSeq @1 :UInt64;
