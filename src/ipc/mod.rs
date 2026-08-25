@@ -15,6 +15,7 @@
 //! clients (VS Code / Continue.dev).  This module is the internal fast path.
 
 pub(crate) mod brain_codec;
+pub(crate) mod checkpoint_codec;
 pub mod client;
 pub mod events;
 pub mod schema;
