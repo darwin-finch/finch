@@ -856,9 +856,13 @@ still blocks the corresponding Brain phase until it is unified.
   Runner control now uses a durable, addressed handoff reservation bound to the exact source lease,
   target runner subject, and environment generation. Remote `brain:control` holders may request or
   cancel it, while only the environment-owning local Cap'n Proto service may accept it; acceptance
-  atomically replaces the lease and makes the previous callback stale. Still add the frontend
-  acceptance/registration UX, prove the environment identity at that boundary, and run a live
-  two-console handoff/revocation smoke test before closing this least-privilege milestone.
+  atomically replaces the lease and makes the previous callback stale. Frontends now expose an
+  ephemeral per-process runner identity plus request/accept/cancel commands, restore their previous
+  runner if a transfer fails, and accept only through the local Unix-socket service when normalized
+  hostname and canonical workspace exactly match the Brain environment. A live daemon test transfers
+  a registered runner, proves only the target callback receives the next ProgramRun, and observes the
+  correlated durable result. Still run the credential-revocation half of the live smoke and close the
+  remaining scope-specific hostile/replay cases before completing this least-privilege milestone.
 - [ ] Revisit shared channels only after the Brain event log, runner lease, and participant-role
   model are complete. The eventual channel should be a threaded/multi-participant projection of a
   Brain: people and models share one durable conversation, while programs run only on the remote

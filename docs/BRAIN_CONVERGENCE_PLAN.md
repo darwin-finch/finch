@@ -443,9 +443,13 @@ submission, cursor acknowledgement, and detach against a restarted daemon. Remot
 the same closed submission union, typed outcomes, and scoped handoff request/cancel operations in
 correlated binary WebSocket envelopes;
 fixture and live-daemon tests cover attach, watch, submit, acknowledge, final detach projection, and
-cleanup, including detach before an explicit watch. Generalized approval/effect resumptions remain
-incomplete, as does replacement of the remaining JSON-encoded detail/context/checkpoint values with
-explicit schema types. A cloneable in-process `BrainLifecycleService` now owns attachment
+cleanup, including detach before an explicit watch. An additional live-daemon fixture requests an
+addressed handoff with scoped remote control authority, accepts it through local Cap'n Proto,
+replaces the registered callback, and proves the next ProgramRun reaches only the target runner.
+Frontend acceptance also verifies the local Unix-socket host, normalized hostname, and canonical
+workspace against the Brain environment. Generalized approval/effect resumptions remain incomplete,
+as does replacement of the remaining JSON-encoded detail/context/checkpoint values with explicit
+schema types. A cloneable in-process `BrainLifecycleService` now owns attachment
 reservation and expiry, watch activation, acknowledgement, detach cleanup, participant submission,
 queued-run resumption, and runner-lease lifetime. Embedded hosts call this boundary directly; local
 RPC and remote WebSocket code are encoding/authentication adapters over it. Hermetic service tests
