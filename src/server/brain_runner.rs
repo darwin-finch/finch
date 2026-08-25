@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::brain::shared::{ProgramLanguage, RunId, RunnerLeaseId};
+use crate::brain::shared::{
+    AttachmentId, ConnectionId, ProgramLanguage, RunId, RunnerLeaseId,
+};
 
 #[derive(Debug)]
 pub enum RunnerRequest {
@@ -126,6 +128,7 @@ struct Registration {
 struct ConnectionAuthority {
     identities: HashMap<String, uuid::Uuid>,
     leases: HashMap<(String, RunnerLeaseId), uuid::Uuid>,
+    attachments: HashMap<(String, AttachmentId, ConnectionId), uuid::Uuid>,
 }
 
 /// Registrations contain only Tokio channels and portable values. Cap'n Proto
@@ -255,6 +258,76 @@ impl BrainRunnerBroker {
         }
     }
 
+    pub(crate) fn claim_connection_attachment(
+        &self,
+        connection_id: uuid::Uuid,
+        brain: &str,
+        attachment_id: AttachmentId,
+        attachment_connection_id: ConnectionId,
+    ) -> Result<()> {
+        let key = (
+            brain.to_string(),
+            attachment_id,
+            attachment_connection_id,
+        );
+        let mut authority = self
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        match authority.attachments.get(&key) {
+            Some(owner) if *owner != connection_id => {
+                anyhow::bail!("Brain attachment is owned by another IPC connection")
+            }
+            _ => {
+                authority.attachments.insert(key, connection_id);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn require_connection_attachment(
+        &self,
+        connection_id: uuid::Uuid,
+        brain: &str,
+        attachment_id: AttachmentId,
+        attachment_connection_id: ConnectionId,
+    ) -> Result<()> {
+        let authority = self
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        if authority.attachments.get(&(
+            brain.to_string(),
+            attachment_id,
+            attachment_connection_id,
+        )) != Some(&connection_id)
+        {
+            anyhow::bail!("Brain attachment is not owned by this IPC connection");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_connection_attachment(
+        &self,
+        connection_id: uuid::Uuid,
+        brain: &str,
+        attachment_id: AttachmentId,
+        attachment_connection_id: ConnectionId,
+    ) {
+        let key = (
+            brain.to_string(),
+            attachment_id,
+            attachment_connection_id,
+        );
+        let mut authority = self
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        if authority.attachments.get(&key) == Some(&connection_id) {
+            authority.attachments.remove(&key);
+        }
+    }
+
     pub(crate) fn register_for_connection(
         &self,
         connection_id: uuid::Uuid,
@@ -289,6 +362,9 @@ impl BrainRunnerBroker {
             .identities
             .retain(|_, owner| *owner != connection_id);
         authority.leases.retain(|_, owner| *owner != connection_id);
+        authority
+            .attachments
+            .retain(|_, owner| *owner != connection_id);
         drop(authority);
         self.registrations
             .write()
@@ -450,6 +526,8 @@ mod tests {
         let owner = uuid::Uuid::new_v4();
         let intruder = uuid::Uuid::new_v4();
         let lease_id = lease();
+        let attachment_id = AttachmentId(uuid::Uuid::new_v4());
+        let attachment_connection_id = ConnectionId(uuid::Uuid::new_v4());
 
         broker
             .claim_connection_identity(owner, "runner-a@box.local")
@@ -474,6 +552,23 @@ mod tests {
             .unwrap();
         assert!(broker.has_registration("brain", lease_id));
 
+        broker
+            .claim_connection_attachment(
+                owner,
+                "brain",
+                attachment_id,
+                attachment_connection_id,
+            )
+            .unwrap();
+        assert!(broker
+            .require_connection_attachment(
+                intruder,
+                "brain",
+                attachment_id,
+                attachment_connection_id,
+            )
+            .is_err());
+
         broker.disconnect_connection(owner);
         assert!(!broker.has_registration("brain", lease_id));
         assert!(broker
@@ -482,6 +577,14 @@ mod tests {
         broker
             .claim_connection_identity(intruder, "runner-a@box.local")
             .unwrap();
+        assert!(broker
+            .require_connection_attachment(
+                owner,
+                "brain",
+                attachment_id,
+                attachment_connection_id,
+            )
+            .is_err());
     }
 
     #[tokio::test]

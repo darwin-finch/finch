@@ -1403,4 +1403,82 @@ mod tests {
                 .unwrap();
         }));
     }
+
+    #[test]
+    #[ignore = "requires a running Finch daemon on the default local socket"]
+    fn test_brain_attachment_cannot_be_replayed_by_another_ipc_connection() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(async {
+            let owner = IpcClient::connect().await.unwrap();
+            let intruder = IpcClient::connect().await.unwrap();
+            let brain = format!("codex-attachment-authority-{}", uuid::Uuid::new_v4());
+            let attachment = owner
+                .brain_attach(
+                    &brain,
+                    "owner/attachment-authority",
+                    crate::brain::shared::AttachmentRole::Driver,
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut owner_watch = owner.brain_watch(&brain, &attachment).await.unwrap();
+            let initial = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                owner_watch.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert!(matches!(
+                initial,
+                crate::brain::shared::BrainWireMessage::Snapshot { .. }
+            ));
+
+            assert!(intruder
+                .brain_submit(
+                    &brain,
+                    &attachment,
+                    crate::brain::shared::BrainEventKind::ParticipantMessage {
+                        text: "forged message".into(),
+                    },
+                )
+                .await
+                .is_err());
+            assert!(intruder
+                .brain_acknowledge(&brain, &attachment, 0)
+                .await
+                .is_err());
+            assert!(intruder.brain_detach(&brain, &attachment).await.is_err());
+            let mut forged_watch = intruder.brain_watch(&brain, &attachment).await.unwrap();
+            let watch_error = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                forged_watch.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(watch_error.is_err());
+
+            let accepted = owner
+                .brain_submit(
+                    &brain,
+                    &attachment,
+                    crate::brain::shared::BrainEventKind::ParticipantMessage {
+                        text: "owner message".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            owner
+                .brain_acknowledge(&brain, &attachment, accepted.accepted.seq)
+                .await
+                .unwrap();
+            owner.brain_detach(&brain, &attachment).await.unwrap();
+        }));
+    }
 }

@@ -255,6 +255,22 @@ impl brain_service::Server for BrainRpcService {
             Ok(attachment) => attachment,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
+        let attachment_connection_id = attachment
+            .connection_id
+            .expect("new local Brain attachment has a pending connection");
+        if let Err(error) = self.runners.claim_connection_attachment(
+            self.connection_id,
+            &brain,
+            attachment.attachment_id,
+            attachment_connection_id,
+        ) {
+            let _ = self.lifecycle.detach(
+                &brain,
+                attachment.attachment_id,
+                attachment_connection_id,
+            );
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         encode_attachment(results.get().init_attachment(), &attachment);
         Promise::ok(())
     }
@@ -274,6 +290,14 @@ impl brain_service::Server for BrainRpcService {
             Ok(id) => id,
             Err(error) => return Promise::err(error),
         };
+        if let Err(error) = self.runners.require_connection_attachment(
+            self.connection_id,
+            &brain,
+            attachment_id,
+            connection_id,
+        ) {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         let attachment = match self.lifecycle.acknowledge(
             &brain,
             attachment_id,
@@ -302,6 +326,14 @@ impl brain_service::Server for BrainRpcService {
             Ok(id) => id,
             Err(error) => return Promise::err(error),
         };
+        if let Err(error) = self.runners.require_connection_attachment(
+            self.connection_id,
+            &brain,
+            attachment_id,
+            connection_id,
+        ) {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         if let Err(error) = self.lifecycle.detach(
             &brain,
             attachment_id,
@@ -309,6 +341,12 @@ impl brain_service::Server for BrainRpcService {
         ) {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
+        self.runners.release_connection_attachment(
+            self.connection_id,
+            &brain,
+            attachment_id,
+            connection_id,
+        );
         Promise::ok(())
     }
 
@@ -327,6 +365,14 @@ impl brain_service::Server for BrainRpcService {
             Ok(id) => id,
             Err(error) => return Promise::err(error),
         };
+        if let Err(error) = self.runners.require_connection_attachment(
+            self.connection_id,
+            &brain,
+            attachment_id,
+            connection_id,
+        ) {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         let kind = match params
             .get_submission()
             .map_err(anyhow::Error::from)
@@ -372,6 +418,14 @@ impl brain_service::Server for BrainRpcService {
             Ok(id) => id,
             Err(error) => return Promise::err(error),
         };
+        if let Err(error) = self.runners.require_connection_attachment(
+            self.connection_id,
+            &brain,
+            attachment_id,
+            connection_id,
+        ) {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         let receiver = pry!(params.get_receiver());
         let watch = match self.lifecycle.watch(
             &brain,
@@ -384,6 +438,8 @@ impl brain_service::Server for BrainRpcService {
         let snapshot = watch.snapshot;
         let mut events = watch.events;
         let lifecycle = self.lifecycle.clone();
+        let runners = self.runners.clone();
+        let transport_connection_id = self.connection_id;
         Promise::from_future(async move {
             let mut initial = receiver.on_message_request();
             let initial_result = encode_snapshot(
@@ -398,6 +454,12 @@ impl brain_service::Server for BrainRpcService {
             };
             if let Some(error) = initial_error {
                 let _ = lifecycle.detach(&brain, attachment_id, connection_id);
+                runners.release_connection_attachment(
+                    transport_connection_id,
+                    &brain,
+                    attachment_id,
+                    connection_id,
+                );
                 return Err(error);
             }
             let watch_error = loop {
@@ -416,6 +478,12 @@ impl brain_service::Server for BrainRpcService {
                 }
             };
             let _ = lifecycle.detach(&brain, attachment_id, connection_id);
+            runners.release_connection_attachment(
+                transport_connection_id,
+                &brain,
+                attachment_id,
+                connection_id,
+            );
             watch_error.map_or(Ok(()), Err)
         })
     }
@@ -662,6 +730,14 @@ impl brain_service::Server for BrainRpcService {
             Ok(id) => id,
             Err(error) => return Promise::err(error),
         };
+        if let Err(error) = self.runners.require_connection_attachment(
+            self.connection_id,
+            &brain,
+            attachment_id,
+            connection_id,
+        ) {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         let lifecycle = self.lifecycle.clone();
         Promise::from_future(async move {
             let run = lifecycle
