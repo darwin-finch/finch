@@ -361,6 +361,64 @@ impl RemoteBrainClient {
         }
     }
 
+    /// Explicitly replace this client's ordinary participant credential with
+    /// one that may request or cancel an addressed runner handoff. This must
+    /// happen before opening the WebSocket because its authorization is bound
+    /// for the lifetime of that connection.
+    pub async fn authorize_runner_handoff_control(
+        &self,
+        subject: &str,
+        role: AttachmentRole,
+    ) -> Result<()> {
+        if self.session.lock().await.is_some() {
+            anyhow::bail!(
+                "disconnect the remote Brain event stream before changing control authority"
+            );
+        }
+        let mut scopes = super::credential::default_participant_scopes(role);
+        scopes.insert(super::credential::BrainCredentialScope::BrainControl);
+        self.ensure_credential_with_scopes(subject, role, Some(scopes))
+            .await
+    }
+
+    pub async fn request_runner_handoff(
+        &self,
+        target_subject: &str,
+        expected_lease_id: super::shared::RunnerLeaseId,
+        environment_generation: u64,
+        ttl_ms: u64,
+    ) -> Result<super::shared::BrainRunnerHandoff> {
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+
+        match self
+            .send_remote_command(BrainRemoteCommandKind::RequestRunnerHandoff {
+                target_subject: target_subject.to_string(),
+                expected_lease_id,
+                environment_generation,
+                ttl_ms,
+            })
+            .await?
+        {
+            BrainRemoteReply::HandoffRequested { handoff, .. } => Ok(handoff),
+            reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
+        }
+    }
+
+    pub async fn cancel_runner_handoff(
+        &self,
+        handoff_id: super::shared::RunnerHandoffId,
+    ) -> Result<()> {
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+
+        match self
+            .send_remote_command(BrainRemoteCommandKind::CancelRunnerHandoff(handoff_id))
+            .await?
+        {
+            BrainRemoteReply::HandoffCancelled { .. } => Ok(()),
+            reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
+        }
+    }
+
     pub async fn disconnect(&self) -> Result<()> {
         use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
@@ -943,6 +1001,68 @@ mod tests {
                 .await
                 .unwrap();
 
+            let request_handoff = socket.next().await.unwrap().unwrap().into_data();
+            let BrainRemoteEnvelope::Command(request_handoff) =
+                crate::ipc::brain_codec::decode_brain_remote_envelope(&request_handoff).unwrap()
+            else {
+                panic!("expected runner handoff request")
+            };
+            let BrainRemoteCommandKind::RequestRunnerHandoff {
+                target_subject,
+                expected_lease_id,
+                environment_generation,
+                ttl_ms,
+            } = request_handoff.kind
+            else {
+                panic!("expected runner handoff request")
+            };
+            assert_eq!(target_subject, "runner-b@box.local");
+            assert_eq!(environment_generation, 1);
+            assert_eq!(ttl_ms, 30_000);
+            let handoff = crate::brain::shared::BrainRunnerHandoff {
+                handoff_id: crate::brain::shared::RunnerHandoffId(uuid::Uuid::new_v4()),
+                from_lease_id: expected_lease_id,
+                requested_by: "alice@laptop.local".into(),
+                target_subject,
+                environment_generation,
+                requested_ms: 10,
+                expires_ms: 20,
+            };
+            let reply = BrainRemoteEnvelope::Reply(BrainRemoteReply::HandoffRequested {
+                request_id: request_handoff.request_id,
+                handoff: handoff.clone(),
+            });
+            socket
+                .send(Message::Binary(
+                    crate::ipc::brain_codec::encode_brain_remote_envelope(&reply)
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+
+            let cancel_handoff = socket.next().await.unwrap().unwrap().into_data();
+            let BrainRemoteEnvelope::Command(cancel_handoff) =
+                crate::ipc::brain_codec::decode_brain_remote_envelope(&cancel_handoff).unwrap()
+            else {
+                panic!("expected runner handoff cancellation")
+            };
+            assert_eq!(
+                cancel_handoff.kind,
+                BrainRemoteCommandKind::CancelRunnerHandoff(handoff.handoff_id)
+            );
+            let reply = BrainRemoteEnvelope::Reply(BrainRemoteReply::HandoffCancelled {
+                request_id: cancel_handoff.request_id,
+            });
+            socket
+                .send(Message::Binary(
+                    crate::ipc::brain_codec::encode_brain_remote_envelope(&reply)
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+
             let detach = socket.next().await.unwrap().unwrap().into_data();
             let BrainRemoteEnvelope::Command(detach) =
                 crate::ipc::brain_codec::decode_brain_remote_envelope(&detach).unwrap()
@@ -1004,6 +1124,19 @@ mod tests {
             .unwrap();
         client.acknowledge(1).await.unwrap();
         assert_eq!(client.attachment().unwrap().acknowledged_seq, 1);
+        let handoff = client
+            .request_runner_handoff(
+                "runner-b@box.local",
+                crate::brain::shared::RunnerLeaseId(uuid::Uuid::new_v4()),
+                1,
+                30_000,
+            )
+            .await
+            .unwrap();
+        client
+            .cancel_runner_handoff(handoff.handoff_id)
+            .await
+            .unwrap();
         client.disconnect().await.unwrap();
         fixture.await.unwrap();
     }

@@ -17,6 +17,13 @@ pub(crate) enum BrainRemoteCommandKind {
     Submit(BrainEventKind),
     Acknowledge(u64),
     Detach,
+    RequestRunnerHandoff {
+        target_subject: String,
+        expected_lease_id: RunnerLeaseId,
+        environment_generation: u64,
+        ttl_ms: u64,
+    },
+    CancelRunnerHandoff(RunnerHandoffId),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +41,13 @@ pub(crate) enum BrainRemoteReply {
     Detached {
         request_id: u64,
     },
+    HandoffRequested {
+        request_id: u64,
+        handoff: BrainRunnerHandoff,
+    },
+    HandoffCancelled {
+        request_id: u64,
+    },
     Error {
         request_id: u64,
         code: String,
@@ -47,6 +61,8 @@ impl BrainRemoteReply {
             Self::Submitted { request_id, .. }
             | Self::Acknowledged { request_id, .. }
             | Self::Detached { request_id }
+            | Self::HandoffRequested { request_id, .. }
+            | Self::HandoffCancelled { request_id }
             | Self::Error { request_id, .. } => *request_id,
         }
     }
@@ -311,6 +327,21 @@ pub(crate) fn encode_brain_remote_envelope(
                 }
                 BrainRemoteCommandKind::Acknowledge(seq) => builder.set_acknowledge(*seq),
                 BrainRemoteCommandKind::Detach => builder.set_detach(()),
+                BrainRemoteCommandKind::RequestRunnerHandoff {
+                    target_subject,
+                    expected_lease_id,
+                    environment_generation,
+                    ttl_ms,
+                } => {
+                    let mut request = builder.init_request_runner_handoff();
+                    request.set_target_subject(target_subject);
+                    request.set_expected_lease_id(&expected_lease_id.0.to_string());
+                    request.set_environment_generation(*environment_generation);
+                    request.set_ttl_ms(*ttl_ms);
+                }
+                BrainRemoteCommandKind::CancelRunnerHandoff(handoff_id) => {
+                    builder.set_cancel_runner_handoff(&handoff_id.0.to_string())
+                }
             }
         }
         BrainRemoteEnvelope::Reply(reply) => {
@@ -332,6 +363,12 @@ pub(crate) fn encode_brain_remote_envelope(
                     encode_attachment(builder.init_acknowledged(), attachment)
                 }
                 BrainRemoteReply::Detached { .. } => builder.set_detached(()),
+                BrainRemoteReply::HandoffRequested { handoff, .. } => {
+                    encode_runner_handoff(builder.init_handoff_requested(), handoff)
+                }
+                BrainRemoteReply::HandoffCancelled { .. } => {
+                    builder.set_handoff_cancelled(())
+                }
                 BrainRemoteReply::Error { code, message, .. } => {
                     let mut error = builder.init_error();
                     error.set_code(code);
@@ -365,6 +402,22 @@ pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<Brain
                 }
                 CommandWhich::Acknowledge(seq) => BrainRemoteCommandKind::Acknowledge(seq),
                 CommandWhich::Detach(()) => BrainRemoteCommandKind::Detach,
+                CommandWhich::RequestRunnerHandoff(request) => {
+                    let request = request?;
+                    BrainRemoteCommandKind::RequestRunnerHandoff {
+                        target_subject: text(request.get_target_subject()?)?,
+                        expected_lease_id: RunnerLeaseId(parse_uuid(
+                            request.get_expected_lease_id()?,
+                        )?),
+                        environment_generation: request.get_environment_generation(),
+                        ttl_ms: request.get_ttl_ms(),
+                    }
+                }
+                CommandWhich::CancelRunnerHandoff(handoff_id) => {
+                    BrainRemoteCommandKind::CancelRunnerHandoff(RunnerHandoffId(parse_uuid(
+                        handoff_id?,
+                    )?))
+                }
             };
             BrainRemoteEnvelope::Command(BrainRemoteCommand { request_id, kind })
         }
@@ -386,6 +439,13 @@ pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<Brain
                     attachment: decode_attachment(attachment?)?,
                 },
                 ReplyWhich::Detached(()) => BrainRemoteReply::Detached { request_id },
+                ReplyWhich::HandoffRequested(handoff) => BrainRemoteReply::HandoffRequested {
+                    request_id,
+                    handoff: decode_runner_handoff(handoff?)?,
+                },
+                ReplyWhich::HandoffCancelled(()) => {
+                    BrainRemoteReply::HandoffCancelled { request_id }
+                }
                 ReplyWhich::Error(error) => {
                     let error = error?;
                     BrainRemoteReply::Error {
@@ -1156,6 +1216,15 @@ mod tests {
                 text: "inspect it".into(),
             },
         );
+        let handoff = BrainRunnerHandoff {
+            handoff_id: RunnerHandoffId(uuid::Uuid::new_v4()),
+            from_lease_id: RunnerLeaseId(uuid::Uuid::new_v4()),
+            requested_by: "alice@laptop.local".into(),
+            target_subject: "runner-b@box.local".into(),
+            environment_generation: 7,
+            requested_ms: 100,
+            expires_ms: 200,
+        };
         let envelopes = vec![
             BrainRemoteEnvelope::Command(BrainRemoteCommand {
                 request_id: 1,
@@ -1171,6 +1240,19 @@ mod tests {
                 request_id: 3,
                 kind: BrainRemoteCommandKind::Detach,
             }),
+            BrainRemoteEnvelope::Command(BrainRemoteCommand {
+                request_id: 4,
+                kind: BrainRemoteCommandKind::RequestRunnerHandoff {
+                    target_subject: handoff.target_subject.clone(),
+                    expected_lease_id: handoff.from_lease_id,
+                    environment_generation: handoff.environment_generation,
+                    ttl_ms: 30_000,
+                },
+            }),
+            BrainRemoteEnvelope::Command(BrainRemoteCommand {
+                request_id: 5,
+                kind: BrainRemoteCommandKind::CancelRunnerHandoff(handoff.handoff_id),
+            }),
             BrainRemoteEnvelope::Reply(BrainRemoteReply::Submitted {
                 request_id: 1,
                 accepted,
@@ -1182,8 +1264,13 @@ mod tests {
                 attachment,
             }),
             BrainRemoteEnvelope::Reply(BrainRemoteReply::Detached { request_id: 3 }),
-            BrainRemoteEnvelope::Reply(BrainRemoteReply::Error {
+            BrainRemoteEnvelope::Reply(BrainRemoteReply::HandoffRequested {
                 request_id: 4,
+                handoff,
+            }),
+            BrainRemoteEnvelope::Reply(BrainRemoteReply::HandoffCancelled { request_id: 5 }),
+            BrainRemoteEnvelope::Reply(BrainRemoteReply::Error {
+                request_id: 6,
                 code: "forbidden".into(),
                 message: "scope denied".into(),
             }),

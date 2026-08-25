@@ -1375,6 +1375,104 @@ async fn execute_remote_brain_command(
             }
             BrainRemoteReply::Detached { request_id }
         }
+        BrainRemoteCommandKind::RequestRunnerHandoff {
+            target_subject,
+            expected_lease_id,
+            environment_generation,
+            ttl_ms,
+        } => {
+            let claims = match authorize_named_brain(
+                server,
+                headers,
+                name,
+                BrainCredentialScope::BrainControl,
+            ) {
+                Ok(claims) => claims,
+                Err(_) => {
+                    return remote_brain_error(
+                        request_id,
+                        "forbidden",
+                        "Brain credential no longer authorizes runner handoff control",
+                    );
+                }
+            };
+            let attachment = match lifecycle.connection(name, attachment_id, connection_id) {
+                Ok(attachment) => attachment,
+                Err(error) => {
+                    return remote_brain_error(request_id, "conflict", error.to_string())
+                }
+            };
+            if claims_match_attachment(&claims, &attachment).is_err() {
+                return remote_brain_error(
+                    request_id,
+                    "forbidden",
+                    "Brain credential participant no longer matches this attachment",
+                );
+            }
+            let environment = match lifecycle.snapshot(name) {
+                Ok(snapshot) if snapshot.environment.generation == environment_generation => {
+                    snapshot.environment
+                }
+                Ok(_) => {
+                    return remote_brain_error(
+                        request_id,
+                        "conflict",
+                        "runner handoff environment generation is no longer current",
+                    )
+                }
+                Err(error) => {
+                    return remote_brain_error(request_id, "conflict", error.to_string())
+                }
+            };
+            match lifecycle.request_runner_handoff(
+                name,
+                &claims.subject,
+                &target_subject,
+                expected_lease_id,
+                &environment,
+                ttl_ms,
+            ) {
+                Ok(handoff) => BrainRemoteReply::HandoffRequested {
+                    request_id,
+                    handoff,
+                },
+                Err(error) => remote_brain_error(request_id, "conflict", error.to_string()),
+            }
+        }
+        BrainRemoteCommandKind::CancelRunnerHandoff(handoff_id) => {
+            let claims = match authorize_named_brain(
+                server,
+                headers,
+                name,
+                BrainCredentialScope::BrainControl,
+            ) {
+                Ok(claims) => claims,
+                Err(_) => {
+                    return remote_brain_error(
+                        request_id,
+                        "forbidden",
+                        "Brain credential no longer authorizes runner handoff control",
+                    );
+                }
+            };
+            let attachment = match lifecycle.connection(name, attachment_id, connection_id) {
+                Ok(attachment) => attachment,
+                Err(error) => {
+                    return remote_brain_error(request_id, "conflict", error.to_string())
+                }
+            };
+            if claims_match_attachment(&claims, &attachment).is_err() {
+                return remote_brain_error(
+                    request_id,
+                    "forbidden",
+                    "Brain credential participant no longer matches this attachment",
+                );
+            }
+            match lifecycle.cancel_runner_handoff(name, handoff_id, &claims.subject) {
+                Ok(()) => BrainRemoteReply::HandoffCancelled { request_id },
+                Err(error) => remote_brain_error(request_id, "conflict", error.to_string()),
+            }
+        }
     }
 }
 
@@ -3601,6 +3699,50 @@ mod named_brain_provider_context_tests {
             .events
             .iter()
             .any(|event| { matches!(event.kind, BrainEventKind::RuntimeCommitted { .. }) }));
+    }
+
+    #[tokio::test]
+    async fn completed_handoff_rejects_the_previous_runner_callback() {
+        let store = crate::brain::shared::SharedBrainStore::with_root("box.local", None);
+        let generation = store.environment().generation;
+        let source = store
+            .acquire_runner_lease("shared", "runner-a", generation, None, 60_000)
+            .unwrap();
+        let runners = crate::server::BrainRunnerBroker::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", source.lease_id, tx);
+        let handoff = store
+            .request_runner_handoff(
+                "shared",
+                "controller",
+                "runner-b",
+                source.lease_id,
+                generation,
+                30_000,
+            )
+            .unwrap();
+        let replacement = store
+            .accept_runner_handoff(
+                "shared",
+                "runner-b",
+                handoff.handoff_id,
+                generation,
+                60_000,
+            )
+            .unwrap();
+
+        let error = dispatch_named_brain_program(
+            &store,
+            &runners,
+            "shared",
+            1,
+            ProgramLanguage::Forth,
+            "21 2 *",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("stale lease"));
+        assert!(!runners.has_registration("shared", replacement.lease_id));
     }
 
     #[tokio::test]

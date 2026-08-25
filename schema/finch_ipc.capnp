@@ -394,7 +394,16 @@ struct BrainRemoteCommand {
     submit      @1 :BrainSubmission;
     acknowledge @2 :UInt64;
     detach      @3 :Void;
+    requestRunnerHandoff @4 :BrainRunnerHandoffRequest;
+    cancelRunnerHandoff  @5 :Text;
   }
+}
+
+struct BrainRunnerHandoffRequest {
+  targetSubject        @0 :Text;
+  expectedLeaseId      @1 :Text;
+  environmentGeneration @2 :UInt64;
+  ttlMs                @3 :UInt64;
 }
 
 struct BrainRemoteError {
@@ -409,6 +418,8 @@ struct BrainRemoteReply {
     acknowledged @2 :BrainAttachment;
     detached     @3 :Void;
     error        @4 :BrainRemoteError;
+    handoffRequested @5 :BrainRunnerHandoff;
+    handoffCancelled @6 :Void;
   }
 }
 
