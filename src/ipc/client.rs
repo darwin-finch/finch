@@ -278,7 +278,7 @@ impl IpcClient {
         let service = self.brain_service().await?;
         let (tx, rx) = mpsc::unbounded_channel();
         let receiver: brain_wire_receiver::Client =
-            capnp_rpc::new_client(BrainWireReceiverImpl { tx });
+            capnp_rpc::new_client(BrainWireReceiverImpl { tx: tx.clone() });
         let mut request = service.watch_request();
         {
             let mut params = request.get();
@@ -288,7 +288,9 @@ impl IpcClient {
             params.set_receiver(receiver);
         }
         tokio::task::spawn_local(async move {
-            let _ = request.send().promise.await;
+            if let Err(error) = request.send().promise.await {
+                let _ = tx.send(Err(anyhow::Error::new(error)));
+            }
         });
         Ok(rx)
     }
@@ -923,6 +925,69 @@ mod tests {
             let version = client.ping().await.expect("ping failed");
             assert!(!version.is_empty(), "version string should be non-empty");
             println!("IPC ping OK — daemon version: {}", version);
+        }));
+    }
+
+    /// Exercise the complete local named-Brain lifecycle capability against a
+    /// running daemon. The fixed Brain name is intended to be archived after
+    /// the smoke test; this test is ignored so ordinary unit suites remain
+    /// hermetic.
+    #[test]
+    #[ignore]
+    fn test_brain_service_lifecycle() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(async {
+            let client = IpcClient::connect()
+                .await
+                .expect("IPC connect — is `finch daemon` running?");
+            let brain = "codex-ipc-smoke-20260824";
+            let snapshot = client.brain_snapshot(brain).await.unwrap();
+            let attachment = client
+                .brain_attach(
+                    brain,
+                    "codex-smoke@localhost",
+                    crate::brain::shared::AttachmentRole::Driver,
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut incoming = client.brain_watch(brain, &attachment).await.unwrap();
+            let initial = tokio::time::timeout(std::time::Duration::from_secs(2), incoming.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let crate::brain::shared::BrainWireMessage::Snapshot { brain: initial } = initial else {
+                panic!("Brain watch did not begin with a snapshot");
+            };
+            assert_eq!(initial.brain_id, snapshot.brain_id);
+
+            let outcome = client
+                .brain_submit(
+                    brain,
+                    &attachment,
+                    crate::brain::shared::BrainEventKind::Prompt {
+                        text: "queue this smoke-test turn".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome.run.as_ref().map(|run| run.status),
+                Some(crate::brain::shared::BrainRunStatus::QueuedForEnvironment)
+            );
+            assert!(outcome.result.is_none());
+            assert!(outcome.accepted.seq > initial.revision);
+            let acknowledged = client
+                .brain_acknowledge(brain, &attachment, outcome.accepted.seq)
+                .await
+                .unwrap();
+            assert_eq!(acknowledged.acknowledged_seq, outcome.accepted.seq);
+            client.brain_detach(brain, &acknowledged).await.unwrap();
         }));
     }
 }

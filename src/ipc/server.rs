@@ -414,13 +414,6 @@ impl brain_service::Server for BrainServiceImpl {
             Err(error) => return Promise::err(error),
         };
         let receiver = pry!(params.get_receiver());
-        if let Err(error) = self.server.shared_brains().require_connection(
-            &brain,
-            attachment_id,
-            connection_id,
-        ) {
-            return Promise::err(capnp::Error::failed(error.to_string()));
-        }
         if let Err(error) = self.server.shared_brains().activate_connection(
             &brain,
             attachment_id,
