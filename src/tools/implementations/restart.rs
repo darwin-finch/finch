@@ -167,6 +167,7 @@ impl Tool for RestartTool {
         };
         Ok(serde_json::to_string(&serde_json::json!({
             DEFERRED_RESTART_KEY: intent,
+            "status": "prepared; finish the current turn normally so Finch can restart only after the canonical Brain commit",
         }))?)
     }
 }
@@ -275,10 +276,16 @@ mod tests {
             )
             .await;
         let intent = deferred_frontend_restart_from_tool_result(&result).unwrap();
+        let encoded: serde_json::Value =
+            serde_json::from_str(result.as_ref().unwrap()).unwrap();
 
         assert_eq!(intent.reason, "exercise the durable Brain restart path");
         assert_eq!(intent.binary_path, std::fs::canonicalize(binary).unwrap());
         assert_eq!(intent.binary_sha256.len(), 64);
+        assert!(encoded["status"]
+            .as_str()
+            .unwrap()
+            .contains("canonical Brain commit"));
         intent.verify().unwrap();
     }
 

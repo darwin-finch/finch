@@ -3227,22 +3227,21 @@ Rules:\n\
                         &result,
                     )
                 {
-                    result = match self.pending_named_brain_turns.get_mut(&query_id) {
+                    match self.pending_named_brain_turns.get_mut(&query_id) {
                         Some(turn) if turn.restart.is_none() => {
-                            let path = restart.binary_path.display().to_string();
-                            let digest = restart.binary_sha256.clone();
                             turn.restart = Some(restart);
-                            Ok(format!(
-                                "Frontend restart prepared for {path} (sha256:{digest}). Finish this turn normally; Finch will replace the frontend only after the daemon commits the Brain run."
-                            ))
                         }
-                        Some(_) => Err(anyhow::anyhow!(
-                            "this Brain turn already has a pending frontend restart"
-                        )),
-                        None => Err(anyhow::anyhow!(
-                            "frontend restart requires a canonical named-Brain turn"
-                        )),
-                    };
+                        Some(_) => {
+                            result = Err(anyhow::anyhow!(
+                                "this Brain turn already has a pending frontend restart"
+                            ));
+                        }
+                        None => {
+                            result = Err(anyhow::anyhow!(
+                                "frontend restart requires a canonical named-Brain turn"
+                            ));
+                        }
+                    }
                 }
                 if let Some(proposal) = deferred_proposal_from_tool_result(&result) {
                     self.output_manager.write_status(format!(
