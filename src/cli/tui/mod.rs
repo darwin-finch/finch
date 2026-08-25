@@ -388,6 +388,55 @@ fn input_line_physical_rows(lines: &[String], terminal_width: usize) -> Vec<usiz
         .collect()
 }
 
+fn ellipsize(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len <= width {
+        return text.to_string();
+    }
+    match width {
+        0 => String::new(),
+        1 => "…".into(),
+        _ => format!("{}…", text.chars().take(width - 1).collect::<String>()),
+    }
+}
+
+/// Build one separator row that can never wrap. Brain identity receives most
+/// of the width; the workspace is shortened first on narrow terminals.
+fn session_separator_line(width: usize, cwd: &str, session: &str) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let prefix = ellipsize("── ", width);
+    let remaining = width.saturating_sub(prefix.chars().count());
+    if remaining == 0 {
+        return prefix;
+    }
+
+    let desired_right = if session.is_empty() {
+        " ──".to_string()
+    } else {
+        format!(" {session} ──")
+    };
+    let right_budget = desired_right
+        .chars()
+        .count()
+        .min(remaining.saturating_mul(2).div_ceil(3).max(3))
+        .min(remaining);
+    let right = if session.is_empty() || right_budget < 5 {
+        ellipsize(&desired_right, right_budget)
+    } else {
+        format!(" {} ──", ellipsize(session, right_budget - 4))
+    };
+    let left_budget = remaining.saturating_sub(right.chars().count());
+    let cwd_part = if left_budget >= 3 {
+        format!(" {} ", ellipsize(cwd, left_budget - 2))
+    } else {
+        String::new()
+    };
+    let used = prefix.chars().count() + cwd_part.chars().count() + right.chars().count();
+    format!("{prefix}{cwd_part}{}{right}", "─".repeat(width.saturating_sub(used)))
+}
+
 /// Return a plain visible suffix small enough to fit in `columns`. This is
 /// used only when one logical line is itself taller than the remaining live
 /// viewport; completed scrollback retains the original ANSI-bearing line.
@@ -517,6 +566,10 @@ pub struct TuiRenderer {
     // terminal (WorkUnit + separator + input + status).  Cleared before each
     // redraw.
     active_rows: usize,
+
+    // Dimensions used for the bytes currently on screen. Resize handling must
+    // remeasure that old rendering at the new width before erasing it.
+    last_terminal_size: Option<(u16, u16)>,
 
     // Row index (0-based from top of live area) where the cursor is parked
     // after draw_live_area().  erase_live_area() uses this to correctly reach
@@ -655,6 +708,7 @@ impl TuiRenderer {
             history_draft: None,
 
             active_rows: 0,
+            last_terminal_size: None,
             cursor_row_from_top: 0,
             printed_ids: HashSet::new(),
 
@@ -999,29 +1053,15 @@ impl TuiRenderer {
         // ── 2. Separator: "──  ~/repos/finch ──────── jade-river ──" ──────────
         // CWD is left-anchored; session name is right-anchored.
         let cwd_label = tilde_cwd();
-        let prefix = "── ";
-        let prefix_vis = 3_usize;
-        let cwd_part = format!(" {} ", cwd_label);
         let session_label = self
             .status_bar
             .get_line(&StatusLineType::SessionLabel)
             .filter(|label| !label.is_empty())
             .unwrap_or_else(|| self.session_label.clone());
-        let right_part = if session_label.is_empty() {
-            " ──".to_string()
-        } else {
-            format!(" {} ──", session_label)
-        };
-        let left_vis = prefix_vis + cwd_part.chars().count();
-        let right_vis = right_part.chars().count();
-        let mid_len = term_width.saturating_sub(left_vis + right_vis);
-        let mid: String = "─".repeat(mid_len);
+        let separator = session_separator_line(term_width, &cwd_label, &session_label);
         execute!(
             stdout,
-            Print(format!(
-                "{}{}{}{}{}{}\r\n",
-                DIM_GRAY, prefix, cwd_part, mid, right_part, RESET
-            ))
+            Print(format!("{}{}{}\r\n", DIM_GRAY, separator, RESET))
         )?;
         rows += 1;
 
@@ -1181,6 +1221,7 @@ impl TuiRenderer {
 
         self.active_rows = rows;
         self.cursor_row_from_top = cursor_row_from_top;
+        self.last_terminal_size = Some((term_width as u16, term_h as u16));
         Ok(())
     }
 
@@ -1411,6 +1452,7 @@ impl TuiRenderer {
         enable_raw_mode()?;
         // Force a full redraw so the REPL live area reappears.
         self.active_rows = 0;
+        self.last_terminal_size = None;
         Ok(())
     }
 }
@@ -1520,7 +1562,10 @@ impl TuiRenderer {
             return None;
         }
         let term_width = usize::from(width).max(1);
-        let term_height = usize::from(height);
+        let (draw_width, draw_height) = self
+            .last_terminal_size
+            .map(|(width, height)| (usize::from(width).max(1), usize::from(height)))
+            .unwrap_or((term_width, usize::from(height)));
         let input_lines = self.input_textarea.lines().to_vec();
         let raw_status = self
             .status_bar
@@ -1536,15 +1581,18 @@ impl TuiRenderer {
             .as_ref()
             .and_then(|todo| todo.try_read().ok().map(|todo| todo.active_items().len()))
             .unwrap_or(0);
-        let status_rows = 1
+        let drawn_status_rows = 1
             + effective_status
                 .lines()
-                .map(|line| shadow_buffer::physical_rows(line, term_width))
+                .map(|line| shadow_buffer::physical_rows(line, draw_width))
                 .sum::<usize>();
-        let input_rows = input_physical_rows(&input_lines, term_width);
-        let reserved_rows =
-            1 + input_rows + status_rows + todo_rows + self.agent_tasks.len();
-        let max_live_rows = live_message_row_budget(term_height, reserved_rows);
+        let drawn_input_rows = input_physical_rows(&input_lines, draw_width);
+        let reserved_rows = 1
+            + drawn_input_rows
+            + drawn_status_rows
+            + todo_rows
+            + self.agent_tasks.len();
+        let max_live_rows = live_message_row_budget(draw_height, reserved_rows);
         let mut rows = 0;
         let live_messages = self.find_live_messages();
         if !live_messages.is_empty() {
@@ -1552,18 +1600,58 @@ impl TuiRenderer {
             for message in live_messages {
                 all_lines.extend(message.format(&self.colors).split('\n').map(str::to_owned));
             }
-            let (visible_lines, _) =
-                live_viewport_lines(&all_lines, term_width, max_live_rows);
+            let (visible_lines, _) = live_viewport_lines(&all_lines, draw_width, max_live_rows);
             rows += visible_lines
                 .iter()
                 .map(|line| shadow_buffer::physical_rows(line.trim_end_matches('\r'), term_width))
                 .sum::<usize>();
         }
-        rows += todo_rows + self.agent_tasks.len() + 1; // tasks + upper separator
+
+        if let Some(ref todo_arc) = self.todo_list {
+            if let Ok(todo) = todo_arc.try_read() {
+                for item in todo.active_items() {
+                    let priority_tag = match item.priority {
+                        crate::tools::todo::TodoPriority::High => " [!]",
+                        _ => "",
+                    };
+                    let max_content = draw_width.saturating_sub(2 + priority_tag.len());
+                    let content = item.content.chars().take(max_content).collect::<String>();
+                    let line = format!("● {content}{priority_tag}");
+                    rows += shadow_buffer::physical_rows(&line, term_width);
+                }
+            }
+        }
+        for task in self.agent_tasks.values() {
+            let indent = "  ".repeat(task.identity.depth);
+            let model = &task.identity.provider_model;
+            let tool = self
+                .agent_active_tools
+                .get(&task.identity.task_id)
+                .map(|name| format!(" · {name}"))
+                .unwrap_or_default();
+            let prefix_width = indent.chars().count() + 2;
+            let available = draw_width
+                .saturating_sub(prefix_width + model.chars().count() + tool.chars().count() + 3);
+            let task_text = task.task.chars().take(available).collect::<String>();
+            let line = format!("{indent}● {task_text} · {model}{tool}");
+            rows += shadow_buffer::physical_rows(&line, term_width);
+        }
+        let session_label = self
+            .status_bar
+            .get_line(&StatusLineType::SessionLabel)
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| self.session_label.clone());
+        let separator = session_separator_line(draw_width, &tilde_cwd(), &session_label);
+        rows += shadow_buffer::physical_rows(&separator, term_width);
         let rows_before_input = rows;
 
         let (cursor_row, cursor_col) = self.input_textarea.cursor();
         let input_phys_rows = input_line_physical_rows(&input_lines, term_width);
+        let status_rows = shadow_buffer::physical_rows(&"─".repeat(draw_width), term_width)
+            + effective_status
+                .lines()
+                .map(|line| shadow_buffer::physical_rows(line, term_width))
+                .sum::<usize>();
         rows += input_phys_rows.iter().sum::<usize>() + status_rows;
         let cursor_text_width = input_lines
             .get(cursor_row)
@@ -2504,6 +2592,33 @@ mod tests {
         assert_eq!(input_line_physical_rows(&lines, 10), vec![1, 1]);
         assert_eq!(input_line_physical_rows(&lines, 5), vec![2, 2]);
         assert_eq!(input_physical_rows(&lines, 5), 4);
+    }
+
+    #[test]
+    fn session_separator_never_wraps_at_narrow_widths() {
+        let session =
+            "◆ brain: golden-crest-9a83c1@Shammahs-MacBook-Air.local · runner · driver";
+        for width in 1..160 {
+            let line = session_separator_line(width, "~/repos/finch", session);
+            assert_eq!(line.chars().count(), width, "width {width}: {line:?}");
+            assert_eq!(
+                shadow_buffer::physical_rows(&line, width),
+                1,
+                "width {width}: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_separator_truncates_workspace_before_brain_identity() {
+        let line = session_separator_line(
+            60,
+            "~/repos/a-very-long-workspace-name",
+            "◆ brain: golden-crest-9a83c1@host · driver",
+        );
+        assert_eq!(line.chars().count(), 60);
+        assert!(line.contains("◆ brain:"), "{line:?}");
+        assert!(line.contains('…'), "{line:?}");
     }
 
     #[test]
