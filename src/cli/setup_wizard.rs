@@ -75,12 +75,7 @@ const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
         "gemini-2.0-flash",
         "get key at aistudio.google.com",
     ),
-    (
-        "mistral",
-        "Mistral AI",
-        "mistral-large-latest",
-        "get key at console.mistral.ai",
-    ),
+    ("mistral", "Mistral AI", "", "get key at console.mistral.ai"),
     (
         "groq",
         "Groq (fast cloud)",
@@ -96,6 +91,16 @@ use crate::providers::endpoints::ProviderEndpoints;
 use crate::providers::model_catalog::{
     self, CatalogAuth, CatalogSource, ModelCatalog, ModelCatalogProfile,
 };
+use chrono::{DateTime, Utc};
+
+type CatalogRefreshResult = Option<(ModelCatalog, Option<String>)>;
+
+#[derive(Debug, Clone)]
+struct CatalogRefresh {
+    generation: u64,
+    selection_identity: String,
+    result: Arc<Mutex<CatalogRefreshResult>>,
+}
 
 /// Try to detect an existing Anthropic API key from the environment or Claude Code config.
 fn detect_anthropic_api_key() -> Option<String> {
@@ -142,6 +147,7 @@ fn known_models_for(provider: &str) -> Vec<String> {
 
 fn model_catalog_profile(
     provider: &str,
+    profile_id: &str,
     api_key: &str,
     persisted: Option<&ProviderEntry>,
 ) -> Option<ModelCatalogProfile> {
@@ -206,14 +212,35 @@ fn model_catalog_profile(
             "/v1/models",
             CatalogAuth::Bearer,
         ),
+        (
+            "mistral",
+            Some(ProviderEntry::Mistral {
+                base_url,
+                chat_path,
+                models_path,
+                ..
+            }),
+        ) => (
+            base_url.as_deref().unwrap_or("https://api.mistral.ai"),
+            chat_path.as_deref().unwrap_or("/v1/chat/completions"),
+            models_path.as_deref().unwrap_or("/v1/models"),
+            CatalogAuth::Bearer,
+        ),
+        ("mistral", _) => (
+            "https://api.mistral.ai",
+            "/v1/chat/completions",
+            "/v1/models",
+            CatalogAuth::Bearer,
+        ),
         _ => return None,
     };
-    Some(ModelCatalogProfile {
-        provider: provider.to_string(),
-        api_key: api_key.to_string(),
-        endpoints: ProviderEndpoints::new(base_url, chat_path, models_path),
+    Some(ModelCatalogProfile::new(
+        provider,
+        profile_id,
+        api_key,
+        ProviderEndpoints::new(base_url, chat_path, models_path),
         auth,
-    })
+    ))
 }
 
 /// Helper function to display ModelSize
@@ -274,7 +301,9 @@ enum SectionState {
         adding_provider: Option<AddProviderStep>,
         catalog_models: Vec<String>,
         catalog_source: CatalogSource,
-        catalog_refresh: Option<Arc<Mutex<Option<(ModelCatalog, Option<String>)>>>>,
+        catalog_refresh: Option<CatalogRefresh>,
+        catalog_generation: u64,
+        catalog_refreshed_at: Option<DateTime<Utc>>,
         catalog_error: Option<String>,
         error: Option<String>,
     },
@@ -632,6 +661,8 @@ impl WizardState {
                 catalog_models: Vec::new(),
                 catalog_source: CatalogSource::StaticFallback,
                 catalog_refresh: None,
+                catalog_generation: 0,
+                catalog_refreshed_at: None,
                 catalog_error: None,
                 error: None,
             },
@@ -969,31 +1000,73 @@ fn is_scanning_state(state: &WizardState) -> bool {
 
 fn advance_catalog_refresh_if_done(state: &mut WizardState) {
     let Some(SectionState::Models {
+        primary_model,
+        tool_models,
         adding_provider,
         catalog_models,
         catalog_source,
         catalog_refresh,
+        catalog_generation,
+        catalog_refreshed_at,
         catalog_error,
         ..
     }) = state.sections.get_mut(&WizardSection::Models)
     else {
         return;
     };
-    let result = catalog_refresh
-        .as_ref()
-        .and_then(|refresh| refresh.try_lock().ok())
-        .and_then(|guard| guard.as_ref().cloned());
-    let Some((catalog, refresh_error)) = result else {
+    let completed = catalog_refresh.as_ref().and_then(|refresh| {
+        refresh
+            .result
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+            .map(|result| {
+                (
+                    refresh.generation,
+                    refresh.selection_identity.clone(),
+                    result,
+                )
+            })
+    });
+    let Some((generation, selection_identity, (catalog, refresh_error))) = completed else {
         return;
     };
+    *catalog_refresh = None;
 
-    let previous_fallback = if let Some(AddProviderStep::ConfigureRemote { provider_idx, .. }) =
-        adding_provider.as_ref()
-    {
-        known_models_for(CLOUD_PROVIDERS[*provider_idx].0)
-    } else {
-        Vec::new()
+    let Some(AddProviderStep::ConfigureRemote {
+        provider_idx,
+        name,
+        api_key,
+        editing_idx,
+        ..
+    }) = adding_provider.as_ref()
+    else {
+        return;
     };
+    let persisted = editing_idx.and_then(|index| {
+        if index == 0 {
+            match primary_model {
+                ModelConfig::Remote { persisted, .. } => persisted.as_ref(),
+                ModelConfig::Local { .. } => None,
+            }
+        } else {
+            tool_models.get(index - 1).and_then(|model| match model {
+                ModelConfig::Remote { persisted, .. } => persisted.as_ref(),
+                ModelConfig::Local { .. } => None,
+            })
+        }
+    });
+    let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
+    let Some(current_profile) = model_catalog_profile(provider_id, name, api_key, persisted) else {
+        return;
+    };
+    if generation != *catalog_generation
+        || selection_identity != model_catalog::profile_cache_identity(&current_profile)
+    {
+        return;
+    }
+
+    let previous_fallback = known_models_for(provider_id);
     if let Some(AddProviderStep::ConfigureRemote { model, .. }) = adding_provider.as_mut() {
         if catalog.source == CatalogSource::Discovered
             && (model.trim().is_empty() || previous_fallback.contains(model))
@@ -1005,8 +1078,8 @@ fn advance_catalog_refresh_if_done(state: &mut WizardState) {
     }
     *catalog_models = catalog.models;
     *catalog_source = catalog.source;
+    *catalog_refreshed_at = Some(catalog.refreshed_at);
     *catalog_error = refresh_error;
-    *catalog_refresh = None;
 }
 
 /// Returns true if the Models section currently has any overlay open
@@ -1231,6 +1304,8 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
         catalog_models,
         catalog_source,
         catalog_refresh,
+        catalog_generation,
+        catalog_refreshed_at,
         catalog_error,
         error,
     }) = state.sections.get_mut(&WizardSection::Models)
@@ -1295,6 +1370,8 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
             match key.code {
                 KeyCode::Esc => {
                     *adding_provider = None;
+                    *catalog_generation = catalog_generation.wrapping_add(1);
+                    *catalog_refresh = None;
                 }
                 KeyCode::Up => match adding_provider {
                     Some(AddProviderStep::SelectAddType { selected }) => {
@@ -1405,7 +1482,10 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     *model = default.to_string();
                                     *catalog_models = known_models_for(CLOUD_PROVIDERS[new_idx].0);
                                     *catalog_source = CatalogSource::StaticFallback;
+                                    *catalog_refreshed_at = None;
                                     *catalog_error = None;
+                                    *catalog_generation = catalog_generation.wrapping_add(1);
+                                    *catalog_refresh = None;
                                 }
                                 2 => {
                                     if !catalog_models.is_empty() {
@@ -1486,7 +1566,10 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     *model = default.to_string();
                                     *catalog_models = known_models_for(CLOUD_PROVIDERS[new_idx].0);
                                     *catalog_source = CatalogSource::StaticFallback;
+                                    *catalog_refreshed_at = None;
                                     *catalog_error = None;
+                                    *catalog_generation = catalog_generation.wrapping_add(1);
+                                    *catalog_refresh = None;
                                 }
                                 2 => {
                                     if !catalog_models.is_empty() {
@@ -1507,6 +1590,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     let Some(AddProviderStep::ConfigureRemote {
                         provider_idx,
+                        name,
                         api_key,
                         editing_idx,
                         ..
@@ -1528,7 +1612,8 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         }
                     });
                     let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
-                    let Some(profile) = model_catalog_profile(provider_id, api_key, persisted)
+                    let Some(profile) =
+                        model_catalog_profile(provider_id, name, api_key, persisted)
                     else {
                         *catalog_error = Some(format!(
                             "{} does not advertise model discovery; enter a model ID manually",
@@ -1543,9 +1628,11 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             return Ok(false);
                         }
                     };
-                    let result: Arc<Mutex<Option<(ModelCatalog, Option<String>)>>> =
-                        Arc::new(Mutex::new(None));
+                    let result: Arc<Mutex<CatalogRefreshResult>> = Arc::new(Mutex::new(None));
                     let result_for_thread = Arc::clone(&result);
+                    *catalog_generation = catalog_generation.wrapping_add(1);
+                    let generation = *catalog_generation;
+                    let selection_identity = model_catalog::profile_cache_identity(&profile);
                     std::thread::spawn(move || {
                         let refreshed = tokio::runtime::Builder::new_current_thread()
                             .enable_all()
@@ -1558,16 +1645,26 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             });
                         *result_for_thread.lock().unwrap() = Some(match refreshed {
                             Ok(result) => result,
-                            Err(error) => (
-                                model_catalog::fallback_catalog(
+                            Err(_) => {
+                                let mut fallback = model_catalog::fallback_catalog(
                                     &profile.provider,
                                     &profile.endpoints.models_url,
-                                ),
-                                Some(error.to_string()),
-                            ),
+                                );
+                                fallback.profile_id = profile.profile_id.clone();
+                                (
+                                    fallback,
+                                    Some(
+                                        "Could not initialize model catalogue refresh".to_string(),
+                                    ),
+                                )
+                            }
                         });
                     });
-                    *catalog_refresh = Some(result);
+                    *catalog_refresh = Some(CatalogRefresh {
+                        generation,
+                        selection_identity,
+                        result,
+                    });
                     *catalog_error = None;
                 }
                 KeyCode::Char(c) => {
@@ -1580,12 +1677,18 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     }) = adding_provider
                     {
                         match *focused_field {
-                            1 => name.push(c),
+                            1 => {
+                                name.push(c);
+                                *catalog_generation = catalog_generation.wrapping_add(1);
+                                *catalog_refresh = None;
+                            }
                             2 => {
                                 model.push(c);
                             }
                             3 => {
                                 api_key.push(c);
+                                *catalog_generation = catalog_generation.wrapping_add(1);
+                                *catalog_refresh = None;
                             }
                             _ => {}
                         }
@@ -1603,12 +1706,16 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         match *focused_field {
                             1 => {
                                 name.pop();
+                                *catalog_generation = catalog_generation.wrapping_add(1);
+                                *catalog_refresh = None;
                             }
                             2 => {
                                 model.pop();
                             }
                             3 => {
                                 api_key.pop();
+                                *catalog_generation = catalog_generation.wrapping_add(1);
+                                *catalog_refresh = None;
                             }
                             _ => {}
                         }
@@ -1629,9 +1736,17 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 let default_model = CLOUD_PROVIDERS[selected].2.to_string();
                                 *catalog_models = known_models_for(CLOUD_PROVIDERS[selected].0);
                                 *catalog_source = CatalogSource::StaticFallback;
+                                *catalog_refreshed_at = None;
                                 *catalog_error = None;
+                                *catalog_generation = catalog_generation.wrapping_add(1);
+                                *catalog_refresh = None;
                                 if let (Some(profile), Ok(cache_dir)) = (
-                                    model_catalog_profile(CLOUD_PROVIDERS[selected].0, "", None),
+                                    model_catalog_profile(
+                                        CLOUD_PROVIDERS[selected].0,
+                                        CLOUD_PROVIDERS[selected].0,
+                                        "",
+                                        None,
+                                    ),
                                     model_catalog::default_cache_dir(),
                                 ) {
                                     if let Ok(Some(cached)) =
@@ -1639,6 +1754,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     {
                                         *catalog_models = cached.models;
                                         *catalog_source = CatalogSource::Cache;
+                                        *catalog_refreshed_at = Some(cached.refreshed_at);
                                     }
                                 }
                                 Some(AddProviderStep::ConfigureRemote {
@@ -1708,6 +1824,26 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     editing_idx,
                                 })
                             } else {
+                                let persisted = editing_idx
+                                    .and_then(|index| {
+                                        if index == 0 {
+                                            match &*primary_model {
+                                                ModelConfig::Remote { persisted, .. } => {
+                                                    persisted.clone()
+                                                }
+                                                ModelConfig::Local { .. } => None,
+                                            }
+                                        } else {
+                                            tool_models.get(index - 1).and_then(|model| match model
+                                            {
+                                                ModelConfig::Remote { persisted, .. } => {
+                                                    persisted.clone()
+                                                }
+                                                ModelConfig::Local { .. } => None,
+                                            })
+                                        }
+                                    })
+                                    .filter(|entry| entry.provider_type() == provider_id);
                                 let edited = ModelConfig::Remote {
                                     provider: provider_id.to_string(),
                                     name: if name.trim().is_empty() {
@@ -1718,7 +1854,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     api_key,
                                     model: resolved_model,
                                     enabled: true,
-                                    persisted: None,
+                                    persisted,
                                 };
                                 if let Some(index) = editing_idx {
                                     if index == 0 {
@@ -1914,9 +2050,12 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             .unwrap_or(0);
                         *catalog_models = known_models_for(CLOUD_PROVIDERS[provider_idx].0);
                         *catalog_source = CatalogSource::StaticFallback;
+                        *catalog_refreshed_at = None;
                         *catalog_error = None;
+                        *catalog_generation = catalog_generation.wrapping_add(1);
+                        *catalog_refresh = None;
                         if let (Some(profile), Ok(cache_dir)) = (
-                            model_catalog_profile(provider, api_key, persisted.as_ref()),
+                            model_catalog_profile(provider, name, api_key, persisted.as_ref()),
                             model_catalog::default_cache_dir(),
                         ) {
                             if let Ok(Some(cached)) =
@@ -1924,6 +2063,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             {
                                 *catalog_models = cached.models;
                                 *catalog_source = CatalogSource::Cache;
+                                *catalog_refreshed_at = Some(cached.refreshed_at);
                             }
                         }
                         *adding_provider = Some(AddProviderStep::ConfigureRemote {
@@ -2745,6 +2885,7 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             adding_provider,
             catalog_source,
             catalog_refresh,
+            catalog_refreshed_at,
             catalog_error,
             error,
             ..
@@ -2760,6 +2901,7 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             adding_provider.as_ref(),
             catalog_source,
             catalog_refresh.is_some(),
+            catalog_refreshed_at.as_ref(),
             catalog_error.as_deref(),
             error.as_deref(),
         ),
@@ -2948,6 +3090,7 @@ fn render_models_section(
     adding_provider: Option<&AddProviderStep>,
     catalog_source: &CatalogSource,
     catalog_refreshing: bool,
+    catalog_refreshed_at: Option<&DateTime<Utc>>,
     catalog_error: Option<&str>,
     error: Option<&str>,
 ) {
@@ -3183,6 +3326,7 @@ fn render_models_section(
             step,
             catalog_source,
             catalog_refreshing,
+            catalog_refreshed_at,
             catalog_error,
         );
     }
@@ -3195,6 +3339,7 @@ fn render_add_provider_overlay(
     step: &AddProviderStep,
     catalog_source: &CatalogSource,
     catalog_refreshing: bool,
+    catalog_refreshed_at: Option<&DateTime<Utc>>,
     catalog_error: Option<&str>,
 ) {
     // Center a box that's 60% wide, 50% tall
@@ -3318,6 +3463,7 @@ fn render_add_provider_overlay(
                 editing_idx.is_some(),
                 catalog_source,
                 catalog_refreshing,
+                catalog_refreshed_at,
                 catalog_error,
             );
         }
@@ -3398,6 +3544,23 @@ fn render_add_provider_overlay(
     }
 }
 
+fn format_catalog_refresh_time(refreshed_at: &DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = now
+        .signed_duration_since(*refreshed_at)
+        .num_seconds()
+        .max(0);
+    let age = if seconds < 60 {
+        "just now".to_string()
+    } else if seconds < 3_600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h ago", seconds / 3_600)
+    } else {
+        format!("{}d ago", seconds / 86_400)
+    };
+    format!("{} ({age})", refreshed_at.format("%Y-%m-%d %H:%M UTC"))
+}
+
 /// Render single-screen cloud provider configuration dialog
 fn render_configure_remote_overlay(
     f: &mut Frame,
@@ -3410,6 +3573,7 @@ fn render_configure_remote_overlay(
     editing: bool,
     catalog_source: &CatalogSource,
     catalog_refreshing: bool,
+    catalog_refreshed_at: Option<&DateTime<Utc>>,
     catalog_error: Option<&str>,
 ) {
     let (provider_id, provider_name, _default_model, key_hint) =
@@ -3480,12 +3644,18 @@ fn render_configure_remote_overlay(
         "Refreshing authenticated model catalogue…".to_string()
     } else {
         format!(
-            "Models: {} · Ctrl+R refresh · model ID remains editable",
+            "Models: {}{} · Ctrl+R refresh · model ID remains editable",
             match catalog_source {
                 CatalogSource::Discovered => "provider discovery",
                 CatalogSource::Cache => "local cache",
                 CatalogSource::StaticFallback => "static fallback",
-            }
+            },
+            catalog_refreshed_at
+                .map(|refreshed| format!(
+                    " · {}",
+                    format_catalog_refresh_time(refreshed, Utc::now())
+                ))
+                .unwrap_or_default()
         )
     };
     lines.push(Line::from(Span::styled(
@@ -4522,6 +4692,47 @@ mod tests {
         }
     }
 
+    fn install_completed_catalog_refresh(
+        state: &mut WizardState,
+        profile: &ModelCatalogProfile,
+        catalog: ModelCatalog,
+    ) {
+        if let Some(SectionState::Models {
+            catalog_refresh,
+            catalog_generation,
+            ..
+        }) = state.sections.get_mut(&WizardSection::Models)
+        {
+            *catalog_generation = catalog_generation.wrapping_add(1);
+            *catalog_refresh = Some(CatalogRefresh {
+                generation: *catalog_generation,
+                selection_identity: model_catalog::profile_cache_identity(profile),
+                result: Arc::new(Mutex::new(Some((catalog, None)))),
+            });
+        }
+    }
+
+    fn edit_primary_remote(state: &mut WizardState, name: &str, model: &str, api_key: &str) {
+        handle_models_input(state, key(KeyCode::Enter)).unwrap();
+        let Some(SectionState::Models {
+            adding_provider:
+                Some(AddProviderStep::ConfigureRemote {
+                    name: editing_name,
+                    model: editing_model,
+                    api_key: editing_key,
+                    ..
+                }),
+            ..
+        }) = state.sections.get_mut(&WizardSection::Models)
+        else {
+            panic!("expected remote editor");
+        };
+        *editing_name = name.to_string();
+        *editing_model = model.to_string();
+        *editing_key = api_key.to_string();
+        handle_models_input(state, key(KeyCode::Enter)).unwrap();
+    }
+
     fn get_primary(state: &WizardState) -> Option<&ModelConfig> {
         if let Some(SectionState::Models { primary_model, .. }) =
             state.sections.get(&WizardSection::Models)
@@ -4589,7 +4800,7 @@ mod tests {
 
     #[test]
     fn discovery_capable_providers_do_not_start_with_compile_time_model_ids() {
-        for provider in ["claude", "openai", "grok"] {
+        for provider in ["claude", "openai", "grok", "mistral"] {
             let (_, _, default_model, _) = CLOUD_PROVIDERS
                 .iter()
                 .find(|(id, ..)| *id == provider)
@@ -4612,7 +4823,8 @@ mod tests {
             name: Some("compatible".to_string()),
             reasoning_effort: None,
         };
-        let profile = model_catalog_profile("openai", "new-key", Some(&persisted)).unwrap();
+        let profile =
+            model_catalog_profile("openai", "compatible", "new-key", Some(&persisted)).unwrap();
         assert_eq!(profile.api_key, "new-key");
         assert_eq!(
             profile.endpoints.chat_url,
@@ -4626,23 +4838,190 @@ mod tests {
 
     #[test]
     fn builtin_discovery_profiles_use_provider_specific_urls_and_auth() {
-        let claude = model_catalog_profile("claude", "key", None).unwrap();
+        let claude = model_catalog_profile("claude", "claude-work", "key", None).unwrap();
         assert_eq!(claude.auth, CatalogAuth::AnthropicApiKey);
         assert_eq!(
             claude.endpoints.models_url,
             "https://api.anthropic.com/v1/models"
         );
 
-        let openai = model_catalog_profile("openai", "key", None).unwrap();
+        let openai = model_catalog_profile("openai", "openai-work", "key", None).unwrap();
         assert_eq!(openai.auth, CatalogAuth::Bearer);
         assert_eq!(
             openai.endpoints.models_url,
             "https://api.openai.com/v1/models"
         );
 
-        let xai = model_catalog_profile("grok", "key", None).unwrap();
+        let xai = model_catalog_profile("grok", "xai-work", "key", None).unwrap();
         assert_eq!(xai.auth, CatalogAuth::Bearer);
         assert_eq!(xai.endpoints.models_url, "https://api.x.ai/v1/models");
+
+        let mistral = model_catalog_profile("mistral", "mistral-work", "key", None).unwrap();
+        assert_eq!(mistral.auth, CatalogAuth::Bearer);
+        assert_eq!(
+            mistral.endpoints.models_url,
+            "https://api.mistral.ai/v1/models"
+        );
+    }
+
+    #[test]
+    fn stale_cross_provider_refresh_is_discarded() {
+        let claude_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, ..)| *id == "claude")
+            .unwrap();
+        let openai_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, ..)| *id == "openai")
+            .unwrap();
+        let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+            provider_idx: claude_idx,
+            name: "claude-work".to_string(),
+            model: String::new(),
+            api_key: "claude-key".to_string(),
+            focused_field: 0,
+            editing_idx: None,
+        });
+        let claude = model_catalog_profile("claude", "claude-work", "claude-key", None).unwrap();
+        install_completed_catalog_refresh(
+            &mut state,
+            &claude,
+            ModelCatalog {
+                provider: "claude".to_string(),
+                profile_id: "claude-work".to_string(),
+                models_url: claude.endpoints.models_url.clone(),
+                models: vec!["claude-account-model".to_string()],
+                source: CatalogSource::Discovered,
+                refreshed_at: Utc::now(),
+            },
+        );
+        if let Some(SectionState::Models {
+            adding_provider,
+            catalog_generation,
+            ..
+        }) = state.sections.get_mut(&WizardSection::Models)
+        {
+            *catalog_generation = catalog_generation.wrapping_add(1);
+            *adding_provider = Some(AddProviderStep::ConfigureRemote {
+                provider_idx: openai_idx,
+                name: "openai-work".to_string(),
+                model: String::new(),
+                api_key: "openai-key".to_string(),
+                focused_field: 0,
+                editing_idx: None,
+            });
+        }
+
+        advance_catalog_refresh_if_done(&mut state);
+        assert!(matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote { provider_idx, model, .. })
+                if *provider_idx == openai_idx && model.is_empty()
+        ));
+    }
+
+    #[test]
+    fn only_latest_same_profile_refresh_is_applied() {
+        let openai_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, ..)| *id == "openai")
+            .unwrap();
+        let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+            provider_idx: openai_idx,
+            name: "openai-work".to_string(),
+            model: String::new(),
+            api_key: "openai-key".to_string(),
+            focused_field: 2,
+            editing_idx: None,
+        });
+        let profile = model_catalog_profile("openai", "openai-work", "openai-key", None).unwrap();
+        install_completed_catalog_refresh(
+            &mut state,
+            &profile,
+            ModelCatalog {
+                provider: "openai".to_string(),
+                profile_id: "openai-work".to_string(),
+                models_url: profile.endpoints.models_url.clone(),
+                models: vec!["old-result".to_string()],
+                source: CatalogSource::Discovered,
+                refreshed_at: Utc::now(),
+            },
+        );
+        if let Some(SectionState::Models {
+            catalog_generation, ..
+        }) = state.sections.get_mut(&WizardSection::Models)
+        {
+            *catalog_generation = catalog_generation.wrapping_add(1);
+        }
+        advance_catalog_refresh_if_done(&mut state);
+        assert!(matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote { model, .. }) if model.is_empty()
+        ));
+
+        let refreshed_at = Utc::now() - chrono::Duration::minutes(7);
+        install_completed_catalog_refresh(
+            &mut state,
+            &profile,
+            ModelCatalog {
+                provider: "openai".to_string(),
+                profile_id: "openai-work".to_string(),
+                models_url: profile.endpoints.models_url.clone(),
+                models: vec!["latest-result".to_string()],
+                source: CatalogSource::Discovered,
+                refreshed_at,
+            },
+        );
+        advance_catalog_refresh_if_done(&mut state);
+        assert!(matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote { model, .. }) if model == "latest-result"
+        ));
+        assert!(matches!(
+            state.sections.get(&WizardSection::Models),
+            Some(SectionState::Models {
+                catalog_source: CatalogSource::Discovered,
+                catalog_refreshed_at: Some(actual),
+                ..
+            }) if *actual == refreshed_at
+        ));
+
+        let cached_at = refreshed_at - chrono::Duration::hours(2);
+        install_completed_catalog_refresh(
+            &mut state,
+            &profile,
+            ModelCatalog {
+                provider: "openai".to_string(),
+                profile_id: "openai-work".to_string(),
+                models_url: profile.endpoints.models_url.clone(),
+                models: vec!["cached-result".to_string()],
+                source: CatalogSource::Cache,
+                refreshed_at: cached_at,
+            },
+        );
+        advance_catalog_refresh_if_done(&mut state);
+        assert!(matches!(
+            state.sections.get(&WizardSection::Models),
+            Some(SectionState::Models {
+                catalog_source: CatalogSource::Cache,
+                catalog_refreshed_at: Some(actual),
+                ..
+            }) if *actual == cached_at
+        ));
+    }
+
+    #[test]
+    fn catalog_refresh_time_displays_timestamp_and_age() {
+        let refreshed_at = DateTime::parse_from_rfc3339("2026-08-25T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let now = DateTime::parse_from_rfc3339("2026-08-25T10:07:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            format_catalog_refresh_time(&refreshed_at, now),
+            "2026-08-25 10:00 UTC (7m ago)"
+        );
     }
 
     #[test]
@@ -4660,21 +5039,19 @@ mod tests {
             focused_field: 2,
             editing_idx: None,
         });
-        if let Some(SectionState::Models {
-            catalog_refresh, ..
-        }) = state.sections.get_mut(&WizardSection::Models)
-        {
-            *catalog_refresh = Some(Arc::new(Mutex::new(Some((
-                ModelCatalog {
-                    provider: "claude".to_string(),
-                    models_url: "https://api.anthropic.com/v1/models".to_string(),
-                    models: vec!["account-visible-model".to_string()],
-                    source: CatalogSource::Discovered,
-                    refreshed_at: chrono::Utc::now(),
-                },
-                None,
-            )))));
-        }
+        let profile = model_catalog_profile("claude", "claude", "test-key", None).unwrap();
+        install_completed_catalog_refresh(
+            &mut state,
+            &profile,
+            ModelCatalog {
+                provider: "claude".to_string(),
+                profile_id: "claude".to_string(),
+                models_url: "https://api.anthropic.com/v1/models".to_string(),
+                models: vec!["account-visible-model".to_string()],
+                source: CatalogSource::Discovered,
+                refreshed_at: chrono::Utc::now(),
+            },
+        );
         advance_catalog_refresh_if_done(&mut state);
         assert!(matches!(
             get_step(&state),
@@ -4694,21 +5071,18 @@ mod tests {
         {
             *model = "manually-entered-model".to_string();
         }
-        if let Some(SectionState::Models {
-            catalog_refresh, ..
-        }) = state.sections.get_mut(&WizardSection::Models)
-        {
-            *catalog_refresh = Some(Arc::new(Mutex::new(Some((
-                ModelCatalog {
-                    provider: "claude".to_string(),
-                    models_url: "https://api.anthropic.com/v1/models".to_string(),
-                    models: vec!["newer-visible-model".to_string()],
-                    source: CatalogSource::Discovered,
-                    refreshed_at: chrono::Utc::now(),
-                },
-                None,
-            )))));
-        }
+        install_completed_catalog_refresh(
+            &mut state,
+            &profile,
+            ModelCatalog {
+                provider: "claude".to_string(),
+                profile_id: "claude".to_string(),
+                models_url: "https://api.anthropic.com/v1/models".to_string(),
+                models: vec!["newer-visible-model".to_string()],
+                source: CatalogSource::Discovered,
+                refreshed_at: chrono::Utc::now(),
+            },
+        );
         advance_catalog_refresh_if_done(&mut state);
         assert!(matches!(
             get_step(&state),
@@ -5460,6 +5834,144 @@ mod tests {
         let saved = build_setup_result(&state).unwrap();
 
         assert_eq!(saved.providers, providers);
+    }
+
+    #[test]
+    fn ordinary_remote_edits_preserve_exact_connection_profile_metadata() {
+        use crate::config::{Config, ReasoningEffort};
+
+        let cases = vec![
+            ProviderEntry::Claude {
+                api_key: "old-key".to_string(),
+                model: Some("old-model".to_string()),
+                base_url: Some("https://claude-compatible.example/v1".to_string()),
+                chat_path: Some("https://chat.example/claude?preview=1".to_string()),
+                models_path: Some("https://models.example/claude?account=a".to_string()),
+                name: Some("claude-old".to_string()),
+            },
+            ProviderEntry::Openai {
+                api_key: "old-key".to_string(),
+                model: Some("old-model".to_string()),
+                base_url: Some("https://openai-compatible.example/v1".to_string()),
+                chat_path: Some("https://chat.example/openai?preview=1".to_string()),
+                models_path: Some("https://models.example/openai?account=b".to_string()),
+                name: Some("openai-old".to_string()),
+                reasoning_effort: Some(ReasoningEffort::High),
+            },
+            ProviderEntry::Grok {
+                api_key: "old-key".to_string(),
+                model: Some("old-model".to_string()),
+                base_url: Some("https://xai-compatible.example/v1".to_string()),
+                chat_path: Some("https://chat.example/xai?preview=1".to_string()),
+                models_path: Some("https://models.example/xai?account=c".to_string()),
+                name: Some("xai-old".to_string()),
+            },
+            ProviderEntry::Mistral {
+                api_key: "old-key".to_string(),
+                model: Some("old-model".to_string()),
+                base_url: Some("https://mistral-compatible.example/v1".to_string()),
+                chat_path: Some("https://chat.example/mistral?preview=1".to_string()),
+                models_path: Some("https://models.example/mistral?account=d".to_string()),
+                name: Some("mistral-old".to_string()),
+            },
+        ];
+
+        for original in cases {
+            let expected_type = original.provider_type().to_string();
+            let mut state = WizardState::new(Some(&Config::with_providers(vec![original.clone()])));
+            edit_primary_remote(&mut state, "renamed", "new-model", "new-key");
+            let saved = build_setup_result(&state).unwrap();
+            let edited = &saved.providers[0];
+            assert_eq!(edited.provider_type(), expected_type);
+            match (&original, edited) {
+                (
+                    ProviderEntry::Claude {
+                        base_url,
+                        chat_path,
+                        models_path,
+                        ..
+                    },
+                    ProviderEntry::Claude {
+                        api_key,
+                        model,
+                        base_url: actual_base,
+                        chat_path: actual_chat,
+                        models_path: actual_models,
+                        name,
+                    },
+                )
+                | (
+                    ProviderEntry::Grok {
+                        base_url,
+                        chat_path,
+                        models_path,
+                        ..
+                    },
+                    ProviderEntry::Grok {
+                        api_key,
+                        model,
+                        base_url: actual_base,
+                        chat_path: actual_chat,
+                        models_path: actual_models,
+                        name,
+                    },
+                )
+                | (
+                    ProviderEntry::Mistral {
+                        base_url,
+                        chat_path,
+                        models_path,
+                        ..
+                    },
+                    ProviderEntry::Mistral {
+                        api_key,
+                        model,
+                        base_url: actual_base,
+                        chat_path: actual_chat,
+                        models_path: actual_models,
+                        name,
+                    },
+                ) => {
+                    assert_eq!(
+                        (actual_base, actual_chat, actual_models),
+                        (base_url, chat_path, models_path)
+                    );
+                    assert_eq!(
+                        (api_key.as_str(), model.as_deref(), name.as_deref()),
+                        ("new-key", Some("new-model"), Some("renamed"))
+                    );
+                }
+                (
+                    ProviderEntry::Openai {
+                        base_url,
+                        chat_path,
+                        models_path,
+                        reasoning_effort,
+                        ..
+                    },
+                    ProviderEntry::Openai {
+                        api_key,
+                        model,
+                        base_url: actual_base,
+                        chat_path: actual_chat,
+                        models_path: actual_models,
+                        name,
+                        reasoning_effort: actual_reasoning,
+                    },
+                ) => {
+                    assert_eq!(
+                        (actual_base, actual_chat, actual_models),
+                        (base_url, chat_path, models_path)
+                    );
+                    assert_eq!(actual_reasoning, reasoning_effort);
+                    assert_eq!(
+                        (api_key.as_str(), model.as_deref(), name.as_deref()),
+                        ("new-key", Some("new-model"), Some("renamed"))
+                    );
+                }
+                _ => panic!("provider type changed during edit"),
+            }
+        }
     }
 
     #[test]
