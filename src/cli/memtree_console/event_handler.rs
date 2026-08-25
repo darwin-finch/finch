@@ -99,6 +99,7 @@ impl EventHandler {
             | ReplEvent::RemoteBrainDisconnected { .. }
             | ReplEvent::HomeRunnerLeaseStatus { .. }
             | ReplEvent::NamedBrainProgramRequested(_)
+            | ReplEvent::NamedBrainTurnRequested(_)
             | ReplEvent::AgentLifecycle(_) => {}
         }
 

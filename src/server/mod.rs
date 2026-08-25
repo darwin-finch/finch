@@ -14,6 +14,7 @@ mod training_worker;
 pub use feedback_handler::{handle_feedback, handle_training_status};
 pub use brain_runner::{
     BrainRunnerBroker, RunnerProgramRequest, RunnerProgramResult, RunnerRegistrationId,
+    RunnerRequest, RunnerTurnRequest, RunnerTurnResult,
 };
 pub use handlers::{
     create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint,

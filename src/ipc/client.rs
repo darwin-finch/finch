@@ -259,6 +259,80 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(())
         })
     }
+
+    fn run_turn(
+        &mut self,
+        params: brain_runner::RunTurnParams,
+        mut results: brain_runner::RunTurnResults,
+    ) -> Promise<(), capnp::Error> {
+        let request = match params.get().and_then(|params| params.get_request()) {
+            Ok(request) => request,
+            Err(error) => return Promise::err(error),
+        };
+        let brain = request
+            .get_brain()
+            .ok()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let prompt = request
+            .get_prompt()
+            .ok()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let context = match request
+            .get_context_json()
+            .map_err(anyhow::Error::new)
+            .and_then(|value| serde_json::from_slice(value).map_err(anyhow::Error::new))
+        {
+            Ok(context) => context,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if self
+            .event_tx
+            .send(crate::cli::repl_event::ReplEvent::NamedBrainTurnRequested(
+                crate::server::RunnerTurnRequest {
+                    brain,
+                    request_seq: request.get_request_seq(),
+                    prompt,
+                    context,
+                    response_tx,
+                },
+            ))
+            .is_err()
+        {
+            return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));
+        }
+        Promise::from_future(async move {
+            let response = response_rx
+                .await
+                .map_err(|_| capnp::Error::failed("frontend dropped runner response".into()))?;
+            let mut result = results.get().init_result();
+            match response {
+                Ok(response) => {
+                    result.set_source(&response.source);
+                    result.set_language(match response.language {
+                        crate::brain::shared::ProgramLanguage::Forth => {
+                            finch_ipc_capnp::ProgramLanguage::Forth
+                        }
+                        crate::brain::shared::ProgramLanguage::Lisp => {
+                            finch_ipc_capnp::ProgramLanguage::Lisp
+                        }
+                    });
+                    result.set_output(&response.output);
+                    result.set_runtime_revision(response.runtime_revision);
+                    let encoded = serde_json::to_vec(&response.checkpoint)
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                    result.set_checkpoint_json(&encoded);
+                    result.set_error("");
+                }
+                Err(error) => result.set_error(&error),
+            }
+            Ok(())
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

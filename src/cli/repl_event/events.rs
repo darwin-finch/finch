@@ -197,6 +197,9 @@ pub enum ReplEvent {
     /// A daemon request routed through the callback registered for this
     /// frontend's current named-Brain runner lease.
     NamedBrainProgramRequested(crate::server::RunnerProgramRequest),
+    /// A complete provider/tool/VM turn routed to the frontend holding the
+    /// named Brain's environment-runner lease.
+    NamedBrainTurnRequested(crate::server::RunnerTurnRequest),
 
 }
 

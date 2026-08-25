@@ -2143,7 +2143,9 @@ mod named_brain_provider_context_tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         runners.register("shared", lease.lease_id, tx);
         tokio::spawn(async move {
-            let request = rx.recv().await.unwrap();
+            let crate::server::RunnerRequest::Program(request) = rx.recv().await.unwrap() else {
+                panic!("expected program request")
+            };
             assert_eq!(request.source, "(define (double (n : int)) : int (* n 2))");
             let runtime = crate::runtime::ProgramRuntime::new();
             let outcome = runtime

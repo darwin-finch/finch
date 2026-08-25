@@ -379,56 +379,55 @@ impl finch_daemon::Server for FinchDaemonImpl {
         let registration_id = broker.register(brain.clone(), lease_id, tx);
         tokio::task::spawn_local(async move {
             while let Some(request) = rx.recv().await {
-                let mut call = runner.run_program_request();
-                {
-                    let mut payload = call.get().init_request();
-                    payload.set_brain(&request.brain);
-                    payload.set_request_seq(request.request_seq);
-                    payload.set_language(match request.language {
-                        crate::brain::shared::ProgramLanguage::Forth => {
-                            finch_ipc_capnp::ProgramLanguage::Forth
+                let disconnected = match request {
+                    crate::server::RunnerRequest::Program(request) => {
+                        let mut call = runner.run_program_request();
+                        {
+                            let mut payload = call.get().init_request();
+                            payload.set_brain(&request.brain);
+                            payload.set_request_seq(request.request_seq);
+                            payload.set_language(program_language_to_capnp(request.language));
+                            payload.set_source(&request.source);
                         }
-                        crate::brain::shared::ProgramLanguage::Lisp => {
-                            finch_ipc_capnp::ProgramLanguage::Lisp
-                        }
-                    });
-                    payload.set_source(&request.source);
-                }
-                let (result, disconnected) = match call.send().promise.await {
-                    Ok(reply) => (
-                        reply
-                            .get()
-                            .and_then(|reply| reply.get_result())
-                            .map_err(|error| error.to_string())
-                            .and_then(|result| {
-                            let error = result
-                                .get_error()
-                                .ok()
-                                .and_then(|value| value.to_str().ok())
-                                .unwrap_or("");
-                            if !error.is_empty() {
-                                return Err(error.to_string());
+                        let (result, disconnected) = match call.send().promise.await {
+                            Ok(reply) => (
+                                decode_runner_program_result(reply.get().and_then(|r| r.get_result())),
+                                false,
+                            ),
+                            Err(error) => (Err(error.to_string()), true),
+                        };
+                        let _ = request.response_tx.send(result);
+                        disconnected
+                    }
+                    crate::server::RunnerRequest::Turn(request) => {
+                        let context_json = serde_json::to_vec(&request.context)
+                            .map_err(|error| error.to_string());
+                        let (result, disconnected) = match context_json {
+                            Ok(context_json) => {
+                                let mut call = runner.run_turn_request();
+                                {
+                                    let mut payload = call.get().init_request();
+                                    payload.set_brain(&request.brain);
+                                    payload.set_request_seq(request.request_seq);
+                                    payload.set_prompt(&request.prompt);
+                                    payload.set_context_json(&context_json);
+                                }
+                                match call.send().promise.await {
+                                    Ok(reply) => (
+                                        decode_runner_turn_result(
+                                            reply.get().and_then(|r| r.get_result()),
+                                        ),
+                                        false,
+                                    ),
+                                    Err(error) => (Err(error.to_string()), true),
+                                }
                             }
-                            let checkpoint = serde_json::from_slice(
-                                result.get_checkpoint_json().map_err(|e| e.to_string())?,
-                            )
-                            .map_err(|error| error.to_string())?;
-                            Ok(crate::server::RunnerProgramResult {
-                                output: result
-                                    .get_output()
-                                    .ok()
-                                    .and_then(|value| value.to_str().ok())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                runtime_revision: result.get_runtime_revision(),
-                                checkpoint,
-                            })
-                            }),
-                        false,
-                    ),
-                    Err(error) => (Err(error.to_string()), true),
+                            Err(error) => (Err(error), false),
+                        };
+                        let _ = request.response_tx.send(result);
+                        disconnected
+                    }
                 };
-                let _ = request.response_tx.send(result);
                 if disconnected {
                     break;
                 }
@@ -451,6 +450,89 @@ impl finch_daemon::Server for FinchDaemonImpl {
         results.get().set_version(env!("CARGO_PKG_VERSION"));
         Promise::ok(())
     }
+}
+
+fn program_language_to_capnp(
+    language: crate::brain::shared::ProgramLanguage,
+) -> finch_ipc_capnp::ProgramLanguage {
+    match language {
+        crate::brain::shared::ProgramLanguage::Forth => finch_ipc_capnp::ProgramLanguage::Forth,
+        crate::brain::shared::ProgramLanguage::Lisp => finch_ipc_capnp::ProgramLanguage::Lisp,
+    }
+}
+
+fn program_language_from_capnp(
+    language: finch_ipc_capnp::ProgramLanguage,
+) -> crate::brain::shared::ProgramLanguage {
+    match language {
+        finch_ipc_capnp::ProgramLanguage::Forth => crate::brain::shared::ProgramLanguage::Forth,
+        finch_ipc_capnp::ProgramLanguage::Lisp => crate::brain::shared::ProgramLanguage::Lisp,
+    }
+}
+
+fn decode_runner_program_result(
+    result: capnp::Result<finch_ipc_capnp::brain_program_result::Reader<'_>>,
+) -> Result<crate::server::RunnerProgramResult, String> {
+    let result = result.map_err(|error| error.to_string())?;
+    let error = result
+        .get_error()
+        .ok()
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !error.is_empty() {
+        return Err(error.to_string());
+    }
+    let checkpoint = serde_json::from_slice(
+        result.get_checkpoint_json().map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(crate::server::RunnerProgramResult {
+        output: result
+            .get_output()
+            .ok()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string(),
+        runtime_revision: result.get_runtime_revision(),
+        checkpoint,
+    })
+}
+
+fn decode_runner_turn_result(
+    result: capnp::Result<finch_ipc_capnp::brain_turn_result::Reader<'_>>,
+) -> Result<crate::server::RunnerTurnResult, String> {
+    let result = result.map_err(|error| error.to_string())?;
+    let error = result
+        .get_error()
+        .ok()
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !error.is_empty() {
+        return Err(error.to_string());
+    }
+    let checkpoint = serde_json::from_slice(
+        result.get_checkpoint_json().map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(crate::server::RunnerTurnResult {
+        source: result
+            .get_source()
+            .ok()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string(),
+        language: program_language_from_capnp(
+            result.get_language().map_err(|error| error.to_string())?,
+        ),
+        output: result
+            .get_output()
+            .ok()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string(),
+        runtime_revision: result.get_runtime_revision(),
+        checkpoint,
+    })
 }
 
 #[cfg(test)]

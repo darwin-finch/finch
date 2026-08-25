@@ -113,8 +113,25 @@ struct BrainProgramResult {
   error           @3 :Text;
 }
 
+struct BrainTurnRequest {
+  brain       @0 :Text;
+  requestSeq  @1 :UInt64;
+  prompt      @2 :Text;
+  contextJson @3 :Data; # Transitional canonical Message list; schema becomes native later.
+}
+
+struct BrainTurnResult {
+  source          @0 :Text;
+  language        @1 :ProgramLanguage;
+  output          @2 :Text;
+  runtimeRevision @3 :UInt64;
+  checkpointJson  @4 :Data; # Transitional typed checkpoint payload; schema becomes native later.
+  error           @5 :Text;
+}
+
 interface BrainRunner {
   runProgram @0 (request :BrainProgramRequest) -> (result :BrainProgramResult);
+  runTurn    @1 (request :BrainTurnRequest) -> (result :BrainTurnResult);
 }
 
 # ---------------------------------------------------------------------------

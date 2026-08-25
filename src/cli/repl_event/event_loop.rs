@@ -1117,6 +1117,7 @@ impl EventLoop {
                         ReplEvent::RemoteBrainDisconnected { .. } => "RemoteBrainDisconnected",
                         ReplEvent::HomeRunnerLeaseStatus { .. } => "HomeRunnerLeaseStatus",
                         ReplEvent::NamedBrainProgramRequested(_) => "NamedBrainProgramRequested",
+                        ReplEvent::NamedBrainTurnRequested(_) => "NamedBrainTurnRequested",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
                     tracing::debug!("Received event: {:?}", event);
@@ -3029,6 +3030,11 @@ Rules:\n\
             }
             ReplEvent::NamedBrainProgramRequested(request) => {
                 self.dispatch_named_brain_program(request);
+            }
+            ReplEvent::NamedBrainTurnRequested(request) => {
+                let _ = request.response_tx.send(Err(
+                    "named Brain full-turn dispatch is not initialized yet".to_string(),
+                ));
             }
             ReplEvent::ShowDialog {
                 dialog: _,

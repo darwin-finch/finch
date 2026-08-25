@@ -10,6 +10,12 @@ use tokio::sync::{mpsc, oneshot};
 use crate::brain::shared::{ProgramLanguage, RunnerLeaseId};
 
 #[derive(Debug)]
+pub enum RunnerRequest {
+    Program(RunnerProgramRequest),
+    Turn(RunnerTurnRequest),
+}
+
+#[derive(Debug)]
 pub struct RunnerProgramRequest {
     pub brain: String,
     pub request_seq: u64,
@@ -25,6 +31,24 @@ pub struct RunnerProgramResult {
     pub checkpoint: crate::vm::TypedRuntimeCheckpoint,
 }
 
+#[derive(Debug)]
+pub struct RunnerTurnRequest {
+    pub brain: String,
+    pub request_seq: u64,
+    pub prompt: String,
+    pub context: Vec<crate::claude::Message>,
+    pub response_tx: oneshot::Sender<Result<RunnerTurnResult, String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunnerTurnResult {
+    pub source: String,
+    pub language: ProgramLanguage,
+    pub output: String,
+    pub runtime_revision: u64,
+    pub checkpoint: crate::vm::TypedRuntimeCheckpoint,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunnerRegistrationId(uuid::Uuid);
 
@@ -32,7 +56,7 @@ pub struct RunnerRegistrationId(uuid::Uuid);
 struct Registration {
     id: RunnerRegistrationId,
     lease_id: RunnerLeaseId,
-    tx: mpsc::UnboundedSender<RunnerProgramRequest>,
+    tx: mpsc::UnboundedSender<RunnerRequest>,
 }
 
 /// Registrations contain only Tokio channels and portable values. Cap'n Proto
@@ -48,7 +72,7 @@ impl BrainRunnerBroker {
         &self,
         brain: impl Into<String>,
         lease_id: RunnerLeaseId,
-        tx: mpsc::UnboundedSender<RunnerProgramRequest>,
+        tx: mpsc::UnboundedSender<RunnerRequest>,
     ) -> RunnerRegistrationId {
         let id = RunnerRegistrationId(uuid::Uuid::new_v4());
         self.registrations
@@ -106,13 +130,48 @@ impl BrainRunnerBroker {
         let (response_tx, response_rx) = oneshot::channel();
         registration
             .tx
-            .send(RunnerProgramRequest {
+            .send(RunnerRequest::Program(RunnerProgramRequest {
                 brain: brain.to_string(),
                 request_seq,
                 language,
                 source,
                 response_tx,
-            })
+            }))
+            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub async fn dispatch_turn(
+        &self,
+        brain: &str,
+        lease_id: RunnerLeaseId,
+        request_seq: u64,
+        prompt: String,
+        context: Vec<crate::claude::Message>,
+    ) -> Result<RunnerTurnResult> {
+        let registration = self
+            .registrations
+            .read()
+            .expect("runner broker lock poisoned")
+            .get(brain)
+            .cloned()
+            .with_context(|| format!("named Brain '{brain}' has no connected runner callback"))?;
+        if registration.lease_id != lease_id {
+            anyhow::bail!("named Brain '{brain}' runner callback belongs to a stale lease");
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        registration
+            .tx
+            .send(RunnerRequest::Turn(RunnerTurnRequest {
+                brain: brain.to_string(),
+                request_seq,
+                prompt,
+                context,
+                response_tx,
+            }))
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
         response_rx
             .await
@@ -136,7 +195,9 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         broker.register("brain", lease_id, tx);
         tokio::spawn(async move {
-            let request = rx.recv().await.unwrap();
+            let RunnerRequest::Program(request) = rx.recv().await.unwrap() else {
+                panic!("expected program request")
+            };
             assert_eq!(request.request_seq, 7);
             assert_eq!(request.source, "21 2 *");
             let runtime = crate::runtime::ProgramRuntime::new();
@@ -189,6 +250,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("stale lease"));
+    }
+
+    #[tokio::test]
+    async fn full_turn_dispatch_carries_canonical_context() {
+        let broker = BrainRunnerBroker::default();
+        let lease_id = lease();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        broker.register("brain", lease_id, tx);
+        tokio::spawn(async move {
+            let RunnerRequest::Turn(request) = rx.recv().await.unwrap() else {
+                panic!("expected full turn request")
+            };
+            assert_eq!(request.prompt, "double it");
+            assert_eq!(request.context.len(), 1);
+            assert_eq!(request.context[0].text(), "21");
+            let runtime = crate::runtime::ProgramRuntime::new();
+            let checkpoint = runtime
+                .revision_history()
+                .unwrap()
+                .pop()
+                .unwrap()
+                .checkpoint
+                .unwrap();
+            request
+                .response_tx
+                .send(Ok(RunnerTurnResult {
+                    source: "(say \"42\")".into(),
+                    language: ProgramLanguage::Lisp,
+                    output: "42".into(),
+                    runtime_revision: 1,
+                    checkpoint,
+                }))
+                .unwrap();
+        });
+
+        let result = broker
+            .dispatch_turn(
+                "brain",
+                lease_id,
+                8,
+                "double it".into(),
+                vec![crate::claude::Message::user("21")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.source, "(say \"42\")");
+        assert_eq!(result.output, "42");
     }
 
     #[test]
