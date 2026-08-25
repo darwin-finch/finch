@@ -1069,6 +1069,86 @@ fn read_query_response(
 mod tests {
     use super::*;
 
+    struct BlockingBrainRunner {
+        started: std::cell::RefCell<
+            Option<tokio::sync::oneshot::Sender<crate::brain::shared::RunId>>,
+        >,
+        cancellations: std::rc::Rc<
+            std::cell::RefCell<
+                std::collections::HashMap<
+                    crate::brain::shared::RunId,
+                    tokio::sync::oneshot::Sender<()>,
+                >,
+            >,
+        >,
+    }
+
+    impl brain_runner::Server for BlockingBrainRunner {
+        fn run_program(
+            &mut self,
+            params: brain_runner::RunProgramParams,
+            mut results: brain_runner::RunProgramResults,
+        ) -> Promise<(), capnp::Error> {
+            let request = match params.get().and_then(|params| params.get_request()) {
+                Ok(request) => request,
+                Err(error) => return Promise::err(error),
+            };
+            let run_id = match request
+                .get_run_id()
+                .ok()
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            {
+                Some(run_id) => crate::brain::shared::RunId(run_id),
+                None => return Promise::err(capnp::Error::failed("invalid run id".into())),
+            };
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+            self.cancellations.borrow_mut().insert(run_id, cancel_tx);
+            if let Some(started) = self.started.borrow_mut().take() {
+                let _ = started.send(run_id);
+            }
+            Promise::from_future(async move {
+                let _ = cancel_rx.await;
+                let mut result = results.get().init_result();
+                result.set_error("named Brain run cancelled");
+                Ok(())
+            })
+        }
+
+        fn run_turn(
+            &mut self,
+            _params: brain_runner::RunTurnParams,
+            _results: brain_runner::RunTurnResults,
+        ) -> Promise<(), capnp::Error> {
+            Promise::err(capnp::Error::unimplemented(
+                "blocking smoke runner only accepts programs".into(),
+            ))
+        }
+
+        fn cancel_run(
+            &mut self,
+            params: brain_runner::CancelRunParams,
+            mut results: brain_runner::CancelRunResults,
+        ) -> Promise<(), capnp::Error> {
+            let params = match params.get() {
+                Ok(params) => params,
+                Err(error) => return Promise::err(error),
+            };
+            let run_id = params
+                .get_run_id()
+                .ok()
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                .map(crate::brain::shared::RunId);
+            let cancelled = run_id
+                .and_then(|run_id| self.cancellations.borrow_mut().remove(&run_id))
+                .is_some_and(|cancel| cancel.send(()).is_ok());
+            results.get().set_cancelled(cancelled);
+            results.get().set_error("");
+            Promise::ok(())
+        }
+    }
+
     #[test]
     fn runner_registration_explains_an_older_daemon_schema() {
         let error = map_runner_registration_error(capnp::Error::unimplemented(
@@ -1175,6 +1255,95 @@ mod tests {
                 .unwrap();
             assert_eq!(acknowledged.acknowledged_seq, outcome.accepted.seq);
             client.brain_detach(brain, &acknowledged).await.unwrap();
+        }));
+    }
+
+    /// Prove that cancellation overtakes an active runner RPC on the live
+    /// Cap'n Proto connection and reaches the exact run before it completes.
+    #[test]
+    #[ignore]
+    fn test_brain_running_cancellation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(async {
+            let client = IpcClient::connect()
+                .await
+                .expect("IPC connect — is `finch daemon` running?");
+            let brain = format!("codex-cancel-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+            let snapshot = client.brain_snapshot(&brain).await.unwrap();
+            let attachment = client
+                .brain_attach(
+                    &brain,
+                    "codex-cancel@localhost",
+                    crate::brain::shared::AttachmentRole::Driver,
+                    None,
+                )
+                .await
+                .unwrap();
+            let _incoming = client.brain_watch(&brain, &attachment).await.unwrap();
+            let lease = client
+                .brain_acquire_runner(
+                    &brain,
+                    "codex-blocking-runner@localhost",
+                    &snapshot.environment,
+                    None,
+                    60_000,
+                )
+                .await
+                .unwrap();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let runner: brain_runner::Client = capnp_rpc::new_client(BlockingBrainRunner {
+                started: std::cell::RefCell::new(Some(started_tx)),
+                cancellations: std::rc::Rc::new(std::cell::RefCell::new(
+                    std::collections::HashMap::new(),
+                )),
+            });
+            let mut registration = client.client.register_brain_runner_request();
+            registration.get().set_brain(&brain);
+            registration
+                .get()
+                .set_lease_id(&lease.lease_id.0.to_string());
+            registration.get().set_runner(runner);
+            registration.send().promise.await.unwrap();
+
+            let submit_client = client.clone();
+            let submit_brain = brain.clone();
+            let submit_attachment = attachment.clone();
+            let submission = tokio::task::spawn_local(async move {
+                submit_client
+                    .brain_submit(
+                        &submit_brain,
+                        &submit_attachment,
+                        crate::brain::shared::BrainEventKind::Program {
+                            language: crate::brain::shared::ProgramLanguage::Lisp,
+                            source: "(say \"this must not complete\")".into(),
+                        },
+                    )
+                    .await
+            });
+            let run_id = tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let cancelled = client
+                .brain_cancel_run(&brain, &attachment, run_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                cancelled.status,
+                crate::brain::shared::BrainRunStatus::Cancelled
+            );
+            let outcome = submission.await.unwrap().unwrap();
+            assert_eq!(outcome.run.unwrap().run_id, run_id);
+            assert_eq!(
+                client.brain_inspect_run(&brain, run_id).await.unwrap().status,
+                crate::brain::shared::BrainRunStatus::Cancelled
+            );
+            client.brain_release_runner(&brain, lease.lease_id).await.unwrap();
+            client.brain_detach(&brain, &attachment).await.unwrap();
         }));
     }
 }
