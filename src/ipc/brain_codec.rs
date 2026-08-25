@@ -1,8 +1,9 @@
 use crate::brain::store::{
     AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
     BrainEvent, BrainEventKind, BrainId, BrainProgram, BrainRun, BrainRunKind, BrainRunStatus,
-    BrainRunnerHandoff, BrainRunnerLease, BrainSnapshot, BrainWireMessage, ConnectionId,
-    ProgramLanguage, RunId, RunnerHandoffId, RunnerLeaseId,
+    BrainRunnerHandoff, BrainRunnerLease, BrainSchedule, BrainScheduleDeliveryPolicy,
+    BrainScheduleDue, BrainSnapshot, BrainWireMessage, ConnectionId, ProgramLanguage, RunId,
+    RunnerHandoffId, RunnerLeaseId, ScheduleId,
 };
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_approval_audience};
 
@@ -325,6 +326,19 @@ fn run_status_from_capnp(status: finch_ipc_capnp::BrainRunStatus) -> BrainRunSta
         finch_ipc_capnp::BrainRunStatus::Failed => BrainRunStatus::Failed,
         finch_ipc_capnp::BrainRunStatus::Cancelled => BrainRunStatus::Cancelled,
         finch_ipc_capnp::BrainRunStatus::Interrupted => BrainRunStatus::Interrupted,
+    }
+}
+
+fn schedule_policy_kind_to_capnp(
+    policy: &BrainScheduleDeliveryPolicy,
+) -> finch_ipc_capnp::BrainSchedulePolicyKind {
+    match policy {
+        BrainScheduleDeliveryPolicy::Coalesce => {
+            finch_ipc_capnp::BrainSchedulePolicyKind::Coalesce
+        }
+        BrainScheduleDeliveryPolicy::BoundedCatchUp { .. } => {
+            finch_ipc_capnp::BrainSchedulePolicyKind::BoundedCatchUp
+        }
     }
 }
 
@@ -685,6 +699,18 @@ pub(super) fn encode_snapshot(
     for (index, run) in snapshot.runs.iter().enumerate() {
         encode_run(runs.reborrow().get(index as u32), run);
     }
+    let mut schedules = builder
+        .reborrow()
+        .init_schedules(snapshot.schedules.len() as u32);
+    for (index, schedule) in snapshot.schedules.iter().enumerate() {
+        encode_schedule(schedules.reborrow().get(index as u32), schedule);
+    }
+    let mut dues = builder
+        .reborrow()
+        .init_pending_schedule_dues(snapshot.pending_schedule_dues.len() as u32);
+    for (index, due) in snapshot.pending_schedule_dues.iter().enumerate() {
+        encode_schedule_due(dues.reborrow().get(index as u32), due);
+    }
     Ok(())
 }
 
@@ -711,6 +737,16 @@ pub(super) fn decode_snapshot(
         .iter()
         .map(decode_run)
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let schedules = reader
+        .get_schedules()?
+        .iter()
+        .map(decode_schedule)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let pending_schedule_dues = reader
+        .get_pending_schedule_dues()?
+        .iter()
+        .map(decode_schedule_due)
+        .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(BrainSnapshot {
         brain_id: parse_brain_id(reader.get_brain_id()?)?,
         name: text(reader.get_name()?)?,
@@ -732,6 +768,8 @@ pub(super) fn decode_snapshot(
             .map(decode_runner_handoff)
             .transpose()?,
         runs,
+        schedules,
+        pending_schedule_dues,
     })
 }
 
@@ -906,6 +944,82 @@ pub(super) fn decode_run(
     })
 }
 
+fn encode_schedule(
+    mut builder: finch_ipc_capnp::brain_schedule::Builder<'_>,
+    schedule: &BrainSchedule,
+) {
+    builder.set_schedule_id(&schedule.schedule_id.0.to_string());
+    builder.set_language(language_to_capnp(schedule.language));
+    builder.set_source(&schedule.source);
+    builder.set_next_due_ms(schedule.next_due_ms);
+    if let Some(interval_ms) = schedule.interval_ms {
+        builder.set_has_interval_ms(true);
+        builder.set_interval_ms(interval_ms);
+    }
+    let mut policy = builder.reborrow().init_delivery_policy();
+    policy.set_kind(schedule_policy_kind_to_capnp(&schedule.delivery_policy));
+    if let BrainScheduleDeliveryPolicy::BoundedCatchUp {
+        max_catch_up,
+        expires_after_ms,
+    } = &schedule.delivery_policy
+    {
+        policy.set_max_catch_up(*max_catch_up);
+        policy.set_expires_after_ms(*expires_after_ms);
+    }
+    builder.set_active(schedule.active);
+}
+
+fn decode_schedule(
+    reader: finch_ipc_capnp::brain_schedule::Reader<'_>,
+) -> anyhow::Result<BrainSchedule> {
+    let policy = reader.get_delivery_policy()?;
+    let delivery_policy = match policy.get_kind()? {
+        finch_ipc_capnp::BrainSchedulePolicyKind::Coalesce => {
+            BrainScheduleDeliveryPolicy::Coalesce
+        }
+        finch_ipc_capnp::BrainSchedulePolicyKind::BoundedCatchUp => {
+            BrainScheduleDeliveryPolicy::BoundedCatchUp {
+                max_catch_up: policy.get_max_catch_up(),
+                expires_after_ms: policy.get_expires_after_ms(),
+            }
+        }
+    };
+    Ok(BrainSchedule {
+        schedule_id: ScheduleId(parse_uuid(reader.get_schedule_id()?)?),
+        language: language_from_capnp(reader.get_language()?),
+        source: text(reader.get_source()?)?,
+        next_due_ms: reader.get_next_due_ms(),
+        interval_ms: reader
+            .get_has_interval_ms()
+            .then(|| reader.get_interval_ms()),
+        delivery_policy,
+        active: reader.get_active(),
+    })
+}
+
+fn encode_schedule_due(
+    mut builder: finch_ipc_capnp::brain_schedule_due::Builder<'_>,
+    due: &BrainScheduleDue,
+) {
+    builder.set_schedule_id(&due.schedule_id.0.to_string());
+    encode_run(builder.reborrow().init_run(), &due.run);
+    builder.set_due_at_ms(due.due_at_ms);
+    builder.set_first_missed_at_ms(due.first_missed_at_ms);
+    builder.set_missed_count(due.missed_count);
+}
+
+fn decode_schedule_due(
+    reader: finch_ipc_capnp::brain_schedule_due::Reader<'_>,
+) -> anyhow::Result<BrainScheduleDue> {
+    Ok(BrainScheduleDue {
+        schedule_id: ScheduleId(parse_uuid(reader.get_schedule_id()?)?),
+        run: decode_run(reader.get_run()?)?,
+        due_at_ms: reader.get_due_at_ms(),
+        first_missed_at_ms: reader.get_first_missed_at_ms(),
+        missed_count: reader.get_missed_count(),
+    })
+}
+
 pub(super) fn encode_event(
     mut builder: finch_ipc_capnp::brain_event::Builder<'_>,
     event: &BrainEvent,
@@ -1072,6 +1186,12 @@ pub(super) fn encode_event(
                 state,
             )?;
         }
+        BrainEventKind::ScheduleChanged { schedule } => {
+            encode_schedule(builder.init_schedule_changed(), schedule);
+        }
+        BrainEventKind::ScheduleDue { due } => {
+            encode_schedule_due(builder.init_schedule_due(), due);
+        }
     }
     Ok(())
 }
@@ -1222,6 +1342,12 @@ pub(super) fn decode_event(
                 )?,
             }
         }
+        Which::ScheduleChanged(schedule) => BrainEventKind::ScheduleChanged {
+            schedule: decode_schedule(schedule?)?,
+        },
+        Which::ScheduleDue(due) => BrainEventKind::ScheduleDue {
+            due: decode_schedule_due(due?)?,
+        },
     };
     Ok(BrainEvent {
         schema_version: reader.get_schema_version(),
@@ -1666,6 +1792,38 @@ mod tests {
             acquired_ms: 10,
             expires_ms: 20,
         };
+        let schedule_id = ScheduleId(uuid::Uuid::new_v4());
+        let scheduled_run = BrainRun {
+            run_id: RunId(uuid::Uuid::new_v4()),
+            kind: BrainRunKind::Scheduled,
+            parent_run_id: None,
+            request_seq: 3,
+            initiating_attachment_id: attachment_id,
+            initiated_by: "alice@laptop.local".into(),
+            status: BrainRunStatus::QueuedForEnvironment,
+            started_ms: 300,
+            updated_ms: 300,
+            detail: None,
+        };
+        let schedule = BrainSchedule {
+            schedule_id,
+            language: ProgramLanguage::Lisp,
+            source: "(say \"scheduled\")".into(),
+            next_due_ms: 500,
+            interval_ms: Some(1_000),
+            delivery_policy: BrainScheduleDeliveryPolicy::BoundedCatchUp {
+                max_catch_up: 2,
+                expires_after_ms: 60_000,
+            },
+            active: true,
+        };
+        let pending_due = BrainScheduleDue {
+            schedule_id,
+            run: scheduled_run.clone(),
+            due_at_ms: 500,
+            first_missed_at_ms: 400,
+            missed_count: 2,
+        };
         let expected = BrainWireMessage::Snapshot {
             brain: BrainSnapshot {
                 brain_id,
@@ -1710,7 +1868,9 @@ mod tests {
                     started_ms: 100,
                     updated_ms: 200,
                     detail: None,
-                }],
+                }, scheduled_run],
+                schedules: vec![schedule],
+                pending_schedule_dues: vec![pending_due],
             },
         };
         let encoded = encode_brain_wire_message(&expected).unwrap();

@@ -787,7 +787,9 @@ pub(crate) async fn submit_named_brain_event(
             | BrainEventKind::ClientAttached { .. }
             | BrainEventKind::ClientDetached { .. }
             | BrainEventKind::RunStarted { .. }
-            | BrainEventKind::RunStatusChanged { .. } => None,
+            | BrainEventKind::RunStatusChanged { .. }
+            | BrainEventKind::ScheduleChanged { .. }
+            | BrainEventKind::ScheduleDue { .. } => None,
             BrainEventKind::Program { .. } | BrainEventKind::Prompt { .. } => {
                 unreachable!("executable requests create a BrainRun")
             }
@@ -1552,6 +1554,8 @@ fn named_brain_provider_messages(snapshot: &crate::brain::store::BrainSnapshot) 
                     | BrainEventKind::ClientDetached { .. }
                     | BrainEventKind::RunStarted { .. }
                     | BrainEventKind::RunStatusChanged { .. }
+                    | BrainEventKind::ScheduleChanged { .. }
+                    | BrainEventKind::ScheduleDue { .. }
             )
         })
         .take(80)
@@ -1633,7 +1637,9 @@ fn named_brain_provider_messages(snapshot: &crate::brain::store::BrainSnapshot) 
             | BrainEventKind::ClientAttached { .. }
             | BrainEventKind::ClientDetached { .. }
             | BrainEventKind::RunStarted { .. }
-            | BrainEventKind::RunStatusChanged { .. } => unreachable!("filtered above"),
+            | BrainEventKind::RunStatusChanged { .. }
+            | BrainEventKind::ScheduleChanged { .. }
+            | BrainEventKind::ScheduleDue { .. } => unreachable!("filtered above"),
         })
         .collect::<Vec<_>>();
 
@@ -2769,6 +2775,8 @@ mod handler_tests {
             runner_lease: None,
             runner_handoff: None,
             runs: Vec::new(),
+            schedules: Vec::new(),
+            pending_schedule_dues: Vec::new(),
         };
 
         let messages = named_brain_provider_messages(&snapshot);
@@ -2854,6 +2862,8 @@ mod handler_tests {
             runner_lease: None,
             runner_handoff: None,
             runs: Vec::new(),
+            schedules: Vec::new(),
+            pending_schedule_dues: Vec::new(),
         };
 
         let messages = named_brain_provider_messages(&snapshot);

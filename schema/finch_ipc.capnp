@@ -1053,6 +1053,36 @@ struct BrainRunStatusChanged {
   detail    @3 :Text;
 }
 
+enum BrainSchedulePolicyKind {
+  coalesce       @0;
+  boundedCatchUp @1;
+}
+
+struct BrainScheduleDeliveryPolicy {
+  kind           @0 :BrainSchedulePolicyKind;
+  maxCatchUp     @1 :UInt32;
+  expiresAfterMs @2 :UInt64;
+}
+
+struct BrainSchedule {
+  scheduleId     @0 :Text;
+  language       @1 :ProgramLanguage;
+  source         @2 :Text;
+  nextDueMs      @3 :UInt64;
+  hasIntervalMs  @4 :Bool;
+  intervalMs     @5 :UInt64;
+  deliveryPolicy @6 :BrainScheduleDeliveryPolicy;
+  active         @7 :Bool;
+}
+
+struct BrainScheduleDue {
+  scheduleId     @0 :Text;
+  run            @1 :BrainRun;
+  dueAtMs        @2 :UInt64;
+  firstMissedAtMs @3 :UInt64;
+  missedCount    @4 :UInt32;
+}
+
 struct BrainEvent {
   schemaVersion        @0 :UInt32;
   brainId              @1 :Text;
@@ -1081,6 +1111,8 @@ struct BrainEvent {
     runnerHandoffCancelled @23 :Text;
     participantMessage     @24 :Text;
     effectRecorded         @25 :BrainEffectRecorded;
+    scheduleChanged        @26 :BrainSchedule;
+    scheduleDue            @27 :BrainScheduleDue;
   }
 }
 
@@ -1097,6 +1129,8 @@ struct BrainSnapshot {
   runs            @9 :List(BrainRun);
   hasRunnerHandoff @10 :Bool;
   runnerHandoff    @11 :BrainRunnerHandoff;
+  schedules        @12 :List(BrainSchedule);
+  pendingScheduleDues @13 :List(BrainScheduleDue);
 }
 
 struct BrainWireMessage {

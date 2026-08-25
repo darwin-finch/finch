@@ -4975,7 +4975,10 @@ Rules:\n\
             // Internal durable VM state is intentionally not rendered as a
             // chat item. The adjacent Program/Result events are its visible
             // projection.
-            BrainEventKind::RuntimeCommitted { .. } | BrainEventKind::EffectRecorded { .. } => {}
+            BrainEventKind::RuntimeCommitted { .. }
+            | BrainEventKind::EffectRecorded { .. }
+            | BrainEventKind::ScheduleChanged { .. }
+            | BrainEventKind::ScheduleDue { .. } => {}
         }
     }
 

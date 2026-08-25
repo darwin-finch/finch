@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 8;
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 9;
 const BRAIN_METADATA_VERSION: u32 = 1;
 
 /// Stable identity of one durable Brain. Names are mutable human aliases;
@@ -87,6 +87,16 @@ impl RunnerHandoffId {
 pub struct RunId(pub uuid::Uuid);
 
 impl RunId {
+    fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ScheduleId(pub uuid::Uuid);
+
+impl ScheduleId {
     fn new() -> Self {
         Self(uuid::Uuid::new_v4())
     }
@@ -194,6 +204,39 @@ struct BrainMetadata {
 pub enum ProgramLanguage {
     Forth,
     Lisp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BrainScheduleDeliveryPolicy {
+    Coalesce,
+    BoundedCatchUp {
+        max_catch_up: u32,
+        expires_after_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainSchedule {
+    pub schedule_id: ScheduleId,
+    pub language: ProgramLanguage,
+    pub source: String,
+    pub next_due_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<u64>,
+    pub delivery_policy: BrainScheduleDeliveryPolicy,
+    pub active: bool,
+}
+
+/// One durable schedule delivery and the queued run that owns it. Keeping the
+/// run in this event makes due calculation -> runnable work one atomic append.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainScheduleDue {
+    pub schedule_id: ScheduleId,
+    pub run: BrainRun,
+    pub due_at_ms: u64,
+    pub first_missed_at_ms: u64,
+    pub missed_count: u32,
 }
 
 /// The one machine/workspace boundary in which a brain may cause effects.
@@ -323,6 +366,12 @@ pub enum BrainEventKind {
         effect: crate::vm::VmSideEffect,
         state: crate::vm::EffectJournalState,
     },
+    ScheduleChanged {
+        schedule: BrainSchedule,
+    },
+    ScheduleDue {
+        due: BrainScheduleDue,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -365,6 +414,10 @@ pub struct BrainSnapshot {
     pub runner_handoff: Option<BrainRunnerHandoff>,
     #[serde(default)]
     pub runs: Vec<BrainRun>,
+    #[serde(default)]
+    pub schedules: Vec<BrainSchedule>,
+    #[serde(default)]
+    pub pending_schedule_dues: Vec<BrainScheduleDue>,
 }
 
 impl BrainSnapshot {
@@ -407,6 +460,8 @@ struct BrainState {
     program_stack: Vec<BrainProgram>,
     attachments: HashMap<AttachmentId, BrainAttachment>,
     runs: HashMap<RunId, BrainRun>,
+    schedules: HashMap<ScheduleId, BrainSchedule>,
+    pending_schedule_dues: HashMap<ScheduleId, BrainScheduleDue>,
     runner_lease: Option<BrainRunnerLease>,
     runner_handoff: Option<BrainRunnerHandoff>,
     runtime_checkpoint: Option<RuntimeCheckpointState>,
@@ -430,6 +485,8 @@ impl BrainState {
             program_stack: Vec::new(),
             attachments: HashMap::new(),
             runs: HashMap::new(),
+            schedules: HashMap::new(),
+            pending_schedule_dues: HashMap::new(),
             runner_lease: None,
             runner_handoff: None,
             runtime_checkpoint: None,
@@ -542,6 +599,22 @@ impl BrainState {
                     run.updated_ms = event.created_ms;
                     run.detail.clone_from(detail);
                 }
+                if status.is_terminal() {
+                    self.pending_schedule_dues
+                        .retain(|_, due| due.run.run_id != *run_id);
+                }
+            }
+            BrainEventKind::ScheduleChanged { schedule } => {
+                self.schedules
+                    .insert(schedule.schedule_id, schedule.clone());
+                if !schedule.active {
+                    self.pending_schedule_dues.remove(&schedule.schedule_id);
+                }
+            }
+            BrainEventKind::ScheduleDue { due } => {
+                self.runs.insert(due.run.run_id, due.run.clone());
+                self.pending_schedule_dues
+                    .insert(due.schedule_id, due.clone());
             }
             BrainEventKind::Program { language, source } => {
                 self.program_stack.push(BrainProgram {
@@ -713,6 +786,8 @@ impl BrainStore {
                 .clone()
                 .filter(|handoff| handoff.expires_ms > unix_millis()),
             runs: sorted_runs(&state.runs),
+            schedules: sorted_schedules(&state.schedules),
+            pending_schedule_dues: sorted_schedule_dues(&state.pending_schedule_dues),
         })
     }
 
@@ -2062,6 +2137,20 @@ fn sorted_runs(runs: &HashMap<RunId, BrainRun>) -> Vec<BrainRun> {
     runs
 }
 
+fn sorted_schedules(schedules: &HashMap<ScheduleId, BrainSchedule>) -> Vec<BrainSchedule> {
+    let mut schedules = schedules.values().cloned().collect::<Vec<_>>();
+    schedules.sort_by_key(|schedule| (schedule.next_due_ms, schedule.schedule_id.0));
+    schedules
+}
+
+fn sorted_schedule_dues(
+    dues: &HashMap<ScheduleId, BrainScheduleDue>,
+) -> Vec<BrainScheduleDue> {
+    let mut dues = dues.values().cloned().collect::<Vec<_>>();
+    dues.sort_by_key(|due| (due.due_at_ms, due.schedule_id.0));
+    dues
+}
+
 fn validate_run_transition(from: BrainRunStatus, to: BrainRunStatus) -> Result<()> {
     use BrainRunStatus::*;
     let allowed = match from {
@@ -2094,6 +2183,110 @@ const fn legacy_brain_event_schema_version() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schedule_due_is_one_durable_coalesced_run_until_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let schedule = BrainSchedule {
+            schedule_id: ScheduleId::new(),
+            language: ProgramLanguage::Lisp,
+            source: "(say \"tick\")".into(),
+            next_due_ms: 1_000,
+            interval_ms: Some(1_000),
+            delivery_policy: BrainScheduleDeliveryPolicy::Coalesce,
+            active: true,
+        };
+        let changed = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::ScheduleChanged {
+                    schedule: schedule.clone(),
+                },
+            )
+            .unwrap();
+        let run = BrainRun {
+            run_id: RunId::new(),
+            kind: BrainRunKind::Scheduled,
+            parent_run_id: None,
+            request_seq: changed.seq,
+            initiating_attachment_id: attachment.attachment_id,
+            initiated_by: "daemon".into(),
+            status: BrainRunStatus::QueuedForEnvironment,
+            started_ms: 1_000,
+            updated_ms: 1_000,
+            detail: None,
+        };
+        let first_due = BrainScheduleDue {
+            schedule_id: schedule.schedule_id,
+            run: run.clone(),
+            due_at_ms: 1_000,
+            first_missed_at_ms: 1_000,
+            missed_count: 1,
+        };
+        store
+            .push(
+                "shared",
+                "daemon",
+                BrainEventKind::ScheduleDue {
+                    due: first_due.clone(),
+                },
+            )
+            .unwrap();
+
+        drop(store);
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let restored = restarted.snapshot("shared").unwrap();
+        assert_eq!(restored.schedules, vec![schedule.clone()]);
+        assert_eq!(restored.pending_schedule_dues, vec![first_due]);
+        assert_eq!(restored.runs, vec![run.clone()]);
+
+        let coalesced = BrainScheduleDue {
+            missed_count: 3,
+            due_at_ms: 3_000,
+            ..restored.pending_schedule_dues[0].clone()
+        };
+        restarted
+            .push(
+                "shared",
+                "daemon",
+                BrainEventKind::ScheduleDue {
+                    due: coalesced.clone(),
+                },
+            )
+            .unwrap();
+        let snapshot = restarted.snapshot("shared").unwrap();
+        assert_eq!(snapshot.pending_schedule_dues, vec![coalesced]);
+        assert_eq!(snapshot.runs.len(), 1, "coalescing must reuse the queued run");
+
+        restarted
+            .transition_run(
+                "shared",
+                "runner",
+                run.run_id,
+                BrainRunStatus::Running,
+                None,
+            )
+            .unwrap();
+        restarted
+            .transition_run(
+                "shared",
+                "runner",
+                run.run_id,
+                BrainRunStatus::Completed,
+                None,
+            )
+            .unwrap();
+        assert!(restarted
+            .snapshot("shared")
+            .unwrap()
+            .pending_schedule_dues
+            .is_empty());
+    }
 
     #[test]
     fn run_lifecycle_is_event_sourced_and_terminal_state_is_final() {
