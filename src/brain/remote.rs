@@ -430,9 +430,23 @@ impl RemoteBrainClient {
         role: AttachmentRole,
         ttl_ms: Option<u64>,
     ) -> Result<(String, super::credential::BrainInvitationClaims)> {
+        self.issue_invitation_with_scopes(role, None, ttl_ms).await
+    }
+
+    /// Delegate an explicitly attenuated participant invitation. On the
+    /// restricted TLS transport this uses the client's already redeemed,
+    /// unbound `brain:control` credential; the bootstrap password is never
+    /// sent to a remote host.
+    pub async fn issue_invitation_with_scopes(
+        &self,
+        role: AttachmentRole,
+        scopes: Option<std::collections::BTreeSet<super::credential::BrainCredentialScope>>,
+        ttl_ms: Option<u64>,
+    ) -> Result<(String, super::credential::BrainInvitationClaims)> {
         #[derive(Serialize)]
         struct Issue {
             role: AttachmentRole,
+            scopes: Option<std::collections::BTreeSet<super::credential::BrainCredentialScope>>,
             ttl_ms: Option<u64>,
         }
         #[derive(Deserialize)]
@@ -441,11 +455,16 @@ impl RemoteBrainClient {
             claims: super::credential::BrainInvitationClaims,
         }
 
+        let (authorization, delegator) = self.delegation_authorization().await?;
         let issued = self
             .http
             .post(self.target.invitations_url())
-            .bearer_auth(self.bootstrap_password()?)
-            .json(&Issue { role, ttl_ms })
+            .bearer_auth(authorization)
+            .json(&Issue {
+                role,
+                scopes: scopes.clone(),
+                ttl_ms,
+            })
             .send()
             .await
             .context("could not reach Brain invitation issuer")?
@@ -454,8 +473,23 @@ impl RemoteBrainClient {
             .json::<Issued>()
             .await
             .context("invalid Brain invitation response")?;
-        if issued.claims.brain != self.target.brain || issued.claims.role != role {
+        if issued.claims.brain != self.target.brain
+            || issued.claims.role != role
+            || scopes
+                .as_ref()
+                .is_some_and(|required| required != &issued.claims.scopes)
+        {
             anyhow::bail!("Brain invitation issuer returned the wrong participant audience");
+        }
+        if delegator.as_ref().is_some_and(|parent| {
+            let mut expected_ancestry = parent.delegation_chain.clone();
+            expected_ancestry.push(parent.credential_id);
+            issued.claims.brain_id != parent.brain_id
+                || issued.claims.environment_generation != parent.environment_generation
+                || issued.claims.expires_ms > parent.expires_ms
+                || issued.claims.delegation_chain != expected_ancestry
+        }) {
+            anyhow::bail!("Brain invitation issuer returned invalid delegation ancestry");
         }
         let (portable_claims, _) =
             super::credential::verify_portable_invitation(&issued.invitation, unix_epoch_millis())?;
@@ -463,6 +497,64 @@ impl RemoteBrainClient {
             anyhow::bail!("Brain invitation envelope does not match the issuer response");
         }
         Ok((issued.invitation, issued.claims))
+    }
+
+    /// Mint an explicitly attenuated participant credential using an
+    /// unbound `brain:control` credential already held by this client.
+    pub async fn issue_credential(
+        &self,
+        subject: &str,
+        role: AttachmentRole,
+        scopes: std::collections::BTreeSet<super::credential::BrainCredentialScope>,
+        ttl_ms: Option<u64>,
+    ) -> Result<(String, super::credential::BrainCredentialClaims)> {
+        #[derive(Serialize)]
+        struct Issue<'a> {
+            subject: &'a str,
+            role: AttachmentRole,
+            scopes: std::collections::BTreeSet<super::credential::BrainCredentialScope>,
+            ttl_ms: Option<u64>,
+        }
+
+        let (authorization, delegator) = self.delegation_authorization().await?;
+        let issued = self
+            .http
+            .post(self.target.credentials_url())
+            .bearer_auth(authorization)
+            .json(&Issue {
+                subject,
+                role,
+                scopes: scopes.clone(),
+                ttl_ms,
+            })
+            .send()
+            .await
+            .context("could not reach Brain credential issuer")?
+            .error_for_status()
+            .context("Brain credential request rejected")?
+            .json::<IssuedBrainCredential>()
+            .await
+            .context("invalid Brain credential response")?;
+        if issued.claims.subject != subject
+            || issued.claims.role != role
+            || issued.claims.brain != self.target.brain
+            || issued.claims.scopes != scopes
+            || issued.claims.attachment_id.is_some()
+            || issued.claims.connection_id.is_some()
+        {
+            anyhow::bail!("Brain credential issuer returned the wrong participant audience");
+        }
+        if delegator.as_ref().is_some_and(|parent| {
+            let mut expected_ancestry = parent.delegation_chain.clone();
+            expected_ancestry.push(parent.credential_id);
+            issued.claims.brain_id != parent.brain_id
+                || issued.claims.environment_generation != parent.environment_generation
+                || issued.claims.expires_ms > parent.expires_ms
+                || issued.claims.delegation_chain != expected_ancestry
+        }) {
+            anyhow::bail!("Brain credential issuer returned invalid delegation ancestry");
+        }
+        Ok((issued.token, issued.claims))
     }
 
     /// Redeem this client's invitation and attach using the role and scopes
@@ -478,7 +570,10 @@ impl RemoteBrainClient {
         Ok((role, attachment))
     }
 
-    async fn redeem_invitation(&self, subject: &str) -> Result<AttachmentRole> {
+    /// Redeem the signed invitation into an unbound scoped credential without
+    /// creating an attachment. Controllers can use this explicit phase to
+    /// delegate narrower authority or perform Brain-scoped administration.
+    pub async fn redeem_invitation(&self, subject: &str) -> Result<AttachmentRole> {
         let mut credential = self.credential.lock().await;
         if let Some(existing) = credential.as_ref() {
             if existing.claims.subject == subject
@@ -1127,6 +1222,43 @@ impl RemoteBrainClient {
             anyhow::bail!("scoped Brain credential expired; reconnect the attachment");
         }
         Ok(credential.token.clone())
+    }
+
+    async fn delegation_authorization(
+        &self,
+    ) -> Result<(
+        String,
+        Option<super::credential::BrainCredentialClaims>,
+    )> {
+        match &self.bootstrap {
+            RemoteBrainBootstrap::Password(password) => Ok((password.clone(), None)),
+            RemoteBrainBootstrap::Invitation { .. } => {
+                let credential = self.credential.lock().await;
+                let credential = credential
+                    .as_ref()
+                    .context("redeem the Brain invitation before delegating authority")?;
+                anyhow::ensure!(
+                    credential.claims.brain == self.target.brain,
+                    "Brain credential has a different Brain audience"
+                );
+                anyhow::ensure!(
+                    credential.claims.attachment_id.is_none()
+                        && credential.claims.connection_id.is_none(),
+                    "attachment-bound credentials cannot delegate authority"
+                );
+                anyhow::ensure!(
+                    credential
+                        .claims
+                        .permits(super::credential::BrainCredentialScope::BrainControl),
+                    "Brain credential does not grant delegation control"
+                );
+                anyhow::ensure!(
+                    credential.claims.expires_ms > unix_epoch_millis(),
+                    "Brain credential has expired"
+                );
+                Ok((credential.token.clone(), Some(credential.claims.clone())))
+            }
+        }
     }
 
     fn bootstrap_password(&self) -> Result<&str> {
@@ -1944,6 +2076,324 @@ mod tests {
             detail.contains("certificate") || detail.contains("UnknownIssuer"),
             "unexpected TLS error: {detail}"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn restricted_production_router_enforces_delegation_and_archive_scopes() {
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+
+        use super::super::credential::{
+            default_participant_scopes, BrainCredentialRequest, BrainCredentialScope,
+            BrainInvitationRequest,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let authority = super::super::credential::BrainCredentialAuthority::ephemeral([82; 32]);
+        let state = Arc::new(
+            crate::server::AgentServer::for_brain_http_test(
+                "fixture.local",
+                temp.path(),
+                authority.clone(),
+            )
+            .unwrap(),
+        );
+        let snapshot = state.brain_store().snapshot("shared").unwrap();
+        let now = unix_epoch_millis();
+        let controller_scopes = [
+            BrainCredentialScope::BrainRead,
+            BrainCredentialScope::BrainAttach,
+            BrainCredentialScope::BrainDetach,
+            BrainCredentialScope::BrainControl,
+            BrainCredentialScope::EnvironmentAdmin,
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let (controller_invitation, _) = authority
+            .issue_invitation(
+                BrainInvitationRequest {
+                    issuer: "fixture.local".into(),
+                    brain_id: snapshot.brain_id,
+                    brain: "shared".into(),
+                    environment_generation: snapshot.environment.generation,
+                    role: AttachmentRole::Driver,
+                    scopes: controller_scopes,
+                    delegation_chain: Vec::new(),
+                    ttl_ms: 120_000,
+                },
+                now,
+            )
+            .unwrap();
+
+        let tls = authority.invitation_tls_identity();
+        crate::node::tls::install_server_crypto_provider();
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
+            vec![tls.certificate_der().to_vec()],
+            tls.private_key_der().to_vec(),
+        )
+        .await
+        .unwrap();
+        let app = crate::server::handlers::create_remote_brain_router(state);
+        let handle = axum_server::Handle::new();
+        let server = tokio::spawn(
+            axum_server::bind_rustls(
+                "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
+                tls_config,
+            )
+            .handle(handle.clone())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>()),
+        );
+        let address = handle.listening().await.unwrap();
+        let target = RemoteBrainTarget {
+            brain: "shared".into(),
+            machine: "localhost".into(),
+            address: format!("localhost:{}", address.port()),
+            secure: true,
+        };
+
+        let controller =
+            RemoteBrainClient::new_with_invitation(target.clone(), controller_invitation.clone())
+                .unwrap();
+        controller.redeem_invitation("controller").await.unwrap();
+        let parent = controller
+            .credential
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .claims
+            .clone();
+        let read = [BrainCredentialScope::BrainRead]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let (_, child) = controller
+            .issue_credential(
+                "reader",
+                AttachmentRole::Observer,
+                read.clone(),
+                Some(10_000),
+            )
+            .await
+            .unwrap();
+        assert_eq!(child.delegation_chain, vec![parent.credential_id]);
+        let (_, invitation) = controller
+            .issue_invitation_with_scopes(
+                AttachmentRole::Observer,
+                Some(default_participant_scopes(AttachmentRole::Observer)),
+                Some(10_000),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invitation.delegation_chain, vec![parent.credential_id]);
+
+        let escalation = [BrainCredentialScope::EnvironmentAdmin]
+            .into_iter()
+            .collect();
+        assert!(controller
+            .issue_credential(
+                "observer-admin",
+                AttachmentRole::Observer,
+                escalation,
+                Some(10_000),
+            )
+            .await
+            .is_err());
+        assert!(controller
+            .issue_credential(
+                "too-long",
+                AttachmentRole::Observer,
+                read.clone(),
+                Some(300_000),
+            )
+            .await
+            .is_err());
+
+        let limited_scopes = [
+            BrainCredentialScope::BrainRead,
+            BrainCredentialScope::BrainAttach,
+        ]
+        .into_iter()
+        .collect();
+        let (limited_invitation, _) = authority
+            .issue_invitation(
+                BrainInvitationRequest {
+                    issuer: "fixture.local".into(),
+                    brain_id: snapshot.brain_id,
+                    brain: "shared".into(),
+                    environment_generation: snapshot.environment.generation,
+                    role: AttachmentRole::Driver,
+                    scopes: limited_scopes,
+                    delegation_chain: Vec::new(),
+                    ttl_ms: 60_000,
+                },
+                now,
+            )
+            .unwrap();
+        let limited =
+            RemoteBrainClient::new_with_invitation(target.clone(), limited_invitation).unwrap();
+        limited.redeem_invitation("limited").await.unwrap();
+        assert!(limited
+            .issue_invitation(AttachmentRole::Observer, Some(10_000))
+            .await
+            .is_err());
+        let limited_token = limited
+            .credential
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .token
+            .clone();
+        assert_eq!(
+            limited
+                .http
+                .post(limited.target.invitations_url())
+                .bearer_auth(limited_token.clone())
+                .json(&serde_json::json!({
+                    "role": AttachmentRole::Observer,
+                    "ttl_ms": 10_000,
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            limited
+                .http
+                .delete(limited.target.http_url())
+                .bearer_auth(limited_token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+
+        for (brain_id, generation, label) in [
+            (
+                BrainId(uuid::Uuid::new_v4()),
+                snapshot.environment.generation,
+                "wrong-brain",
+            ),
+            (
+                snapshot.brain_id,
+                snapshot.environment.generation + 1,
+                "wrong-generation",
+            ),
+        ] {
+            let token = authority
+                .issue(
+                    BrainCredentialRequest {
+                        issuer: "fixture.local".into(),
+                        subject: label.into(),
+                        brain_id,
+                        brain: "shared".into(),
+                        environment_generation: generation,
+                        role: AttachmentRole::Driver,
+                        scopes: [BrainCredentialScope::BrainControl].into_iter().collect(),
+                        delegation_chain: Vec::new(),
+                        ttl_ms: 60_000,
+                    },
+                    now,
+                )
+                .unwrap();
+            let claims = authority.verify(&token, now).unwrap();
+            let hostile = RemoteBrainClient::new_with_invitation(
+                target.clone(),
+                controller_invitation.clone(),
+            )
+            .unwrap();
+            *hostile.credential.lock().await = Some(RemoteBrainCredential { token, claims });
+            assert!(hostile
+                .issue_credential(label, AttachmentRole::Observer, read.clone(), Some(10_000))
+                .await
+                .is_err());
+        }
+
+        let expired_token = authority
+            .issue(
+                BrainCredentialRequest {
+                    issuer: "fixture.local".into(),
+                    subject: "expired".into(),
+                    brain_id: snapshot.brain_id,
+                    brain: "shared".into(),
+                    environment_generation: snapshot.environment.generation,
+                    role: AttachmentRole::Driver,
+                    scopes: [BrainCredentialScope::BrainControl].into_iter().collect(),
+                    delegation_chain: Vec::new(),
+                    ttl_ms: 1,
+                },
+                now.saturating_sub(10),
+            )
+            .unwrap();
+        let expired_claims = authority
+            .verify(&expired_token, now.saturating_sub(10))
+            .unwrap();
+        let expired = RemoteBrainClient::new_with_invitation(
+            target.clone(),
+            controller_invitation.clone(),
+        )
+        .unwrap();
+        *expired.credential.lock().await = Some(RemoteBrainCredential {
+            token: expired_token,
+            claims: expired_claims,
+        });
+        assert!(expired
+            .issue_credential("expired-child", AttachmentRole::Observer, read, Some(1))
+            .await
+            .is_err());
+
+        let ancestor_token = authority
+            .issue(
+                BrainCredentialRequest {
+                    issuer: "fixture.local".into(),
+                    subject: "ancestor".into(),
+                    brain_id: snapshot.brain_id,
+                    brain: "shared".into(),
+                    environment_generation: snapshot.environment.generation,
+                    role: AttachmentRole::Driver,
+                    scopes: [BrainCredentialScope::BrainControl].into_iter().collect(),
+                    delegation_chain: Vec::new(),
+                    ttl_ms: 60_000,
+                },
+                now,
+            )
+            .unwrap();
+        let ancestor = authority.verify(&ancestor_token, now).unwrap();
+        let revoked_child_token = authority
+            .issue(
+                BrainCredentialRequest {
+                    issuer: "fixture.local".into(),
+                    subject: "revoked-child".into(),
+                    brain_id: snapshot.brain_id,
+                    brain: "shared".into(),
+                    environment_generation: snapshot.environment.generation,
+                    role: AttachmentRole::Driver,
+                    scopes: [BrainCredentialScope::BrainControl].into_iter().collect(),
+                    delegation_chain: vec![ancestor.credential_id],
+                    ttl_ms: 30_000,
+                },
+                now,
+            )
+            .unwrap();
+        let revoked_child_claims = authority.verify(&revoked_child_token, now).unwrap();
+        let revoked_child =
+            RemoteBrainClient::new_with_invitation(target, controller_invitation).unwrap();
+        *revoked_child.credential.lock().await = Some(RemoteBrainCredential {
+            token: revoked_child_token,
+            claims: revoked_child_claims,
+        });
+        authority.revoke(ancestor.credential_id).unwrap();
+        let read = [BrainCredentialScope::BrainRead].into_iter().collect();
+        assert!(revoked_child
+            .issue_credential("descendant", AttachmentRole::Observer, read, Some(1_000))
+            .await
+            .is_err());
+
+        controller.archive("controller").await.unwrap();
         server.abort();
     }
 
