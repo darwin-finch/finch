@@ -4536,6 +4536,50 @@ mod tests {
     }
 
     #[test]
+    fn run_status_payload_id_remains_compatible_with_envelope_correlation() {
+        let run_id = RunId::new();
+        let legacy = serde_json::json!({
+            "schema_version": 13,
+            "brain_id": BrainId::nil(),
+            "seq": 2,
+            "environment_generation": 1,
+            "sender": "daemon",
+            "created_ms": 1,
+            "kind": "run_status_changed",
+            "run_id": run_id,
+            "status": "cancelled"
+        });
+        let legacy: BrainEvent = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.run_id, None);
+        assert!(matches!(
+            legacy.kind,
+            BrainEventKind::RunStatusChanged {
+                run_id: payload_run_id,
+                status: BrainRunStatus::Cancelled,
+                ..
+            } if payload_run_id == run_id
+        ));
+
+        let current = BrainEvent {
+            schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+            brain_id: BrainId::new(),
+            seq: 2,
+            environment_generation: 1,
+            sender: "daemon".into(),
+            created_ms: 1,
+            run_id: Some(run_id),
+            kind: BrainEventKind::RunStatusChanged {
+                run_id,
+                status: BrainRunStatus::Cancelled,
+                detail: None,
+            },
+        };
+        let encoded = serde_json::to_string(&current).unwrap();
+        let decoded: BrainEvent = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, current);
+    }
+
+    #[test]
     fn concurrent_metadata_creation_converges_on_one_identity() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
