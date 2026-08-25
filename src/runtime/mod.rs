@@ -2375,6 +2375,31 @@ impl ProgramRuntime {
         checkpoint: TypedRuntimeCheckpoint,
         revision: u64,
     ) -> Result<bool> {
+        self.hydrate_reducible_state(checkpoint, revision, true)
+            .await
+    }
+
+    /// Replace reducible VM state with an exact application-owned checkpoint,
+    /// even when its revision is numerically lower than the current lineage.
+    /// This is required when one frontend explicitly changes which Brain it
+    /// serves: revisions are comparable only within a Brain. Host bindings and
+    /// live grants remain frontend-owned and are preserved across the switch.
+    pub async fn replace_reducible_state(
+        &self,
+        checkpoint: TypedRuntimeCheckpoint,
+        revision: u64,
+    ) -> Result<()> {
+        self.hydrate_reducible_state(checkpoint, revision, false)
+            .await
+            .map(|_| ())
+    }
+
+    async fn hydrate_reducible_state(
+        &self,
+        checkpoint: TypedRuntimeCheckpoint,
+        revision: u64,
+        only_if_newer: bool,
+    ) -> Result<bool> {
         let mut restored = TypedRuntime::from_checkpoint(checkpoint.clone()).map_err(|diagnostics| {
             anyhow::anyhow!(
                 "cannot hydrate typed runtime checkpoint: {}",
@@ -2387,7 +2412,7 @@ impl ProgramRuntime {
         })?;
         let _submission = self.submission_gate.lock().await;
         let current_revision = self.revision();
-        if revision <= current_revision {
+        if only_if_newer && revision <= current_revision {
             return Ok(false);
         }
         if self.pending_typed_execution_count()? != 0 {
@@ -9636,6 +9661,52 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         assert_eq!(runner.revision(), defined.output_revision);
         assert_eq!(runner.capability_ledger().unwrap(), authority_before);
 
+        let called = runner
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "21 double",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(called.values.as_slice(), [ProgramValue::Int(42)]));
+    }
+
+    #[tokio::test]
+    async fn switching_brains_replaces_an_unrelated_higher_revision_lineage() {
+        let source = ProgramRuntime::new();
+        let defined = source
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(define (double (n : int)) : int (* n 2))",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        let checkpoint = source
+            .revision_history()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.revision == defined.output_revision)
+            .and_then(|snapshot| snapshot.checkpoint)
+            .unwrap();
+
+        let runner = ProgramRuntime::new();
+        runner
+            .submit(submission(ProgramLanguage::Forth, "10", ExecutionEffect::Pure))
+            .await
+            .unwrap();
+        runner
+            .submit(submission(ProgramLanguage::Forth, "20", ExecutionEffect::Pure))
+            .await
+            .unwrap();
+        assert!(runner.revision() > defined.output_revision);
+
+        runner
+            .replace_reducible_state(checkpoint, defined.output_revision)
+            .await
+            .unwrap();
+        assert_eq!(runner.revision(), defined.output_revision);
         let called = runner
             .submit(submission(
                 ProgramLanguage::Forth,
