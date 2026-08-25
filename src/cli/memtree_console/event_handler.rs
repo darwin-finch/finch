@@ -101,6 +101,7 @@ impl EventHandler {
             | ReplEvent::HomeBrainMessage { .. }
             | ReplEvent::HomeBrainWatchFailed { .. }
             | ReplEvent::ReconnectHomeBrain { .. }
+            | ReplEvent::ReconnectHomeRunner { .. }
             | ReplEvent::RunnerLeaseStatus { .. }
             | ReplEvent::NamedBrainProgramRequested(_)
             | ReplEvent::NamedBrainTurnRequested(_)
