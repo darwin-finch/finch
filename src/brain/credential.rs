@@ -736,6 +736,35 @@ pub fn verify_portable_invitation(
     Ok((claims, public_key))
 }
 
+/// Decode the claims carried by a participant credential without asserting
+/// authenticity. Remote clients use this only to ensure an authenticated
+/// issuer's JSON response exactly matches the opaque token it returned; the
+/// daemon remains the authority that verifies the HMAC.
+pub(crate) fn decode_unverified_credential_claims(
+    token: &str,
+) -> Result<BrainCredentialClaims> {
+    let mut parts = token.split('.');
+    let prefix = parts.next().unwrap_or_default();
+    let payload = parts
+        .next()
+        .context("Brain credential payload is missing")?;
+    let signature = parts
+        .next()
+        .context("Brain credential signature is missing")?;
+    if prefix != TOKEN_PREFIX || signature.is_empty() || parts.next().is_some() {
+        anyhow::bail!("Brain credential envelope is invalid");
+    }
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .context("Brain credential payload is invalid")?;
+    let claims: BrainCredentialClaims =
+        serde_json::from_slice(&encoded).context("Brain credential claims are invalid")?;
+    if claims.version != CREDENTIAL_VERSION {
+        anyhow::bail!("unsupported Brain credential version {}", claims.version);
+    }
+    Ok(claims)
+}
+
 pub fn invitation_tls_certificate_der(claims: &BrainInvitationClaims) -> Result<Vec<u8>> {
     let certificate = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&claims.tls_certificate_der)
@@ -991,6 +1020,24 @@ mod tests {
         let index = token.find('.').unwrap() + 2;
         token.replace_range(index..=index, "x");
         assert!(authority.verify(&token, 10_500).is_err());
+    }
+
+    #[test]
+    fn unverified_envelope_decode_is_exact_but_not_an_authentication_step() {
+        let authority = BrainCredentialAuthority::ephemeral([19; 32]);
+        let token = authority.issue(request(1_000), 10_000).unwrap();
+        let verified = authority.verify(&token, 10_100).unwrap();
+        assert_eq!(decode_unverified_credential_claims(&token).unwrap(), verified);
+
+        let mut parts = token.split('.').collect::<Vec<_>>();
+        parts[2] = "not-the-real-signature";
+        let forged_signature = parts.join(".");
+        assert_eq!(
+            decode_unverified_credential_claims(&forged_signature).unwrap(),
+            verified,
+            "decoding exists only to correlate an authenticated issuer response"
+        );
+        assert!(authority.verify(&forged_signature, 10_100).is_err());
     }
 
     #[test]
