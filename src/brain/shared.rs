@@ -263,6 +263,11 @@ pub enum BrainEventKind {
     Prompt {
         text: String,
     },
+    /// A participant-to-participant message. It is durable and enters later
+    /// prompt context, but never schedules a provider turn by itself.
+    ParticipantMessage {
+        text: String,
+    },
     ToolCall {
         request_seq: u64,
         tool_id: String,
@@ -569,6 +574,7 @@ impl BrainState {
                 }
             }
             BrainEventKind::Prompt { .. }
+            | BrainEventKind::ParticipantMessage { .. }
             | BrainEventKind::ToolCall { .. }
             | BrainEventKind::ToolResult { .. }
             | BrainEventKind::ApprovalRequested { .. }
@@ -1271,6 +1277,7 @@ impl SharedBrainStore {
                 matches!(
                     event.kind,
                     BrainEventKind::Prompt { .. }
+                        | BrainEventKind::ParticipantMessage { .. }
                         | BrainEventKind::ToolCall { .. }
                         | BrainEventKind::ToolResult { .. }
                         | BrainEventKind::ApprovalRequested { .. }

@@ -363,6 +363,7 @@ struct BrainEvent {
     runnerHandoffRequested @21 :BrainRunnerHandoff;
     runnerHandoffCompleted @22 :BrainRunnerHandoffCompleted;
     runnerHandoffCancelled @23 :Text;
+    participantMessage     @24 :Text;
   }
 }
 
@@ -447,6 +448,7 @@ struct BrainSubmission {
     program         @1 :BrainProgramSubmitted;
     programPopped   @2 :UInt64;
     approvalDecided @3 :BrainApprovalDecided;
+    participantMessage @4 :Text;
   }
 }
 

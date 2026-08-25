@@ -194,6 +194,7 @@ pub(super) fn encode_brain_submission(
 ) -> anyhow::Result<()> {
     match kind {
         BrainEventKind::Prompt { text } => builder.set_prompt(text),
+        BrainEventKind::ParticipantMessage { text } => builder.set_participant_message(text),
         BrainEventKind::Program { language, source } => {
             let mut program = builder.init_program();
             program.set_language(language_to_capnp(*language));
@@ -224,6 +225,9 @@ pub(super) fn decode_brain_submission(
 
     Ok(match reader.which()? {
         Which::Prompt(value) => BrainEventKind::Prompt { text: text(value?)? },
+        Which::ParticipantMessage(value) => BrainEventKind::ParticipantMessage {
+            text: text(value?)?,
+        },
         Which::Program(program) => {
             let program = program?;
             BrainEventKind::Program {
@@ -798,6 +802,7 @@ pub(super) fn encode_event(
             }
         }
         BrainEventKind::Prompt { text } => builder.set_prompt(text),
+        BrainEventKind::ParticipantMessage { text } => builder.set_participant_message(text),
         BrainEventKind::ToolCall {
             request_seq,
             tool_id,
@@ -945,6 +950,9 @@ pub(super) fn decode_event(
         Which::Prompt(value) => BrainEventKind::Prompt {
             text: text(value?)?,
         },
+        Which::ParticipantMessage(value) => BrainEventKind::ParticipantMessage {
+            text: text(value?)?,
+        },
         Which::ToolCall(call) => {
             let call = call?;
             BrainEventKind::ToolCall {
@@ -1062,6 +1070,9 @@ mod tests {
             BrainEventKind::Prompt {
                 text: "inspect the workspace".into(),
             },
+            BrainEventKind::ParticipantMessage {
+                text: "hello, collaborators".into(),
+            },
             BrainEventKind::Program {
                 language: ProgramLanguage::Lisp,
                 source: "(say \"hello\")".into(),
@@ -1165,6 +1176,9 @@ mod tests {
             },
             BrainEventKind::Prompt {
                 text: "inspect it".into(),
+            },
+            BrainEventKind::ParticipantMessage {
+                text: "hello, collaborators".into(),
             },
             BrainEventKind::ToolCall {
                 request_seq: 5,

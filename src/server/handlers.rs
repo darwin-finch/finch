@@ -468,13 +468,16 @@ fn attachment_can_submit(
         AttachmentRole::Driver => matches!(
             kind,
             BrainEventKind::Prompt { .. }
+                | BrainEventKind::ParticipantMessage { .. }
                 | BrainEventKind::Program { .. }
                 | BrainEventKind::ProgramPopped { .. }
                 | BrainEventKind::ApprovalDecided { .. }
         ),
         AttachmentRole::Consultant => matches!(
             kind,
-            BrainEventKind::Prompt { .. } | BrainEventKind::ApprovalDecided { .. }
+            BrainEventKind::Prompt { .. }
+                | BrainEventKind::ParticipantMessage { .. }
+                | BrainEventKind::ApprovalDecided { .. }
         ),
         AttachmentRole::Observer | AttachmentRole::Runner => false,
     }
@@ -497,6 +500,7 @@ pub(crate) async fn submit_named_brain_event(
     if !matches!(
         kind,
         BrainEventKind::Prompt { .. }
+            | BrainEventKind::ParticipantMessage { .. }
             | BrainEventKind::Program { .. }
             | BrainEventKind::ProgramPopped { .. }
             | BrainEventKind::ApprovalDecided { .. }
@@ -568,7 +572,8 @@ pub(crate) async fn submit_named_brain_event(
         }
         Some(_) => None,
         None => match kind {
-            BrainEventKind::ProgramPopped { .. }
+            BrainEventKind::ParticipantMessage { .. }
+            | BrainEventKind::ProgramPopped { .. }
             | BrainEventKind::ToolCall { .. }
             | BrainEventKind::ToolResult { .. }
             | BrainEventKind::ApprovalRequested { .. }
@@ -1116,6 +1121,9 @@ fn named_brain_provider_messages(snapshot: &crate::brain::shared::BrainSnapshot)
         .rev()
         .map(|event| match &event.kind {
             BrainEventKind::Prompt { text } => Message::user(format!("[{}]\n{text}", event.sender)),
+            BrainEventKind::ParticipantMessage { text } => {
+                Message::user(format!("[participant {}]\n{text}", event.sender))
+            }
             BrainEventKind::ToolCall {
                 tool_id,
                 name,
@@ -3064,6 +3072,9 @@ mod named_brain_provider_context_tests {
         let prompt = BrainEventKind::Prompt {
             text: "hello".into(),
         };
+        let participant_message = BrainEventKind::ParticipantMessage {
+            text: "hello, collaborators".into(),
+        };
         let program = BrainEventKind::Program {
             language: ProgramLanguage::Lisp,
             source: "(say \"hello\")".into(),
@@ -3074,12 +3085,24 @@ mod named_brain_provider_context_tests {
             decision: serde_json::json!({"choice": "deny"}),
         };
         assert!(attachment_can_submit(AttachmentRole::Driver, &prompt));
+        assert!(attachment_can_submit(
+            AttachmentRole::Driver,
+            &participant_message
+        ));
         assert!(attachment_can_submit(AttachmentRole::Driver, &program));
         assert!(attachment_can_submit(AttachmentRole::Driver, &decision));
         assert!(attachment_can_submit(AttachmentRole::Consultant, &prompt));
+        assert!(attachment_can_submit(
+            AttachmentRole::Consultant,
+            &participant_message
+        ));
         assert!(attachment_can_submit(AttachmentRole::Consultant, &decision));
         assert!(!attachment_can_submit(AttachmentRole::Consultant, &program));
         assert!(!attachment_can_submit(AttachmentRole::Observer, &prompt));
+        assert!(!attachment_can_submit(
+            AttachmentRole::Observer,
+            &participant_message
+        ));
         assert!(!attachment_can_submit(AttachmentRole::Runner, &program));
     }
 
@@ -4122,6 +4145,71 @@ mod named_brain_provider_context_tests {
             )
             .await,
             Err(BrainSubmissionError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn participant_message_is_durable_context_without_creating_a_run() {
+        let store = crate::brain::shared::SharedBrainStore::with_root("box.local", None);
+        let runners = crate::server::BrainRunnerBroker::default();
+        let approvals = crate::server::BrainApprovalBroker::default();
+        let consultant = store
+            .attach(
+                "shared",
+                "bob@box.local",
+                AttachmentRole::Consultant,
+                None,
+            )
+            .unwrap();
+
+        let outcome = submit_named_brain_event(
+            &store,
+            &runners,
+            &approvals,
+            "shared",
+            &consultant,
+            BrainEventKind::ParticipantMessage {
+                text: "the failing test is scheduler_cancel".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.run.is_none());
+        assert!(outcome.result.is_none());
+        let snapshot = store.snapshot("shared").unwrap();
+        assert!(snapshot.runs.is_empty());
+        assert!(matches!(
+            &outcome.accepted.kind,
+            BrainEventKind::ParticipantMessage { text }
+                if text == "the failing test is scheduler_cancel"
+        ));
+        let messages = named_brain_provider_messages(&snapshot);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert!(messages[0]
+            .text_content()
+            .contains("[participant bob@box.local]"));
+        assert!(messages[0]
+            .text_content()
+            .contains("the failing test is scheduler_cancel"));
+
+        let observer = store
+            .attach("shared", "eve@box.local", AttachmentRole::Observer, None)
+            .unwrap();
+        assert!(matches!(
+            submit_named_brain_event(
+                &store,
+                &runners,
+                &approvals,
+                "shared",
+                &observer,
+                BrainEventKind::ParticipantMessage {
+                    text: "forged".into(),
+                },
+            )
+            .await,
+            Err(BrainSubmissionError::Forbidden(_))
         ));
     }
 }

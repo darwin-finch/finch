@@ -4494,6 +4494,9 @@ Rules:\n\
             BrainEventKind::Prompt { text } => self
                 .output_manager
                 .write_user(format!("{}: {text}", event.sender)),
+            BrainEventKind::ParticipantMessage { text } => self
+                .output_manager
+                .write_info(format!("{}: {text}", event.sender)),
             BrainEventKind::ToolCall {
                 tool_id,
                 name,
