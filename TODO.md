@@ -74,6 +74,9 @@ still blocks the corresponding Brain phase until it is unified.
   S-expressions as the canonical structural Lisp reader, while allowing a later lighter
   expression/indentation reader that immediately produces the identical syntax tree. Reader sugar
   must disappear before expansion/elaboration and must not create a second semantic path. Add
+  full nested `quote`, `quasiquote`, `unquote`, and splice support over first-class `syntax` values;
+  replace the current symbol-only `quote` restriction, and test that quoted calls remain data while
+  unquoted calls execute. Preserve spans and hygiene through every nested quoted form. Add
   normalization conformance fixtures proving that each sugared program and its canonical
   S-expression produce structurally identical `syntax` modulo spelling-specific source origins,
   then identical elaborated HIR/IR. Do not brand or implement the notation as a third language.
