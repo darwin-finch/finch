@@ -222,6 +222,37 @@ impl AgentServer {
 
         tracing::info!("Training worker spawned");
 
+        // The daemon owns only due-time calculation and durable queueing.
+        // Actual ProgramRuns remain on each Brain's leased environment runner.
+        let schedule_store = self.brain_store.clone();
+        let schedule_runners = self.brain_runners.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let names = match schedule_store.list() {
+                    Ok(names) => names,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not list Brains for schedule delivery");
+                        continue;
+                    }
+                };
+                for name in names {
+                    if let Err(error) = handlers::deliver_due_named_brain_schedules(
+                        schedule_store.clone(),
+                        schedule_runners.clone(),
+                        name.clone(),
+                        crate::brain::store::unix_millis(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(brain = %name, %error, "could not deliver due Brain schedule");
+                    }
+                }
+            }
+        });
+
         // Monitor generator state and inject model when ready
         let local_gen_clone = Arc::clone(&self.local_generator);
         let state_monitor = Arc::clone(&self.generator_state);

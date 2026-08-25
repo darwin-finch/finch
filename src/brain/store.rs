@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 9;
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 10;
 const BRAIN_METADATA_VERSION: u32 = 1;
 
 /// Stable identity of one durable Brain. Names are mutable human aliases;
@@ -219,6 +219,10 @@ pub enum BrainScheduleDeliveryPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrainSchedule {
     pub schedule_id: ScheduleId,
+    #[serde(default = "legacy_schedule_attachment_id")]
+    pub initiating_attachment_id: AttachmentId,
+    #[serde(default)]
+    pub created_by: String,
     pub language: ProgramLanguage,
     pub source: String,
     pub next_due_ms: u64,
@@ -234,9 +238,19 @@ pub struct BrainSchedule {
 pub struct BrainScheduleDue {
     pub schedule_id: ScheduleId,
     pub run: BrainRun,
+    /// Immutable program snapshot for this delivery. Later schedule edits do
+    /// not change already queued work.
+    #[serde(default = "legacy_schedule_language")]
+    pub language: ProgramLanguage,
+    #[serde(default)]
+    pub source: String,
     pub due_at_ms: u64,
     pub first_missed_at_ms: u64,
     pub missed_count: u32,
+    /// The next occurrence after all ticks represented by this delivery.
+    /// `None` atomically retires a one-shot schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_due_ms: Option<u64>,
 }
 
 /// The one machine/workspace boundary in which a brain may cause effects.
@@ -461,7 +475,7 @@ struct BrainState {
     attachments: HashMap<AttachmentId, BrainAttachment>,
     runs: HashMap<RunId, BrainRun>,
     schedules: HashMap<ScheduleId, BrainSchedule>,
-    pending_schedule_dues: HashMap<ScheduleId, BrainScheduleDue>,
+    pending_schedule_dues: HashMap<RunId, BrainScheduleDue>,
     runner_lease: Option<BrainRunnerLease>,
     runner_handoff: Option<BrainRunnerHandoff>,
     runtime_checkpoint: Option<RuntimeCheckpointState>,
@@ -608,13 +622,29 @@ impl BrainState {
                 self.schedules
                     .insert(schedule.schedule_id, schedule.clone());
                 if !schedule.active {
-                    self.pending_schedule_dues.remove(&schedule.schedule_id);
+                    self.pending_schedule_dues
+                        .retain(|_, due| due.schedule_id != schedule.schedule_id);
                 }
             }
             BrainEventKind::ScheduleDue { due } => {
+                let mut due = due.clone();
+                if let Some(schedule) = self.schedules.get_mut(&due.schedule_id) {
+                    if event.schema_version < 10 {
+                        due.language = schedule.language;
+                        due.source.clone_from(&schedule.source);
+                        if schedule.initiating_attachment_id == legacy_schedule_attachment_id() {
+                            schedule.initiating_attachment_id = due.run.initiating_attachment_id;
+                            schedule.created_by.clone_from(&due.run.initiated_by);
+                        }
+                    } else {
+                        match due.next_due_ms {
+                            Some(next_due_ms) => schedule.next_due_ms = next_due_ms,
+                            None => schedule.active = false,
+                        }
+                    }
+                }
                 self.runs.insert(due.run.run_id, due.run.clone());
-                self.pending_schedule_dues
-                    .insert(due.schedule_id, due.clone());
+                self.pending_schedule_dues.insert(due.run.run_id, due);
             }
             BrainEventKind::Program { language, source } => {
                 self.program_stack.push(BrainProgram {
@@ -789,6 +819,213 @@ impl BrainStore {
             schedules: sorted_schedules(&state.schedules),
             pending_schedule_dues: sorted_schedule_dues(&state.pending_schedule_dues),
         })
+    }
+
+    pub fn create_schedule(
+        &self,
+        name: &str,
+        created_by: &str,
+        initiating_attachment_id: AttachmentId,
+        language: ProgramLanguage,
+        source: impl Into<String>,
+        next_due_ms: u64,
+        interval_ms: Option<u64>,
+        delivery_policy: BrainScheduleDeliveryPolicy,
+    ) -> Result<BrainSchedule> {
+        let name = Self::validate_name(name)?;
+        let created_by = validate_participant_subject("schedule creator", created_by)?;
+        let source = source.into();
+        if source.trim().is_empty() {
+            anyhow::bail!("scheduled program source cannot be empty");
+        }
+        if interval_ms == Some(0) {
+            anyhow::bail!("schedule interval must be greater than zero");
+        }
+        if let BrainScheduleDeliveryPolicy::BoundedCatchUp {
+            max_catch_up,
+            expires_after_ms,
+        } = &delivery_policy
+        {
+            if *max_catch_up == 0 || *expires_after_ms == 0 {
+                anyhow::bail!(
+                    "bounded catch-up requires a positive backlog bound and expiry"
+                );
+            }
+        }
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        let attachment = state
+            .attachments
+            .get(&initiating_attachment_id)
+            .context("schedule creator attachment does not exist")?;
+        if attachment.subject != created_by {
+            anyhow::bail!("schedule creator does not own the initiating attachment");
+        }
+        if !matches!(attachment.role, AttachmentRole::Runner | AttachmentRole::Driver) {
+            anyhow::bail!("attachment role cannot create scheduled ProgramRuns");
+        }
+        let schedule = BrainSchedule {
+            schedule_id: ScheduleId::new(),
+            initiating_attachment_id,
+            created_by: created_by.to_string(),
+            language,
+            source,
+            next_due_ms,
+            interval_ms,
+            delivery_policy,
+            active: true,
+        };
+        self.push_locked(
+            name,
+            state,
+            created_by,
+            BrainEventKind::ScheduleChanged {
+                schedule: schedule.clone(),
+            },
+        )?;
+        Ok(schedule)
+    }
+
+    /// Atomically advance due schedules and append the exact queued ProgramRun
+    /// for each delivery. The returned runs are durable before this method
+    /// returns and are safe for the runner broker to dispatch immediately.
+    pub fn queue_due_schedules(&self, name: &str, now_ms: u64) -> Result<Vec<BrainRun>> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        let mut schedules = state
+            .schedules
+            .values()
+            .filter(|schedule| schedule.active && schedule.next_due_ms <= now_ms)
+            .cloned()
+            .collect::<Vec<_>>();
+        schedules.sort_by_key(|schedule| (schedule.next_due_ms, schedule.schedule_id.0));
+
+        let mut queued = Vec::new();
+        for schedule in schedules {
+            let pending = state
+                .pending_schedule_dues
+                .values()
+                .filter(|due| due.schedule_id == schedule.schedule_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            if pending.iter().any(|due| {
+                state.runs.get(&due.run.run_id).is_some_and(|run| {
+                    matches!(run.status, BrainRunStatus::Running | BrainRunStatus::AwaitingApproval)
+                })
+            }) {
+                continue;
+            }
+
+            let (occurrence_count, last_due_ms, next_due_ms) =
+                schedule_due_window(&schedule, now_ms)?;
+            match &schedule.delivery_policy {
+                BrainScheduleDeliveryPolicy::Coalesce => {
+                    if let Some(existing) = pending.into_iter().find(|due| {
+                        state.runs.get(&due.run.run_id).is_some_and(|run| {
+                            run.status == BrainRunStatus::QueuedForEnvironment
+                        })
+                    }) {
+                        let event_seq = state.events.last().map(|event| event.seq + 1).unwrap_or(1);
+                        let mut run = existing.run;
+                        run.request_seq = event_seq;
+                        run.updated_ms = now_ms;
+                        let due = BrainScheduleDue {
+                            schedule_id: schedule.schedule_id,
+                            run: run.clone(),
+                            language: schedule.language,
+                            source: schedule.source.clone(),
+                            due_at_ms: last_due_ms,
+                            first_missed_at_ms: existing.first_missed_at_ms,
+                            missed_count: existing
+                                .missed_count
+                                .saturating_add(occurrence_count),
+                            next_due_ms,
+                        };
+                        self.push_locked(
+                            name,
+                            state,
+                            "daemon:scheduler",
+                            BrainEventKind::ScheduleDue { due },
+                        )?;
+                        queued.push(run);
+                    } else {
+                        let run = queued_schedule_run(state, &schedule, now_ms);
+                        let due = BrainScheduleDue {
+                            schedule_id: schedule.schedule_id,
+                            run: run.clone(),
+                            language: schedule.language,
+                            source: schedule.source.clone(),
+                            due_at_ms: last_due_ms,
+                            first_missed_at_ms: schedule.next_due_ms,
+                            missed_count: occurrence_count,
+                            next_due_ms,
+                        };
+                        self.push_locked(
+                            name,
+                            state,
+                            "daemon:scheduler",
+                            BrainEventKind::ScheduleDue { due },
+                        )?;
+                        queued.push(run);
+                    }
+                }
+                BrainScheduleDeliveryPolicy::BoundedCatchUp {
+                    max_catch_up,
+                    expires_after_ms,
+                } => {
+                    let capacity = (*max_catch_up as usize).saturating_sub(pending.len());
+                    if capacity == 0 {
+                        continue;
+                    }
+                    let cutoff = now_ms.saturating_sub(*expires_after_ms);
+                    let mut due_at_ms = schedule.next_due_ms.max(cutoff);
+                    if let Some(interval_ms) = schedule.interval_ms {
+                        if due_at_ms > schedule.next_due_ms {
+                            let skipped = due_at_ms
+                                .saturating_sub(schedule.next_due_ms)
+                                .div_ceil(interval_ms);
+                            due_at_ms = schedule
+                                .next_due_ms
+                                .saturating_add(skipped.saturating_mul(interval_ms));
+                        }
+                    }
+                    for _ in 0..capacity {
+                        if due_at_ms > now_ms {
+                            break;
+                        }
+                        let delivery_next = schedule
+                            .interval_ms
+                            .and_then(|interval| due_at_ms.checked_add(interval));
+                        let run = queued_schedule_run(state, &schedule, now_ms);
+                        let due = BrainScheduleDue {
+                            schedule_id: schedule.schedule_id,
+                            run: run.clone(),
+                            language: schedule.language,
+                            source: schedule.source.clone(),
+                            due_at_ms,
+                            first_missed_at_ms: due_at_ms,
+                            missed_count: 1,
+                            next_due_ms: delivery_next,
+                        };
+                        self.push_locked(
+                            name,
+                            state,
+                            "daemon:scheduler",
+                            BrainEventKind::ScheduleDue { due },
+                        )?;
+                        queued.push(run);
+                        let Some(next) = delivery_next else {
+                            break;
+                        };
+                        due_at_ms = next;
+                    }
+                }
+            }
+        }
+        Ok(queued)
     }
 
     pub fn start_run(
@@ -2137,6 +2374,48 @@ fn sorted_runs(runs: &HashMap<RunId, BrainRun>) -> Vec<BrainRun> {
     runs
 }
 
+fn queued_schedule_run(
+    state: &BrainState,
+    schedule: &BrainSchedule,
+    now_ms: u64,
+) -> BrainRun {
+    BrainRun {
+        run_id: RunId::new(),
+        kind: BrainRunKind::Scheduled,
+        parent_run_id: None,
+        request_seq: state.events.last().map(|event| event.seq + 1).unwrap_or(1),
+        initiating_attachment_id: schedule.initiating_attachment_id,
+        initiated_by: schedule.created_by.clone(),
+        status: BrainRunStatus::QueuedForEnvironment,
+        started_ms: now_ms,
+        updated_ms: now_ms,
+        detail: None,
+    }
+}
+
+fn schedule_due_window(
+    schedule: &BrainSchedule,
+    now_ms: u64,
+) -> Result<(u32, u64, Option<u64>)> {
+    let Some(interval_ms) = schedule.interval_ms else {
+        return Ok((1, schedule.next_due_ms, None));
+    };
+    let elapsed = now_ms.saturating_sub(schedule.next_due_ms);
+    let count = elapsed / interval_ms + 1;
+    let last_due_ms = schedule
+        .next_due_ms
+        .checked_add((count - 1).checked_mul(interval_ms).context("schedule overflow")?)
+        .context("schedule overflow")?;
+    let next_due_ms = last_due_ms
+        .checked_add(interval_ms)
+        .context("schedule overflow")?;
+    Ok((
+        u32::try_from(count).unwrap_or(u32::MAX),
+        last_due_ms,
+        Some(next_due_ms),
+    ))
+}
+
 fn sorted_schedules(schedules: &HashMap<ScheduleId, BrainSchedule>) -> Vec<BrainSchedule> {
     let mut schedules = schedules.values().cloned().collect::<Vec<_>>();
     schedules.sort_by_key(|schedule| (schedule.next_due_ms, schedule.schedule_id.0));
@@ -2144,10 +2423,10 @@ fn sorted_schedules(schedules: &HashMap<ScheduleId, BrainSchedule>) -> Vec<Brain
 }
 
 fn sorted_schedule_dues(
-    dues: &HashMap<ScheduleId, BrainScheduleDue>,
+    dues: &HashMap<RunId, BrainScheduleDue>,
 ) -> Vec<BrainScheduleDue> {
     let mut dues = dues.values().cloned().collect::<Vec<_>>();
-    dues.sort_by_key(|due| (due.due_at_ms, due.schedule_id.0));
+    dues.sort_by_key(|due| (due.due_at_ms, due.schedule_id.0, due.run.run_id.0));
     dues
 }
 
@@ -2180,6 +2459,14 @@ const fn legacy_brain_event_schema_version() -> u32 {
     1
 }
 
+fn legacy_schedule_attachment_id() -> AttachmentId {
+    AttachmentId(uuid::Uuid::nil())
+}
+
+const fn legacy_schedule_language() -> ProgramLanguage {
+    ProgramLanguage::Forth
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2191,76 +2478,42 @@ mod tests {
         let attachment = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
-        let schedule = BrainSchedule {
-            schedule_id: ScheduleId::new(),
-            language: ProgramLanguage::Lisp,
-            source: "(say \"tick\")".into(),
-            next_due_ms: 1_000,
-            interval_ms: Some(1_000),
-            delivery_policy: BrainScheduleDeliveryPolicy::Coalesce,
-            active: true,
-        };
-        let changed = store
-            .push(
+        store
+            .create_schedule(
                 "shared",
                 "alice",
-                BrainEventKind::ScheduleChanged {
-                    schedule: schedule.clone(),
-                },
+                attachment.attachment_id,
+                ProgramLanguage::Lisp,
+                "(say \"tick\")",
+                1_000,
+                Some(1_000),
+                BrainScheduleDeliveryPolicy::Coalesce,
             )
             .unwrap();
-        let run = BrainRun {
-            run_id: RunId::new(),
-            kind: BrainRunKind::Scheduled,
-            parent_run_id: None,
-            request_seq: changed.seq,
-            initiating_attachment_id: attachment.attachment_id,
-            initiated_by: "daemon".into(),
-            status: BrainRunStatus::QueuedForEnvironment,
-            started_ms: 1_000,
-            updated_ms: 1_000,
-            detail: None,
-        };
-        let first_due = BrainScheduleDue {
-            schedule_id: schedule.schedule_id,
-            run: run.clone(),
-            due_at_ms: 1_000,
-            first_missed_at_ms: 1_000,
-            missed_count: 1,
-        };
-        store
-            .push(
-                "shared",
-                "daemon",
-                BrainEventKind::ScheduleDue {
-                    due: first_due.clone(),
-                },
-            )
-            .unwrap();
+        let queued = store.queue_due_schedules("shared", 3_500).unwrap();
+        assert_eq!(queued.len(), 1);
+        let run = queued[0].clone();
+        let first = store.snapshot("shared").unwrap();
+        let first_due = first.pending_schedule_dues[0].clone();
+        assert_eq!(first_due.missed_count, 3);
+        assert_eq!(first_due.due_at_ms, 3_000);
+        assert_eq!(first_due.next_due_ms, Some(4_000));
+        assert_eq!(run.request_seq, first.revision);
+        assert!(store.queue_due_schedules("shared", 3_500).unwrap().is_empty());
 
         drop(store);
         let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = restarted.snapshot("shared").unwrap();
-        assert_eq!(restored.schedules, vec![schedule.clone()]);
+        assert_eq!(restored.schedules[0].next_due_ms, 4_000);
         assert_eq!(restored.pending_schedule_dues, vec![first_due]);
         assert_eq!(restored.runs, vec![run.clone()]);
 
-        let coalesced = BrainScheduleDue {
-            missed_count: 3,
-            due_at_ms: 3_000,
-            ..restored.pending_schedule_dues[0].clone()
-        };
-        restarted
-            .push(
-                "shared",
-                "daemon",
-                BrainEventKind::ScheduleDue {
-                    due: coalesced.clone(),
-                },
-            )
-            .unwrap();
+        let requeued = restarted.queue_due_schedules("shared", 5_500).unwrap();
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].run_id, run.run_id);
         let snapshot = restarted.snapshot("shared").unwrap();
-        assert_eq!(snapshot.pending_schedule_dues, vec![coalesced]);
+        assert_eq!(snapshot.pending_schedule_dues[0].missed_count, 5);
+        assert_eq!(snapshot.pending_schedule_dues[0].next_due_ms, Some(6_000));
         assert_eq!(snapshot.runs.len(), 1, "coalescing must reuse the queued run");
 
         restarted
@@ -2286,6 +2539,68 @@ mod tests {
             .unwrap()
             .pending_schedule_dues
             .is_empty());
+    }
+
+    #[test]
+    fn bounded_catch_up_limits_pending_runs_and_skips_expired_ticks() {
+        let store = BrainStore::with_root("box.local", None);
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        store
+            .create_schedule(
+                "shared",
+                "alice",
+                attachment.attachment_id,
+                ProgramLanguage::Forth,
+                "\"tick\" say",
+                1_000,
+                Some(1_000),
+                BrainScheduleDeliveryPolicy::BoundedCatchUp {
+                    max_catch_up: 2,
+                    expires_after_ms: 2_500,
+                },
+            )
+            .unwrap();
+
+        let queued = store.queue_due_schedules("shared", 5_000).unwrap();
+        assert_eq!(queued.len(), 2);
+        let snapshot = store.snapshot("shared").unwrap();
+        assert_eq!(
+            snapshot
+                .pending_schedule_dues
+                .iter()
+                .map(|due| due.due_at_ms)
+                .collect::<Vec<_>>(),
+            vec![3_000, 4_000]
+        );
+        assert_eq!(snapshot.schedules[0].next_due_ms, 5_000);
+        assert!(store.queue_due_schedules("shared", 5_000).unwrap().is_empty());
+
+        store
+            .transition_run(
+                "shared",
+                "runner",
+                queued[0].run_id,
+                BrainRunStatus::Running,
+                None,
+            )
+            .unwrap();
+        store
+            .transition_run(
+                "shared",
+                "runner",
+                queued[0].run_id,
+                BrainRunStatus::Completed,
+                None,
+            )
+            .unwrap();
+        let next = store.queue_due_schedules("shared", 5_000).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(
+            store.snapshot("shared").unwrap().pending_schedule_dues.len(),
+            2
+        );
     }
 
     #[test]

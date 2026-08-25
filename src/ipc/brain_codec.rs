@@ -949,6 +949,8 @@ fn encode_schedule(
     schedule: &BrainSchedule,
 ) {
     builder.set_schedule_id(&schedule.schedule_id.0.to_string());
+    builder.set_initiating_attachment_id(&schedule.initiating_attachment_id.0.to_string());
+    builder.set_created_by(&schedule.created_by);
     builder.set_language(language_to_capnp(schedule.language));
     builder.set_source(&schedule.source);
     builder.set_next_due_ms(schedule.next_due_ms);
@@ -986,6 +988,10 @@ fn decode_schedule(
     };
     Ok(BrainSchedule {
         schedule_id: ScheduleId(parse_uuid(reader.get_schedule_id()?)?),
+        initiating_attachment_id: AttachmentId(parse_uuid(
+            reader.get_initiating_attachment_id()?,
+        )?),
+        created_by: text(reader.get_created_by()?)?,
         language: language_from_capnp(reader.get_language()?),
         source: text(reader.get_source()?)?,
         next_due_ms: reader.get_next_due_ms(),
@@ -1003,9 +1009,13 @@ fn encode_schedule_due(
 ) {
     builder.set_schedule_id(&due.schedule_id.0.to_string());
     encode_run(builder.reborrow().init_run(), &due.run);
+    builder.set_language(language_to_capnp(due.language));
+    builder.set_source(&due.source);
     builder.set_due_at_ms(due.due_at_ms);
     builder.set_first_missed_at_ms(due.first_missed_at_ms);
     builder.set_missed_count(due.missed_count);
+    builder.set_has_next_due_ms(due.next_due_ms.is_some());
+    builder.set_next_due_ms(due.next_due_ms.unwrap_or_default());
 }
 
 fn decode_schedule_due(
@@ -1014,9 +1024,14 @@ fn decode_schedule_due(
     Ok(BrainScheduleDue {
         schedule_id: ScheduleId(parse_uuid(reader.get_schedule_id()?)?),
         run: decode_run(reader.get_run()?)?,
+        language: language_from_capnp(reader.get_language()?),
+        source: text(reader.get_source()?)?,
         due_at_ms: reader.get_due_at_ms(),
         first_missed_at_ms: reader.get_first_missed_at_ms(),
         missed_count: reader.get_missed_count(),
+        next_due_ms: reader
+            .get_has_next_due_ms()
+            .then(|| reader.get_next_due_ms()),
     })
 }
 
@@ -1807,6 +1822,8 @@ mod tests {
         };
         let schedule = BrainSchedule {
             schedule_id,
+            initiating_attachment_id: attachment_id,
+            created_by: "alice@laptop.local".into(),
             language: ProgramLanguage::Lisp,
             source: "(say \"scheduled\")".into(),
             next_due_ms: 500,
@@ -1820,9 +1837,12 @@ mod tests {
         let pending_due = BrainScheduleDue {
             schedule_id,
             run: scheduled_run.clone(),
+            language: ProgramLanguage::Lisp,
+            source: "(say \"scheduled\")".into(),
             due_at_ms: 500,
             first_missed_at_ms: 400,
             missed_count: 2,
+            next_due_ms: Some(1_500),
         };
         let expected = BrainWireMessage::Snapshot {
             brain: BrainSnapshot {

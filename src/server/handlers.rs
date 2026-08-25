@@ -873,6 +873,22 @@ async fn dispatch_named_brain_run(
                 Err(error) => Err(error),
             }
         }
+        BrainEventKind::ScheduleDue { due } if due.run.run_id == run.run_id => {
+            match dispatch_named_brain_program(
+                store,
+                runners,
+                name,
+                run.run_id,
+                request.seq,
+                due.language,
+                &due.source,
+            )
+            .await
+            {
+                Ok(output) => push_named_brain_result(store, name, request.seq, Ok(output)),
+                Err(error) => Err(error),
+            }
+        }
         BrainEventKind::Prompt { text } => {
             match snapshot
                 .attachments
@@ -1119,6 +1135,40 @@ pub(crate) async fn resume_queued_named_brain_runs(
         resumed += 1;
     }
     Ok(resumed)
+}
+
+/// Advance one Brain's durable schedules and, when its environment runner is
+/// live, execute the newly queued ProgramRuns through that exact runner.
+pub(crate) async fn deliver_due_named_brain_schedules(
+    store: crate::brain::store::BrainStore,
+    runners: crate::server::BrainRunnerBroker,
+    name: String,
+    now_ms: u64,
+) -> anyhow::Result<usize> {
+    use crate::brain::store::BrainRunStatus;
+
+    let execution_lock = store.execution_lock(&name)?;
+    let _turn = execution_lock.lock_owned().await;
+    let queued = store.queue_due_schedules(&name, now_ms)?;
+    if queued.is_empty() || !named_brain_runner_is_ready(&store, &runners, &name)? {
+        return Ok(queued.len());
+    }
+
+    let mut dispatched = 0;
+    for run in queued {
+        if !named_brain_runner_is_ready(&store, &runners, &name)? {
+            break;
+        }
+        let current = store.inspect_run(&name, run.run_id)?;
+        if current.status != BrainRunStatus::QueuedForEnvironment {
+            continue;
+        }
+        let running =
+            store.transition_run(&name, "daemon", run.run_id, BrainRunStatus::Running, None)?;
+        dispatch_named_brain_run(&store, &runners, &name, &running).await?;
+        dispatched += 1;
+    }
+    Ok(dispatched)
 }
 
 fn commit_named_brain_approval_decision(
@@ -4004,6 +4054,140 @@ mod handler_tests {
             .events
             .iter()
             .any(|event| { matches!(event.kind, BrainEventKind::Result { .. }) }));
+    }
+
+    #[tokio::test]
+    async fn due_schedule_survives_offline_restart_and_executes_on_runner_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().into()),
+        );
+        let attachment = store
+            .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
+            .unwrap();
+        store
+            .create_schedule(
+                "shared",
+                &attachment.subject,
+                attachment.attachment_id,
+                ProgramLanguage::Lisp,
+                "(say \"scheduled\")",
+                1_000,
+                None,
+                crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+
+        assert_eq!(
+            deliver_due_named_brain_schedules(
+                store.clone(),
+                crate::server::BrainRunnerBroker::default(),
+                "shared".into(),
+                1_000,
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.snapshot("shared").unwrap().runs[0].status,
+            crate::brain::store::BrainRunStatus::QueuedForEnvironment
+        );
+
+        drop(store);
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().into()),
+        );
+        let lease = store
+            .acquire_runner_lease(
+                "shared",
+                "runner@box.local",
+                store.environment().generation,
+                None,
+                60_000,
+            )
+            .unwrap();
+        let runners = crate::server::BrainRunnerBroker::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, tx);
+        tokio::spawn(async move {
+            let crate::server::RunnerRequest::Program(request) = rx.recv().await.unwrap() else {
+                panic!("expected scheduled program request")
+            };
+            assert_eq!(request.source, "(say \"scheduled\")");
+            assert_eq!(request.language, ProgramLanguage::Lisp);
+            let runtime = crate::runtime::ProgramRuntime::new();
+            let outcome = runtime
+                .submit_typed_only(crate::runtime::ProgramSubmission {
+                    language: crate::programs::ProgramLanguage::Lisp,
+                    source_id: Some("scheduled-run-test".into()),
+                    source: request.source,
+                    intent: "scheduled Brain run".into(),
+                    effect: crate::programs::ExecutionEffect::Unclassified,
+                    declared_capabilities: Vec::new(),
+                    manifest_generation: runtime.manifest_generation(),
+                    expected_revision: Some(runtime.revision()),
+                    budget: None,
+                })
+                .await
+                .unwrap();
+            let checkpoint = runtime
+                .revision_history()
+                .unwrap()
+                .into_iter()
+                .find(|snapshot| snapshot.revision == outcome.output_revision)
+                .and_then(|snapshot| snapshot.checkpoint)
+                .unwrap();
+            request
+                .response_tx
+                .send(Ok(crate::server::RunnerProgramResult {
+                    output: outcome.output,
+                    runtime_revision: outcome.output_revision,
+                    checkpoint,
+                    effect_journal: Vec::new(),
+                }))
+                .unwrap();
+        });
+
+        assert_eq!(
+            resume_queued_named_brain_runs(
+                store.clone(),
+                runners,
+                "shared".into(),
+                lease.lease_id,
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let snapshot = store.snapshot("shared").unwrap();
+        assert!(!snapshot.schedules[0].active);
+        assert!(snapshot.pending_schedule_dues.is_empty());
+        assert_eq!(snapshot.runs.len(), 1);
+        assert_eq!(
+            snapshot.runs[0].status,
+            crate::brain::store::BrainRunStatus::Completed
+        );
+        let due_seq = snapshot
+            .events
+            .iter()
+            .find_map(|event| {
+                matches!(event.kind, BrainEventKind::ScheduleDue { .. }).then_some(event.seq)
+            })
+            .unwrap();
+        assert_eq!(snapshot.runs[0].request_seq, due_seq);
+        assert!(snapshot.events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                BrainEventKind::Result {
+                    request_seq,
+                    output,
+                    error: None,
+                } if *request_seq == due_seq && output == "scheduled"
+            )
+        }));
     }
 
     #[tokio::test]

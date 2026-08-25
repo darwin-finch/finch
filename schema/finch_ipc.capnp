@@ -1073,6 +1073,8 @@ struct BrainSchedule {
   intervalMs     @5 :UInt64;
   deliveryPolicy @6 :BrainScheduleDeliveryPolicy;
   active         @7 :Bool;
+  initiatingAttachmentId @8 :Text;
+  createdBy      @9 :Text;
 }
 
 struct BrainScheduleDue {
@@ -1081,6 +1083,10 @@ struct BrainScheduleDue {
   dueAtMs        @2 :UInt64;
   firstMissedAtMs @3 :UInt64;
   missedCount    @4 :UInt32;
+  hasNextDueMs   @5 :Bool;
+  nextDueMs      @6 :UInt64;
+  language       @7 :ProgramLanguage;
+  source         @8 :Text;
 }
 
 struct BrainEvent {
