@@ -1152,6 +1152,21 @@ still blocks the corresponding Brain phase until it is unified.
   sibling-connection replay, and approval-audience substitution matrix now passes. mDNS carries
   only stable authority-free identity/reachability metadata; dynamic node/model availability is
   queried with `brain:read` and checked against the credential and invited node identity.
+- [ ] Simplify the Brain invitation cryptographic envelope after the current transport stabilizes.
+  Use the persistent Ed25519 node key as the single portable issuer identity, but allow a rotated or
+  ephemeral TLS key whose SPKI is bound by the signed compact invitation claims alongside the
+  recipient endpoint, Brain audience/generation, role/scopes, invitation ID, validity, and
+  delegation ancestry. Stop embedding the full DER certificate once migration compatibility is
+  defined. State the bootstrap limit explicitly: if the side channel can replace the entire invite,
+  endpoint, and issuer key, Finch needs an already-known contact key or human-verified short
+  fingerprint/QR; cryptography cannot infer the intended human identity. Add optional recipient-key
+  binding so an intercepted bearer invite cannot be redeemed by a different client, and bind the
+  resulting credential to that client key with challenge/mTLS-style proof of possession on
+  reconnect. Evaluate replacing the separate post-redemption HMAC signing secret with the node
+  identity only where doing so does not broaden offline credential verification or complicate
+  rotation. Keep consumption, retry identity, revocation, attenuation, and attachment binding as
+  durable capability state. Version both envelope forms and test downgrade, key rotation, endpoint
+  substitution, invite theft/racing, and cross-node replay.
 - [ ] Enforce least privilege independently for event visibility, prompt/program submission,
   approval, control-lease ownership, workspace effects, environment changes, credential minting,
   and distributed inference. mDNS advertisement and discovery now use an authority-free metadata
