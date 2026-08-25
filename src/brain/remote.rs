@@ -2367,7 +2367,7 @@ mod tests {
                 .http
                 .delete(sibling.target.delegated_credential_url(other_claims.credential_id))
                 .bearer_auth(&sibling_token)
-                .json(&serde_json::json!({"credential": other_token}))
+                .json(&serde_json::json!({"credential": other_token.clone()}))
                 .send()
                 .await
                 .unwrap()
@@ -2394,6 +2394,85 @@ mod tests {
                 .status(),
             reqwest::StatusCode::FORBIDDEN
         );
+
+        let bound_parent_token = authority
+            .issue(
+                BrainCredentialRequest {
+                    issuer: "fixture.local".into(),
+                    subject: "bound-admin".into(),
+                    brain_id: snapshot.brain_id,
+                    brain: "shared".into(),
+                    environment_generation: snapshot.environment.generation,
+                    role: AttachmentRole::Driver,
+                    scopes: [
+                        BrainCredentialScope::BrainAttach,
+                        BrainCredentialScope::BrainControl,
+                        BrainCredentialScope::EnvironmentAdmin,
+                    ]
+                    .into_iter()
+                    .collect(),
+                    delegation_chain: Vec::new(),
+                    ttl_ms: 60_000,
+                },
+                now,
+            )
+            .unwrap();
+        let bound_parent = authority.verify(&bound_parent_token, now).unwrap();
+        let (bound_token, bound_claims) = authority
+            .bind_attachment(
+                &bound_parent,
+                AttachmentId(uuid::Uuid::new_v4()),
+                super::super::store::ConnectionId(uuid::Uuid::new_v4()),
+                now,
+            )
+            .unwrap();
+        assert!(bound_claims.permits(BrainCredentialScope::BrainControl));
+        assert!(bound_claims.permits(BrainCredentialScope::EnvironmentAdmin));
+        for (method, url, body) in [
+            (
+                reqwest::Method::POST,
+                controller.target.credentials_url(),
+                serde_json::json!({
+                    "subject": "forbidden-child",
+                    "role": AttachmentRole::Observer,
+                    "scopes": [BrainCredentialScope::BrainRead],
+                    "ttl_ms": 1_000,
+                }),
+            ),
+            (
+                reqwest::Method::POST,
+                controller.target.invitations_url(),
+                serde_json::json!({
+                    "role": AttachmentRole::Observer,
+                    "ttl_ms": 1_000,
+                }),
+            ),
+            (
+                reqwest::Method::DELETE,
+                controller
+                    .target
+                    .delegated_credential_url(other_claims.credential_id),
+                serde_json::json!({"credential": other_token}),
+            ),
+            (
+                reqwest::Method::DELETE,
+                controller.target.http_url(),
+                serde_json::json!({}),
+            ),
+        ] {
+            assert_eq!(
+                controller
+                    .http
+                    .request(method, url)
+                    .bearer_auth(&bound_token)
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::FORBIDDEN
+            );
+        }
 
         let escalation = [BrainCredentialScope::EnvironmentAdmin]
             .into_iter()
