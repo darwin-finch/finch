@@ -767,7 +767,12 @@ still blocks the corresponding Brain phase until it is unified.
   every renewal, hydrates newer durable reducible VM state without importing daemon authority, and
   returns a correlated output/revision/checkpoint. The daemon validates and content-addresses that
   checkpoint; missing and stale callbacks fail closed. Request-boundary, replacement-callback,
-  authority-separation, pending-continuation, and daemon-restart tests cover the path.
+  authority-separation, pending-continuation, and daemon-restart tests cover the path. Interactive
+  prompts/programs now receive canonical event-sourced `RunId`s and lifecycle state: missing
+  callbacks leave never-started work `queued_for_environment`, registration drains that queue under
+  the Brain turn lane, approval suspension is visible on the same run, runner failures become
+  correlated failed runs, and daemon restart marks already-started work interrupted without
+  replaying it.
 - [ ] Route the ordinary home-console conversation and its complete coding-agent/tool loop through
   the same named-Brain event log. Ordinary home prompts now use a durable driver attachment and the
   daemon turn lane; the leased frontend runs the complete provider/tool/VM callback, while both home

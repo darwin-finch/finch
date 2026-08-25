@@ -134,6 +134,16 @@ state beside the event log without inheriting frontend authority or replaying ef
 runner receives the durable checkpoint during callback registration before it accepts work.
 Concurrent commits journal their exact runtime revision and recovery never regresses to a
 later-appended older checkpoint.
+Every accepted prompt or typed program now also creates one canonical, versioned `BrainRun` with a
+stable `RunId`, initiating attachment, request-event cursor, kind, timestamps, detail, and explicit
+`queued_for_environment`, `running`, `awaiting_approval`, `completed`, `failed`, `cancelled`, or
+`interrupted` state. A request accepted without a usable lease-bound callback remains durably queued
+and produces no invented result. Registering the matching runner callback drains queued runs in
+event order under the Brain turn lane. Runner errors persist a correlated error result before the
+run becomes failed, and the reverse approval capability projects suspension and resumption onto the
+same run. Reconstruction after daemon restart leaves never-started queued work eligible for the next
+valid lease but marks previously running or approval-suspended work interrupted; it never implicitly
+replays work with unknown external progress.
 Each named Brain also owns one daemon turn lane, so concurrent attached consoles cannot interleave
 input acceptance, VM commit, checkpoint publication, and Result events. Its WebSocket subscription
 is snapshot-first without a snapshot/subscribe gap. A 2026-08-24 two-console smoke test shared a
@@ -143,10 +153,11 @@ against the restored dictionary. A second live provider test rejected a three-ar
 then committed the corrected program; another daemon restart restored the earlier definition and
 continued the runtime revision. Static wire repair never retries host effects, approvals,
 cancellation, or runtime-limit failures.
-This remains a compatibility adapter rather than the final `BrainService`: approval audiences,
-scoped participant credentials, typed cursor/event transport, run interruption, and effect-resume
-correlation remain incomplete. Runtime ownership has moved to the leased environment runner; the
-daemon is now the durable coordinator for this Program path.
+This remains a compatibility adapter rather than the final `BrainService`: lifecycle operations are
+still split between HTTP handlers and local RPC, run ancestry/budgets/cancellation are incomplete,
+and generalized effect-resume correlation still needs the unified service. Runtime ownership has
+moved to the leased environment runner; the daemon is now the durable coordinator for interactive
+prompt/program runs.
 
 On 2026-08-24 a live attachment test used separate driver and consultant consoles against one
 Brain. The driver defined and invoked a shared Lisp word, the consultant was forbidden from
@@ -353,8 +364,9 @@ Exit: existing behavior is measurable before consolidation.
 
 ### B1: Canonical identity and event schema
 
-- Stable `BrainId`, attachment ID, connection ID, runner-lease ID, and revision types are present.
-  Add canonical `RunId` and request ID coverage to the remaining run lifecycle.
+- Stable `BrainId`, `RunId`, attachment ID, connection ID, runner-lease ID, request-event cursor, and
+  revision types are present. Extend the same identities through the remaining schedule, subagent,
+  speculative, cancellation, and final-summary lifecycle.
 - Version the expanded event envelope and projection rules.
 - Add migrations for existing named JSONL logs and ephemeral summaries.
 
