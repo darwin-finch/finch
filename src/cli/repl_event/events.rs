@@ -186,6 +186,12 @@ pub enum ReplEvent {
     RemoteBrainDisconnected {
         target: String,
     },
+    /// The expiring lease for this console's home Brain was renewed, lost, or
+    /// reacquired. Only a live lease permits the UI to advertise `runner`.
+    HomeRunnerLeaseStatus {
+        active: bool,
+        detail: String,
+    },
 
 }
 

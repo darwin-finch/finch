@@ -180,19 +180,80 @@ impl EventLoop {
 
 impl EventLoop {
     /// Register the frontend's home Brain in the daemon's durable named store.
-    /// This registers the frontend's home namespace. It does not manufacture
-    /// a runner lease; execution ownership is advertised only after the
-    /// daemon grants one through the Brain service.
-    async fn register_home_brain(&self) -> Result<bool> {
+    /// Register the frontend's home namespace and maintain its expiring
+    /// environment-runner lease. A failed renewal immediately removes the
+    /// runner claim from the status bar; retry never reuses an expired ID.
+    async fn register_home_brain(&self) -> Result<Option<bool>> {
         let Some(base) = self.daemon_base_url.as_deref() else {
-            return Ok(false);
+            return Ok(None);
         };
-        reqwest::Client::new()
+        let http = reqwest::Client::new();
+        let snapshot = http
             .get(format!("{base}/v1/brains/named/{}", self.session_label))
             .send()
             .await?
-            .error_for_status()?;
-        Ok(true)
+            .error_for_status()?
+            .json::<crate::brain::shared::BrainSnapshot>()
+            .await?;
+        let endpoint = format!(
+            "{base}/v1/brains/named/{}/runner-lease",
+            self.session_label
+        );
+        let initial = request_home_runner_lease(
+            &http,
+            &endpoint,
+            &self.session_label,
+            &snapshot.environment,
+            None,
+        )
+        .await;
+        let initially_active = initial.is_ok();
+        let mut lease_id = initial.ok().map(|lease| lease.lease_id);
+        let event_tx = self.event_tx.clone();
+        let subject = self.session_label.clone();
+        let environment = snapshot.environment;
+        tokio::spawn(async move {
+            let mut was_active = initially_active;
+            loop {
+                tokio::select! {
+                    _ = event_tx.closed() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+                }
+                match request_home_runner_lease(
+                    &http,
+                    &endpoint,
+                    &subject,
+                    &environment,
+                    lease_id,
+                )
+                .await
+                {
+                    Ok(lease) => {
+                        lease_id = Some(lease.lease_id);
+                        if !was_active {
+                            let _ = event_tx.send(ReplEvent::HomeRunnerLeaseStatus {
+                                active: true,
+                                detail: "lease reacquired".into(),
+                            });
+                        }
+                        was_active = true;
+                    }
+                    Err(error) => {
+                        // A retry with an expired/stale lease must acquire a
+                        // fresh identity; it may never revive the old lease.
+                        lease_id = None;
+                        if was_active {
+                            let _ = event_tx.send(ReplEvent::HomeRunnerLeaseStatus {
+                                active: false,
+                                detail: error.to_string(),
+                            });
+                        }
+                        was_active = false;
+                    }
+                }
+            }
+        });
+        Ok(Some(initially_active))
     }
 
     /// Handle `/brains` — list the daemon's authoritative named Brains.
@@ -209,6 +270,7 @@ impl EventLoop {
             environment: crate::brain::shared::BrainEnvironment,
             event_revision: u64,
             retained_programs: usize,
+            runner: Option<crate::brain::shared::BrainRunnerLease>,
         }
 
         let brains = match reqwest::Client::new()
@@ -249,12 +311,18 @@ impl EventLoop {
                     } else {
                         ""
                     };
+                    let runner = b
+                        .runner
+                        .as_ref()
+                        .map(|lease| format!(" · runner {}", lease.subject))
+                        .unwrap_or_else(|| " · runner offline".into());
                     lines.push(format!(
-                        "  {:55}  event {:<5}  {:<3} retained programs  {}{}",
+                        "  {:55}  event {:<5}  {:<3} retained programs  {}{}{}",
                         format!("{}@{}", b.name, b.environment.machine),
                         b.event_revision,
                         b.retained_programs,
                         b.environment.workspace.display(),
+                        runner,
                         current,
                     ));
                 }
@@ -305,4 +373,29 @@ impl EventLoop {
         }
         self.render_tui().await
     }
+}
+
+async fn request_home_runner_lease(
+    http: &reqwest::Client,
+    endpoint: &str,
+    subject: &str,
+    environment: &crate::brain::shared::BrainEnvironment,
+    lease_id: Option<crate::brain::shared::RunnerLeaseId>,
+) -> Result<crate::brain::shared::BrainRunnerLease> {
+    let response = http
+        .post(endpoint)
+        .json(&serde_json::json!({
+            "subject": subject,
+            "environment": environment,
+            "lease_id": lease_id,
+            "ttl_ms": 30_000,
+        }))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!(response.text().await.unwrap_or_else(|_| {
+            "runner lease request failed".into()
+        }));
+    }
+    Ok(response.json().await?)
 }

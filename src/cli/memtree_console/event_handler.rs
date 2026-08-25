@@ -97,6 +97,7 @@ impl EventHandler {
             ReplEvent::RemoteBrainMessage { .. } => {}
             ReplEvent::RemoteBrainError { .. }
             | ReplEvent::RemoteBrainDisconnected { .. }
+            | ReplEvent::HomeRunnerLeaseStatus { .. }
             | ReplEvent::AgentLifecycle(_) => {}
         }
 

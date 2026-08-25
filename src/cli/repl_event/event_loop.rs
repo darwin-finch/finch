@@ -269,6 +269,10 @@ pub struct EventLoop {
     /// This is singular by design: host effects are never broadcast.
     active_remote_brain: Option<crate::brain::remote::RemoteBrainClient>,
 
+    /// Whether this frontend currently holds the daemon-issued lease for its
+    /// home Brain. The UI never infers runner status from local process role.
+    home_runner_lease_active: bool,
+
     /// Base URL of the local daemon (e.g. "http://127.0.0.1:8000").
     /// Used by the cross-machine relay poller.
     daemon_base_url: Option<String>,
@@ -805,6 +809,7 @@ impl EventLoop {
             diff_store: DiffStore::new(),
             peer_session_rx,
             active_remote_brain: None,
+            home_runner_lease_active: false,
             daemon_base_url,
             llm_tx,
             llm_rx: Some(llm_rx),
@@ -837,19 +842,22 @@ impl EventLoop {
             })
             .unwrap_or_else(|| "~".to_string());
         self.cwd = cwd.clone();
-        let home_brain_registered = match self.register_home_brain().await {
-            Ok(registered) => registered,
+        let home_runner_state = match self.register_home_brain().await {
+            Ok(state) => state,
             Err(error) => {
                 tracing::warn!("could not register home Brain: {error}");
-                false
+                None
             }
         };
+        self.home_runner_lease_active = home_runner_state == Some(true);
         self.status_bar.update_line(
             crate::cli::status_bar::StatusLineType::SessionLabel,
-            if home_brain_registered {
-                format!("◆ brain: {} · home · local", self.session_label)
-            } else {
-                format!("◆ brain: {} · home · daemon offline", self.session_label)
+            match home_runner_state {
+                Some(true) => format!("◆ brain: {} · runner", self.session_label),
+                Some(false) => {
+                    format!("◆ brain: {} · home · no runner lease", self.session_label)
+                }
+                None => format!("◆ brain: {} · home · daemon offline", self.session_label),
             },
         );
 
@@ -1060,6 +1068,7 @@ impl EventLoop {
                         ReplEvent::RemoteBrainMessage { .. } => "RemoteBrainMessage",
                         ReplEvent::RemoteBrainError { .. } => "RemoteBrainError",
                         ReplEvent::RemoteBrainDisconnected { .. } => "RemoteBrainDisconnected",
+                        ReplEvent::HomeRunnerLeaseStatus { .. } => "HomeRunnerLeaseStatus",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
                     tracing::debug!("Received event: {:?}", event);
@@ -2919,6 +2928,26 @@ Rules:\n\
                     self.render_tui().await?;
                 }
             }
+            ReplEvent::HomeRunnerLeaseStatus { active, detail } => {
+                self.home_runner_lease_active = active;
+                if self.active_remote_brain.is_none() {
+                    self.status_bar.update_line(
+                        crate::cli::status_bar::StatusLineType::SessionLabel,
+                        if active {
+                            format!("◆ brain: {} · runner", self.session_label)
+                        } else {
+                            format!("◆ brain: {} · home · no runner lease", self.session_label)
+                        },
+                    );
+                    if !active {
+                        self.output_manager.write_info(format!(
+                            "{}: runner lease unavailable: {detail}",
+                            self.session_label
+                        ));
+                    }
+                    self.render_tui().await?;
+                }
+            }
             ReplEvent::ShowDialog {
                 dialog: _,
                 response_tx,
@@ -3302,11 +3331,9 @@ Rules:\n\
         client.target.machine = snapshot.environment.machine.clone();
 
         let target_name = client.target.display_name();
+        let runner_online = snapshot.runner_lease.is_some();
         self.active_remote_brain = Some(client);
-        self.status_bar.update_line(
-            crate::cli::status_bar::StatusLineType::SessionLabel,
-            format!("◆ brain: {target_name} · driver"),
-        );
+        self.update_remote_brain_status(runner_online);
         self.render_remote_brain_message(crate::brain::shared::BrainWireMessage::Snapshot {
             brain: snapshot,
         })
@@ -3345,7 +3372,11 @@ Rules:\n\
         }
         self.status_bar.update_line(
             crate::cli::status_bar::StatusLineType::SessionLabel,
-            format!("◆ brain: {} · home · local", self.session_label),
+            if self.home_runner_lease_active {
+                format!("◆ brain: {} · runner", self.session_label)
+            } else {
+                format!("◆ brain: {} · home · no runner lease", self.session_label)
+            },
         );
         self.render_tui().await
     }
@@ -3424,6 +3455,7 @@ Rules:\n\
     ) -> Result<()> {
         match message {
             crate::brain::shared::BrainWireMessage::Snapshot { brain } => {
+                self.update_remote_brain_status(brain.runner_lease.is_some());
                 let acknowledged_seq = self
                     .active_remote_brain
                     .as_ref()
@@ -3445,15 +3477,48 @@ Rules:\n\
                 }
             }
             crate::brain::shared::BrainWireMessage::Event { event } => {
+                match &event.kind {
+                    crate::brain::shared::BrainEventKind::RunnerLeaseAcquired { .. } => {
+                        self.update_remote_brain_status(true);
+                    }
+                    crate::brain::shared::BrainEventKind::RunnerLeaseReleased { .. } => {
+                        self.update_remote_brain_status(false);
+                    }
+                    _ => {}
+                }
                 self.render_remote_brain_event(&event);
             }
         }
         self.render_tui().await
     }
 
+    fn update_remote_brain_status(&self, runner_online: bool) {
+        let Some(client) = self.active_remote_brain.as_ref() else {
+            return;
+        };
+        let role = client
+            .attachment()
+            .map(|attachment| format!("{:?}", attachment.role).to_lowercase())
+            .unwrap_or_else(|| "detached".into());
+        self.status_bar.update_line(
+            crate::cli::status_bar::StatusLineType::SessionLabel,
+            format!(
+                "◆ brain: {} · {role} · runner {}",
+                client.target.display_name(),
+                if runner_online { "online" } else { "offline" }
+            ),
+        );
+    }
+
     fn render_remote_brain_event(&self, event: &crate::brain::shared::BrainEvent) {
         use crate::brain::shared::BrainEventKind;
         match &event.kind {
+            BrainEventKind::RunnerLeaseAcquired { lease } => self.output_manager.write_info(
+                format!("{} is the active environment runner", lease.subject),
+            ),
+            BrainEventKind::RunnerLeaseReleased { .. } => self
+                .output_manager
+                .write_info("environment runner disconnected"),
             BrainEventKind::ClientAttached {
                 subject, role, ..
             } => self.output_manager.write_info(format!(

@@ -85,6 +85,14 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
             "/v1/brains/named/:name/attachments/:attachment_id/connections/:connection_id",
             axum::routing::delete(detach_named_brain),
         )
+        .route(
+            "/v1/brains/named/:name/runner-lease",
+            post(acquire_named_brain_runner),
+        )
+        .route(
+            "/v1/brains/named/:name/runner-lease/:lease_id",
+            axum::routing::delete(release_named_brain_runner),
+        )
         .route("/v1/brains/named/:name/ws", get(watch_named_brain))
         .route(
             "/v1/brains/password",
@@ -161,6 +169,7 @@ struct NamedBrainListEntry {
     environment: crate::brain::shared::BrainEnvironment,
     event_revision: u64,
     retained_programs: usize,
+    runner: Option<crate::brain::shared::BrainRunnerLease>,
 }
 
 async fn list_named_brains(
@@ -184,6 +193,7 @@ async fn list_named_brains(
             environment: snapshot.environment,
             event_revision: snapshot.revision,
             retained_programs: snapshot.program_stack.len(),
+            runner: snapshot.runner_lease,
         });
     }
     Ok(Json(result))
@@ -278,6 +288,89 @@ async fn detach_named_brain(
             &name,
             crate::brain::shared::AttachmentId(attachment_id),
             crate::brain::shared::ConnectionId(connection_id),
+        )
+        .map_err(|error| AppError(error).into_response())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct AcquireNamedBrainRunnerRequest {
+    subject: String,
+    environment: crate::brain::shared::BrainEnvironment,
+    lease_id: Option<crate::brain::shared::RunnerLeaseId>,
+    ttl_ms: u64,
+}
+
+async fn acquire_named_brain_runner(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(name): Path<String>,
+    Json(request): Json<AcquireNamedBrainRunnerRequest>,
+) -> Result<Json<crate::brain::shared::BrainRunnerLease>, Response> {
+    if !addr.ip().is_loopback() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "remote runner leases require scoped environment credentials"
+            })),
+        )
+            .into_response());
+    }
+    if &request.environment != server.shared_brains().environment() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "runner environment does not match the daemon Brain environment"
+            })),
+        )
+            .into_response());
+    }
+    let lease = server
+        .shared_brains()
+        .acquire_runner_lease(
+            &name,
+            &request.subject,
+            request.environment.generation,
+            request.lease_id,
+            request.ttl_ms,
+        )
+        .map_err(|error| AppError(error).into_response())?;
+    let store = server.shared_brains().clone();
+    let lease_id = lease.lease_id;
+    let expires_ms = lease.expires_ms;
+    tokio::spawn(async move {
+        loop {
+            let delay_ms = expires_ms.saturating_sub(unix_epoch_millis());
+            if delay_ms == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        let _ = store.expire_runner_lease(&name, lease_id, unix_epoch_millis());
+    });
+    Ok(Json(lease))
+}
+
+fn unix_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+async fn release_named_brain_runner(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path((name, lease_id)): Path<(String, uuid::Uuid)>,
+) -> Result<StatusCode, Response> {
+    if !addr.ip().is_loopback() {
+        return Err(StatusCode::FORBIDDEN.into_response());
+    }
+    server
+        .shared_brains()
+        .release_runner_lease(
+            &name,
+            crate::brain::shared::RunnerLeaseId(lease_id),
         )
         .map_err(|error| AppError(error).into_response())?;
     Ok(StatusCode::NO_CONTENT)
@@ -425,6 +518,8 @@ async fn push_named_brain_event(
         BrainEventKind::ProgramPopped { .. }
         | BrainEventKind::Result { .. }
         | BrainEventKind::RuntimeCommitted { .. }
+        | BrainEventKind::RunnerLeaseAcquired { .. }
+        | BrainEventKind::RunnerLeaseReleased { .. }
         | BrainEventKind::ClientAttached { .. }
         | BrainEventKind::ClientDetached { .. } => None,
     };
@@ -646,6 +741,8 @@ fn named_brain_provider_messages(
             !matches!(
                 event.kind,
                 BrainEventKind::RuntimeCommitted { .. }
+                    | BrainEventKind::RunnerLeaseAcquired { .. }
+                    | BrainEventKind::RunnerLeaseReleased { .. }
                     | BrainEventKind::ClientAttached { .. }
                     | BrainEventKind::ClientDetached { .. }
             )
@@ -691,6 +788,8 @@ fn named_brain_provider_messages(
                 ))
             }
             BrainEventKind::RuntimeCommitted { .. }
+            | BrainEventKind::RunnerLeaseAcquired { .. }
+            | BrainEventKind::RunnerLeaseReleased { .. }
             | BrainEventKind::ClientAttached { .. }
             | BrainEventKind::ClientDetached { .. } => unreachable!("filtered above"),
         })
@@ -1978,6 +2077,7 @@ mod named_brain_provider_context_tests {
             ],
             program_stack: Vec::new(),
             attachments: Vec::new(),
+            runner_lease: None,
         };
 
         let messages = named_brain_provider_messages(&snapshot);
@@ -2001,6 +2101,7 @@ mod named_brain_provider_context_tests {
             },
             event_revision: 21,
             retained_programs: 7,
+            runner: None,
         };
 
         let value = serde_json::to_value(entry).unwrap();

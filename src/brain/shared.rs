@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 3;
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 4;
 const BRAIN_METADATA_VERSION: u32 = 1;
 
 /// Stable identity of one durable Brain. Names are mutable human aliases;
@@ -60,6 +60,25 @@ impl Default for ConnectionId {
     fn default() -> Self {
         Self(uuid::Uuid::nil())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RunnerLeaseId(pub uuid::Uuid);
+
+impl RunnerLeaseId {
+    fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainRunnerLease {
+    pub lease_id: RunnerLeaseId,
+    pub subject: String,
+    pub environment_generation: u64,
+    pub acquired_ms: u64,
+    pub expires_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +135,12 @@ pub struct BrainEnvironment {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrainEventKind {
+    RunnerLeaseAcquired {
+        lease: BrainRunnerLease,
+    },
+    RunnerLeaseReleased {
+        lease_id: RunnerLeaseId,
+    },
     ClientAttached {
         attachment_id: AttachmentId,
         #[serde(default)]
@@ -189,6 +214,7 @@ pub struct BrainSnapshot {
     pub events: Vec<BrainEvent>,
     pub program_stack: Vec<BrainProgram>,
     pub attachments: Vec<BrainAttachment>,
+    pub runner_lease: Option<BrainRunnerLease>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -203,6 +229,7 @@ struct BrainState {
     events: Vec<BrainEvent>,
     program_stack: Vec<BrainProgram>,
     attachments: HashMap<AttachmentId, BrainAttachment>,
+    runner_lease: Option<BrainRunnerLease>,
     runtime_checkpoint: Option<RuntimeCheckpointState>,
     runtime_commit_count: u64,
     tx: broadcast::Sender<BrainEvent>,
@@ -223,6 +250,7 @@ impl BrainState {
             events: Vec::new(),
             program_stack: Vec::new(),
             attachments: HashMap::new(),
+            runner_lease: None,
             runtime_checkpoint: None,
             runtime_commit_count: 0,
             tx,
@@ -238,6 +266,18 @@ impl BrainState {
 
     fn apply(&mut self, event: BrainEvent) {
         match &event.kind {
+            BrainEventKind::RunnerLeaseAcquired { lease } => {
+                self.runner_lease = Some(lease.clone());
+            }
+            BrainEventKind::RunnerLeaseReleased { lease_id } => {
+                if self
+                    .runner_lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.lease_id == *lease_id)
+                {
+                    self.runner_lease = None;
+                }
+            }
             BrainEventKind::ClientAttached {
                 attachment_id,
                 connection_id,
@@ -426,7 +466,120 @@ impl SharedBrainStore {
             events: state.events.clone(),
             program_stack: state.program_stack.clone(),
             attachments: sorted_attachments(&state.attachments),
+            runner_lease: state
+                .runner_lease
+                .clone()
+                .filter(|lease| lease.expires_ms > unix_millis()),
         })
+    }
+
+    pub fn acquire_runner_lease(
+        &self,
+        name: &str,
+        subject: &str,
+        environment_generation: u64,
+        lease_id: Option<RunnerLeaseId>,
+        ttl_ms: u64,
+    ) -> Result<BrainRunnerLease> {
+        let name = Self::validate_name(name)?;
+        let subject = subject.trim();
+        if subject.is_empty() || subject.len() > 128 || subject.chars().any(char::is_control) {
+            anyhow::bail!("runner subject must be 1-128 printable characters");
+        }
+        if environment_generation != self.environment.generation {
+            anyhow::bail!("runner environment generation does not match this Brain");
+        }
+        if !(5_000..=300_000).contains(&ttl_ms) {
+            anyhow::bail!("runner lease TTL must be between 5 and 300 seconds");
+        }
+        self.ensure_loaded(name)?;
+        let now = unix_millis();
+        let expires_ms = now.saturating_add(ttl_ms);
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).expect("brain loaded above");
+        if let Some(current) = state
+            .runner_lease
+            .clone()
+            .filter(|current| current.expires_ms > now)
+        {
+            if current.subject != subject || lease_id != Some(current.lease_id) {
+                anyhow::bail!("Brain already has a live runner lease");
+            }
+            state
+                .runner_lease
+                .as_mut()
+                .expect("live runner lease checked above")
+                .expires_ms = expires_ms;
+            let mut renewed = current;
+            renewed.expires_ms = expires_ms;
+            return Ok(renewed);
+        }
+        if lease_id.is_some() {
+            anyhow::bail!("runner lease expired; acquire a new lease identity");
+        }
+        let lease = BrainRunnerLease {
+            lease_id: RunnerLeaseId::new(),
+            subject: subject.to_string(),
+            environment_generation,
+            acquired_ms: now,
+            expires_ms,
+        };
+        self.push_locked(
+            name,
+            state,
+            subject,
+            BrainEventKind::RunnerLeaseAcquired {
+                lease: lease.clone(),
+            },
+        )?;
+        Ok(lease)
+    }
+
+    pub fn release_runner_lease(&self, name: &str, lease_id: RunnerLeaseId) -> Result<()> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).expect("brain loaded above");
+        let current = state
+            .runner_lease
+            .as_ref()
+            .context("Brain has no runner lease")?;
+        if current.lease_id != lease_id {
+            anyhow::bail!("runner lease is no longer current");
+        }
+        let subject = current.subject.clone();
+        self.push_locked(
+            name,
+            state,
+            &subject,
+            BrainEventKind::RunnerLeaseReleased { lease_id },
+        )?;
+        Ok(())
+    }
+
+    pub fn expire_runner_lease(
+        &self,
+        name: &str,
+        lease_id: RunnerLeaseId,
+        now_ms: u64,
+    ) -> Result<bool> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).expect("brain loaded above");
+        let Some(current) = state.runner_lease.as_ref() else {
+            return Ok(false);
+        };
+        if current.lease_id != lease_id || current.expires_ms > now_ms {
+            return Ok(false);
+        }
+        self.push_locked(
+            name,
+            state,
+            "daemon",
+            BrainEventKind::RunnerLeaseReleased { lease_id },
+        )?;
+        Ok(true)
     }
 
     pub fn attach(
@@ -1365,6 +1518,67 @@ mod tests {
                 second.connection_id.unwrap(),
             )
             .is_ok());
+    }
+
+    #[test]
+    fn runner_lease_is_exclusive_renewable_and_event_sourced() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let generation = store.environment().generation;
+        let lease = store
+            .acquire_runner_lease("shared", "console-a", generation, None, 60_000)
+            .unwrap();
+        assert!(store
+            .acquire_runner_lease("shared", "console-b", generation, None, 60_000)
+            .is_err());
+        assert!(store
+            .acquire_runner_lease(
+                "shared",
+                "console-a",
+                generation,
+                Some(RunnerLeaseId(uuid::Uuid::new_v4())),
+                60_000,
+            )
+            .is_err());
+        let renewed = store
+            .acquire_runner_lease(
+                "shared",
+                "console-a",
+                generation,
+                Some(lease.lease_id),
+                120_000,
+            )
+            .unwrap();
+        assert_eq!(renewed.lease_id, lease.lease_id);
+        assert!(renewed.expires_ms >= lease.expires_ms);
+
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        assert_eq!(
+            restarted
+                .snapshot("shared")
+                .unwrap()
+                .runner_lease
+                .unwrap()
+                .lease_id,
+            lease.lease_id
+        );
+        restarted
+            .release_runner_lease("shared", lease.lease_id)
+            .unwrap();
+        assert!(restarted.snapshot("shared").unwrap().runner_lease.is_none());
+        assert!(restarted
+            .acquire_runner_lease("shared", "console-b", generation + 1, None, 60_000)
+            .is_err());
+        let replacement = restarted
+            .acquire_runner_lease("shared", "console-b", generation, None, 60_000)
+            .unwrap();
+        assert!(restarted
+            .expire_runner_lease("shared", replacement.lease_id, replacement.expires_ms - 1)
+            .is_ok_and(|expired| !expired));
+        assert!(restarted
+            .expire_runner_lease("shared", replacement.lease_id, replacement.expires_ms)
+            .unwrap());
+        assert!(restarted.snapshot("shared").unwrap().runner_lease.is_none());
     }
 
     #[test]
