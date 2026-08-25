@@ -114,15 +114,20 @@ Named-Brain HTTP/WebSocket attachment and local frontend registration currently 
 durable namespace. Attachments now have daemon-authoritative identities, roles, connection leases,
 and monotonically acknowledged event cursors that survive reconnect and daemon restart. Each Brain
 also has an exclusive, expiring runner lease bound to its exact environment generation. The
-ordinary frontend/daemon Cap'n Proto channel still lacks typed Brain event, cursor, lease, and
-effect-resume operations; those should become adapters over one service rather than reviving
-transport-owned spawn/list/respond lifecycles.
+ordinary frontend/daemon Cap'n Proto channel now carries a lease-bound runner callback, correlated
+ProgramRun request/result records, and bootstrap revision/checkpoint state. It still lacks the full
+typed Brain event, attachment cursor, lease-management, approval, and effect-resume contract; those
+should become adapters over one service rather than reviving transport-owned spawn/list/respond
+lifecycles.
 
-The named-Brain HTTP compatibility handler no longer replays the accumulated program stack through
-the old Co-Forth or native Lisp evaluators. Program events and raw provider-wire responses enter one
-typed `ProgramRuntime`; successful reducible revisions are stored as content-addressed checkpoints
-beside the event log and restored without replaying source or effects. Concurrent commits journal
-their exact runtime revision and recovery never regresses to a later-appended older checkpoint.
+The named-Brain HTTP compatibility handler no longer executes ProgramRuns inside the daemon. It
+serializes the accepted event, requires the active environment lease's registered callback, and
+dispatches the source to the frontend-owned typed `ProgramRuntime`. The runner returns its exact
+output/revision/checkpoint; the daemon independently reverifies and content-addresses reducible
+state beside the event log without inheriting frontend authority or replaying effects. A restarted
+runner receives the durable checkpoint during callback registration before it accepts work.
+Concurrent commits journal their exact runtime revision and recovery never regresses to a
+later-appended older checkpoint.
 Each named Brain also owns one daemon turn lane, so concurrent attached consoles cannot interleave
 input acceptance, VM commit, checkpoint publication, and Result events. Its WebSocket subscription
 is snapshot-first without a snapshot/subscribe gap. A 2026-08-24 two-console smoke test shared a
@@ -132,16 +137,18 @@ against the restored dictionary. A second live provider test rejected a three-ar
 then committed the corrected program; another daemon restart restored the earlier definition and
 continued the runtime revision. Static wire repair never retries host effects, approvals,
 cancellation, or runtime-limit failures.
-This remains a compatibility adapter, not the final runner-lease architecture: it has no approval
-audience and therefore cannot acquire workspace/host grants. B2-B4 must move its runtime ownership
-to the leased environment runner and retain the daemon as durable coordinator only.
+This remains a compatibility adapter rather than the final `BrainService`: approval audiences,
+scoped participant credentials, typed cursor/event transport, run interruption, and effect-resume
+correlation remain incomplete. Runtime ownership has moved to the leased environment runner; the
+daemon is now the durable coordinator for this Program path.
 
 On 2026-08-24 a live attachment test used separate driver and consultant consoles against one
 Brain. The driver defined and invoked a shared Lisp word, the consultant was forbidden from
 submitting a program, acknowledged cursors survived reconnect, stale connection acknowledgements
 returned a conflict, and WebSocket close produced a durable detach event. A short runner lease was
 also observed expiring into a durable release event. This validates the compatibility transport and
-lease state machine, not yet environment-runner execution delegation.
+lease state machine. Automated callback/dispatch tests now cover environment-runner delegation;
+another live two-console smoke test remains required for the new path.
 
 ## Target model
 
@@ -380,8 +387,10 @@ Exit: the transport conformance suite produces equivalent events and outcomes.
 
 Current compatibility status: HTTP/WebSocket implement authenticated attachment, cursor, role, and
 runner-lease operations. They are test scaffolding for this phase, not permission to preserve a
-second service implementation. Cap'n Proto, embedded mode, and the ordinary local daemon client do
-not yet implement the same typed contract.
+second service implementation. Local Cap'n Proto now implements the lease-bound runner callback and
+checkpoint bootstrap, but not attachment cursors, the complete Brain event envelope, approvals, or
+effect resumptions. Embedded mode and the ordinary remote client likewise do not yet implement the
+same typed contract.
 
 ### B5: Client projections and shadow-buffer UI
 

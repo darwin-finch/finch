@@ -730,11 +730,16 @@ still blocks the corresponding Brain phase until it is unified.
   roles constrain submission; and the status/list projections report the authoritative role and
   live runner. The exclusive runner lease expires, renews without event-log heartbeat spam, is
   bound to an exact environment generation, and emits a durable release on expiry.
+- [x] Dispatch named-Brain ProgramRuns to the leased environment frontend instead of executing
+  them in the daemon. The frontend registers a lease-bound Cap'n Proto callback, re-registers it on
+  every renewal, hydrates newer durable reducible VM state without importing daemon authority, and
+  returns a correlated output/revision/checkpoint. The daemon validates and content-addresses that
+  checkpoint; missing and stale callbacks fail closed. Request-boundary, replacement-callback,
+  authority-separation, pending-continuation, and daemon-restart tests cover the path.
 - [ ] Complete Brain control and approval ownership above that substrate. Put the role and approval
-  audience on every permission/proposal view, add scoped participant credentials, and dispatch
-  actual execution to the leased environment frontend. The named-Brain HTTP handler still executes
-  pure compatibility programs inside the daemon; a lease currently reports liveness but does not
-  delegate ProgramRuns or grant workspace authority.
+  audience on every permission/proposal view and add scoped participant credentials. ProgramRuns
+  now execute on the leased frontend, but approval/control authority still needs explicit audience,
+  disconnect, cancellation, and handoff semantics rather than relying on the local dialog alone.
 - [ ] Persist a frontend attachment identity across frontend process restarts, not merely reconnects
   in one process, while keeping the daemon cursor authoritative. Expire or clean up an attachment
   that REST-attaches but crashes before its WebSocket activates, without advancing its cursor.
