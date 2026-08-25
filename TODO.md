@@ -908,8 +908,10 @@ still blocks the corresponding Brain phase until it is unified.
   credentials. A live two-frontend check on 2026-08-25 attached a second driver, projected the same
   relay to both consoles, and confirmed that it created no `BrainRun`; presence rows now include a
   short durable attachment ID so two consoles owned by the same subject remain distinguishable.
-  Still add an explicit `@finch` prompt spelling, participant-specific rendering,
-  threads/channels, and the corresponding collaboration authorization tests. Until then,
+  `@finch <prompt>` now explicitly schedules a model turn without persisting the addressee marker,
+  while `/say` remains relay-only; projected prompts and relays use distinct markers and stable
+  participant-derived backgrounds. Still add threads/channels and the corresponding collaboration
+  authorization tests. Until then,
   quarantine the remaining aspirational IRC/room/peer/gas command surfaces (`/join`, `/part`,
   `/room`, `/connect`, and related commands) rather than presenting them as a second collaboration
   protocol.

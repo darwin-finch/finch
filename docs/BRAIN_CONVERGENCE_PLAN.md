@@ -189,6 +189,10 @@ Participant collaboration no longer has to masquerade as a model prompt: `Partic
 closed-schema submission/event that is durable and available to later provider context but creates
 no `BrainRun`. Drivers and consultants may relay it, observers and runners may not, and `/say`,
 `/who`, and `/whois` expose relay and public presence without revealing credentials.
+`@finch <prompt>` is the explicit model-addressing spelling inside that shared conversation, while
+`/say` records a participant message without scheduling a run. Client projections render both as
+attributed participant messages with distinct prompt/relay markers and stable per-participant
+backgrounds instead of conflating relays with system notices.
 The obsolete client-local speculative agent and hidden context-injection path are absent, so they
 can no longer bypass this coordinator or consume a separate provider session while the user types.
 
