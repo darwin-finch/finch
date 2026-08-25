@@ -3858,10 +3858,18 @@ Rules:\n\
                             ));
                         }
                         self.last_home_runner_error = Some(detail);
-                        self.schedule_home_runner_reconnect(
-                            epoch,
-                            attempt.saturating_add(1),
-                        );
+                        if self
+                            .last_home_runner_error
+                            .as_deref()
+                            .is_some_and(|detail| detail.contains("handed off"))
+                        {
+                            self.home_runner_lease_id = None;
+                        } else {
+                            self.schedule_home_runner_reconnect(
+                                epoch,
+                                attempt.saturating_add(1),
+                            );
+                        }
                     }
                 }
             }

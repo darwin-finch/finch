@@ -50,14 +50,26 @@ fn participant_attachment_label(
 
 fn reconnect_runner_lease_id(
     retained: Option<crate::brain::store::RunnerLeaseId>,
-    observed: Option<&crate::brain::store::BrainRunnerLease>,
+    snapshot: &crate::brain::store::BrainSnapshot,
     subject: &str,
-) -> Option<crate::brain::store::RunnerLeaseId> {
-    retained.or_else(|| {
-        observed
-            .filter(|lease| lease.subject == subject)
-            .map(|lease| lease.lease_id)
-    })
+) -> Result<Option<crate::brain::store::RunnerLeaseId>> {
+    if retained.is_some_and(|lease_id| snapshot.runner_lease_was_handed_off(lease_id)) {
+        anyhow::bail!("runner lease handed off to another frontend");
+    }
+    let observed = snapshot
+        .runner_lease
+        .as_ref()
+        .filter(|lease| lease.expires_ms > crate::brain::store::unix_millis());
+    match observed {
+        Some(lease) if lease.subject != subject => anyhow::bail!(
+            "Brain runner lease belongs to another subject ({})",
+            lease.subject
+        ),
+        Some(lease) => Ok(Some(lease.lease_id)),
+        // Absence is durable proof that a retained ID expired or was released.
+        // Only then may this exact subject mint a replacement identity.
+        None => Ok(None),
+    }
 }
 
 fn lease_id_after_registration(
@@ -420,9 +432,9 @@ impl EventLoop {
         verify_local_frontend_environment(&snapshot.environment)?;
         let durable_lease_id = reconnect_runner_lease_id(
             self.home_runner_lease_id,
-            snapshot.runner_lease.as_ref(),
+            &snapshot,
             &self.runner_subject,
-        );
+        )?;
         let lease = ipc
             .brain_acquire_runner(
                 &self.session_label,
@@ -1161,16 +1173,42 @@ mod brain_handler_tests {
             subject: "runner/frontend-stable".into(),
             environment_generation: 1,
             acquired_ms: 10,
-            expires_ms: 20,
+            expires_ms: u64::MAX,
         };
+        let mut snapshot = test_runner_snapshot(Some(observed), Vec::new());
         assert_eq!(
-            reconnect_runner_lease_id(None, Some(&observed), "runner/frontend-stable"),
+            reconnect_runner_lease_id(None, &snapshot, "runner/frontend-stable").unwrap(),
             Some(observed_id)
         );
+        assert!(reconnect_runner_lease_id(None, &snapshot, "another/frontend").is_err());
+
+        snapshot.runner_lease.as_mut().unwrap().expires_ms = 0;
         assert_eq!(
-            reconnect_runner_lease_id(None, Some(&observed), "another/frontend"),
+            reconnect_runner_lease_id(
+                Some(observed_id),
+                &snapshot,
+                "runner/frontend-stable"
+            )
+            .unwrap(),
             None
         );
+
+        let foreign = crate::brain::store::BrainRunnerLease {
+            lease_id: crate::brain::store::RunnerLeaseId(uuid::Uuid::new_v4()),
+            subject: "another/frontend".into(),
+            environment_generation: 1,
+            acquired_ms: 10,
+            expires_ms: u64::MAX,
+        };
+        let snapshot = test_runner_snapshot(Some(foreign), Vec::new());
+        let error = reconnect_runner_lease_id(
+            Some(observed_id),
+            &snapshot,
+            "runner/frontend-stable",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("another subject"));
     }
 
     #[test]
@@ -1184,5 +1222,80 @@ mod brain_handler_tests {
             lease_id_after_registration(Some(lease_id), None, false, true),
             None
         );
+    }
+
+    #[test]
+    fn handed_off_runner_lease_cannot_fall_back_to_a_new_identity() {
+        let old_id = crate::brain::store::RunnerLeaseId(uuid::Uuid::new_v4());
+        let handoff_id = crate::brain::store::RunnerHandoffId(uuid::Uuid::new_v4());
+        let target_lease = crate::brain::store::BrainRunnerLease {
+            lease_id: crate::brain::store::RunnerLeaseId(uuid::Uuid::new_v4()),
+            subject: "target/frontend".into(),
+            environment_generation: 1,
+            acquired_ms: 10,
+            expires_ms: u64::MAX,
+        };
+        let handoff = crate::brain::store::BrainRunnerHandoff {
+            handoff_id,
+            from_lease_id: old_id,
+            requested_by: "source/frontend".into(),
+            target_subject: "target/frontend".into(),
+            environment_generation: 1,
+            requested_ms: 10,
+            expires_ms: 20,
+        };
+        let events = vec![
+            test_runner_event(crate::brain::store::BrainEventKind::RunnerHandoffRequested {
+                handoff,
+            }),
+            test_runner_event(crate::brain::store::BrainEventKind::RunnerHandoffCompleted {
+                handoff_id,
+                lease: target_lease.clone(),
+            }),
+        ];
+        let snapshot = test_runner_snapshot(Some(target_lease), events);
+        let error = reconnect_runner_lease_id(Some(old_id), &snapshot, "source/frontend")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("handed off"));
+    }
+
+    fn test_runner_snapshot(
+        runner_lease: Option<crate::brain::store::BrainRunnerLease>,
+        events: Vec<crate::brain::store::BrainEvent>,
+    ) -> crate::brain::store::BrainSnapshot {
+        crate::brain::store::BrainSnapshot {
+            brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
+            name: "shared".into(),
+            environment: crate::brain::store::BrainEnvironment {
+                machine: "box.local".into(),
+                workspace: std::path::PathBuf::from("/tmp"),
+                generation: 1,
+            },
+            revision: events.len() as u64,
+            events,
+            program_stack: Vec::new(),
+            attachments: Vec::new(),
+            runner_lease,
+            runner_handoff: None,
+            runs: Vec::new(),
+            tasks: Vec::new(),
+            schedules: Vec::new(),
+            pending_schedule_dues: Vec::new(),
+        }
+    }
+
+    fn test_runner_event(
+        kind: crate::brain::store::BrainEventKind,
+    ) -> crate::brain::store::BrainEvent {
+        crate::brain::store::BrainEvent {
+            schema_version: 1,
+            brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
+            seq: 1,
+            environment_generation: 1,
+            sender: "test".into(),
+            created_ms: 10,
+            kind,
+        }
     }
 }
