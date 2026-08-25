@@ -137,6 +137,10 @@ pub fn create_remote_brain_router(server: Arc<AgentServer>) -> Router {
     Router::new()
         .route("/v1/brains/named/:name", get(get_named_brain))
         .route(
+            "/v1/brains/named/:name/capabilities",
+            get(get_named_brain_capabilities),
+        )
+        .route(
             "/v1/brains/named/:name/attachments",
             post(attach_named_brain),
         )
@@ -568,6 +572,31 @@ async fn get_named_brain(
         .snapshot(&name)
         .map(Json)
         .map_err(|error| AppError(error).into_response())
+}
+
+async fn get_named_brain_capabilities(
+    State(server): State<Arc<AgentServer>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<crate::brain::remote::RemoteBrainCapabilities>, Response> {
+    authorize_named_brain(
+        &server,
+        &headers,
+        &name,
+        crate::brain::credential::BrainCredentialScope::BrainRead,
+    )?;
+    let snapshot = server
+        .shared_brains()
+        .snapshot(&name)
+        .map_err(|error| AppError(error).into_response())?;
+    Ok(Json(crate::brain::remote::RemoteBrainCapabilities {
+        schema_version: 1,
+        brain_id: snapshot.brain_id,
+        brain: snapshot.name,
+        environment: snapshot.environment,
+        node_public_key: hex::encode(server.brain_credentials().invitation_public_key()),
+        node: crate::node::NodeCapabilities::detect(server.primary_provider().is_some()),
+    }))
 }
 
 #[derive(Debug, Deserialize)]

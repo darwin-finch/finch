@@ -41,8 +41,9 @@ pub fn collect_machine_specs() -> (u32, u64, u64) {
     (cpu_cores, ram_mb, bench_ms)
 }
 
-/// Full description of this node's capabilities — advertised via mDNS
-/// and returned by the /v1/node/info endpoint.
+/// Full description of this node's capabilities. Dynamic capability data is
+/// not advertised over mDNS; remote collaborators retrieve it through a
+/// Brain-scoped authenticated endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
     pub identity: NodeIdentity,
@@ -50,7 +51,7 @@ pub struct NodeInfo {
 }
 
 /// What this node can do
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCapabilities {
     /// RAM in GB
     pub ram_gb: usize,

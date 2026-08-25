@@ -12,12 +12,26 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use super::shared::{
-    AttachmentId, AttachmentRole, BrainAttachment, BrainEventKind, BrainId, BrainSnapshot,
-    BrainWireMessage,
+    AttachmentId, AttachmentRole, BrainAttachment, BrainEnvironment, BrainEventKind, BrainId,
+    BrainSnapshot, BrainWireMessage,
 };
 
 pub const DEFAULT_BRAIN_PORT: u16 = crate::config::constants::DEFAULT_BRAIN_TLS_PORT;
 const ATTACHMENT_IDENTITIES_VERSION: u32 = 1;
+
+/// Dynamic node information returned only after Brain-scoped authentication.
+/// The audience fields prevent a client from accepting capabilities obtained
+/// through a different Brain or environment generation on the same node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteBrainCapabilities {
+    pub schema_version: u32,
+    pub brain_id: BrainId,
+    pub brain: String,
+    pub environment: BrainEnvironment,
+    /// Hex-encoded Ed25519 node identity used to sign invitations.
+    pub node_public_key: String,
+    pub node: crate::node::NodeCapabilities,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct AttachmentIdentityRecord {
@@ -214,6 +228,10 @@ impl RemoteBrainTarget {
 
     fn attachments_url(&self) -> String {
         format!("{}/attachments", self.http_url())
+    }
+
+    fn capabilities_url(&self) -> String {
+        format!("{}/capabilities", self.http_url())
     }
 
     fn credentials_url(&self) -> String {
@@ -626,6 +644,38 @@ impl RemoteBrainClient {
             .context("invalid brain snapshot")
     }
 
+    /// Retrieve live node/model availability after authenticating to the exact
+    /// Brain audience named by this client's scoped credential.
+    pub async fn capabilities(&self) -> Result<RemoteBrainCapabilities> {
+        let credential = self
+            .credential
+            .lock()
+            .await
+            .clone()
+            .context("client has not bootstrapped a scoped Brain credential")?;
+        if credential.claims.expires_ms <= unix_epoch_millis() {
+            anyhow::bail!("scoped Brain credential expired; reconnect the attachment");
+        }
+        let capabilities = self
+            .http
+            .get(self.target.capabilities_url())
+            .bearer_auth(&credential.token)
+            .send()
+            .await
+            .context("could not reach Brain capability endpoint")?
+            .error_for_status()
+            .context("Brain capability query rejected")?
+            .json::<RemoteBrainCapabilities>()
+            .await
+            .context("invalid Brain capability response")?;
+        validate_remote_capabilities(
+            &capabilities,
+            &credential.claims,
+            self.invited_node_public_key(),
+        )?;
+        Ok(capabilities)
+    }
+
     pub async fn push(&self, kind: BrainEventKind) -> Result<()> {
         use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
@@ -1031,6 +1081,37 @@ impl RemoteBrainClient {
     }
 }
 
+fn validate_remote_capabilities(
+    capabilities: &RemoteBrainCapabilities,
+    claims: &super::credential::BrainCredentialClaims,
+    invited_node_public_key: Option<[u8; 32]>,
+) -> Result<()> {
+    anyhow::ensure!(
+        capabilities.schema_version == 1,
+        "unsupported Brain capability schema version {}",
+        capabilities.schema_version
+    );
+    anyhow::ensure!(
+        capabilities.brain_id == claims.brain_id
+            && capabilities.brain == claims.brain
+            && capabilities.environment.generation == claims.environment_generation,
+        "Brain capability response has the wrong credential audience"
+    );
+    let node_public_key: [u8; 32] = hex::decode(&capabilities.node_public_key)
+        .context("Brain capability response contains an invalid node identity")?
+        .try_into()
+        .map_err(|_| {
+            anyhow::anyhow!("Brain capability response contains an invalid node identity")
+        })?;
+    if let Some(expected) = invited_node_public_key {
+        anyhow::ensure!(
+            node_public_key == expected,
+            "Brain capability response came from a different invited node identity"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 enum AttachedBrainTransport {
     Local(crate::ipc::IpcClient),
@@ -1259,6 +1340,113 @@ mod tests {
         assert!(RemoteBrainTarget::parse("brain-only").is_err());
         assert!(RemoteBrainTarget::parse("../brain@host").is_err());
         assert!(RemoteBrainTarget::parse("brain@host/path").is_err());
+    }
+
+    fn capability_test_claims(
+        brain_id: BrainId,
+    ) -> super::super::credential::BrainCredentialClaims {
+        super::super::credential::BrainCredentialClaims {
+            version: 1,
+            credential_id: uuid::Uuid::new_v4(),
+            issuer: "fixture.local".into(),
+            subject: "alice@laptop.local".into(),
+            brain_id,
+            brain: "shared".into(),
+            environment_generation: 7,
+            role: AttachmentRole::Observer,
+            scopes: super::super::credential::default_participant_scopes(AttachmentRole::Observer),
+            attachment_id: None,
+            connection_id: None,
+            delegation_chain: Vec::new(),
+            issued_ms: 0,
+            expires_ms: u64::MAX,
+        }
+    }
+
+    fn capability_test_response(
+        brain_id: BrainId,
+        node_public_key: [u8; 32],
+    ) -> RemoteBrainCapabilities {
+        RemoteBrainCapabilities {
+            schema_version: 1,
+            brain_id,
+            brain: "shared".into(),
+            environment: BrainEnvironment {
+                machine: "fixture.local".into(),
+                workspace: "/workspace".into(),
+                generation: 7,
+            },
+            node_public_key: hex::encode(node_public_key),
+            node: crate::node::NodeCapabilities {
+                ram_gb: 16,
+                local_model: Some("fixture-model".into()),
+                has_teacher_api: true,
+                version: "test".into(),
+                os: "test".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn remote_capabilities_are_credential_audience_bound_and_node_pinned() {
+        let brain_id = BrainId(uuid::Uuid::new_v4());
+        let claims = capability_test_claims(brain_id);
+        let capabilities = capability_test_response(brain_id, [61; 32]);
+        validate_remote_capabilities(&capabilities, &claims, Some([61; 32])).unwrap();
+
+        let mut wrong_brain = capabilities.clone();
+        wrong_brain.brain_id = BrainId(uuid::Uuid::new_v4());
+        assert!(validate_remote_capabilities(&wrong_brain, &claims, Some([61; 32])).is_err());
+
+        let mut wrong_generation = capabilities.clone();
+        wrong_generation.environment.generation += 1;
+        assert!(validate_remote_capabilities(&wrong_generation, &claims, Some([61; 32])).is_err());
+        assert!(validate_remote_capabilities(&capabilities, &claims, Some([62; 32])).is_err());
+    }
+
+    #[tokio::test]
+    async fn capability_query_uses_the_scoped_credential() {
+        use axum::{http::HeaderMap, routing::get, Json, Router};
+
+        let brain_id = BrainId(uuid::Uuid::new_v4());
+        let response = capability_test_response(brain_id, [63; 32]);
+        let app = Router::new().route(
+            "/v1/brains/named/shared/capabilities",
+            get(move |headers: HeaderMap| {
+                let response = response.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer scoped-token")
+                    );
+                    Json(response)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let target = RemoteBrainTarget {
+            brain: "shared".into(),
+            machine: "fixture.local".into(),
+            address: address.to_string(),
+            secure: false,
+        };
+        let client = RemoteBrainClient::new(target, "unused").unwrap();
+        *client.credential.lock().await = Some(RemoteBrainCredential {
+            token: "scoped-token".into(),
+            claims: capability_test_claims(brain_id),
+        });
+
+        let capabilities = client.capabilities().await.unwrap();
+        assert_eq!(capabilities.brain_id, brain_id);
+        assert_eq!(
+            capabilities.node.local_model.as_deref(),
+            Some("fixture-model")
+        );
+        server.abort();
     }
 
     #[tokio::test]
