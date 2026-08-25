@@ -2199,7 +2199,7 @@ mod tests {
 
         let owner = RemoteBrainClient::new(target.clone(), "owner-secret").unwrap();
         let (invitation, claims) = owner
-            .issue_invitation(AttachmentRole::Consultant, Some(30_000))
+            .issue_invitation(AttachmentRole::Consultant, Some(60_000))
             .await
             .unwrap();
         assert_eq!(invitation, fixture.invitation);
