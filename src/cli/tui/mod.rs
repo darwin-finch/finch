@@ -367,9 +367,15 @@ fn live_message_row_budget(terminal_height: usize, reserved_rows: usize) -> usiz
 }
 
 fn input_physical_rows(lines: &[String], terminal_width: usize) -> usize {
+    input_line_physical_rows(lines, terminal_width)
+        .into_iter()
+        .sum()
+}
+
+fn input_line_physical_rows(lines: &[String], terminal_width: usize) -> Vec<usize> {
     let width = terminal_width.max(1);
     if lines.is_empty() {
-        return 1;
+        return vec![1];
     }
     lines
         .iter()
@@ -379,7 +385,7 @@ fn input_physical_rows(lines: &[String], terminal_width: usize) -> usize {
                 .max(1)
                 .div_ceil(width)
         })
-        .sum()
+        .collect()
 }
 
 /// Return a plain visible suffix small enough to fit in `columns`. This is
@@ -1051,11 +1057,10 @@ impl TuiRenderer {
             let rows_before_input = rows;
 
             // Track physical terminal rows consumed by each input line (accounts for wrapping).
-            let mut input_phys_rows: Vec<usize> = Vec::new();
+            let input_phys_rows = input_line_physical_rows(&lines, term_width);
 
             if lines.is_empty() {
                 execute!(stdout, Print(&prompt))?;
-                input_phys_rows.push(1);
             } else {
                 for (i, line) in lines.iter().enumerate() {
                     if i == 0 {
@@ -1067,18 +1072,6 @@ impl TuiRenderer {
                         execute!(stdout, Print("\r\n"))?;
                     }
 
-                    // Physical terminal rows = ceil((prefix_vis + text_vis) / term_width).
-                    // A line that exactly fills the terminal still counts as 1 physical row;
-                    // one that overflows wraps into additional rows.
-                    let prefix_vis = if i == 0 { prompt_vis_len } else { cont_vis_len };
-                    let text_vis = shadow_buffer::visible_length(line);
-                    let total_vis = prefix_vis + text_vis;
-                    let phys = if term_width > 0 {
-                        total_vis.max(1).div_ceil(term_width)
-                    } else {
-                        1
-                    };
-                    input_phys_rows.push(phys.max(1));
                 }
             }
 
@@ -1507,12 +1500,85 @@ impl TuiRenderer {
         id
     }
 
-    pub fn handle_resize(&mut self, _w: u16, _h: u16) -> Result<()> {
+    pub fn handle_resize(&mut self, w: u16, h: u16) -> Result<()> {
         // Terminal emulators reflow scrollback themselves. Clearing the entire screen
-        // here destroys visible history; invalidate only Finch's live region and let
-        // the caller redraw it using the new terminal dimensions.
+        // here destroys visible history. Re-measure the already drawn live region at
+        // its new width before the caller erases it; using the old physical-row count
+        // leaves one separator behind for every resize event.
+        if let Some((rows, cursor_row_from_top)) = self.reflowed_live_geometry(w, h) {
+            self.active_rows = rows;
+            self.cursor_row_from_top = cursor_row_from_top;
+        }
         self.live_area_dirty = true;
         Ok(())
+    }
+
+    fn reflowed_live_geometry(&self, width: u16, height: u16) -> Option<(usize, usize)> {
+        if self.active_dialog.is_some() {
+            // Dialog geometry is computed by its renderer. Keep the last known
+            // dimensions rather than guessing and risking transcript erasure.
+            return None;
+        }
+        let term_width = usize::from(width).max(1);
+        let term_height = usize::from(height);
+        let input_lines = self.input_textarea.lines().to_vec();
+        let raw_status = self
+            .status_bar
+            .get_status_without(&StatusLineType::SessionLabel);
+        let effective_status = compute_effective_status(
+            self.ghost_text.as_deref(),
+            &raw_status,
+            &input_lines.join("\n"),
+            &self.command_registry,
+        );
+        let todo_rows = self
+            .todo_list
+            .as_ref()
+            .and_then(|todo| todo.try_read().ok().map(|todo| todo.active_items().len()))
+            .unwrap_or(0);
+        let status_rows = 1
+            + effective_status
+                .lines()
+                .map(|line| shadow_buffer::physical_rows(line, term_width))
+                .sum::<usize>();
+        let input_rows = input_physical_rows(&input_lines, term_width);
+        let reserved_rows =
+            1 + input_rows + status_rows + todo_rows + self.agent_tasks.len();
+        let max_live_rows = live_message_row_budget(term_height, reserved_rows);
+        let mut rows = 0;
+        let live_messages = self.find_live_messages();
+        if !live_messages.is_empty() {
+            let mut all_lines = Vec::new();
+            for message in live_messages {
+                all_lines.extend(message.format(&self.colors).split('\n').map(str::to_owned));
+            }
+            let (visible_lines, _) =
+                live_viewport_lines(&all_lines, term_width, max_live_rows);
+            rows += visible_lines
+                .iter()
+                .map(|line| shadow_buffer::physical_rows(line.trim_end_matches('\r'), term_width))
+                .sum::<usize>();
+        }
+        rows += todo_rows + self.agent_tasks.len() + 1; // tasks + upper separator
+        let rows_before_input = rows;
+
+        let (cursor_row, cursor_col) = self.input_textarea.cursor();
+        let input_phys_rows = input_line_physical_rows(&input_lines, term_width);
+        rows += input_phys_rows.iter().sum::<usize>() + status_rows;
+        let cursor_text_width = input_lines
+            .get(cursor_row)
+            .map(|line| {
+                shadow_buffer::visible_length(&line.chars().take(cursor_col).collect::<String>())
+            })
+            .unwrap_or(0);
+        let cursor_sub_row = (2 + cursor_text_width) / term_width;
+        let cursor_phys_above = input_phys_rows[..cursor_row.min(input_phys_rows.len())]
+            .iter()
+            .sum::<usize>();
+        Some((
+            rows,
+            rows_before_input + cursor_phys_above + cursor_sub_row,
+        ))
     }
 }
 
@@ -2429,6 +2495,15 @@ mod tests {
             input_physical_rows(&["one".into(), "123456789".into()], 10),
             3
         );
+    }
+
+    #[test]
+    fn input_line_geometry_is_recomputed_after_width_shrinks() {
+        let lines = vec!["12345678".into(), "abcdef".into()];
+
+        assert_eq!(input_line_physical_rows(&lines, 10), vec![1, 1]);
+        assert_eq!(input_line_physical_rows(&lines, 5), vec![2, 2]);
+        assert_eq!(input_physical_rows(&lines, 5), 4);
     }
 
     #[test]
