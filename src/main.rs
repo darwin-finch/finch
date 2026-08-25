@@ -82,7 +82,6 @@ struct Args {
     /// Example: finch --session "battleground"
     #[arg(long = "session", short = 's')]
     session: Option<String>,
-
 }
 
 #[derive(Parser, Debug)]
@@ -603,11 +602,8 @@ mod script_tests {
     fn one_shot_wire_metrics_preserve_first_failure_and_repair_outcome() {
         let dir = tempfile::tempdir().unwrap();
         let logger = finch::metrics::MetricsLogger::new(dir.path().to_path_buf()).unwrap();
-        let mut metric = finch::metrics::WireAdherenceMetric::first_pass(
-            "xai",
-            "grok-code-fast-1",
-            "one_shot",
-        );
+        let mut metric =
+            finch::metrics::WireAdherenceMetric::first_pass("xai", "grok-code-fast-1", "one_shot");
         mark_wire_rejection(&mut metric, "Hello there!", "E-LINK-002: unknown word");
         metric.repair_attempted = true;
         finish_wire_metric(Some(&logger), &mut metric, Some("hello"), false);
@@ -1719,6 +1715,10 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     // Create server configuration
     let server_config = ServerConfig {
         bind_address: config.server.bind_address.clone(),
+        brain_bind_address: config
+            .server
+            .advertise
+            .then(|| config.server.brain_bind_address.clone()),
         max_sessions: config.server.max_sessions,
         session_timeout_minutes: config.server.session_timeout_minutes,
         auth_enabled: config.server.auth_enabled,
@@ -1766,14 +1766,15 @@ async fn run_daemon(bind_address: String) -> Result<()> {
 
         match ServiceDiscovery::new(service_config) {
             Ok(discovery) => {
-                // Extract port from bind_address
+                // Advertise the encrypted collaboration listener, never the
+                // loopback/plain daemon administration listener.
                 let port = config
                     .server
-                    .bind_address
+                    .brain_bind_address
                     .split(':')
                     .next_back()
                     .and_then(|p| p.parse::<u16>().ok())
-                    .unwrap_or(finch::config::constants::DEFAULT_DAEMON_PORT);
+                    .unwrap_or(finch::config::constants::DEFAULT_BRAIN_TLS_PORT);
 
                 match discovery.advertise(port) {
                     Ok(_) => {
@@ -2689,7 +2690,6 @@ async fn run_library_command(cmd: LibraryCommand) -> Result<()> {
                 }
             }
         }
-
     }
 
     Ok(())
@@ -3126,8 +3126,7 @@ mod tests {
 
     #[test]
     fn legacy_coforth_and_exchange_subcommands_are_not_public() {
-        assert!(Args::try_parse_from(["finch", "coforth", "run", "--code", "1 2 +"])
-            .is_err());
+        assert!(Args::try_parse_from(["finch", "coforth", "run", "--code", "1 2 +"]).is_err());
         assert!(Args::try_parse_from(["finch", "exchange", "list"]).is_err());
         assert!(Args::try_parse_from(["finch", "--peer", "peer.example:8000"]).is_err());
         assert!(Args::try_parse_from(["finch", "library", "verify"]).is_err());

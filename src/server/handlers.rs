@@ -130,6 +130,33 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         .merge(feedback_router)
 }
 
+/// The TLS listener deliberately exposes only the collaboration protocol.
+/// Daemon administration, passwords, file APIs, provider APIs, and registry
+/// endpoints remain on the loopback listener.
+pub fn create_remote_brain_router(server: Arc<AgentServer>) -> Router {
+    Router::new()
+        .route("/v1/brains/named/:name", get(get_named_brain))
+        .route(
+            "/v1/brains/named/:name/attachments",
+            post(attach_named_brain),
+        )
+        .route(
+            "/v1/brains/named/:name/credentials",
+            post(issue_named_brain_credential),
+        )
+        .route(
+            "/v1/brains/named/:name/invitations",
+            post(issue_named_brain_invitation),
+        )
+        .route(
+            "/v1/brains/invitations/redeem",
+            post(redeem_named_brain_invitation),
+        )
+        .route("/v1/brains/named/:name/ws", get(watch_named_brain))
+        .route("/health", get(health_check))
+        .with_state(server)
+}
+
 // ---------------------------------------------------------------------------
 // Brain route handlers
 // ---------------------------------------------------------------------------
@@ -223,9 +250,7 @@ const MAX_BRAIN_INVITATION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 struct IssueNamedBrainCredentialRequest {
     subject: String,
     role: crate::brain::shared::AttachmentRole,
-    scopes: Option<
-        std::collections::BTreeSet<crate::brain::credential::BrainCredentialScope>,
-    >,
+    scopes: Option<std::collections::BTreeSet<crate::brain::credential::BrainCredentialScope>>,
     ttl_ms: Option<u64>,
 }
 
@@ -238,9 +263,7 @@ struct IssueNamedBrainCredentialResponse {
 #[derive(Debug, Deserialize)]
 struct IssueNamedBrainInvitationRequest {
     role: crate::brain::shared::AttachmentRole,
-    scopes: Option<
-        std::collections::BTreeSet<crate::brain::credential::BrainCredentialScope>,
-    >,
+    scopes: Option<std::collections::BTreeSet<crate::brain::credential::BrainCredentialScope>>,
     ttl_ms: Option<u64>,
 }
 
@@ -685,8 +708,7 @@ fn attachment_can_submit(
         ),
         AttachmentRole::Consultant => matches!(
             kind,
-            BrainEventKind::ParticipantMessage { .. }
-                | BrainEventKind::ApprovalDecided { .. }
+            BrainEventKind::ParticipantMessage { .. } | BrainEventKind::ApprovalDecided { .. }
         ),
         AttachmentRole::Observer | AttachmentRole::Runner => false,
     }
@@ -760,17 +782,14 @@ pub(crate) async fn submit_named_brain_event(
         } else {
             crate::brain::shared::BrainRunStatus::QueuedForEnvironment
         };
-        Some(
-            store
-                .start_run(
-                    name,
-                    &attachment.subject,
-                    crate::brain::shared::BrainRunKind::Interactive,
-                    accepted.seq,
-                    attachment.attachment_id,
-                    status,
-                )?,
-        )
+        Some(store.start_run(
+            name,
+            &attachment.subject,
+            crate::brain::shared::BrainRunKind::Interactive,
+            accepted.seq,
+            attachment.attachment_id,
+            status,
+        )?)
     } else {
         None
     };
@@ -900,8 +919,8 @@ async fn dispatch_named_brain_run(
                     .await
                 }
                 None => Err(anyhow::anyhow!(
-                        "Brain run {} initiating attachment is missing",
-                        run.run_id.0
+                    "Brain run {} initiating attachment is missing",
+                    run.run_id.0
                 )),
             }
         }
@@ -913,13 +932,7 @@ async fn dispatch_named_brain_run(
 
     match execution {
         Ok(result) => {
-            store.transition_run(
-                name,
-                "daemon",
-                run.run_id,
-                BrainRunStatus::Completed,
-                None,
-            )?;
+            store.transition_run(name, "daemon", run.run_id, BrainRunStatus::Completed, None)?;
             Ok(Some(result))
         }
         Err(error) => {
@@ -978,13 +991,8 @@ pub(crate) async fn resume_queued_named_brain_runs(
         if !lease_is_current || !runners.has_registration(&name, lease_id) {
             break;
         }
-        let running = store.transition_run(
-            &name,
-            "daemon",
-            run.run_id,
-            BrainRunStatus::Running,
-            None,
-        )?;
+        let running =
+            store.transition_run(&name, "daemon", run.run_id, BrainRunStatus::Running, None)?;
         dispatch_named_brain_run(&store, &runners, &name, &running).await?;
         resumed += 1;
     }
@@ -1233,7 +1241,10 @@ fn persist_named_brain_effect_journal(
                 execution_id,
                 effect,
                 state,
-            } => Some(((execution_id, effect.sequence), (request_seq, effect, state))),
+            } => Some((
+                (execution_id, effect.sequence),
+                (request_seq, effect, state),
+            )),
             _ => None,
         })
         .collect::<std::collections::HashMap<_, _>>();
@@ -1609,9 +1620,7 @@ async fn execute_remote_brain_command(
             };
             let attachment = match lifecycle.connection(name, attachment_id, connection_id) {
                 Ok(attachment) => attachment,
-                Err(error) => {
-                    return remote_brain_error(request_id, "conflict", error.to_string())
-                }
+                Err(error) => return remote_brain_error(request_id, "conflict", error.to_string()),
             };
             if claims_match_attachment(&claims, &attachment).is_err() {
                 return remote_brain_error(
@@ -1641,26 +1650,21 @@ async fn execute_remote_brain_command(
             }
         }
         BrainRemoteCommandKind::Acknowledge(seq) => {
-            let claims = match authorize_named_brain(
-                server,
-                headers,
-                name,
-                BrainCredentialScope::BrainRead,
-            ) {
-                Ok(claims) => claims,
-                Err(_) => {
-                    return remote_brain_error(
-                        request_id,
-                        "forbidden",
-                        "Brain credential no longer authorizes acknowledgement",
-                    );
-                }
-            };
+            let claims =
+                match authorize_named_brain(server, headers, name, BrainCredentialScope::BrainRead)
+                {
+                    Ok(claims) => claims,
+                    Err(_) => {
+                        return remote_brain_error(
+                            request_id,
+                            "forbidden",
+                            "Brain credential no longer authorizes acknowledgement",
+                        );
+                    }
+                };
             let attachment = match lifecycle.connection(name, attachment_id, connection_id) {
                 Ok(attachment) => attachment,
-                Err(error) => {
-                    return remote_brain_error(request_id, "conflict", error.to_string())
-                }
+                Err(error) => return remote_brain_error(request_id, "conflict", error.to_string()),
             };
             if claims_match_attachment(&claims, &attachment).is_err() {
                 return remote_brain_error(
@@ -1695,9 +1699,7 @@ async fn execute_remote_brain_command(
             };
             let attachment = match lifecycle.connection(name, attachment_id, connection_id) {
                 Ok(attachment) => attachment,
-                Err(error) => {
-                    return remote_brain_error(request_id, "conflict", error.to_string())
-                }
+                Err(error) => return remote_brain_error(request_id, "conflict", error.to_string()),
             };
             if claims_match_attachment(&claims, &attachment).is_err() {
                 return remote_brain_error(
@@ -1734,9 +1736,7 @@ async fn execute_remote_brain_command(
             };
             let attachment = match lifecycle.connection(name, attachment_id, connection_id) {
                 Ok(attachment) => attachment,
-                Err(error) => {
-                    return remote_brain_error(request_id, "conflict", error.to_string())
-                }
+                Err(error) => return remote_brain_error(request_id, "conflict", error.to_string()),
             };
             if claims_match_attachment(&claims, &attachment).is_err() {
                 return remote_brain_error(
@@ -1756,9 +1756,7 @@ async fn execute_remote_brain_command(
                         "runner handoff environment generation is no longer current",
                     )
                 }
-                Err(error) => {
-                    return remote_brain_error(request_id, "conflict", error.to_string())
-                }
+                Err(error) => return remote_brain_error(request_id, "conflict", error.to_string()),
             };
             match lifecycle.request_runner_handoff(
                 name,
@@ -1793,9 +1791,7 @@ async fn execute_remote_brain_command(
             };
             let attachment = match lifecycle.connection(name, attachment_id, connection_id) {
                 Ok(attachment) => attachment,
-                Err(error) => {
-                    return remote_brain_error(request_id, "conflict", error.to_string())
-                }
+                Err(error) => return remote_brain_error(request_id, "conflict", error.to_string()),
             };
             if claims_match_attachment(&claims, &attachment).is_err() {
                 return remote_brain_error(
@@ -1827,9 +1823,7 @@ async fn execute_remote_brain_command(
             };
             let attachment = match lifecycle.connection(name, attachment_id, connection_id) {
                 Ok(attachment) => attachment,
-                Err(error) => {
-                    return remote_brain_error(request_id, "conflict", error.to_string())
-                }
+                Err(error) => return remote_brain_error(request_id, "conflict", error.to_string()),
             };
             if claims_match_attachment(&claims, &attachment).is_err() {
                 return remote_brain_error(
@@ -3179,8 +3173,10 @@ mod named_brain_provider_context_tests {
         assert!(consultant.contains(&BrainCredentialScope::BrainSubmit));
         assert!(!consultant.contains(&BrainCredentialScope::BrainApprove));
         assert!(!consultant.contains(&BrainCredentialScope::BrainControl));
-        assert!(crate::brain::credential::permitted_participant_scopes(AttachmentRole::Consultant)
-            .contains(&BrainCredentialScope::BrainApprove));
+        assert!(
+            crate::brain::credential::permitted_participant_scopes(AttachmentRole::Consultant)
+                .contains(&BrainCredentialScope::BrainApprove)
+        );
 
         let observer =
             crate::brain::credential::default_participant_scopes(AttachmentRole::Observer);
@@ -3568,7 +3564,9 @@ mod named_brain_provider_context_tests {
             .push(
                 "shared",
                 "alice@box.local",
-                BrainEventKind::Prompt { text: "search".into() },
+                BrainEventKind::Prompt {
+                    text: "search".into(),
+                },
             )
             .unwrap()
             .seq;
@@ -3904,15 +3902,20 @@ mod named_brain_provider_context_tests {
             "box.local",
             Some(temp.path().into()),
         );
-        assert!(restarted.snapshot("shared").unwrap().events.iter().any(|event| {
-            matches!(
-                &event.kind,
-                BrainEventKind::EffectRecorded { execution_id, effect, state, .. }
-                    if *execution_id == expected_effect.execution_id
-                        && effect == &expected_effect.entry.effect
-                        && state == &expected_effect.entry.state
-            )
-        }));
+        assert!(restarted
+            .snapshot("shared")
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| {
+                matches!(
+                    &event.kind,
+                    BrainEventKind::EffectRecorded { execution_id, effect, state, .. }
+                        if *execution_id == expected_effect.execution_id
+                            && effect == &expected_effect.entry.effect
+                            && state == &expected_effect.entry.state
+                )
+            }));
     }
 
     #[tokio::test]
@@ -4207,15 +4210,20 @@ mod named_brain_provider_context_tests {
             "box.local",
             Some(temp.path().into()),
         );
-        assert!(restarted.snapshot("shared").unwrap().events.iter().any(|event| {
-            matches!(
-                &event.kind,
-                BrainEventKind::EffectRecorded { execution_id, effect, state, .. }
-                    if *execution_id == expected_effect.execution_id
-                        && effect == &expected_effect.entry.effect
-                        && state == &expected_effect.entry.state
-            )
-        }));
+        assert!(restarted
+            .snapshot("shared")
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| {
+                matches!(
+                    &event.kind,
+                    BrainEventKind::EffectRecorded { execution_id, effect, state, .. }
+                        if *execution_id == expected_effect.execution_id
+                            && effect == &expected_effect.entry.effect
+                            && state == &expected_effect.entry.state
+                )
+            }));
     }
 
     #[tokio::test]
@@ -4266,13 +4274,7 @@ mod named_brain_provider_context_tests {
             )
             .unwrap();
         let replacement = store
-            .accept_runner_handoff(
-                "shared",
-                "runner-b",
-                handoff.handoff_id,
-                generation,
-                60_000,
-            )
+            .accept_runner_handoff("shared", "runner-b", handoff.handoff_id, generation, 60_000)
             .unwrap();
 
         let error = dispatch_named_brain_program(
@@ -4475,9 +4477,12 @@ mod named_brain_provider_context_tests {
             store.snapshot("shared").unwrap().runs[0].status,
             crate::brain::shared::BrainRunStatus::QueuedForEnvironment
         );
-        assert!(!store.snapshot("shared").unwrap().events.iter().any(|event| {
-            matches!(event.kind, BrainEventKind::Result { .. })
-        }));
+        assert!(!store
+            .snapshot("shared")
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| { matches!(event.kind, BrainEventKind::Result { .. }) }));
     }
 
     #[tokio::test]
@@ -4547,25 +4552,27 @@ mod named_brain_provider_context_tests {
                 && error.as_deref() == Some("frontend execution failed")
         ));
         let failed = &store.snapshot("shared").unwrap().runs[0];
-        assert_eq!(
-            failed.status,
-            crate::brain::shared::BrainRunStatus::Failed
-        );
+        assert_eq!(failed.status, crate::brain::shared::BrainRunStatus::Failed);
         assert_eq!(failed.detail.as_deref(), Some("frontend execution failed"));
-        assert!(store.snapshot("shared").unwrap().events.iter().any(|event| {
-            matches!(
-                &event.kind,
-                BrainEventKind::EffectRecorded {
-                    request_seq,
-                    execution_id,
-                    effect,
-                    state,
-                } if *request_seq == request.seq
-                    && *execution_id == expected_effect.execution_id
-                    && effect == &expected_effect.entry.effect
-                    && state == &expected_effect.entry.state
-            )
-        }));
+        assert!(store
+            .snapshot("shared")
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| {
+                matches!(
+                    &event.kind,
+                    BrainEventKind::EffectRecorded {
+                        request_seq,
+                        execution_id,
+                        effect,
+                        state,
+                    } if *request_seq == request.seq
+                        && *execution_id == expected_effect.execution_id
+                        && effect == &expected_effect.entry.effect
+                        && state == &expected_effect.entry.state
+                )
+            }));
     }
 
     #[tokio::test]
@@ -4636,12 +4643,7 @@ mod named_brain_provider_context_tests {
         let runners = crate::server::BrainRunnerBroker::default();
         let approvals = crate::server::BrainApprovalBroker::default();
         let consultant = store
-            .attach(
-                "shared",
-                "bob@box.local",
-                AttachmentRole::Consultant,
-                None,
-            )
+            .attach("shared", "bob@box.local", AttachmentRole::Consultant, None)
             .unwrap();
 
         let outcome = submit_named_brain_event(

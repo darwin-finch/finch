@@ -291,6 +291,10 @@ impl BrainCredentialAuthority {
         self.invitation_signer.public_key_bytes()
     }
 
+    pub(crate) fn invitation_signer(&self) -> &crate::node::identity::NodeSigningIdentity {
+        &self.invitation_signer
+    }
+
     /// Load the daemon credential authority from a private state directory.
     /// The signing key is generated once and survives daemon restarts.
     pub fn load_or_create(state_directory: &Path) -> Result<Self> {

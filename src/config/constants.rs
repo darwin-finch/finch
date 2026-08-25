@@ -12,6 +12,10 @@ pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:11435";
 /// Default daemon port number (split from ADDR for contexts that need just the port).
 pub const DEFAULT_DAEMON_PORT: u16 = 11435;
 
+/// TLS-only listener for remote named-Brain collaboration.
+pub const DEFAULT_BRAIN_TLS_ADDR: &str = "0.0.0.0:11436";
+pub const DEFAULT_BRAIN_TLS_PORT: u16 = 11436;
+
 /// Default maximum tokens for teacher API requests.
 pub const DEFAULT_MAX_TOKENS: u32 = 8000;
 

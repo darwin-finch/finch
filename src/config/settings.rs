@@ -162,6 +162,9 @@ pub struct ServerConfig {
     pub enabled: bool,
     /// Bind address (e.g., "127.0.0.1:8000")
     pub bind_address: String,
+    /// TLS-only remote Brain listener. It is opened only when service
+    /// advertisement (and therefore LAN collaboration) is enabled.
+    pub brain_bind_address: String,
     /// Maximum number of concurrent sessions
     pub max_sessions: usize,
     /// Session timeout in minutes
@@ -205,6 +208,7 @@ impl Default for ServerConfig {
         Self {
             enabled: false,
             bind_address: crate::config::constants::DEFAULT_HTTP_ADDR.to_string(),
+            brain_bind_address: crate::config::constants::DEFAULT_BRAIN_TLS_ADDR.to_string(),
             max_sessions: 100,
             session_timeout_minutes: 30,
             auth_enabled: false,
@@ -553,6 +557,17 @@ impl Config {
                  • 127.0.0.1:8000\n  \
                  • 0.0.0.0:11435\n  \
                  • localhost:8080"
+            ));
+        }
+
+        if self.server.advertise && !self.server.brain_bind_address.contains(':') {
+            anyhow::bail!(errors::wrap_error_with_suggestion(
+                format!(
+                    "Invalid Brain TLS bind address: '{}'",
+                    self.server.brain_bind_address
+                ),
+                "Brain TLS bind address should be in IP:PORT form\n\
+                 Example: 0.0.0.0:11436"
             ));
         }
 

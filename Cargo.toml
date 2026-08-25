@@ -32,6 +32,7 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "str
 
 # HTTP server + WebSocket (session transport)
 axum = { version = "0.7", features = ["ws"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }

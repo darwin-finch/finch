@@ -2,8 +2,8 @@
 // HTTP daemon mode for multi-tenant agent serving
 
 mod brain_approval;
-mod brain_service;
 mod brain_runner;
+mod brain_service;
 mod feedback_handler;
 pub mod handlers;
 mod middleware;
@@ -14,13 +14,13 @@ pub mod session_registry;
 mod training_worker;
 
 pub use brain_approval::BrainApprovalBroker;
+pub use brain_runner::{
+    BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerEffectRecord,
+    RunnerProgramError, RunnerProgramRequest, RunnerProgramResult, RunnerRegistrationId,
+    RunnerRequest, RunnerTurnError, RunnerTurnEvent, RunnerTurnRequest, RunnerTurnResult,
+};
 pub use brain_service::{
     BrainLifecycleService, BrainSubmissionError, BrainSubmissionOutcome, BrainWatch,
-};
-pub use brain_runner::{
-    BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerProgramRequest,
-    RunnerEffectRecord, RunnerProgramError, RunnerProgramResult, RunnerRegistrationId,
-    RunnerRequest, RunnerTurnError, RunnerTurnEvent, RunnerTurnRequest, RunnerTurnResult,
 };
 pub use feedback_handler::{handle_feedback, handle_training_status};
 pub use handlers::{
@@ -56,6 +56,8 @@ struct ProviderSlot {
 pub struct ServerConfig {
     /// Bind address (e.g., "127.0.0.1:8000")
     pub bind_address: String,
+    /// Optional TLS-only listener for remote named-Brain collaboration.
+    pub brain_bind_address: Option<String>,
     /// Maximum number of concurrent sessions
     pub max_sessions: usize,
     /// Session timeout in minutes
@@ -72,6 +74,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_address: crate::config::constants::DEFAULT_HTTP_ADDR.to_string(),
+            brain_bind_address: None,
             max_sessions: 100,
             session_timeout_minutes: 30,
             auth_enabled: false,
@@ -331,21 +334,46 @@ impl AgentServer {
 
         // Build router with a body size limit to guard against oversized foreign payloads.
         // 4MB is generous for natural-language queries while blocking obvious DoS attempts.
-        let app = create_router(app_state)
+        let app = create_router(Arc::clone(&app_state))
             .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)) // 4MB
             .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
             .layer(TraceLayer::new_for_http());
 
-        tracing::info!("Starting Shammah agent server on {}", addr);
+        tracing::info!("Starting Finch agent server on {}", addr);
 
         // Start server — ConnectInfo requires into_make_service_with_connect_info
         // so handlers can read the peer's IP for auth logging.
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(
+        let local_server = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await?;
+        );
+
+        if let Some(brain_bind_address) = &app_state.config.brain_bind_address {
+            let brain_addr: SocketAddr = brain_bind_address.parse()?;
+            let hostname = hostname_or_default();
+            let tls_identity = crate::node::tls::NodeTlsIdentity::from_signing_identity(
+                app_state.brain_credentials.invitation_signer(),
+                &hostname,
+            )?;
+            let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
+                vec![tls_identity.certificate_der().to_vec()],
+                tls_identity.private_key_der().to_vec(),
+            )
+            .await?;
+            let brain_app = crate::server::handlers::create_remote_brain_router(app_state)
+                .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
+                .layer(TraceLayer::new_for_http());
+            tracing::info!("Starting encrypted Brain listener on {}", brain_addr);
+            let remote_server = axum_server::bind_rustls(brain_addr, tls_config)
+                .serve(brain_app.into_make_service_with_connect_info::<std::net::SocketAddr>());
+            tokio::select! {
+                result = local_server => result?,
+                result = remote_server => result?,
+            }
+        } else {
+            local_server.await?;
+        }
 
         Ok(())
     }
