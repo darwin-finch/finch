@@ -674,6 +674,8 @@ struct PushNamedBrainEvent {
 struct PushNamedBrainResponse {
     accepted: crate::brain::shared::BrainEvent,
     #[serde(skip_serializing_if = "Option::is_none")]
+    run: Option<crate::brain::shared::BrainRun>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<crate::brain::shared::BrainEvent>,
 }
 
@@ -760,6 +762,7 @@ async fn push_named_brain_event(
         .map_err(brain_state_conflict)?;
         return Ok(Json(PushNamedBrainResponse {
             accepted,
+            run: None,
             result: None,
         }));
     }
@@ -776,47 +779,240 @@ async fn push_named_brain_event(
         .push(&name, &attachment.subject, request.kind.clone())
         .map_err(|error| AppError(error).into_response())?;
 
-    let result = match request.kind {
-        BrainEventKind::Program { language, source } => {
-            let execution =
-                execute_named_brain_program(&server, &name, accepted.seq, language, &source).await;
-            Some(push_named_brain_result(
-                server.shared_brains(),
-                &name,
-                accepted.seq,
-                execution,
-            ))
-        }
-        BrainEventKind::Prompt { text } => {
-            let execution =
-                execute_named_brain_prompt(&server, &name, accepted.seq, &text, &attachment).await;
-            Some(match execution {
-                Ok(result) => Ok(result),
-                Err(error) => {
-                    push_named_brain_result(server.shared_brains(), &name, accepted.seq, Err(error))
-                }
-            })
-        }
-        BrainEventKind::ProgramPopped { .. }
-        | BrainEventKind::ToolCall { .. }
-        | BrainEventKind::ToolResult { .. }
-        | BrainEventKind::ApprovalRequested { .. }
-        | BrainEventKind::ApprovalDecided { .. }
-        | BrainEventKind::Result { .. }
-        | BrainEventKind::RuntimeCommitted { .. }
-        | BrainEventKind::RunnerLeaseAcquired { .. }
-        | BrainEventKind::RunnerLeaseReleased { .. }
-        | BrainEventKind::ClientAttached { .. }
-        | BrainEventKind::ClientDetached { .. }
-        | BrainEventKind::RunStarted { .. }
-        | BrainEventKind::RunStatusChanged { .. } => None,
+    let run = if matches!(
+        request.kind,
+        BrainEventKind::Program { .. } | BrainEventKind::Prompt { .. }
+    ) {
+        let status = if named_brain_runner_is_ready(
+            server.shared_brains(),
+            server.brain_runners(),
+            &name,
+        )
+        .map_err(|error| AppError(error).into_response())?
+        {
+            crate::brain::shared::BrainRunStatus::Running
+        } else {
+            crate::brain::shared::BrainRunStatus::QueuedForEnvironment
+        };
+        Some(
+            server
+                .shared_brains()
+                .start_run(
+                    &name,
+                    &attachment.subject,
+                    crate::brain::shared::BrainRunKind::Interactive,
+                    accepted.seq,
+                    attachment.attachment_id,
+                    status,
+                )
+                .map_err(|error| AppError(error).into_response())?,
+        )
+    } else {
+        None
+    };
+
+    let result = match run.as_ref() {
+        Some(run) if run.status == crate::brain::shared::BrainRunStatus::Running => Some(
+            dispatch_named_brain_run(server.shared_brains(), server.brain_runners(), &name, run)
+                .await,
+        ),
+        Some(_) => None,
+        None => match request.kind {
+            BrainEventKind::ProgramPopped { .. }
+            | BrainEventKind::ToolCall { .. }
+            | BrainEventKind::ToolResult { .. }
+            | BrainEventKind::ApprovalRequested { .. }
+            | BrainEventKind::ApprovalDecided { .. }
+            | BrainEventKind::Result { .. }
+            | BrainEventKind::RuntimeCommitted { .. }
+            | BrainEventKind::RunnerLeaseAcquired { .. }
+            | BrainEventKind::RunnerLeaseReleased { .. }
+            | BrainEventKind::ClientAttached { .. }
+            | BrainEventKind::ClientDetached { .. }
+            | BrainEventKind::RunStarted { .. }
+            | BrainEventKind::RunStatusChanged { .. } => None,
+            BrainEventKind::Program { .. } | BrainEventKind::Prompt { .. } => {
+                unreachable!("executable requests create a BrainRun")
+            }
+        },
     };
     let result = match result {
-        Some(result) => Some(result.map_err(|error| AppError(error).into_response())?),
+        Some(result) => result.map_err(|error| AppError(error).into_response())?,
         None => None,
     };
 
-    Ok(Json(PushNamedBrainResponse { accepted, result }))
+    Ok(Json(PushNamedBrainResponse {
+        accepted,
+        run,
+        result,
+    }))
+}
+
+fn named_brain_runner_is_ready(
+    store: &crate::brain::shared::SharedBrainStore,
+    runners: &crate::server::BrainRunnerBroker,
+    name: &str,
+) -> anyhow::Result<bool> {
+    let snapshot = store.snapshot(name)?;
+    ensure_named_brain_store_environment(store, &snapshot)?;
+    Ok(snapshot.runner_lease.as_ref().is_some_and(|lease| {
+        lease.environment_generation == snapshot.environment.generation
+            && lease.expires_ms > crate::brain::shared::unix_millis()
+            && runners.has_registration(name, lease.lease_id)
+    }))
+}
+
+async fn dispatch_named_brain_run(
+    store: &crate::brain::shared::SharedBrainStore,
+    runners: &crate::server::BrainRunnerBroker,
+    name: &str,
+    run: &crate::brain::shared::BrainRun,
+) -> anyhow::Result<Option<crate::brain::shared::BrainEvent>> {
+    use crate::brain::shared::{BrainEventKind, BrainRunStatus};
+
+    let snapshot = store.snapshot(name)?;
+    let request = match snapshot
+        .events
+        .iter()
+        .find(|event| event.seq == run.request_seq)
+        .cloned()
+    {
+        Some(request) => request,
+        None => {
+            let detail = format!("Brain run {} request event is missing", run.run_id.0);
+            let result = push_named_brain_result(
+                store,
+                name,
+                run.request_seq,
+                Err(anyhow::anyhow!(detail.clone())),
+            )?;
+            store.transition_run(
+                name,
+                "daemon",
+                run.run_id,
+                BrainRunStatus::Failed,
+                Some(detail),
+            )?;
+            return Ok(Some(result));
+        }
+    };
+    let execution = match request.kind {
+        BrainEventKind::Program { language, source } => {
+            match dispatch_named_brain_program(
+                store,
+                runners,
+                name,
+                request.seq,
+                language,
+                &source,
+            )
+            .await
+            {
+                Ok(output) => push_named_brain_result(store, name, request.seq, Ok(output)),
+                Err(error) => Err(error),
+            }
+        }
+        BrainEventKind::Prompt { text } => {
+            match snapshot
+                .attachments
+                .iter()
+                .find(|attachment| attachment.attachment_id == run.initiating_attachment_id)
+            {
+                Some(requester) => {
+                    dispatch_named_brain_turn(
+                        store,
+                        runners,
+                        name,
+                        request.seq,
+                        &text,
+                        requester,
+                    )
+                    .await
+                }
+                None => Err(anyhow::anyhow!(
+                        "Brain run {} initiating attachment is missing",
+                        run.run_id.0
+                )),
+            }
+        }
+        _ => Err(anyhow::anyhow!(
+            "Brain run {} request event is not executable",
+            run.run_id.0
+        )),
+    };
+
+    match execution {
+        Ok(result) => {
+            store.transition_run(
+                name,
+                "daemon",
+                run.run_id,
+                BrainRunStatus::Completed,
+                None,
+            )?;
+            Ok(Some(result))
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            let result = push_named_brain_result(
+                store,
+                name,
+                request.seq,
+                Err(anyhow::anyhow!(detail.clone())),
+            )?;
+            store.transition_run(
+                name,
+                "daemon",
+                run.run_id,
+                BrainRunStatus::Failed,
+                Some(detail),
+            )?;
+            Ok(Some(result))
+        }
+    }
+}
+
+/// Drain durable work that arrived while the environment runner was absent.
+/// The exact lease that registered the callback must still be current before
+/// each run begins; work that has not begun remains queued on disconnect.
+pub(crate) async fn resume_queued_named_brain_runs(
+    store: crate::brain::shared::SharedBrainStore,
+    runners: crate::server::BrainRunnerBroker,
+    name: String,
+    lease_id: crate::brain::shared::RunnerLeaseId,
+) -> anyhow::Result<usize> {
+    use crate::brain::shared::BrainRunStatus;
+
+    let execution_lock = store.execution_lock(&name)?;
+    let _turn = execution_lock.lock_owned().await;
+    let queued = store
+        .snapshot(&name)?
+        .runs
+        .into_iter()
+        .filter(|run| run.status == BrainRunStatus::QueuedForEnvironment)
+        .collect::<Vec<_>>();
+    let mut resumed = 0;
+    for run in queued {
+        let snapshot = store.snapshot(&name)?;
+        let lease_is_current = snapshot.runner_lease.as_ref().is_some_and(|lease| {
+            lease.lease_id == lease_id
+                && lease.environment_generation == snapshot.environment.generation
+                && lease.expires_ms > crate::brain::shared::unix_millis()
+        });
+        if !lease_is_current || !runners.has_registration(&name, lease_id) {
+            break;
+        }
+        let running = store.transition_run(
+            &name,
+            "daemon",
+            run.run_id,
+            BrainRunStatus::Running,
+            None,
+        )?;
+        dispatch_named_brain_run(&store, &runners, &name, &running).await?;
+        resumed += 1;
+    }
+    Ok(resumed)
 }
 
 fn commit_named_brain_approval_decision(
@@ -883,24 +1079,6 @@ fn push_named_brain_result(
     )
 }
 
-async fn execute_named_brain_program(
-    server: &AgentServer,
-    name: &str,
-    request_seq: u64,
-    language: crate::brain::shared::ProgramLanguage,
-    source: &str,
-) -> anyhow::Result<String> {
-    dispatch_named_brain_program(
-        server.shared_brains(),
-        server.brain_runners(),
-        name,
-        request_seq,
-        language,
-        source,
-    )
-    .await
-}
-
 async fn dispatch_named_brain_program(
     store: &crate::brain::shared::SharedBrainStore,
     runners: &crate::server::BrainRunnerBroker,
@@ -930,24 +1108,6 @@ async fn dispatch_named_brain_program(
         outcome.checkpoint,
     )?;
     Ok(outcome.output)
-}
-
-async fn execute_named_brain_prompt(
-    server: &AgentServer,
-    name: &str,
-    request_seq: u64,
-    prompt: &str,
-    requester: &crate::brain::shared::BrainAttachment,
-) -> anyhow::Result<crate::brain::shared::BrainEvent> {
-    dispatch_named_brain_turn(
-        server.shared_brains(),
-        server.brain_runners(),
-        name,
-        request_seq,
-        prompt,
-        requester,
-    )
-    .await
 }
 
 async fn dispatch_named_brain_turn(
@@ -3418,5 +3578,263 @@ mod named_brain_provider_context_tests {
             .events
             .iter()
             .any(|event| { matches!(event.kind, BrainEventKind::RuntimeCommitted { .. }) }));
+    }
+
+    #[tokio::test]
+    async fn queued_brain_run_resumes_on_runner_registration_and_survives_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::shared::SharedBrainStore::with_root(
+            "box.local",
+            Some(temp.path().into()),
+        );
+        let pending = store
+            .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
+            .unwrap();
+        let attachment = store
+            .activate_connection(
+                "shared",
+                pending.attachment_id,
+                pending.connection_id.unwrap(),
+            )
+            .unwrap();
+        let request = store
+            .push(
+                "shared",
+                &attachment.subject,
+                BrainEventKind::Program {
+                    language: ProgramLanguage::Lisp,
+                    source: "(define (double (n : int)) : int (* n 2))".into(),
+                },
+            )
+            .unwrap();
+        let run = store
+            .start_run(
+                "shared",
+                &attachment.subject,
+                crate::brain::shared::BrainRunKind::Interactive,
+                request.seq,
+                attachment.attachment_id,
+                crate::brain::shared::BrainRunStatus::QueuedForEnvironment,
+            )
+            .unwrap();
+        drop(store);
+        let store = crate::brain::shared::SharedBrainStore::with_root(
+            "box.local",
+            Some(temp.path().into()),
+        );
+        assert_eq!(
+            store.snapshot("shared").unwrap().runs[0].status,
+            crate::brain::shared::BrainRunStatus::QueuedForEnvironment
+        );
+        let lease = store
+            .acquire_runner_lease(
+                "shared",
+                "runner@box.local",
+                store.environment().generation,
+                None,
+                60_000,
+            )
+            .unwrap();
+        let runners = crate::server::BrainRunnerBroker::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, tx);
+        tokio::spawn(async move {
+            let crate::server::RunnerRequest::Program(request) = rx.recv().await.unwrap() else {
+                panic!("expected queued program request")
+            };
+            let runtime = crate::runtime::ProgramRuntime::new();
+            let outcome = runtime
+                .submit_typed_only(crate::runtime::ProgramSubmission {
+                    language: crate::programs::ProgramLanguage::Lisp,
+                    source_id: Some("queued-run-test".into()),
+                    source: request.source,
+                    intent: "resume queued Brain run".into(),
+                    effect: crate::programs::ExecutionEffect::Pure,
+                    declared_capabilities: Vec::new(),
+                    manifest_generation: runtime.manifest_generation(),
+                    expected_revision: Some(runtime.revision()),
+                    budget: None,
+                })
+                .await
+                .unwrap();
+            let checkpoint = runtime
+                .revision_history()
+                .unwrap()
+                .into_iter()
+                .find(|snapshot| snapshot.revision == outcome.output_revision)
+                .and_then(|snapshot| snapshot.checkpoint)
+                .unwrap();
+            request
+                .response_tx
+                .send(Ok(crate::server::RunnerProgramResult {
+                    output: "definition committed".into(),
+                    runtime_revision: outcome.output_revision,
+                    checkpoint,
+                }))
+                .unwrap();
+        });
+
+        assert_eq!(
+            resume_queued_named_brain_runs(
+                store.clone(),
+                runners,
+                "shared".into(),
+                lease.lease_id,
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let snapshot = store.snapshot("shared").unwrap();
+        assert_eq!(snapshot.runs[0].run_id, run.run_id);
+        assert_eq!(
+            snapshot.runs[0].status,
+            crate::brain::shared::BrainRunStatus::Completed
+        );
+        assert!(snapshot.events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                BrainEventKind::Result {
+                    request_seq,
+                    output,
+                    error: None,
+                } if *request_seq == request.seq && output == "definition committed"
+            )
+        }));
+
+        drop(store);
+        let restarted = crate::brain::shared::SharedBrainStore::with_root(
+            "box.local",
+            Some(temp.path().into()),
+        );
+        assert_eq!(
+            restarted.snapshot("shared").unwrap().runs[0].status,
+            crate::brain::shared::BrainRunStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_brain_run_stays_queued_without_the_registered_lease() {
+        let store = crate::brain::shared::SharedBrainStore::with_root("box.local", None);
+        let attachment = store
+            .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
+            .unwrap();
+        let request = store
+            .push(
+                "shared",
+                &attachment.subject,
+                BrainEventKind::Program {
+                    language: ProgramLanguage::Forth,
+                    source: "21 2 *".into(),
+                },
+            )
+            .unwrap();
+        store
+            .start_run(
+                "shared",
+                &attachment.subject,
+                crate::brain::shared::BrainRunKind::Interactive,
+                request.seq,
+                attachment.attachment_id,
+                crate::brain::shared::BrainRunStatus::QueuedForEnvironment,
+            )
+            .unwrap();
+        let lease = store
+            .acquire_runner_lease(
+                "shared",
+                "runner@box.local",
+                store.environment().generation,
+                None,
+                60_000,
+            )
+            .unwrap();
+
+        assert_eq!(
+            resume_queued_named_brain_runs(
+                store.clone(),
+                crate::server::BrainRunnerBroker::default(),
+                "shared".into(),
+                lease.lease_id,
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            store.snapshot("shared").unwrap().runs[0].status,
+            crate::brain::shared::BrainRunStatus::QueuedForEnvironment
+        );
+        assert!(!store.snapshot("shared").unwrap().events.iter().any(|event| {
+            matches!(event.kind, BrainEventKind::Result { .. })
+        }));
+    }
+
+    #[tokio::test]
+    async fn runner_failure_is_a_durable_failed_run_and_correlated_result() {
+        let store = crate::brain::shared::SharedBrainStore::with_root("box.local", None);
+        let attachment = store
+            .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
+            .unwrap();
+        let request = store
+            .push(
+                "shared",
+                &attachment.subject,
+                BrainEventKind::Program {
+                    language: ProgramLanguage::Forth,
+                    source: "21 2 *".into(),
+                },
+            )
+            .unwrap();
+        let run = store
+            .start_run(
+                "shared",
+                &attachment.subject,
+                crate::brain::shared::BrainRunKind::Interactive,
+                request.seq,
+                attachment.attachment_id,
+                crate::brain::shared::BrainRunStatus::Running,
+            )
+            .unwrap();
+        let lease = store
+            .acquire_runner_lease(
+                "shared",
+                "runner@box.local",
+                store.environment().generation,
+                None,
+                60_000,
+            )
+            .unwrap();
+        let runners = crate::server::BrainRunnerBroker::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, tx);
+        tokio::spawn(async move {
+            let crate::server::RunnerRequest::Program(request) = rx.recv().await.unwrap() else {
+                panic!("expected program request")
+            };
+            request
+                .response_tx
+                .send(Err("frontend execution failed".into()))
+                .unwrap();
+        });
+
+        let result = dispatch_named_brain_run(&store, &runners, "shared", &run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result.kind,
+            BrainEventKind::Result {
+                request_seq,
+                ref error,
+                ..
+            } if request_seq == request.seq
+                && error.as_deref() == Some("frontend execution failed")
+        ));
+        let failed = &store.snapshot("shared").unwrap().runs[0];
+        assert_eq!(
+            failed.status,
+            crate::brain::shared::BrainRunStatus::Failed
+        );
+        assert_eq!(failed.detail.as_deref(), Some("frontend execution failed"));
     }
 }

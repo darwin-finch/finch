@@ -81,6 +81,28 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
             Ok(registration) => registration,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
+        let run_id = match self.server.shared_brains().snapshot(&self.brain) {
+            Ok(snapshot) => snapshot
+                .runs
+                .into_iter()
+                .find(|run| {
+                    run.request_seq == self.request_seq
+                        && run.status == crate::brain::shared::BrainRunStatus::Running
+                })
+                .map(|run| run.run_id),
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        if let Some(run_id) = run_id {
+            if let Err(error) = self.server.shared_brains().transition_run(
+                &self.brain,
+                "daemon",
+                run_id,
+                crate::brain::shared::BrainRunStatus::AwaitingApproval,
+                Some(format!("awaiting approval {approval_id}")),
+            ) {
+                return Promise::err(capnp::Error::failed(error.to_string()));
+            }
+        }
         if approval_kind == "tool" {
             let input = detail
                 .get("input")
@@ -96,6 +118,15 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
                     input,
                 },
             ) {
+                if let Some(run_id) = run_id {
+                    let _ = self.server.shared_brains().transition_run(
+                        &self.brain,
+                        "daemon",
+                        run_id,
+                        crate::brain::shared::BrainRunStatus::Interrupted,
+                        Some(error.to_string()),
+                    );
+                }
                 return Promise::err(capnp::Error::failed(error.to_string()));
             }
         }
@@ -111,14 +142,49 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
                 detail,
             },
         ) {
+            if let Some(run_id) = run_id {
+                let _ = self.server.shared_brains().transition_run(
+                    &self.brain,
+                    "daemon",
+                    run_id,
+                    crate::brain::shared::BrainRunStatus::Interrupted,
+                    Some(error.to_string()),
+                );
+            }
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
 
+        let store = self.server.shared_brains().clone();
+        let brain = self.brain.clone();
         Promise::from_future(async move {
-            let decision = registration
-                .wait()
-                .await
-                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            let decision = match registration.wait().await {
+                Ok(decision) => {
+                    if let Some(run_id) = run_id {
+                        store
+                            .transition_run(
+                                &brain,
+                                "daemon",
+                                run_id,
+                                crate::brain::shared::BrainRunStatus::Running,
+                                None,
+                            )
+                            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                    }
+                    decision
+                }
+                Err(error) => {
+                    if let Some(run_id) = run_id {
+                        let _ = store.transition_run(
+                            &brain,
+                            "daemon",
+                            run_id,
+                            crate::brain::shared::BrainRunStatus::Interrupted,
+                            Some(error.to_string()),
+                        );
+                    }
+                    return Err(capnp::Error::failed(error.to_string()));
+                }
+            };
             let decision = serde_json::to_vec(&decision)
                 .map_err(|error| capnp::Error::failed(error.to_string()))?;
             results.get().set_decision_json(&decision);
@@ -476,6 +542,9 @@ impl finch_daemon::Server for FinchDaemonImpl {
         let broker = self.server.brain_runners().clone();
         let server = Arc::clone(&self.server);
         let registration_id = broker.register(brain.clone(), lease_id, tx);
+        let queued_store = server.shared_brains().clone();
+        let queued_broker = broker.clone();
+        let queued_brain = brain.clone();
         tokio::task::spawn_local(async move {
             while let Some(request) = rx.recv().await {
                 let disconnected = match request {
@@ -546,6 +615,21 @@ impl finch_daemon::Server for FinchDaemonImpl {
                 }
             }
             broker.unregister(&brain, registration_id);
+        });
+        // Return the registration bootstrap first. The frontend then marks
+        // this lease active before the queued callback reaches its event loop.
+        tokio::task::spawn_local(async move {
+            tokio::task::yield_now().await;
+            if let Err(error) = crate::server::handlers::resume_queued_named_brain_runs(
+                queued_store,
+                queued_broker,
+                queued_brain.clone(),
+                lease_id,
+            )
+            .await
+            {
+                tracing::warn!(brain = %queued_brain, %error, "could not resume queued Brain runs");
+            }
         });
         let mut response = results.get();
         response.set_runtime_revision(runtime_revision);
