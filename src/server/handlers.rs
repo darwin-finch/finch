@@ -290,6 +290,10 @@ async fn detach_named_brain(
             crate::brain::shared::ConnectionId(connection_id),
         )
         .map_err(brain_state_conflict)?;
+    server
+        .shared_brains()
+        .remove_if_unused(&name)
+        .map_err(brain_state_conflict)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -354,7 +358,12 @@ async fn acquire_named_brain_runner(
             }
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
-        let _ = store.expire_runner_lease(&name, lease_id, unix_epoch_millis());
+        if store
+            .expire_runner_lease(&name, lease_id, unix_epoch_millis())
+            .is_ok_and(|expired| expired)
+        {
+            let _ = store.remove_if_unused(&name);
+        }
     });
     Ok(Json(lease))
 }
@@ -380,6 +389,10 @@ async fn release_named_brain_runner(
             &name,
             crate::brain::shared::RunnerLeaseId(lease_id),
         )
+        .map_err(|error| AppError(error).into_response())?;
+    server
+        .shared_brains()
+        .remove_if_unused(&name)
         .map_err(|error| AppError(error).into_response())?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -874,6 +887,7 @@ async fn watch_named_brain(
             if let Ok(json) = serde_json::to_string(&initial) {
                 if socket.send(WsMessage::Text(json.into())).await.is_err() {
                     let _ = store.detach(&name, attachment_id, connection_id);
+                    let _ = store.remove_if_unused(&name);
                     return;
                 }
             }
@@ -914,6 +928,7 @@ async fn watch_named_brain(
                 }
             }
             let _ = store.detach(&name, attachment_id, connection_id);
+            let _ = store.remove_if_unused(&name);
         })
         .into_response())
 }

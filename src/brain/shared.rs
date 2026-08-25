@@ -652,6 +652,67 @@ impl SharedBrainStore {
         Ok(())
     }
 
+    /// Remove a provisional Brain once its last live participant has left.
+    ///
+    /// Attachment and runner-lease events are transport bookkeeping, not
+    /// conversation history. A Brain becomes durable as soon as it contains
+    /// a user prompt, submitted program, result, or committed runtime state.
+    pub fn remove_if_unused(&self, name: &str) -> Result<bool> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        {
+            // Keep the state lock from the eligibility check through removal.
+            // Otherwise a concurrent attach could recreate a live participant
+            // between the check and deletion of the provisional directory.
+            let mut brains = self.brains.write().expect("shared brain lock poisoned");
+            let state = brains.get(name).expect("brain loaded above");
+            let has_substantive_history = state.events.iter().any(|event| {
+                matches!(
+                    event.kind,
+                    BrainEventKind::Prompt { .. }
+                        | BrainEventKind::Program { .. }
+                        | BrainEventKind::ProgramPopped { .. }
+                        | BrainEventKind::Result { .. }
+                        | BrainEventKind::RuntimeCommitted { .. }
+                )
+            });
+            let has_connected_attachment = state
+                .attachments
+                .values()
+                .any(|attachment| attachment.connected);
+            if has_substantive_history || has_connected_attachment || state.runner_lease.is_some() {
+                return Ok(false);
+            }
+
+            if let Some(runtime) = self
+                .runtimes
+                .read()
+                .expect("shared brain runtime lock poisoned")
+                .get(name)
+                .cloned()
+            {
+                runtime.clear_authority_sink()?;
+            }
+            if let Some(root) = &self.root {
+                let directory = root.join(name);
+                if directory.exists() {
+                    std::fs::remove_dir_all(&directory)
+                        .with_context(|| format!("remove unused Brain {}", directory.display()))?;
+                }
+            }
+            brains.remove(name);
+        }
+        self.runtimes
+            .write()
+            .expect("shared brain runtime lock poisoned")
+            .remove(name);
+        self.execution_locks
+            .write()
+            .expect("shared brain execution-lock map poisoned")
+            .remove(name);
+        Ok(true)
+    }
+
     pub fn require_connection(
         &self,
         name: &str,
@@ -1409,6 +1470,74 @@ mod tests {
         assert_eq!(restored.brain_id, original.brain_id);
         assert_ne!(restored.brain_id, BrainId::nil());
         assert!(temp.path().join("quiet-brain/metadata.json").exists());
+    }
+
+    #[test]
+    fn unused_brain_is_removed_after_its_last_participant_leaves() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let generation = store.environment().generation;
+        let attachment = store
+            .attach("provisional", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let lease = store
+            .acquire_runner_lease("provisional", "alice", generation, None, 60_000)
+            .unwrap();
+
+        store
+            .detach(
+                "provisional",
+                attachment.attachment_id,
+                attachment.connection_id.unwrap(),
+            )
+            .unwrap();
+        assert!(!store.remove_if_unused("provisional").unwrap());
+        store
+            .release_runner_lease("provisional", lease.lease_id)
+            .unwrap();
+        assert!(store.remove_if_unused("provisional").unwrap());
+        assert!(!temp.path().join("provisional").exists());
+        assert!(!store.list().unwrap().contains(&"provisional".to_string()));
+    }
+
+    #[test]
+    fn substantive_brain_survives_after_every_participant_leaves() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("durable", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        store
+            .push(
+                "durable",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "remember this".into(),
+                },
+            )
+            .unwrap();
+        store
+            .detach(
+                "durable",
+                attachment.attachment_id,
+                attachment.connection_id.unwrap(),
+            )
+            .unwrap();
+
+        assert!(!store.remove_if_unused("durable").unwrap());
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        assert_eq!(
+            restarted.snapshot("durable").unwrap().program_stack.len(),
+            0
+        );
+        assert!(restarted
+            .snapshot("durable")
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| {
+                matches!(&event.kind, BrainEventKind::Prompt { text } if text == "remember this")
+            }));
     }
 
     #[test]
