@@ -980,7 +980,7 @@ impl EventLoop {
 
         // Set initial memory context in status bar
         if let Some(ref mem) = self.memory_system {
-            if let Ok(stats) = mem.stats().await {
+            if mem.stats().await.is_ok() {
                 let engine = if NeuralEmbeddingEngine::find_in_cache().is_some() {
                     "neural"
                 } else {
@@ -988,7 +988,7 @@ impl EventLoop {
                 };
                 self.status_bar.update_line(
                     crate::cli::status_bar::StatusLineType::MemoryContext,
-                    format!("🧠 {}  ·  {} memories", engine, stats.conversation_count),
+                    format!("🧠 {engine}  ·  recalled 0"),
                 );
             }
         }

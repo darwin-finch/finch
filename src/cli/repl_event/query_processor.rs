@@ -738,15 +738,10 @@ pub(super) async fn dispatch_tool_uses(
 
     // Update memory status bar now that tools are queued
     if let Some(ref mem) = memory_system {
-        if let Ok(stats) = mem.stats().await {
-            status_bar.update_line(
-                crate::cli::status_bar::StatusLineType::MemoryContext,
-                format!(
-                    "🧠 recalled {}  ·  {} memories",
-                    memory_recall_count, stats.conversation_count
-                ),
-            );
-        }
+        status_bar.update_line(
+            crate::cli::status_bar::StatusLineType::MemoryContext,
+            format!("🧠 recalled {memory_recall_count}"),
+        );
         refresh_context_strip(mem, session_label, cwd, status_bar, context_lines).await;
     }
 }
