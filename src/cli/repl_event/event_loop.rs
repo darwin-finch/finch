@@ -3654,6 +3654,17 @@ Rules:\n\
             .await
             .restore_snapshot(context.clone());
         let query_id = self.query_states.create_query(context).await;
+        self.query_states
+            .bind_brain_memory_provenance(
+                query_id,
+                super::query_state::BrainTurnMemoryProvenance {
+                    brain_id: request.approval_audience.brain_id,
+                    run_id: request.run_id,
+                    request_seq: request.request_seq,
+                    original_prompt: request.prompt.clone(),
+                },
+            )
+            .await;
         *self.active_query_id.write().await = Some(query_id);
         self.pending_named_brain_turns.insert(
             query_id,

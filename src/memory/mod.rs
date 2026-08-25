@@ -64,6 +64,15 @@ pub struct MemorySystem {
     config: MemoryConfig,
 }
 
+/// Canonical source identity for a conversation pair projected from one
+/// successful named-Brain run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrainConversationProvenance {
+    pub brain_id: String,
+    pub run_id: String,
+    pub request_seq: u64,
+}
+
 impl MemorySystem {
     /// Create new memory system (synchronous).
     ///
@@ -131,6 +140,20 @@ impl MemorySystem {
             "ALTER TABLE program_registry ADD COLUMN effect TEXT NOT NULL DEFAULT 'unclassified'",
             [],
         );
+
+        // Correlate projected memory with the authoritative Brain run. Existing
+        // local history remains valid with NULL provenance.
+        let _ = conn.execute("ALTER TABLE conversations ADD COLUMN brain_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE conversations ADD COLUMN run_id TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE conversations ADD COLUMN request_seq INTEGER",
+            [],
+        );
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_brain_run_role
+             ON conversations(brain_id, run_id, role)
+             WHERE brain_id IS NOT NULL AND run_id IS NOT NULL;",
+        )?;
 
         tracing::debug!("Memory system initialized: {}", config.db_path.display());
 
@@ -207,17 +230,60 @@ impl MemorySystem {
         model: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<()> {
+        self.insert_conversation_record(role, content, model, session_id, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Insert one side of a successful named-Brain turn exactly once.
+    /// Identical retries are no-ops; conflicting identity reuse is rejected.
+    pub async fn insert_brain_conversation(
+        &self,
+        role: &str,
+        content: &str,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        provenance: &BrainConversationProvenance,
+    ) -> Result<bool> {
+        self.insert_conversation_record(
+            role,
+            content,
+            model,
+            session_id,
+            Some(provenance),
+        )
+        .await
+    }
+
+    async fn insert_conversation_record(
+        &self,
+        role: &str,
+        content: &str,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        provenance: Option<&BrainConversationProvenance>,
+    ) -> Result<bool> {
         let timestamp = chrono::Utc::now()
             .timestamp_nanos_opt()
             .ok_or_else(|| anyhow::anyhow!("Timestamp out of range"))?;
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = provenance.map_or_else(
+            || uuid::Uuid::new_v4().to_string(),
+            |source| format!("brain:{}:run:{}:role:{role}", source.brain_id, source.run_id),
+        );
+        let brain_id = provenance.map(|source| source.brain_id.as_str());
+        let run_id = provenance.map(|source| source.run_id.as_str());
+        let request_seq = provenance
+            .map(|source| i64::try_from(source.request_seq))
+            .transpose()
+            .context("Brain request sequence exceeds SQLite INTEGER range")?;
 
         // Store in SQLite
-        {
+        let inserted = {
             let conn = self.db.lock().await;
-            conn.execute(
-                "INSERT INTO conversations (id, timestamp, role, content, tokens, model, session_id, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            let changed = conn.execute(
+                "INSERT OR IGNORE INTO conversations
+                 (id, timestamp, role, content, tokens, model, session_id, brain_id, run_id, request_seq, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     &id,
                     timestamp,
@@ -226,9 +292,36 @@ impl MemorySystem {
                     None::<i32>, // tokens (TODO: count)
                     model,
                     session_id,
+                    brain_id,
+                    run_id,
+                    request_seq,
                     timestamp,
                 ],
             )?;
+            if changed == 0 {
+                let existing: (String, String, Option<String>, Option<String>, Option<i64>) = conn
+                    .query_row(
+                        "SELECT role, content, brain_id, run_id, request_seq
+                         FROM conversations WHERE id = ?1",
+                        [&id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                    )?;
+                anyhow::ensure!(
+                    existing == (
+                        role.to_string(),
+                        content.to_string(),
+                        brain_id.map(str::to_owned),
+                        run_id.map(str::to_owned),
+                        request_seq,
+                    ),
+                    "named-Brain memory identity {id} was reused with conflicting content"
+                );
+            }
+            changed != 0
+        };
+
+        if !inserted {
+            return Ok(false);
         }
 
         // Quality filter: classify and extract key content before indexing.
@@ -248,7 +341,7 @@ impl MemorySystem {
 
         tracing::debug!("Inserted conversation into memory: {} chars", content.len());
 
-        Ok(())
+        Ok(true)
     }
 
     /// Query memory for relevant context
@@ -726,6 +819,62 @@ mod tests {
         assert_eq!(stats.conversation_count, 1);
         assert_eq!(stats.tree_node_count, 1);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn named_brain_conversation_is_idempotent_and_conflict_safe() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?;
+        let provenance = BrainConversationProvenance {
+            brain_id: "brain-1".into(),
+            run_id: "run-1".into(),
+            request_seq: 17,
+        };
+
+        assert!(memory
+            .insert_brain_conversation(
+                "user",
+                "inspect the scheduler cancellation path",
+                Some("test-model"),
+                Some("test-brain"),
+                &provenance,
+            )
+            .await?);
+        assert!(!memory
+            .insert_brain_conversation(
+                "user",
+                "inspect the scheduler cancellation path",
+                Some("test-model"),
+                Some("test-brain"),
+                &provenance,
+            )
+            .await?);
+        assert!(memory
+            .insert_brain_conversation(
+                "user",
+                "different content for the same run",
+                Some("test-model"),
+                Some("test-brain"),
+                &provenance,
+            )
+            .await
+            .is_err());
+
+        assert_eq!(memory.stats().await?.conversation_count, 1);
+        let stored: (String, String, i64) = {
+            let conn = memory.db.lock().await;
+            conn.query_row(
+                "SELECT brain_id, run_id, request_seq FROM conversations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?
+        };
+        assert_eq!(stored, ("brain-1".into(), "run-1".into(), 17));
         Ok(())
     }
 

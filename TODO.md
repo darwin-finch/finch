@@ -982,7 +982,13 @@ still blocks the corresponding Brain phase until it is unified.
   failures and retries do not duplicate memories. Separate always-applied user/project policy from
   best-effort semantic recall; a preference that must govern behavior cannot depend on reaching the
   top-k TF-IDF/neural results. Give recalled summaries stable provenance/IDs and an explicit path to
-  inspect their fuller source instead of injecting anonymous truncated text alone.
+  inspect their fuller source instead of injecting anonymous truncated text alone. Named-Brain
+  frontend queries now retain `BrainId`, `RunId`, request-event sequence, and the original prompt
+  across provider tool continuations; their user/assistant memory rows use a deterministic
+  Brain/run/role identity, identical retries are no-ops, and conflicting reuse fails. A regression
+  proves that the original prompt—not the final tool-result message—is indexed once. Still move the
+  projection trigger out of frontend provider completion and into daemon consumption of committed
+  successful Brain events, then add stable recall-source inspection.
 - [ ] Make OpenAI tool-call behavior respect control ownership: a participant client must not
   accidentally execute workspace tools on its own machine.
 

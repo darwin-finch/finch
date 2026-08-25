@@ -10,6 +10,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     tokens INTEGER,
     model TEXT,
     session_id TEXT,
+    brain_id TEXT,
+    run_id TEXT,
+    request_seq INTEGER,
     created_at INTEGER NOT NULL
 );
 

@@ -12,6 +12,16 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// Provenance for semantic memory projected from one named-Brain run. This is
+/// correlation metadata, never authentication or authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrainTurnMemoryProvenance {
+    pub brain_id: crate::brain::store::BrainId,
+    pub run_id: crate::brain::store::RunId,
+    pub request_seq: u64,
+    pub original_prompt: String,
+}
+
 /// State of an in-flight query
 #[derive(Debug, Clone)]
 pub enum QueryState {
@@ -46,6 +56,9 @@ pub struct QueryMetadata {
     /// Snapshot of conversation at query start time
     pub conversation_snapshot: Vec<Message>,
 
+    /// Present only when a named-Brain run caused this provider query.
+    pub brain_memory_provenance: Option<BrainTurnMemoryProvenance>,
+
     /// Cancellation token for this query
     pub cancellation_token: CancellationToken,
 
@@ -78,6 +91,7 @@ impl QueryStateManager {
             id,
             state: QueryState::Processing,
             conversation_snapshot,
+            brain_memory_provenance: None,
             cancellation_token: CancellationToken::new(),
             created_at: std::time::Instant::now(),
             tool_work_unit: None,
@@ -85,6 +99,17 @@ impl QueryStateManager {
 
         self.states.write().await.insert(id, metadata);
         id
+    }
+
+    /// Bind the query to its durable Brain/run before provider dispatch.
+    pub async fn bind_brain_memory_provenance(
+        &self,
+        query_id: Uuid,
+        provenance: BrainTurnMemoryProvenance,
+    ) {
+        if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
+            metadata.brain_memory_provenance = Some(provenance);
+        }
     }
 
     /// Update the state of a query
