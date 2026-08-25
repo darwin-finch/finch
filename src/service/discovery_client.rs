@@ -14,9 +14,7 @@ pub struct DiscoveredService {
     pub name: String,
     pub host: String,
     pub port: u16,
-    pub model: String,
     pub description: String,
-    pub capabilities: Vec<String>,
     pub node_public_key: Option<[u8; 32]>,
 }
 
@@ -53,26 +51,10 @@ impl ServiceDiscoveryClient {
             match receiver.recv_timeout(remaining) {
                 Ok(ServiceEvent::ServiceResolved(info)) => {
                     // Extract service properties
-                    let model = info
-                        .get_property_val_str("model")
-                        .unwrap_or("unknown")
-                        .to_string();
-
                     let description = info
                         .get_property_val_str("description")
                         .unwrap_or("")
                         .to_string();
-
-                    let capabilities_str = info
-                        .get_property_val_str("capabilities")
-                        .unwrap_or("")
-                        .to_string();
-
-                    let capabilities: Vec<String> = if capabilities_str.is_empty() {
-                        Vec::new()
-                    } else {
-                        capabilities_str.split(',').map(|s| s.to_string()).collect()
-                    };
                     let node_public_key = info
                         .get_property_val_str("node_key")
                         .and_then(|encoded| hex::decode(encoded).ok())
@@ -91,9 +73,7 @@ impl ServiceDiscoveryClient {
                         name: info.get_fullname().to_string(),
                         host,
                         port: info.get_port(),
-                        model,
                         description,
-                        capabilities,
                         node_public_key,
                     };
 

@@ -1754,13 +1754,6 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         let service_config = ServiceConfig {
             name: config.server.service_name.clone(),
             description: config.server.service_description.clone(),
-            model: format!("{:?}", config.backend.model_size), // e.g., "Small", "Medium", "Large"
-            capabilities: vec![
-                "code".to_string(),
-                "general".to_string(),
-                "tool-use".to_string(),
-                "brain".to_string(),
-            ],
             node_public_key: server.brain_credentials().invitation_public_key(),
         };
 

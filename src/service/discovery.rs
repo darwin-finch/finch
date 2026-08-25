@@ -14,8 +14,6 @@ pub const SERVICE_TYPE: &str = "_finch._tcp.local.";
 pub struct ServiceConfig {
     pub name: String,
     pub description: String,
-    pub model: String,
-    pub capabilities: Vec<String>,
     /// Public Ed25519 transport identity. Safe to advertise; it grants no
     /// authority and is compared against authenticated invitation/channel data.
     pub node_public_key: [u8; 32],
@@ -86,11 +84,9 @@ impl ServiceDiscovery {
             .context("Failed to register mDNS service")?;
 
         tracing::info!(
-            "Advertising service: {} on port {} (model: {}, capabilities: {})",
+            "Advertising Finch node discovery endpoint: {} on port {}",
             self.instance_name,
-            port,
-            self.config.model,
-            self.config.capabilities.join(", ")
+            port
         );
 
         Ok(())
@@ -119,19 +115,11 @@ impl ServiceDiscovery {
 /// authorize a listener to use it.
 fn advertised_properties(config: &ServiceConfig) -> HashMap<String, String> {
     HashMap::from([
-        ("model".to_string(), config.model.clone()),
         ("description".to_string(), config.description.clone()),
-        ("capabilities".to_string(), config.capabilities.join(",")),
-        (
-            "version".to_string(),
-            env!("CARGO_PKG_VERSION").to_string(),
-        ),
+        ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
         // Cute node name — shown in the TUI when this machine is discovered.
         ("name".to_string(), crate::node_name::NAME.clone()),
-        (
-            "node_key".to_string(),
-            hex::encode(config.node_public_key),
-        ),
+        ("node_key".to_string(), hex::encode(config.node_public_key)),
     ])
 }
 
@@ -144,8 +132,6 @@ mod tests {
         let config = ServiceConfig {
             name: "test-finch".into(),
             description: "test service".into(),
-            model: "test-model".into(),
-            capabilities: vec!["chat".into(), "brain".into()],
             node_public_key: [7; 32],
         };
 
@@ -153,17 +139,7 @@ mod tests {
         let mut keys = properties.keys().map(String::as_str).collect::<Vec<_>>();
         keys.sort_unstable();
 
-        assert_eq!(
-            keys,
-            [
-                "capabilities",
-                "description",
-                "model",
-                "name",
-                "node_key",
-                "version"
-            ]
-        );
+        assert_eq!(keys, ["description", "name", "node_key", "version"]);
         assert_eq!(properties["node_key"], hex::encode([7; 32]));
         for forbidden in ["token", "password", "credential", "secret", "api_key"] {
             assert!(!properties.contains_key(forbidden));

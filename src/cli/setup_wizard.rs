@@ -2839,12 +2839,7 @@ fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep
                         "{}{} @ {}:{}{}",
                         prefix, agent.name, agent.host, agent.port, suffix
                     );
-                    let model_line = format!("        model: {}", agent.model);
-                    let lines = vec![
-                        Line::from(label).style(style),
-                        Line::from(model_line).style(Style::default().fg(Color::DarkGray)),
-                    ];
-                    ListItem::new(lines)
+                    ListItem::new(Line::from(label).style(style))
                 })
                 .collect();
             let list = List::new(items).block(

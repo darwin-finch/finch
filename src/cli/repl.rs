@@ -3858,15 +3858,8 @@ impl Repl {
             for (i, service) in services.iter().enumerate() {
                 self.output_status(format!("{}. {}", i + 1, service.name));
                 self.output_status(format!("   Host: {}:{}", service.host, service.port));
-                self.output_status(format!("   Model: {}", service.model));
                 if !service.description.is_empty() {
                     self.output_status(format!("   Description: {}", service.description));
-                }
-                if !service.capabilities.is_empty() {
-                    self.output_status(format!(
-                        "   Capabilities: {}",
-                        service.capabilities.join(", ")
-                    ));
                 }
                 self.output_status("");
             }

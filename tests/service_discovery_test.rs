@@ -10,12 +10,10 @@ fn test_service_discovery_creation() -> Result<()> {
     let config = ServiceConfig {
         name: "test-finch".to_string(),
         description: "Test Finch instance".to_string(),
-        model: "Qwen-2.5-7B".to_string(),
-        capabilities: vec!["code".to_string(), "general".to_string()],
         node_public_key: [1; 32],
     };
 
-    let discovery = ServiceDiscovery::new(config)?;
+    let _discovery = ServiceDiscovery::new(config)?;
 
     // Just verify it was created successfully
     // (We won't actually advertise in tests to avoid network effects)
@@ -28,14 +26,11 @@ fn test_service_config_builder() -> Result<()> {
     let config = ServiceConfig {
         name: "finch-test-machine".to_string(),
         description: "Finch on test machine".to_string(),
-        model: "Qwen-2.5-1.5B".to_string(),
-        capabilities: vec!["code".to_string()],
         node_public_key: [2; 32],
     };
 
     assert_eq!(config.name, "finch-test-machine");
-    assert_eq!(config.model, "Qwen-2.5-1.5B");
-    assert_eq!(config.capabilities.len(), 1);
+    assert_eq!(config.description, "Finch on test machine");
 
     Ok(())
 }
@@ -43,7 +38,7 @@ fn test_service_config_builder() -> Result<()> {
 #[test]
 fn test_discovery_client_creation() -> Result<()> {
     // Test creating a discovery client
-    let client = ServiceDiscoveryClient::new()?;
+    let _client = ServiceDiscoveryClient::new()?;
 
     // Client creation should succeed
     Ok(())
@@ -77,38 +72,11 @@ fn test_service_config_empty_name() -> Result<()> {
     let config = ServiceConfig {
         name: String::new(),
         description: "Test".to_string(),
-        model: "Qwen-2.5-3B".to_string(),
-        capabilities: vec![],
         node_public_key: [3; 32],
     };
 
     // Should create discovery even with empty name (will use hostname)
-    let discovery = ServiceDiscovery::new(config)?;
-
-    Ok(())
-}
-
-#[test]
-fn test_service_capabilities_list() -> Result<()> {
-    // Test various capability configurations
-    let configs = vec![
-        vec!["code", "general", "tool-use"],
-        vec!["code"],
-        vec![], // Empty capabilities
-    ];
-
-    for caps in configs {
-        let config = ServiceConfig {
-            name: "test".to_string(),
-            description: "Test".to_string(),
-            model: "Qwen".to_string(),
-            capabilities: caps.iter().map(|s| s.to_string()).collect(),
-            node_public_key: [4; 32],
-        };
-
-        // Should create successfully with any capability list
-        let _discovery = ServiceDiscovery::new(config)?;
-    }
+    let _discovery = ServiceDiscovery::new(config)?;
 
     Ok(())
 }
