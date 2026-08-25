@@ -418,6 +418,8 @@ impl RemoteBrainClient {
                 .context("Brain invitation contains an invalid TLS certificate")?;
             let http = Client::builder()
                 .timeout(std::time::Duration::from_secs(180))
+                .redirect(reqwest::redirect::Policy::none())
+                .tls_built_in_root_certs(false)
                 .add_root_certificate(certificate)
                 .build()?;
             let mut roots = rustls::RootCertStore::empty();
@@ -437,6 +439,7 @@ impl RemoteBrainClient {
             (
                 Client::builder()
                     .timeout(std::time::Duration::from_secs(180))
+                    .redirect(reqwest::redirect::Policy::none())
                     .build()?,
                 None,
             )
@@ -2316,7 +2319,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invitation_rejects_a_substituted_https_certificate() {
+    async fn invitation_redemption_never_follows_a_cross_host_redirect() {
+        use axum::{response::Redirect, routing::post, Router};
+
+        let redirected_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attacker_count = redirected_requests.clone();
+        let attacker = Router::new().route(
+            "/stolen",
+            post(move || {
+                let attacker_count = attacker_count.clone();
+                async move {
+                    attacker_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    "unexpected redirect"
+                }
+            }),
+        );
+        let attacker_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let attacker_address = attacker_listener.local_addr().unwrap();
+        let attacker_server =
+            tokio::spawn(async move { axum::serve(attacker_listener, attacker).await.unwrap() });
+
+        let secret = [43; 32];
+        let authority = super::super::credential::BrainCredentialAuthority::ephemeral(secret);
+        let (invitation, invitation_claims) = authority
+            .issue_invitation(
+                super::super::credential::BrainInvitationRequest {
+                    issuer: "fixture.local".into(),
+                    brain_id: BrainId(uuid::Uuid::new_v4()),
+                    brain: "shared".into(),
+                    environment_generation: 1,
+                    role: AttachmentRole::Observer,
+                    scopes: super::super::credential::default_participant_scopes(
+                        AttachmentRole::Observer,
+                    ),
+                    delegation_chain: Vec::new(),
+                    ttl_ms: 60_000,
+                },
+                unix_epoch_millis(),
+            )
+            .unwrap();
+        let redirect_url = format!("http://{attacker_address}/stolen");
+        let app = Router::new().route(
+            "/v1/brains/invitations/redeem",
+            post(move || {
+                let redirect_url = redirect_url.clone();
+                async move { Redirect::temporary(&redirect_url) }
+            }),
+        );
+        let node = crate::node::identity::NodeSigningIdentity::from_secret(secret);
+        let tls =
+            crate::node::tls::NodeTlsIdentity::from_signing_identity(&node, "localhost").unwrap();
+        let invitation_certificate =
+            super::super::credential::invitation_tls_certificate_der(&invitation_claims).unwrap();
+        crate::node::tls::install_server_crypto_provider();
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
+            vec![invitation_certificate],
+            tls.private_key_der().to_vec(),
+        )
+        .await
+        .unwrap();
+        let handle = axum_server::Handle::new();
+        let server = tokio::spawn(
+            axum_server::bind_rustls(
+                "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
+                tls_config,
+            )
+            .handle(handle.clone())
+            .serve(app.into_make_service()),
+        );
+        let address = handle.listening().await.unwrap();
+        let client = RemoteBrainClient::new_with_invitation(
+            RemoteBrainTarget {
+                brain: "shared".into(),
+                machine: "localhost".into(),
+                address: format!("localhost:{}", address.port()),
+                secure: true,
+            },
+            invitation,
+        )
+        .unwrap();
+
+        let error = client
+            .redeem_invitation("alice@laptop.local")
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("invalid Brain invitation redemption response"));
+        assert_eq!(
+            redirected_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the invitation bearer must never be replayed to a redirect target"
+        );
+        server.abort();
+        attacker_server.abort();
+    }
+
+    #[tokio::test]
+    async fn invitation_rejects_an_alternate_certificate_for_the_same_hostname() {
         use axum::{routing::post, Json, Router};
 
         let invited_secret = [51; 32];
