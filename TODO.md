@@ -243,7 +243,39 @@ still blocks the corresponding Brain phase until it is unified.
   selectable model variants (model ID, context/capability overrides, pricing/budget defaults).
   Support cloning a configured provider variant with only the model changed, a fast `/model`
   picker over compatible variants, and explicit full-profile selection when endpoint or account
-  also changes. Never duplicate secret material into every model entry.
+  also changes. Never duplicate secret material into every model entry. Replace the setup wizard's
+  stale compile-time model arrays with a refreshable provider catalogue: authenticated model-list
+  discovery where the provider actually exposes it, a cache with source and refresh time, manual
+  model IDs for providers without discovery, and a tested static fallback. Keep capability and
+  context metadata keyed by provider plus model rather than inferring it from a display name.
+- [ ] **P0 — make OpenAI-compatible onboarding endpoint-correct before adding Ox Alpha or Z.AI.**
+  Introduce a reusable compatible-API connection profile whose configured base URL is actually
+  honored and whose chat path is explicit instead of always appending `/v1/chat/completions`.
+  Then add independently named, preview-gated presets for Ox Alpha routes (for example Tokenra's
+  `https://tokenra.io/v1/chat/completions`, model `stealth/ox-alpha`, bearer token, and—only after
+  validating its current terms—the anonymous OpenCode Zen preview) and, if desired, Z.AI's general
+  and Coding Plan routes (`https://api.z.ai/api/paas/v4/chat/completions` and
+  `https://api.z.ai/api/coding/paas/v4/chat/completions`). Do not conflate the anonymous Ox model's
+  unverified vendor identity with a Z.AI account/profile. Model auth as required bearer, optional
+  bearer, no-auth, or refreshable credential reference; allow endpoint-scoped headers without
+  leaking them into logs. Add mock-server URL/auth/request tests plus opt-in live smoke tests before
+  advertising a preset as working. Today the OpenAI/Claude/Mistral `base_url` config fields are
+  persisted but ignored by the factory, while the compatible client hardcodes an extra `/v1`.
+- [ ] **P0 — replace claimed provider parity with model-level, conformance-tested capabilities.**
+  `LlmProvider::supports_streaming()` and `supports_tools()` currently default to `true`, but the
+  common request/response contract cannot represent several advertised features. Add explicit
+  text/image/audio/video input, structured-output/JSON-schema, tool-choice and parallel/streaming
+  tool-call controls, reasoning enable/effort plus preserved reasoning deltas, usage/cache/cost,
+  provider-native search/retrieval, stop/sampling limits, and output-modality capabilities. Preserve
+  multimodal blocks in OpenAI-compatible and Gemini requests instead of replacing them with
+  `[image]` text; accept compatible tool arguments returned as either JSON strings or objects; and
+  finalize SSE text/tool blocks on clean EOF as well as `[DONE]`. For Z.AI specifically map
+  `thinking.type`, `reasoning_content`, `tool_stream`, multimodal parts, and its model-dependent
+  limits rather than sending OpenAI's `reasoning_effort`. Gate every UI feature and request field on
+  the selected model's declared/probed capabilities, record unsupported-field diagnostics, and run
+  fixtures for non-streaming, streaming, tools, tool continuation, reasoning, structured output,
+  and each advertised input modality across Claude, OpenAI, Grok, Gemini, Mistral, Groq, Ollama,
+  remote daemons, and every new compatible profile.
 - [ ] Generalize provider authentication beyond static API tokens. Add secure-store-backed OAuth,
   browser/device authorization, refreshable account sessions, and provider-native subscription
   credentials where their terms and APIs permit them (including Codex/OpenAI and Claude account
