@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,6 +12,9 @@ use std::time::Duration;
 use super::endpoints::ProviderEndpoints;
 
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CATALOG_BODY_BYTES: usize = 1_048_576;
+const MAX_MODEL_COUNT: usize = 4_096;
+const MAX_MODEL_ID_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogAuth {
@@ -21,9 +25,31 @@ pub enum CatalogAuth {
 #[derive(Debug, Clone)]
 pub struct ModelCatalogProfile {
     pub provider: String,
+    /// Stable, non-secret configured profile/account label.
+    pub profile_id: String,
     pub api_key: String,
     pub endpoints: ProviderEndpoints,
     pub auth: CatalogAuth,
+    pub request_timeout: Duration,
+}
+
+impl ModelCatalogProfile {
+    pub fn new(
+        provider: impl Into<String>,
+        profile_id: impl Into<String>,
+        api_key: impl Into<String>,
+        endpoints: ProviderEndpoints,
+        auth: CatalogAuth,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            profile_id: profile_id.into(),
+            api_key: api_key.into(),
+            endpoints,
+            auth,
+            request_timeout: CATALOG_TIMEOUT,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -37,6 +63,7 @@ pub enum CatalogSource {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelCatalog {
     pub provider: String,
+    pub profile_id: String,
     pub models_url: String,
     pub models: Vec<String>,
     pub source: CatalogSource,
@@ -75,6 +102,7 @@ pub fn static_fallback(provider: &str) -> Vec<String> {
 pub fn fallback_catalog(provider: &str, models_url: &str) -> ModelCatalog {
     ModelCatalog {
         provider: provider.to_string(),
+        profile_id: provider.to_string(),
         models_url: cache_safe_url(models_url),
         models: static_fallback(provider),
         source: CatalogSource::StaticFallback,
@@ -93,7 +121,7 @@ pub async fn refresh(profile: &ModelCatalogProfile, cache_dir: &Path) -> Result<
     }
 
     let client = Client::builder()
-        .timeout(CATALOG_TIMEOUT)
+        .timeout(profile.request_timeout)
         .build()
         .context("Failed to create model catalogue HTTP client")?;
     let mut request = client.get(&profile.endpoints.models_url);
@@ -104,29 +132,65 @@ pub async fn refresh(profile: &ModelCatalogProfile, cache_dir: &Path) -> Result<
         CatalogAuth::Bearer => request.bearer_auth(&profile.api_key),
     };
 
-    let response = request
-        .send()
-        .await
-        .with_context(|| format!("Failed to refresh {} model catalogue", profile.provider))?;
+    let origin = sanitized_origin(&profile.endpoints.models_url);
+    let response = request.send().await.map_err(|_| {
+        anyhow::anyhow!(
+            "Could not reach {} model catalogue at {}",
+            profile.provider,
+            origin
+        )
+    })?;
     let status = response.status();
     if !status.is_success() {
         bail!(
-            "{} model catalogue returned HTTP {}",
+            "{} model catalogue at {} returned HTTP {}",
             profile.provider,
+            origin,
             status
         );
     }
 
-    let payload: ModelsResponse = response
-        .json()
-        .await
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_CATALOG_BODY_BYTES as u64)
+    {
+        bail!(
+            "{} model catalogue response exceeded size limit",
+            profile.provider
+        );
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| {
+            anyhow::anyhow!(
+                "Could not read {} model catalogue response",
+                profile.provider
+            )
+        })?;
+        if body.len().saturating_add(chunk.len()) > MAX_CATALOG_BODY_BYTES {
+            bail!(
+                "{} model catalogue response exceeded size limit",
+                profile.provider
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let payload: ModelsResponse = serde_json::from_slice(&body)
         .with_context(|| format!("Invalid {} model catalogue response", profile.provider))?;
+    if payload.data.len() > MAX_MODEL_COUNT {
+        bail!(
+            "{} model catalogue exceeded model count limit",
+            profile.provider
+        );
+    }
     let mut models: Vec<String> = payload
         .data
         .into_iter()
         .map(|record| record.id.trim().to_string())
         .filter(|id| !id.is_empty())
         .collect();
+    validate_models(&profile.provider, &models)?;
     models.sort();
     models.dedup();
     if models.is_empty() {
@@ -135,6 +199,7 @@ pub async fn refresh(profile: &ModelCatalogProfile, cache_dir: &Path) -> Result<
 
     let catalog = ModelCatalog {
         provider: profile.provider.clone(),
+        profile_id: profile.profile_id.clone(),
         models_url: cache_safe_url(&profile.endpoints.models_url),
         models,
         source: CatalogSource::Discovered,
@@ -157,10 +222,10 @@ pub async fn refresh_with_fallback(
             if let Ok(Some(cached)) = read_cache(profile, cache_dir) {
                 (cached, Some(error.to_string()))
             } else {
-                (
-                    fallback_catalog(&profile.provider, &profile.endpoints.models_url),
-                    Some(error.to_string()),
-                )
+                let mut fallback =
+                    fallback_catalog(&profile.provider, &profile.endpoints.models_url);
+                fallback.profile_id = profile.profile_id.clone();
+                (fallback, Some(error.to_string()))
             }
         }
     }
@@ -168,20 +233,24 @@ pub async fn refresh_with_fallback(
 
 pub fn read_cache(profile: &ModelCatalogProfile, cache_dir: &Path) -> Result<Option<ModelCatalog>> {
     let path = cache_path(profile, cache_dir);
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("Failed to read {}", path.display()))
+    let contents = match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.len() > MAX_CATALOG_BODY_BYTES as u64 => {
+            bail!("Model catalogue cache exceeded size limit")
         }
+        Ok(_) => std::fs::read(&path)
+            .with_context(|| "Failed to read model catalogue cache".to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Failed to inspect model catalogue cache"),
     };
-    let mut catalog: ModelCatalog = serde_json::from_str(&contents)
-        .with_context(|| format!("Invalid model catalogue cache {}", path.display()))?;
+    let mut catalog: ModelCatalog =
+        serde_json::from_slice(&contents).context("Invalid model catalogue cache")?;
     if catalog.provider != profile.provider
+        || catalog.profile_id != profile.profile_id
         || catalog.models_url != cache_safe_url(&profile.endpoints.models_url)
     {
         return Ok(None);
     }
+    validate_models(&catalog.provider, &catalog.models)?;
     catalog.source = CatalogSource::Cache;
     Ok(Some(catalog))
 }
@@ -200,16 +269,67 @@ fn write_cache(
 }
 
 fn cache_path(profile: &ModelCatalogProfile, cache_dir: &Path) -> PathBuf {
-    let mut hasher = Sha256::new();
-    hasher.update(profile.provider.as_bytes());
-    hasher.update([0]);
-    hasher.update(profile.endpoints.models_url.as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
-    cache_dir.join(format!("{}-{}.json", profile.provider, &digest[..16]))
+    cache_dir.join(format!("catalog-{}.json", profile_cache_identity(profile)))
 }
 
 fn cache_safe_url(url: &str) -> String {
-    url.split(['?', '#']).next().unwrap_or(url).to_string()
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return "<configured-endpoint>".to_string();
+    };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.to_string()
+}
+
+fn sanitized_origin(url: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return "<configured-endpoint>".to_string();
+    };
+    let Some(host) = parsed.host_str() else {
+        return "<configured-endpoint>".to_string();
+    };
+    match parsed.port() {
+        Some(port) => format!("{}://{}:{}", parsed.scheme(), host, port),
+        None => format!("{}://{}", parsed.scheme(), host),
+    }
+}
+
+/// Opaque full-width cache/request identity. Credential material participates
+/// in the digest but is never persisted or returned directly.
+pub fn profile_cache_identity(profile: &ModelCatalogProfile) -> String {
+    let mut hasher = Sha256::new();
+    let normalized_private_url = reqwest::Url::parse(&profile.endpoints.models_url)
+        .map(|mut url| {
+            url.set_fragment(None);
+            url.to_string()
+        })
+        .unwrap_or_else(|_| profile.endpoints.models_url.clone());
+    for component in [
+        profile.provider.as_bytes(),
+        profile.profile_id.as_bytes(),
+        cache_safe_url(&profile.endpoints.models_url).as_bytes(),
+        profile.api_key.as_bytes(),
+        normalized_private_url.as_bytes(),
+    ] {
+        hasher.update((component.len() as u64).to_be_bytes());
+        hasher.update(component);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn validate_models(provider: &str, models: &[String]) -> Result<()> {
+    if models.len() > MAX_MODEL_COUNT {
+        bail!("{} model catalogue exceeded model count limit", provider);
+    }
+    if models.iter().any(|id| id.len() > MAX_MODEL_ID_BYTES) {
+        bail!(
+            "{} model catalogue contained an oversized model ID",
+            provider
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -218,16 +338,13 @@ mod tests {
     use mockito::Matcher;
 
     fn profile(server_url: &str, provider: &str, auth: CatalogAuth) -> ModelCatalogProfile {
-        ModelCatalogProfile {
-            provider: provider.to_string(),
-            api_key: "secret-that-must-not-be-cached".to_string(),
-            endpoints: ProviderEndpoints::new(
-                server_url,
-                "/v1/chat/completions",
-                "/custom/catalog/models",
-            ),
+        ModelCatalogProfile::new(
+            provider,
+            format!("{provider}-work"),
+            "secret-that-must-not-be-cached",
+            ProviderEndpoints::new(server_url, "/v1/chat/completions", "/custom/catalog/models"),
             auth,
-        }
+        )
     }
 
     #[tokio::test]
@@ -265,15 +382,37 @@ mod tests {
             .await;
         let cache = tempfile::tempdir().unwrap();
         let profile = profile(&server.url(), "openai", CatalogAuth::Bearer);
-        refresh(&profile, cache.path()).await.unwrap();
+        let live = refresh(&profile, cache.path()).await.unwrap();
         mock.assert_async().await;
 
         let cached = read_cache(&profile, cache.path()).unwrap().unwrap();
         assert_eq!(cached.source, CatalogSource::Cache);
+        assert_eq!(cached.refreshed_at, live.refreshed_at);
         let contents = std::fs::read_to_string(cache_path(&profile, cache.path())).unwrap();
         assert!(!contents.contains("secret-that-must-not-be-cached"));
         assert!(contents.contains("refreshed_at"));
         assert!(contents.contains("models_url"));
+    }
+
+    #[tokio::test]
+    async fn mistral_refresh_uses_configured_path_and_bearer_auth() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/custom/catalog/models")
+            .match_header("authorization", "Bearer secret-that-must-not-be-cached")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"mistral-account-model"}]}"#)
+            .create_async()
+            .await;
+        let cache = tempfile::tempdir().unwrap();
+        let catalog = refresh(
+            &profile(&server.url(), "mistral", CatalogAuth::Bearer),
+            cache.path(),
+        )
+        .await
+        .unwrap();
+        mock.assert_async().await;
+        assert_eq!(catalog.models, vec!["mistral-account-model"]);
     }
 
     #[tokio::test]
@@ -302,6 +441,169 @@ mod tests {
         let contents = std::fs::read_to_string(cache_path(&profile, cache.path())).unwrap();
         assert!(!contents.contains("query-secret"));
         assert!(read_cache(&profile, cache.path()).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn accounts_at_same_endpoint_have_isolated_full_digest_caches() {
+        let mut server = mockito::Server::new_async().await;
+        let account_a = server
+            .mock("GET", "/custom/catalog/models")
+            .match_header("authorization", "Bearer account-a-key")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"account-a-model"}]}"#)
+            .create_async()
+            .await;
+        let account_b = server
+            .mock("GET", "/custom/catalog/models")
+            .match_header("authorization", "Bearer account-b-key")
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"account-b-model"}]}"#)
+            .create_async()
+            .await;
+        let cache = tempfile::tempdir().unwrap();
+        let mut a = profile(&server.url(), "openai", CatalogAuth::Bearer);
+        a.api_key = "account-a-key".to_string();
+        let mut b = profile(&server.url(), "openai", CatalogAuth::Bearer);
+        b.api_key = "account-b-key".to_string();
+
+        refresh(&a, cache.path()).await.unwrap();
+        refresh(&b, cache.path()).await.unwrap();
+        account_a.assert_async().await;
+        account_b.assert_async().await;
+        assert_ne!(profile_cache_identity(&a), profile_cache_identity(&b));
+        assert_eq!(profile_cache_identity(&a).len(), 64);
+        assert_ne!(cache_path(&a, cache.path()), cache_path(&b, cache.path()));
+        assert_eq!(
+            read_cache(&a, cache.path()).unwrap().unwrap().models,
+            vec!["account-a-model"]
+        );
+        assert_eq!(
+            read_cache(&b, cache.path()).unwrap().unwrap().models,
+            vec!["account-b-model"]
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_body_count_and_id_are_rejected() {
+        let cache = tempfile::tempdir().unwrap();
+
+        let mut body_server = mockito::Server::new_async().await;
+        let _body = body_server
+            .mock("GET", "/custom/catalog/models")
+            .with_status(200)
+            .with_body("x".repeat(MAX_CATALOG_BODY_BYTES + 1))
+            .create_async()
+            .await;
+        let body_error = refresh(
+            &profile(&body_server.url(), "openai", CatalogAuth::Bearer),
+            cache.path(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(body_error.contains("size limit"));
+
+        let mut count_server = mockito::Server::new_async().await;
+        let count_body = serde_json::json!({
+            "data": (0..=MAX_MODEL_COUNT)
+                .map(|index| serde_json::json!({"id": format!("model-{index}")}))
+                .collect::<Vec<_>>()
+        })
+        .to_string();
+        let _count = count_server
+            .mock("GET", "/custom/catalog/models")
+            .with_status(200)
+            .with_body(count_body)
+            .create_async()
+            .await;
+        let count_error = refresh(
+            &profile(&count_server.url(), "openai", CatalogAuth::Bearer),
+            cache.path(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(count_error.contains("count limit"));
+
+        let mut id_server = mockito::Server::new_async().await;
+        let _id = id_server
+            .mock("GET", "/custom/catalog/models")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({"data": [{"id": "x".repeat(MAX_MODEL_ID_BYTES + 1)}]})
+                    .to_string(),
+            )
+            .create_async()
+            .await;
+        let id_error = refresh(
+            &profile(&id_server.url(), "openai", CatalogAuth::Bearer),
+            cache.path(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(id_error.contains("oversized model ID"));
+    }
+
+    #[tokio::test]
+    async fn transport_and_timeout_errors_redact_url_credentials() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut refused = ModelCatalogProfile::new(
+            "openai",
+            "redaction-test",
+            "header-secret",
+            ProviderEndpoints::new(
+                "http://visible-user:visible-pass@127.0.0.1:9",
+                "/v1/chat/completions",
+                "/private/models?access_token=query-secret",
+            ),
+            CatalogAuth::Bearer,
+        );
+        refused.request_timeout = Duration::from_millis(50);
+        let error = refresh(&refused, cache.path())
+            .await
+            .unwrap_err()
+            .to_string();
+        for secret in [
+            "visible-user",
+            "visible-pass",
+            "header-secret",
+            "query-secret",
+            "/private/models",
+        ] {
+            assert!(!error.contains(secret), "error leaked {secret}: {error}");
+        }
+        assert!(error.contains("http://127.0.0.1:9"));
+
+        let mut timeout_server = mockito::Server::new_async().await;
+        let _slow = timeout_server
+            .mock("GET", "/private/models")
+            .with_chunked_body(|writer| {
+                std::thread::sleep(Duration::from_millis(100));
+                writer.write_all(br#"{"data":[{"id":"late"}]}"#)
+            })
+            .create_async()
+            .await;
+        let mut timeout = ModelCatalogProfile::new(
+            "openai",
+            "timeout-test",
+            "timeout-header-secret",
+            ProviderEndpoints::new(
+                &timeout_server.url(),
+                "/v1/chat/completions",
+                "/private/models?access_token=timeout-query-secret",
+            ),
+            CatalogAuth::Bearer,
+        );
+        timeout.request_timeout = Duration::from_millis(10);
+        let error = refresh(&timeout, cache.path())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("timeout-header-secret"));
+        assert!(!error.contains("timeout-query-secret"));
+        assert!(!error.contains("/private/models"));
+        assert!(error.contains(&timeout_server.url()));
     }
 
     #[tokio::test]
@@ -341,7 +643,9 @@ mod tests {
     #[test]
     fn cache_metadata_drops_endpoint_query_credentials() {
         assert_eq!(
-            cache_safe_url("https://models.example/v1/models?access_token=secret#fragment"),
+            cache_safe_url(
+                "https://secret-user:secret-pass@models.example/v1/models?access_token=secret#fragment"
+            ),
             "https://models.example/v1/models"
         );
     }
