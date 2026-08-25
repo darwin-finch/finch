@@ -92,6 +92,13 @@ pub enum ReplEvent {
         envelope: VmEffectEnvelope,
     },
 
+    /// Every effect for one provider-response output port has been enqueued.
+    /// Completion travels through the same ordered event bus so scrollback
+    /// cannot commit the WorkUnit after only its first `say` chunk.
+    VmOutputComplete {
+        output_unit: Arc<WorkUnit>,
+    },
+
     /// An explicitly entered typed program finished on a background worker.
     /// Its output unit already exists in the shadow buffer; the event loop
     /// owns final status/error projection and the corresponding redraw.

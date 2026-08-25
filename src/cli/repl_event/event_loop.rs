@@ -1099,6 +1099,7 @@ impl EventLoop {
                         ReplEvent::VmApprovalNeeded { .. } => "VmApprovalNeeded",
                         ReplEvent::OutputReady { .. } => "OutputReady",
                         ReplEvent::VmEffect { .. } => "VmEffect",
+                        ReplEvent::VmOutputComplete { .. } => "VmOutputComplete",
                         ReplEvent::TypedProgramComplete { .. } => "TypedProgramComplete",
                         ReplEvent::UserInput { .. } => "UserInput",
                         ReplEvent::StatsUpdate { .. } => "StatsUpdate",
@@ -2682,6 +2683,11 @@ Rules:\n\
                         envelope.execution_id, envelope.effect.sequence
                     ));
                 }
+                self.render_tui().await?;
+            }
+
+            ReplEvent::VmOutputComplete { output_unit } => {
+                output_unit.set_complete();
                 self.render_tui().await?;
             }
 

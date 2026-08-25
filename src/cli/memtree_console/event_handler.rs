@@ -84,6 +84,7 @@ impl EventHandler {
             // Ignore these events (they don't affect tree structure)
             ReplEvent::OutputReady { .. } => {}
             ReplEvent::VmEffect { .. } => {}
+            ReplEvent::VmOutputComplete { .. } => {}
             ReplEvent::VmApprovalNeeded { .. } => {}
             ReplEvent::TypedProgramComplete { .. } => {}
             ReplEvent::StreamingComplete { .. } => {}

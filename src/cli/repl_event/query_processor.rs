@@ -275,7 +275,9 @@ async fn execute_wire_with_single_repair(
                 metric.terminal_failure = true;
             }
             record_wire_metric(metrics_logger, &metric);
-            output_unit.set_complete();
+            let _ = event_tx.send(ReplEvent::VmOutputComplete {
+                output_unit: Arc::clone(&output_unit),
+            });
             return WireExecution {
                 source_for_history: source,
                 response: outcome.output,
@@ -303,7 +305,9 @@ async fn execute_wire_with_single_repair(
     if !repairable {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
-        output_unit.set_complete();
+        let _ = event_tx.send(ReplEvent::VmOutputComplete {
+            output_unit: Arc::clone(&output_unit),
+        });
         return WireExecution {
             source_for_history: source,
             response: diagnostic,
@@ -363,7 +367,7 @@ async fn execute_wire_with_single_repair(
         runtime,
         output_manager,
         Arc::clone(&repair_output_unit),
-        event_tx,
+        event_tx.clone(),
         repaired_source.clone(),
     )
     .await
@@ -376,7 +380,9 @@ async fn execute_wire_with_single_repair(
                     Some(crate::metrics::WireFailureClass::MissingOutputEffect);
             }
             record_wire_metric(metrics_logger, &metric);
-            repair_output_unit.set_complete();
+            let _ = event_tx.send(ReplEvent::VmOutputComplete {
+                output_unit: Arc::clone(&repair_output_unit),
+            });
             WireExecution {
                 source_for_history: repaired_source,
                 response: outcome.output,
@@ -389,7 +395,9 @@ async fn execute_wire_with_single_repair(
                 .cloned()
                 .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
             repair_output_unit.append_response(&format!("VM wire error: {detail}"));
-            repair_output_unit.set_complete();
+            let _ = event_tx.send(ReplEvent::VmOutputComplete {
+                output_unit: Arc::clone(&repair_output_unit),
+            });
             metric.terminal_failure = true;
             record_wire_metric(metrics_logger, &metric);
             WireExecution {
@@ -400,7 +408,9 @@ async fn execute_wire_with_single_repair(
         Err(error) => {
             let detail = format!("VM wire error: {error}");
             repair_output_unit.append_response(&detail);
-            repair_output_unit.set_complete();
+            let _ = event_tx.send(ReplEvent::VmOutputComplete {
+                output_unit: Arc::clone(&repair_output_unit),
+            });
             metric.terminal_failure = true;
             record_wire_metric(metrics_logger, &metric);
             WireExecution {
@@ -1704,6 +1714,8 @@ mod tests {
 
     #[tokio::test]
     async fn interactive_wire_scheduler_resumes_only_cooperative_yields() {
+        use crate::cli::messages::{Message, MessageStatus};
+
         let runtime = crate::runtime::ProgramRuntime::new();
         let output = Arc::new(OutputManager::default());
         output.disable_stdout();
@@ -1712,8 +1724,8 @@ mod tests {
         let complete = execute_direct_wire_response(
             &runtime,
             Arc::clone(&output),
-            work_unit,
-            event_tx,
+            Arc::clone(&work_unit),
+            event_tx.clone(),
             "(begin (say \"one\") (yield) (say \"two\") (yield) (say \"three\"))".to_string(),
         )
         .await
@@ -1723,11 +1735,30 @@ mod tests {
             crate::runtime::outcome::ExecutionStatus::Completed
         );
         assert_eq!(complete.output, "onetwothree");
+        event_tx
+            .send(ReplEvent::VmOutputComplete {
+                output_unit: Arc::clone(&work_unit),
+            })
+            .unwrap();
+
         let mut emitted = 0;
-        while event_rx.try_recv().is_ok() {
-            emitted += 1;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                ReplEvent::VmEffect {
+                    projection,
+                    envelope,
+                } => {
+                    assert_eq!(work_unit.status(), MessageStatus::InProgress);
+                    projection.project_envelope(envelope);
+                    emitted += 1;
+                }
+                ReplEvent::VmOutputComplete { output_unit } => output_unit.set_complete(),
+                other => panic!("unexpected event: {other:?}"),
+            }
         }
         assert_eq!(emitted, 3, "all say events cross the UI bus");
+        assert_eq!(work_unit.content(), "onetwothree");
+        assert_eq!(work_unit.status(), MessageStatus::Complete);
         assert!(runtime
             .pending_typed_execution(complete.execution_id)
             .unwrap()
