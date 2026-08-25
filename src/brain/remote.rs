@@ -1410,6 +1410,37 @@ mod tests {
                 .await
                 .unwrap();
 
+            let controller_credential_id = controller
+                .credential
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .claims
+                .credential_id;
+            controller
+                .http
+                .delete(format!(
+                    "http://127.0.0.1:{DEFAULT_BRAIN_PORT}/v1/brains/credentials/{controller_credential_id}"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let revoked = controller
+                .cancel_runner_handoff(handoff.handoff_id)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                revoked.contains("revoked")
+                    || revoked.contains("unauthorized")
+                    || revoked.contains("connection closed")
+                    || revoked.contains("no longer authorizes"),
+                "unexpected revocation error: {revoked}"
+            );
+
             let target_lease = ipc
                 .brain_accept_runner_handoff(
                     &brain,
@@ -1426,9 +1457,20 @@ mod tests {
                 .await
                 .unwrap();
 
-            let submitter = controller.clone();
+            let mut submitter = RemoteBrainClient::new(controller.target.clone(), "loopback")
+                .unwrap();
+            submitter
+                .attach(
+                    "codex-submit@localhost",
+                    AttachmentRole::Driver,
+                    None,
+                )
+                .await
+                .unwrap();
+            let _submit_events = submitter.watch().await.unwrap();
+            let submitting_client = submitter.clone();
             let submission = tokio::task::spawn_local(async move {
-                submitter
+                submitting_client
                     .push(BrainEventKind::Program {
                         language: crate::brain::shared::ProgramLanguage::Lisp,
                         source: "(say \"handoff-live\")".into(),
@@ -1484,8 +1526,8 @@ mod tests {
             ipc.brain_release_runner(&brain, target_lease.lease_id)
                 .await
                 .unwrap();
-            controller.disconnect().await.unwrap();
-            controller.archive("codex-control@localhost").await.unwrap();
+            submitter.disconnect().await.unwrap();
+            submitter.archive("codex-submit@localhost").await.unwrap();
         }));
     }
 
