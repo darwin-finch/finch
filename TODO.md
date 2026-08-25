@@ -734,8 +734,11 @@ still blocks the corresponding Brain phase until it is unified.
 - [ ] Make the daemon own schedule definitions/due-time delivery only. Coalesce missed ticks into one
   pending event per schedule while the environment-owning frontend is unavailable; require explicit
   bounded catch-up and idempotency policy before delivering every missed occurrence.
-- [ ] Split reducible VM state from the execute-once host-effect journal. Never replay file,
-  process, dialog, or network effects while restoring VM state.
+- [x] Split reducible VM state from the execute-once host-effect journal. Runner callbacks now
+  carry exact schema-native effect/state records independently of checkpoints on success, failure,
+  and cooperative cancellation. The daemon persists each `(execution_id, sequence)` once before
+  publishing a reducible checkpoint or final result, rejects conflicting identity reuse, and
+  restores checkpoints without replaying file, process, dialog, network, or output effects.
 - [ ] Add typed compensating actions for reversible effects. File undo must use preimage and
   postimage hashes plus a conflict-aware reverse changeset.
 - [x] Finish remote named-brain attach/detach, live scrollback replacement, status display, and

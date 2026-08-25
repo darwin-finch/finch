@@ -145,9 +145,14 @@ revalidates the signed credential for each mutation and periodically while the c
 The daemon's transport-neutral submission operation never executes ProgramRuns inside the daemon.
 It serializes the accepted event, requires the active environment lease's registered callback, and
 dispatches the source to the frontend-owned typed `ProgramRuntime`. The runner returns its exact
-output/revision/checkpoint; the daemon independently reverifies and content-addresses reducible
-state beside the event log without inheriting frontend authority or replaying effects. A restarted
-runner receives the durable checkpoint during callback registration before it accepts work.
+output/revision/checkpoint plus a separate schema-native execute-once effect journal on success,
+failure, and cooperative cancellation. The daemon persists each globally unique
+`(execution_id, sequence)` effect fact before publishing the reducible checkpoint or final result;
+an exact retry is idempotent and conflicting identity reuse fails closed. It independently
+reverifies and content-addresses reducible state beside the event log without inheriting frontend
+authority or replaying effects. A restarted runner receives the durable checkpoint during callback
+registration before it accepts work, while prior effect facts remain audit events rather than
+checkpoint instructions.
 Concurrent commits journal their exact runtime revision and recovery never regresses to a
 later-appended older checkpoint. The content-addressed durable blob uses this same Cap'n Proto
 checkpoint graph; legacy `.json` blobs remain a read-only migration input for hashes already present
