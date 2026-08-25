@@ -398,6 +398,60 @@ impl EventLoop {
         self.render_tui().await
     }
 
+    async fn handle_brain_runs(&mut self) -> Result<()> {
+        let client = self
+            .selected_brain()
+            .cloned()
+            .context("no Brain is attached")?;
+        let snapshot = client.snapshot().await?;
+        let mut lines = vec![format!("Runs in {}:", client.target.display_name())];
+        if snapshot.runs.is_empty() {
+            lines.push("  (none)".into());
+        } else {
+            for run in snapshot.runs {
+                let run_id = run.run_id.0.to_string();
+                let parent = run
+                    .parent_run_id
+                    .map(|parent| format!(" · parent {}", &parent.0.to_string()[..8]))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "  {}  {:?} · {:?} · event {}{}",
+                    &run_id[..8], run.status, run.kind, run.request_seq, parent
+                ));
+            }
+        }
+        self.output_manager.write_info(lines.join("\n"));
+        self.render_tui().await
+    }
+
+    async fn handle_brain_run_cancel(&mut self, prefix: String) -> Result<()> {
+        let prefix = prefix.trim().to_ascii_lowercase();
+        anyhow::ensure!(prefix.len() >= 4, "run id prefix must contain at least 4 characters");
+        let client = self
+            .selected_brain()
+            .cloned()
+            .context("no Brain is attached")?;
+        let snapshot = client.snapshot().await?;
+        let matches = snapshot
+            .runs
+            .iter()
+            .filter(|run| run.run_id.0.to_string().starts_with(&prefix))
+            .map(|run| run.run_id)
+            .collect::<Vec<_>>();
+        let run_id = match matches.as_slice() {
+            [] => anyhow::bail!("no run id begins with '{prefix}'"),
+            [run_id] => *run_id,
+            _ => anyhow::bail!("run id prefix '{prefix}' is ambiguous"),
+        };
+        let run = client.cancel_run(run_id).await?;
+        let run_id = run.run_id.0.to_string();
+        self.output_manager.write_info(format!(
+            "run {} is {:?}",
+            &run_id[..8], run.status
+        ));
+        self.render_tui().await
+    }
+
     async fn handle_brain_archive(&mut self, name: String) -> Result<()> {
         let active_name = self
             .active_remote_brain

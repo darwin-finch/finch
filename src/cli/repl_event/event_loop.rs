@@ -2129,6 +2129,16 @@ Rules:\n\
                     Command::BrainAttach(target) => {
                         self.handle_brain_attach(target).await?;
                     }
+                    Command::BrainRuns => {
+                        self.handle_brain_runs().await?;
+                    }
+                    Command::BrainRunCancel(prefix) => {
+                        if let Err(error) = self.handle_brain_run_cancel(prefix).await {
+                            self.output_manager
+                                .write_info(format!("brain cancel: {error}"));
+                            self.render_tui().await?;
+                        }
+                    }
                     Command::BrainDetach => {
                         self.handle_brain_detach().await?;
                     }

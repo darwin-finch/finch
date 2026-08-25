@@ -54,6 +54,8 @@ pub enum Command {
     LicenseRemove,           // /license remove
     // Durable Brain sessions
     Brains,                        // /brains — list named, detachable sessions
+    BrainRuns,                     // /brain runs — list runs in the attached Brain
+    BrainRunCancel(String),        // /brain cancel <run-id-prefix>
     BrainArchive(String),          // /brain archive <name>
     BrainAttach(String),           // /brain attach <name@machine[:port]>
     BrainDetach,                   // /brain detach
@@ -143,6 +145,7 @@ impl Command {
             "/brains" | "/brains list" | "/brain list" | "/brain ls" => {
                 return Some(Command::Brains);
             }
+            "/brain runs" | "/brain run list" => return Some(Command::BrainRuns),
             "/brain detach" => return Some(Command::BrainDetach),
             "/brain handoff accept" => return Some(Command::BrainHandoffAccept(None)),
             "/brain handoff cancel" => return Some(Command::BrainHandoffCancel(None)),
@@ -255,6 +258,12 @@ impl Command {
             let target = rest.trim();
             if !target.is_empty() {
                 return Some(Command::BrainAttach(target.to_string()));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/brain cancel ") {
+            let run = rest.trim();
+            if !run.is_empty() {
+                return Some(Command::BrainRunCancel(run.to_string()));
             }
         }
         if let Some(rest) = trimmed.strip_prefix("/brain handoff accept ") {
@@ -516,6 +525,8 @@ pub fn handle_command(
         ),
         // Brain commands are handled directly in REPL
         Command::Brains
+        | Command::BrainRuns
+        | Command::BrainRunCancel(_)
         | Command::BrainArchive(_)
         | Command::BrainAttach(_)
         | Command::BrainDetach
@@ -687,6 +698,8 @@ pub fn format_help() -> String {
          {reset}\n\
          {yellow_bold}🧠 Detachable Brains:{reset}\n\
          {cyan}  /brain list{reset}        List named Brain sessions ({gray}/brains{reset} also works)\n\
+         {cyan}  /brain runs{reset}        List runs in the attached Brain\n\
+         {cyan}  /brain cancel <run>{reset} Cancel an initiated run by id prefix\n\
          {cyan}  /brain attach <name>[@machine]{reset} Attach locally or to a remote Brain\n\
          {cyan}  /brain detach{reset}      Return to this console's home Brain\n\
          {cyan}  /brain handoff <subject>{reset} Request an addressed runner transfer\n\
@@ -1004,6 +1017,11 @@ mod tests {
             Some(Command::Brains)
         ));
         assert!(matches!(Command::parse("/brain ls"), Some(Command::Brains)));
+        assert!(matches!(Command::parse("/brain runs"), Some(Command::BrainRuns)));
+        assert!(matches!(
+            Command::parse("/brain cancel 1234abcd"),
+            Some(Command::BrainRunCancel(prefix)) if prefix == "1234abcd"
+        ));
         assert!(matches!(
             Command::parse("/brain archive old-project"),
             Some(Command::BrainArchive(name)) if name == "old-project"
@@ -1038,10 +1056,6 @@ mod tests {
         // task. Unknown `/brain` subcommands intentionally fall back to help.
         assert!(matches!(
             Command::parse("/brain investigate flaky tests"),
-            Some(Command::Help)
-        ));
-        assert!(matches!(
-            Command::parse("/brain cancel old-worker"),
             Some(Command::Help)
         ));
     }
