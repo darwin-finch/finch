@@ -863,7 +863,7 @@ still blocks the corresponding Brain phase until it is unified.
   in its own status namespace, while semantic recall remains independently replaceable. Unit coverage
   includes zero-recall isolation, source/error filtering, truncation, and stale-line removal; a live
   smoke check preserved the projected context across both frontend and daemon restart.
-- [x] Add theme-aware author/channel backgrounds so user input, model-authored VM source, tool
+- [ ] Add theme-aware author/channel backgrounds so user input, model-authored VM source, tool
   activity, and VM/user-visible output are distinguishable without relying on low-contrast cyan
   foreground text alone. Use subtle full-width turn bands like other modern coding harnesses rather
   than coloring only glyphs; define theme-aware hover/selection/expanded states for interactive
@@ -871,8 +871,12 @@ still blocks the corresponding Brain phase until it is unified.
   copied, and make the styling part of structured `OutputManager` rows so redraw, resize,
   scrollback, and concurrent WorkUnits remain stable. In a shared Brain, assign stable
   distinguishable participant background accents from participant identity and label the author;
-  do not make every human console look like the same local user. Completed in
-  [GitHub #48](https://github.com/darwin-finch/finch/issues/48).
+  do not make every human console look like the same local user. Semantic role/participant band
+  styles from [GitHub #48](https://github.com/darwin-finch/finch/issues/48) now exist on structured
+  messages and in `ShadowBuffer`, but the ordinary live draw and
+  full-viewport resize repaint still print `Message::format()` output directly instead of routing
+  through those styled rows. Wire the main renderer to the semantic shadow-buffer path and add a
+  resize regression proving the bands survive full viewport reconstruction before closing this item.
 - [x] Give `$VISUAL`/`$EDITOR` a correct terminal-protocol handoff. Leave Finch raw/live rendering,
   enter a clean alternate screen for Vim and similar full-screen editors, restore terminal modes on
   every exit path, discard the editor screen instead of retaining its `~` rows in scrollback, then
