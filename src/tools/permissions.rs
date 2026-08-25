@@ -232,11 +232,9 @@ impl PermissionManager {
             // every concrete host effect inferred from a submitted program.
             "submit_program" => PermissionCheck::Allow,
 
-            // Write/edit/patch: must surface as diff proposal in the room
-            // The caller (peer loop) is responsible for converting Allow here into
-            // a DiffPropose SessionEvent rather than applying directly.
+            // Write/edit/patch: require an explicit reviewed changeset.
             "write" | "edit" | "patch" => {
-                PermissionCheck::AskUser("Peer proposes a file change — review diff".to_string())
+                PermissionCheck::AskUser("Model proposes a file change — review diff".to_string())
             }
 
             // Bash: allow read-only commands silently, ask for everything else

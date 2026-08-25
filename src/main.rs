@@ -77,11 +77,10 @@ struct Args {
     #[arg(long)]
     json: bool,
 
-    /// Join a named session (UUIDv5 derived from name).
-    /// Two users with the same name arrive at the same session ID.
-    /// Example: finch --session "battleground"
-    #[arg(long = "session", short = 's')]
-    session: Option<String>,
+    /// Use this named Brain as the console's durable home environment.
+    /// Example: finch --brain "battleground"
+    #[arg(long = "brain")]
+    brain: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -1132,10 +1131,10 @@ async fn main() -> Result<()> {
     // One name identifies the actual home Brain. Explicit names attach by name;
     // generated names include a short uniqueness suffix so a new console cannot
     // silently inherit an old Brain's memory and event history.
-    let session_name = args
-        .session
+    let brain_name = args
+        .brain
         .clone()
-        .unwrap_or_else(finch::session::names::generate);
+        .unwrap_or_else(finch::brain::names::generate);
 
     let mut repl = Repl::new(
         config,
@@ -1143,7 +1142,7 @@ async fn main() -> Result<()> {
         router,
         metrics_logger,
         daemon_client,
-        session_name,
+        brain_name,
     )
     .await;
 

@@ -1,8 +1,7 @@
-//! In-memory store of pending diff proposals in the room.
+//! In-memory store of pending reviewed changes.
 //!
-//! Peers propose diffs via `SessionEvent::Diff`; humans argue back in chat;
-//! the AI revises via `SessionEvent::DiffEdit`.  When the human is satisfied
-//! they run `/accept [prefix]` or `/reject [reason]`.
+//! A producer proposes a `ReviewEvent::Diff`; later review events revise,
+//! accept, or reject that proposal.
 
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -25,7 +24,7 @@ pub struct PendingDiff {
     pub patch: String,
     /// Optional prose description of what this diff does.
     pub description: Option<String>,
-    /// Name of the peer who proposed this diff.
+    /// Display identity of the proposal author.
     pub proposed_by: String,
     pub state: DiffState,
 }
@@ -160,7 +159,7 @@ mod tests {
             "src/foo.rs".to_string(),
             "--- a/src/foo.rs\n+++ b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new\n".to_string(),
             Some("fix the thing".to_string()),
-            "peer-abc".to_string(),
+            "model".to_string(),
         );
         (store, id)
     }
@@ -207,8 +206,8 @@ mod tests {
         let mut store = DiffStore::new();
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
-        store.propose(id1, "a.rs".into(), "p1".into(), None, "peer".into());
-        store.propose(id2, "b.rs".into(), "p2".into(), None, "peer".into());
+        store.propose(id1, "a.rs".into(), "p1".into(), None, "model".into());
+        store.propose(id2, "b.rs".into(), "p2".into(), None, "model".into());
         let resolved = store.resolve_pending(None).unwrap();
         assert_eq!(resolved.id, id2); // most recent
     }

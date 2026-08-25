@@ -95,6 +95,7 @@ pub mod planning; // IMPCPD iterative plan refinement loop
 pub mod poset; // Co-Forth poset VM — partially-ordered task graph with 3D renderer
 pub mod programs; // Persistent shared Forth/Lisp program vocabulary
 pub mod providers; // Multi-provider LLM support
+pub mod review; // Local reviewed-changeset projection
 pub mod samples;   // Sample spreadsheet generator (finch samples)
 pub mod lisp;      // Scheme-flavoured Lisp dialect with async SSH + crypto
 pub mod ssh;       // SSH client (russh) — sessions referenced from Lisp
@@ -104,7 +105,6 @@ pub mod runtime; // Provider-neutral Forth/Lisp execution and capabilities
 pub mod scheduling; // Autonomous task scheduling (Phase 5)
 pub mod server; // HTTP daemon mode (Phase 1)
 pub mod service; // Service discovery (Phase 3)
-pub mod session; // Bidirectional event bus — local or WebSocket transport
 pub mod tools; // Tool execution system
 pub mod training; // Batch training and checkpoints (Phase 2) // Offline Ed25519 commercial license key validation
 pub mod vm; // Typed stack IR, verifier, capabilities, and language contracts

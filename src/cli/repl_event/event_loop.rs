@@ -35,7 +35,7 @@ use crate::memory::NeuralEmbeddingEngine;
 use crate::models::bootstrap::GeneratorState;
 use crate::models::tokenizer::TextTokenizer;
 use crate::router::Router;
-use crate::session::diff_store::DiffStore;
+use crate::review::store::DiffStore;
 use crate::tools::executor::ToolExecutor;
 use crate::tools::types::ToolDefinition;
 
@@ -345,14 +345,14 @@ pub struct EventLoop {
     /// Stored so the user can re-plan without losing the word.
     plan_word: Option<String>,
 
-    /// Local transport for the legacy diff-review event store.
-    peer_tx: tokio::sync::broadcast::Sender<crate::session::SessionEvent>,
+    /// Local event channel for reviewed changesets.
+    review_tx: tokio::sync::broadcast::Sender<crate::review::ReviewEvent>,
 
     /// In-memory store of pending diff proposals.
     diff_store: DiffStore,
 
     /// Receiver for local Diff/DiffEdit/DiffAccept/DiffReject events.
-    peer_session_rx: tokio::sync::broadcast::Receiver<crate::session::SessionEvent>,
+    review_rx: tokio::sync::broadcast::Receiver<crate::review::ReviewEvent>,
 
     // ── LLM worker loop channel ───────────────────────────────────────────
     /// Send LLM requests to the worker loop.
@@ -1002,8 +1002,8 @@ impl EventLoop {
             )
         };
 
-        let (peer_tx, peer_session_rx) =
-            tokio::sync::broadcast::channel::<crate::session::SessionEvent>(128);
+        let (review_tx, review_rx) =
+            tokio::sync::broadcast::channel::<crate::review::ReviewEvent>(128);
 
         let participant_subject = local_participant_subject();
         let runner_subject = runner_subject_from(&participant_subject, Uuid::new_v4());
@@ -1074,9 +1074,9 @@ impl EventLoop {
             stack,
             poset,
             plan_word: None,
-            peer_tx,
+            review_tx,
             diff_store: DiffStore::new(),
-            peer_session_rx,
+            review_rx,
             active_remote_brain: None,
             home_brain: None,
             home_runner_lease_active: false,
@@ -1650,18 +1650,17 @@ impl EventLoop {
                 }
 
                 // Structured diff-review events (proposals, edits, accepts, rejects)
-                ev = self.peer_session_rx.recv() => {
+                ev = self.review_rx.recv() => {
                     match ev {
-                        Ok(crate::session::SessionEvent::Diff { id, label, patch, description }) => {
-                            // Find the proposer name from session list (unknown if not found)
-                            let proposed_by = "peer".to_string();
+                        Ok(crate::review::ReviewEvent::Diff { id, label, patch, description }) => {
+                            let proposed_by = "model".to_string();
                             self.diff_store.propose(id, label.clone(), patch.clone(), description.clone(), proposed_by.clone());
                             self.render_diff_proposal(id, &label, &patch, description.as_deref(), &proposed_by);
                             if let Err(e) = self.render_tui().await {
                                 tracing::warn!("TUI render after Diff proposal failed: {e}");
                             }
                         }
-                        Ok(crate::session::SessionEvent::DiffEdit { diff_id, patch, description }) => {
+                        Ok(crate::review::ReviewEvent::DiffEdit { diff_id, patch, description }) => {
                             self.diff_store.edit(diff_id, patch.clone(), description.clone());
                             if let Some(d) = self.diff_store.get(diff_id) {
                                 let label = d.label.clone();
@@ -1679,7 +1678,7 @@ impl EventLoop {
                                 tracing::warn!("TUI render after DiffEdit failed: {e}");
                             }
                         }
-                        Ok(crate::session::SessionEvent::DiffAccept { diff_id }) => {
+                        Ok(crate::review::ReviewEvent::DiffAccept { diff_id }) => {
                             if let Some(d) = self.diff_store.accept(diff_id) {
                                 use crossterm::style::Stylize;
                                 self.output_manager.write_info(format!(
@@ -1692,7 +1691,7 @@ impl EventLoop {
                                 tracing::warn!("TUI render after DiffAccept failed: {e}");
                             }
                         }
-                        Ok(crate::session::SessionEvent::DiffReject { diff_id, reason }) => {
+                        Ok(crate::review::ReviewEvent::DiffReject { diff_id, reason }) => {
                             self.diff_store.reject(diff_id, reason.clone());
                             use crossterm::style::Stylize;
                             let reason_str = reason.as_deref().unwrap_or("no reason given");
@@ -3910,12 +3909,12 @@ Rules:\n\
     /// Render a diff proposal visually in the room output.
     ///
     /// ```text
-    /// peer-a1b2c3d4 proposes: src/session/mod.rs
+    /// model proposes: src/review/mod.rs
     /// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     /// - old line
     /// + new line
     /// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    /// "adds Diff variant to SessionEvent"
+    /// "updates the reviewed changeset"
     /// [accept: /accept <id>] [reject: /reject <reason>]
     /// ```
     fn render_diff_proposal(
@@ -4019,10 +4018,10 @@ Rules:\n\
             }
         }
 
-        // Broadcast DiffAccept so the proposing peer knows
+        // Publish the review decision to local proposal consumers.
         let _ = self
-            .peer_tx
-            .send(crate::session::SessionEvent::diff_accept(diff_id));
+            .review_tx
+            .send(crate::review::ReviewEvent::diff_accept(diff_id));
         self.render_tui().await
     }
 
@@ -4111,10 +4110,10 @@ Rules:\n\
             },
         ));
 
-        // Broadcast DiffReject so the proposing peer knows
+        // Publish the review decision to local proposal consumers.
         let _ = self
-            .peer_tx
-            .send(crate::session::SessionEvent::diff_reject(diff_id, reason));
+            .review_tx
+            .send(crate::review::ReviewEvent::diff_reject(diff_id, reason));
         self.render_tui().await
     }
 

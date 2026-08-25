@@ -1,8 +1,8 @@
-/// Session name generator — adjective + landscape noun + collision-resistant suffix,
+/// Brain name generator — adjective + landscape noun + collision-resistant suffix,
 /// e.g. "quiet-hill-a13f09".
 ///
-/// Distinct word lists from node_name.rs so session names feel different from node names.
-/// Landscape nouns give a sense of place; good mnemonic for "where are we talking".
+/// Distinct word lists from `node_name.rs` make durable Brain identities easy
+/// to distinguish from machine identities.
 use uuid::Uuid;
 
 const ADJECTIVES: &[&str] = &[
@@ -15,11 +15,11 @@ const NOUNS: &[&str] = &[
     "moor", "glen", "cove", "dune", "ridge", "crest", "brook", "field", "shore",
 ];
 
-/// Namespace UUID for Finch session names (distinct from node namespace).
+/// Namespace UUID for Finch Brain names (distinct from the node namespace).
 /// Generated once; baked in so name → UUID is always deterministic.
-const SESSION_NS: Uuid = uuid::uuid!("a1b2c3d4-e5f6-7890-abcd-ef1234567890");
+const BRAIN_NAME_NS: Uuid = uuid::uuid!("a1b2c3d4-e5f6-7890-abcd-ef1234567890");
 
-/// Generate a cute, practically unique session name: "quiet-hill-a13f09", etc.
+/// Generate a cute, practically unique Brain name: "quiet-hill-a13f09", etc.
 ///
 /// Uses thread-local randomness via rand.  Not deterministic — call `to_uuid`
 /// to get the stable UUID for a known name.
@@ -44,12 +44,12 @@ pub fn generate() -> String {
     format!("{adj}-{noun}-{suffix:06x}")
 }
 
-/// Derive a stable UUIDv5 from a session name.
+/// Derive a stable UUIDv5 from a Brain name.
 ///
 /// Two callers who agree on the same name will always get the same UUID, regardless
-/// of machine or time.  This is the share-able session ID.
+/// of machine or time.
 pub fn to_uuid(name: &str) -> Uuid {
-    Uuid::new_v5(&SESSION_NS, name.as_bytes())
+    Uuid::new_v5(&BRAIN_NAME_NS, name.as_bytes())
 }
 
 #[cfg(test)]

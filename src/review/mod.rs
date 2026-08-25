@@ -4,8 +4,7 @@
 //! event log. This module deliberately contains no second chat/session bus or
 //! network transport.
 
-pub mod diff_store;
-pub mod names;
+pub mod store;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -14,7 +13,7 @@ use uuid::Uuid;
 /// in-process channel; they are not a parallel collaboration protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum SessionEvent {
+pub enum ReviewEvent {
     /// A proposed unified diff against a named file, buffer, or change set.
     Diff {
         id: Uuid,
@@ -39,7 +38,7 @@ pub enum SessionEvent {
     },
 }
 
-impl SessionEvent {
+impl ReviewEvent {
     pub fn diff(
         label: impl Into<String>,
         patch: impl Into<String>,
@@ -80,10 +79,9 @@ mod tests {
 
     #[test]
     fn diff_event_json_round_trip_preserves_identity() {
-        let (event, id) =
-            SessionEvent::diff("workspace", "--- old\n+++ new", Some("review".into()));
+        let (event, id) = ReviewEvent::diff("workspace", "--- old\n+++ new", Some("review".into()));
         let encoded = serde_json::to_string(&event).unwrap();
-        let decoded: SessionEvent = serde_json::from_str(&encoded).unwrap();
-        assert!(matches!(decoded, SessionEvent::Diff { id: decoded_id, .. } if decoded_id == id));
+        let decoded: ReviewEvent = serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(decoded, ReviewEvent::Diff { id: decoded_id, .. } if decoded_id == id));
     }
 }
