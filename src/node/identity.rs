@@ -7,9 +7,100 @@
 //   - Future: points and reputation on the worker network
 
 use anyhow::{Context, Result};
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+const NODE_SIGNING_KEY_FILE: &str = "node-signing.key";
+
+/// Persistent cryptographic identity for authenticating Finch transports.
+/// This is intentionally separate from the human-readable/deterministic node
+/// UUID: names and UUIDs locate a node, while this key proves possession.
+#[derive(Clone)]
+pub struct NodeSigningIdentity {
+    signing_key: SigningKey,
+}
+
+impl NodeSigningIdentity {
+    pub fn load_or_create(state_directory: &Path) -> Result<Self> {
+        std::fs::create_dir_all(state_directory)
+            .with_context(|| format!("create {}", state_directory.display()))?;
+        let path = state_directory.join(NODE_SIGNING_KEY_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let secret: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+                    anyhow::anyhow!(
+                        "node signing key {} has {} bytes, expected 32",
+                        path.display(),
+                        bytes.len()
+                    )
+                })?;
+                protect_private_file(&path)?;
+                Ok(Self::from_secret(secret))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut secret = [0_u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
+                write_private_key(&path, &secret)?;
+                Ok(Self::from_secret(secret))
+            }
+            Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+        }
+    }
+
+    pub fn from_secret(secret: [u8; 32]) -> Self {
+        Self {
+            signing_key: SigningKey::from_bytes(&secret),
+        }
+    }
+
+    pub fn public_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.verifying_key().to_bytes()
+    }
+
+    pub fn sign(&self, message: &[u8]) -> [u8; 64] {
+        self.signing_key.sign(message).to_bytes()
+    }
+
+    pub fn verify(public_key: [u8; 32], message: &[u8], signature: [u8; 64]) -> Result<()> {
+        let key = VerifyingKey::from_bytes(&public_key).context("invalid node public key")?;
+        let signature = ed25519_dalek::Signature::from_bytes(&signature);
+        key.verify(message, &signature)
+            .context("node signature does not match")
+    }
+}
+
+fn write_private_key(path: &Path, secret: &[u8; 32]) -> Result<()> {
+    let parent = path.parent().context("node signing key has no parent")?;
+    let temporary = parent.join(format!(".node-signing.{}.tmp", Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .with_context(|| format!("create {}", temporary.display()))?;
+    std::io::Write::write_all(&mut file, secret)
+        .with_context(|| format!("write {}", temporary.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync {}", temporary.display()))?;
+    std::fs::rename(&temporary, path).with_context(|| format!("commit {}", path.display()))?;
+    protect_private_file(path)
+}
+
+fn protect_private_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("protect {}", path.display()))?;
+    }
+    Ok(())
+}
 
 /// A finch node's stable identity
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,5 +266,41 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let parsed: NodeIdentity = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.name, "my-dev-machine");
+    }
+
+    #[test]
+    fn signing_identity_survives_restart_and_rejects_other_keys() {
+        let temp = TempDir::new().unwrap();
+        let first = NodeSigningIdentity::load_or_create(temp.path()).unwrap();
+        let public_key = first.public_key_bytes();
+        let signature = first.sign(b"brain transport transcript");
+        NodeSigningIdentity::verify(public_key, b"brain transport transcript", signature).unwrap();
+
+        let restarted = NodeSigningIdentity::load_or_create(temp.path()).unwrap();
+        assert_eq!(restarted.public_key_bytes(), public_key);
+        assert_eq!(restarted.sign(b"brain transport transcript"), signature);
+
+        let other = NodeSigningIdentity::from_secret([9; 32]);
+        assert!(NodeSigningIdentity::verify(
+            other.public_key_bytes(),
+            b"brain transport transcript",
+            signature,
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signing_identity_private_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        NodeSigningIdentity::load_or_create(temp.path()).unwrap();
+        let mode = std::fs::metadata(temp.path().join(NODE_SIGNING_KEY_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
