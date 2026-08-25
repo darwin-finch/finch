@@ -749,7 +749,11 @@ still blocks the corresponding Brain phase until it is unified.
   messages in ordered binary WebSocket frames remotely; retain HTTP only for authenticated
   discovery/bootstrap. Prefer the zero-copy-friendly word-aligned encoding, use packed encoding
   only when measured bandwidth savings justify unpacking, and keep large blobs content-addressed or
-  separately streamed.
+  separately streamed. The versioned schema, closed participant-submission union, full local RPC
+  implementation, typed IPC client, snapshot-first watch, and shared transport-neutral submission
+  operation now exist. Still migrate the local TUI from its concrete HTTP client, encode remote
+  mutations with the same schema behind scoped authentication, add cross-transport conformance
+  fixtures, and then remove duplicated lifecycle HTTP routes.
 - [ ] Define Brain initialization as a reviewed typed program/module with an explicit capability
   budget and journaled effects. Deterministic VM vocabulary/module loading may occur before a
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work
