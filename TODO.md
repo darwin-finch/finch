@@ -773,9 +773,12 @@ still blocks the corresponding Brain phase until it is unified.
   same Lisp source/result in both projections. Frontend tool calls and results now cross the
   runner callback as typed Cap'n Proto lifecycle entries, persist before the final program in the
   canonical log, reconstruct provider-native tool messages after restart, and replay as grouped
-  tool rows on attached consoles without duplicating the home runner's live view. Add canonical
-  approval request/decision events next so remote history includes the remaining human-control
-  lifecycle; keep workspace execution and provider tools in the frontend runner.
+  tool rows on attached consoles without duplicating the home runner's live view. Approval
+  requests and the exact selected decision now share that ordered typed callback transcript,
+  persist as versioned canonical events attributed to the runner participant, and replay as
+  approval rows without being injected into the provider protocol. A failed or cancelled callback
+  returns and persists its partial lifecycle before the terminal Brain error; keep workspace
+  execution and provider tools in the frontend runner.
 - [ ] Complete Brain control and approval ownership above that substrate. Put the role and approval
   audience on every permission/proposal view and add scoped participant credentials. ProgramRuns
   now execute on the leased frontend, but approval/control authority still needs explicit audience,

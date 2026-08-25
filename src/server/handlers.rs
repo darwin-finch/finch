@@ -540,6 +540,8 @@ async fn push_named_brain_event(
         BrainEventKind::ProgramPopped { .. }
         | BrainEventKind::ToolCall { .. }
         | BrainEventKind::ToolResult { .. }
+        | BrainEventKind::ApprovalRequested { .. }
+        | BrainEventKind::ApprovalDecided { .. }
         | BrainEventKind::Result { .. }
         | BrainEventKind::RuntimeCommitted { .. }
         | BrainEventKind::RunnerLeaseAcquired { .. }
@@ -656,16 +658,17 @@ async fn dispatch_named_brain_turn(
 ) -> anyhow::Result<crate::brain::shared::BrainEvent> {
     let snapshot = store.snapshot(name)?;
     ensure_named_brain_store_environment(store, &snapshot)?;
-    let lease_id = snapshot
+    let lease = snapshot
         .runner_lease
         .as_ref()
         .filter(|lease| {
             lease.environment_generation == snapshot.environment.generation
                 && lease.expires_ms > crate::brain::shared::unix_millis()
         })
-        .map(|lease| lease.lease_id)
+        .cloned()
         .ok_or_else(|| anyhow::anyhow!("named Brain '{name}' has no live environment runner"))?;
-    let outcome = runners
+    let lease_id = lease.lease_id;
+    let outcome = match runners
         .dispatch_turn(
             name,
             lease_id,
@@ -673,43 +676,29 @@ async fn dispatch_named_brain_turn(
             prompt.to_string(),
             named_brain_provider_messages(&snapshot),
         )
-        .await?;
-    for tool_event in outcome.tool_events {
-        match tool_event {
-            crate::server::RunnerToolEvent::Call {
-                tool_id,
-                name: tool_name,
-                input,
-            } => {
-                store.push(
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if let Some(failure) = error.downcast_ref::<crate::server::RunnerTurnError>() {
+                persist_named_brain_turn_events(
+                    store,
                     name,
-                    "provider",
-                    crate::brain::shared::BrainEventKind::ToolCall {
-                        request_seq,
-                        tool_id,
-                        name: tool_name,
-                        input,
-                    },
+                    request_seq,
+                    &lease.subject,
+                    failure.turn_events.clone(),
                 )?;
             }
-            crate::server::RunnerToolEvent::Result {
-                tool_id,
-                output,
-                is_error,
-            } => {
-                store.push(
-                    name,
-                    "runner",
-                    crate::brain::shared::BrainEventKind::ToolResult {
-                        request_seq,
-                        tool_id,
-                        output,
-                        is_error,
-                    },
-                )?;
-            }
+            return Err(error);
         }
-    }
+    };
+    persist_named_brain_turn_events(
+        store,
+        name,
+        request_seq,
+        &lease.subject,
+        outcome.turn_events,
+    )?;
     let program = store.push(
         name,
         "provider",
@@ -727,6 +716,84 @@ async fn dispatch_named_brain_turn(
     push_named_brain_result(store, name, program.seq, Ok(outcome.output))
 }
 
+fn persist_named_brain_turn_events(
+    store: &crate::brain::shared::SharedBrainStore,
+    name: &str,
+    request_seq: u64,
+    runner_subject: &str,
+    turn_events: Vec<crate::server::RunnerTurnEvent>,
+) -> anyhow::Result<()> {
+    for turn_event in turn_events {
+        match turn_event {
+            crate::server::RunnerTurnEvent::Call {
+                tool_id,
+                name: tool_name,
+                input,
+            } => {
+                store.push(
+                    name,
+                    "provider",
+                    crate::brain::shared::BrainEventKind::ToolCall {
+                        request_seq,
+                        tool_id,
+                        name: tool_name,
+                        input,
+                    },
+                )?;
+            }
+            crate::server::RunnerTurnEvent::Result {
+                tool_id,
+                output,
+                is_error,
+            } => {
+                store.push(
+                    name,
+                    "runner",
+                    crate::brain::shared::BrainEventKind::ToolResult {
+                        request_seq,
+                        tool_id,
+                        output,
+                        is_error,
+                    },
+                )?;
+            }
+            crate::server::RunnerTurnEvent::ApprovalRequested {
+                approval_id,
+                approval_kind,
+                subject,
+                detail,
+            } => {
+                store.push(
+                    name,
+                    "runner",
+                    crate::brain::shared::BrainEventKind::ApprovalRequested {
+                        request_seq,
+                        approval_id,
+                        approval_kind,
+                        subject,
+                        detail,
+                    },
+                )?;
+            }
+            crate::server::RunnerTurnEvent::ApprovalDecided {
+                approval_id,
+                decision,
+            } => {
+                store.push(
+                    name,
+                    runner_subject,
+                    crate::brain::shared::BrainEventKind::ApprovalDecided {
+                        request_seq,
+                        approval_id,
+                        decision,
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn named_brain_provider_messages(
     snapshot: &crate::brain::shared::BrainSnapshot,
 ) -> Vec<Message> {
@@ -740,6 +807,8 @@ fn named_brain_provider_messages(
             !matches!(
                 event.kind,
                 BrainEventKind::RuntimeCommitted { .. }
+                    | BrainEventKind::ApprovalRequested { .. }
+                    | BrainEventKind::ApprovalDecided { .. }
                     | BrainEventKind::RunnerLeaseAcquired { .. }
                     | BrainEventKind::RunnerLeaseReleased { .. }
                     | BrainEventKind::ClientAttached { .. }
@@ -813,6 +882,8 @@ fn named_brain_provider_messages(
                 ))
             }
             BrainEventKind::RuntimeCommitted { .. }
+            | BrainEventKind::ApprovalRequested { .. }
+            | BrainEventKind::ApprovalDecided { .. }
             | BrainEventKind::RunnerLeaseAcquired { .. }
             | BrainEventKind::RunnerLeaseReleased { .. }
             | BrainEventKind::ClientAttached { .. }
@@ -2406,13 +2477,23 @@ mod named_brain_provider_context_tests {
                     source: source.into(),
                     language: ProgramLanguage::Lisp,
                     output: "triple defined".into(),
-                    tool_events: vec![
-                        crate::server::RunnerToolEvent::Call {
+                    turn_events: vec![
+                        crate::server::RunnerTurnEvent::Call {
                             tool_id: "tool-1".into(),
                             name: "search_word".into(),
                             input: serde_json::json!({"query": "triple"}),
                         },
-                        crate::server::RunnerToolEvent::Result {
+                        crate::server::RunnerTurnEvent::ApprovalRequested {
+                            approval_id: "tool-1".into(),
+                            approval_kind: "tool".into(),
+                            subject: "search_word".into(),
+                            detail: serde_json::json!({"input": {"query": "triple"}}),
+                        },
+                        crate::server::RunnerTurnEvent::ApprovalDecided {
+                            approval_id: "tool-1".into(),
+                            decision: serde_json::json!({"choice": "approve_once"}),
+                        },
+                        crate::server::RunnerTurnEvent::Result {
                             tool_id: "tool-1".into(),
                             output: "no matches".into(),
                             is_error: false,
@@ -2453,6 +2534,13 @@ mod named_brain_provider_context_tests {
                 BrainEventKind::ToolResult { tool_id, .. } => {
                     Some(("result", tool_id.as_str()))
                 }
+                BrainEventKind::ApprovalRequested { approval_id, .. } => {
+                    Some(("approval_requested", approval_id.as_str()))
+                }
+                BrainEventKind::ApprovalDecided { approval_id, .. } => {
+                    assert_eq!(event.sender, "runner@box.local");
+                    Some(("approval_decided", approval_id.as_str()))
+                }
                 BrainEventKind::Program { .. } if event.sender == "provider" => {
                     Some(("program", ""))
                 }
@@ -2461,8 +2549,14 @@ mod named_brain_provider_context_tests {
             .collect::<Vec<_>>();
         assert_eq!(
             kinds,
-            vec![("call", "tool-1"), ("result", "tool-1"), ("program", "")],
-            "tool lifecycle must precede the final provider program in the canonical log"
+            vec![
+                ("call", "tool-1"),
+                ("approval_requested", "tool-1"),
+                ("approval_decided", "tool-1"),
+                ("result", "tool-1"),
+                ("program", ""),
+            ],
+            "turn lifecycle must precede the final provider program in the canonical log"
         );
         assert!(snapshot.events.iter().any(|event| {
             event.seq == request_seq
@@ -2480,6 +2574,82 @@ mod named_brain_provider_context_tests {
                 } if committed == request_seq
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn failed_named_brain_turn_persists_partial_approval_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::shared::SharedBrainStore::with_root(
+            "box.local",
+            Some(temp.path().into()),
+        );
+        let prompt_seq = store
+            .push(
+                "shared",
+                "driver@box.local",
+                BrainEventKind::Prompt {
+                    text: "try an effect".into(),
+                },
+            )
+            .unwrap()
+            .seq;
+        let lease = store
+            .acquire_runner_lease(
+                "shared",
+                "runner@box.local",
+                store.environment().generation,
+                None,
+                60_000,
+            )
+            .unwrap();
+        let runners = crate::server::BrainRunnerBroker::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, tx);
+        tokio::spawn(async move {
+            let crate::server::RunnerRequest::Turn(request) = rx.recv().await.unwrap() else {
+                panic!("expected full turn request")
+            };
+            request
+                .response_tx
+                .send(Err(crate::server::RunnerTurnError {
+                    message: "provider failed after approval".into(),
+                    turn_events: vec![
+                        crate::server::RunnerTurnEvent::ApprovalRequested {
+                            approval_id: "approval-1".into(),
+                            approval_kind: "vm_capability".into(),
+                            subject: "FileRead".into(),
+                            detail: serde_json::json!({"reason": "read manifest"}),
+                        },
+                        crate::server::RunnerTurnEvent::ApprovalDecided {
+                            approval_id: "approval-1".into(),
+                            decision: serde_json::json!({"choice": "allow_once"}),
+                        },
+                    ],
+                }))
+                .unwrap();
+        });
+
+        let error = dispatch_named_brain_turn(
+            &store,
+            &runners,
+            "shared",
+            prompt_seq,
+            "try an effect",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("provider failed after approval"));
+        let snapshot = store.snapshot("shared").unwrap();
+        assert!(matches!(
+            &snapshot.events[snapshot.events.len() - 2].kind,
+            BrainEventKind::ApprovalRequested { approval_id, .. }
+                if approval_id == "approval-1"
+        ));
+        assert!(matches!(
+            &snapshot.events[snapshot.events.len() - 1].kind,
+            BrainEventKind::ApprovalDecided { approval_id, decision, .. }
+                if approval_id == "approval-1" && decision["choice"] == "allow_once"
+        ));
     }
 
     #[tokio::test]

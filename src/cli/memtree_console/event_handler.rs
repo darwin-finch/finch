@@ -59,6 +59,7 @@ impl EventHandler {
             } => {
                 self.handle_tool_result(console, *query_id, tool_id, result)?;
             }
+            ReplEvent::ToolCallsStarted { .. } => {}
 
             ReplEvent::ToolApprovalNeeded {
                 query_id, tool_use, ..

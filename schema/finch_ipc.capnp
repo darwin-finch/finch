@@ -127,24 +127,31 @@ struct BrainTurnResult {
   runtimeRevision @3 :UInt64;
   checkpointJson  @4 :Data; # Transitional typed checkpoint payload; schema becomes native later.
   error           @5 :Text;
-  toolEvents      @6 :List(BrainToolEvent);
+  turnEvents      @6 :List(BrainTurnEvent);
 }
 
-enum BrainToolEventKind {
-  call   @0;
-  result @1;
+enum BrainTurnEventKind {
+  call              @0;
+  result            @1;
+  approvalRequested @2;
+  approvalDecided   @3;
 }
 
-# Ordered provider/runner tool transcript produced while servicing one Brain
-# prompt. Arbitrary tool arguments remain JSON values at the provider API
-# boundary, but the event envelope and lifecycle are typed Cap'n Proto data.
-struct BrainToolEvent {
-  kind      @0 :BrainToolEventKind;
-  toolId    @1 :Text;
-  name      @2 :Text; # Present for call events.
-  inputJson @3 :Data; # Present for call events.
-  output    @4 :Text; # Present for result events.
-  isError   @5 :Bool; # Present for result events.
+# Ordered provider/runner lifecycle produced while servicing one Brain prompt.
+# Arbitrary provider arguments and policy details remain JSON values at their
+# respective boundaries, while the event envelope and ordering are typed.
+struct BrainTurnEvent {
+  kind         @0 :BrainTurnEventKind;
+  toolId       @1 :Text;
+  name         @2 :Text; # Present for call events.
+  inputJson    @3 :Data; # Present for call events.
+  output       @4 :Text; # Present for result events.
+  isError      @5 :Bool; # Present for result events.
+  approvalId   @6 :Text;
+  approvalKind @7 :Text; # "tool" or "vm_capability".
+  subject      @8 :Text; # Tool name or capability name.
+  detailJson   @9 :Data; # Present for approval requests.
+  decisionJson @10 :Data; # Present for approval decisions.
 }
 
 interface BrainRunner {

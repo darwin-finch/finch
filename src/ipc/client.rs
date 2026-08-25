@@ -310,6 +310,11 @@ impl brain_runner::Server for BrainRunnerImpl {
                 .await
                 .map_err(|_| capnp::Error::failed("frontend dropped runner response".into()))?;
             let mut result = results.get().init_result();
+            let turn_events = match &response {
+                Ok(response) => &response.turn_events,
+                Err(error) => &error.turn_events,
+            };
+            encode_brain_turn_events(result.reborrow(), turn_events)?;
             match response {
                 Ok(response) => {
                     result.set_source(&response.source);
@@ -322,47 +327,76 @@ impl brain_runner::Server for BrainRunnerImpl {
                         }
                     });
                     result.set_output(&response.output);
-                    let mut tool_events = result
-                        .reborrow()
-                        .init_tool_events(response.tool_events.len() as u32);
-                    for (index, event) in response.tool_events.iter().enumerate() {
-                        let mut encoded = tool_events.reborrow().get(index as u32);
-                        match event {
-                            crate::server::RunnerToolEvent::Call {
-                                tool_id,
-                                name,
-                                input,
-                            } => {
-                                encoded.set_kind(finch_ipc_capnp::BrainToolEventKind::Call);
-                                encoded.set_tool_id(tool_id);
-                                encoded.set_name(name);
-                                let input = serde_json::to_vec(input)
-                                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                                encoded.set_input_json(&input);
-                            }
-                            crate::server::RunnerToolEvent::Result {
-                                tool_id,
-                                output,
-                                is_error,
-                            } => {
-                                encoded.set_kind(finch_ipc_capnp::BrainToolEventKind::Result);
-                                encoded.set_tool_id(tool_id);
-                                encoded.set_output(output);
-                                encoded.set_is_error(*is_error);
-                            }
-                        }
-                    }
                     result.set_runtime_revision(response.runtime_revision);
                     let encoded = serde_json::to_vec(&response.checkpoint)
                         .map_err(|error| capnp::Error::failed(error.to_string()))?;
                     result.set_checkpoint_json(&encoded);
                     result.set_error("");
                 }
-                Err(error) => result.set_error(&error),
+                Err(error) => result.set_error(&error.message),
             }
             Ok(())
         })
     }
+}
+
+fn encode_brain_turn_events(
+    mut result: finch_ipc_capnp::brain_turn_result::Builder<'_>,
+    events: &[crate::server::RunnerTurnEvent],
+) -> capnp::Result<()> {
+    let mut turn_events = result.reborrow().init_turn_events(events.len() as u32);
+    for (index, event) in events.iter().enumerate() {
+        let mut encoded = turn_events.reborrow().get(index as u32);
+        match event {
+            crate::server::RunnerTurnEvent::Call {
+                tool_id,
+                name,
+                input,
+            } => {
+                encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::Call);
+                encoded.set_tool_id(tool_id);
+                encoded.set_name(name);
+                let input = serde_json::to_vec(input)
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                encoded.set_input_json(&input);
+            }
+            crate::server::RunnerTurnEvent::Result {
+                tool_id,
+                output,
+                is_error,
+            } => {
+                encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::Result);
+                encoded.set_tool_id(tool_id);
+                encoded.set_output(output);
+                encoded.set_is_error(*is_error);
+            }
+            crate::server::RunnerTurnEvent::ApprovalRequested {
+                approval_id,
+                approval_kind,
+                subject,
+                detail,
+            } => {
+                encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::ApprovalRequested);
+                encoded.set_approval_id(approval_id);
+                encoded.set_approval_kind(approval_kind);
+                encoded.set_subject(subject);
+                let detail = serde_json::to_vec(detail)
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                encoded.set_detail_json(&detail);
+            }
+            crate::server::RunnerTurnEvent::ApprovalDecided {
+                approval_id,
+                decision,
+            } => {
+                encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
+                encoded.set_approval_id(approval_id);
+                let decision = serde_json::to_vec(decision)
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                encoded.set_decision_json(&decision);
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

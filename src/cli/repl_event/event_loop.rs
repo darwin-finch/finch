@@ -203,16 +203,14 @@ pub struct EventLoop {
     /// Canonical tool calls replay into one grouped unit per Brain turn.
     remote_brain_tool_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
     remote_brain_tool_rows: std::collections::HashMap<String, usize>,
+    remote_brain_approval_rows: std::collections::HashMap<String, usize>,
 
     /// Pending tool approval requests (query_id -> (tool_use, response_tx))
     pending_approvals: PendingApprovalsMap,
 
     /// Structured approval continuation for an exact typed-VM capability
     /// request. The choices mirror the displayed rows by index.
-    pending_vm_approval: Option<(
-        tokio::sync::oneshot::Sender<crate::vm::ApprovalChoice>,
-        Vec<crate::vm::ApprovalChoice>,
-    )>,
+    pending_vm_approval: Option<PendingVmApproval>,
 
     /// IPC client — Cap'n Proto channel to the daemon.
     /// Must live inside a tokio LocalSet (capnp-rpc !Send).
@@ -428,48 +426,25 @@ struct DeferredVmApproval {
 
 struct PendingNamedBrainTurn {
     response_tx: tokio::sync::oneshot::Sender<
-        std::result::Result<crate::server::RunnerTurnResult, String>,
+        std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError>,
     >,
-    /// The daemon supplied this canonical prefix. Only later rich content
-    /// belongs to the delegated turn's tool transcript.
-    context_message_count: usize,
+    /// Exact lifecycle order observed by this frontend while servicing the
+    /// delegated turn. The daemon persists these as canonical Brain events.
+    turn_events: Vec<crate::server::RunnerTurnEvent>,
 }
 
-fn runner_tool_events_since(
-    messages: &[crate::claude::Message],
-    start: usize,
-) -> Vec<crate::server::RunnerToolEvent> {
-    messages
-        .iter()
-        .skip(start.min(messages.len()))
-        .flat_map(|message| message.content.iter())
-        .filter_map(|block| match block {
-            crate::claude::ContentBlock::ToolUse { id, name, input } => {
-                Some(crate::server::RunnerToolEvent::Call {
-                    tool_id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                })
-            }
-            crate::claude::ContentBlock::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } => Some(crate::server::RunnerToolEvent::Result {
-                tool_id: tool_use_id.clone(),
-                output: content.clone(),
-                is_error: is_error.unwrap_or(false),
-            }),
-            crate::claude::ContentBlock::Text { .. }
-            | crate::claude::ContentBlock::Image { .. } => None,
-        })
-        .collect()
+struct PendingVmApproval {
+    response_tx: tokio::sync::oneshot::Sender<crate::vm::ApprovalChoice>,
+    choices: Vec<crate::vm::ApprovalChoice>,
+    query_id: Option<Uuid>,
+    approval_id: String,
 }
 
 struct LocalBrainProjection {
     source: String,
     output: String,
     tool_ids: std::collections::HashSet<String>,
+    approval_ids: std::collections::HashSet<String>,
     program_seq: Option<u64>,
 }
 
@@ -486,6 +461,12 @@ impl LocalBrainProjection {
             crate::brain::shared::BrainEventKind::ToolCall { tool_id, .. }
             | crate::brain::shared::BrainEventKind::ToolResult { tool_id, .. }
                 if self.tool_ids.contains(tool_id) =>
+            {
+                LocalProjectionMatch::Suppress
+            }
+            crate::brain::shared::BrainEventKind::ApprovalRequested { approval_id, .. }
+            | crate::brain::shared::BrainEventKind::ApprovalDecided { approval_id, .. }
+                if self.approval_ids.contains(approval_id) =>
             {
                 LocalProjectionMatch::Suppress
             }
@@ -910,6 +891,7 @@ impl EventLoop {
             local_brain_projections: std::collections::VecDeque::new(),
             remote_brain_tool_unit: None,
             remote_brain_tool_rows: std::collections::HashMap::new(),
+            remote_brain_approval_rows: std::collections::HashMap::new(),
             pending_approvals: Arc::new(RwLock::new(std::collections::HashMap::new())),
             pending_vm_approval: None,
             ipc_client,
@@ -1219,6 +1201,7 @@ impl EventLoop {
                         ReplEvent::QueryComplete { .. } => "QueryComplete",
                         ReplEvent::QueryFailed { .. } => "QueryFailed",
                         ReplEvent::ToolResult { .. } => "ToolResult",
+                        ReplEvent::ToolCallsStarted { .. } => "ToolCallsStarted",
                         ReplEvent::ToolApprovalNeeded { .. } => "ToolApprovalNeeded",
                         ReplEvent::VmApprovalNeeded { .. } => "VmApprovalNeeded",
                         ReplEvent::OutputReady { .. } => "OutputReady",
@@ -1335,17 +1318,31 @@ impl EventLoop {
                                     tracing::debug!("[EVENT_LOOP] Brain action denied");
                                     let _ = action_tx.send(None);
                                 }
-                            } else if let Some((response_tx, choices)) =
-                                self.pending_vm_approval.take()
-                            {
+                            } else if let Some(pending) = self.pending_vm_approval.take() {
                                 let choice = match dialog_result {
-                                    crate::cli::tui::DialogResult::Selected(index) => choices
+                                    crate::cli::tui::DialogResult::Selected(index) => pending
+                                        .choices
                                         .get(index)
                                         .cloned()
                                         .unwrap_or(crate::vm::ApprovalChoice::Deny),
                                     _ => crate::vm::ApprovalChoice::Deny,
                                 };
-                                let _ = response_tx.send(choice);
+                                if let Some(query_id) = pending.query_id {
+                                    if let Some(turn) =
+                                        self.pending_named_brain_turns.get_mut(&query_id)
+                                    {
+                                        turn.turn_events.push(
+                                            crate::server::RunnerTurnEvent::ApprovalDecided {
+                                                approval_id: pending.approval_id,
+                                                decision: serde_json::to_value(&choice)
+                                                    .unwrap_or_else(|_| serde_json::json!({
+                                                        "choice": "serialization_error"
+                                                    })),
+                                            },
+                                        );
+                                    }
+                                }
+                                let _ = pending.response_tx.send(choice);
                             } else {
                                 // Find which query this dialog was for (tool approval)
                                 let mut approvals = self.pending_approvals.write().await;
@@ -1403,6 +1400,17 @@ impl EventLoop {
                                         };
                                         self.dialog_result_to_confirmation(adjusted_result, &tool_use)
                                     };
+
+                                    if let Some(turn) =
+                                        self.pending_named_brain_turns.get_mut(&query_id)
+                                    {
+                                        turn.turn_events.push(
+                                            crate::server::RunnerTurnEvent::ApprovalDecided {
+                                                approval_id: tool_use.id.clone(),
+                                                decision: confirmation_audit_value(&confirmation),
+                                            },
+                                        );
+                                    }
 
                                     // Send confirmation back to tool execution task
                                     let _ = response_tx.send(confirmation);
@@ -2717,7 +2725,10 @@ Rules:\n\
                     .write_error(format!("Query failed: {}", error));
 
                 if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
-                    let _ = pending.response_tx.send(Err(error.clone()));
+                    let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
+                        message: error.clone(),
+                        turn_events: pending.turn_events,
+                    }));
                 }
 
                 // Render TUI to ensure viewport is redrawn after error message
@@ -2754,6 +2765,21 @@ Rules:\n\
                     self.spawn_deferred_vm_approval(query_id, tool_id, approval);
                 } else {
                     self.handle_tool_result(query_id, tool_id, result).await?;
+                }
+            }
+
+            ReplEvent::ToolCallsStarted {
+                query_id,
+                tool_uses,
+            } => {
+                if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
+                    turn.turn_events.extend(tool_uses.into_iter().map(|tool_use| {
+                        crate::server::RunnerTurnEvent::Call {
+                            tool_id: tool_use.id,
+                            name: tool_use.name,
+                            input: tool_use.input,
+                        }
+                    }));
                 }
             }
 
@@ -2987,9 +3013,10 @@ Rules:\n\
                     // Clear tool-call history for cancelled query
                     self.tool_call_history.write().await.remove(&qid);
                     if let Some(pending) = self.pending_named_brain_turns.remove(&qid) {
-                        let _ = pending
-                            .response_tx
-                            .send(Err("named Brain turn cancelled by runner user".into()));
+                        let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
+                            message: "named Brain turn cancelled by runner user".into(),
+                            turn_events: pending.turn_events,
+                        }));
                     }
 
                     // If we were in plan/executing mode, cancel that too so the
@@ -3270,17 +3297,23 @@ Rules:\n\
         request: crate::server::RunnerTurnRequest,
     ) -> Result<()> {
         if request.brain != self.session_label || !self.home_runner_lease_active {
-            let _ = request.response_tx.send(Err(format!(
-                "frontend does not hold the runner lease for named Brain '{}'",
-                request.brain
-            )));
+            let _ = request.response_tx.send(Err(crate::server::RunnerTurnError {
+                message: format!(
+                    "frontend does not hold the runner lease for named Brain '{}'",
+                    request.brain
+                ),
+                turn_events: Vec::new(),
+            }));
             return Ok(());
         }
         if self.active_query_id.read().await.is_some() {
-            let _ = request.response_tx.send(Err(format!(
-                "named Brain '{}' runner is already executing a turn",
-                request.brain
-            )));
+            let _ = request.response_tx.send(Err(crate::server::RunnerTurnError {
+                message: format!(
+                    "named Brain '{}' runner is already executing a turn",
+                    request.brain
+                ),
+                turn_events: Vec::new(),
+            }));
             return Ok(());
         }
 
@@ -3292,14 +3325,13 @@ Rules:\n\
             .write()
             .await
             .restore_snapshot(context.clone());
-        let context_message_count = context.len();
         let query_id = self.query_states.create_query(context).await;
         *self.active_query_id.write().await = Some(query_id);
         self.pending_named_brain_turns.insert(
             query_id,
             PendingNamedBrainTurn {
                 response_tx: request.response_tx,
-                context_message_count,
+                turn_events: Vec::new(),
             },
         );
         self.update_compaction_status().await;
@@ -3314,9 +3346,10 @@ Rules:\n\
         {
             *self.active_query_id.write().await = None;
             if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
-                let _ = pending.response_tx.send(Err(
-                    "frontend LLM worker is unavailable".to_string(),
-                ));
+                let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
+                    message: "frontend LLM worker is unavailable".to_string(),
+                    turn_events: pending.turn_events,
+                }));
             }
         }
         Ok(())
@@ -3326,16 +3359,16 @@ Rules:\n\
         let Some(pending) = self.pending_named_brain_turns.remove(&query_id) else {
             return;
         };
+        let PendingNamedBrainTurn {
+            response_tx,
+            turn_events,
+        } = pending;
         let result = (|| -> anyhow::Result<crate::server::RunnerTurnResult> {
             let messages = self
                 .conversation
                 .try_read()
                 .map_err(|_| anyhow::anyhow!("named Brain conversation is busy"))?
                 .get_messages();
-            let tool_events = runner_tool_events_since(
-                &messages,
-                pending.context_message_count,
-            );
             let source = messages
                 .into_iter()
                 .rev()
@@ -3367,29 +3400,49 @@ Rules:\n\
                 source,
                 language,
                 output,
-                tool_events,
+                turn_events: turn_events.clone(),
                 runtime_revision,
                 checkpoint,
             })
         })()
-        .map_err(|error| error.to_string());
+        .map_err(|error| crate::server::RunnerTurnError {
+            message: error.to_string(),
+            turn_events,
+        });
         if let Ok(result) = &result {
             let tool_ids = result
-                .tool_events
+                .turn_events
                 .iter()
-                .map(|event| match event {
-                    crate::server::RunnerToolEvent::Call { tool_id, .. }
-                    | crate::server::RunnerToolEvent::Result { tool_id, .. } => tool_id.clone(),
+                .filter_map(|event| match event {
+                    crate::server::RunnerTurnEvent::Call { tool_id, .. }
+                    | crate::server::RunnerTurnEvent::Result { tool_id, .. } => {
+                        Some(tool_id.clone())
+                    }
+                    crate::server::RunnerTurnEvent::ApprovalRequested { .. }
+                    | crate::server::RunnerTurnEvent::ApprovalDecided { .. } => None,
+                })
+                .collect();
+            let approval_ids = result
+                .turn_events
+                .iter()
+                .filter_map(|event| match event {
+                    crate::server::RunnerTurnEvent::ApprovalRequested { approval_id, .. }
+                    | crate::server::RunnerTurnEvent::ApprovalDecided { approval_id, .. } => {
+                        Some(approval_id.clone())
+                    }
+                    crate::server::RunnerTurnEvent::Call { .. }
+                    | crate::server::RunnerTurnEvent::Result { .. } => None,
                 })
                 .collect();
             self.local_brain_projections.push_back(LocalBrainProjection {
                 source: result.source.clone(),
                 output: result.output.clone(),
                 tool_ids,
+                approval_ids,
                 program_seq: None,
             });
         }
-        let _ = pending.response_tx.send(result);
+        let _ = response_tx.send(result);
     }
 
     /// The editor runs outside the VM; once it finishes, resume precisely the
@@ -4070,11 +4123,76 @@ Rules:\n\
                     unit.complete_row_with_body(row, summary, body);
                 }
             }
+            BrainEventKind::ApprovalRequested {
+                approval_id,
+                approval_kind,
+                subject,
+                detail,
+                ..
+            } => {
+                if self.selected_brain_is_home()
+                    && self
+                        .local_brain_projections
+                        .front_mut()
+                        .is_some_and(|projection| {
+                            projection.observe(event) == LocalProjectionMatch::Suppress
+                        })
+                {
+                    return;
+                }
+                let unit = self
+                    .remote_brain_tool_unit
+                    .get_or_insert_with(|| self.output_manager.start_work_unit("Brain tools"));
+                let row = unit.add_row(format!("approval ({approval_kind}): {subject}"));
+                let body = serde_json::to_string_pretty(detail)
+                    .unwrap_or_else(|_| detail.to_string())
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                for line in body {
+                    unit.append_row_body_line(row, line);
+                }
+                self.remote_brain_approval_rows
+                    .insert(approval_id.clone(), row);
+            }
+            BrainEventKind::ApprovalDecided {
+                approval_id,
+                decision,
+                ..
+            } => {
+                if self.selected_brain_is_home()
+                    && self
+                        .local_brain_projections
+                        .front_mut()
+                        .is_some_and(|projection| {
+                            projection.observe(event) == LocalProjectionMatch::Suppress
+                        })
+                {
+                    return;
+                }
+                let unit = self
+                    .remote_brain_tool_unit
+                    .get_or_insert_with(|| self.output_manager.start_work_unit("Brain tools"));
+                let row = self
+                    .remote_brain_approval_rows
+                    .remove(approval_id)
+                    .unwrap_or_else(|| unit.add_row(format!("approval {approval_id}")));
+                let summary = decision
+                    .get("choice")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("decided");
+                if summary == "deny" {
+                    unit.fail_row(row, "denied");
+                } else {
+                    unit.complete_row(row, summary);
+                }
+            }
             BrainEventKind::Program { language, source } => {
                 if let Some(unit) = self.remote_brain_tool_unit.take() {
                     unit.set_complete();
                 }
                 self.remote_brain_tool_rows.clear();
+                self.remote_brain_approval_rows.clear();
                 if self.selected_brain_is_home()
                     && self
                         .local_brain_projections
@@ -4207,6 +4325,19 @@ Rules:\n\
                 (tool_id.clone(), serde_json::Value::Null, fallback, row_idx)
             })
         };
+
+        if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
+            let (output, is_error) = match &result {
+                Ok(output) => (output.clone(), false),
+                Err(error) => (error.to_string(), true),
+            };
+            turn.turn_events
+                .push(crate::server::RunnerTurnEvent::Result {
+                    tool_id: tool_id.clone(),
+                    output,
+                    is_error,
+                });
+        }
 
         // Update the row in the WorkUnit with a semantic summary + optional body
         match &result {
@@ -4886,6 +5017,16 @@ Rules:\n\
 
         tracing::debug!("[EVENT_LOOP] Requesting tool approval: {}", tool_use.name);
 
+        if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
+            turn.turn_events
+                .push(crate::server::RunnerTurnEvent::ApprovalRequested {
+                    approval_id: tool_use.id.clone(),
+                    approval_kind: "tool".to_string(),
+                    subject: tool_use.name.clone(),
+                    detail: serde_json::json!({"input": tool_use.input.clone()}),
+                });
+        }
+
         // Create approval dialog — compact 3-option style matching Claude Code UX
         let tool_name = &tool_use.name;
         let summary = tool_approval_summary(&tool_use);
@@ -4930,6 +5071,22 @@ Rules:\n\
                 "Denied a concurrent VM capability request while another approval dialog was active",
             );
             return Ok(());
+        }
+
+        let query_id = *self.active_query_id.read().await;
+        let approval_id = prompt.request.id.to_string();
+        if let Some(query_id) = query_id {
+            if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
+                turn.turn_events
+                    .push(crate::server::RunnerTurnEvent::ApprovalRequested {
+                        approval_id: approval_id.clone(),
+                        approval_kind: "vm_capability".to_string(),
+                        subject: format!("{:?}", prompt.exact.capability),
+                        detail: serde_json::to_value(&prompt).unwrap_or_else(|_| {
+                            serde_json::json!({"reason": prompt.request.reason.clone()})
+                        }),
+                    });
+            }
         }
 
         let mut choices = vec![crate::vm::ApprovalChoice::AllowOnce];
@@ -4979,7 +5136,12 @@ Rules:\n\
             prompt.request.reason, availability, exact, warning
         ));
 
-        self.pending_vm_approval = Some((response_tx, choices));
+        self.pending_vm_approval = Some(PendingVmApproval {
+            response_tx,
+            choices,
+            query_id,
+            approval_id,
+        });
         let mut tui = self.tui_renderer.lock().await;
         tui.active_dialog = Some(dialog);
         tui.pending_dialog_result = None;
@@ -5580,6 +5742,48 @@ pub(crate) fn dialog_result_to_confirmation(
     }
 }
 
+fn confirmation_audit_value(
+    confirmation: &super::events::ConfirmationResult,
+) -> serde_json::Value {
+    use super::events::ConfirmationResult;
+
+    match confirmation {
+        ConfirmationResult::ApproveOnce => serde_json::json!({"choice": "approve_once"}),
+        ConfirmationResult::ApproveExactSession(signature) => serde_json::json!({
+            "choice": "approve_exact_session",
+            "tool": signature.tool_name,
+            "context_key": signature.context_key,
+            "command": signature.command,
+            "args": signature.args,
+            "directory": signature.directory,
+        }),
+        ConfirmationResult::ApprovePatternSession(pattern) => serde_json::json!({
+            "choice": "approve_pattern_session",
+            "pattern_id": pattern.id,
+            "pattern": pattern.pattern,
+            "tool": pattern.tool_name,
+        }),
+        ConfirmationResult::ApproveExactPersistent(signature) => serde_json::json!({
+            "choice": "approve_exact_persistent",
+            "tool": signature.tool_name,
+            "context_key": signature.context_key,
+            "command": signature.command,
+            "args": signature.args,
+            "directory": signature.directory,
+        }),
+        ConfirmationResult::ApprovePatternPersistent(pattern) => serde_json::json!({
+            "choice": "approve_pattern_persistent",
+            "pattern_id": pattern.id,
+            "pattern": pattern.pattern,
+            "tool": pattern.tool_name,
+        }),
+        ConfirmationResult::ApproveWithInput(_) => {
+            serde_json::json!({"choice": "approve_with_edited_input"})
+        }
+        ConfirmationResult::Deny => serde_json::json!({"choice": "deny"}),
+    }
+}
+
 // ── Unified diff applicator ───────────────────────────────────────────────────
 //
 // A line-based applicator for the unified diff format produced by `diff -u`.
@@ -5687,61 +5891,11 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn named_brain_tool_transcript_excludes_context_and_preserves_order() {
-        let messages = vec![
-            crate::claude::Message::with_content(
-                "assistant",
-                vec![crate::claude::ContentBlock::ToolUse {
-                    id: "old".into(),
-                    name: "read".into(),
-                    input: serde_json::json!({"path": "old"}),
-                }],
-            ),
-            crate::claude::Message::with_content(
-                "assistant",
-                vec![
-                    crate::claude::ContentBlock::ToolUse {
-                        id: "one".into(),
-                        name: "search_word".into(),
-                        input: serde_json::json!({"query": "fib"}),
-                    },
-                    crate::claude::ContentBlock::ToolUse {
-                        id: "two".into(),
-                        name: "get_vm_state".into(),
-                        input: serde_json::json!({}),
-                    },
-                ],
-            ),
-            crate::claude::Message::with_content(
-                "user",
-                vec![
-                    crate::claude::ContentBlock::ToolResult {
-                        tool_use_id: "one".into(),
-                        content: "found".into(),
-                        is_error: None,
-                    },
-                    crate::claude::ContentBlock::ToolResult {
-                        tool_use_id: "two".into(),
-                        content: "denied".into(),
-                        is_error: Some(true),
-                    },
-                ],
-            ),
-            crate::claude::Message::assistant("(say \"done\")"),
-        ];
-
-        let events = super::runner_tool_events_since(&messages, 1);
-        assert_eq!(events.len(), 4);
-        assert!(matches!(
-            &events[0],
-            crate::server::RunnerToolEvent::Call { tool_id, name, .. }
-                if tool_id == "one" && name == "search_word"
-        ));
-        assert!(matches!(
-            &events[3],
-            crate::server::RunnerToolEvent::Result { tool_id, is_error: true, .. }
-                if tool_id == "two"
-        ));
+    fn approval_audit_value_preserves_the_decision_scope() {
+        let decision = super::confirmation_audit_value(
+            &super::super::events::ConfirmationResult::ApproveOnce,
+        );
+        assert_eq!(decision, serde_json::json!({"choice": "approve_once"}));
     }
 
     use super::*;
@@ -5768,6 +5922,7 @@ mod tests {
             source: "(say \"hello\")".into(),
             output: "hello".into(),
             tool_ids: std::collections::HashSet::new(),
+            approval_ids: std::collections::HashSet::new(),
             program_seq: None,
         };
         let program = brain_event(
@@ -5805,6 +5960,7 @@ mod tests {
             source: "(say \"hello\")".into(),
             output: "hello".into(),
             tool_ids: std::collections::HashSet::new(),
+            approval_ids: std::collections::HashSet::new(),
             program_seq: Some(12),
         };
         let result = brain_event(

@@ -60,6 +60,14 @@ pub enum ReplEvent {
         result: Result<String>,
     },
 
+    /// Provider-native tool calls became part of this query. The frontend
+    /// records them before execution so a delegated Brain turn preserves the
+    /// real call/approval/result ordering instead of reconstructing it later.
+    ToolCallsStarted {
+        query_id: Uuid,
+        tool_uses: Vec<ToolUse>,
+    },
+
     /// Tool approval is needed (blocking for that query only)
     ToolApprovalNeeded {
         query_id: Uuid,

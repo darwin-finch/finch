@@ -614,6 +614,10 @@ pub(super) async fn dispatch_tool_uses(
     use super::tool_display::format_tool_label;
     use tokio_util::sync::CancellationToken;
 
+    let _ = event_tx.send(ReplEvent::ToolCallsStarted {
+        query_id,
+        tool_uses: tool_uses.clone(),
+    });
     let current_mode = mode.read().await;
     for tool_use in tool_uses {
         // Loop detection: a second identical (tool, input) call for this query means

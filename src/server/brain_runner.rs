@@ -37,7 +37,7 @@ pub struct RunnerTurnRequest {
     pub request_seq: u64,
     pub prompt: String,
     pub context: Vec<crate::claude::Message>,
-    pub response_tx: oneshot::Sender<Result<RunnerTurnResult, String>>,
+    pub response_tx: oneshot::Sender<Result<RunnerTurnResult, RunnerTurnError>>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,13 +45,29 @@ pub struct RunnerTurnResult {
     pub source: String,
     pub language: ProgramLanguage,
     pub output: String,
-    pub tool_events: Vec<RunnerToolEvent>,
+    pub turn_events: Vec<RunnerTurnEvent>,
     pub runtime_revision: u64,
     pub checkpoint: crate::vm::TypedRuntimeCheckpoint,
 }
 
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
+pub struct RunnerTurnError {
+    pub message: String,
+    pub turn_events: Vec<RunnerTurnEvent>,
+}
+
+impl From<String> for RunnerTurnError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            turn_events: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum RunnerToolEvent {
+pub enum RunnerTurnEvent {
     Call {
         tool_id: String,
         name: String,
@@ -61,6 +77,16 @@ pub enum RunnerToolEvent {
         tool_id: String,
         output: String,
         is_error: bool,
+    },
+    ApprovalRequested {
+        approval_id: String,
+        approval_kind: String,
+        subject: String,
+        detail: serde_json::Value,
+    },
+    ApprovalDecided {
+        approval_id: String,
+        decision: serde_json::Value,
     },
 }
 
@@ -191,7 +217,7 @@ impl BrainRunnerBroker {
         response_rx
             .await
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
-            .map_err(anyhow::Error::msg)
+            .map_err(anyhow::Error::new)
     }
 }
 
@@ -294,7 +320,7 @@ mod tests {
                     source: "(say \"42\")".into(),
                     language: ProgramLanguage::Lisp,
                     output: "42".into(),
-                    tool_events: Vec::new(),
+                    turn_events: Vec::new(),
                     runtime_revision: 1,
                     checkpoint,
                 }))

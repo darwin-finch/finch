@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 5;
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 6;
 const BRAIN_METADATA_VERSION: u32 = 1;
 
 /// Stable identity of one durable Brain. Names are mutable human aliases;
@@ -167,6 +167,18 @@ pub enum BrainEventKind {
         tool_id: String,
         output: String,
         is_error: bool,
+    },
+    ApprovalRequested {
+        request_seq: u64,
+        approval_id: String,
+        approval_kind: String,
+        subject: String,
+        detail: serde_json::Value,
+    },
+    ApprovalDecided {
+        request_seq: u64,
+        approval_id: String,
+        decision: serde_json::Value,
     },
     Program {
         language: ProgramLanguage,
@@ -365,6 +377,8 @@ impl BrainState {
             BrainEventKind::Prompt { .. }
             | BrainEventKind::ToolCall { .. }
             | BrainEventKind::ToolResult { .. }
+            | BrainEventKind::ApprovalRequested { .. }
+            | BrainEventKind::ApprovalDecided { .. }
             | BrainEventKind::Result { .. } => {}
         }
         self.events.push(event);
@@ -687,6 +701,8 @@ impl SharedBrainStore {
                     BrainEventKind::Prompt { .. }
                         | BrainEventKind::ToolCall { .. }
                         | BrainEventKind::ToolResult { .. }
+                        | BrainEventKind::ApprovalRequested { .. }
+                        | BrainEventKind::ApprovalDecided { .. }
                         | BrainEventKind::Program { .. }
                         | BrainEventKind::ProgramPopped { .. }
                         | BrainEventKind::Result { .. }
@@ -1434,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_lifecycle_is_rebuilt_from_the_event_log() {
+    fn tool_and_approval_lifecycle_is_rebuilt_from_the_event_log() {
         let temp = tempfile::tempdir().unwrap();
         let store = SharedBrainStore::with_root("workstation.local", Some(temp.path().into()));
         store
@@ -1446,6 +1462,30 @@ mod tests {
                     tool_id: "tool-1".into(),
                     name: "search_word".into(),
                     input: serde_json::json!({"query": "fib"}),
+                },
+            )
+            .unwrap();
+        store
+            .push(
+                "finch",
+                "runner",
+                BrainEventKind::ApprovalRequested {
+                    request_seq: 1,
+                    approval_id: "tool-1".into(),
+                    approval_kind: "tool".into(),
+                    subject: "search_word".into(),
+                    detail: serde_json::json!({"input": {"query": "fib"}}),
+                },
+            )
+            .unwrap();
+        store
+            .push(
+                "finch",
+                "alice",
+                BrainEventKind::ApprovalDecided {
+                    request_seq: 1,
+                    approval_id: "tool-1".into(),
+                    decision: serde_json::json!({"choice": "approve_once"}),
                 },
             )
             .unwrap();
@@ -1471,6 +1511,16 @@ mod tests {
         ));
         assert!(matches!(
             &snapshot.events[1].kind,
+            BrainEventKind::ApprovalRequested { approval_id, subject, .. }
+                if approval_id == "tool-1" && subject == "search_word"
+        ));
+        assert!(matches!(
+            &snapshot.events[2].kind,
+            BrainEventKind::ApprovalDecided { approval_id, decision, .. }
+                if approval_id == "tool-1" && decision["choice"] == "approve_once"
+        ));
+        assert!(matches!(
+            &snapshot.events[3].kind,
             BrainEventKind::ToolResult { tool_id, output, is_error: false, .. }
                 if tool_id == "tool-1" && output == "found"
         ));

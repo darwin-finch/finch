@@ -419,10 +419,10 @@ impl finch_daemon::Server for FinchDaemonImpl {
                                         ),
                                         false,
                                     ),
-                                    Err(error) => (Err(error.to_string()), true),
+                                    Err(error) => (Err(error.to_string().into()), true),
                                 }
                             }
-                            Err(error) => (Err(error), false),
+                            Err(error) => (Err(error.into()), false),
                         };
                         let _ = request.response_tx.send(result);
                         disconnected
@@ -500,23 +500,16 @@ fn decode_runner_program_result(
 
 fn decode_runner_turn_result(
     result: capnp::Result<finch_ipc_capnp::brain_turn_result::Reader<'_>>,
-) -> Result<crate::server::RunnerTurnResult, String> {
+) -> Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError> {
     let result = result.map_err(|error| error.to_string())?;
     let error = result
         .get_error()
         .ok()
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    if !error.is_empty() {
-        return Err(error.to_string());
-    }
-    let checkpoint = serde_json::from_slice(
-        result.get_checkpoint_json().map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    let mut tool_events = Vec::new();
-    let encoded_tool_events = result.get_tool_events().map_err(|error| error.to_string())?;
-    for encoded in encoded_tool_events.iter() {
+    let mut turn_events = Vec::new();
+    let encoded_turn_events = result.get_turn_events().map_err(|error| error.to_string())?;
+    for encoded in encoded_turn_events.iter() {
         let tool_id = encoded
             .get_tool_id()
             .ok()
@@ -524,12 +517,12 @@ fn decode_runner_turn_result(
             .unwrap_or("")
             .to_string();
         match encoded.get_kind().map_err(|error| error.to_string())? {
-            finch_ipc_capnp::BrainToolEventKind::Call => {
+            finch_ipc_capnp::BrainTurnEventKind::Call => {
                 let input = serde_json::from_slice(
                     encoded.get_input_json().map_err(|error| error.to_string())?,
                 )
                 .map_err(|error| error.to_string())?;
-                tool_events.push(crate::server::RunnerToolEvent::Call {
+                turn_events.push(crate::server::RunnerTurnEvent::Call {
                     tool_id,
                     name: encoded
                         .get_name()
@@ -540,8 +533,8 @@ fn decode_runner_turn_result(
                     input,
                 });
             }
-            finch_ipc_capnp::BrainToolEventKind::Result => {
-                tool_events.push(crate::server::RunnerToolEvent::Result {
+            finch_ipc_capnp::BrainTurnEventKind::Result => {
+                turn_events.push(crate::server::RunnerTurnEvent::Result {
                     tool_id,
                     output: encoded
                         .get_output()
@@ -552,8 +545,62 @@ fn decode_runner_turn_result(
                     is_error: encoded.get_is_error(),
                 });
             }
+            finch_ipc_capnp::BrainTurnEventKind::ApprovalRequested => {
+                let detail = serde_json::from_slice(
+                    encoded.get_detail_json().map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                turn_events.push(crate::server::RunnerTurnEvent::ApprovalRequested {
+                    approval_id: encoded
+                        .get_approval_id()
+                        .ok()
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string(),
+                    approval_kind: encoded
+                        .get_approval_kind()
+                        .ok()
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string(),
+                    subject: encoded
+                        .get_subject()
+                        .ok()
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string(),
+                    detail,
+                });
+            }
+            finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided => {
+                let decision = serde_json::from_slice(
+                    encoded
+                        .get_decision_json()
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                turn_events.push(crate::server::RunnerTurnEvent::ApprovalDecided {
+                    approval_id: encoded
+                        .get_approval_id()
+                        .ok()
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string(),
+                    decision,
+                });
+            }
         }
     }
+    if !error.is_empty() {
+        return Err(crate::server::RunnerTurnError {
+            message: error.to_string(),
+            turn_events,
+        });
+    }
+    let checkpoint = serde_json::from_slice(
+        result.get_checkpoint_json().map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(crate::server::RunnerTurnResult {
         source: result
             .get_source()
@@ -570,7 +617,7 @@ fn decode_runner_turn_result(
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string(),
-        tool_events,
+        turn_events,
         runtime_revision: result.get_runtime_revision(),
         checkpoint,
     })
@@ -581,7 +628,7 @@ mod tests {
     use super::{decode_runner_turn_result, execute_typed_forth_ipc};
 
     #[test]
-    fn runner_turn_result_decodes_ordered_capnp_tool_events() {
+    fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
         let runtime = crate::runtime::ProgramRuntime::new();
         let checkpoint = runtime
             .revision_history()
@@ -601,14 +648,26 @@ mod tests {
             result.set_runtime_revision(1);
             result.set_checkpoint_json(&checkpoint_json);
             result.set_error("");
-            let mut events = result.init_tool_events(2);
+            let mut events = result.init_turn_events(4);
             let mut call = events.reborrow().get(0);
-            call.set_kind(super::finch_ipc_capnp::BrainToolEventKind::Call);
+            call.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::Call);
             call.set_tool_id("tool-1");
             call.set_name("search_word");
             call.set_input_json(br#"{"query":"fib"}"#);
-            let mut tool_result = events.reborrow().get(1);
-            tool_result.set_kind(super::finch_ipc_capnp::BrainToolEventKind::Result);
+            let mut approval = events.reborrow().get(1);
+            approval.set_kind(
+                super::finch_ipc_capnp::BrainTurnEventKind::ApprovalRequested,
+            );
+            approval.set_approval_id("tool-1");
+            approval.set_approval_kind("tool");
+            approval.set_subject("search_word");
+            approval.set_detail_json(br#"{"input":{"query":"fib"}}"#);
+            let mut decision = events.reborrow().get(2);
+            decision.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
+            decision.set_approval_id("tool-1");
+            decision.set_decision_json(br#"{"choice":"approve_once"}"#);
+            let mut tool_result = events.reborrow().get(3);
+            tool_result.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::Result);
             tool_result.set_tool_id("tool-1");
             tool_result.set_output("found");
             tool_result.set_is_error(false);
@@ -619,19 +678,57 @@ mod tests {
             .unwrap();
         let decoded = decode_runner_turn_result(Ok(reader)).unwrap();
         assert_eq!(
-            decoded.tool_events,
+            decoded.turn_events,
             vec![
-                crate::server::RunnerToolEvent::Call {
+                crate::server::RunnerTurnEvent::Call {
                     tool_id: "tool-1".into(),
                     name: "search_word".into(),
                     input: serde_json::json!({"query": "fib"}),
                 },
-                crate::server::RunnerToolEvent::Result {
+                crate::server::RunnerTurnEvent::ApprovalRequested {
+                    approval_id: "tool-1".into(),
+                    approval_kind: "tool".into(),
+                    subject: "search_word".into(),
+                    detail: serde_json::json!({"input": {"query": "fib"}}),
+                },
+                crate::server::RunnerTurnEvent::ApprovalDecided {
+                    approval_id: "tool-1".into(),
+                    decision: serde_json::json!({"choice": "approve_once"}),
+                },
+                crate::server::RunnerTurnEvent::Result {
                     tool_id: "tool-1".into(),
                     output: "found".into(),
                     is_error: false,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn runner_turn_error_keeps_partial_lifecycle() {
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut result = message
+                .init_root::<super::finch_ipc_capnp::brain_turn_result::Builder>();
+            result.set_error("provider failed after approval");
+            let mut events = result.init_turn_events(1);
+            let mut decision = events.reborrow().get(0);
+            decision.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
+            decision.set_approval_id("approval-1");
+            decision.set_decision_json(br#"{"choice":"deny"}"#);
+        }
+
+        let reader = message
+            .get_root_as_reader::<super::finch_ipc_capnp::brain_turn_result::Reader>()
+            .unwrap();
+        let error = decode_runner_turn_result(Ok(reader)).unwrap_err();
+        assert_eq!(error.message, "provider failed after approval");
+        assert_eq!(
+            error.turn_events,
+            vec![crate::server::RunnerTurnEvent::ApprovalDecided {
+                approval_id: "approval-1".into(),
+                decision: serde_json::json!({"choice": "deny"}),
+            }]
         );
     }
 
