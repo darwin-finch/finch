@@ -805,6 +805,9 @@ struct BrainProgramRequest {
   interaction @5 :BrainProgramInteraction;
   hasGrantCeiling @6 :Bool;
   grantCeiling @7 :List(CapabilityRequirement);
+  # Reverse host bridge bound by the daemon to this exact authenticated run.
+  # The runner never receives or supplies participant attachment credentials.
+  control @8 :BrainProgramControl;
 }
 
 enum BrainProgramInteraction {
@@ -896,6 +899,23 @@ interface BrainRunner {
   runTurn    @1 (request :BrainTurnRequest) -> (result :BrainTurnResult);
   cancelRun  @2 (brain :Text, runId :Text) -> (cancelled :Bool, error :Text);
   projectMemory @3 (request :BrainMemoryProjectionRequest) -> (inserted :UInt32, error :Text);
+}
+
+# Per-program reverse capability for durable host state owned by a Brain run.
+# The daemon binds creator identity and authority to the run before handing this
+# capability to the frontend runner.
+interface BrainProgramControl {
+  createSchedule @0 (language :ProgramLanguage,
+                     source :Text,
+                     grantCeiling :List(CapabilityRequirement),
+                     nextDueMs :UInt64,
+                     hasIntervalMs :Bool,
+                     intervalMs :UInt64,
+                     policy :BrainScheduleDeliveryPolicy) ->
+                    (schedule :BrainSchedule);
+  inspectSchedule @1 (scheduleId :Text) ->
+                     (found :Bool, schedule :BrainSchedule);
+  cancelSchedule @2 (scheduleId :Text) -> (cancelled :Bool);
 }
 
 # Per-turn reverse capability. The runner publishes an addressed approval and

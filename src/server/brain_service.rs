@@ -127,6 +127,87 @@ impl BrainLifecycleService {
         self.store.inspect_schedule(brain, schedule_id)
     }
 
+    fn schedule_principal_for_run(
+        &self,
+        brain: &str,
+        run_id: RunId,
+        request_seq: u64,
+    ) -> Result<BrainRun> {
+        let run = self.inspect_run(brain, run_id)?;
+        ensure!(
+            run.request_seq == request_seq,
+            "schedule callback does not match the Brain run request"
+        );
+        ensure!(
+            matches!(
+                run.status,
+                BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
+            ),
+            "schedule callback is no longer active for this Brain run"
+        );
+        Ok(run)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_schedule_for_run(
+        &self,
+        brain: &str,
+        run_id: RunId,
+        request_seq: u64,
+        maximum_grant_ceiling: Option<&crate::vm::EffectSet>,
+        language: ProgramLanguage,
+        source: String,
+        grant_ceiling: crate::vm::EffectSet,
+        next_due_ms: u64,
+        interval_ms: Option<u64>,
+        delivery_policy: BrainScheduleDeliveryPolicy,
+    ) -> Result<BrainSchedule> {
+        let run = self.schedule_principal_for_run(brain, run_id, request_seq)?;
+        if let Some(maximum) = maximum_grant_ceiling {
+            ensure!(
+                maximum.grants(&grant_ceiling),
+                "a scheduled Brain run cannot create a schedule with broader authority"
+            );
+        }
+        self.store.create_schedule(
+            brain,
+            &run.initiated_by,
+            run.initiating_attachment_id,
+            language,
+            source,
+            grant_ceiling,
+            next_due_ms,
+            interval_ms,
+            delivery_policy,
+        )
+    }
+
+    pub fn inspect_schedule_for_run(
+        &self,
+        brain: &str,
+        run_id: RunId,
+        request_seq: u64,
+        schedule_id: ScheduleId,
+    ) -> Result<Option<BrainSchedule>> {
+        let run = self.schedule_principal_for_run(brain, run_id, request_seq)?;
+        Ok(self
+            .store
+            .inspect_schedule(brain, schedule_id)?
+            .filter(|schedule| schedule.created_by == run.initiated_by))
+    }
+
+    pub fn cancel_schedule_for_run(
+        &self,
+        brain: &str,
+        run_id: RunId,
+        request_seq: u64,
+        schedule_id: ScheduleId,
+    ) -> Result<bool> {
+        let run = self.schedule_principal_for_run(brain, run_id, request_seq)?;
+        self.store
+            .cancel_schedule(brain, &run.initiated_by, schedule_id)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_schedule(
         &self,
@@ -752,6 +833,130 @@ mod tests {
             .unwrap()
             .unwrap()
             .active);
+    }
+
+    #[tokio::test]
+    async fn program_schedule_control_is_run_scoped_creator_bound_and_attenuated() {
+        let service = service();
+        let alice = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let alice_connection = alice.connection_id.unwrap();
+        service
+            .watch("shared", alice.attachment_id, alice_connection)
+            .unwrap();
+        let bob = service
+            .attach("shared", "bob", AttachmentRole::Driver, None)
+            .unwrap();
+        let bob_connection = bob.connection_id.unwrap();
+        service
+            .watch("shared", bob.attachment_id, bob_connection)
+            .unwrap();
+        let request = service
+            .store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Program {
+                    language: ProgramLanguage::Lisp,
+                    source: "(say \"now\")".into(),
+                },
+            )
+            .unwrap();
+        let run = service
+            .start_run_with_parent(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                request.seq,
+                alice.attachment_id,
+                BrainRunStatus::Running,
+                None,
+            )
+            .unwrap();
+        let maximum = crate::vm::EffectSet::from_requirement(
+            crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::VmRead,
+                selector: crate::vm::ResourceSelector::None,
+            },
+        );
+        let broader = maximum.union(&crate::vm::EffectSet::from_requirement(
+            crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::NetworkConnect,
+                selector: crate::vm::ResourceSelector::Network {
+                    host: "example.com".into(),
+                    ports: vec![443],
+                },
+            },
+        ));
+        assert!(service
+            .create_schedule_for_run(
+                "shared",
+                run.run_id,
+                request.seq,
+                Some(&maximum),
+                ProgramLanguage::Lisp,
+                "(say \"too broad\")".into(),
+                broader,
+                100,
+                None,
+                BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("broader authority"));
+
+        let own = service
+            .create_schedule_for_run(
+                "shared",
+                run.run_id,
+                request.seq,
+                Some(&maximum),
+                ProgramLanguage::Lisp,
+                "(say \"later\")".into(),
+                maximum.clone(),
+                100,
+                None,
+                BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        assert_eq!(own.created_by, "alice");
+        assert_eq!(own.initiating_attachment_id, alice.attachment_id);
+
+        let foreign = service
+            .create_schedule(
+                "shared",
+                bob.attachment_id,
+                bob_connection,
+                ProgramLanguage::Lisp,
+                "(say \"bob\")".into(),
+                crate::vm::EffectSet::pure(),
+                100,
+                None,
+                BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        assert!(service
+            .inspect_schedule_for_run("shared", run.run_id, request.seq, foreign.schedule_id)
+            .unwrap()
+            .is_none());
+        assert!(service
+            .cancel_schedule_for_run("shared", run.run_id, request.seq, foreign.schedule_id)
+            .is_err());
+
+        service
+            .store
+            .transition_run(
+                "shared",
+                "daemon",
+                run.run_id,
+                BrainRunStatus::Completed,
+                None,
+            )
+            .unwrap();
+        assert!(service
+            .inspect_schedule_for_run("shared", run.run_id, request.seq, own.schedule_id)
+            .is_err());
     }
 
     #[tokio::test]

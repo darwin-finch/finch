@@ -118,6 +118,7 @@ pub type TypedEffectSink = Arc<dyn Fn(VmEffectEnvelope) + Send + Sync>;
 pub enum DeferredHostEffects {
     None,
     ProgramInvocations,
+    Schedules,
     AllAwaited,
 }
 
@@ -128,6 +129,12 @@ impl DeferredHostEffects {
             Self::ProgramInvocations => {
                 effect.requirement.capability == crate::vm::CapabilityKind::ProgramInvoke
             }
+            Self::Schedules => matches!(
+                effect.requirement.capability,
+                crate::vm::CapabilityKind::ScheduleCreate
+                    | crate::vm::CapabilityKind::ScheduleRead
+                    | crate::vm::CapabilityKind::ScheduleManage
+            ),
             Self::AllAwaited => true,
         }
     }
@@ -1299,7 +1306,7 @@ impl ProgramRuntime {
         Ok(())
     }
 
-    fn effective_grants_for(
+    pub(crate) fn effective_grants_for(
         &self,
         caller: Option<&scheduler::AgentIdentity>,
     ) -> Result<EffectSet> {
@@ -2678,6 +2685,26 @@ impl ProgramRuntime {
             None,
             DeferredHostEffects::None,
             Some(grant_ceiling),
+        )
+        .await
+    }
+
+    /// Run one named-Brain program with schedule effects delegated to the
+    /// attached Brain service. An optional ceiling is the persisted authority
+    /// of an unattended scheduled run; interactive runs pass `None` and
+    /// capture their live grants only when a schedule is actually created.
+    pub(crate) async fn submit_typed_only_with_deferred_schedule_effects(
+        &self,
+        submission: ProgramSubmission,
+        effect_sink: TypedEffectSink,
+        grant_ceiling: Option<EffectSet>,
+    ) -> Result<ExecutionOutcome> {
+        self.submit_as_with_optional_typed_effect_sink(
+            submission,
+            None,
+            Some(effect_sink),
+            DeferredHostEffects::Schedules,
+            grant_ceiling,
         )
         .await
     }
@@ -7432,6 +7459,61 @@ mod tests {
                 state: crate::vm::EffectJournalState::Acknowledged { values },
                 ..
             }) if values == &vec![TypedValue::Bytes(b"from external event loop".to_vec())]
+        ));
+    }
+
+    #[tokio::test]
+    async fn named_brain_schedule_submission_defers_only_the_schedule_host_result() {
+        let runtime = ProgramRuntime::new();
+        let requirement = crate::vm::CapabilityRequirement {
+            capability: crate::vm::CapabilityKind::ScheduleCreate,
+            selector: crate::vm::ResourceSelector::Schedule { policy: None },
+        };
+        runtime.grant_typed_capability(requirement.clone()).unwrap();
+        let (sink, receiver) = typed_effect_channel();
+        let pending = runtime
+            .submit_typed_only_with_deferred_schedule_effects(
+                submission(
+                    ProgramLanguage::Lisp,
+                    "(schedule-create \"(say \\\"later\\\")\" 1770000000)",
+                    ExecutionEffect::Unclassified,
+                ),
+                sink,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.status, ExecutionStatus::Suspended);
+        let envelope = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(envelope.execution_id, pending.execution_id);
+        assert_eq!(envelope.effect.requirement, requirement);
+        assert!(matches!(
+            envelope.effect.event,
+            crate::vm::HostSideEffect::Request { ref arguments }
+                if matches!(arguments.as_slice(),
+                    [TypedValue::String(_), TypedValue::Int(1770000000)])
+        ));
+
+        let completed = runtime
+            .resume_vm_effect(VmResume {
+                execution_id: envelope.execution_id,
+                sequence: envelope.effect.sequence,
+                response: VmResumeResponse::Result {
+                    values: vec![TypedValue::Resource {
+                        kind: "schedule".into(),
+                        handle: uuid::Uuid::new_v4().to_string(),
+                        generation: 0,
+                    }],
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ExecutionStatus::Completed);
+        assert!(matches!(
+            completed.values.as_slice(),
+            [ProgramValue::Resource { kind, .. }] if kind == "schedule"
         ));
     }
 

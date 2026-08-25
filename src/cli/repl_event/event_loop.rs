@@ -539,6 +539,204 @@ struct PendingNamedBrainTurn {
     >,
 }
 
+async fn resume_named_brain_program_boundaries(
+    runtime: &crate::runtime::ProgramRuntime,
+    event_tx: mpsc::UnboundedSender<ReplEvent>,
+    control_tx: Option<
+        mpsc::UnboundedSender<crate::server::RunnerProgramControlRequest>,
+    >,
+    language: crate::brain::store::ProgramLanguage,
+    interaction: crate::server::RunnerProgramInteraction,
+    fixed_grant_ceiling: Option<crate::vm::EffectSet>,
+    effects: std::sync::mpsc::Receiver<crate::runtime::VmEffectEnvelope>,
+    mut outcome: crate::runtime::outcome::ExecutionOutcome,
+) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
+    loop {
+        outcome = match interaction {
+            crate::server::RunnerProgramInteraction::Interactive => {
+                super::query_processor::resume_interactive_boundaries(
+                    runtime,
+                    event_tx.clone(),
+                    outcome,
+                )
+                .await?
+            }
+            crate::server::RunnerProgramInteraction::Noninteractive => {
+                super::query_processor::resume_noninteractive_boundaries(runtime, outcome).await?
+            }
+        };
+        let Some(crate::runtime::PendingTypedExecutionInfo {
+            reason:
+                crate::runtime::PendingTypedReason::AwaitingHostEffect { requirement },
+            resume_effect_sequence: Some(sequence),
+            ..
+        }) = runtime.pending_typed_execution(outcome.execution_id)?
+        else {
+            return Ok(outcome);
+        };
+        if !matches!(
+            requirement.capability,
+            crate::vm::CapabilityKind::ScheduleCreate
+                | crate::vm::CapabilityKind::ScheduleRead
+                | crate::vm::CapabilityKind::ScheduleManage
+        ) {
+            return Ok(outcome);
+        }
+        let envelope = loop {
+            let envelope = match effects.try_recv() {
+                Ok(envelope) => envelope,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    anyhow::bail!("named Brain schedule effect stream closed")
+                }
+            };
+            if envelope.execution_id == outcome.execution_id
+                && envelope.effect.sequence == sequence
+            {
+                break envelope;
+            }
+        };
+        let response = match &control_tx {
+            Some(control_tx) => match execute_named_brain_schedule_effect(
+                runtime,
+                control_tx,
+                language,
+                fixed_grant_ceiling.as_ref(),
+                &envelope.effect,
+            )
+            .await
+            {
+                Ok(values) => crate::runtime::VmResumeResponse::Result { values },
+                Err(error) => crate::runtime::VmResumeResponse::Denied {
+                    reason: error.to_string(),
+                },
+            },
+            None => crate::runtime::VmResumeResponse::Denied {
+                reason: "named Brain schedule service is unavailable".into(),
+            },
+        };
+        outcome = runtime
+            .resume_vm_effect(crate::runtime::VmResume {
+                execution_id: envelope.execution_id,
+                sequence: envelope.effect.sequence,
+                response,
+            })
+            .await?;
+    }
+}
+
+async fn execute_named_brain_schedule_effect(
+    runtime: &crate::runtime::ProgramRuntime,
+    control_tx: &mpsc::UnboundedSender<crate::server::RunnerProgramControlRequest>,
+    language: crate::brain::store::ProgramLanguage,
+    fixed_grant_ceiling: Option<&crate::vm::EffectSet>,
+    effect: &crate::vm::VmSideEffect,
+) -> anyhow::Result<Vec<crate::vm::TypedValue>> {
+    let crate::vm::HostSideEffect::Request { arguments } = &effect.event else {
+        anyhow::bail!("schedule boundary did not carry a host request");
+    };
+    match effect.requirement.capability {
+        crate::vm::CapabilityKind::ScheduleCreate => {
+            let [crate::vm::TypedValue::String(source), crate::vm::TypedValue::Int(timestamp)] =
+                arguments.as_slice()
+            else {
+                anyhow::bail!("schedule-create requires a callback and Unix timestamp");
+            };
+            let next_due_ms = u64::try_from(*timestamp)
+                .ok()
+                .and_then(|timestamp| timestamp.checked_mul(1_000))
+                .ok_or_else(|| anyhow::anyhow!("schedule timestamp is outside the supported range"))?;
+            let grant_ceiling = match fixed_grant_ceiling {
+                Some(grant_ceiling) => grant_ceiling.clone(),
+                None => runtime.effective_grants_for(None)?,
+            };
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            control_tx
+                .send(crate::server::RunnerProgramControlRequest::CreateSchedule {
+                    language,
+                    source: source.clone(),
+                    grant_ceiling,
+                    next_due_ms,
+                    interval_ms: None,
+                    delivery_policy:
+                        crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce,
+                    response_tx,
+                })
+                .map_err(|_| anyhow::anyhow!("named Brain schedule control disconnected"))?;
+            let schedule = response_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("named Brain schedule response was dropped"))?
+                .map_err(anyhow::Error::msg)?;
+            Ok(vec![crate::vm::TypedValue::Resource {
+                kind: "schedule".into(),
+                handle: schedule.schedule_id.0.to_string(),
+                generation: 0,
+            }])
+        }
+        crate::vm::CapabilityKind::ScheduleRead => {
+            let schedule_id = schedule_id_argument(arguments)?;
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            control_tx
+                .send(crate::server::RunnerProgramControlRequest::InspectSchedule {
+                    schedule_id,
+                    response_tx,
+                })
+                .map_err(|_| anyhow::anyhow!("named Brain schedule control disconnected"))?;
+            let schedule = response_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("named Brain schedule response was dropped"))?
+                .map_err(anyhow::Error::msg)?;
+            let value = schedule.map(|schedule| {
+                serde_json::json!({
+                    "id": schedule.schedule_id.0,
+                    "created_by": schedule.created_by,
+                    "language": match schedule.language {
+                        crate::brain::store::ProgramLanguage::Forth => "forth",
+                        crate::brain::store::ProgramLanguage::Lisp => "lisp",
+                    },
+                    "next_due_ms": schedule.next_due_ms,
+                    "interval_ms": schedule.interval_ms,
+                    "active": schedule.active,
+                })
+            });
+            Ok(vec![crate::vm::TypedValue::Option {
+                inner_type: crate::vm::Type::Json,
+                value: value.map(|value| Box::new(crate::vm::TypedValue::Json(value))),
+            }])
+        }
+        crate::vm::CapabilityKind::ScheduleManage => {
+            let schedule_id = schedule_id_argument(arguments)?;
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            control_tx
+                .send(crate::server::RunnerProgramControlRequest::CancelSchedule {
+                    schedule_id,
+                    response_tx,
+                })
+                .map_err(|_| anyhow::anyhow!("named Brain schedule control disconnected"))?;
+            Ok(vec![crate::vm::TypedValue::Bool(
+                response_rx
+                    .await
+                    .map_err(|_| anyhow::anyhow!("named Brain schedule response was dropped"))?
+                    .map_err(anyhow::Error::msg)?,
+            )])
+        }
+        _ => anyhow::bail!("effect is not a named Brain schedule operation"),
+    }
+}
+
+fn schedule_id_argument(
+    arguments: &[crate::vm::TypedValue],
+) -> anyhow::Result<crate::brain::store::ScheduleId> {
+    let [crate::vm::TypedValue::Resource { kind, handle, .. }] = arguments else {
+        anyhow::bail!("schedule operation requires one schedule resource");
+    };
+    anyhow::ensure!(kind == "schedule", "resource is not a schedule");
+    Ok(crate::brain::store::ScheduleId(uuid::Uuid::parse_str(handle)?))
+}
+
 #[derive(Clone)]
 struct RemoteBrainApproval {
     client: crate::brain::remote::AttachedBrainClient,
@@ -3527,8 +3725,9 @@ Rules:\n\
         let cancel = tokio_util::sync::CancellationToken::new();
         self.pending_named_brain_programs
             .insert(run_id, cancel.clone());
-        tokio::spawn(async move {
-            let language = match request.language {
+        tokio::task::spawn_local(async move {
+            let brain_language = request.language;
+            let language = match brain_language {
                 crate::brain::store::ProgramLanguage::Forth => {
                     crate::programs::ProgramLanguage::Forth
                 }
@@ -3551,34 +3750,29 @@ Rules:\n\
                 budget: None,
             };
             let execution = async {
-                let outcome = match request.grant_ceiling.clone() {
-                    Some(grant_ceiling) => {
-                        runtime
-                            .submit_typed_only_with_grant_ceiling(submission, grant_ceiling)
-                            .await
-                    }
-                    None => runtime.submit_typed_only(submission).await,
-                }
-                .map_err(|error| crate::server::RunnerProgramError::from(error.to_string()))?;
+                let fixed_grant_ceiling = request.grant_ceiling.clone();
+                let (effect_sink, effect_rx) = crate::runtime::typed_effect_channel();
+                let outcome = runtime
+                    .submit_typed_only_with_deferred_schedule_effects(
+                        submission,
+                        effect_sink,
+                        fixed_grant_ceiling.clone(),
+                    )
+                    .await
+                    .map_err(|error| crate::server::RunnerProgramError::from(error.to_string()))?;
                 let execution_id = outcome.execution_id;
                 let mut resumed = Box::pin(async {
-                    match request.interaction {
-                        crate::server::RunnerProgramInteraction::Interactive => {
-                            super::query_processor::resume_interactive_boundaries(
-                                runtime.as_ref(),
-                                event_tx.clone(),
-                                outcome,
-                            )
-                            .await
-                        }
-                        crate::server::RunnerProgramInteraction::Noninteractive => {
-                            super::query_processor::resume_noninteractive_boundaries(
-                                runtime.as_ref(),
-                                outcome,
-                            )
-                            .await
-                        }
-                    }
+                    resume_named_brain_program_boundaries(
+                        runtime.as_ref(),
+                        event_tx.clone(),
+                        request.control_tx,
+                        brain_language,
+                        request.interaction,
+                        fixed_grant_ceiling,
+                        effect_rx,
+                        outcome,
+                    )
+                    .await
                 });
                 let outcome = tokio::select! {
                     biased;
@@ -6740,6 +6934,83 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn named_brain_schedule_effect_uses_the_run_scoped_control_proxy() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+        let schedule_id = crate::brain::store::ScheduleId(uuid::Uuid::new_v4());
+        tokio::spawn(async move {
+            let crate::server::RunnerProgramControlRequest::CreateSchedule {
+                language,
+                source,
+                grant_ceiling,
+                next_due_ms,
+                interval_ms,
+                delivery_policy,
+                response_tx,
+            } = control_rx.recv().await.unwrap()
+            else {
+                panic!("expected schedule creation")
+            };
+            assert_eq!(language, crate::brain::store::ProgramLanguage::Lisp);
+            assert_eq!(source, "(say \"later\")");
+            assert!(grant_ceiling.is_pure());
+            assert_eq!(next_due_ms, 1_770_000_000_000);
+            assert_eq!(interval_ms, None);
+            assert_eq!(
+                delivery_policy,
+                crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce
+            );
+            response_tx
+                .send(Ok(crate::brain::store::BrainSchedule {
+                    schedule_id,
+                    initiating_attachment_id: crate::brain::store::AttachmentId(
+                        uuid::Uuid::new_v4(),
+                    ),
+                    created_by: "alice".into(),
+                    grant_ceiling,
+                    language,
+                    source,
+                    next_due_ms,
+                    interval_ms,
+                    delivery_policy,
+                    active: true,
+                }))
+                .unwrap();
+        });
+        let effect = crate::vm::VmSideEffect {
+            protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+            sequence: 1,
+            requirement: crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::ScheduleCreate,
+                selector: crate::vm::ResourceSelector::Schedule { policy: None },
+            },
+            event: crate::vm::HostSideEffect::Request {
+                arguments: vec![
+                    crate::vm::TypedValue::String("(say \"later\")".into()),
+                    crate::vm::TypedValue::Int(1_770_000_000),
+                ],
+            },
+            output: vec![crate::vm::Type::Resource("schedule".into())],
+            origin: crate::vm::SourceOrigin::generated("schedule-create"),
+        };
+
+        let values = super::execute_named_brain_schedule_effect(
+            &runtime,
+            &control_tx,
+            crate::brain::store::ProgramLanguage::Lisp,
+            Some(&crate::vm::EffectSet::pure()),
+            &effect,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            values.as_slice(),
+            [crate::vm::TypedValue::Resource { kind, handle, .. }]
+                if kind == "schedule" && handle == &schedule_id.0.to_string()
+        ));
+    }
+
     #[test]
     fn approval_audit_value_preserves_the_decision_scope() {
         let decision = super::confirmation_audit_value(

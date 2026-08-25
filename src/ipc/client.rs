@@ -644,6 +644,120 @@ impl brain_runner::Server for BrainRunnerImpl {
             }
             Err(error) => return Promise::err(error.into()),
         };
+        let control = match request.get_control() {
+            Ok(control) => control,
+            Err(error) => return Promise::err(error),
+        };
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<
+            crate::server::RunnerProgramControlRequest,
+        >();
+        tokio::task::spawn_local(async move {
+            while let Some(request) = control_rx.recv().await {
+                match request {
+                    crate::server::RunnerProgramControlRequest::CreateSchedule {
+                        language,
+                        source,
+                        grant_ceiling,
+                        next_due_ms,
+                        interval_ms,
+                        delivery_policy,
+                        response_tx,
+                    } => {
+                        let result = async {
+                            let mut call = control.create_schedule_request();
+                            {
+                                let mut params = call.get();
+                                params.set_language(match language {
+                                    crate::brain::store::ProgramLanguage::Forth => {
+                                        finch_ipc_capnp::ProgramLanguage::Forth
+                                    }
+                                    crate::brain::store::ProgramLanguage::Lisp => {
+                                        finch_ipc_capnp::ProgramLanguage::Lisp
+                                    }
+                                });
+                                params.set_source(&source);
+                                crate::ipc::checkpoint_codec::encode_effects(
+                                    params.reborrow().init_grant_ceiling(
+                                        grant_ceiling.0.len() as u32,
+                                    ),
+                                    &grant_ceiling,
+                                );
+                                params.set_next_due_ms(next_due_ms);
+                                if let Some(interval_ms) = interval_ms {
+                                    params.set_has_interval_ms(true);
+                                    params.set_interval_ms(interval_ms);
+                                }
+                                let mut policy = params.reborrow().init_policy();
+                                match delivery_policy {
+                                    crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce => {
+                                        policy.set_kind(
+                                            finch_ipc_capnp::BrainSchedulePolicyKind::Coalesce,
+                                        );
+                                    }
+                                    crate::brain::store::BrainScheduleDeliveryPolicy::BoundedCatchUp {
+                                        max_catch_up,
+                                        expires_after_ms,
+                                    } => {
+                                        policy.set_kind(
+                                            finch_ipc_capnp::BrainSchedulePolicyKind::BoundedCatchUp,
+                                        );
+                                        policy.set_max_catch_up(max_catch_up);
+                                        policy.set_expires_after_ms(expires_after_ms);
+                                    }
+                                }
+                            }
+                            let reply = call.send().promise.await?;
+                            crate::ipc::brain_codec::decode_schedule(
+                                reply.get()?.get_schedule()?,
+                            )
+                            .map_err(|error| capnp::Error::failed(error.to_string()))
+                        }
+                        .await
+                        .map_err(|error| error.to_string());
+                        let _ = response_tx.send(result);
+                    }
+                    crate::server::RunnerProgramControlRequest::InspectSchedule {
+                        schedule_id,
+                        response_tx,
+                    } => {
+                        let result = async {
+                            let mut call = control.inspect_schedule_request();
+                            call.get().set_schedule_id(&schedule_id.0.to_string());
+                            let reply = call.send().promise.await?;
+                            let reply = reply.get()?;
+                            reply
+                                .get_found()
+                                .then(|| {
+                                    reply
+                                        .get_schedule()
+                                        .map_err(anyhow::Error::from)
+                                        .and_then(crate::ipc::brain_codec::decode_schedule)
+                                })
+                                .transpose()
+                                .map_err(|error| capnp::Error::failed(error.to_string()))
+                        }
+                        .await
+                        .map_err(|error| error.to_string());
+                        let _ = response_tx.send(result);
+                    }
+                    crate::server::RunnerProgramControlRequest::CancelSchedule {
+                        schedule_id,
+                        response_tx,
+                    } => {
+                        let result = async {
+                            let mut call = control.cancel_schedule_request();
+                            call.get().set_schedule_id(&schedule_id.0.to_string());
+                            Ok::<_, capnp::Error>(
+                                call.send().promise.await?.get()?.get_cancelled(),
+                            )
+                        }
+                        .await
+                        .map_err(|error| error.to_string());
+                        let _ = response_tx.send(result);
+                    }
+                }
+            }
+        });
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if self
             .event_tx
@@ -678,6 +792,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                         } else {
                             None
                         },
+                        control_tx: Some(control_tx),
                         response_tx,
                     },
                 ),

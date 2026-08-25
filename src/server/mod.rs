@@ -15,7 +15,7 @@ pub use brain_approval::BrainApprovalBroker;
 pub use brain_runner::{
     BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerEffectRecord,
     RunnerMemoryProjectionRequest, RunnerProgramError, RunnerProgramInteraction,
-    RunnerProgramRequest, RunnerProgramResult,
+    RunnerProgramControlRequest, RunnerProgramRequest, RunnerProgramResult,
     RunnerRegistrationId, RunnerRequest, RunnerTurnError, RunnerTurnEvent, RunnerTurnRequest,
     RunnerTurnResult,
 };

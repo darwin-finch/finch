@@ -56,6 +56,130 @@ struct BrainTurnControlImpl {
     expected_audience: crate::brain::store::BrainApprovalAudience,
 }
 
+/// Reverse capability scoped to one daemon-authenticated ProgramRun. The
+/// frontend may request durable schedule operations, but it never receives
+/// participant attachment credentials and cannot substitute another run.
+struct BrainProgramControlImpl {
+    lifecycle: crate::server::BrainLifecycleService,
+    brain: String,
+    run_id: crate::brain::store::RunId,
+    request_seq: u64,
+    maximum_grant_ceiling: Option<crate::vm::EffectSet>,
+}
+
+impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl {
+    fn create_schedule(
+        &mut self,
+        params: finch_ipc_capnp::brain_program_control::CreateScheduleParams,
+        mut results: finch_ipc_capnp::brain_program_control::CreateScheduleResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(params) => params,
+            Err(error) => return Promise::err(error),
+        };
+        let language = match params.get_language() {
+            Ok(language) => program_language_from_capnp(language),
+            Err(error) => return Promise::err(error.into()),
+        };
+        let source = match params.get_source() {
+            Ok(source) => source.to_str().unwrap_or("").to_string(),
+            Err(error) => return Promise::err(error),
+        };
+        let grant_ceiling = match params
+            .get_grant_ceiling()
+            .map_err(anyhow::Error::from)
+            .and_then(crate::ipc::checkpoint_codec::decode_effects)
+        {
+            Ok(effects) => effects,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let policy = match decode_schedule_policy(params.get_policy()) {
+            Ok(policy) => policy,
+            Err(error) => return Promise::err(error),
+        };
+        let schedule = match self.lifecycle.create_schedule_for_run(
+            &self.brain,
+            self.run_id,
+            self.request_seq,
+            self.maximum_grant_ceiling.as_ref(),
+            language,
+            source,
+            grant_ceiling,
+            params.get_next_due_ms(),
+            params
+                .get_has_interval_ms()
+                .then(|| params.get_interval_ms()),
+            policy,
+        ) {
+            Ok(schedule) => schedule,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        encode_schedule(results.get().init_schedule(), &schedule);
+        Promise::ok(())
+    }
+
+    fn inspect_schedule(
+        &mut self,
+        params: finch_ipc_capnp::brain_program_control::InspectScheduleParams,
+        mut results: finch_ipc_capnp::brain_program_control::InspectScheduleResults,
+    ) -> Promise<(), capnp::Error> {
+        let schedule_id = match params
+            .get()
+            .and_then(|params| params.get_schedule_id())
+            .map_err(anyhow::Error::from)
+            .and_then(|value| value.to_str().map_err(anyhow::Error::from))
+            .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::from))
+        {
+            Ok(id) => crate::brain::store::ScheduleId(id),
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let schedule = match self.lifecycle.inspect_schedule_for_run(
+            &self.brain,
+            self.run_id,
+            self.request_seq,
+            schedule_id,
+        ) {
+            Ok(schedule) => schedule,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let mut response = results.get();
+        response.set_found(schedule.is_some());
+        if let Some(schedule) = schedule {
+            encode_schedule(response.init_schedule(), &schedule);
+        }
+        Promise::ok(())
+    }
+
+    fn cancel_schedule(
+        &mut self,
+        params: finch_ipc_capnp::brain_program_control::CancelScheduleParams,
+        mut results: finch_ipc_capnp::brain_program_control::CancelScheduleResults,
+    ) -> Promise<(), capnp::Error> {
+        let schedule_id = match params
+            .get()
+            .and_then(|params| params.get_schedule_id())
+            .map_err(anyhow::Error::from)
+            .and_then(|value| value.to_str().map_err(anyhow::Error::from))
+            .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::from))
+        {
+            Ok(id) => crate::brain::store::ScheduleId(id),
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        match self.lifecycle.cancel_schedule_for_run(
+            &self.brain,
+            self.run_id,
+            self.request_seq,
+            schedule_id,
+        ) {
+            Ok(cancelled) => {
+                results.get().set_cancelled(cancelled);
+                Promise::ok(())
+            }
+            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+        }
+    }
+}
+
 impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
     fn request_approval(
         &mut self,
@@ -786,19 +910,8 @@ impl brain_service::Server for BrainRpcService {
             Ok(effects) => effects,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        let policy = match params.get_policy() {
-            Ok(policy) => match policy.get_kind() {
-                Ok(finch_ipc_capnp::BrainSchedulePolicyKind::Coalesce) => {
-                    crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce
-                }
-                Ok(finch_ipc_capnp::BrainSchedulePolicyKind::BoundedCatchUp) => {
-                    crate::brain::store::BrainScheduleDeliveryPolicy::BoundedCatchUp {
-                        max_catch_up: policy.get_max_catch_up(),
-                        expires_after_ms: policy.get_expires_after_ms(),
-                    }
-                }
-                Err(error) => return Promise::err(error.into()),
-            },
+        let policy = match decode_schedule_policy(params.get_policy()) {
+            Ok(policy) => policy,
             Err(error) => return Promise::err(error),
         };
         let schedule = match self.lifecycle.create_schedule(
@@ -1387,6 +1500,23 @@ fn program_language_from_capnp(
     }
 }
 
+fn decode_schedule_policy(
+    policy: capnp::Result<finch_ipc_capnp::brain_schedule_delivery_policy::Reader<'_>>,
+) -> capnp::Result<crate::brain::store::BrainScheduleDeliveryPolicy> {
+    let policy = policy?;
+    match policy.get_kind()? {
+        finch_ipc_capnp::BrainSchedulePolicyKind::Coalesce => {
+            Ok(crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce)
+        }
+        finch_ipc_capnp::BrainSchedulePolicyKind::BoundedCatchUp => Ok(
+            crate::brain::store::BrainScheduleDeliveryPolicy::BoundedCatchUp {
+                max_catch_up: policy.get_max_catch_up(),
+                expires_after_ms: policy.get_expires_after_ms(),
+            },
+        ),
+    }
+}
+
 async fn forward_runner_request(
     runner: finch_ipc_capnp::brain_runner::Client,
     server: Arc<AgentServer>,
@@ -1419,6 +1549,15 @@ async fn forward_runner_request(
                         grant_ceiling,
                     );
                 }
+                let control: finch_ipc_capnp::brain_program_control::Client =
+                    capnp_rpc::new_client(BrainProgramControlImpl {
+                        lifecycle: crate::server::BrainLifecycleService::from_server(&server),
+                        brain: request.brain.clone(),
+                        run_id: request.run_id,
+                        request_seq: request.request_seq,
+                        maximum_grant_ceiling: request.grant_ceiling.clone(),
+                    });
+                payload.set_control(control);
             }
             let (result, disconnected) = match call.send().promise.await {
                 Ok(reply) => (

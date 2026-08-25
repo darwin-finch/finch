@@ -46,7 +46,31 @@ pub struct RunnerProgramRequest {
     pub source: String,
     pub interaction: RunnerProgramInteraction,
     pub grant_ceiling: Option<crate::vm::EffectSet>,
+    /// Send-safe proxy for the run-scoped daemon capability installed only
+    /// after this request crosses the runner IPC boundary.
+    pub control_tx: Option<mpsc::UnboundedSender<RunnerProgramControlRequest>>,
     pub response_tx: oneshot::Sender<Result<RunnerProgramResult, RunnerProgramError>>,
+}
+
+#[derive(Debug)]
+pub enum RunnerProgramControlRequest {
+    CreateSchedule {
+        language: ProgramLanguage,
+        source: String,
+        grant_ceiling: crate::vm::EffectSet,
+        next_due_ms: u64,
+        interval_ms: Option<u64>,
+        delivery_policy: crate::brain::store::BrainScheduleDeliveryPolicy,
+        response_tx: oneshot::Sender<Result<crate::brain::store::BrainSchedule, String>>,
+    },
+    InspectSchedule {
+        schedule_id: crate::brain::store::ScheduleId,
+        response_tx: oneshot::Sender<Result<Option<crate::brain::store::BrainSchedule>, String>>,
+    },
+    CancelSchedule {
+        schedule_id: crate::brain::store::ScheduleId,
+        response_tx: oneshot::Sender<Result<bool, String>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,6 +494,7 @@ impl BrainRunnerBroker {
                 source,
                 interaction,
                 grant_ceiling,
+                control_tx: None,
                 response_tx,
             }))
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
