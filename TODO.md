@@ -843,7 +843,9 @@ still blocks the corresponding Brain phase until it is unified.
   credential without reverting ordinary operations to the password.
 - [ ] Enforce least privilege independently for event visibility, prompt/program submission,
   approval, control-lease ownership, workspace effects, environment changes, credential minting,
-  and distributed inference. Never advertise credentials in mDNS discovery records.
+  and distributed inference. mDNS advertisement and discovery now use an authority-free metadata
+  allowlist; the reusable legacy peer token is neither broadcast nor copied into discovered peer
+  state. Keep all future discovery records credential-free.
 - [ ] Revisit shared channels only after the Brain event log, runner lease, and participant-role
   model are complete. The eventual channel should be a threaded/multi-participant projection of a
   Brain: people and models share one durable conversation, while programs run only on the remote

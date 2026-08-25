@@ -346,9 +346,11 @@ content classification, context or memory references, target Brain ID, reason, a
 key. It does not directly mutate the target VM stack, graft memory, transfer a grant, install code,
 or schedule work. Receiver-local policy decides whether to surface, ingest, or run it.
 
-mDNS is advisory discovery only. Remove secrets from TXT records. Remote attachment requires an
-authenticated encrypted channel, cryptographic peer identity, replay protection, Brain-level ACLs,
-and auditable invitation/revocation. A `.local` name is not identity.
+mDNS is advisory discovery only. TXT records now use an explicit metadata allowlist and contain no
+reusable peer credential; discovery clients likewise cannot import authority from hostile legacy
+`token` properties. Remote attachment requires an authenticated encrypted channel, cryptographic
+peer identity, replay protection, Brain-level ACLs, and auditable invitation/revocation. A `.local`
+name is not identity.
 
 ## UI projection
 
@@ -449,7 +451,8 @@ Exit: local, daemon, and remote attachment render the same event history.
 
 ### B6: Remote security and discovery
 
-- Replace advertised peer tokens and plaintext remote Brain authentication.
+- Keep the completed removal of advertised peer tokens covered by an authority-free allowlist test,
+  and replace the remaining plaintext remote Brain authentication.
 - Add cryptographic node identity, encrypted authenticated channels, invitations/ACLs, and revocation.
 - Advertise only stable discovery metadata; retrieve live capabilities after authentication.
 
