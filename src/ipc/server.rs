@@ -11,8 +11,12 @@ use capnp_rpc::{pry, rpc_twoparty_capnp, twoparty, RpcSystem};
 use tokio::net::UnixListener;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::ipc::brain_codec::{decode_approval_audience, encode_approval_audience};
-use crate::ipc::schema::finch_ipc_capnp::{self, finch_daemon};
+use crate::ipc::brain_codec::{
+    decode_approval_audience, decode_brain_submission, decode_environment, encode_approval_audience,
+    encode_attachment, encode_brain_submission_outcome, encode_event, encode_runner_lease,
+    encode_snapshot,
+};
+use crate::ipc::schema::finch_ipc_capnp::{self, brain_service, finch_daemon};
 use crate::server::AgentServer;
 
 // ---------------------------------------------------------------------------
@@ -28,6 +32,11 @@ impl FinchDaemonImpl {
     fn new(server: Arc<AgentServer>) -> Self {
         Self { server }
     }
+}
+
+#[derive(Clone)]
+struct BrainServiceImpl {
+    server: Arc<AgentServer>,
 }
 
 /// Reverse per-turn capability used by the leased frontend runner to suspend
@@ -191,6 +200,405 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
             Ok(())
         })
     }
+}
+
+impl brain_service::Server for BrainServiceImpl {
+    fn snapshot(
+        &mut self,
+        params: brain_service::SnapshotParams,
+        mut results: brain_service::SnapshotResults,
+    ) -> Promise<(), capnp::Error> {
+        let brain = pry!(pry!(params.get()).get_brain())
+            .to_str()
+            .unwrap_or("")
+            .to_string();
+        let snapshot = match self.server.shared_brains().snapshot(&brain) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        match encode_snapshot(results.get().init_snapshot(), &snapshot) {
+            Ok(()) => Promise::ok(()),
+            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+        }
+    }
+
+    fn attach(
+        &mut self,
+        params: brain_service::AttachParams,
+        mut results: brain_service::AttachResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let subject = pry!(params.get_subject())
+            .to_str()
+            .unwrap_or("")
+            .to_string();
+        let role = match params.get_role() {
+            Ok(role) => attachment_role_from_capnp(role),
+            Err(error) => return Promise::err(error.into()),
+        };
+        if role == crate::brain::shared::AttachmentRole::Runner {
+            return Promise::err(capnp::Error::failed(
+                "runner authority requires a runner lease, not a client attachment".into(),
+            ));
+        }
+        let attachment_id = if params.get_has_attachment_id() {
+            match parse_attachment_id(params.get_attachment_id()) {
+                Ok(id) => Some(id),
+                Err(error) => return Promise::err(error),
+            }
+        } else {
+            None
+        };
+        let attachment = match self
+            .server
+            .shared_brains()
+            .attach(&brain, &subject, role, attachment_id)
+        {
+            Ok(attachment) => attachment,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let store = self.server.shared_brains().clone();
+        let pending_brain = brain.clone();
+        let pending_attachment_id = attachment.attachment_id;
+        let pending_connection_id = attachment
+            .connection_id
+            .expect("new Brain attachment has a pending connection");
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            if store
+                .expire_pending_connection(
+                    &pending_brain,
+                    pending_attachment_id,
+                    pending_connection_id,
+                )
+                .unwrap_or(false)
+            {
+                let _ = store.remove_if_unused(&pending_brain);
+            }
+        });
+        encode_attachment(results.get().init_attachment(), &attachment);
+        Promise::ok(())
+    }
+
+    fn acknowledge(
+        &mut self,
+        params: brain_service::AcknowledgeParams,
+        mut results: brain_service::AcknowledgeResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let connection_id = match parse_connection_id(params.get_connection_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let attachment = match self.server.shared_brains().acknowledge(
+            &brain,
+            attachment_id,
+            connection_id,
+            params.get_seq(),
+        ) {
+            Ok(attachment) => attachment,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        encode_attachment(results.get().init_attachment(), &attachment);
+        Promise::ok(())
+    }
+
+    fn detach(
+        &mut self,
+        params: brain_service::DetachParams,
+        _results: brain_service::DetachResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let connection_id = match parse_connection_id(params.get_connection_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let snapshot = match self.server.shared_brains().snapshot(&brain) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        if let Err(error) = self
+            .server
+            .shared_brains()
+            .detach(&brain, attachment_id, connection_id)
+        {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        self.server
+            .brain_approvals()
+            .cancel_attachment(snapshot.brain_id, attachment_id);
+        let _ = self.server.shared_brains().remove_if_unused(&brain);
+        Promise::ok(())
+    }
+
+    fn submit(
+        &mut self,
+        params: brain_service::SubmitParams,
+        mut results: brain_service::SubmitResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let connection_id = match parse_connection_id(params.get_connection_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let kind = match params
+            .get_submission()
+            .map_err(anyhow::Error::from)
+            .and_then(decode_brain_submission)
+        {
+            Ok(kind) => kind,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let attachment = match self.server.shared_brains().require_connection(
+            &brain,
+            attachment_id,
+            connection_id,
+        ) {
+            Ok(attachment) => attachment,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let store = self.server.shared_brains().clone();
+        let runners = self.server.brain_runners().clone();
+        let approvals = self.server.brain_approvals().clone();
+        Promise::from_future(async move {
+            let outcome = crate::server::handlers::submit_named_brain_event(
+                &store,
+                &runners,
+                &approvals,
+                &brain,
+                &attachment,
+                kind,
+            )
+            .await
+            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            encode_brain_submission_outcome(
+                results.get().init_outcome(),
+                &outcome.accepted,
+                outcome.run.as_ref(),
+                outcome.result.as_ref(),
+            )
+            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn watch(
+        &mut self,
+        params: brain_service::WatchParams,
+        _results: brain_service::WatchResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let connection_id = match parse_connection_id(params.get_connection_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let receiver = pry!(params.get_receiver());
+        if let Err(error) = self.server.shared_brains().require_connection(
+            &brain,
+            attachment_id,
+            connection_id,
+        ) {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        if let Err(error) = self.server.shared_brains().activate_connection(
+            &brain,
+            attachment_id,
+            connection_id,
+        ) {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        let mut events = match self.server.shared_brains().subscribe(&brain) {
+            Ok(events) => events,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let snapshot = match self.server.shared_brains().snapshot(&brain) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let brain_id = snapshot.brain_id;
+        let store = self.server.shared_brains().clone();
+        let approvals = self.server.brain_approvals().clone();
+        Promise::from_future(async move {
+            let mut initial = receiver.on_message_request();
+            let initial_result = encode_snapshot(
+                initial.get().init_message().init_snapshot(),
+                &snapshot,
+            )
+            .map_err(|error| capnp::Error::failed(error.to_string()))
+            .and_then(|()| Ok(initial));
+            let initial_error = match initial_result {
+                Ok(initial) => initial.send().promise.await.err(),
+                Err(error) => Some(error),
+            };
+            if let Some(error) = initial_error {
+                let _ = store.detach(&brain, attachment_id, connection_id);
+                approvals.cancel_attachment(brain_id, attachment_id);
+                let _ = store.remove_if_unused(&brain);
+                return Err(error);
+            }
+            let watch_error = loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(error) => break Some(capnp::Error::failed(error.to_string())),
+                };
+                if event.seq <= snapshot.revision {
+                    continue;
+                }
+                let mut call = receiver.on_message_request();
+                encode_event(call.get().init_message().init_event(), &event)
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                if call.send().promise.await.is_err() {
+                    break None;
+                }
+            };
+            let _ = store.detach(&brain, attachment_id, connection_id);
+            approvals.cancel_attachment(brain_id, attachment_id);
+            let _ = store.remove_if_unused(&brain);
+            watch_error.map_or(Ok(()), Err)
+        })
+    }
+
+    fn acquire_runner(
+        &mut self,
+        params: brain_service::AcquireRunnerParams,
+        mut results: brain_service::AcquireRunnerResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let subject = pry!(params.get_subject())
+            .to_str()
+            .unwrap_or("")
+            .to_string();
+        let environment = match params
+            .get_environment()
+            .map_err(anyhow::Error::from)
+            .and_then(decode_environment)
+        {
+            Ok(environment) => environment,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        if &environment != self.server.shared_brains().environment() {
+            return Promise::err(capnp::Error::failed(
+                "runner environment does not match the daemon Brain environment".into(),
+            ));
+        }
+        let lease_id = if params.get_has_lease_id() {
+            match parse_runner_lease_id(params.get_lease_id()) {
+                Ok(id) => Some(id),
+                Err(error) => return Promise::err(error),
+            }
+        } else {
+            None
+        };
+        let lease = match self.server.shared_brains().acquire_runner_lease(
+            &brain,
+            &subject,
+            environment.generation,
+            lease_id,
+            params.get_ttl_ms(),
+        ) {
+            Ok(lease) => lease,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let store = self.server.shared_brains().clone();
+        let lease_brain = brain.clone();
+        let lease_id = lease.lease_id;
+        let expires_ms = lease.expires_ms;
+        tokio::spawn(async move {
+            loop {
+                let delay_ms = expires_ms.saturating_sub(unix_epoch_millis());
+                if delay_ms == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            if store
+                .expire_runner_lease(&lease_brain, lease_id, unix_epoch_millis())
+                .is_ok_and(|expired| expired)
+            {
+                let _ = store.remove_if_unused(&lease_brain);
+            }
+        });
+        encode_runner_lease(results.get().init_lease(), &lease);
+        Promise::ok(())
+    }
+
+    fn release_runner(
+        &mut self,
+        params: brain_service::ReleaseRunnerParams,
+        _results: brain_service::ReleaseRunnerResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let lease_id = match parse_runner_lease_id(params.get_lease_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        if let Err(error) = self
+            .server
+            .shared_brains()
+            .release_runner_lease(&brain, lease_id)
+        {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        let _ = self.server.shared_brains().remove_if_unused(&brain);
+        Promise::ok(())
+    }
+}
+
+fn parse_attachment_id(
+    value: capnp::Result<capnp::text::Reader<'_>>,
+) -> Result<crate::brain::shared::AttachmentId, capnp::Error> {
+    let value = value?.to_str()?;
+    uuid::Uuid::parse_str(value)
+        .map(crate::brain::shared::AttachmentId)
+        .map_err(|error| capnp::Error::failed(error.to_string()))
+}
+
+fn parse_connection_id(
+    value: capnp::Result<capnp::text::Reader<'_>>,
+) -> Result<crate::brain::shared::ConnectionId, capnp::Error> {
+    let value = value?.to_str()?;
+    uuid::Uuid::parse_str(value)
+        .map(crate::brain::shared::ConnectionId)
+        .map_err(|error| capnp::Error::failed(error.to_string()))
+}
+
+fn parse_runner_lease_id(
+    value: capnp::Result<capnp::text::Reader<'_>>,
+) -> Result<crate::brain::shared::RunnerLeaseId, capnp::Error> {
+    let value = value?.to_str()?;
+    uuid::Uuid::parse_str(value)
+        .map(crate::brain::shared::RunnerLeaseId)
+        .map_err(|error| capnp::Error::failed(error.to_string()))
+}
+
+fn unix_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +1045,18 @@ impl finch_daemon::Server for FinchDaemonImpl {
         Promise::ok(())
     }
 
+    fn brain_service(
+        &mut self,
+        _params: finch_daemon::BrainServiceParams,
+        mut results: finch_daemon::BrainServiceResults,
+    ) -> Promise<(), capnp::Error> {
+        let service: brain_service::Client = capnp_rpc::new_client(BrainServiceImpl {
+            server: Arc::clone(&self.server),
+        });
+        results.get().set_service(service);
+        Promise::ok(())
+    }
+
     // ---- health ----------------------------------------------------------
 
     fn ping(
@@ -655,6 +1075,25 @@ fn program_language_to_capnp(
     match language {
         crate::brain::shared::ProgramLanguage::Forth => finch_ipc_capnp::ProgramLanguage::Forth,
         crate::brain::shared::ProgramLanguage::Lisp => finch_ipc_capnp::ProgramLanguage::Lisp,
+    }
+}
+
+fn attachment_role_from_capnp(
+    role: finch_ipc_capnp::BrainAttachmentRole,
+) -> crate::brain::shared::AttachmentRole {
+    match role {
+        finch_ipc_capnp::BrainAttachmentRole::Runner => {
+            crate::brain::shared::AttachmentRole::Runner
+        }
+        finch_ipc_capnp::BrainAttachmentRole::Driver => {
+            crate::brain::shared::AttachmentRole::Driver
+        }
+        finch_ipc_capnp::BrainAttachmentRole::Consultant => {
+            crate::brain::shared::AttachmentRole::Consultant
+        }
+        finch_ipc_capnp::BrainAttachmentRole::Observer => {
+            crate::brain::shared::AttachmentRole::Observer
+        }
     }
 }
 

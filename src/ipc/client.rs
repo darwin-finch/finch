@@ -12,14 +12,26 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::claude::{ContentBlock, Message};
 use crate::generators::StreamChunk;
-use crate::ipc::brain_codec::{decode_approval_audience, encode_approval_audience};
-use crate::ipc::schema::finch_ipc_capnp::{self, brain_runner, finch_daemon, stream_receiver};
+use crate::ipc::brain_codec::{
+    decode_approval_audience, decode_attachment, decode_brain_wire_reader, decode_event,
+    decode_run, decode_runner_lease, decode_snapshot, encode_approval_audience,
+    encode_brain_submission, encode_environment,
+};
+use crate::ipc::schema::finch_ipc_capnp::{
+    self, brain_runner, brain_service, brain_wire_receiver, finch_daemon, stream_receiver,
+};
 use crate::ipc::transport::sock_path;
 use crate::tools::types::{ToolDefinition, ToolUse};
 
 pub struct BrainRunnerBootstrap {
     pub runtime_revision: u64,
     pub checkpoint: crate::vm::TypedRuntimeCheckpoint,
+}
+
+pub struct BrainSubmissionResult {
+    pub accepted: crate::brain::shared::BrainEvent,
+    pub run: Option<crate::brain::shared::BrainRun>,
+    pub result: Option<crate::brain::shared::BrainEvent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +148,189 @@ impl IpcClient {
         let stack = r.get_stack()?.iter().collect::<Vec<i64>>();
         let output = r.get_output()?.to_str()?.to_string();
         Ok((stack, output))
+    }
+
+    async fn brain_service(&self) -> Result<brain_service::Client> {
+        let request = self.client.brain_service_request();
+        let reply = request.send().promise.await?;
+        Ok(reply.get()?.get_service()?)
+    }
+
+    pub async fn brain_snapshot(&self, brain: &str) -> Result<crate::brain::shared::BrainSnapshot> {
+        let service = self.brain_service().await?;
+        let mut request = service.snapshot_request();
+        request.get().set_brain(brain);
+        let reply = request.send().promise.await?;
+        decode_snapshot(reply.get()?.get_snapshot()?)
+    }
+
+    pub async fn brain_attach(
+        &self,
+        brain: &str,
+        subject: &str,
+        role: crate::brain::shared::AttachmentRole,
+        attachment_id: Option<crate::brain::shared::AttachmentId>,
+    ) -> Result<crate::brain::shared::BrainAttachment> {
+        let service = self.brain_service().await?;
+        let mut request = service.attach_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_subject(subject);
+            params.set_role(attachment_role_to_capnp(role));
+            if let Some(attachment_id) = attachment_id {
+                params.set_has_attachment_id(true);
+                params.set_attachment_id(&attachment_id.0.to_string());
+            }
+        }
+        let reply = request.send().promise.await?;
+        decode_attachment(reply.get()?.get_attachment()?)
+    }
+
+    pub async fn brain_acknowledge(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::shared::BrainAttachment,
+        seq: u64,
+    ) -> Result<crate::brain::shared::BrainAttachment> {
+        let connection_id = attachment
+            .connection_id
+            .context("Brain attachment has no live connection")?;
+        let service = self.brain_service().await?;
+        let mut request = service.acknowledge_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_attachment_id(&attachment.attachment_id.0.to_string());
+            params.set_connection_id(&connection_id.0.to_string());
+            params.set_seq(seq);
+        }
+        let reply = request.send().promise.await?;
+        decode_attachment(reply.get()?.get_attachment()?)
+    }
+
+    pub async fn brain_detach(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::shared::BrainAttachment,
+    ) -> Result<()> {
+        let connection_id = attachment
+            .connection_id
+            .context("Brain attachment has no live connection")?;
+        let service = self.brain_service().await?;
+        let mut request = service.detach_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_attachment_id(&attachment.attachment_id.0.to_string());
+            params.set_connection_id(&connection_id.0.to_string());
+        }
+        request.send().promise.await?;
+        Ok(())
+    }
+
+    pub async fn brain_submit(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::shared::BrainAttachment,
+        kind: crate::brain::shared::BrainEventKind,
+    ) -> Result<BrainSubmissionResult> {
+        let connection_id = attachment
+            .connection_id
+            .context("Brain attachment has no live connection")?;
+        let service = self.brain_service().await?;
+        let mut request = service.submit_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_attachment_id(&attachment.attachment_id.0.to_string());
+            params.set_connection_id(&connection_id.0.to_string());
+            encode_brain_submission(params.init_submission(), &kind)?;
+        }
+        let reply = request.send().promise.await?;
+        let outcome = reply.get()?.get_outcome()?;
+        Ok(BrainSubmissionResult {
+            accepted: decode_event(outcome.get_accepted()?)?,
+            run: outcome
+                .get_has_run()
+                .then(|| outcome.get_run())
+                .transpose()?
+                .map(decode_run)
+                .transpose()?,
+            result: outcome
+                .get_has_result()
+                .then(|| outcome.get_result())
+                .transpose()?
+                .map(decode_event)
+                .transpose()?,
+        })
+    }
+
+    pub async fn brain_watch(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::shared::BrainAttachment,
+    ) -> Result<mpsc::UnboundedReceiver<Result<crate::brain::shared::BrainWireMessage>>> {
+        let connection_id = attachment
+            .connection_id
+            .context("Brain attachment has no live connection")?;
+        let service = self.brain_service().await?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let receiver: brain_wire_receiver::Client =
+            capnp_rpc::new_client(BrainWireReceiverImpl { tx });
+        let mut request = service.watch_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_attachment_id(&attachment.attachment_id.0.to_string());
+            params.set_connection_id(&connection_id.0.to_string());
+            params.set_receiver(receiver);
+        }
+        tokio::task::spawn_local(async move {
+            let _ = request.send().promise.await;
+        });
+        Ok(rx)
+    }
+
+    pub async fn brain_acquire_runner(
+        &self,
+        brain: &str,
+        subject: &str,
+        environment: &crate::brain::shared::BrainEnvironment,
+        lease_id: Option<crate::brain::shared::RunnerLeaseId>,
+        ttl_ms: u64,
+    ) -> Result<crate::brain::shared::BrainRunnerLease> {
+        let service = self.brain_service().await?;
+        let mut request = service.acquire_runner_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_subject(subject);
+            encode_environment(params.reborrow().init_environment(), environment);
+            if let Some(lease_id) = lease_id {
+                params.set_has_lease_id(true);
+                params.set_lease_id(&lease_id.0.to_string());
+            }
+            params.set_ttl_ms(ttl_ms);
+        }
+        let reply = request.send().promise.await?;
+        decode_runner_lease(reply.get()?.get_lease()?)
+    }
+
+    pub async fn brain_release_runner(
+        &self,
+        brain: &str,
+        lease_id: crate::brain::shared::RunnerLeaseId,
+    ) -> Result<()> {
+        let service = self.brain_service().await?;
+        let mut request = service.release_runner_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_lease_id(&lease_id.0.to_string());
+        }
+        request.send().promise.await?;
+        Ok(())
     }
 
     // Health
@@ -443,8 +638,51 @@ fn encode_brain_turn_event(
 // Streaming receiver capability (client-side callback)
 // ---------------------------------------------------------------------------
 
+struct BrainWireReceiverImpl {
+    tx: mpsc::UnboundedSender<Result<crate::brain::shared::BrainWireMessage>>,
+}
+
+impl brain_wire_receiver::Server for BrainWireReceiverImpl {
+    fn on_message(
+        &mut self,
+        params: brain_wire_receiver::OnMessageParams,
+        _results: brain_wire_receiver::OnMessageResults,
+    ) -> Promise<(), capnp::Error> {
+        let message = params
+            .get()
+            .and_then(|params| params.get_message())
+            .map_err(anyhow::Error::from)
+            .and_then(decode_brain_wire_reader);
+        if self.tx.send(message).is_err() {
+            return Promise::err(capnp::Error::disconnected(
+                "Brain wire receiver was dropped".into(),
+            ));
+        }
+        Promise::ok(())
+    }
+}
+
 struct StreamReceiverImpl {
     tx: mpsc::UnboundedSender<Result<StreamChunk>>,
+}
+
+fn attachment_role_to_capnp(
+    role: crate::brain::shared::AttachmentRole,
+) -> finch_ipc_capnp::BrainAttachmentRole {
+    match role {
+        crate::brain::shared::AttachmentRole::Runner => {
+            finch_ipc_capnp::BrainAttachmentRole::Runner
+        }
+        crate::brain::shared::AttachmentRole::Driver => {
+            finch_ipc_capnp::BrainAttachmentRole::Driver
+        }
+        crate::brain::shared::AttachmentRole::Consultant => {
+            finch_ipc_capnp::BrainAttachmentRole::Consultant
+        }
+        crate::brain::shared::AttachmentRole::Observer => {
+            finch_ipc_capnp::BrainAttachmentRole::Observer
+        }
+    }
 }
 
 impl stream_receiver::Server for StreamReceiverImpl {

@@ -168,6 +168,24 @@ pub(super) fn decode_brain_submission(
     })
 }
 
+pub(super) fn encode_brain_submission_outcome(
+    mut builder: finch_ipc_capnp::brain_submission_outcome::Builder<'_>,
+    accepted: &BrainEvent,
+    run: Option<&BrainRun>,
+    result: Option<&BrainEvent>,
+) -> anyhow::Result<()> {
+    encode_event(builder.reborrow().init_accepted(), accepted)?;
+    if let Some(run) = run {
+        builder.set_has_run(true);
+        encode_run(builder.reborrow().init_run(), run);
+    }
+    if let Some(result) = result {
+        builder.set_has_result(true);
+        encode_event(builder.reborrow().init_result(), result)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn encode_brain_wire_message(message: &BrainWireMessage) -> anyhow::Result<Vec<u8>> {
     let mut encoded = capnp::message::Builder::new_default();
     let root = encoded.init_root::<finch_ipc_capnp::brain_wire_message::Builder<'_>>();
@@ -183,6 +201,12 @@ pub(crate) fn decode_brain_wire_message(bytes: &[u8]) -> anyhow::Result<BrainWir
     let encoded =
         capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
     let root = encoded.get_root::<finch_ipc_capnp::brain_wire_message::Reader<'_>>()?;
+    decode_brain_wire_reader(root)
+}
+
+pub(super) fn decode_brain_wire_reader(
+    root: finch_ipc_capnp::brain_wire_message::Reader<'_>,
+) -> anyhow::Result<BrainWireMessage> {
     match root.which()? {
         finch_ipc_capnp::brain_wire_message::Snapshot(snapshot) => Ok(BrainWireMessage::Snapshot {
             brain: decode_snapshot(snapshot?)?,
@@ -193,7 +217,7 @@ pub(crate) fn decode_brain_wire_message(bytes: &[u8]) -> anyhow::Result<BrainWir
     }
 }
 
-fn encode_snapshot(
+pub(super) fn encode_snapshot(
     mut builder: finch_ipc_capnp::brain_snapshot::Builder<'_>,
     snapshot: &BrainSnapshot,
 ) -> anyhow::Result<()> {
@@ -228,7 +252,7 @@ fn encode_snapshot(
     Ok(())
 }
 
-fn decode_snapshot(
+pub(super) fn decode_snapshot(
     reader: finch_ipc_capnp::brain_snapshot::Reader<'_>,
 ) -> anyhow::Result<BrainSnapshot> {
     let events = reader
@@ -269,7 +293,7 @@ fn decode_snapshot(
     })
 }
 
-fn encode_environment(
+pub(super) fn encode_environment(
     mut builder: finch_ipc_capnp::brain_environment::Builder<'_>,
     environment: &BrainEnvironment,
 ) {
@@ -278,7 +302,7 @@ fn encode_environment(
     builder.set_generation(environment.generation);
 }
 
-fn decode_environment(
+pub(super) fn decode_environment(
     reader: finch_ipc_capnp::brain_environment::Reader<'_>,
 ) -> anyhow::Result<BrainEnvironment> {
     Ok(BrainEnvironment {
@@ -288,7 +312,7 @@ fn decode_environment(
     })
 }
 
-fn encode_attachment(
+pub(super) fn encode_attachment(
     mut builder: finch_ipc_capnp::brain_attachment::Builder<'_>,
     attachment: &BrainAttachment,
 ) {
@@ -303,7 +327,7 @@ fn encode_attachment(
     }
 }
 
-fn decode_attachment(
+pub(super) fn decode_attachment(
     reader: finch_ipc_capnp::brain_attachment::Reader<'_>,
 ) -> anyhow::Result<BrainAttachment> {
     Ok(BrainAttachment {
@@ -322,7 +346,7 @@ fn decode_attachment(
     })
 }
 
-fn encode_runner_lease(
+pub(super) fn encode_runner_lease(
     mut builder: finch_ipc_capnp::brain_runner_lease::Builder<'_>,
     lease: &BrainRunnerLease,
 ) {
@@ -333,7 +357,7 @@ fn encode_runner_lease(
     builder.set_expires_ms(lease.expires_ms);
 }
 
-fn decode_runner_lease(
+pub(super) fn decode_runner_lease(
     reader: finch_ipc_capnp::brain_runner_lease::Reader<'_>,
 ) -> anyhow::Result<BrainRunnerLease> {
     Ok(BrainRunnerLease {
@@ -366,7 +390,7 @@ fn decode_program(
     })
 }
 
-fn encode_run(mut builder: finch_ipc_capnp::brain_run::Builder<'_>, run: &BrainRun) {
+pub(super) fn encode_run(mut builder: finch_ipc_capnp::brain_run::Builder<'_>, run: &BrainRun) {
     builder.set_run_id(&run.run_id.0.to_string());
     builder.set_kind(run_kind_to_capnp(run.kind));
     if let Some(parent_run_id) = run.parent_run_id {
@@ -385,7 +409,9 @@ fn encode_run(mut builder: finch_ipc_capnp::brain_run::Builder<'_>, run: &BrainR
     }
 }
 
-fn decode_run(reader: finch_ipc_capnp::brain_run::Reader<'_>) -> anyhow::Result<BrainRun> {
+pub(super) fn decode_run(
+    reader: finch_ipc_capnp::brain_run::Reader<'_>,
+) -> anyhow::Result<BrainRun> {
     Ok(BrainRun {
         run_id: RunId(parse_uuid(reader.get_run_id()?)?),
         kind: run_kind_from_capnp(reader.get_kind()?),
@@ -411,7 +437,7 @@ fn decode_run(reader: finch_ipc_capnp::brain_run::Reader<'_>) -> anyhow::Result<
     })
 }
 
-fn encode_event(
+pub(super) fn encode_event(
     mut builder: finch_ipc_capnp::brain_event::Builder<'_>,
     event: &BrainEvent,
 ) -> anyhow::Result<()> {
@@ -551,7 +577,9 @@ fn encode_event(
     Ok(())
 }
 
-fn decode_event(reader: finch_ipc_capnp::brain_event::Reader<'_>) -> anyhow::Result<BrainEvent> {
+pub(super) fn decode_event(
+    reader: finch_ipc_capnp::brain_event::Reader<'_>,
+) -> anyhow::Result<BrainEvent> {
     use finch_ipc_capnp::brain_event::Which;
     let kind = match reader.which()? {
         Which::RunnerLeaseAcquired(lease) => BrainEventKind::RunnerLeaseAcquired {
