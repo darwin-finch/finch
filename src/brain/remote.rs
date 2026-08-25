@@ -3879,11 +3879,18 @@ mod tests {
             ).unwrap());
             let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
             let environment = lifecycle.snapshot("shared").unwrap().environment;
-            let lease = lifecycle.snapshot("shared").unwrap().runner_lease.unwrap_or_else(|| {
-                lifecycle.acquire_runner(
-                    "shared", "runner", &environment, None, 60_000,
-                ).unwrap()
-            });
+            let lease = match lifecycle.snapshot("shared").unwrap().runner_lease {
+                Some(lease) if lease.environment_generation == environment.generation
+                    && lease.expires_ms > unix_epoch_millis() => lease,
+                stale => {
+                    if let Some(stale) = stale {
+                        lifecycle.release_runner("shared", stale.lease_id).unwrap();
+                    }
+                    lifecycle.acquire_runner(
+                        "shared", "runner", &environment, None, 60_000,
+                    ).unwrap()
+                }
+            };
             let (runner_tx, runner_rx) = mpsc::unbounded_channel();
             lifecycle.register_test_runner("shared", lease.lease_id, runner_tx);
             let app = crate::server::handlers::create_router(server);
@@ -4142,10 +4149,11 @@ mod tests {
         daemon.abort();
         let _ = daemon.await;
 
-        let (target, daemon, _runner_rx, _, lifecycle) =
+        let (target, daemon, mut runner_rx, _, lifecycle) =
             start(temp.path(), credentials.clone(), 2).await;
         let (client, events, current_attachment) =
             attach(target, Some(attachment.attachment_id)).await;
+        let client = std::sync::Arc::new(client);
         assert_eq!(client.cancel_run_with_handle(
             cancellable.run_id, &cancel_run_handle,
         ).await.unwrap().status, super::super::store::BrainRunStatus::Cancelled);
@@ -4173,6 +4181,119 @@ mod tests {
         );
         let (first, second) = tokio::join!(first, second);
         assert_eq!(first.unwrap().schedule_id, second.unwrap().schedule_id);
+
+        // A Prompt holds the Brain turn lane until its runner returns. A live
+        // remote approval must therefore use the narrower approval mutation
+        // lane, including when the exact same decision arrives concurrently.
+        let live_prompt = BrainEventKind::Prompt {
+            text: "wait for a remote approval".into(),
+        };
+        let live_prompt_handle = client.prepare_push_mutation(&live_prompt).await.unwrap();
+        let (approval_ready_tx, approval_ready_rx) = tokio::sync::oneshot::channel();
+        let live_lifecycle = lifecycle.clone();
+        let live_runner = tokio::spawn(async move {
+            let request = loop {
+                match runner_rx.recv().await.unwrap() {
+                    crate::server::RunnerRequest::Turn(request) => break request,
+                    crate::server::RunnerRequest::ProjectMemory(projection) => {
+                        projection.response_tx.send(Ok(0)).unwrap();
+                    }
+                    other => panic!("expected live Prompt turn, got {other:?}"),
+                }
+            };
+            let approval_id = "live-remote-approval";
+            let audience = request.approval_audience.clone();
+            let registration = live_lifecycle.register_test_approval(
+                request.request_seq, approval_id, audience.clone(),
+            ).unwrap();
+            live_lifecycle.push_test_event(
+                "shared", "runner", BrainEventKind::ApprovalRequested {
+                    request_seq: request.request_seq,
+                    approval_id: approval_id.into(),
+                    approval_kind: "vm_capability".into(),
+                    subject: "FileRead".into(),
+                    audience: Some(audience.clone()),
+                    detail: serde_json::json!({"path": "README.md"}),
+                },
+            ).unwrap();
+            approval_ready_tx.send((request.request_seq, audience.clone())).unwrap();
+            let decision = registration.wait().await.unwrap();
+            let runtime = crate::runtime::ProgramRuntime::new();
+            let outcome = runtime.submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Lisp,
+                source_id: Some("live-remote-approval".into()),
+                source: "(define (approved) : int 1)".into(),
+                intent: "finish approved remote Prompt".into(),
+                effect: crate::programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            }).await.unwrap();
+            let checkpoint = runtime.revision_history().unwrap().into_iter()
+                .find(|snapshot| snapshot.revision == outcome.output_revision)
+                .and_then(|snapshot| snapshot.checkpoint).unwrap();
+            request.response_tx.send(Ok(crate::server::RunnerTurnResult {
+                source: "(define (approved) : int 1)".into(),
+                language: ProgramLanguage::Lisp,
+                output: "approved remotely".into(),
+                turn_events: vec![
+                    crate::server::RunnerTurnEvent::ApprovalRequested {
+                        approval_id: approval_id.into(),
+                        approval_kind: "vm_capability".into(),
+                        subject: "FileRead".into(),
+                        audience,
+                        detail: serde_json::json!({"path": "README.md"}),
+                    },
+                    crate::server::RunnerTurnEvent::ApprovalDecided {
+                        approval_id: approval_id.into(), decision,
+                    },
+                ],
+                runtime_revision: outcome.output_revision,
+                checkpoint,
+                effect_journal: Vec::new(),
+                commit_ack: None,
+            })).unwrap();
+        });
+        let prompt_client = client.clone();
+        let prompt_handle = live_prompt_handle.clone();
+        let mut prompt_submission = tokio::spawn(async move {
+            prompt_client.push_with_handle(live_prompt, &prompt_handle).await
+        });
+        let (request_seq, _) = tokio::select! {
+            ready = approval_ready_rx => ready.unwrap(),
+            ended = &mut prompt_submission => {
+                panic!("live Prompt ended before requesting approval: {ended:?}")
+            }
+        };
+        let approval_submission = async {
+            let decision = BrainEventKind::ApprovalDecided {
+                request_seq,
+                approval_id: "live-remote-approval".into(),
+                decision: serde_json::json!({"choice": "approve_once"}),
+            };
+            let handle = client.prepare_push_mutation(&decision).await.unwrap();
+            let first = client.push_with_handle(decision.clone(), &handle);
+            let second = client.push_with_handle(decision, &handle);
+            let (first, second) = tokio::join!(first, second);
+            assert_eq!(first.unwrap(), second.unwrap());
+            handle
+        };
+        let (prompt_result, live_decision_handle) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async { tokio::join!(prompt_submission, approval_submission) },
+        ).await.expect("remote approval deadlocked behind its originating Prompt");
+        prompt_result.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), live_runner)
+            .await.expect("live runner did not finish after approval").unwrap();
+        let live_snapshot = client.snapshot().await.unwrap();
+        assert_eq!(live_snapshot.events.iter().filter(|event| matches!(
+            &event.kind, BrainEventKind::ApprovalDecided { approval_id, .. }
+                if approval_id == "live-remote-approval"
+        )).count(), 1);
+        assert_eq!(live_snapshot.events.iter().filter(|event| event.mutation.as_ref()
+            .is_some_and(|receipt| receipt.mutation_id
+                == live_decision_handle.idempotency_key)).count(), 1);
 
         let before_approval = lifecycle.push_test_event(
             "shared", "provider", BrainEventKind::ParticipantMessage {

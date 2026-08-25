@@ -935,8 +935,9 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
         decision,
     } = &kind
     {
-        let execution_lock = store.execution_lock(name)?;
-        let _turn = execution_lock.lock_owned().await;
+        let brain_id = store.snapshot(name)?.brain_id;
+        let mutation_lock = approvals.mutation_lock(brain_id, *request_seq, approval_id);
+        let _decision = mutation_lock.lock_owned().await;
         let accepted = commit_named_brain_approval_decision(
             store,
             approvals,
@@ -3070,10 +3071,16 @@ async fn watch_named_brain(
 
             let (command_tx, mut command_rx) =
                 tokio::sync::mpsc::unbounded_channel::<BrainRemoteCommand>();
+            let (approval_tx, mut approval_rx) =
+                tokio::sync::mpsc::unbounded_channel::<BrainRemoteCommand>();
             let (reply_tx, mut reply_rx) =
                 tokio::sync::mpsc::unbounded_channel::<BrainRemoteReply>();
             let worker_name = name.clone();
             let worker_headers = headers.clone();
+            let approval_server = server.clone();
+            let approval_name = name.clone();
+            let approval_headers = headers.clone();
+            let approval_reply_tx = reply_tx.clone();
             let worker = tokio::spawn(async move {
                 while let Some(command) = command_rx.recv().await {
                     let reply = execute_remote_brain_command(
@@ -3087,6 +3094,26 @@ async fn watch_named_brain(
                     .await;
                     let detached = matches!(reply, BrainRemoteReply::Detached { .. });
                     if reply_tx.send(reply).is_err() || detached {
+                        break;
+                    }
+                }
+            });
+            // A runner may suspend an executable command while it awaits an
+            // approval from this same socket. Keep approval decisions ordered
+            // with each other, but do not queue them behind that suspended
+            // command (or behind the Brain turn lane it holds).
+            let approval_worker = tokio::spawn(async move {
+                while let Some(command) = approval_rx.recv().await {
+                    let reply = execute_remote_brain_command(
+                        &approval_server,
+                        &approval_headers,
+                        &approval_name,
+                        attachment_id,
+                        connection_id,
+                        command,
+                    )
+                    .await;
+                    if approval_reply_tx.send(reply).is_err() {
                         break;
                     }
                 }
@@ -3130,7 +3157,18 @@ async fn watch_named_brain(
                                     ) {
                                         detach_request_id = Some(command.request_id);
                                     }
-                                    if command_tx.send(command).is_err() {
+                                    let is_approval = matches!(
+                                        &command.kind,
+                                        crate::ipc::brain_codec::BrainRemoteCommandKind::Submit(
+                                            crate::brain::store::BrainEventKind::ApprovalDecided { .. }
+                                        )
+                                    );
+                                    let sent = if is_approval {
+                                        approval_tx.send(command)
+                                    } else {
+                                        command_tx.send(command)
+                                    };
+                                    if sent.is_err() {
                                         break;
                                     }
                                 }
@@ -3230,7 +3268,9 @@ async fn watch_named_brain(
                 }
             }
             drop(command_tx);
+            drop(approval_tx);
             let _ = worker.await;
+            let _ = approval_worker.await;
             let _ = lifecycle.detach(&name, attachment_id, connection_id);
         })
         .into_response())
@@ -4713,6 +4753,211 @@ mod handler_tests {
             &store, &crate::server::BrainApprovalBroker::default(), "shared", &attachment,
             request_seq, "uncertain", decision, Some(receipt),
         ).is_ok(), "durable terminal did not replay after response loss");
+    }
+
+    #[tokio::test]
+    async fn live_prompt_can_be_approved_while_its_turn_lane_is_held() {
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let driver = store
+            .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
+            .unwrap();
+        let lease = store
+            .acquire_runner_lease(
+                "shared",
+                "runner@box.local",
+                store.environment().generation,
+                None,
+                60_000,
+            )
+            .unwrap();
+        let runners = crate::server::BrainRunnerBroker::default();
+        let approvals = crate::server::BrainApprovalBroker::default();
+        let (runner_tx, mut runner_rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, runner_tx);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let runner_store = store.clone();
+        let runner_approvals = approvals.clone();
+        let runner = tokio::spawn(async move {
+            let crate::server::RunnerRequest::Turn(request) = runner_rx.recv().await.unwrap()
+            else {
+                panic!("expected full turn request")
+            };
+            let audience = request.approval_audience.clone();
+            let registration = runner_approvals
+                .register(request.request_seq, "live-approval", audience.clone())
+                .unwrap();
+            runner_store
+                .push(
+                    "shared",
+                    "runner@box.local",
+                    BrainEventKind::ApprovalRequested {
+                        request_seq: request.request_seq,
+                        approval_id: "live-approval".into(),
+                        approval_kind: "vm_capability".into(),
+                        subject: "FileRead".into(),
+                        audience: Some(audience.clone()),
+                        detail: serde_json::json!({"path": "README.md"}),
+                    },
+                )
+                .unwrap();
+            let revision = runner_store.snapshot("shared").unwrap().revision;
+            ready_tx
+                .send((request.request_seq, audience.clone(), revision))
+                .unwrap();
+            let decision = registration.wait().await.unwrap();
+
+            let runtime = crate::runtime::ProgramRuntime::new();
+            let source = "(say \"approved\")";
+            let outcome = runtime
+                .submit_typed_only(crate::runtime::ProgramSubmission {
+                    language: crate::programs::ProgramLanguage::Lisp,
+                    source_id: Some("live-approval-test".into()),
+                    source: source.into(),
+                    intent: "complete an approved live turn".into(),
+                    effect: crate::programs::ExecutionEffect::Pure,
+                    declared_capabilities: Vec::new(),
+                    manifest_generation: runtime.manifest_generation(),
+                    expected_revision: Some(runtime.revision()),
+                    budget: None,
+                })
+                .await
+                .unwrap();
+            let checkpoint = runtime
+                .revision_history()
+                .unwrap()
+                .into_iter()
+                .find(|snapshot| snapshot.revision == outcome.output_revision)
+                .and_then(|snapshot| snapshot.checkpoint)
+                .unwrap();
+            request
+                .response_tx
+                .send(Ok(crate::server::RunnerTurnResult {
+                    source: source.into(),
+                    language: ProgramLanguage::Lisp,
+                    output: "approved".into(),
+                    turn_events: vec![
+                        crate::server::RunnerTurnEvent::ApprovalRequested {
+                            approval_id: "live-approval".into(),
+                            approval_kind: "vm_capability".into(),
+                            subject: "FileRead".into(),
+                            audience,
+                            detail: serde_json::json!({"path": "README.md"}),
+                        },
+                        crate::server::RunnerTurnEvent::ApprovalDecided {
+                            approval_id: "live-approval".into(),
+                            decision,
+                        },
+                    ],
+                    runtime_revision: outcome.output_revision,
+                    checkpoint,
+                    effect_journal: Vec::new(),
+                    commit_ack: None,
+                }))
+                .unwrap();
+            let crate::server::RunnerRequest::ProjectMemory(request) =
+                runner_rx.recv().await.unwrap()
+            else {
+                panic!("expected committed memory projection")
+            };
+            request.response_tx.send(Ok(0)).unwrap();
+        });
+
+        let prompt_store = store.clone();
+        let prompt_runners = runners.clone();
+        let prompt_approvals = approvals.clone();
+        let prompt_driver = driver.clone();
+        let prompt = tokio::spawn(async move {
+            submit_named_brain_event(
+                &prompt_store,
+                &prompt_runners,
+                &prompt_approvals,
+                "shared",
+                &prompt_driver,
+                BrainEventKind::Prompt {
+                    text: "read README after approval".into(),
+                },
+            )
+            .await
+        });
+        let (request_seq, audience, expected_revision) = ready_rx.await.unwrap();
+        let decision = serde_json::json!({"choice": "approve_once"});
+        let mutation_id = uuid::Uuid::new_v4();
+        let receipt = crate::brain::store::BrainMutationReceipt {
+            mutation_id,
+            attachment_id: driver.attachment_id,
+            expected_revision,
+            environment_generation: audience.environment_generation,
+            command_sha256: "live-approval-decision".into(),
+        };
+        let decide = |store: crate::brain::store::BrainStore,
+                      runners: crate::server::BrainRunnerBroker,
+                      approvals: crate::server::BrainApprovalBroker,
+                      driver: crate::brain::store::BrainAttachment,
+                      receipt: crate::brain::store::BrainMutationReceipt,
+                      decision: serde_json::Value| {
+            tokio::spawn(async move {
+                submit_named_brain_event_with_authority_and_receipt(
+                    &store,
+                    &runners,
+                    &approvals,
+                    "shared",
+                    &driver,
+                    BrainEventKind::ApprovalDecided {
+                        request_seq,
+                        approval_id: "live-approval".into(),
+                        decision,
+                    },
+                    true,
+                    Some(receipt),
+                )
+                .await
+            })
+        };
+        let first = decide(
+            store.clone(), runners.clone(), approvals.clone(), driver.clone(),
+            receipt.clone(), decision.clone(),
+        );
+        let second = decide(
+            store.clone(), runners.clone(), approvals.clone(), driver.clone(),
+            receipt, decision,
+        );
+        let (first, second, prompt) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async { tokio::join!(first, second, prompt) },
+        )
+        .await
+        .expect("approval decision deadlocked behind the suspended turn lane");
+        let first = first.unwrap().unwrap();
+        let second = second.unwrap().unwrap();
+        assert_eq!(first.accepted, second.accepted);
+        let prompt = prompt.unwrap().unwrap();
+        assert_eq!(prompt.run.unwrap().status, crate::brain::store::BrainRunStatus::Running);
+        runner.await.unwrap();
+
+        let snapshot = store.snapshot("shared").unwrap();
+        assert_eq!(
+            snapshot.events.iter().filter(|event| matches!(
+                &event.kind,
+                BrainEventKind::ApprovalDecided { approval_id, .. }
+                    if approval_id == "live-approval"
+            )).count(),
+            1,
+        );
+        assert_eq!(
+            snapshot.events.iter().filter(|event| matches!(
+                &event.kind,
+                BrainEventKind::MutationRecorded {
+                    outcome: crate::brain::store::BrainMutationOutcome::ApprovalDecisionDelivered {
+                        mutation_id: recorded, ..
+                    },
+                } if *recorded == mutation_id
+            )).count(),
+            1,
+        );
+        assert_eq!(
+            snapshot.runs.iter().find(|run| run.request_seq == request_seq).unwrap().status,
+            crate::brain::store::BrainRunStatus::Completed,
+        );
     }
 
     #[tokio::test]

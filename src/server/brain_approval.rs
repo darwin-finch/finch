@@ -6,10 +6,10 @@
 //! attachment submits a decision.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{Context, Result};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 use crate::brain::store::{AttachmentId, BrainApprovalAudience, BrainId};
 
@@ -30,6 +30,7 @@ struct PendingApproval {
 #[derive(Clone, Default)]
 pub struct BrainApprovalBroker {
     pending: Arc<Mutex<HashMap<ApprovalKey, PendingApproval>>>,
+    mutation_locks: Arc<Mutex<HashMap<ApprovalKey, Weak<AsyncMutex<()>>>>>,
 }
 
 pub struct ApprovalRegistration {
@@ -45,6 +46,32 @@ pub struct ClaimedApproval {
 }
 
 impl BrainApprovalBroker {
+    /// Serialize durable decisions for one approval without taking the Brain's
+    /// turn lane. The originating turn intentionally holds that lane while its
+    /// runner waits for this decision.
+    pub fn mutation_lock(
+        &self,
+        brain_id: BrainId,
+        request_seq: u64,
+        approval_id: &str,
+    ) -> Arc<AsyncMutex<()>> {
+        let key = ApprovalKey {
+            brain_id,
+            request_seq,
+            approval_id: approval_id.to_string(),
+        };
+        let mut locks = self
+            .mutation_locks
+            .lock()
+            .expect("approval mutation lock map poisoned");
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+
     pub fn register(
         &self,
         request_seq: u64,
