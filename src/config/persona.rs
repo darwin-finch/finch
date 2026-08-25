@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A persona defines how the AI should behave
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +70,17 @@ pub struct PersonaExample {
 }
 
 impl Persona {
+    fn user_file_name(name: &str) -> Result<String> {
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        {
+            anyhow::bail!("Invalid persona name: {name}");
+        }
+        Ok(format!("{name}.toml"))
+    }
+
     /// Load persona from TOML file
     pub fn load(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path)
@@ -98,7 +109,9 @@ impl Persona {
     /// Load persona by name: checks ~/.finch/personas/<name>.toml first, then builtins
     pub fn load_by_name(name: &str) -> Result<Self> {
         if let Some(home) = dirs::home_dir() {
-            let user_path = home.join(".finch/personas").join(format!("{}.toml", name));
+            let user_path = home
+                .join(".finch/personas")
+                .join(Self::user_file_name(name)?);
             if user_path.exists() {
                 return Self::load(&user_path).with_context(|| {
                     format!("Failed to load user persona from {}", user_path.display())
@@ -106,6 +119,42 @@ impl Persona {
             }
         }
         Self::load_builtin(name)
+    }
+
+    /// Persist a user override for a persona's system prompt. User files take
+    /// precedence over the compiled-in template in `load_by_name`.
+    pub fn save_system_prompt_override(name: &str, system_prompt: &str) -> Result<PathBuf> {
+        let home = dirs::home_dir().context("Could not determine home directory")?;
+        Self::save_system_prompt_override_in(&home.join(".finch/personas"), name, system_prompt)
+    }
+
+    fn save_system_prompt_override_in(
+        personas_dir: &Path,
+        name: &str,
+        system_prompt: &str,
+    ) -> Result<PathBuf> {
+        let path = personas_dir.join(Self::user_file_name(name)?);
+        let mut persona = if path.exists() {
+            Self::load(&path)?
+        } else {
+            Self::load_builtin(name)?
+        };
+        persona.behavior.system_prompt = system_prompt.to_string();
+
+        fs::create_dir_all(personas_dir).with_context(|| {
+            format!("Failed to create persona directory {}", personas_dir.display())
+        })?;
+        let encoded = toml::to_string_pretty(&persona).context("Failed to serialize persona")?;
+        let temporary = path.with_extension("toml.tmp");
+        fs::write(&temporary, encoded).with_context(|| {
+            format!(
+                "Failed to save persona override to {}",
+                temporary.display()
+            )
+        })?;
+        fs::rename(&temporary, &path)
+            .with_context(|| format!("Failed to install persona override at {}", path.display()))?;
+        Ok(path)
     }
 
     /// Get system prompt formatted for injection
@@ -213,6 +262,33 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
+    }
+
+    #[test]
+    fn test_system_prompt_override_is_saved_as_user_persona() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Persona::save_system_prompt_override_in(
+            dir.path(),
+            "default",
+            "Say hello once you've loaded.",
+        )
+        .unwrap();
+
+        let saved = Persona::load(&path).unwrap();
+        assert_eq!(
+            saved.behavior.system_prompt,
+            "Say hello once you've loaded."
+        );
+        assert_eq!(saved.persona.name, "Default");
+    }
+
+    #[test]
+    fn test_user_persona_name_rejects_path_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = Persona::save_system_prompt_override_in(dir.path(), "../outside", "bad")
+            .unwrap_err();
+        assert!(error.to_string().contains("Invalid persona name"));
+        assert!(!dir.path().parent().unwrap().join("outside.toml").exists());
     }
 
     // ── default ───────────────────────────────────────────────────────────────

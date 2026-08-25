@@ -671,7 +671,7 @@ impl Repl {
         ));
 
         // Phase 2: Load active persona
-        let active_persona = match crate::config::Persona::load_builtin(&config.active_persona) {
+        let active_persona = match crate::config::Persona::load_by_name(&config.active_persona) {
             Ok(persona) => Arc::new(RwLock::new(persona)),
             Err(e) => {
                 output_status!(
@@ -3598,7 +3598,7 @@ impl Repl {
     /// Phase 2: Handle /persona select <name> command
     async fn handle_persona_select(&mut self, name: &str) -> Result<()> {
         // Try to load the persona
-        match crate::config::Persona::load_builtin(name) {
+        match crate::config::Persona::load_by_name(name) {
             Ok(persona) => {
                 let old_name = self.active_persona.read().await.name().to_string();
                 *self.active_persona.write().await = persona;

@@ -451,7 +451,7 @@ impl WizardState {
         let builtin_personas: Vec<PersonaInfo> = Persona::list_builtins()
             .iter()
             .filter_map(|slug| {
-                Persona::load_builtin(slug).ok().map(|p| PersonaInfo {
+                Persona::load_by_name(slug).ok().map(|p| PersonaInfo {
                     slug: slug.to_string(),
                     name: p.name().to_string(),
                     description: p.persona.description.clone(),
@@ -588,6 +588,9 @@ pub struct SetupResult {
 
     // Persona
     pub default_persona: String,
+    /// Edited prompt for the selected persona when it differs from the
+    /// compiled-in template.
+    pub custom_system_prompt: Option<String>,
 
     // Feature flags
     pub auto_approve_tools: bool,
@@ -692,7 +695,11 @@ pub fn run_setup_wizard() -> Result<Option<SetupResult>> {
 ///
 /// Used both by `main.rs` (first-run) and by the `/setup` REPL command.
 pub fn apply_and_save(result: &SetupResult) -> Result<()> {
-    config_from_setup_result(result).save()
+    config_from_setup_result(result).save()?;
+    if let Some(prompt) = result.custom_system_prompt.as_deref() {
+        crate::config::Persona::save_system_prompt_override(&result.default_persona, prompt)?;
+    }
+    Ok(())
 }
 
 /// Convert wizard output into the complete configuration written to disk.
@@ -1938,13 +1945,21 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
     };
 
     // Extract persona
-    let default_persona = if let Some(SectionState::Personas {
-        default_persona, ..
+    let (default_persona, custom_system_prompt) = if let Some(SectionState::Personas {
+        available_personas,
+        selected_idx,
+        default_persona,
+        ..
     }) = state.sections.get(&WizardSection::Personas)
     {
-        default_persona.clone()
+        let custom_prompt = available_personas.get(*selected_idx).and_then(|persona| {
+            let builtin = crate::config::Persona::load_builtin(&persona.slug).ok()?;
+            (persona.system_prompt != builtin.behavior.system_prompt)
+                .then(|| persona.system_prompt.clone())
+        });
+        (default_persona.clone(), custom_prompt)
     } else {
-        "default".to_string()
+        ("default".to_string(), None)
     };
 
     // Extract features
@@ -2184,6 +2199,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         teachers,
         finch_api_key: finch_api_key_val,
         default_persona,
+        custom_system_prompt,
         auto_approve_tools: auto_approve,
         streaming_enabled: streaming,
         debug_logging: debug,
@@ -4626,5 +4642,35 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn test_edited_system_prompt_is_included_in_setup_result() {
+        let mut state = WizardState::new(None);
+        if let Some(SectionState::Personas {
+            available_personas,
+            selected_idx,
+            default_persona,
+            ..
+        }) = state.sections.get_mut(&WizardSection::Personas)
+        {
+            *selected_idx = available_personas
+                .iter()
+                .position(|persona| persona.slug == "default")
+                .unwrap();
+            *default_persona = "default".to_string();
+            available_personas[*selected_idx].system_prompt =
+                "Say hello once you've loaded.".to_string();
+        } else {
+            panic!("expected persona section");
+        }
+
+        let result = build_setup_result(&state).unwrap();
+        assert_eq!(
+            result.custom_system_prompt.as_deref(),
+            Some("Say hello once you've loaded.")
+        );
+        let config = config_from_setup_result(&result);
+        assert_eq!(config.active_persona, "default");
     }
 }
