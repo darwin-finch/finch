@@ -54,19 +54,19 @@ const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
     (
         "grok",
         "Grok (xAI)",
-        "grok-code-fast-1",
+        "",
         "get key at console.x.ai (X Premium+ included)",
     ),
     (
         "claude",
         "Claude (Anthropic)",
-        "claude-sonnet-4-6",
+        "",
         "get key at console.anthropic.com",
     ),
     (
         "openai",
         "GPT-4 (OpenAI)",
-        "gpt-4o",
+        "",
         "get key at platform.openai.com",
     ),
     (
@@ -92,6 +92,10 @@ const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
 use crate::config::{ExecutionTarget, ProviderEntry, TeacherEntry};
 use crate::models::compatibility;
 use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
+use crate::providers::endpoints::ProviderEndpoints;
+use crate::providers::model_catalog::{
+    self, CatalogAuth, CatalogSource, ModelCatalog, ModelCatalogProfile,
+};
 
 /// Try to detect an existing Anthropic API key from the environment or Claude Code config.
 fn detect_anthropic_api_key() -> Option<String> {
@@ -132,28 +136,84 @@ fn detect_xai_api_key() -> Option<String> {
 }
 
 /// Known model names for cloud providers (used for cycling in ConfigureRemote dialog)
-fn known_models_for(provider: &str) -> &'static [&'static str] {
-    match provider {
-        "claude" => &[
-            "claude-sonnet-4-6",
-            "claude-opus-4-6",
-            "claude-haiku-4-5-20251001",
-        ],
-        "openai" => &["gpt-4o", "gpt-4-turbo", "o1-mini", "o3-mini"],
-        "grok" => &["grok-code-fast-1", "grok-2-latest"],
-        "gemini" => &["gemini-2.0-flash", "gemini-2.0-pro-exp", "gemini-1.5-pro"],
-        "mistral" => &[
-            "mistral-large-latest",
-            "codestral-latest",
-            "mistral-medium-latest",
-        ],
-        "groq" => &[
-            "llama-3.3-70b-versatile",
-            "mixtral-8x7b-32768",
-            "gemma2-9b-it",
-        ],
-        _ => &[],
-    }
+fn known_models_for(provider: &str) -> Vec<String> {
+    model_catalog::static_fallback(provider)
+}
+
+fn model_catalog_profile(
+    provider: &str,
+    api_key: &str,
+    persisted: Option<&ProviderEntry>,
+) -> Option<ModelCatalogProfile> {
+    let (base_url, chat_path, models_path, auth) = match (provider, persisted) {
+        (
+            "claude",
+            Some(ProviderEntry::Claude {
+                base_url,
+                chat_path,
+                models_path,
+                ..
+            }),
+        ) => (
+            base_url.as_deref().unwrap_or("https://api.anthropic.com"),
+            chat_path.as_deref().unwrap_or("/v1/messages"),
+            models_path.as_deref().unwrap_or("/v1/models"),
+            CatalogAuth::AnthropicApiKey,
+        ),
+        ("claude", _) => (
+            "https://api.anthropic.com",
+            "/v1/messages",
+            "/v1/models",
+            CatalogAuth::AnthropicApiKey,
+        ),
+        (
+            "openai",
+            Some(ProviderEntry::Openai {
+                base_url,
+                chat_path,
+                models_path,
+                ..
+            }),
+        ) => (
+            base_url.as_deref().unwrap_or("https://api.openai.com"),
+            chat_path.as_deref().unwrap_or("/v1/chat/completions"),
+            models_path.as_deref().unwrap_or("/v1/models"),
+            CatalogAuth::Bearer,
+        ),
+        ("openai", _) => (
+            "https://api.openai.com",
+            "/v1/chat/completions",
+            "/v1/models",
+            CatalogAuth::Bearer,
+        ),
+        (
+            "grok",
+            Some(ProviderEntry::Grok {
+                base_url,
+                chat_path,
+                models_path,
+                ..
+            }),
+        ) => (
+            base_url.as_deref().unwrap_or("https://api.x.ai"),
+            chat_path.as_deref().unwrap_or("/v1/chat/completions"),
+            models_path.as_deref().unwrap_or("/v1/models"),
+            CatalogAuth::Bearer,
+        ),
+        ("grok", _) => (
+            "https://api.x.ai",
+            "/v1/chat/completions",
+            "/v1/models",
+            CatalogAuth::Bearer,
+        ),
+        _ => return None,
+    };
+    Some(ModelCatalogProfile {
+        provider: provider.to_string(),
+        api_key: api_key.to_string(),
+        endpoints: ProviderEndpoints::new(base_url, chat_path, models_path),
+        auth,
+    })
 }
 
 /// Helper function to display ModelSize
@@ -212,6 +272,10 @@ enum SectionState {
         editing_model_mode: bool, // editing model name for selected entry
         model_input: String,      // model name input buffer
         adding_provider: Option<AddProviderStep>,
+        catalog_models: Vec<String>,
+        catalog_source: CatalogSource,
+        catalog_refresh: Option<Arc<Mutex<Option<(ModelCatalog, Option<String>)>>>>,
+        catalog_error: Option<String>,
         error: Option<String>,
     },
     Personas {
@@ -343,17 +407,19 @@ fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
             enabled: true,
             persisted: Some(provider.clone()),
         }),
-        _ => provider.to_teacher_entry().map(|teacher| ModelConfig::Remote {
-            provider: teacher.provider.clone(),
-            name: teacher
-                .name
-                .clone()
-                .unwrap_or_else(|| teacher.provider.clone()),
-            api_key: teacher.api_key,
-            model: teacher.model.unwrap_or_default(),
-            enabled: true,
-            persisted: Some(provider.clone()),
-        }),
+        _ => provider
+            .to_teacher_entry()
+            .map(|teacher| ModelConfig::Remote {
+                provider: teacher.provider.clone(),
+                name: teacher
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| teacher.provider.clone()),
+                api_key: teacher.api_key,
+                model: teacher.model.unwrap_or_default(),
+                enabled: true,
+                persisted: Some(provider.clone()),
+            }),
     }
 }
 
@@ -563,6 +629,10 @@ impl WizardState {
                 editing_model_mode: false,
                 model_input: String::new(),
                 adding_provider: None,
+                catalog_models: Vec::new(),
+                catalog_source: CatalogSource::StaticFallback,
+                catalog_refresh: None,
+                catalog_error: None,
                 error: None,
             },
         );
@@ -885,9 +955,58 @@ fn is_scanning_state(state: &WizardState) -> bool {
     }) = state.sections.get(&WizardSection::Models)
     {
         matches!(adding_provider, Some(AddProviderStep::Scanning { .. }))
+            || matches!(
+                state.sections.get(&WizardSection::Models),
+                Some(SectionState::Models {
+                    catalog_refresh: Some(_),
+                    ..
+                })
+            )
     } else {
         false
     }
+}
+
+fn advance_catalog_refresh_if_done(state: &mut WizardState) {
+    let Some(SectionState::Models {
+        adding_provider,
+        catalog_models,
+        catalog_source,
+        catalog_refresh,
+        catalog_error,
+        ..
+    }) = state.sections.get_mut(&WizardSection::Models)
+    else {
+        return;
+    };
+    let result = catalog_refresh
+        .as_ref()
+        .and_then(|refresh| refresh.try_lock().ok())
+        .and_then(|guard| guard.as_ref().cloned());
+    let Some((catalog, refresh_error)) = result else {
+        return;
+    };
+
+    let previous_fallback = if let Some(AddProviderStep::ConfigureRemote { provider_idx, .. }) =
+        adding_provider.as_ref()
+    {
+        known_models_for(CLOUD_PROVIDERS[*provider_idx].0)
+    } else {
+        Vec::new()
+    };
+    if let Some(AddProviderStep::ConfigureRemote { model, .. }) = adding_provider.as_mut() {
+        if catalog.source == CatalogSource::Discovered
+            && (model.trim().is_empty() || previous_fallback.contains(model))
+        {
+            if let Some(discovered) = catalog.models.first() {
+                *model = discovered.clone();
+            }
+        }
+    }
+    *catalog_models = catalog.models;
+    *catalog_source = catalog.source;
+    *catalog_error = refresh_error;
+    *catalog_refresh = None;
 }
 
 /// Returns true if the Models section currently has any overlay open
@@ -1028,6 +1147,7 @@ fn run_tabbed_wizard(
         // the background thread's results without blocking on keyboard input.
         let key_opt: Option<crossterm::event::KeyEvent> = if is_scanning_state(&state) {
             advance_scan_if_done(&mut state);
+            advance_catalog_refresh_if_done(&mut state);
             if event::poll(Duration::from_millis(100))? {
                 match event::read()? {
                     Event::Key(key) => Some(key),
@@ -1108,6 +1228,10 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
         editing_model_mode,
         model_input,
         adding_provider,
+        catalog_models,
+        catalog_source,
+        catalog_refresh,
+        catalog_error,
         error,
     }) = state.sections.get_mut(&WizardSection::Models)
     {
@@ -1279,17 +1403,19 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     // Reset model to default for new provider
                                     let default = CLOUD_PROVIDERS[new_idx].2;
                                     *model = default.to_string();
+                                    *catalog_models = known_models_for(CLOUD_PROVIDERS[new_idx].0);
+                                    *catalog_source = CatalogSource::StaticFallback;
+                                    *catalog_error = None;
                                 }
                                 2 => {
-                                    let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
-                                    let models = known_models_for(provider_id);
-                                    if !models.is_empty() {
-                                        let pos = models
+                                    if !catalog_models.is_empty() {
+                                        let pos = catalog_models
                                             .iter()
-                                            .position(|m| *m == model.as_str())
+                                            .position(|m| m == model)
                                             .unwrap_or(0);
-                                        let new_pos = (pos + models.len() - 1) % models.len();
-                                        *model = models[new_pos].to_string();
+                                        let new_pos =
+                                            (pos + catalog_models.len() - 1) % catalog_models.len();
+                                        *model = catalog_models[new_pos].clone();
                                     }
                                 }
                                 _ => {}
@@ -1358,16 +1484,18 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     // Reset model to default for new provider
                                     let default = CLOUD_PROVIDERS[new_idx].2;
                                     *model = default.to_string();
+                                    *catalog_models = known_models_for(CLOUD_PROVIDERS[new_idx].0);
+                                    *catalog_source = CatalogSource::StaticFallback;
+                                    *catalog_error = None;
                                 }
                                 2 => {
-                                    let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
-                                    let models = known_models_for(provider_id);
-                                    if !models.is_empty() {
-                                        let pos = models
+                                    if !catalog_models.is_empty() {
+                                        let pos = catalog_models
                                             .iter()
-                                            .position(|m| *m == model.as_str())
+                                            .position(|m| m == model)
                                             .unwrap_or(0);
-                                        *model = models[(pos + 1) % models.len()].to_string();
+                                        *model = catalog_models[(pos + 1) % catalog_models.len()]
+                                            .clone();
                                     }
                                 }
                                 _ => {}
@@ -1375,6 +1503,72 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         }
                         _ => {}
                     }
+                }
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let Some(AddProviderStep::ConfigureRemote {
+                        provider_idx,
+                        api_key,
+                        editing_idx,
+                        ..
+                    }) = adding_provider.as_ref()
+                    else {
+                        return Ok(false);
+                    };
+                    let persisted = editing_idx.and_then(|index| {
+                        if index == 0 {
+                            match primary_model {
+                                ModelConfig::Remote { persisted, .. } => persisted.as_ref(),
+                                ModelConfig::Local { .. } => None,
+                            }
+                        } else {
+                            tool_models.get(index - 1).and_then(|model| match model {
+                                ModelConfig::Remote { persisted, .. } => persisted.as_ref(),
+                                ModelConfig::Local { .. } => None,
+                            })
+                        }
+                    });
+                    let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
+                    let Some(profile) = model_catalog_profile(provider_id, api_key, persisted)
+                    else {
+                        *catalog_error = Some(format!(
+                            "{} does not advertise model discovery; enter a model ID manually",
+                            CLOUD_PROVIDERS[*provider_idx].1
+                        ));
+                        return Ok(false);
+                    };
+                    let cache_dir = match model_catalog::default_cache_dir() {
+                        Ok(path) => path,
+                        Err(error) => {
+                            *catalog_error = Some(error.to_string());
+                            return Ok(false);
+                        }
+                    };
+                    let result: Arc<Mutex<Option<(ModelCatalog, Option<String>)>>> =
+                        Arc::new(Mutex::new(None));
+                    let result_for_thread = Arc::clone(&result);
+                    std::thread::spawn(move || {
+                        let refreshed = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(anyhow::Error::from)
+                            .map(|runtime| {
+                                runtime.block_on(model_catalog::refresh_with_fallback(
+                                    &profile, &cache_dir,
+                                ))
+                            });
+                        *result_for_thread.lock().unwrap() = Some(match refreshed {
+                            Ok(result) => result,
+                            Err(error) => (
+                                model_catalog::fallback_catalog(
+                                    &profile.provider,
+                                    &profile.endpoints.models_url,
+                                ),
+                                Some(error.to_string()),
+                            ),
+                        });
+                    });
+                    *catalog_refresh = Some(result);
+                    *catalog_error = None;
                 }
                 KeyCode::Char(c) => {
                     if let Some(AddProviderStep::ConfigureRemote {
@@ -1433,6 +1627,20 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             if selected < n_cloud {
                                 // Open single-screen remote dialog pre-selected to this provider
                                 let default_model = CLOUD_PROVIDERS[selected].2.to_string();
+                                *catalog_models = known_models_for(CLOUD_PROVIDERS[selected].0);
+                                *catalog_source = CatalogSource::StaticFallback;
+                                *catalog_error = None;
+                                if let (Some(profile), Ok(cache_dir)) = (
+                                    model_catalog_profile(CLOUD_PROVIDERS[selected].0, "", None),
+                                    model_catalog::default_cache_dir(),
+                                ) {
+                                    if let Ok(Some(cached)) =
+                                        model_catalog::read_cache(&profile, &cache_dir)
+                                    {
+                                        *catalog_models = cached.models;
+                                        *catalog_source = CatalogSource::Cache;
+                                    }
+                                }
                                 Some(AddProviderStep::ConfigureRemote {
                                     provider_idx: selected,
                                     name: CLOUD_PROVIDERS[selected].0.to_string(),
@@ -1486,39 +1694,54 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             } else {
                                 model
                             };
-                            let edited = ModelConfig::Remote {
-                                provider: provider_id.to_string(),
-                                name: if name.trim().is_empty() {
-                                    provider_id.to_string()
-                                } else {
-                                    name.trim().to_string()
-                                },
-                                api_key,
-                                model: resolved_model,
-                                enabled: true,
-                                persisted: None,
-                            };
-                            if let Some(index) = editing_idx {
-                                if index == 0 {
-                                    *primary_model = edited;
-                                } else if let Some(slot) = tool_models.get_mut(index - 1) {
-                                    let enabled = slot.enabled();
-                                    *slot = edited;
-                                    slot.set_enabled(enabled);
-                                }
-                                *selected_idx = index;
-                            } else if matches!(
-                                primary_model,
-                                ModelConfig::Remote { api_key: ref k, .. } if k.is_empty()
-                            ) && tool_models.is_empty()
-                            {
-                                *primary_model = edited;
-                                *selected_idx = 0;
+                            if resolved_model.trim().is_empty() {
+                                *catalog_error = Some(
+                                    "Refresh the authenticated catalogue with Ctrl+R or enter a model ID manually"
+                                        .to_string(),
+                                );
+                                Some(AddProviderStep::ConfigureRemote {
+                                    provider_idx,
+                                    name,
+                                    model: resolved_model,
+                                    api_key,
+                                    focused_field: 2,
+                                    editing_idx,
+                                })
                             } else {
-                                tool_models.push(edited);
-                                *selected_idx = tool_models.len();
+                                let edited = ModelConfig::Remote {
+                                    provider: provider_id.to_string(),
+                                    name: if name.trim().is_empty() {
+                                        provider_id.to_string()
+                                    } else {
+                                        name.trim().to_string()
+                                    },
+                                    api_key,
+                                    model: resolved_model,
+                                    enabled: true,
+                                    persisted: None,
+                                };
+                                if let Some(index) = editing_idx {
+                                    if index == 0 {
+                                        *primary_model = edited;
+                                    } else if let Some(slot) = tool_models.get_mut(index - 1) {
+                                        let enabled = slot.enabled();
+                                        *slot = edited;
+                                        slot.set_enabled(enabled);
+                                    }
+                                    *selected_idx = index;
+                                } else if matches!(
+                                    primary_model,
+                                    ModelConfig::Remote { api_key: ref k, .. } if k.is_empty()
+                                ) && tool_models.is_empty()
+                                {
+                                    *primary_model = edited;
+                                    *selected_idx = 0;
+                                } else {
+                                    tool_models.push(edited);
+                                    *selected_idx = tool_models.len();
+                                }
+                                None
                             }
-                            None
                         }
                         // ── single-screen local dialog — confirm ─────────────────────
                         Some(AddProviderStep::ConfigureLocal {
@@ -1681,6 +1904,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         name,
                         model,
                         api_key,
+                        persisted,
                         ..
                     }) = selected
                     {
@@ -1688,6 +1912,20 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             .iter()
                             .position(|(id, ..)| *id == provider)
                             .unwrap_or(0);
+                        *catalog_models = known_models_for(CLOUD_PROVIDERS[provider_idx].0);
+                        *catalog_source = CatalogSource::StaticFallback;
+                        *catalog_error = None;
+                        if let (Some(profile), Ok(cache_dir)) = (
+                            model_catalog_profile(provider, api_key, persisted.as_ref()),
+                            model_catalog::default_cache_dir(),
+                        ) {
+                            if let Ok(Some(cached)) =
+                                model_catalog::read_cache(&profile, &cache_dir)
+                            {
+                                *catalog_models = cached.models;
+                                *catalog_source = CatalogSource::Cache;
+                            }
+                        }
                         *adding_provider = Some(AddProviderStep::ConfigureRemote {
                             provider_idx,
                             name: name.clone(),
@@ -2505,7 +2743,11 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             editing_model_mode,
             model_input,
             adding_provider,
+            catalog_source,
+            catalog_refresh,
+            catalog_error,
             error,
+            ..
         }) => render_models_section(
             f,
             area,
@@ -2516,6 +2758,9 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             *editing_model_mode,
             model_input,
             adding_provider.as_ref(),
+            catalog_source,
+            catalog_refresh.is_some(),
+            catalog_error.as_deref(),
             error.as_deref(),
         ),
         Some(SectionState::Personas {
@@ -2701,6 +2946,9 @@ fn render_models_section(
     editing_model_mode: bool,
     model_input: &str,
     adding_provider: Option<&AddProviderStep>,
+    catalog_source: &CatalogSource,
+    catalog_refreshing: bool,
+    catalog_error: Option<&str>,
     error: Option<&str>,
 ) {
     let chunks = Layout::default()
@@ -2929,12 +3177,26 @@ fn render_models_section(
 
     // Render add-provider overlay if active
     if let Some(step) = adding_provider {
-        render_add_provider_overlay(f, area, step);
+        render_add_provider_overlay(
+            f,
+            area,
+            step,
+            catalog_source,
+            catalog_refreshing,
+            catalog_error,
+        );
     }
 }
 
 /// Render the add-provider overlay (centered box)
-fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep) {
+fn render_add_provider_overlay(
+    f: &mut Frame,
+    area: Rect,
+    step: &AddProviderStep,
+    catalog_source: &CatalogSource,
+    catalog_refreshing: bool,
+    catalog_error: Option<&str>,
+) {
     // Center a box that's 60% wide, 50% tall
     let overlay_width = (area.width * 6 / 10).max(50).min(area.width);
     let overlay_height = (area.height / 2).max(14).min(area.height);
@@ -3054,6 +3316,9 @@ fn render_add_provider_overlay(f: &mut Frame, area: Rect, step: &AddProviderStep
                 api_key,
                 *focused_field,
                 editing_idx.is_some(),
+                catalog_source,
+                catalog_refreshing,
+                catalog_error,
             );
         }
         // ── single-screen local model dialog ─────────────────────────────────────────
@@ -3143,6 +3408,9 @@ fn render_configure_remote_overlay(
     api_key: &str,
     focused_field: usize,
     editing: bool,
+    catalog_source: &CatalogSource,
+    catalog_refreshing: bool,
+    catalog_error: Option<&str>,
 ) {
     let (provider_id, provider_name, _default_model, key_hint) =
         CLOUD_PROVIDERS[provider_idx.min(CLOUD_PROVIDERS.len() - 1)];
@@ -3208,12 +3476,35 @@ fn render_configure_remote_overlay(
         Style::default().fg(Color::DarkGray),
     )));
 
+    let catalog_label = if catalog_refreshing {
+        "Refreshing authenticated model catalogue…".to_string()
+    } else {
+        format!(
+            "Models: {} · Ctrl+R refresh · model ID remains editable",
+            match catalog_source {
+                CatalogSource::Discovered => "provider discovery",
+                CatalogSource::Cache => "local cache",
+                CatalogSource::StaticFallback => "static fallback",
+            }
+        )
+    };
+    lines.push(Line::from(Span::styled(
+        catalog_label,
+        Style::default().fg(Color::Cyan),
+    )));
+    if let Some(error) = catalog_error {
+        lines.push(Line::from(Span::styled(
+            format!("Refresh warning: {error}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         if editing {
-            "↑↓ navigate · type to edit · Enter saves · Esc cancels"
+            "↑↓ navigate · type to edit · Ctrl+R refresh · Enter saves · Esc cancels"
         } else {
-            "↑↓ navigate · ←→ change provider/model · Enter adds · Esc back"
+            "↑↓ navigate · ←→ change provider/model · Ctrl+R refresh · Enter adds · Esc back"
         },
         Style::default().fg(Color::Yellow),
     )));
@@ -4076,7 +4367,10 @@ mod tests {
 
         handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
         if let Some(AddProviderStep::ConfigureRemote {
-            name, editing_idx, ..
+            name,
+            model,
+            editing_idx,
+            ..
         }) = state
             .sections
             .get_mut(&WizardSection::Models)
@@ -4088,6 +4382,7 @@ mod tests {
             })
         {
             *name = "work-claude".to_string();
+            *model = "manually-selected-claude".to_string();
             assert_eq!(*editing_idx, Some(0));
         } else {
             panic!("expected provider editor");
@@ -4203,9 +4498,14 @@ mod tests {
     fn state_with_step(step: AddProviderStep) -> WizardState {
         let mut state = WizardState::new(None);
         if let Some(SectionState::Models {
-            adding_provider, ..
+            adding_provider,
+            catalog_models,
+            ..
         }) = state.sections.get_mut(&WizardSection::Models)
         {
+            if let AddProviderStep::ConfigureRemote { provider_idx, .. } = &step {
+                *catalog_models = known_models_for(CLOUD_PROVIDERS[*provider_idx].0);
+            }
             *adding_provider = Some(step);
         }
         state
@@ -4270,9 +4570,10 @@ mod tests {
         for (id, _, default_model, _) in CLOUD_PROVIDERS {
             let models = known_models_for(id);
             assert!(!models.is_empty(), "provider '{}' has no known models", id);
-            // Default model from CLOUD_PROVIDERS must be in the list
+            // Discovery-capable providers intentionally start blank so the
+            // wizard cannot silently select a stale compile-time identifier.
             assert!(
-                models.contains(default_model),
+                default_model.is_empty() || models.iter().any(|model| model == default_model),
                 "provider '{}': default model '{}' not in known_models_for list {:?}",
                 id,
                 default_model,
@@ -4284,6 +4585,136 @@ mod tests {
     #[test]
     fn test_known_models_for_unknown_provider_returns_empty() {
         assert!(known_models_for("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn discovery_capable_providers_do_not_start_with_compile_time_model_ids() {
+        for provider in ["claude", "openai", "grok"] {
+            let (_, _, default_model, _) = CLOUD_PROVIDERS
+                .iter()
+                .find(|(id, ..)| *id == provider)
+                .unwrap();
+            assert!(
+                default_model.is_empty(),
+                "{provider} should start editable and blank"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_profile_preserves_configured_full_paths() {
+        let persisted = ProviderEntry::Openai {
+            api_key: "old-key".to_string(),
+            model: Some("manual-model".to_string()),
+            base_url: Some("https://compatible.example/v1".to_string()),
+            chat_path: Some("https://chat.example/exact/completions?preview=1".to_string()),
+            models_path: Some("https://models.example/exact/catalog?account=work".to_string()),
+            name: Some("compatible".to_string()),
+            reasoning_effort: None,
+        };
+        let profile = model_catalog_profile("openai", "new-key", Some(&persisted)).unwrap();
+        assert_eq!(profile.api_key, "new-key");
+        assert_eq!(
+            profile.endpoints.chat_url,
+            "https://chat.example/exact/completions?preview=1"
+        );
+        assert_eq!(
+            profile.endpoints.models_url,
+            "https://models.example/exact/catalog?account=work"
+        );
+    }
+
+    #[test]
+    fn builtin_discovery_profiles_use_provider_specific_urls_and_auth() {
+        let claude = model_catalog_profile("claude", "key", None).unwrap();
+        assert_eq!(claude.auth, CatalogAuth::AnthropicApiKey);
+        assert_eq!(
+            claude.endpoints.models_url,
+            "https://api.anthropic.com/v1/models"
+        );
+
+        let openai = model_catalog_profile("openai", "key", None).unwrap();
+        assert_eq!(openai.auth, CatalogAuth::Bearer);
+        assert_eq!(
+            openai.endpoints.models_url,
+            "https://api.openai.com/v1/models"
+        );
+
+        let xai = model_catalog_profile("grok", "key", None).unwrap();
+        assert_eq!(xai.auth, CatalogAuth::Bearer);
+        assert_eq!(xai.endpoints.models_url, "https://api.x.ai/v1/models");
+    }
+
+    #[test]
+    fn completed_discovery_replaces_only_blank_or_fallback_model() {
+        let claude_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, ..)| *id == "claude")
+            .unwrap();
+        let fallback = known_models_for("claude")[0].clone();
+        let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+            provider_idx: claude_idx,
+            name: "claude".to_string(),
+            model: fallback,
+            api_key: "test-key".to_string(),
+            focused_field: 2,
+            editing_idx: None,
+        });
+        if let Some(SectionState::Models {
+            catalog_refresh, ..
+        }) = state.sections.get_mut(&WizardSection::Models)
+        {
+            *catalog_refresh = Some(Arc::new(Mutex::new(Some((
+                ModelCatalog {
+                    provider: "claude".to_string(),
+                    models_url: "https://api.anthropic.com/v1/models".to_string(),
+                    models: vec!["account-visible-model".to_string()],
+                    source: CatalogSource::Discovered,
+                    refreshed_at: chrono::Utc::now(),
+                },
+                None,
+            )))));
+        }
+        advance_catalog_refresh_if_done(&mut state);
+        assert!(matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote { model, .. })
+                if model == "account-visible-model"
+        ));
+
+        if let Some(AddProviderStep::ConfigureRemote { model, .. }) = state
+            .sections
+            .get_mut(&WizardSection::Models)
+            .and_then(|section| match section {
+                SectionState::Models {
+                    adding_provider, ..
+                } => adding_provider.as_mut(),
+                _ => None,
+            })
+        {
+            *model = "manually-entered-model".to_string();
+        }
+        if let Some(SectionState::Models {
+            catalog_refresh, ..
+        }) = state.sections.get_mut(&WizardSection::Models)
+        {
+            *catalog_refresh = Some(Arc::new(Mutex::new(Some((
+                ModelCatalog {
+                    provider: "claude".to_string(),
+                    models_url: "https://api.anthropic.com/v1/models".to_string(),
+                    models: vec!["newer-visible-model".to_string()],
+                    source: CatalogSource::Discovered,
+                    refreshed_at: chrono::Utc::now(),
+                },
+                None,
+            )))));
+        }
+        advance_catalog_refresh_if_done(&mut state);
+        assert!(matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote { model, .. })
+                if model == "manually-entered-model"
+        ));
     }
 
     // ── is_overlay_active ─────────────────────────────────────────────────────
@@ -4597,11 +5028,11 @@ mod tests {
             .iter()
             .position(|(id, _, _, _)| *id == "claude")
             .unwrap();
-        let first_model = known_models_for("claude")[0];
+        let first_model = known_models_for("claude")[0].clone();
         let mut state = state_with_step(AddProviderStep::ConfigureRemote {
             provider_idx: claude_idx,
             name: "claude".to_string(),
-            model: first_model.to_string(),
+            model: first_model,
             api_key: String::new(),
             focused_field: 2, // Model field
             editing_idx: None,
@@ -4609,7 +5040,7 @@ mod tests {
         handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
         if let Some(AddProviderStep::ConfigureRemote { model, .. }) = get_step(&state) {
             let models = known_models_for("claude");
-            assert_eq!(model.as_str(), models[1]);
+            assert_eq!(model, &models[1]);
         } else {
             panic!("expected ConfigureRemote");
         }
@@ -4621,11 +5052,11 @@ mod tests {
             .iter()
             .position(|(id, _, _, _)| *id == "claude")
             .unwrap();
-        let first_model = known_models_for("claude")[0];
+        let first_model = known_models_for("claude")[0].clone();
         let mut state = state_with_step(AddProviderStep::ConfigureRemote {
             provider_idx: claude_idx,
             name: "claude".to_string(),
-            model: first_model.to_string(),
+            model: first_model,
             api_key: String::new(),
             focused_field: 2,
             editing_idx: None,
@@ -4634,7 +5065,7 @@ mod tests {
         if let Some(AddProviderStep::ConfigureRemote { model, .. }) = get_step(&state) {
             let models = known_models_for("claude");
             // wraps from first to last
-            assert_eq!(model.as_str(), models[models.len() - 1]);
+            assert_eq!(model, &models[models.len() - 1]);
         } else {
             panic!("expected ConfigureRemote");
         }
@@ -4737,26 +5168,35 @@ mod tests {
     }
 
     #[test]
-    fn test_configure_remote_enter_uses_default_model_when_model_empty() {
+    fn test_configure_remote_requires_refresh_or_manual_id_when_model_empty() {
         let claude_idx = CLOUD_PROVIDERS
             .iter()
             .position(|(id, _, _, _)| *id == "claude")
             .unwrap();
-        let default_claude_model = CLOUD_PROVIDERS[claude_idx].2;
         let mut state = state_with_step(AddProviderStep::ConfigureRemote {
             provider_idx: claude_idx,
             name: "claude".to_string(),
-            model: String::new(), // empty — should use default
+            model: String::new(),
             api_key: "sk-ant-key".to_string(),
             focused_field: 3,
             editing_idx: None,
         });
         handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
-        if let Some(ModelConfig::Remote { model, .. }) = get_primary(&state) {
-            assert_eq!(model.as_str(), default_claude_model);
-        } else {
-            panic!("expected Remote primary");
-        }
+        assert!(matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote {
+                model,
+                focused_field: 2,
+                ..
+            }) if model.is_empty()
+        ));
+        assert!(matches!(
+            state.sections.get(&WizardSection::Models),
+            Some(SectionState::Models {
+                catalog_error: Some(error),
+                ..
+            }) if error.contains("Ctrl+R")
+        ));
     }
 
     // ── ConfigureRemote: Esc goes back ────────────────────────────────────────
