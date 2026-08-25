@@ -22,7 +22,7 @@ struct ContentBlock {
 struct ToolUseBlock {
   id        @0 :Text;
   name      @1 :Text;
-  inputJson @2 :Text;  # JSON-encoded input
+  input     @2 :JsonValue;
 }
 
 struct ToolResultBlock {
@@ -49,7 +49,7 @@ struct ToolDefinition {
 struct ToolUse {
   id        @0 :Text;
   name      @1 :Text;
-  inputJson @2 :Text;
+  input     @2 :JsonValue;
 }
 
 # ---------------------------------------------------------------------------
@@ -139,7 +139,7 @@ struct BrainTurnRequest {
   brain       @0 :Text;
   requestSeq  @1 :UInt64;
   prompt      @2 :Text;
-  contextJson @3 :Data; # Transitional canonical Message list; schema becomes native later.
+  context     @3 :List(Message);
   approvalAudience @4 :BrainApprovalAudience;
   control          @5 :BrainTurnControl;
   runId            @6 :Text;

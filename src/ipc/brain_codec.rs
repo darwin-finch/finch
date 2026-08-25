@@ -97,6 +97,82 @@ fn decode_json_value_at(
     })
 }
 
+pub(super) fn encode_messages(
+    mut builder: capnp::struct_list::Builder<finch_ipc_capnp::message::Owned>,
+    messages: &[crate::claude::Message],
+) -> anyhow::Result<()> {
+    for (message_index, message) in messages.iter().enumerate() {
+        let mut encoded_message = builder.reborrow().get(message_index as u32);
+        encoded_message.set_role(&message.role);
+        let mut content = encoded_message.init_content(message.content.len() as u32);
+        for (block_index, block) in message.content.iter().enumerate() {
+            let mut encoded_block = content.reborrow().get(block_index as u32);
+            match block {
+                crate::claude::ContentBlock::Text { text } => encoded_block.set_text(text),
+                crate::claude::ContentBlock::ToolUse { id, name, input } => {
+                    let mut tool = encoded_block.init_tool_use();
+                    tool.set_id(id);
+                    tool.set_name(name);
+                    encode_json_value(tool.reborrow().init_input(), input)?;
+                }
+                crate::claude::ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    let mut result = encoded_block.init_tool_result();
+                    result.set_tool_use_id(tool_use_id);
+                    result.set_content(content);
+                    result.set_is_error(is_error.unwrap_or(false));
+                }
+                crate::claude::ContentBlock::Image { .. } => {
+                    // The current IPC schema has no image arm. Preserve the
+                    // historical behavior rather than inventing a text form.
+                    encoded_block.set_text("");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn decode_messages(
+    messages: capnp::struct_list::Reader<finch_ipc_capnp::message::Owned>,
+) -> anyhow::Result<Vec<crate::claude::Message>> {
+    let mut decoded = Vec::with_capacity(messages.len() as usize);
+    for message in messages.iter() {
+        let role = text(message.get_role()?)?;
+        let mut content = Vec::new();
+        for block in message.get_content()?.iter() {
+            use finch_ipc_capnp::content_block::Which;
+            match block.which()? {
+                Which::Text(value) => content.push(crate::claude::ContentBlock::Text {
+                    text: text(value?)?,
+                }),
+                Which::ToolUse(value) => {
+                    let value = value?;
+                    content.push(crate::claude::ContentBlock::ToolUse {
+                        id: text(value.get_id()?)?,
+                        name: text(value.get_name()?)?,
+                        input: decode_json_value(value.get_input()?)?,
+                    });
+                }
+                Which::ToolResult(value) => {
+                    let value = value?;
+                    content.push(crate::claude::ContentBlock::ToolResult {
+                        tool_use_id: text(value.get_tool_use_id()?)?,
+                        content: text(value.get_content()?)?,
+                        is_error: Some(value.get_is_error()),
+                    });
+                }
+                Which::Thinking(_) => {}
+            }
+        }
+        decoded.push(crate::claude::Message { role, content });
+    }
+    Ok(decoded)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BrainRemoteCommand {
     pub request_id: u64,
@@ -1185,6 +1261,75 @@ mod tests {
             .unwrap();
 
         assert_eq!(decode_json_value(root).unwrap(), expected);
+    }
+
+    #[test]
+    fn typed_message_context_preserves_tool_inputs() {
+        let expected_input = serde_json::json!({
+            "path": "src/lib.rs",
+            "line": 42,
+            "flags": [true, false],
+        });
+        let messages = vec![crate::claude::Message {
+            role: "assistant".into(),
+            content: vec![
+                crate::claude::ContentBlock::Text {
+                    text: "checking".into(),
+                },
+                crate::claude::ContentBlock::ToolUse {
+                    id: "tool-1".into(),
+                    name: "read".into(),
+                    input: expected_input.clone(),
+                },
+                crate::claude::ContentBlock::ToolResult {
+                    tool_use_id: "tool-1".into(),
+                    content: "contents".into(),
+                    is_error: Some(false),
+                },
+            ],
+        }];
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut request =
+                message.init_root::<finch_ipc_capnp::brain_turn_request::Builder<'_>>();
+            encode_messages(
+                request.reborrow().init_context(messages.len() as u32),
+                &messages,
+            )
+            .unwrap();
+        }
+
+        let encoded = capnp::serialize::write_message_to_words(&message);
+        let mut cursor = std::io::Cursor::new(encoded);
+        let decoded = capnp::serialize::read_message(
+            &mut cursor,
+            capnp::message::ReaderOptions::new(),
+        )
+        .unwrap();
+        let request = decoded
+            .get_root::<finch_ipc_capnp::brain_turn_request::Reader<'_>>()
+            .unwrap();
+        let decoded = decode_messages(request.get_context().unwrap()).unwrap();
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].role, "assistant");
+        assert!(matches!(
+            &decoded[0].content[0],
+            crate::claude::ContentBlock::Text { text } if text == "checking"
+        ));
+        assert!(matches!(
+            &decoded[0].content[1],
+            crate::claude::ContentBlock::ToolUse { id, name, input }
+                if id == "tool-1" && name == "read" && input == &expected_input
+        ));
+        assert!(matches!(
+            &decoded[0].content[2],
+            crate::claude::ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error: Some(false),
+            } if tool_use_id == "tool-1" && content == "contents"
+        ));
     }
 
     #[test]

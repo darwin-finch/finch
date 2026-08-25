@@ -668,55 +668,6 @@ fn parse_runner_handoff_id(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: read a capnp Message list into internal Message vec
-// ---------------------------------------------------------------------------
-
-fn read_messages(
-    list: capnp::struct_list::Reader<finch_ipc_capnp::message::Owned>,
-) -> Result<Vec<crate::claude::Message>, capnp::Error> {
-    let mut out = Vec::with_capacity(list.len() as usize);
-    for msg in list.iter() {
-        let role = msg.get_role()?.to_str()?.to_string();
-        let mut content = Vec::new();
-        for block in msg.get_content()?.iter() {
-            use finch_ipc_capnp::content_block::Which;
-            match block.which()? {
-                Which::Text(t) => {
-                    content.push(crate::claude::ContentBlock::Text {
-                        text: t?.to_str()?.to_string(),
-                    });
-                }
-                Which::ToolUse(tu) => {
-                    let tu = tu?;
-                    let input: serde_json::Value =
-                        serde_json::from_str(tu.get_input_json()?.to_str()?)
-                            .unwrap_or(serde_json::Value::Null);
-                    content.push(crate::claude::ContentBlock::ToolUse {
-                        id: tu.get_id()?.to_str()?.to_string(),
-                        name: tu.get_name()?.to_str()?.to_string(),
-                        input,
-                    });
-                }
-                Which::ToolResult(tr) => {
-                    let tr = tr?;
-                    content.push(crate::claude::ContentBlock::ToolResult {
-                        tool_use_id: tr.get_tool_use_id()?.to_str()?.to_string(),
-                        content: tr.get_content()?.to_str()?.to_string(),
-                        is_error: Some(tr.get_is_error()),
-                    });
-                }
-                Which::Thinking(t) => {
-                    // Ignore thinking blocks on ingestion (no internal type for it yet)
-                    let _ = t;
-                }
-            }
-        }
-        out.push(crate::claude::Message { role, content });
-    }
-    Ok(out)
-}
-
-// ---------------------------------------------------------------------------
 // Helper: read tool definitions
 // ---------------------------------------------------------------------------
 
@@ -754,7 +705,7 @@ fn write_query_response(
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
     latency_ms: Option<u64>,
-) {
+) -> capnp::Result<()> {
     builder.set_text(text);
     builder.set_model(model);
     builder.set_input_tokens(input_tokens.unwrap_or(0));
@@ -766,8 +717,10 @@ fn write_query_response(
         let mut t = tu_list.reborrow().get(i as u32);
         t.set_id(tu.id.as_str());
         t.set_name(tu.name.as_str());
-        t.set_input_json(tu.input.to_string().as_str());
+        super::brain_codec::encode_json_value(t.reborrow().init_input(), &tu.input)
+            .map_err(|error| capnp::Error::failed(error.to_string()))?;
     }
+    Ok(())
 }
 
 async fn execute_typed_forth_ipc(program: String) -> Result<(Vec<i64>, String)> {
@@ -823,7 +776,10 @@ impl finch_daemon::Server for FinchDaemonImpl {
         mut results: finch_daemon::QueryResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
-        let messages = pry!(read_messages(pry!(p.get_messages())));
+        let messages = pry!(
+            super::brain_codec::decode_messages(pry!(p.get_messages()))
+                .map_err(|error| capnp::Error::failed(error.to_string()))
+        );
         let tools = pry!(read_tools(pry!(p.get_tools())));
         let server = Arc::clone(&self.server);
 
@@ -851,7 +807,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
                 None,
                 None,
                 None,
-            );
+            )?;
             Ok(())
         })
     }
@@ -864,7 +820,10 @@ impl finch_daemon::Server for FinchDaemonImpl {
         _results: finch_daemon::QueryStreamResults,
     ) -> Promise<(), capnp::Error> {
         let p = pry!(params.get());
-        let messages = pry!(read_messages(pry!(p.get_messages())));
+        let messages = pry!(
+            super::brain_codec::decode_messages(pry!(p.get_messages()))
+                .map_err(|error| capnp::Error::failed(error.to_string()))
+        );
         let tools = pry!(read_tools(pry!(p.get_tools())));
         let receiver = pry!(p.get_receiver());
         let server = Arc::clone(&self.server);
@@ -923,7 +882,11 @@ impl finch_daemon::Server for FinchDaemonImpl {
                             let mut tu = r.get().init_chunk().init_tool_use_complete();
                             tu.set_id(id.as_str());
                             tu.set_name(name.as_str());
-                            tu.set_input_json(input.to_string().as_str());
+                            super::brain_codec::encode_json_value(
+                                tu.reborrow().init_input(),
+                                &input,
+                            )
+                            .map_err(|error| capnp::Error::failed(error.to_string()))?;
                             r.send().promise.await?;
                         }
                     }
@@ -1137,18 +1100,22 @@ async fn forward_runner_request(
             disconnected
         }
         crate::server::RunnerRequest::Turn(request) => {
-            let context_json =
-                serde_json::to_vec(&request.context).map_err(|error| error.to_string());
-            let (result, disconnected) = match context_json {
-                Ok(context_json) => {
-                    let mut call = runner.run_turn_request();
-                    {
-                        let mut payload = call.get().init_request();
-                        payload.set_brain(&request.brain);
-                        payload.set_run_id(&request.run_id.0.to_string());
-                        payload.set_request_seq(request.request_seq);
-                        payload.set_prompt(&request.prompt);
-                        payload.set_context_json(&context_json);
+            let (result, disconnected) = {
+                let mut call = runner.run_turn_request();
+                let encoded = {
+                    let mut payload = call.get().init_request();
+                    payload.set_brain(&request.brain);
+                    payload.set_run_id(&request.run_id.0.to_string());
+                    payload.set_request_seq(request.request_seq);
+                    payload.set_prompt(&request.prompt);
+                    let encoded = super::brain_codec::encode_messages(
+                        payload
+                            .reborrow()
+                            .init_context(request.context.len() as u32),
+                        &request.context,
+                    )
+                    .map_err(|error| error.to_string());
+                    if encoded.is_ok() {
                         encode_approval_audience(
                             payload.reborrow().init_approval_audience(),
                             &request.approval_audience,
@@ -1162,15 +1129,18 @@ async fn forward_runner_request(
                             });
                         payload.set_control(control);
                     }
-                    match call.send().promise.await {
+                    encoded
+                };
+                match encoded {
+                    Ok(()) => match call.send().promise.await {
                         Ok(reply) => (
                             decode_runner_turn_result(reply.get().and_then(|r| r.get_result())),
                             false,
                         ),
                         Err(error) => (Err(error.to_string().into()), true),
-                    }
+                    },
+                    Err(error) => (Err(error.into()), false),
                 }
-                Err(error) => (Err(error.into()), false),
             };
             let _ = request.response_tx.send(result);
             disconnected

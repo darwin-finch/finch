@@ -91,7 +91,10 @@ impl IpcClient {
         let mut req = self.client.query_request();
         {
             let mut p = req.get();
-            write_messages(p.reborrow().init_messages(messages.len() as u32), &messages);
+            super::brain_codec::encode_messages(
+                p.reborrow().init_messages(messages.len() as u32),
+                &messages,
+            )?;
             write_tools(p.reborrow().init_tools(tools.len() as u32), &tools);
         }
         let reply = req.send().promise.await?;
@@ -117,7 +120,10 @@ impl IpcClient {
         let mut req = self.client.query_stream_request();
         {
             let mut p = req.get();
-            write_messages(p.reborrow().init_messages(messages.len() as u32), &messages);
+            super::brain_codec::encode_messages(
+                p.reborrow().init_messages(messages.len() as u32),
+                &messages,
+            )?;
             write_tools(p.reborrow().init_tools(tools.len() as u32), &tools);
             p.set_receiver(receiver_client);
         }
@@ -598,9 +604,9 @@ impl brain_runner::Server for BrainRunnerImpl {
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         let context = match request
-            .get_context_json()
+            .get_context()
             .map_err(anyhow::Error::new)
-            .and_then(|value| serde_json::from_slice(value).map_err(anyhow::Error::new))
+            .and_then(super::brain_codec::decode_messages)
         {
             Ok(context) => context,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -894,9 +900,8 @@ impl stream_receiver::Server for StreamReceiverImpl {
                         .to_str()
                         .map_err(|e| capnp::Error::failed(e.to_string()))?
                         .to_string();
-                    let input_str = tu.get_input_json()?.to_str()?.to_string();
-                    let input: serde_json::Value =
-                        serde_json::from_str(&input_str).unwrap_or(serde_json::Value::Null);
+                    let input = super::brain_codec::decode_json_value(tu.get_input()?)
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?;
                     Ok(StreamChunk::ContentBlockComplete(ContentBlock::ToolUse {
                         id,
                         name,
@@ -937,44 +942,6 @@ impl stream_receiver::Server for StreamReceiverImpl {
 // ---------------------------------------------------------------------------
 // Wire-format helpers
 // ---------------------------------------------------------------------------
-
-fn write_messages(
-    mut builder: capnp::struct_list::Builder<finch_ipc_capnp::message::Owned>,
-    messages: &[Message],
-) {
-    for (i, msg) in messages.iter().enumerate() {
-        let mut m = builder.reborrow().get(i as u32);
-        m.set_role(msg.role.as_str());
-        let mut content = m.init_content(msg.content.len() as u32);
-        for (j, block) in msg.content.iter().enumerate() {
-            let mut b = content.reborrow().get(j as u32);
-            match block {
-                ContentBlock::Text { text } => {
-                    b.set_text(text.as_str());
-                }
-                ContentBlock::ToolUse { id, name, input } => {
-                    let mut tu = b.init_tool_use();
-                    tu.set_id(id.as_str());
-                    tu.set_name(name.as_str());
-                    tu.set_input_json(input.to_string().as_str());
-                }
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } => {
-                    let mut tr = b.init_tool_result();
-                    tr.set_tool_use_id(tool_use_id.as_str());
-                    tr.set_content(content.as_str());
-                    tr.set_is_error(is_error.unwrap_or(false));
-                }
-                _ => {
-                    // Thinking blocks etc. — skip; not sent to daemon
-                }
-            }
-        }
-    }
-}
 
 fn write_tools(
     mut builder: capnp::struct_list::Builder<finch_ipc_capnp::tool_definition::Owned>,
@@ -1022,8 +989,8 @@ fn read_query_response(
 
     let mut tool_uses = Vec::new();
     for tu in r.get_tool_uses()?.iter() {
-        let input: serde_json::Value =
-            serde_json::from_str(tu.get_input_json()?.to_str()?).unwrap_or(serde_json::Value::Null);
+        let input = super::brain_codec::decode_json_value(tu.get_input()?)
+            .map_err(|error| capnp::Error::failed(error.to_string()))?;
         tool_uses.push(ToolUse {
             id: tu
                 .get_id()?
