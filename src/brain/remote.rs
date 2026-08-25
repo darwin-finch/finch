@@ -1014,6 +1014,18 @@ mod tests {
         };
         assert!(detached);
 
+        let mut never_watched =
+            RemoteBrainClient::new(client.target.clone(), "loopback").unwrap();
+        never_watched
+            .attach(
+                "codex-pending-cleanup@localhost",
+                AttachmentRole::Observer,
+                None,
+            )
+            .await
+            .unwrap();
+        never_watched.disconnect().await.unwrap();
+
         client
             .http
             .delete(client.target.http_url())

@@ -83,14 +83,6 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
             "/v1/brains/credentials/:credential_id",
             axum::routing::delete(revoke_named_brain_credential),
         )
-        .route(
-            "/v1/brains/named/:name/runner-lease",
-            post(acquire_named_brain_runner),
-        )
-        .route(
-            "/v1/brains/named/:name/runner-lease/:lease_id",
-            axum::routing::delete(release_named_brain_runner),
-        )
         .route("/v1/brains/named/:name/ws", get(watch_named_brain))
         .route(
             "/v1/brains/password",
@@ -463,93 +455,11 @@ pub(crate) fn detach_named_brain_attachment(
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-struct AcquireNamedBrainRunnerRequest {
-    subject: String,
-    environment: crate::brain::shared::BrainEnvironment,
-    lease_id: Option<crate::brain::shared::RunnerLeaseId>,
-    ttl_ms: u64,
-}
-
-async fn acquire_named_brain_runner(
-    State(server): State<Arc<AgentServer>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path(name): Path<String>,
-    Json(request): Json<AcquireNamedBrainRunnerRequest>,
-) -> Result<Json<crate::brain::shared::BrainRunnerLease>, Response> {
-    if !addr.ip().is_loopback() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "remote runner leases require scoped environment credentials"
-            })),
-        )
-            .into_response());
-    }
-    if &request.environment != server.shared_brains().environment() {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "runner environment does not match the daemon Brain environment"
-            })),
-        )
-            .into_response());
-    }
-    let lease = server
-        .shared_brains()
-        .acquire_runner_lease(
-            &name,
-            &request.subject,
-            request.environment.generation,
-            request.lease_id,
-            request.ttl_ms,
-        )
-        .map_err(|error| AppError(error).into_response())?;
-    let store = server.shared_brains().clone();
-    let lease_id = lease.lease_id;
-    let expires_ms = lease.expires_ms;
-    tokio::spawn(async move {
-        loop {
-            let delay_ms = expires_ms.saturating_sub(unix_epoch_millis());
-            if delay_ms == 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-        }
-        if store
-            .expire_runner_lease(&name, lease_id, unix_epoch_millis())
-            .is_ok_and(|expired| expired)
-        {
-            let _ = store.remove_if_unused(&name);
-        }
-    });
-    Ok(Json(lease))
-}
-
 fn unix_epoch_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
-}
-
-async fn release_named_brain_runner(
-    State(server): State<Arc<AgentServer>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path((name, lease_id)): Path<(String, uuid::Uuid)>,
-) -> Result<StatusCode, Response> {
-    if !addr.ip().is_loopback() {
-        return Err(StatusCode::FORBIDDEN.into_response());
-    }
-    server
-        .shared_brains()
-        .release_runner_lease(&name, crate::brain::shared::RunnerLeaseId(lease_id))
-        .map_err(|error| AppError(error).into_response())?;
-    server
-        .shared_brains()
-        .remove_if_unused(&name)
-        .map_err(|error| AppError(error).into_response())?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Serialize)]
@@ -1644,6 +1554,8 @@ async fn watch_named_brain(
                 tokio::time::interval(std::time::Duration::from_secs(5));
             authority_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut replies_open = true;
+            let mut detach_request_id = None;
+            let mut pending_detach_projection = None;
             loop {
                 tokio::select! {
                     incoming = socket.recv() => match incoming {
@@ -1657,6 +1569,12 @@ async fn watch_named_brain(
                         Some(Ok(WsMessage::Binary(bytes))) => {
                             match crate::ipc::brain_codec::decode_brain_remote_envelope(&bytes) {
                                 Ok(BrainRemoteEnvelope::Command(command)) => {
+                                    if matches!(
+                                        &command.kind,
+                                        crate::ipc::brain_codec::BrainRemoteCommandKind::Detach
+                                    ) {
+                                        detach_request_id = Some(command.request_id);
+                                    }
                                     if command_tx.send(command).is_err() {
                                         break;
                                     }
@@ -1672,12 +1590,29 @@ async fn watch_named_brain(
                             replies_open = false;
                             continue;
                         };
+                        let reply_request_id = reply.request_id();
+                        let detached = matches!(&reply, BrainRemoteReply::Detached { .. });
+                        let detach_failed = matches!(&reply, BrainRemoteReply::Error { .. })
+                            && detach_request_id == Some(reply_request_id);
                         let envelope = BrainRemoteEnvelope::Reply(reply);
                         let Ok(encoded) = crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope) else {
                             break;
                         };
                         if socket.send(WsMessage::Binary(encoded.into())).await.is_err() {
                             break;
+                        }
+                        if detached {
+                            detach_request_id = None;
+                            if let Some(wire) = pending_detach_projection.take() {
+                                let envelope = BrainRemoteEnvelope::Projection(wire);
+                                let Ok(encoded) = crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope) else {
+                                    break;
+                                };
+                                let _ = socket.send(WsMessage::Binary(encoded.into())).await;
+                                break;
+                            }
+                        } else if detach_failed {
+                            detach_request_id = None;
                         }
                     }
                     event = events.recv() => {
@@ -1700,6 +1635,10 @@ async fn watch_named_brain(
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         };
+                        if closes_attachment && detach_request_id.is_some() {
+                            pending_detach_projection = Some(wire);
+                            continue;
+                        }
                         let envelope = BrainRemoteEnvelope::Projection(wire);
                         let Ok(encoded) = crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope) else {
                             break;
