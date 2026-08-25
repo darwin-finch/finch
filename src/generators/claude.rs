@@ -45,6 +45,8 @@ If tests fail: read the error carefully and diagnose the root cause before retry
 Match the style of surrounding code — indentation, naming, patterns.
 Don't add comments unless the logic is genuinely non-obvious.
 Work through multi-step tasks systematically, verifying each step.
+Use `todo_read`/`todo_write` only to maintain a genuine multi-step task plan. Do not inspect the TODO
+list for greetings, ordinary questions, calculations, or merely to discover whether it is empty.
 Be direct. If something is unclear, ask one focused question rather than guessing.";
 
 /// Plain-text command reference injected into every system prompt.
@@ -229,6 +231,13 @@ mod tests {
         assert!(CODING_SYSTEM_PROMPT.contains("not the Finch application or terminal UI"));
         assert!(CODING_SYSTEM_PROMPT.contains("tool calls remain structurally separate"));
         assert!(!CODING_SYSTEM_PROMPT.starts_with("You are Finch"));
+    }
+
+    #[test]
+    fn coding_prompt_does_not_probe_todos_on_ordinary_turns() {
+        assert!(CODING_SYSTEM_PROMPT.contains(
+            "Do not inspect the TODO\nlist for greetings, ordinary questions, calculations"
+        ));
     }
 
     #[test]

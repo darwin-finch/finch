@@ -33,9 +33,10 @@ impl Tool for TodoWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Replace the entire session task list atomically. Use this to create, update, or mark tasks \
+        "Replace the entire session task list atomically for a genuine multi-step task. Use this to create, update, or mark tasks \
          as completed. Always include ALL tasks in each call — omitted tasks are deleted. \
-         Call todo_read first if you need to preserve existing tasks."
+         Call todo_read first only when you need to preserve existing tasks. Do not use TODO tools \
+         for greetings, ordinary questions, calculations, or speculative list checks."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -131,8 +132,9 @@ impl Tool for TodoReadTool {
 
     fn description(&self) -> &str {
         "Return the current session task list as a JSON array. \
-         Use this before todo_write when you want to update specific tasks \
-         without losing the rest of the list."
+         Use this only immediately before todo_write when maintaining an existing multi-step plan \
+         without losing the rest of the list. Do not call it for greetings, ordinary questions, \
+         calculations, or merely to discover whether a list exists."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -376,5 +378,12 @@ mod tests {
         let tool = TodoReadTool::new(list);
         let schema = tool.input_schema();
         assert!(schema.required.is_empty());
+    }
+
+    #[test]
+    fn todo_read_description_rejects_speculative_probes() {
+        let tool = TodoReadTool::new(make_list());
+        assert!(tool.description().contains("only immediately before todo_write"));
+        assert!(tool.description().contains("merely to discover whether a list exists"));
     }
 }
