@@ -892,7 +892,10 @@ still blocks the corresponding Brain phase until it is unified.
   an LLM turn; drivers and consultants can submit them while observers and runners cannot. `/say`
   exposes that path without losing terminal punctuation, `/who` projects connected authenticated
   attachments, and `/whois <subject>` reports public role/presence/cursor metadata but never
-  credentials. Still add an explicit `@finch` prompt spelling, participant-specific rendering,
+  credentials. A live two-frontend check on 2026-08-25 attached a second driver, projected the same
+  relay to both consoles, and confirmed that it created no `BrainRun`; presence rows now include a
+  short durable attachment ID so two consoles owned by the same subject remain distinguishable.
+  Still add an explicit `@finch` prompt spelling, participant-specific rendering,
   threads/channels, and the corresponding collaboration authorization tests. Until then,
   quarantine the remaining aspirational IRC/room/peer/gas command surfaces (`/join`, `/part`,
   `/room`, `/connect`, and related commands) rather than presenting them as a second collaboration
