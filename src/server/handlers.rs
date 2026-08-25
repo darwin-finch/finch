@@ -867,6 +867,7 @@ async fn dispatch_named_brain_run(
                 language,
                 &source,
                 crate::server::RunnerProgramInteraction::Interactive,
+                None,
             )
             .await
             {
@@ -884,6 +885,7 @@ async fn dispatch_named_brain_run(
                 due.language,
                 &due.source,
                 crate::server::RunnerProgramInteraction::Noninteractive,
+                Some(due.grant_ceiling),
             )
             .await
             {
@@ -1251,6 +1253,7 @@ async fn dispatch_named_brain_program(
     language: crate::brain::store::ProgramLanguage,
     source: &str,
     interaction: crate::server::RunnerProgramInteraction,
+    grant_ceiling: Option<crate::vm::EffectSet>,
 ) -> anyhow::Result<String> {
     let snapshot = store.snapshot(name)?;
     ensure_named_brain_store_environment(store, &snapshot)?;
@@ -1272,6 +1275,7 @@ async fn dispatch_named_brain_program(
             language,
             source.to_string(),
             interaction,
+            grant_ceiling,
         )
         .await
     {
@@ -3415,6 +3419,7 @@ mod handler_tests {
             ProgramLanguage::Lisp,
             "(define (double (n : int)) : int (* n 2))",
             crate::server::RunnerProgramInteraction::Interactive,
+            None,
         )
         .await
         .unwrap();
@@ -3818,6 +3823,7 @@ mod handler_tests {
             ProgramLanguage::Forth,
             "21 2 *",
             crate::server::RunnerProgramInteraction::Interactive,
+            None,
         )
         .await
         .unwrap_err();
@@ -3863,6 +3869,7 @@ mod handler_tests {
             ProgramLanguage::Forth,
             "21 2 *",
             crate::server::RunnerProgramInteraction::Interactive,
+            None,
         )
         .await
         .unwrap_err();
@@ -4080,6 +4087,7 @@ mod handler_tests {
                 attachment.attachment_id,
                 ProgramLanguage::Lisp,
                 "(say \"scheduled\")",
+                crate::vm::EffectSet::pure(),
                 1_000,
                 None,
                 crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce,
@@ -4129,6 +4137,7 @@ mod handler_tests {
                 request.interaction,
                 crate::server::RunnerProgramInteraction::Noninteractive
             );
+            assert_eq!(request.grant_ceiling, Some(crate::vm::EffectSet::pure()));
             let runtime = crate::runtime::ProgramRuntime::new();
             let outcome = runtime
                 .submit_typed_only(crate::runtime::ProgramSubmission {

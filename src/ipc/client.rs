@@ -563,6 +563,20 @@ impl brain_runner::Server for BrainRunnerImpl {
                             }
                             Err(error) => return Promise::err(error.into()),
                         },
+                        grant_ceiling: if request.get_has_grant_ceiling() {
+                            match request
+                                .get_grant_ceiling()
+                                .map_err(anyhow::Error::new)
+                                .and_then(crate::ipc::checkpoint_codec::decode_effects)
+                            {
+                                Ok(grants) => Some(grants),
+                                Err(error) => {
+                                    return Promise::err(capnp::Error::failed(error.to_string()))
+                                }
+                            }
+                        } else {
+                            None
+                        },
                         response_tx,
                     },
                 ),

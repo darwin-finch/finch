@@ -45,6 +45,7 @@ pub struct RunnerProgramRequest {
     pub language: ProgramLanguage,
     pub source: String,
     pub interaction: RunnerProgramInteraction,
+    pub grant_ceiling: Option<crate::vm::EffectSet>,
     pub response_tx: oneshot::Sender<Result<RunnerProgramResult, RunnerProgramError>>,
 }
 
@@ -446,6 +447,7 @@ impl BrainRunnerBroker {
         language: ProgramLanguage,
         source: String,
         interaction: RunnerProgramInteraction,
+        grant_ceiling: Option<crate::vm::EffectSet>,
     ) -> Result<RunnerProgramResult> {
         let registration = self
             .registrations
@@ -467,6 +469,7 @@ impl BrainRunnerBroker {
                 language,
                 source,
                 interaction,
+                grant_ceiling,
                 response_tx,
             }))
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
@@ -695,6 +698,7 @@ mod tests {
                 request.interaction,
                 RunnerProgramInteraction::Interactive
             );
+            assert!(request.grant_ceiling.is_none());
             let runtime = crate::runtime::ProgramRuntime::new();
             let checkpoint = runtime
                 .revision_history()
@@ -723,6 +727,7 @@ mod tests {
                 ProgramLanguage::Forth,
                 "21 2 *".into(),
                 RunnerProgramInteraction::Interactive,
+                None,
             )
             .await
             .unwrap();
@@ -746,6 +751,7 @@ mod tests {
                 ProgramLanguage::Lisp,
                 "(+ 1 1)".into(),
                 RunnerProgramInteraction::Interactive,
+                None,
             )
             .await
             .unwrap_err();

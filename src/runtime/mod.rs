@@ -2667,7 +2667,7 @@ impl ProgramRuntime {
     /// Internal scheduled-callback entry point. The persisted ceiling is
     /// authored only by `schedule-create`; callers outside this module cannot
     /// manufacture an authority-bearing `ProgramSubmission` field.
-    async fn submit_typed_only_with_grant_ceiling(
+    pub(crate) async fn submit_typed_only_with_grant_ceiling(
         &self,
         submission: ProgramSubmission,
         grant_ceiling: EffectSet,

@@ -803,6 +803,8 @@ struct BrainProgramRequest {
   source     @3 :Text;
   runId      @4 :Text;
   interaction @5 :BrainProgramInteraction;
+  hasGrantCeiling @6 :Bool;
+  grantCeiling @7 :List(CapabilityRequirement);
 }
 
 enum BrainProgramInteraction {
@@ -1081,6 +1083,7 @@ struct BrainSchedule {
   active         @7 :Bool;
   initiatingAttachmentId @8 :Text;
   createdBy      @9 :Text;
+  grantCeiling   @10 :List(CapabilityRequirement);
 }
 
 struct BrainScheduleDue {
@@ -1093,6 +1096,7 @@ struct BrainScheduleDue {
   nextDueMs      @6 :UInt64;
   language       @7 :ProgramLanguage;
   source         @8 :Text;
+  grantCeiling   @9 :List(CapabilityRequirement);
 }
 
 struct BrainEvent {

@@ -223,6 +223,8 @@ pub struct BrainSchedule {
     pub initiating_attachment_id: AttachmentId,
     #[serde(default)]
     pub created_by: String,
+    #[serde(default)]
+    pub grant_ceiling: crate::vm::EffectSet,
     pub language: ProgramLanguage,
     pub source: String,
     pub next_due_ms: u64,
@@ -244,6 +246,8 @@ pub struct BrainScheduleDue {
     pub language: ProgramLanguage,
     #[serde(default)]
     pub source: String,
+    #[serde(default)]
+    pub grant_ceiling: crate::vm::EffectSet,
     pub due_at_ms: u64,
     pub first_missed_at_ms: u64,
     pub missed_count: u32,
@@ -632,6 +636,7 @@ impl BrainState {
                     if event.schema_version < 10 {
                         due.language = schedule.language;
                         due.source.clone_from(&schedule.source);
+                        due.grant_ceiling.clone_from(&schedule.grant_ceiling);
                         if schedule.initiating_attachment_id == legacy_schedule_attachment_id() {
                             schedule.initiating_attachment_id = due.run.initiating_attachment_id;
                             schedule.created_by.clone_from(&due.run.initiated_by);
@@ -828,6 +833,7 @@ impl BrainStore {
         initiating_attachment_id: AttachmentId,
         language: ProgramLanguage,
         source: impl Into<String>,
+        grant_ceiling: crate::vm::EffectSet,
         next_due_ms: u64,
         interval_ms: Option<u64>,
         delivery_policy: BrainScheduleDeliveryPolicy,
@@ -871,6 +877,7 @@ impl BrainStore {
             created_by: created_by.to_string(),
             language,
             source,
+            grant_ceiling,
             next_due_ms,
             interval_ms,
             delivery_policy,
@@ -937,6 +944,7 @@ impl BrainStore {
                             run: run.clone(),
                             language: schedule.language,
                             source: schedule.source.clone(),
+                            grant_ceiling: schedule.grant_ceiling.clone(),
                             due_at_ms: last_due_ms,
                             first_missed_at_ms: existing.first_missed_at_ms,
                             missed_count: existing
@@ -958,6 +966,7 @@ impl BrainStore {
                             run: run.clone(),
                             language: schedule.language,
                             source: schedule.source.clone(),
+                            grant_ceiling: schedule.grant_ceiling.clone(),
                             due_at_ms: last_due_ms,
                             first_missed_at_ms: schedule.next_due_ms,
                             missed_count: occurrence_count,
@@ -1005,6 +1014,7 @@ impl BrainStore {
                             run: run.clone(),
                             language: schedule.language,
                             source: schedule.source.clone(),
+                            grant_ceiling: schedule.grant_ceiling.clone(),
                             due_at_ms,
                             first_missed_at_ms: due_at_ms,
                             missed_count: 1,
@@ -2485,6 +2495,7 @@ mod tests {
                 attachment.attachment_id,
                 ProgramLanguage::Lisp,
                 "(say \"tick\")",
+                crate::vm::EffectSet::pure(),
                 1_000,
                 Some(1_000),
                 BrainScheduleDeliveryPolicy::Coalesce,
@@ -2554,6 +2565,7 @@ mod tests {
                 attachment.attachment_id,
                 ProgramLanguage::Forth,
                 "\"tick\" say",
+                crate::vm::EffectSet::pure(),
                 1_000,
                 Some(1_000),
                 BrainScheduleDeliveryPolicy::BoundedCatchUp {

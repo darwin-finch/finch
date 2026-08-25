@@ -1267,6 +1267,15 @@ async fn forward_runner_request(
                         finch_ipc_capnp::BrainProgramInteraction::Noninteractive
                     }
                 });
+                payload.set_has_grant_ceiling(request.grant_ceiling.is_some());
+                if let Some(grant_ceiling) = &request.grant_ceiling {
+                    crate::ipc::checkpoint_codec::encode_effects(
+                        payload
+                            .reborrow()
+                            .init_grant_ceiling(grant_ceiling.0.len() as u32),
+                        grant_ceiling,
+                    );
+                }
             }
             let (result, disconnected) = match call.send().promise.await {
                 Ok(reply) => (

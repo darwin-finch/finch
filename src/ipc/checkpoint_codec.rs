@@ -450,7 +450,7 @@ fn decode_requirement(
     })
 }
 
-fn encode_effects(
+pub(crate) fn encode_effects(
     mut builder: capnp::struct_list::Builder<'_, wire::capability_requirement::Owned>,
     value: &EffectSet,
 ) {
@@ -459,7 +459,7 @@ fn encode_effects(
     }
 }
 
-fn decode_effects(
+pub(crate) fn decode_effects(
     reader: capnp::struct_list::Reader<'_, wire::capability_requirement::Owned>,
 ) -> Result<EffectSet> {
     let mut values = BTreeSet::new();

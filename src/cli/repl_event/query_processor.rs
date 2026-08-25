@@ -2026,12 +2026,21 @@ mod tests {
     #[tokio::test]
     async fn noninteractive_program_denies_new_authority_without_opening_ui() {
         let runtime = crate::runtime::ProgramRuntime::new();
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("./**").unwrap(),
+            ))
+            .unwrap();
         let submission = direct_wire_submission(
             &runtime,
             "(file-read (path \"Cargo.toml\"))".to_string(),
         )
         .unwrap();
-        let suspended = runtime.submit_typed_only(submission).await.unwrap();
+        let suspended = runtime
+            .submit_typed_only_with_grant_ceiling(submission, crate::vm::EffectSet::pure())
+            .await
+            .unwrap();
         assert_eq!(
             suspended.status,
             crate::runtime::outcome::ExecutionStatus::AuthorizationRequired
@@ -2049,7 +2058,7 @@ mod tests {
             .pending_typed_execution(denied.execution_id)
             .unwrap()
             .is_none());
-        assert!(runtime.capability_ledger().unwrap().grants.grants.is_empty());
+        assert_eq!(runtime.capability_ledger().unwrap().grants.grants.len(), 1);
         assert!(denied.effect_journal.iter().any(|entry| matches!(
             entry.state,
             crate::vm::EffectJournalState::Denied { .. }

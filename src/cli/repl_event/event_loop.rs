@@ -3551,10 +3551,15 @@ Rules:\n\
                 budget: None,
             };
             let execution = async {
-                let outcome = runtime
-                    .submit_typed_only(submission)
-                    .await
-                    .map_err(|error| crate::server::RunnerProgramError::from(error.to_string()))?;
+                let outcome = match request.grant_ceiling.clone() {
+                    Some(grant_ceiling) => {
+                        runtime
+                            .submit_typed_only_with_grant_ceiling(submission, grant_ceiling)
+                            .await
+                    }
+                    None => runtime.submit_typed_only(submission).await,
+                }
+                .map_err(|error| crate::server::RunnerProgramError::from(error.to_string()))?;
                 let execution_id = outcome.execution_id;
                 let mut resumed = Box::pin(async {
                     match request.interaction {
