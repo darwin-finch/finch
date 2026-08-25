@@ -760,8 +760,10 @@ still blocks the corresponding Brain phase until it is unified.
   runner request is in flight. A loopback fixture and ignored live-daemon test cover the remote
   command lifecycle, including detach before an explicit watch. JSON submit, acknowledge, detach,
   and runner-lease routes have been removed; HTTP now remains only for authenticated
-  discovery/credential/attachment bootstrap and explicit administrative archive. Still add one
-  cross-transport conformance fixture that asserts identical outcomes and converge embedded mode.
+  discovery/credential/attachment bootstrap and explicit administrative archive. An ignored live
+  conformance fixture now drives local RPC and remote binary adapters through the same lifecycle and
+  compares their normalized events, submission outcomes, and queued run state. Still converge
+  embedded mode on the same service façade.
 - [ ] Define Brain initialization as a reviewed typed program/module with an explicit capability
   budget and journaled effects. Deterministic VM vocabulary/module loading may occur before a
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work

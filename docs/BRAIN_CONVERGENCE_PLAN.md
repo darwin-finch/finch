@@ -426,9 +426,11 @@ capability entirely on its `LocalSet`; a live ignored test verifies snapshot-fir
 submission, cursor acknowledgement, and detach against a restarted daemon. Remote consoles carry
 the same closed submission union and typed outcomes in correlated binary WebSocket envelopes;
 fixture and live-daemon tests cover attach, watch, submit, acknowledge, final detach projection, and
-cleanup, including detach before an explicit watch. A shared conformance fixture must compare
-transport outcomes directly, generalized approval/effect resumptions remain incomplete, and embedded
-mode likewise does not yet implement the same contract.
+cleanup, including detach before an explicit watch. Generalized approval/effect resumptions remain
+incomplete, and embedded mode likewise does not yet implement the same contract. The first ignored
+live conformance fixture now drives local RPC and remote binary clients through the same
+attach/watch/prompt/queued-run/acknowledge/detach script and compares normalized events and outcomes;
+it should become hermetic when the in-process adapter exists.
 
 ### B5: Client projections and shadow-buffer UI
 
