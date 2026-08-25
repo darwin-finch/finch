@@ -891,9 +891,11 @@ still blocks the corresponding Brain phase until it is unified.
   self-signed TLS certificate; each signed invitation carries that exact DER trust root. Opt-in LAN
   collaboration uses a restricted TLS-only listener on port 11436, advertised through mDNS without
   authority, and invitation clients pin HTTPS and WSS to the signed certificate. The plaintext
-  daemon/admin listener remains loopback-only and remote password bootstrap is rejected. B6 still
-  requires the remaining hostile-LAN, certificate-substitution, replay, confused-deputy, and
-  cross-Brain authorization coverage.
+  daemon/admin listener remains loopback-only and remote password bootstrap is rejected. B6's
+  hostile-LAN, certificate-substitution, invitation replay, confused-deputy, cross-Brain audience,
+  sibling-connection replay, and approval-audience substitution matrix now passes. mDNS carries
+  only stable authority-free identity/reachability metadata; dynamic node/model availability is
+  queried with `brain:read` and checked against the credential and invited node identity.
 - [ ] Enforce least privilege independently for event visibility, prompt/program submission,
   approval, control-lease ownership, workspace effects, environment changes, credential minting,
   and distributed inference. mDNS advertisement and discovery now use an authority-free metadata
@@ -975,9 +977,10 @@ still blocks the corresponding Brain phase until it is unified.
 
 ## Distributed inference
 
-- [ ] Extend mDNS node advertisements with a versioned compute manifest: CPU/GPU/TPU kind,
-  device count, memory capacity/availability, runtimes, loaded models, queue depth, and approximate
-  throughput. Confirm current values through an authenticated node API.
+- [ ] Extend the authenticated node-capability response with a versioned compute manifest:
+  CPU/GPU/TPU kind, device count, memory capacity/availability, runtimes, loaded models, queue depth,
+  and approximate throughput. Keep mDNS limited to stable identity and transport reachability;
+  dynamic compute state is disclosed only after authentication.
 - [ ] Schedule bounded, content-addressed inference jobs across discovered compute nodes without
   granting those nodes workspace or execution-environment authority.
 - [ ] Record remote inference provenance: node, model, input hash, resource budget, timing, and

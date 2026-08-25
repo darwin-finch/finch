@@ -559,6 +559,14 @@ Exit: local, daemon, and remote attachment render the same event history.
 
 Exit: hostile-LAN, replay, confused-deputy, and cross-Brain authorization tests pass.
 
+Status: complete. mDNS now advertises only description, version, stable node name, TLS endpoint,
+and the authority-free Ed25519 identity hint. Dynamic node/model availability is returned by the
+`brain:read`-protected per-Brain capability endpoint and is independently checked by clients against
+the credential's Brain ID/name/environment generation and the invitation's node key. The B6 matrix
+covers loopback-only bootstrap, hostile discovery metadata, substituted TLS certificates,
+concurrent and restart-safe invitation replay, ancestor revocation, cross-Brain/generation/scope
+audiences, sibling attachment-connection replay, and runner approval-audience substitution.
+
 ### B7: Remove duplicate abstractions
 
 - Remove obsolete registries, shared string-context endpoints, transport-owned lifecycle code, and
