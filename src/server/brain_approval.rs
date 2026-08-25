@@ -153,10 +153,8 @@ impl ApprovalRegistration {
 
 impl Drop for ApprovalRegistration {
     fn drop(&mut self) {
-        if self.response_rx.is_some() {
-            self.broker
-                .cancel_key(&self.key, "approval requester disconnected");
-        }
+        self.broker
+            .cancel_key(&self.key, "approval requester disconnected");
     }
 }
 
@@ -235,5 +233,25 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("disconnected"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_wait_drops_the_pending_continuation() {
+        let broker = BrainApprovalBroker::default();
+        let attachment_id = AttachmentId(uuid::Uuid::new_v4());
+        let audience = audience(attachment_id);
+        let registration = broker
+            .register(7, "approval-1", audience.clone())
+            .unwrap();
+        let waiter = tokio::spawn(registration.wait());
+        tokio::task::yield_now().await;
+        waiter.abort();
+        let _ = waiter.await;
+
+        let error = match broker.claim(audience.brain_id, "approval-1", attachment_id) {
+            Ok(_) => panic!("cancelled approval remained pending"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not pending"));
     }
 }

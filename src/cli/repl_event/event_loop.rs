@@ -204,6 +204,8 @@ pub struct EventLoop {
     remote_brain_tool_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
     remote_brain_tool_rows: std::collections::HashMap<String, usize>,
     remote_brain_approval_rows: std::collections::HashMap<String, usize>,
+    queued_remote_brain_approvals: std::collections::VecDeque<RemoteBrainApproval>,
+    active_remote_brain_approval: Option<RemoteBrainApproval>,
 
     /// Pending tool approval requests (query_id -> (tool_use, response_tx))
     pending_approvals: PendingApprovalsMap,
@@ -421,6 +423,77 @@ fn approval_audience_summary(
     )
 }
 
+fn vm_approval_choices(prompt: &crate::vm::ApprovalPrompt) -> Vec<crate::vm::ApprovalChoice> {
+    let mut choices = vec![crate::vm::ApprovalChoice::AllowOnce];
+    if !prompt.request.agent_ancestry.is_empty() {
+        choices.push(crate::vm::ApprovalChoice::AllowTask);
+    }
+    choices.push(crate::vm::ApprovalChoice::AllowSession);
+    choices.push(crate::vm::ApprovalChoice::AllowProjectExact);
+    if let Some(requirement) = prompt.suggested_patterns.first().cloned() {
+        choices.push(crate::vm::ApprovalChoice::AllowProjectPattern { requirement });
+    }
+    choices.push(crate::vm::ApprovalChoice::Deny);
+    choices
+}
+
+fn vm_approval_dialog(
+    prompt: &crate::vm::ApprovalPrompt,
+    audience: Option<&crate::brain::shared::BrainApprovalAudience>,
+    runtime: &crate::runtime::ProgramRuntime,
+) -> crate::cli::tui::Dialog {
+    use crate::cli::tui::{Dialog, DialogOption};
+
+    let choices = vm_approval_choices(prompt);
+    let options = choices
+        .iter()
+        .map(|choice| match choice {
+            crate::vm::ApprovalChoice::AllowOnce => DialogOption::with_description(
+                "Allow once",
+                "Resume only this exact pending effect",
+            ),
+            crate::vm::ApprovalChoice::AllowTask => DialogOption::with_description(
+                "Allow for task",
+                "Reuse only within this child task",
+            ),
+            crate::vm::ApprovalChoice::AllowSession => DialogOption::with_description(
+                "Allow for session",
+                "Reuse in this resumable Finch session",
+            ),
+            crate::vm::ApprovalChoice::AllowProjectExact => DialogOption::with_description(
+                "Allow for project",
+                "Reuse this exact capability in the current project",
+            ),
+            crate::vm::ApprovalChoice::AllowProjectPattern { .. } => {
+                DialogOption::with_description(
+                    "Allow project pattern",
+                    "Reuse the displayed narrowed pattern in this project",
+                )
+            }
+            crate::vm::ApprovalChoice::AllowGlobal => DialogOption::with_description(
+                "Allow globally",
+                "Reuse this capability outside the current project",
+            ),
+            crate::vm::ApprovalChoice::Deny => DialogOption::new("Deny"),
+        })
+        .collect();
+    let exact = serde_json::to_string_pretty(&prompt.exact)
+        .unwrap_or_else(|_| format!("{:?}", prompt.exact));
+    let availability = runtime.capability_availability(&prompt.exact);
+    let warning = if prompt.broad_scope_warning {
+        "\n\nWarning: this request covers a broad resource scope."
+    } else {
+        ""
+    };
+    let audience = audience
+        .map(|audience| format!("\n\n{}", approval_audience_summary(audience)))
+        .unwrap_or_default();
+    Dialog::select("Finch VM capability request", options).with_body(format!(
+        "Reason: {}\nHost availability: {:?}\n\nRequired capability:\n{}{}{}",
+        prompt.request.reason, availability, exact, warning, audience
+    ))
+}
+
 /// Application-owned data extracted from one verified, suspended
 /// `proposal-open` effect. The effect handle—not source text—is the authority
 /// to resume this exact VM frame.
@@ -446,6 +519,27 @@ struct PendingNamedBrainTurn {
     /// delegated turn. The daemon persists these as canonical Brain events.
     turn_events: Vec<crate::server::RunnerTurnEvent>,
     approval_audience: crate::brain::shared::BrainApprovalAudience,
+    approval_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<crate::server::RunnerApprovalRequest>,
+    >,
+}
+
+#[derive(Clone)]
+struct RemoteBrainApproval {
+    client: crate::brain::remote::RemoteBrainClient,
+    request_seq: u64,
+    approval_id: String,
+    audience: crate::brain::shared::BrainApprovalAudience,
+    kind: RemoteBrainApprovalKind,
+}
+
+#[derive(Clone)]
+enum RemoteBrainApprovalKind {
+    Tool(crate::tools::types::ToolUse),
+    Vm {
+        prompt: crate::vm::ApprovalPrompt,
+        choices: Vec<crate::vm::ApprovalChoice>,
+    },
 }
 
 struct PendingVmApproval {
@@ -907,6 +1001,8 @@ impl EventLoop {
             remote_brain_tool_unit: None,
             remote_brain_tool_rows: std::collections::HashMap::new(),
             remote_brain_approval_rows: std::collections::HashMap::new(),
+            queued_remote_brain_approvals: std::collections::VecDeque::new(),
+            active_remote_brain_approval: None,
             pending_approvals: Arc::new(RwLock::new(std::collections::HashMap::new())),
             pending_vm_approval: None,
             ipc_client,
@@ -1333,6 +1429,99 @@ impl EventLoop {
                                     tracing::debug!("[EVENT_LOOP] Brain action denied");
                                     let _ = action_tx.send(None);
                                 }
+                            } else if let Some(pending) =
+                                self.active_remote_brain_approval.take()
+                            {
+                                let decision = match &pending.kind {
+                                    RemoteBrainApprovalKind::Tool(tool_use) => {
+                                        let is_file_mutating = matches!(
+                                            tool_use.name.as_str(),
+                                            "write" | "Write" | "edit" | "Edit"
+                                        );
+                                        let is_editor_option = is_file_mutating
+                                            && matches!(
+                                                dialog_result,
+                                                crate::cli::tui::DialogResult::Selected(1)
+                                            );
+                                        let confirmation = if is_editor_option {
+                                            let proposed = tool_use
+                                                .input
+                                                .get("content")
+                                                .or_else(|| tool_use.input.get("new_string"))
+                                                .and_then(serde_json::Value::as_str)
+                                                .unwrap_or("");
+                                            match open_in_editor(proposed) {
+                                                Ok(edited) => {
+                                                    let mut input = tool_use.input.clone();
+                                                    if input.get("content").is_some() {
+                                                        input["content"] =
+                                                            serde_json::Value::String(edited);
+                                                    } else {
+                                                        input["new_string"] =
+                                                            serde_json::Value::String(edited);
+                                                    }
+                                                    super::events::ConfirmationResult::ApproveWithInput(
+                                                        input,
+                                                    )
+                                                }
+                                                Err(error) => {
+                                                    tracing::warn!(
+                                                        "remote approval editor failed: {error}"
+                                                    );
+                                                    super::events::ConfirmationResult::Deny
+                                                }
+                                            }
+                                        } else {
+                                            let adjusted = if is_file_mutating {
+                                                match dialog_result {
+                                                    crate::cli::tui::DialogResult::Selected(0) => {
+                                                        crate::cli::tui::DialogResult::Selected(0)
+                                                    }
+                                                    crate::cli::tui::DialogResult::Selected(index) => {
+                                                        crate::cli::tui::DialogResult::Selected(
+                                                            index - 1,
+                                                        )
+                                                    }
+                                                    other => other,
+                                                }
+                                            } else {
+                                                dialog_result
+                                            };
+                                            dialog_result_to_confirmation(adjusted, tool_use)
+                                        };
+                                        confirmation_audit_value(&confirmation)
+                                    }
+                                    RemoteBrainApprovalKind::Vm { choices, .. } => {
+                                        let choice = match dialog_result {
+                                            crate::cli::tui::DialogResult::Selected(index) => choices
+                                                .get(index)
+                                                .cloned()
+                                                .unwrap_or(crate::vm::ApprovalChoice::Deny),
+                                            _ => crate::vm::ApprovalChoice::Deny,
+                                        };
+                                        serde_json::to_value(choice).unwrap_or_else(|_| {
+                                            serde_json::json!({"choice": "deny"})
+                                        })
+                                    }
+                                };
+                                let client = pending.client;
+                                let target = client.target.display_name();
+                                let event_tx = self.event_tx.clone();
+                                tokio::spawn(async move {
+                                    if let Err(error) = client
+                                        .push(crate::brain::shared::BrainEventKind::ApprovalDecided {
+                                            request_seq: pending.request_seq,
+                                            approval_id: pending.approval_id,
+                                            decision,
+                                        })
+                                        .await
+                                    {
+                                        let _ = event_tx.send(ReplEvent::RemoteBrainError {
+                                            target,
+                                            error: error.to_string(),
+                                        });
+                                    }
+                                });
                             } else if let Some(pending) = self.pending_vm_approval.take() {
                                 let choice = match dialog_result {
                                     crate::cli::tui::DialogResult::Selected(index) => pending
@@ -1434,6 +1623,7 @@ impl EventLoop {
                                 }
                             }
                         }
+                        self.try_present_remote_brain_approval().await?;
                     }
 
                     if let Some(rating) = pending_feedback {
@@ -3153,6 +3343,7 @@ Rules:\n\
             ReplEvent::RemoteBrainDisconnected { target } => {
                 let is_current = self.selected_brain_matches(&target);
                 if is_current {
+                    self.clear_remote_brain_approvals_for_target(&target).await;
                     let role = if self.selected_brain_is_home() {
                         "home"
                     } else {
@@ -3357,6 +3548,7 @@ Rules:\n\
                 response_tx: request.response_tx,
                 turn_events: Vec::new(),
                 approval_audience: request.approval_audience,
+                approval_tx: request.approval_tx,
             },
         );
         self.update_compaction_status().await;
@@ -3880,6 +4072,8 @@ Rules:\n\
 
     async fn handle_brain_detach(&mut self) -> Result<()> {
         if let Some(client) = self.active_remote_brain.take() {
+            self.clear_remote_brain_approvals_for_target(&client.target.display_name())
+                .await;
             if let Err(error) = client.disconnect().await {
                 self.output_manager.write_info(format!(
                     "{}: could not close attachment cleanly: {error}",
@@ -4026,6 +4220,7 @@ Rules:\n\
                     .filter(|event| event.seq > acknowledged_seq)
                 {
                     self.render_remote_brain_event(event);
+                    self.observe_remote_brain_approval(event);
                 }
             }
             crate::brain::shared::BrainWireMessage::Event { event } => {
@@ -4039,9 +4234,142 @@ Rules:\n\
                     _ => {}
                 }
                 self.render_remote_brain_event(&event);
+                self.observe_remote_brain_approval(&event);
             }
         }
+        self.try_present_remote_brain_approval().await?;
         self.render_tui().await
+    }
+
+    fn observe_remote_brain_approval(&mut self, event: &crate::brain::shared::BrainEvent) {
+        use crate::brain::shared::BrainEventKind;
+
+        match &event.kind {
+            BrainEventKind::ApprovalRequested {
+                request_seq,
+                approval_id,
+                approval_kind,
+                subject,
+                audience: Some(audience),
+                detail,
+            } => {
+                let Some(client) = self.selected_brain().cloned() else {
+                    return;
+                };
+                if client
+                    .attachment()
+                    .is_none_or(|attachment| attachment.attachment_id != audience.attachment_id)
+                {
+                    return;
+                }
+                if self
+                    .active_remote_brain_approval
+                    .as_ref()
+                    .is_some_and(|pending| pending.approval_id == *approval_id)
+                    || self
+                        .queued_remote_brain_approvals
+                        .iter()
+                        .any(|pending| pending.approval_id == *approval_id)
+                {
+                    return;
+                }
+                let kind = match approval_kind.as_str() {
+                    "tool" => RemoteBrainApprovalKind::Tool(crate::tools::types::ToolUse {
+                        id: approval_id.clone(),
+                        name: subject.clone(),
+                        input: detail
+                            .get("input")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    }),
+                    "vm_capability" => {
+                        let Ok(prompt) = serde_json::from_value::<crate::vm::ApprovalPrompt>(
+                            detail.clone(),
+                        ) else {
+                            self.output_manager.write_error(format!(
+                                "approval {approval_id} has an invalid VM capability prompt"
+                            ));
+                            return;
+                        };
+                        let choices = vm_approval_choices(&prompt);
+                        RemoteBrainApprovalKind::Vm { prompt, choices }
+                    }
+                    _ => {
+                        self.output_manager.write_error(format!(
+                            "approval {approval_id} has unknown kind '{approval_kind}'"
+                        ));
+                        return;
+                    }
+                };
+                self.queued_remote_brain_approvals
+                    .push_back(RemoteBrainApproval {
+                        client,
+                        request_seq: *request_seq,
+                        approval_id: approval_id.clone(),
+                        audience: audience.clone(),
+                        kind,
+                    });
+            }
+            BrainEventKind::ApprovalDecided { approval_id, .. } => {
+                self.queued_remote_brain_approvals
+                    .retain(|pending| pending.approval_id != *approval_id);
+                if self
+                    .active_remote_brain_approval
+                    .as_ref()
+                    .is_some_and(|pending| pending.approval_id == *approval_id)
+                {
+                    self.active_remote_brain_approval = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn try_present_remote_brain_approval(&mut self) -> Result<()> {
+        if self.active_remote_brain_approval.is_some()
+            || self.queued_remote_brain_approvals.is_empty()
+        {
+            return Ok(());
+        }
+        let mut tui = self.tui_renderer.lock().await;
+        if tui.active_dialog.is_some() {
+            return Ok(());
+        }
+        let pending = self
+            .queued_remote_brain_approvals
+            .pop_front()
+            .expect("remote approval queue checked above");
+        let dialog = match &pending.kind {
+            RemoteBrainApprovalKind::Tool(tool_use) => {
+                let mut summary = tool_approval_summary(tool_use);
+                summary.push_str("\n\n");
+                summary.push_str(&approval_audience_summary(&pending.audience));
+                crate::cli::tui::Dialog::tool_approval(&tool_use.name, &summary)
+            }
+            RemoteBrainApprovalKind::Vm { prompt, .. } => {
+                vm_approval_dialog(prompt, Some(&pending.audience), self.program_runtime.as_ref())
+            }
+        };
+        self.active_remote_brain_approval = Some(pending);
+        tui.active_dialog = Some(dialog);
+        tui.pending_dialog_result = None;
+        tui.render()?;
+        Ok(())
+    }
+
+    async fn clear_remote_brain_approvals_for_target(&mut self, target: &str) {
+        self.queued_remote_brain_approvals
+            .retain(|pending| pending.client.target.display_name() != target);
+        let clear_dialog = self
+            .active_remote_brain_approval
+            .as_ref()
+            .is_some_and(|pending| pending.client.target.display_name() == target);
+        if clear_dialog {
+            self.active_remote_brain_approval = None;
+            let mut tui = self.tui_renderer.lock().await;
+            tui.active_dialog = None;
+            tui.pending_dialog_result = None;
+        }
     }
 
     fn update_remote_brain_status(&self, runner_online: bool) {
@@ -5062,6 +5390,44 @@ Rules:\n\
             .pending_named_brain_turns
             .get(&query_id)
             .map(|turn| turn.approval_audience.clone());
+        let approval_tx = self
+            .pending_named_brain_turns
+            .get(&query_id)
+            .and_then(|turn| turn.approval_tx.clone());
+        if let (Some(approval_tx), Some(audience)) =
+            (approval_tx, approval_audience.as_ref())
+        {
+            let event = crate::server::RunnerTurnEvent::ApprovalRequested {
+                approval_id: tool_use.id.clone(),
+                approval_kind: "tool".to_string(),
+                subject: tool_use.name.clone(),
+                audience: audience.clone(),
+                detail: serde_json::json!({"input": tool_use.input.clone()}),
+            };
+            let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+            if approval_tx
+                .send(crate::server::RunnerApprovalRequest {
+                    event,
+                    response_tx: decision_tx,
+                })
+                .is_err()
+            {
+                let _ = response_tx.send(super::events::ConfirmationResult::Deny);
+                return Ok(());
+            }
+            tokio::spawn(async move {
+                let confirmation = decision_rx
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok())
+                    .and_then(|decision| {
+                        confirmation_from_audit_value(&decision, &tool_use).ok()
+                    })
+                    .unwrap_or(super::events::ConfirmationResult::Deny);
+                let _ = response_tx.send(confirmation);
+            });
+            return Ok(());
+        }
         if let (Some(turn), Some(audience)) = (
             self.pending_named_brain_turns.get_mut(&query_id),
             approval_audience.as_ref(),
@@ -5116,8 +5482,6 @@ Rules:\n\
         prompt: crate::vm::ApprovalPrompt,
         response_tx: tokio::sync::oneshot::Sender<crate::vm::ApprovalChoice>,
     ) -> Result<()> {
-        use crate::cli::tui::{Dialog, DialogOption};
-
         if self.pending_vm_approval.is_some() {
             let _ = response_tx.send(crate::vm::ApprovalChoice::Deny);
             self.output_manager.write_error(
@@ -5128,6 +5492,48 @@ Rules:\n\
 
         let query_id = *self.active_query_id.read().await;
         let approval_id = prompt.request.id.to_string();
+        let approval_tx = query_id.and_then(|query_id| {
+            self.pending_named_brain_turns
+                .get(&query_id)
+                .and_then(|turn| turn.approval_tx.clone())
+        });
+        if let (Some(query_id), Some(approval_tx)) = (query_id, approval_tx) {
+            let audience = self
+                .pending_named_brain_turns
+                .get(&query_id)
+                .expect("named Brain turn disappeared while requesting approval")
+                .approval_audience
+                .clone();
+            let event = crate::server::RunnerTurnEvent::ApprovalRequested {
+                approval_id: approval_id.clone(),
+                approval_kind: "vm_capability".to_string(),
+                subject: format!("{:?}", prompt.exact.capability),
+                audience,
+                detail: serde_json::to_value(&prompt)
+                    .unwrap_or_else(|_| serde_json::json!({"reason": prompt.request.reason.clone()})),
+            };
+            let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+            if approval_tx
+                .send(crate::server::RunnerApprovalRequest {
+                    event,
+                    response_tx: decision_tx,
+                })
+                .is_err()
+            {
+                let _ = response_tx.send(crate::vm::ApprovalChoice::Deny);
+                return Ok(());
+            }
+            tokio::spawn(async move {
+                let choice = decision_rx
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok())
+                    .and_then(|decision| serde_json::from_value(decision).ok())
+                    .unwrap_or(crate::vm::ApprovalChoice::Deny);
+                let _ = response_tx.send(choice);
+            });
+            return Ok(());
+        }
         if let Some(query_id) = query_id {
             if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
                 turn.turn_events
@@ -5143,61 +5549,11 @@ Rules:\n\
             }
         }
 
-        let mut choices = vec![crate::vm::ApprovalChoice::AllowOnce];
-        let mut options = vec![DialogOption::with_description(
-            "Allow once",
-            "Resume only this exact pending effect",
-        )];
-        if !prompt.request.agent_ancestry.is_empty() {
-            choices.push(crate::vm::ApprovalChoice::AllowTask);
-            options.push(DialogOption::with_description(
-                "Allow for task",
-                "Reuse only within this child task",
-            ));
-        }
-        choices.push(crate::vm::ApprovalChoice::AllowSession);
-        options.push(DialogOption::with_description(
-            "Allow for session",
-            "Reuse in this resumable Finch session",
-        ));
-        choices.push(crate::vm::ApprovalChoice::AllowProjectExact);
-        options.push(DialogOption::with_description(
-            "Allow for project",
-            "Reuse this exact capability in the current project",
-        ));
-        if let Some(requirement) = prompt.suggested_patterns.first().cloned() {
-            choices.push(crate::vm::ApprovalChoice::AllowProjectPattern { requirement });
-            options.push(DialogOption::with_description(
-                "Allow project pattern",
-                "Reuse the displayed narrowed pattern in this project",
-            ));
-        }
-        choices.push(crate::vm::ApprovalChoice::Deny);
-        options.push(DialogOption::new("Deny"));
-
-        let exact = serde_json::to_string_pretty(&prompt.exact)
-            .unwrap_or_else(|_| format!("{:?}", prompt.exact));
-        let availability = self
-            .program_runtime
-            .capability_availability(&prompt.exact);
-        let warning = if prompt.broad_scope_warning {
-            "\n\nWarning: this request covers a broad resource scope."
-        } else {
-            ""
-        };
+        let choices = vm_approval_choices(&prompt);
         let audience = query_id
             .and_then(|query_id| self.pending_named_brain_turns.get(&query_id))
-            .map(|turn| {
-                format!(
-                    "\n\n{}",
-                    approval_audience_summary(&turn.approval_audience)
-                )
-            })
-            .unwrap_or_default();
-        let dialog = Dialog::select("Finch VM capability request", options).with_body(format!(
-            "Reason: {}\nHost availability: {:?}\n\nRequired capability:\n{}{}{}",
-            prompt.request.reason, availability, exact, warning, audience
-        ));
+            .map(|turn| &turn.approval_audience);
+        let dialog = vm_approval_dialog(&prompt, audience, self.program_runtime.as_ref());
 
         self.pending_vm_approval = Some(PendingVmApproval {
             response_tx,
@@ -5840,10 +6196,38 @@ fn confirmation_audit_value(
             "pattern": pattern.pattern,
             "tool": pattern.tool_name,
         }),
-        ConfirmationResult::ApproveWithInput(_) => {
-            serde_json::json!({"choice": "approve_with_edited_input"})
-        }
+        ConfirmationResult::ApproveWithInput(input) => serde_json::json!({
+            "choice": "approve_with_edited_input",
+            "input": input,
+        }),
         ConfirmationResult::Deny => serde_json::json!({"choice": "deny"}),
+    }
+}
+
+fn confirmation_from_audit_value(
+    decision: &serde_json::Value,
+    tool_use: &crate::tools::types::ToolUse,
+) -> anyhow::Result<super::events::ConfirmationResult> {
+    use super::events::ConfirmationResult;
+
+    match decision.get("choice").and_then(serde_json::Value::as_str) {
+        Some("approve_once") => Ok(ConfirmationResult::ApproveOnce),
+        Some("approve_pattern_session") => Ok(ConfirmationResult::ApprovePatternSession(
+            crate::tools::patterns::ToolPattern::new(
+                "*".to_string(),
+                tool_use.name.clone(),
+                format!("Allow all {} calls (session)", tool_use.name),
+            ),
+        )),
+        Some("approve_with_edited_input") => Ok(ConfirmationResult::ApproveWithInput(
+            decision
+                .get("input")
+                .cloned()
+                .context("edited approval decision omitted its input")?,
+        )),
+        Some("deny") => Ok(ConfirmationResult::Deny),
+        Some(choice) => anyhow::bail!("unsupported remote tool approval choice '{choice}'"),
+        None => anyhow::bail!("remote tool approval decision omitted its choice"),
     }
 }
 
@@ -5959,6 +6343,25 @@ mod tests {
             &super::super::events::ConfirmationResult::ApproveOnce,
         );
         assert_eq!(decision, serde_json::json!({"choice": "approve_once"}));
+    }
+
+    #[test]
+    fn remote_tool_approval_round_trips_edited_input() {
+        let tool_use = crate::tools::types::ToolUse {
+            id: "tool-1".into(),
+            name: "edit".into(),
+            input: serde_json::json!({"path": "src/main.rs", "new_string": "old"}),
+        };
+        let edited = serde_json::json!({"path": "src/main.rs", "new_string": "new"});
+        let audit = super::confirmation_audit_value(
+            &super::super::events::ConfirmationResult::ApproveWithInput(edited.clone()),
+        );
+
+        assert!(matches!(
+            super::confirmation_from_audit_value(&audit, &tool_use).unwrap(),
+            super::super::events::ConfirmationResult::ApproveWithInput(input)
+                if input == edited
+        ));
     }
 
     use super::*;

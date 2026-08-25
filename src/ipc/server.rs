@@ -81,6 +81,24 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
             Ok(registration) => registration,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
+        if approval_kind == "tool" {
+            let input = detail
+                .get("input")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            if let Err(error) = self.server.shared_brains().push(
+                &self.brain,
+                "provider",
+                crate::brain::shared::BrainEventKind::ToolCall {
+                    request_seq: self.request_seq,
+                    tool_id: approval_id.clone(),
+                    name: subject.clone(),
+                    input,
+                },
+            ) {
+                return Promise::err(capnp::Error::failed(error.to_string()));
+            }
+        }
         if let Err(error) = self.server.shared_brains().push(
             &self.brain,
             "runner",

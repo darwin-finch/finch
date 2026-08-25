@@ -810,6 +810,34 @@ fn persist_named_brain_turn_events(
     expected_approval_audience: &crate::brain::shared::BrainApprovalAudience,
     turn_events: Vec<crate::server::RunnerTurnEvent>,
 ) -> anyhow::Result<()> {
+    let mut persisted = store
+        .snapshot(name)?
+        .events
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            crate::brain::shared::BrainEventKind::ToolCall {
+                request_seq: event_request,
+                tool_id,
+                ..
+            } if event_request == request_seq => Some(format!("call:{tool_id}")),
+            crate::brain::shared::BrainEventKind::ToolResult {
+                request_seq: event_request,
+                tool_id,
+                ..
+            } if event_request == request_seq => Some(format!("result:{tool_id}")),
+            crate::brain::shared::BrainEventKind::ApprovalRequested {
+                request_seq: event_request,
+                approval_id,
+                ..
+            } if event_request == request_seq => Some(format!("approval:{approval_id}")),
+            crate::brain::shared::BrainEventKind::ApprovalDecided {
+                request_seq: event_request,
+                approval_id,
+                ..
+            } if event_request == request_seq => Some(format!("decision:{approval_id}")),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
     for turn_event in turn_events {
         match turn_event {
             crate::server::RunnerTurnEvent::Call {
@@ -817,6 +845,9 @@ fn persist_named_brain_turn_events(
                 name: tool_name,
                 input,
             } => {
+                if !persisted.insert(format!("call:{tool_id}")) {
+                    continue;
+                }
                 store.push(
                     name,
                     "provider",
@@ -833,6 +864,9 @@ fn persist_named_brain_turn_events(
                 output,
                 is_error,
             } => {
+                if !persisted.insert(format!("result:{tool_id}")) {
+                    continue;
+                }
                 store.push(
                     name,
                     "runner",
@@ -855,6 +889,9 @@ fn persist_named_brain_turn_events(
                     audience == *expected_approval_audience,
                     "runner substituted the approval audience for request {request_seq}"
                 );
+                if !persisted.insert(format!("approval:{approval_id}")) {
+                    continue;
+                }
                 store.push(
                     name,
                     "runner",
@@ -872,6 +909,9 @@ fn persist_named_brain_turn_events(
                 approval_id,
                 decision,
             } => {
+                if !persisted.insert(format!("decision:{approval_id}")) {
+                    continue;
+                }
                 store.push(
                     name,
                     runner_subject,
@@ -2546,6 +2586,132 @@ mod named_brain_provider_context_tests {
             .unwrap();
         claimed.complete(serde_json::json!({"choice": "deny"}));
         assert_eq!(registration.wait().await.unwrap()["choice"], "deny");
+    }
+
+    #[test]
+    fn final_turn_flush_deduplicates_live_approval_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::shared::SharedBrainStore::with_root(
+            "box.local",
+            Some(temp.path().into()),
+        );
+        let request_seq = store
+            .push(
+                "shared",
+                "alice@box.local",
+                BrainEventKind::Prompt { text: "search".into() },
+            )
+            .unwrap()
+            .seq;
+        let snapshot = store.snapshot("shared").unwrap();
+        let attachment = driver_attachment("alice@box.local");
+        let audience = BrainApprovalAudience {
+            brain_id: snapshot.brain_id,
+            brain: snapshot.name,
+            attachment_id: attachment.attachment_id,
+            subject: attachment.subject,
+            role: attachment.role,
+            environment_generation: snapshot.environment.generation,
+        };
+        store
+            .push(
+                "shared",
+                "provider",
+                BrainEventKind::ToolCall {
+                    request_seq,
+                    tool_id: "tool-1".into(),
+                    name: "search_word".into(),
+                    input: serde_json::json!({"query": "fib"}),
+                },
+            )
+            .unwrap();
+        store
+            .push(
+                "shared",
+                "runner",
+                BrainEventKind::ApprovalRequested {
+                    request_seq,
+                    approval_id: "tool-1".into(),
+                    approval_kind: "tool".into(),
+                    subject: "search_word".into(),
+                    audience: Some(audience.clone()),
+                    detail: serde_json::json!({"input": {"query": "fib"}}),
+                },
+            )
+            .unwrap();
+        store
+            .push(
+                "shared",
+                "alice@box.local",
+                BrainEventKind::ApprovalDecided {
+                    request_seq,
+                    approval_id: "tool-1".into(),
+                    decision: serde_json::json!({"choice": "approve_once"}),
+                },
+            )
+            .unwrap();
+
+        persist_named_brain_turn_events(
+            &store,
+            "shared",
+            request_seq,
+            "runner@box.local",
+            &audience,
+            vec![
+                crate::server::RunnerTurnEvent::Call {
+                    tool_id: "tool-1".into(),
+                    name: "search_word".into(),
+                    input: serde_json::json!({"query": "fib"}),
+                },
+                crate::server::RunnerTurnEvent::ApprovalRequested {
+                    approval_id: "tool-1".into(),
+                    approval_kind: "tool".into(),
+                    subject: "search_word".into(),
+                    audience: audience.clone(),
+                    detail: serde_json::json!({"input": {"query": "fib"}}),
+                },
+                crate::server::RunnerTurnEvent::ApprovalDecided {
+                    approval_id: "tool-1".into(),
+                    decision: serde_json::json!({"choice": "approve_once"}),
+                },
+                crate::server::RunnerTurnEvent::Result {
+                    tool_id: "tool-1".into(),
+                    output: "found".into(),
+                    is_error: false,
+                },
+            ],
+        )
+        .unwrap();
+
+        let events = store.snapshot("shared").unwrap().events;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, BrainEventKind::ToolCall { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, BrainEventKind::ApprovalRequested { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, BrainEventKind::ApprovalDecided { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, BrainEventKind::ToolResult { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
