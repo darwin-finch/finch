@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -979,6 +979,15 @@ impl BrainStore {
         Ok(())
     }
 
+    pub(crate) fn prune_run_publication(&self, name: &str, run_id: RunId) -> Result<()> {
+        let name = Self::validate_name(name)?;
+        self.run_publication_gates
+            .write()
+            .expect("shared Brain run-gate map poisoned")
+            .remove(&(name.to_string(), run_id));
+        Ok(())
+    }
+
     pub fn validate_name(name: &str) -> Result<&str> {
         let name = name.trim();
         if name.is_empty()
@@ -1591,11 +1600,28 @@ impl BrainStore {
                 detail,
             },
         )?;
-        Ok(state
+        let transitioned = state
             .runs
             .get(&run_id)
             .expect("run transition was projected")
-            .clone())
+            .clone();
+        drop(brains);
+        if status.is_terminal() {
+            let gate = self
+                .run_publication_gates
+                .read()
+                .expect("shared Brain run-gate map poisoned")
+                .get(&(name.to_string(), run_id))
+                .cloned();
+            let idle = gate
+                .as_ref()
+                .and_then(|gate| gate.try_lock().ok())
+                .is_some_and(|gate| !gate.cancel_requested());
+            if idle {
+                self.prune_run_publication(name, run_id)?;
+            }
+        }
+        Ok(transitioned)
     }
 
     pub fn acquire_runner_lease(
@@ -2231,6 +2257,10 @@ impl BrainStore {
             .write()
             .expect("shared brain execution-lock map poisoned")
             .remove(name);
+        self.run_publication_gates
+            .write()
+            .expect("shared Brain run-gate map poisoned")
+            .retain(|(brain, _), _| brain != name);
         Ok(archived_to)
     }
 
@@ -2653,7 +2683,8 @@ impl BrainStore {
         }
         let brain_id = self.load_or_create_metadata(name)?.brain_id;
         let initialization = self.load_or_create_initialization(name, brain_id)?;
-        let events = self.read_events(name)?;
+        let mut events = self.read_events(name)?;
+        backfill_legacy_speculative_run_correlation(&mut events);
         let mut reviewed_schedules = HashMap::new();
         for event in &events {
             if event.schema_version > BRAIN_EVENT_SCHEMA_VERSION {
@@ -3084,6 +3115,105 @@ const fn legacy_brain_event_schema_version() -> u32 {
     1
 }
 
+/// Schema v14 added explicit event-envelope RunId correlation. Reconstruct
+/// completed v13 speculative transcripts from the durable run lifecycle so an
+/// old helper turn cannot enter ordinary provider context after upgrade.
+fn backfill_legacy_speculative_run_correlation(events: &mut [BrainEvent]) {
+    struct LegacySpeculativeRun {
+        run_id: RunId,
+        request_seq: u64,
+        started_seq: u64,
+        terminal_seq: Option<u64>,
+    }
+
+    let runs = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            BrainEventKind::RunStarted { run }
+                if event.schema_version < 14 && run.kind == BrainRunKind::Speculative =>
+            {
+                let terminal_seq = events.iter().find_map(|candidate| match &candidate.kind {
+                    BrainEventKind::RunStatusChanged { run_id, status, .. }
+                        if *run_id == run.run_id
+                            && candidate.seq > event.seq
+                            && status.is_terminal() =>
+                    {
+                        Some(candidate.seq)
+                    }
+                    _ => None,
+                });
+                Some(LegacySpeculativeRun {
+                    run_id: run.run_id,
+                    request_seq: run.request_seq,
+                    started_seq: event.seq,
+                    terminal_seq,
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    for run in runs {
+        let end_seq = run.terminal_seq.unwrap_or_else(|| {
+            events
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    BrainEventKind::RunStarted { run: later }
+                        if event.seq > run.started_seq && later.request_seq > run.request_seq =>
+                    {
+                        Some(later.request_seq.saturating_sub(1))
+                    }
+                    _ => None,
+                })
+                .min()
+                .unwrap_or(u64::MAX)
+        });
+        let provider_program_seqs = events
+            .iter()
+            .filter(|event| {
+                event.seq > run.started_seq
+                    && event.seq <= end_seq
+                    && event.sender == "provider"
+                    && matches!(event.kind, BrainEventKind::Program { .. })
+            })
+            .map(|event| event.seq)
+            .collect::<HashSet<_>>();
+
+        for event in events.iter_mut() {
+            if event.run_id.is_some() || event.schema_version >= 14 {
+                continue;
+            }
+            let lifecycle_match = match &event.kind {
+                BrainEventKind::RunStarted { run: started } => started.run_id == run.run_id,
+                BrainEventKind::RunStatusChanged { run_id, .. } => *run_id == run.run_id,
+                _ => false,
+            };
+            let referenced_seq = match &event.kind {
+                BrainEventKind::ToolCall { request_seq, .. }
+                | BrainEventKind::ToolResult { request_seq, .. }
+                | BrainEventKind::ApprovalRequested { request_seq, .. }
+                | BrainEventKind::ApprovalDecided { request_seq, .. }
+                | BrainEventKind::EffectRecorded { request_seq, .. }
+                | BrainEventKind::Result { request_seq, .. }
+                | BrainEventKind::RuntimeCommitted { request_seq, .. } => Some(*request_seq),
+                _ => None,
+            };
+            let correlated = event.seq == run.request_seq
+                || lifecycle_match
+                || (event.seq > run.started_seq
+                    && event.seq <= end_seq
+                    && event.sender == "provider"
+                    && matches!(event.kind, BrainEventKind::Program { .. }))
+                || referenced_seq.is_some_and(|seq| {
+                    seq == run.request_seq || provider_program_seqs.contains(&seq)
+                });
+            if correlated {
+                event.run_id = Some(run.run_id);
+            }
+        }
+    }
+}
+
 fn legacy_schedule_attachment_id() -> AttachmentId {
     AttachmentId(uuid::Uuid::nil())
 }
@@ -3368,6 +3498,46 @@ mod tests {
         assert_eq!(restored.request_seq, prompt.seq);
         assert_eq!(restored.status, BrainRunStatus::Completed);
         assert!(restored.updated_ms >= restored.started_ms);
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_and_archive_prune_run_publication_gates() {
+        let store = BrainStore::with_root("box.local", None);
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let (_, run) = store
+            .accept_speculative_run("shared", "alice", attachment.attachment_id, "one".into())
+            .unwrap();
+        drop(
+            store
+                .acquire_run_publication("shared", run.run_id)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(store.run_publication_gates.read().unwrap().len(), 1);
+        store
+            .transition_run(
+                "shared",
+                "daemon",
+                run.run_id,
+                BrainRunStatus::Cancelled,
+                None,
+            )
+            .unwrap();
+        assert!(store.run_publication_gates.read().unwrap().is_empty());
+
+        let (_, second) = store
+            .accept_speculative_run("shared", "alice", attachment.attachment_id, "two".into())
+            .unwrap();
+        drop(
+            store
+                .acquire_run_publication("shared", second.run_id)
+                .await
+                .unwrap(),
+        );
+        store.archive("shared").unwrap();
+        assert!(store.run_publication_gates.read().unwrap().is_empty());
     }
 
     #[test]

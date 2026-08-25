@@ -507,16 +507,25 @@ impl BrainLifecycleService {
                 && lease.expires_ms > crate::brain::store::unix_millis()
                 && self.runners.has_registration(brain, lease.lease_id)
         });
-        drop(_turn);
         if let Some(lease) = ready_lease {
             let service = self.clone();
             let brain = brain.to_string();
             let run_id = run.run_id;
             tokio::spawn(async move {
-                if let Err(error) = service.resume_queued_runs(brain.clone(), lease.lease_id).await {
+                let _turn = _turn;
+                if let Err(error) = handlers::resume_queued_named_brain_runs_in_lane(
+                    service.store.clone(),
+                    service.runners.clone(),
+                    brain.clone(),
+                    lease.lease_id,
+                )
+                .await
+                {
                     tracing::warn!(%brain, run_id = %run_id.0, %error, "speculative Brain supervisor failed");
                 }
             });
+        } else {
+            drop(_turn);
         }
         Ok(BrainSubmissionOutcome {
             accepted,
@@ -613,8 +622,8 @@ impl BrainLifecycleService {
                 }
             }
         }
-        let _publication = self.store.acquire_run_publication(brain, run_id).await?;
-        match self.store.transition_run(
+        let publication = self.store.acquire_run_publication(brain, run_id).await?;
+        let transitioned = match self.store.transition_run(
             brain,
             &attachment.subject,
             run_id,
@@ -630,7 +639,15 @@ impl BrainLifecycleService {
                     Err(error)
                 }
             }
+        };
+        drop(publication);
+        if !matches!(
+            run.status,
+            BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
+        ) {
+            self.store.prune_run_publication(brain, run_id)?;
         }
+        transitioned
     }
 
     pub fn acquire_runner(
@@ -989,6 +1006,13 @@ mod tests {
                 commit_ack: None,
             }))
             .unwrap();
+        // Acquiring the same turn lane is a completion barrier for the
+        // detached supervisor; assertions below cannot pass vacuously before
+        // it has observed and rejected the late response.
+        service
+            .resume_queued_runs("shared".into(), lease.lease_id)
+            .await
+            .unwrap();
         assert!(accepted.result.is_none());
         let snapshot = service.snapshot("shared").unwrap();
         assert_eq!(
@@ -1010,6 +1034,97 @@ mod tests {
                         | BrainEventKind::Result { .. }
                 )
         }));
+    }
+
+    #[tokio::test]
+    async fn accepted_speculative_run_keeps_fifo_lane_until_supervised_dispatch() {
+        let service = service();
+        let driver = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let connection_id = driver.connection_id.unwrap();
+        let _watch = service
+            .watch("shared", driver.attachment_id, connection_id)
+            .unwrap();
+        let environment = service.store.environment().clone();
+        let lease = service
+            .acquire_runner("shared", "runner", &environment, None, 60_000)
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        service.runners.register("shared", lease.lease_id, tx);
+
+        let speculative = service
+            .start_speculative(
+                "shared",
+                driver.attachment_id,
+                connection_id,
+                "first".into(),
+            )
+            .await
+            .unwrap();
+        let ordinary = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .submit(
+                        "shared",
+                        driver.attachment_id,
+                        connection_id,
+                        BrainEventKind::Prompt {
+                            text: "second".into(),
+                        },
+                    )
+                    .await
+            })
+        };
+        let crate::server::RunnerRequest::Turn(first) = rx.recv().await.unwrap() else {
+            panic!("expected first turn")
+        };
+        assert_eq!(first.prompt, "first");
+        assert_eq!(
+            first.request_seq,
+            speculative.run.as_ref().unwrap().request_seq
+        );
+        let first_seq = first.request_seq;
+        let checkpoint = crate::runtime::ProgramRuntime::new()
+            .revision_history()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        first
+            .response_tx
+            .send(Ok(crate::server::RunnerTurnResult {
+                source: "(say \"first\")".into(),
+                language: ProgramLanguage::Lisp,
+                output: "first".into(),
+                turn_events: Vec::new(),
+                runtime_revision: 0,
+                checkpoint: checkpoint.clone(),
+                effect_journal: Vec::new(),
+                commit_ack: None,
+            }))
+            .unwrap();
+        let crate::server::RunnerRequest::Turn(second) = rx.recv().await.unwrap() else {
+            panic!("expected second turn")
+        };
+        assert_eq!(second.prompt, "second");
+        assert!(first_seq < second.request_seq);
+        second
+            .response_tx
+            .send(Ok(crate::server::RunnerTurnResult {
+                source: "(say \"second\")".into(),
+                language: ProgramLanguage::Lisp,
+                output: "second".into(),
+                turn_events: Vec::new(),
+                runtime_revision: 0,
+                checkpoint,
+                effect_journal: Vec::new(),
+                commit_ack: None,
+            }))
+            .unwrap();
+        ordinary.await.unwrap().unwrap();
     }
 
     #[tokio::test]

@@ -1332,10 +1332,23 @@ pub(crate) async fn resume_queued_named_brain_runs(
     name: String,
     lease_id: crate::brain::store::RunnerLeaseId,
 ) -> anyhow::Result<usize> {
-    use crate::brain::store::BrainRunStatus;
-
     let execution_lock = store.execution_lock(&name)?;
     let _turn = execution_lock.lock_owned().await;
+    resume_queued_named_brain_runs_in_lane(store, runners, name, lease_id).await
+}
+
+/// Drain queued work while the caller already owns the Brain turn lane. This
+/// lets an accepted asynchronous run transfer that lane directly to its
+/// supervisor, so a later submission cannot overtake it between accept and
+/// dispatch.
+pub(crate) async fn resume_queued_named_brain_runs_in_lane(
+    store: crate::brain::store::BrainStore,
+    runners: crate::server::BrainRunnerBroker,
+    name: String,
+    lease_id: crate::brain::store::RunnerLeaseId,
+) -> anyhow::Result<usize> {
+    use crate::brain::store::BrainRunStatus;
+
     let queued = store
         .snapshot(&name)?
         .runs
@@ -1512,6 +1525,8 @@ async fn dispatch_named_brain_program(
             if let Some(failure) = error.downcast_ref::<crate::server::RunnerProgramError>() {
                 let publication = store.acquire_run_publication(name, run_id).await?;
                 if publication.cancel_requested() {
+                    drop(publication);
+                    store.prune_run_publication(name, run_id)?;
                     anyhow::bail!("named Brain run cancelled");
                 }
                 persist_named_brain_effect_journal(
@@ -1536,12 +1551,16 @@ async fn dispatch_named_brain_program(
                     crate::brain::store::BrainRunStatus::Failed,
                     Some(error.to_string()),
                 )?;
+                drop(publication);
+                store.prune_run_publication(name, run_id)?;
             }
             return Err(error);
         }
     };
     let publication = store.acquire_run_publication(name, run_id).await?;
     if publication.cancel_requested() {
+        drop(publication);
+        store.prune_run_publication(name, run_id)?;
         anyhow::bail!("named Brain run cancelled");
     }
     persist_named_brain_effect_journal(
@@ -1573,6 +1592,8 @@ async fn dispatch_named_brain_program(
         crate::brain::store::BrainRunStatus::Completed,
         None,
     )?;
+    drop(publication);
+    store.prune_run_publication(name, run_id)?;
     Ok(result)
 }
 
@@ -1625,6 +1646,8 @@ async fn dispatch_named_brain_turn(
             if let Some(failure) = error.downcast_ref::<crate::server::RunnerTurnError>() {
                 let publication = store.acquire_run_publication(name, run_id).await?;
                 if publication.cancel_requested() {
+                    drop(publication);
+                    store.prune_run_publication(name, run_id)?;
                     anyhow::bail!("named Brain run cancelled");
                 }
                 persist_named_brain_turn_events(
@@ -1658,12 +1681,16 @@ async fn dispatch_named_brain_turn(
                     crate::brain::store::BrainRunStatus::Failed,
                     Some(error.to_string()),
                 )?;
+                drop(publication);
+                store.prune_run_publication(name, run_id)?;
             }
             return Err(error);
         }
     };
     let publication = store.acquire_run_publication(name, run_id).await?;
     if publication.cancel_requested() {
+        drop(publication);
+        store.prune_run_publication(name, run_id)?;
         anyhow::bail!("named Brain run cancelled");
     }
     let commit_ack = outcome.commit_ack.clone();
@@ -1708,6 +1735,8 @@ async fn dispatch_named_brain_turn(
         crate::brain::store::BrainRunStatus::Completed,
         None,
     )?;
+    drop(publication);
+    store.prune_run_publication(name, run_id)?;
     Ok((result, commit_ack))
 }
 
@@ -1980,10 +2009,9 @@ fn named_brain_provider_messages_at(
     let projected = events
         .into_iter()
         .rev()
-        .map(|event| match &event.kind {
-            BrainEventKind::SpeculativePrompt { .. } => {
-                unreachable!("speculative transcripts are filtered above")
-            }
+        .filter_map(|event| {
+            Some(match &event.kind {
+                BrainEventKind::SpeculativePrompt { .. } => return None,
             BrainEventKind::Prompt { text } => {
                 let prompt = format!("[{}]\n{text}", event.sender);
                 Message::user(
@@ -2069,7 +2097,8 @@ fn named_brain_provider_messages_at(
             | BrainEventKind::RunStarted { .. }
             | BrainEventKind::RunStatusChanged { .. }
             | BrainEventKind::ScheduleChanged { .. }
-            | BrainEventKind::ScheduleDue { .. } => unreachable!("filtered above"),
+                | BrainEventKind::ScheduleDue { .. } => return None,
+            })
         })
         .collect::<Vec<_>>();
 
@@ -5875,6 +5904,177 @@ mod handler_tests {
         .await
         .unwrap();
         runner.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v13_completed_speculative_restart_backfills_context_isolation_end_to_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().to_path_buf()),
+        );
+        let original = store
+            .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
+            .unwrap();
+        let (_, queued) = store
+            .accept_speculative_run(
+                "shared",
+                &original.subject,
+                original.attachment_id,
+                "v13-secret-prompt".into(),
+            )
+            .unwrap();
+        store
+            .transition_run(
+                "shared",
+                "daemon",
+                queued.run_id,
+                crate::brain::store::BrainRunStatus::Running,
+                None,
+            )
+            .unwrap();
+        store
+            .push_for_run(
+                "shared",
+                "runner",
+                queued.run_id,
+                BrainEventKind::ToolCall {
+                    request_seq: queued.request_seq,
+                    tool_id: "v13-tool".into(),
+                    name: "v13-secret-tool".into(),
+                    input: serde_json::json!({"secret": true}),
+                },
+            )
+            .unwrap();
+        store
+            .push(
+                "shared",
+                "bob@box.local",
+                BrainEventKind::ParticipantMessage {
+                    text: "v13-visible-interleaved".into(),
+                },
+            )
+            .unwrap();
+        let program = store
+            .push_for_run(
+                "shared",
+                "provider",
+                queued.run_id,
+                BrainEventKind::Program {
+                    language: ProgramLanguage::Lisp,
+                    source: "(say \"v13-secret-program\")".into(),
+                },
+            )
+            .unwrap();
+        store
+            .push_for_run(
+                "shared",
+                "daemon",
+                queued.run_id,
+                BrainEventKind::Result {
+                    request_seq: program.seq,
+                    output: "v13-secret-result".into(),
+                    error: None,
+                },
+            )
+            .unwrap();
+        store
+            .transition_run(
+                "shared",
+                "daemon",
+                queued.run_id,
+                crate::brain::store::BrainRunStatus::Completed,
+                None,
+            )
+            .unwrap();
+        drop(store);
+
+        let path = temp.path().join("shared/events.jsonl");
+        let legacy = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut event: serde_json::Value = serde_json::from_str(line).unwrap();
+                event["schema_version"] = serde_json::json!(13);
+                event.as_object_mut().unwrap().remove("correlation_run_id");
+                serde_json::to_string(&event).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{legacy}\n")).unwrap();
+
+        let restarted = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().to_path_buf()),
+        );
+        let snapshot = restarted.snapshot("shared").unwrap();
+        assert!(snapshot.events.iter().any(|event| {
+            event.run_id == Some(queued.run_id)
+                && matches!(event.kind, BrainEventKind::Result { .. })
+        }));
+        assert!(snapshot.events.iter().any(|event| {
+            event.run_id.is_none()
+                && matches!(
+                    &event.kind,
+                    BrainEventKind::ParticipantMessage { text }
+                        if text == "v13-visible-interleaved"
+                )
+        }));
+        let driver = restarted
+            .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
+            .unwrap();
+        let lease = restarted
+            .acquire_runner_lease(
+                "shared",
+                "runner@box.local",
+                restarted.environment().generation,
+                None,
+                60_000,
+            )
+            .unwrap();
+        let runners = crate::server::BrainRunnerBroker::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, tx);
+        let checking = tokio::spawn(async move {
+            let crate::server::RunnerRequest::Turn(request) = rx.recv().await.unwrap() else {
+                panic!("expected ordinary prompt after restart")
+            };
+            let context = request
+                .context
+                .iter()
+                .map(|message| message.text_content())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(context.contains("v13-visible-interleaved"));
+            for hidden in [
+                "v13-secret-prompt",
+                "v13-secret-tool",
+                "v13-secret-program",
+                "v13-secret-result",
+            ] {
+                assert!(!context.contains(hidden), "leaked v13 transcript: {hidden}");
+            }
+            request
+                .response_tx
+                .send(Err(crate::server::RunnerTurnError {
+                    message: "context checked".into(),
+                    turn_events: Vec::new(),
+                    effect_journal: Vec::new(),
+                }))
+                .unwrap();
+        });
+        let _ = submit_named_brain_event(
+            &restarted,
+            &runners,
+            &crate::server::BrainApprovalBroker::default(),
+            "shared",
+            &driver,
+            BrainEventKind::Prompt {
+                text: "ordinary-after-v13".into(),
+            },
+        )
+        .await;
+        checking.await.unwrap();
     }
 
     #[tokio::test]
