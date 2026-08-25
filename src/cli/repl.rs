@@ -1897,7 +1897,8 @@ impl Repl {
                 match line {
                     Some(text) => text,
                     None => {
-                        // Ctrl+C or Ctrl+D - graceful exit
+                        // Ctrl+C - graceful exit. Ctrl+D is forward-delete (or
+                        // a no-op on an empty buffer) in both input modes.
                         self.output_status("");
                         self.save_models().await?;
                         if let Some(ref mut handler) = self.input_handler {

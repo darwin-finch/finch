@@ -79,7 +79,7 @@ Brains: /brain list  /brain attach <name>[@machine]  /brain detach
 Other: /plan [task]  /graph  /setup  /license  /license activate <key>  /accept  /reject
   /ask <query>  /self-fix
 
-Keyboard: Ctrl+C cancel  Ctrl+D quit  Ctrl+G good  Ctrl+B bad  Ctrl+Z undefine
+Keyboard: Ctrl+C cancel  Ctrl+D forward-delete  Ctrl+G good  Ctrl+B bad  Ctrl+Z undefine
   Ctrl+P pop  Tab complete  Shift+Tab plan mode  Shift+Enter newline";
 
 /// Build the full system prompt including working directory and project context.
@@ -245,5 +245,11 @@ mod tests {
         let prompt = build_system_prompt(Some("/workspace"), None);
         assert!(prompt.contains("Working directory: /workspace"));
         assert!(prompt.contains("Never use `cat` to read"));
+    }
+
+    #[test]
+    fn command_capsule_does_not_advertise_ctrl_d_as_exit() {
+        assert!(COMMAND_REFERENCE.contains("Ctrl+D forward-delete"));
+        assert!(!COMMAND_REFERENCE.contains("Ctrl+D quit"));
     }
 }

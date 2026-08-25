@@ -673,7 +673,7 @@ pub fn format_help() -> String {
          {cyan_bold}╚═══════════════════════════════════════════════════════════════════════╝{reset}\n\n\
          {yellow_bold}📋 Basic Commands:{reset}\n\
          {cyan}  /help{reset}              Show this help message\n\
-         {cyan}  /quit{reset}              Exit the REPL (also: Ctrl+D)\n\
+         {cyan}  /quit{reset}              Exit the REPL\n\
          {cyan}  /clear{reset}             Clear conversation history and free up context\n\
          {cyan}  /compact [note]{reset}    Clear history but keep a summary in context\n\
          {cyan}  /debug{reset}             Toggle debug output\n\
@@ -735,7 +735,7 @@ pub fn format_help() -> String {
          {gray}    /good{reset} This is exactly the right approach\n\n\
          {yellow_bold}⌨️  Keyboard Shortcuts:{reset}\n\
          {cyan}  Ctrl+C{reset}             Cancel current query (interrupts generation)\n\
-         {cyan}  Ctrl+D{reset}             Exit REPL (same as /quit)\n\
+         {cyan}  Ctrl+D{reset}             Delete the character under the cursor\n\
          {cyan}  Ctrl+G{reset}             Mark last response as {green}good{reset} (1x training weight)\n\
          {cyan}  Ctrl+B{reset}             Mark last response as {red}bad{reset} (10x training weight)\n\
          {cyan}  Ctrl+P{reset}             Pop top word off vocabulary stack (/pop)\n\
@@ -1017,6 +1017,15 @@ mod tests {
         let help = format_help();
         assert!(help.contains("/forth <source>"));
         assert!(!help.contains("legacy-forth"));
+    }
+
+    #[test]
+    fn help_reserves_exit_for_the_explicit_quit_command() {
+        let help = format_help();
+        assert!(help.contains("Ctrl+D"));
+        assert!(help.contains("Delete the character under the cursor"));
+        assert!(!help.contains("Exit REPL (same as /quit)"));
+        assert!(!help.contains("Exit the REPL (also: Ctrl+D)"));
     }
 
     #[test]

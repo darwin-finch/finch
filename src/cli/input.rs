@@ -36,7 +36,7 @@ impl InputHandler {
     ///
     /// Returns:
     /// - `Ok(Some(line))` - user entered text
-    /// - `Ok(None)` - user pressed Ctrl+C or Ctrl+D
+    /// - `Ok(None)` - user pressed Ctrl+C
     /// - `Err(e)` - I/O or other error
     pub fn read_line(&mut self, prompt: &str) -> Result<Option<String>> {
         match self.editor.readline(prompt) {
@@ -50,18 +50,7 @@ impl InputHandler {
                 }
                 Ok(Some(line))
             }
-            Err(ReadlineError::Interrupted) => {
-                // Ctrl+C - graceful exit
-                Ok(None)
-            }
-            Err(ReadlineError::Eof) => {
-                // Ctrl+D - graceful exit
-                Ok(None)
-            }
-            Err(err) => {
-                // Other errors (I/O, etc.)
-                Err(err).context("Failed to read input")
-            }
+            Err(error) => readline_error_outcome(error),
         }
     }
 
@@ -84,6 +73,18 @@ impl InputHandler {
     }
 }
 
+fn readline_error_outcome(error: ReadlineError) -> Result<Option<String>> {
+    match error {
+        // Ctrl+C - graceful exit
+        ReadlineError::Interrupted => Ok(None),
+        // Rustyline reports Ctrl+D as EOF only when there is no character
+        // under the cursor. Finch reserves process exit for `/quit`, so this
+        // is the same no-op used by the TUI input path.
+        ReadlineError::Eof => Ok(Some(String::new())),
+        error => Err(error).context("Failed to read input"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +94,17 @@ mod tests {
         // Should create successfully
         let result = InputHandler::new();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn empty_prompt_ctrl_d_is_not_an_exit_request() {
+        assert_eq!(
+            readline_error_outcome(ReadlineError::Eof).unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(
+            readline_error_outcome(ReadlineError::Interrupted).unwrap(),
+            None
+        );
     }
 }

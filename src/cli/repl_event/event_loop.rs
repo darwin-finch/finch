@@ -3555,7 +3555,7 @@ Rules:\n\
                 } else {
                     // No active query — Ctrl+C when idle:
                     //   • in plan/executing mode → exit that mode, stay in finch
-                    //   • in normal mode → exit finch entirely (like Ctrl+D or /quit)
+                    //   • in normal mode → exit finch entirely (like /quit)
                     let mode = self.mode.read().await.clone();
                     if !matches!(mode, ReplMode::Normal) {
                         *self.mode.write().await = ReplMode::Normal;

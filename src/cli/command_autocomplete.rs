@@ -75,7 +75,7 @@ impl CommandRegistry {
                 CommandSpec {
                     name: "/quit",
                     params: None,
-                    description: "Exit Finch (also: Ctrl+D)",
+                    description: "Exit Finch",
                     category: CommandCategory::Basic,
                 },
                 CommandSpec {
