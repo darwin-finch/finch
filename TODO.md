@@ -505,6 +505,16 @@ still blocks the corresponding Brain phase until it is unified.
   3,225 stored entries: 160 accepted, 29 missing, and 3,036 rejected (2,988 `E-LINK-002`, 31
   `E-TYPE-002`, 12 `E-STACK-001`, and five other reader/signature failures). Preserve this baseline
   for comparison; it is migration evidence, not a reason to make legacy execution public again.
+- [ ] Delete the abandoned peer/gas experiment completely; it is not a compatibility surface or a
+  future distributed-compute design. Remove `src/registry`, `src/peer_token.rs`,
+  `src/coforth/scatter.rs`, gas/credit/debit/settlement bookkeeping, peer file/command transfer,
+  legacy interpreter and lexer hooks (`scatter"`, registry words, peer token maps), obsolete command
+  guards/tests, and dependencies that become unused. Stop creating or reading
+  `~/.finch/peer_token`; an already-created file may remain inert user data rather than prompting a
+  destructive migration. Preserve no replacement shim: future compute borrowing must use scoped
+  Brain credentials, typed compute manifests, bounded content-addressed jobs, and audited results.
+  Prove removal with repository-wide symbol/route searches plus the full test compile before closing
+  this item.
 - [ ] Complete provider language packages, structured shadow-buffer outcomes, rollback/security
   tests, concurrency tests, and provider conformance tests. Manual configured-cloud smoke checks on
   2026-08-23 successfully executed provider-emitted Lisp `say`, Lisp arithmetic, and Co-Forth
