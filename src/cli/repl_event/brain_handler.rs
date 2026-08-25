@@ -183,7 +183,7 @@ impl EventLoop {
     /// Register the frontend's home namespace and maintain its expiring
     /// environment-runner lease. A failed renewal immediately removes the
     /// runner claim from the status bar; retry never reuses an expired ID.
-    async fn register_home_brain(&self) -> Result<Option<bool>> {
+    async fn register_home_brain(&self) -> Result<Option<std::result::Result<(), String>>> {
         let Some(base) = self.daemon_base_url.as_deref() else {
             return Ok(None);
         };
@@ -207,7 +207,7 @@ impl EventLoop {
             None,
         )
         .await;
-        let callback_registered = match (&initial, self.ipc_client.as_ref()) {
+        let initial_registration = match (&initial, self.ipc_client.as_ref()) {
             (Ok(lease), Some(ipc)) => match ipc
                 .register_brain_runner(&self.session_label, lease.lease_id, self.event_tx.clone())
                 .await
@@ -219,12 +219,13 @@ impl EventLoop {
                         bootstrap.runtime_revision,
                     )
                     .await
-                    .is_ok(),
-                Err(_) => false,
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
             },
-            _ => false,
+            (Ok(_), None) => Err("Cap'n Proto daemon connection unavailable".into()),
+            (Err(error), _) => Err(error.to_string()),
         };
-        let initially_active = initial.is_ok() && callback_registered;
         let initial_had_lease = initial.is_ok();
         let mut lease_id = initial.ok().map(|lease| lease.lease_id);
         let event_tx = self.event_tx.clone();
@@ -278,7 +279,7 @@ impl EventLoop {
                 }
             }
         });
-        Ok(Some(initially_active))
+        Ok(Some(initial_registration))
     }
 
     /// Handle `/brains` — list the daemon's authoritative named Brains.

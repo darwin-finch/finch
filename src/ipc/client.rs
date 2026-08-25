@@ -165,13 +165,27 @@ impl IpcClient {
             params.set_lease_id(&lease_id.0.to_string());
             params.set_runner(runner);
         }
-        let reply = request.send().promise.await?;
+        let reply = request
+            .send()
+            .promise
+            .await
+            .map_err(map_runner_registration_error)?;
         let response = reply.get()?;
         Ok(BrainRunnerBootstrap {
             runtime_revision: response.get_runtime_revision(),
             checkpoint: serde_json::from_slice(response.get_checkpoint_json()?)
                 .context("daemon returned an invalid named-Brain checkpoint")?,
         })
+    }
+}
+
+fn map_runner_registration_error(error: capnp::Error) -> anyhow::Error {
+    if error.kind == capnp::ErrorKind::Unimplemented {
+        anyhow::anyhow!(
+            "the running Finch daemon uses an older IPC schema; restart the daemon and reconnect"
+        )
+    } else {
+        anyhow::Error::new(error)
     }
 }
 
@@ -459,6 +473,16 @@ fn read_query_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_registration_explains_an_older_daemon_schema() {
+        let error = map_runner_registration_error(capnp::Error::unimplemented(
+            "remote method missing".into(),
+        ));
+        let message = error.to_string();
+        assert!(message.contains("older IPC schema"));
+        assert!(message.contains("restart the daemon"));
+    }
 
     /// Connect to the live daemon socket and verify ping round-trip.
     ///

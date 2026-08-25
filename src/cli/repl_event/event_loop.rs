@@ -273,6 +273,10 @@ pub struct EventLoop {
     /// home Brain. The UI never infers runner status from local process role.
     home_runner_lease_active: bool,
 
+    /// Last runner-registration failure shown to the user. Lease renewal is
+    /// periodic, so identical transport failures must not spam scrollback.
+    last_home_runner_error: Option<String>,
+
     /// Base URL of the local daemon (e.g. "http://127.0.0.1:8000").
     /// Used by the cross-machine relay poller.
     daemon_base_url: Option<String>,
@@ -810,6 +814,7 @@ impl EventLoop {
             peer_session_rx,
             active_remote_brain: None,
             home_runner_lease_active: false,
+            last_home_runner_error: None,
             daemon_base_url,
             llm_tx,
             llm_rx: Some(llm_rx),
@@ -849,12 +854,17 @@ impl EventLoop {
                 None
             }
         };
-        self.home_runner_lease_active = home_runner_state == Some(true);
+        self.home_runner_lease_active = matches!(home_runner_state, Some(Ok(())));
+        let home_runner_error = home_runner_state
+            .as_ref()
+            .and_then(|state| state.as_ref().err())
+            .cloned();
+        self.last_home_runner_error = home_runner_error.clone();
         self.status_bar.update_line(
             crate::cli::status_bar::StatusLineType::SessionLabel,
-            match home_runner_state {
-                Some(true) => format!("◆ brain: {} · runner", self.session_label),
-                Some(false) => {
+            match &home_runner_state {
+                Some(Ok(())) => format!("◆ brain: {} · runner", self.session_label),
+                Some(Err(_)) => {
                     format!("◆ brain: {} · home · no runner lease", self.session_label)
                 }
                 None => format!("◆ brain: {} · home · daemon offline", self.session_label),
@@ -870,6 +880,12 @@ impl EventLoop {
             &cwd,
             &self.session_label,
         ));
+        if let Some(error) = home_runner_error {
+            self.output_manager.write_info(format!(
+                "{}: runner unavailable: {}",
+                self.session_label, error
+            ));
+        }
         // ─────────────────────────────────────────────────────────────────────
 
         // Show weekly license notice for non-commercial users (honor system)
@@ -2955,6 +2971,7 @@ Rules:\n\
                 };
                 let active = registration.is_ok();
                 self.home_runner_lease_active = active;
+                let registration_error = registration.err();
                 if self.active_remote_brain.is_none() {
                     self.status_bar.update_line(
                         crate::cli::status_bar::StatusLineType::SessionLabel,
@@ -2964,12 +2981,17 @@ Rules:\n\
                             format!("◆ brain: {} · home · no runner lease", self.session_label)
                         },
                     );
-                    if !active {
-                        self.output_manager.write_info(format!(
-                            "{}: runner unavailable: {}",
-                            self.session_label,
-                            registration.err().unwrap_or(detail)
-                        ));
+                    if let Some(error) = registration_error {
+                        let changed = self.last_home_runner_error.as_deref() != Some(&error);
+                        self.last_home_runner_error = Some(error.clone());
+                        if changed {
+                            self.output_manager.write_info(format!(
+                                "{}: runner unavailable: {}",
+                                self.session_label, error
+                            ));
+                        }
+                    } else {
+                        self.last_home_runner_error = None;
                     }
                     self.render_tui().await?;
                 }
