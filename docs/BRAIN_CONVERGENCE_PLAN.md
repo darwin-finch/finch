@@ -124,7 +124,11 @@ also has an exclusive, expiring runner lease bound to its exact environment gene
 ordinary frontend/daemon Cap'n Proto channel now carries a lease-bound runner callback, correlated
 ProgramRun request/result records, and bootstrap revision/checkpoint state. It also exposes the
 first versioned `BrainService` capability for snapshots, attachments, acknowledged cursors, detach,
-participant submissions, ordered snapshot-first watches, and runner-lease management. Participant
+participant submissions, ordered snapshot-first watches, runner-lease management, and addressed
+runner handoffs. A handoff is a durable reservation naming the exact source lease, target runner
+subject, and environment generation. A remote `brain:control` participant may request or cancel it,
+but only the environment-owning local service may accept it; acceptance atomically installs a new
+lease, so the old frontend callback immediately becomes stale. Participant
 input is a closed union rather than a forgeable event envelope; the daemon still assigns ordering,
 identity, timestamps, results, and run transitions. The home TUI now keeps a cloneable local
 capability on the frontend `LocalSet` and uses it for snapshot, persistent attachment, ordered watch,
@@ -431,11 +435,13 @@ Exit: the transport conformance suite produces equivalent events and outcomes.
 
 Current compatibility status: HTTP performs authenticated remote discovery, credential issuance,
 and attachment bootstrap. Local Cap'n Proto has a typed `BrainService` for the complete event
-envelope, participant submission/outcome, attachment cursor, ordered watch, and runner lease,
+envelope, participant submission/outcome, attachment cursor, ordered watch, runner lease, and
+environment-authorized handoff acceptance,
 alongside the lease-bound runner callback and checkpoint bootstrap. The local TUI consumes that
 capability entirely on its `LocalSet`; a live ignored test verifies snapshot-first watch, queued run
 submission, cursor acknowledgement, and detach against a restarted daemon. Remote consoles carry
-the same closed submission union and typed outcomes in correlated binary WebSocket envelopes;
+the same closed submission union, typed outcomes, and scoped handoff request/cancel operations in
+correlated binary WebSocket envelopes;
 fixture and live-daemon tests cover attach, watch, submit, acknowledge, final detach projection, and
 cleanup, including detach before an explicit watch. Generalized approval/effect resumptions remain
 incomplete, as does replacement of the remaining JSON-encoded detail/context/checkpoint values with

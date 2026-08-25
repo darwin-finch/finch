@@ -853,7 +853,12 @@ still blocks the corresponding Brain phase until it is unified.
   discovery records credential-free. A `brain:control` credential may now mint a bounded descendant
   whose scopes are a subset of both the delegator and target role, whose expiry cannot exceed its
   parent, and whose signed ancestry makes ancestor revocation invalidate the whole descendant chain.
-  Still define the actual runner-control handoff operation and its environment-authority proof.
+  Runner control now uses a durable, addressed handoff reservation bound to the exact source lease,
+  target runner subject, and environment generation. Remote `brain:control` holders may request or
+  cancel it, while only the environment-owning local Cap'n Proto service may accept it; acceptance
+  atomically replaces the lease and makes the previous callback stale. Still add the frontend
+  acceptance/registration UX, prove the environment identity at that boundary, and run a live
+  two-console handoff/revocation smoke test before closing this least-privilege milestone.
 - [ ] Revisit shared channels only after the Brain event log, runner lease, and participant-role
   model are complete. The eventual channel should be a threaded/multi-participant projection of a
   Brain: people and models share one durable conversation, while programs run only on the remote
