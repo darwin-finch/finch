@@ -865,6 +865,42 @@ impl SharedBrainStore {
             .clone())
     }
 
+    /// Return the durable reducible state a newly connected environment
+    /// runner must install before accepting ProgramRuns. Authority and live
+    /// host resources are intentionally stored and rebound separately.
+    pub fn runner_checkpoint(
+        &self,
+        name: &str,
+    ) -> Result<(u64, crate::vm::TypedRuntimeCheckpoint)> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let state = self
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .get(name)
+            .and_then(|state| state.runtime_checkpoint.clone());
+        match state {
+            Some(state) => Ok((
+                state.durable_revision,
+                self.read_runtime_checkpoint(name, &state.checkpoint_sha256)?,
+            )),
+            None => {
+                let runtime = crate::runtime::ProgramRuntime::new();
+                let snapshot = runtime
+                    .revision_history()?
+                    .pop()
+                    .context("fresh typed runtime has no initial checkpoint")?;
+                Ok((
+                    snapshot.revision,
+                    snapshot
+                        .checkpoint
+                        .context("fresh typed runtime is not checkpointable")?,
+                ))
+            }
+        }
+    }
+
     /// Journal the latest checkpoint only after a ProgramRuntime commit. The
     /// source event remains the audit record; restart restores state rather
     /// than replaying effects from that source.
@@ -903,6 +939,58 @@ impl SharedBrainStore {
             BrainEventKind::RuntimeCommitted {
                 request_seq,
                 runtime_revision: snapshot.revision,
+                checkpoint_sha256,
+            },
+        )
+    }
+
+    /// Commit reducible state returned by the frontend that owns this Brain's
+    /// environment. The daemon validates and journals the checkpoint but does
+    /// not execute the source or inherit the frontend's host authority.
+    pub fn commit_runner_runtime(
+        &self,
+        name: &str,
+        request_seq: u64,
+        runtime_revision: u64,
+        checkpoint: crate::vm::TypedRuntimeCheckpoint,
+    ) -> Result<BrainEvent> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        if let Some(current) = self
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .get(name)
+            .and_then(|state| state.runtime_checkpoint.as_ref())
+        {
+            if runtime_revision <= current.durable_revision {
+                anyhow::bail!(
+                    "runner checkpoint revision {runtime_revision} does not advance durable revision {}",
+                    current.durable_revision
+                );
+            }
+        }
+        let restored = crate::runtime::ProgramRuntime::from_checkpoint_at_revision(
+            checkpoint.clone(),
+            runtime_revision,
+        )?;
+        let encoded = serde_json::to_vec(&checkpoint)?;
+        let checkpoint_sha256 = hex::encode(Sha256::digest(&encoded));
+        self.write_runtime_checkpoint(name, &checkpoint_sha256, &encoded)?;
+        self.runtime_checkpoints
+            .write()
+            .expect("shared brain checkpoint lock poisoned")
+            .insert(checkpoint_sha256.clone(), checkpoint);
+        self.runtimes
+            .write()
+            .expect("shared brain runtime lock poisoned")
+            .insert(name.to_string(), Arc::new(restored));
+        self.push(
+            name,
+            "runner",
+            BrainEventKind::RuntimeCommitted {
+                request_seq,
+                runtime_revision,
                 checkpoint_sha256,
             },
         )
@@ -1207,7 +1295,7 @@ impl SharedBrainStore {
     }
 }
 
-fn unix_millis() -> u64 {
+pub(crate) fn unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1705,6 +1793,56 @@ mod tests {
         );
         assert_eq!(outcome.values, vec![crate::programs::ProgramValue::Int(49)]);
         assert_eq!(outcome.output_revision, committed_revision + 1);
+    }
+
+    #[tokio::test]
+    async fn named_brain_commits_a_validated_frontend_runner_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        store.snapshot("brain").unwrap();
+        let runner = crate::runtime::ProgramRuntime::new();
+        let outcome = runner
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Lisp,
+                source_id: Some("runner:event:1".into()),
+                source: "(define (triple (n : int)) (* n 3))".into(),
+                intent: "frontend runner definition".into(),
+                effect: crate::programs::ExecutionEffect::VmWrite,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runner.manifest_generation(),
+                expected_revision: Some(runner.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        let checkpoint = runner
+            .revision_history()
+            .unwrap()
+            .into_iter()
+            .find(|revision| revision.revision == outcome.output_revision)
+            .and_then(|revision| revision.checkpoint)
+            .unwrap();
+        store
+            .commit_runner_runtime("brain", 1, outcome.output_revision, checkpoint)
+            .unwrap();
+
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restored = restarted.program_runtime("brain").unwrap();
+        let called = restored
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Forth,
+                source_id: Some("test:restored-runner".into()),
+                source: "14 triple".into(),
+                intent: "call frontend definition after daemon restart".into(),
+                effect: crate::programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: restored.manifest_generation(),
+                expected_revision: Some(restored.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(called.values, vec![crate::programs::ProgramValue::Int(42)]);
     }
 
     #[tokio::test]

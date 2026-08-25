@@ -2365,6 +2365,84 @@ impl ProgramRuntime {
         self.revision.load(Ordering::Acquire)
     }
 
+    /// Install a newer application-owned reducible checkpoint without
+    /// replacing this frontend's host authority or resource bindings. The
+    /// submission gate makes hydration mutually exclusive with ProgramRun
+    /// commits; retained continuations prevent replacement because they were
+    /// compiled against the current revision lineage.
+    pub async fn hydrate_reducible_state_if_newer(
+        &self,
+        checkpoint: TypedRuntimeCheckpoint,
+        revision: u64,
+    ) -> Result<bool> {
+        let mut restored = TypedRuntime::from_checkpoint(checkpoint.clone()).map_err(|diagnostics| {
+            anyhow::anyhow!(
+                "cannot hydrate typed runtime checkpoint: {}",
+                diagnostics
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        })?;
+        let _submission = self.submission_gate.lock().await;
+        let current_revision = self.revision();
+        if revision <= current_revision {
+            return Ok(false);
+        }
+        if self.pending_typed_execution_count()? != 0 {
+            bail!(
+                "cannot hydrate revision {revision} while typed continuations are pending"
+            );
+        }
+
+        let host_names = self
+            .host_vocabulary
+            .read()
+            .map_err(|_| anyhow::anyhow!("host vocabulary lock poisoned"))?
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut typed = self
+            .typed
+            .lock()
+            .map_err(|_| anyhow::anyhow!("typed VM lock poisoned"))?;
+        let host_signatures = host_names
+            .iter()
+            .filter_map(|name| {
+                typed
+                    .vocabulary()
+                    .get(name)
+                    .cloned()
+                    .map(|signature| (name.clone(), signature))
+            })
+            .collect::<BTreeMap<_, _>>();
+        restored
+            .replace_host_vocabulary(Vec::<String>::new(), &host_signatures)
+            .map_err(|diagnostic| anyhow::anyhow!(diagnostic.to_string()))?;
+        // Reducible checkpoints never carry grants. Keep the live frontend's
+        // derived execution ceiling; the capability ledger/policy remains the
+        // authoritative source for subsequent ProgramRuns.
+        restored.set_grants(typed.grants().clone());
+        let stack = restored.stack().to_vec();
+        let vocabulary = restored.vocabulary().keys().cloned().collect();
+        *typed = restored;
+        *self
+            .revision_history
+            .lock()
+            .map_err(|_| anyhow::anyhow!("revision history lock poisoned"))? = vec![
+            VmRevisionSnapshot {
+                revision,
+                stack,
+                vocabulary,
+                checkpoint: Some(checkpoint),
+                checkpoint_diagnostic: None,
+            },
+        ];
+        self.revision.store(revision, Ordering::Release);
+        Ok(true)
+    }
+
     /// Snapshot only source-language linking context for report-only replay.
     /// Stack values, grants, pending effects, and host resources are excluded.
     pub fn compiler_context(&self) -> Result<ProgramCompilerContext> {
@@ -9523,6 +9601,88 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         assert_eq!(history[1].revision, 1);
         assert_eq!(history[1].stack, vec![TypedValue::Int(7)]);
         assert!(history[1].checkpoint.is_some());
+    }
+
+    #[tokio::test]
+    async fn newer_runner_checkpoint_hydrates_without_importing_authority() {
+        let source = ProgramRuntime::new();
+        let defined = source
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(define (double (n : int)) : int (* n 2))",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        let checkpoint = source
+            .revision_history()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.revision == defined.output_revision)
+            .and_then(|snapshot| snapshot.checkpoint)
+            .unwrap();
+
+        let runner = ProgramRuntime::new();
+        let local_grant = crate::vm::CapabilityRequirement::file(
+            crate::vm::FileOperation::Read,
+            crate::vm::FileSelector::parse("./**").unwrap(),
+        );
+        runner.grant_typed_capability(local_grant.clone()).unwrap();
+        let authority_before = runner.capability_ledger().unwrap();
+        assert!(runner
+            .hydrate_reducible_state_if_newer(checkpoint, defined.output_revision)
+            .await
+            .unwrap());
+        assert_eq!(runner.revision(), defined.output_revision);
+        assert_eq!(runner.capability_ledger().unwrap(), authority_before);
+
+        let called = runner
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "21 double",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(called.values.as_slice(), [ProgramValue::Int(42)]));
+    }
+
+    #[tokio::test]
+    async fn runner_hydration_never_replaces_pending_continuations() {
+        let source = ProgramRuntime::new();
+        let first = source
+            .submit(submission(ProgramLanguage::Forth, "1", ExecutionEffect::Pure))
+            .await
+            .unwrap();
+        let second = source
+            .submit(submission(ProgramLanguage::Forth, "2", ExecutionEffect::Pure))
+            .await
+            .unwrap();
+        let checkpoint = source
+            .revision_history()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.revision == second.output_revision)
+            .and_then(|snapshot| snapshot.checkpoint)
+            .unwrap();
+
+        let runner = ProgramRuntime::new();
+        let pending = runner
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "unit yield",
+                ExecutionEffect::Pure,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pending.status, ExecutionStatus::Suspended);
+        let error = runner
+            .hydrate_reducible_state_if_newer(checkpoint, first.output_revision + 1)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("continuations are pending"));
+        assert_eq!(runner.revision(), 0);
+        assert_eq!(runner.pending_typed_execution_count().unwrap(), 1);
     }
 
     #[tokio::test]
