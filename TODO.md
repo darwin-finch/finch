@@ -733,10 +733,13 @@ still blocks the corresponding Brain phase until it is unified.
   `runner offline`. Treat event-watch loss and runner-registration loss as separate correlated
   failures, reconnect them from the durable attachment/runner identities, and add a rebuilt-daemon
   startup regression that reaches a live runner without requiring a daemon restart.
-- [ ] Restore the memory/context status projection after fresh Brain attachment. `tfidf · recalled 0`
+- [x] Restore the memory/context status projection after fresh Brain attachment. `tfidf · recalled 0`
   must not replace or erase available conversation-context rows merely because semantic recall
   returned no matches; render the recall engine/count and canonical conversation context as distinct
-  projections, with startup/reconnect tests for zero-recall and nonzero-recall cases.
+  projections. Canonical prompt/participant/result context now comes from the durable Brain event log
+  in its own status namespace, while semantic recall remains independently replaceable. Unit coverage
+  includes zero-recall isolation, source/error filtering, truncation, and stale-line removal; a live
+  smoke check preserved the projected context across both frontend and daemon restart.
 - [ ] Add theme-aware author/channel backgrounds so user input, model-authored VM source, tool
   activity, and VM/user-visible output are distinguishable without relying on low-contrast cyan
   foreground text alone. Use subtle full-width turn bands like other modern coding harnesses rather

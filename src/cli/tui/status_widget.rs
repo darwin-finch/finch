@@ -76,7 +76,7 @@ impl<'a> StatusWidget<'a> {
                 // Compaction percentage: subtle gray
                 Style::default().fg(Color::DarkGray)
             }
-            StatusLineType::ContextLine(_) => {
+            StatusLineType::ContextLine(_) | StatusLineType::BrainContextLine(_) => {
                 // Context line: de-emphasised like ConversationFocus
                 Style::default().fg(Color::DarkGray)
             }
@@ -125,6 +125,7 @@ impl<'a> Widget for StatusWidget<'a> {
                 StatusLineType::ConversationTopic
                     | StatusLineType::ConversationFocus
                     | StatusLineType::ContextLine(_)
+                    | StatusLineType::BrainContextLine(_)
             );
             // Insert separator at the boundary: memory → conversation
             if is_conversation && prev_was_memory {

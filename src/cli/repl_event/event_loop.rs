@@ -4903,6 +4903,11 @@ Rules:\n\
         match message {
             crate::brain::store::BrainWireMessage::Snapshot { brain } => {
                 self.update_remote_brain_status(brain.runner_lease.is_some());
+                project_brain_context(
+                    &self.status_bar,
+                    &brain.events,
+                    self.context_lines.saturating_sub(1),
+                );
                 let acknowledged_seq = self
                     .selected_brain()
                     .and_then(|client| client.attachment())
@@ -4928,6 +4933,17 @@ Rules:\n\
                         self.update_remote_brain_status(false);
                     }
                     _ => {}
+                }
+                if brain_context_text(&event).is_some() {
+                    if let Some(client) = self.selected_brain().cloned() {
+                        if let Ok(snapshot) = client.snapshot().await {
+                            project_brain_context(
+                                &self.status_bar,
+                                &snapshot.events,
+                                self.context_lines.saturating_sub(1),
+                            );
+                        }
+                    }
                 }
                 self.render_remote_brain_event(&event);
                 self.observe_remote_brain_approval(&event);
@@ -6649,6 +6665,61 @@ Rules:\n\
     }
 }
 
+fn brain_context_text(event: &crate::brain::store::BrainEvent) -> Option<String> {
+    use crate::brain::store::BrainEventKind;
+
+    let text = match &event.kind {
+        BrainEventKind::Prompt { text } | BrainEventKind::ParticipantMessage { text } => text,
+        BrainEventKind::Result {
+            output,
+            error: None,
+            ..
+        } => output,
+        _ => return None,
+    };
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return None;
+    }
+    let compact = if compact.chars().count() <= 70 {
+        compact
+    } else {
+        format!("{}…", compact.chars().take(69).collect::<String>())
+    };
+    Some(format!("{}: {compact}", event.sender))
+}
+
+fn project_brain_context(
+    status_bar: &crate::cli::status_bar::StatusBar,
+    events: &[crate::brain::store::BrainEvent],
+    depth: usize,
+) {
+    let mut lines = events
+        .iter()
+        .rev()
+        .filter_map(brain_context_text)
+        .take(depth)
+        .collect::<Vec<_>>();
+    lines.reverse();
+    let count = lines.len();
+    for (index, text) in lines.into_iter().enumerate() {
+        let label = if count == 1 || index + 1 == count {
+            format!("   └─ now: {text}")
+        } else if index == 0 {
+            format!("💬 {text}")
+        } else {
+            format!("   ├─ {text}")
+        };
+        status_bar.update_line(
+            crate::cli::status_bar::StatusLineType::BrainContextLine(index),
+            label,
+        );
+    }
+    for index in count..8 {
+        status_bar.remove_line(&crate::cli::status_bar::StatusLineType::BrainContextLine(index));
+    }
+}
+
 /// Snapshot replay reconstructs conversation, not transient connection chrome.
 /// Presence and runner ownership are projected into the status line from the
 /// snapshot itself; replaying their historical transitions pollutes scrollback
@@ -7262,6 +7333,100 @@ mod tests {
 
         assert!(replay_event_belongs_in_transcript(&prompt));
         assert!(!replay_event_belongs_in_transcript(&attached));
+    }
+
+    #[test]
+    fn canonical_brain_context_projects_conversation_without_program_source() {
+        use crate::brain::store::{BrainEventKind, ProgramLanguage};
+        use crate::cli::status_bar::{StatusBar, StatusLineType};
+
+        let events = vec![
+            brain_event(
+                1,
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "please compute forty two squared".into(),
+                },
+            ),
+            brain_event(
+                2,
+                "model",
+                BrainEventKind::Program {
+                    language: ProgramLanguage::Lisp,
+                    source: "(say \"1764\")".into(),
+                },
+            ),
+            brain_event(
+                3,
+                "model",
+                BrainEventKind::Result {
+                    request_seq: 1,
+                    output: "1764".into(),
+                    error: None,
+                },
+            ),
+        ];
+        let status = StatusBar::new();
+
+        super::project_brain_context(&status, &events, 2);
+
+        let lines = status
+            .get_lines()
+            .into_iter()
+            .filter(|line| matches!(line.line_type, StatusLineType::BrainContextLine(_)))
+            .map(|line| line.content)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            vec![
+                "💬 alice: please compute forty two squared",
+                "   └─ now: model: 1764",
+            ]
+        );
+
+        super::project_brain_context(&status, &[], 2);
+        assert!(status
+            .get_lines()
+            .iter()
+            .all(|line| !matches!(line.line_type, StatusLineType::BrainContextLine(_))));
+    }
+
+    #[test]
+    fn canonical_brain_context_ignores_failed_results_and_bounds_text() {
+        use crate::brain::store::BrainEventKind;
+        use crate::cli::status_bar::{StatusBar, StatusLineType};
+
+        let events = vec![
+            brain_event(
+                1,
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "a".repeat(100),
+                },
+            ),
+            brain_event(
+                2,
+                "model",
+                BrainEventKind::Result {
+                    request_seq: 1,
+                    output: "partial output".into(),
+                    error: Some("provider failed".into()),
+                },
+            ),
+        ];
+        let status = StatusBar::new();
+
+        super::project_brain_context(&status, &events, 4);
+
+        let lines = status
+            .get_lines()
+            .into_iter()
+            .filter(|line| matches!(line.line_type, StatusLineType::BrainContextLine(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].content.starts_with("   └─ now: alice: "));
+        assert!(lines[0].content.ends_with('…'));
+        assert!(!lines[0].content.contains("partial output"));
     }
 
     #[test]

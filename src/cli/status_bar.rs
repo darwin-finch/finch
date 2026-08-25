@@ -24,6 +24,10 @@ pub enum StatusLineType {
     /// N-th depth-sliced context line (0 = broadest/overall … last = most recent).
     /// Replaces ConversationTopic + ConversationFocus when context_lines > 1.
     ContextLine(usize),
+    /// N-th canonical conversation line projected from the attached Brain log.
+    /// This is deliberately distinct from semantic-memory/session summaries so
+    /// a zero-result recall cannot erase durable conversation history.
+    BrainContextLine(usize),
     /// Live query statistics (tokens, latency, model)
     LiveStats,
     /// Training statistics (queries, local%, quality)
@@ -135,6 +139,21 @@ impl StatusBar {
         for (n, content) in ctx_entries {
             result.push(StatusLine {
                 line_type: StatusLineType::ContextLine(n),
+                content,
+            });
+        }
+
+        let mut brain_entries: Vec<(usize, String)> = lines
+            .iter()
+            .filter_map(|(key, value)| match key {
+                StatusLineType::BrainContextLine(index) => Some((*index, value.clone())),
+                _ => None,
+            })
+            .collect();
+        brain_entries.sort_by_key(|(index, _)| *index);
+        for (index, content) in brain_entries {
+            result.push(StatusLine {
+                line_type: StatusLineType::BrainContextLine(index),
                 content,
             });
         }
@@ -432,6 +451,22 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].line_type, StatusLineType::SessionLabel);
         assert_eq!(lines[1].line_type, StatusLineType::MemoryContext);
+    }
+
+    #[test]
+    fn semantic_and_canonical_brain_context_have_independent_slots() {
+        let status = StatusBar::new();
+        status.update_line(StatusLineType::BrainContextLine(0), "Brain turn");
+        status.update_line(StatusLineType::ContextLine(0), "Semantic summary");
+        status.update_line(StatusLineType::MemoryContext, "Recall status");
+
+        status.remove_line(&StatusLineType::ContextLine(0));
+
+        let lines = status.get_lines();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].line_type, StatusLineType::MemoryContext);
+        assert_eq!(lines[1].line_type, StatusLineType::BrainContextLine(0));
+        assert_eq!(lines[1].content, "Brain turn");
     }
 
     #[test]
