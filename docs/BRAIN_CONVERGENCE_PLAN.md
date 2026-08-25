@@ -125,9 +125,10 @@ ProgramRun request/result records, and bootstrap revision/checkpoint state. It a
 first versioned `BrainService` capability for snapshots, attachments, acknowledged cursors, detach,
 participant submissions, ordered snapshot-first watches, and runner-lease management. Participant
 input is a closed union rather than a forgeable event envelope; the daemon still assigns ordering,
-identity, timestamps, results, and run transitions. Local TUI projection still uses the
-HTTP/WebSocket compatibility client and must migrate without moving its `!Send` Cap'n Proto client
-outside the frontend `LocalSet`.
+identity, timestamps, results, and run transitions. The home TUI now keeps a cloneable local
+capability on the frontend `LocalSet` and uses it for snapshot, persistent attachment, ordered watch,
+acknowledgement, submission, lease renewal/release, and detach. Foreign remote attachments retain
+the scoped-auth HTTP/binary-WebSocket adapter behind the same client projection.
 
 The named-Brain HTTP compatibility handler no longer executes ProgramRuns inside the daemon. It
 serializes the accepted event, requires the active environment lease's registered callback, and
@@ -158,11 +159,10 @@ continued the runtime revision. Static wire repair never retries host effects, a
 cancellation, or runtime-limit failures.
 The transport-neutral participant-submission operation is now shared by HTTP and local Cap'n Proto,
 and the local RPC exposes the complete first lifecycle surface. The HTTP/WebSocket client remains a
-compatibility projection rather than the final transport arrangement: local TUI attachment/watch
-has not migrated, remote mutation messages are still JSON, run ancestry/budgets/cancellation are
-incomplete, and generalized effect-resume correlation still needs the unified service. Runtime
-ownership has moved to the leased environment runner; the daemon is now the durable coordinator for
-interactive prompt/program runs.
+compatibility projection rather than the final transport arrangement: remote mutation messages are
+still JSON, run ancestry/budgets/cancellation are incomplete, and generalized effect-resume
+correlation still needs the unified service. Runtime ownership has moved to the leased environment
+runner; the daemon is now the durable coordinator for interactive prompt/program runs.
 
 On 2026-08-24 a live attachment test used separate driver and consultant consoles against one
 Brain. The driver defined and invoked a shared Lisp word, the consultant was forbidden from
@@ -416,10 +416,11 @@ runner-lease operations. They are test scaffolding for this phase, not permissio
 second service implementation. Local Cap'n Proto now has a typed `BrainService` for the complete
 event envelope, participant submission/outcome, attachment cursor, ordered watch, and runner lease,
 alongside the lease-bound runner callback and checkpoint bootstrap. Its submission adapter enters
-the same transport-neutral role/order/run operation as HTTP. The local TUI still needs to consume
-that capability, remote mutations still need the same binary request schema and scoped-auth
-adapter, and generalized approval/effect resumptions remain incomplete. Embedded mode likewise does
-not yet implement the same contract.
+the same transport-neutral role/order/run operation as HTTP. The local TUI now consumes that
+capability entirely on its `LocalSet`; a live ignored test verifies snapshot-first watch, queued run
+submission, cursor acknowledgement, and detach against a restarted daemon. Remote mutations still
+need the same binary request schema and scoped-auth adapter, and generalized approval/effect
+resumptions remain incomplete. Embedded mode likewise does not yet implement the same contract.
 
 ### B5: Client projections and shadow-buffer UI
 

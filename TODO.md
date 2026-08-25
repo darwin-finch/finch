@@ -751,9 +751,11 @@ still blocks the corresponding Brain phase until it is unified.
   only when measured bandwidth savings justify unpacking, and keep large blobs content-addressed or
   separately streamed. The versioned schema, closed participant-submission union, full local RPC
   implementation, typed IPC client, snapshot-first watch, and shared transport-neutral submission
-  operation now exist. Still migrate the local TUI from its concrete HTTP client, encode remote
-  mutations with the same schema behind scoped authentication, add cross-transport conformance
-  fixtures, and then remove duplicated lifecycle HTTP routes.
+  operation now exist. The home TUI now uses that capability for snapshot, persistent attachment,
+  watch, acknowledgement, submit, runner-lease renewal/release, and detach; an ignored live test
+  exercises the full local lifecycle against a daemon. Still encode remote mutations with the same
+  schema behind scoped authentication, add cross-transport conformance fixtures, and then remove
+  duplicated lifecycle HTTP routes.
 - [ ] Define Brain initialization as a reviewed typed program/module with an explicit capability
   budget and journaled effects. Deterministic VM vocabulary/module loading may occur before a
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work
