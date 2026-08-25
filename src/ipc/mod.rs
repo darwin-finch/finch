@@ -14,7 +14,7 @@
 //! The HTTP server on port 11435 stays up for external OpenAI-compatible
 //! clients (VS Code / Continue.dev).  This module is the internal fast path.
 
-mod brain_codec;
+pub(crate) mod brain_codec;
 pub mod client;
 pub mod events;
 pub mod schema;

@@ -434,11 +434,12 @@ impl RemoteBrainClient {
                         let Some(Ok(message)) = incoming else {
                             break;
                         };
-                        if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
-                            if let Ok(message) = serde_json::from_str::<BrainWireMessage>(&text) {
-                                if tx.send(message).is_err() {
-                                    break;
-                                }
+                        if let tokio_tungstenite::tungstenite::Message::Binary(bytes) = message {
+                            let Ok(message) = crate::ipc::brain_codec::decode_brain_wire_message(&bytes) else {
+                                break;
+                            };
+                            if tx.send(message).is_err() {
+                                break;
                             }
                         }
                     }

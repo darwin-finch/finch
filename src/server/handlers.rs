@@ -1346,8 +1346,12 @@ async fn watch_named_brain(
         .on_upgrade(move |mut socket| async move {
             use axum::extract::ws::Message as WsMessage;
             let initial = crate::brain::shared::BrainWireMessage::Snapshot { brain: snapshot };
-            if let Ok(json) = serde_json::to_string(&initial) {
-                if socket.send(WsMessage::Text(json.into())).await.is_err() {
+            if let Ok(encoded) = crate::ipc::brain_codec::encode_brain_wire_message(&initial) {
+                if socket
+                    .send(WsMessage::Binary(encoded.into()))
+                    .await
+                    .is_err()
+                {
                     let _ = store.detach(&name, attachment_id, connection_id);
                     approvals.cancel_attachment(brain_id, attachment_id);
                     let _ = store.remove_if_unused(&name);
@@ -1383,10 +1387,14 @@ async fn watch_named_brain(
                 {
                     break;
                 }
-                let Ok(json) = serde_json::to_string(&wire) else {
+                let Ok(encoded) = crate::ipc::brain_codec::encode_brain_wire_message(&wire) else {
                     continue;
                 };
-                if socket.send(WsMessage::Text(json.into())).await.is_err() {
+                if socket
+                    .send(WsMessage::Binary(encoded.into()))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
