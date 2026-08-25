@@ -1098,6 +1098,42 @@ impl RemoteBrainClient {
         }
     }
 
+    pub async fn prepare_runner_handoff_mutation(
+        &self,
+        target_subject: &str,
+        expected_lease_id: super::store::RunnerLeaseId,
+        environment_generation: u64,
+        ttl_ms: u64,
+    ) -> Result<BrainMutationHandle> {
+        self.prepare_mutation(
+            &crate::ipc::brain_codec::BrainRemoteCommandKind::RequestRunnerHandoff {
+                target_subject: target_subject.to_string(), expected_lease_id,
+                environment_generation, ttl_ms,
+            },
+        ).await
+    }
+
+    pub async fn request_runner_handoff_with_handle(
+        &self,
+        target_subject: &str,
+        expected_lease_id: super::store::RunnerLeaseId,
+        environment_generation: u64,
+        ttl_ms: u64,
+        handle: &BrainMutationHandle,
+    ) -> Result<super::store::BrainRunnerHandoff> {
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+        match self.send_remote_command_with_handle(
+            BrainRemoteCommandKind::RequestRunnerHandoff {
+                target_subject: target_subject.to_string(), expected_lease_id,
+                environment_generation, ttl_ms,
+            },
+            Some(handle),
+        ).await? {
+            BrainRemoteReply::HandoffRequested { handoff, .. } => Ok(handoff),
+            reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
+        }
+    }
+
     pub async fn cancel_runner_handoff(
         &self,
         handoff_id: super::store::RunnerHandoffId,
@@ -1197,6 +1233,47 @@ impl RemoteBrainClient {
             })
             .await?
         {
+            BrainRemoteReply::ScheduleCreated { schedule, .. } => Ok(schedule),
+            reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_create_schedule_mutation(
+        &self,
+        language: super::store::ProgramLanguage,
+        source: &str,
+        grant_ceiling: &crate::vm::EffectSet,
+        next_due_ms: u64,
+        interval_ms: Option<u64>,
+        delivery_policy: super::store::BrainScheduleDeliveryPolicy,
+    ) -> Result<BrainMutationHandle> {
+        self.prepare_mutation(
+            &crate::ipc::brain_codec::BrainRemoteCommandKind::CreateSchedule {
+                language, source: source.to_string(), grant_ceiling: grant_ceiling.clone(),
+                next_due_ms, interval_ms, delivery_policy,
+            },
+        ).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_schedule_with_handle(
+        &self,
+        language: super::store::ProgramLanguage,
+        source: String,
+        grant_ceiling: crate::vm::EffectSet,
+        next_due_ms: u64,
+        interval_ms: Option<u64>,
+        delivery_policy: super::store::BrainScheduleDeliveryPolicy,
+        handle: &BrainMutationHandle,
+    ) -> Result<super::store::BrainSchedule> {
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+        match self.send_remote_command_with_handle(
+            BrainRemoteCommandKind::CreateSchedule {
+                language, source, grant_ceiling, next_due_ms, interval_ms, delivery_policy,
+            },
+            Some(handle),
+        ).await? {
             BrainRemoteReply::ScheduleCreated { schedule, .. } => Ok(schedule),
             reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
         }
