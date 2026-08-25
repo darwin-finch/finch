@@ -38,7 +38,7 @@ impl EventLoop {
         let initial = ipc
             .brain_acquire_runner(
                 &self.session_label,
-                &self.participant_subject,
+                &self.runner_subject,
                 &snapshot.environment,
                 None,
                 30_000,
@@ -64,10 +64,28 @@ impl EventLoop {
             (Err(error), _) => Err(error.to_string()),
         };
         let initial_had_lease = initial.is_ok();
-        let mut lease_id = initial.ok().map(|lease| lease.lease_id);
+        let lease_id = initial.ok().map(|lease| lease.lease_id);
+        self.start_runner_lease_renewal(
+            ipc,
+            snapshot.name,
+            self.runner_subject.clone(),
+            snapshot.environment,
+            lease_id,
+            initial_had_lease,
+        );
+        Ok(Some(initial_registration))
+    }
+
+    fn start_runner_lease_renewal(
+        &self,
+        ipc: crate::ipc::IpcClient,
+        brain: String,
+        subject: String,
+        environment: crate::brain::shared::BrainEnvironment,
+        mut lease_id: Option<crate::brain::shared::RunnerLeaseId>,
+        initial_had_lease: bool,
+    ) {
         let event_tx = self.event_tx.clone();
-        let subject = self.participant_subject.clone();
-        let environment = snapshot.environment;
         let epoch = self
             .runner_renewal_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -84,7 +102,7 @@ impl EventLoop {
                     break;
                 }
                 match ipc
-                    .brain_acquire_runner(&snapshot.name, &subject, &environment, lease_id, 30_000)
+                    .brain_acquire_runner(&brain, &subject, &environment, lease_id, 30_000)
                     .await
                 {
                     Ok(lease) => {
@@ -95,7 +113,7 @@ impl EventLoop {
                         // pretending that lease ownership alone means the
                         // runner is reachable.
                         let _ = event_tx.send(ReplEvent::RunnerLeaseStatus {
-                            brain: snapshot.name.clone(),
+                            brain: brain.clone(),
                             epoch,
                             lease_id: Some(lease.lease_id),
                             detail: if had_lease {
@@ -114,7 +132,7 @@ impl EventLoop {
                         // could reclaim the Brain after the target exits.
                         let inspected_handoff = match lease_id {
                             Some(previous) => ipc
-                                .brain_snapshot(&snapshot.name)
+                                .brain_snapshot(&brain)
                                 .await
                                 .ok()
                                 .map(|brain| brain.runner_lease_was_handed_off(previous)),
@@ -123,7 +141,7 @@ impl EventLoop {
                         let handed_off = inspected_handoff == Some(true);
                         if had_lease {
                             let _ = event_tx.send(ReplEvent::RunnerLeaseStatus {
-                                brain: snapshot.name.clone(),
+                                brain: brain.clone(),
                                 epoch,
                                 lease_id: None,
                                 detail: if handed_off {
@@ -146,7 +164,6 @@ impl EventLoop {
                 }
             }
         });
-        Ok(Some(initial_registration))
     }
 
     /// Attach the home console as a driver to the same durable Brain whose
@@ -220,8 +237,7 @@ impl EventLoop {
             self.ipc_client.as_ref(),
             self.runner_brain.take(),
             self.home_runner_lease_id.take(),
-        )
-        {
+        ) {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 ipc.brain_release_runner(&brain, lease_id),
@@ -363,6 +379,308 @@ impl EventLoop {
                 .output_manager
                 .write_info(format!("could not archive Brain {name}: {error}")),
         }
+        self.render_tui().await
+    }
+
+    fn selected_handoff(
+        snapshot: &crate::brain::shared::BrainSnapshot,
+        requested: Option<&str>,
+    ) -> Result<crate::brain::shared::BrainRunnerHandoff> {
+        let handoff = snapshot
+            .runner_handoff
+            .clone()
+            .context("the selected Brain has no pending runner handoff")?;
+        if let Some(requested) = requested {
+            let actual = handoff.handoff_id.0.to_string();
+            if !actual.starts_with(requested) {
+                anyhow::bail!("pending runner handoff ID does not match '{requested}'");
+            }
+        }
+        Ok(handoff)
+    }
+
+    async fn remote_handoff_control_client(
+        &self,
+        target: crate::brain::remote::RemoteBrainTarget,
+    ) -> Result<(
+        crate::brain::remote::RemoteBrainClient,
+        tokio::sync::mpsc::UnboundedReceiver<crate::brain::shared::BrainWireMessage>,
+    )> {
+        let password = crate::config::load_config()
+            .map(|config| config.server.brain_password)
+            .unwrap_or_default();
+        let mut client = crate::brain::remote::RemoteBrainClient::new(target, password)?;
+        client
+            .authorize_runner_handoff_control(
+                &self.participant_subject,
+                crate::brain::shared::AttachmentRole::Driver,
+            )
+            .await?;
+        client
+            .attach(
+                &self.participant_subject,
+                crate::brain::shared::AttachmentRole::Driver,
+                None,
+            )
+            .await?;
+        let events = client.watch().await?;
+        Ok((client, events))
+    }
+
+    async fn handle_brain_handoff(&mut self, target_subject: String) -> Result<()> {
+        let selected = self
+            .selected_brain()
+            .context("attach to the Brain whose runner should be transferred")?;
+        let target = selected.target.clone();
+        let snapshot = selected.snapshot().await?;
+        let source = snapshot
+            .runner_lease
+            .as_ref()
+            .context("the selected Brain has no live runner to hand off")?;
+        let handoff = if self.active_remote_brain.is_some() {
+            let (client, _events) = self.remote_handoff_control_client(target).await?;
+            let result = client
+                .request_runner_handoff(
+                    &target_subject,
+                    source.lease_id,
+                    snapshot.environment.generation,
+                    30_000,
+                )
+                .await;
+            let disconnect = client.disconnect().await;
+            match (result, disconnect) {
+                (Ok(handoff), _) => handoff,
+                (Err(error), _) => return Err(error),
+            }
+        } else {
+            self.ipc_client
+                .as_ref()
+                .context("Cap'n Proto daemon connection unavailable")?
+                .brain_request_runner_handoff(
+                    &snapshot.name,
+                    &self.participant_subject,
+                    &target_subject,
+                    source.lease_id,
+                    &snapshot.environment,
+                    30_000,
+                )
+                .await?
+        };
+        self.output_manager.write_info(format!(
+            "runner handoff {} requested for {}",
+            &handoff.handoff_id.0.to_string()[..8],
+            handoff.target_subject
+        ));
+        self.render_tui().await
+    }
+
+    async fn handle_brain_handoff_cancel(&mut self, requested: Option<String>) -> Result<()> {
+        let selected = self
+            .selected_brain()
+            .context("attach to the Brain whose handoff should be cancelled")?;
+        let target = selected.target.clone();
+        let snapshot = selected.snapshot().await?;
+        let handoff = Self::selected_handoff(&snapshot, requested.as_deref())?;
+        if self.active_remote_brain.is_some() {
+            let (client, _events) = self.remote_handoff_control_client(target).await?;
+            let result = client.cancel_runner_handoff(handoff.handoff_id).await;
+            let disconnect = client.disconnect().await;
+            match (result, disconnect) {
+                (Ok(()), _) => {}
+                (Err(error), _) => return Err(error),
+            }
+        } else {
+            self.ipc_client
+                .as_ref()
+                .context("Cap'n Proto daemon connection unavailable")?
+                .brain_cancel_runner_handoff(
+                    &snapshot.name,
+                    handoff.handoff_id,
+                    &self.participant_subject,
+                )
+                .await?;
+        }
+        self.output_manager.write_info(format!(
+            "runner handoff {} cancelled",
+            &handoff.handoff_id.0.to_string()[..8]
+        ));
+        self.render_tui().await
+    }
+
+    async fn restore_runner_after_failed_handoff(
+        &mut self,
+        ipc: &crate::ipc::IpcClient,
+        previous: Option<(String, crate::brain::shared::BrainEnvironment)>,
+    ) -> Result<()> {
+        let Some((brain, environment)) = previous else {
+            return Ok(());
+        };
+        let lease = ipc
+            .brain_acquire_runner(&brain, &self.runner_subject, &environment, None, 30_000)
+            .await
+            .with_context(|| format!("restore runner lease for {brain}"))?;
+        if let Err(error) = ipc
+            .register_brain_runner(&brain, lease.lease_id, self.event_tx.clone())
+            .await
+        {
+            let _ = ipc.brain_release_runner(&brain, lease.lease_id).await;
+            return Err(error.context(format!("restore runner callback for {brain}")));
+        }
+        self.runner_brain = Some(brain.clone());
+        self.home_runner_lease_id = Some(lease.lease_id);
+        self.home_runner_lease_active = true;
+        self.start_runner_lease_renewal(
+            ipc.clone(),
+            brain,
+            self.runner_subject.clone(),
+            environment,
+            Some(lease.lease_id),
+            true,
+        );
+        Ok(())
+    }
+
+    async fn fail_handoff_and_restore_runner(
+        &mut self,
+        ipc: &crate::ipc::IpcClient,
+        previous: Option<(String, crate::brain::shared::BrainEnvironment)>,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        match self
+            .restore_runner_after_failed_handoff(ipc, previous)
+            .await
+        {
+            Ok(()) => error,
+            Err(restore_error) => error.context(format!(
+                "the previous runner could not be restored: {restore_error:#}"
+            )),
+        }
+    }
+
+    async fn handle_brain_handoff_accept(&mut self, requested: Option<String>) -> Result<()> {
+        let selected = self
+            .selected_brain()
+            .context("attach to the Brain whose handoff should be accepted")?;
+        let selected_target = selected.target.clone();
+        let snapshot = selected.snapshot().await?;
+        let handoff = Self::selected_handoff(&snapshot, requested.as_deref())?;
+        anyhow::ensure!(
+            handoff.target_subject == self.runner_subject,
+            "runner handoff is addressed to {}, not this frontend ({})",
+            handoff.target_subject,
+            self.runner_subject
+        );
+
+        if self.active_remote_brain.is_some() {
+            let base = self
+                .daemon_base_url
+                .as_deref()
+                .context("local daemon is unavailable")?;
+            let local = crate::brain::remote::RemoteBrainTarget::local(&snapshot.name, base)?;
+            anyhow::ensure!(
+                selected_target.address == local.address,
+                "runner handoff acceptance must run on the Brain environment host"
+            );
+        }
+        let ipc = self
+            .ipc_client
+            .as_ref()
+            .context("Cap'n Proto daemon connection unavailable")?
+            .clone();
+
+        anyhow::ensure!(
+            self.runner_brain.as_deref() != Some(snapshot.name.as_str()),
+            "this frontend already serves {}",
+            snapshot.name
+        );
+
+        let previous_runner = match (self.runner_brain.as_ref(), self.home_runner_lease_id) {
+            (Some(brain), Some(_)) => Some((
+                brain.clone(),
+                ipc.brain_snapshot(brain)
+                    .await
+                    .with_context(|| format!("inspect current runner Brain {brain}"))?
+                    .environment,
+            )),
+            _ => None,
+        };
+
+        self.runner_renewal_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let (Some(current_brain), Some(current_lease)) =
+            (self.runner_brain.as_ref(), self.home_runner_lease_id)
+        {
+            ipc.brain_release_runner(&current_brain, current_lease)
+                .await
+                .with_context(|| format!("release runner lease for {current_brain}"))?;
+        }
+        self.runner_brain = None;
+        self.home_runner_lease_id = None;
+        self.home_runner_lease_active = false;
+
+        let lease = match ipc
+            .brain_accept_runner_handoff(
+                &snapshot.name,
+                &self.runner_subject,
+                handoff.handoff_id,
+                &snapshot.environment,
+                30_000,
+            )
+            .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                return Err(self
+                    .fail_handoff_and_restore_runner(&ipc, previous_runner, error)
+                    .await);
+            }
+        };
+        let registration = ipc
+            .register_brain_runner(&snapshot.name, lease.lease_id, self.event_tx.clone())
+            .await;
+        let bootstrap = match registration {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                let _ = ipc
+                    .brain_release_runner(&snapshot.name, lease.lease_id)
+                    .await;
+                let error = error.context("register accepted runner callback");
+                return Err(self
+                    .fail_handoff_and_restore_runner(&ipc, previous_runner, error)
+                    .await);
+            }
+        };
+        if let Err(error) = self
+            .program_runtime
+            .replace_reducible_state(bootstrap.checkpoint, bootstrap.runtime_revision)
+            .await
+        {
+            let _ = ipc
+                .brain_release_runner(&snapshot.name, lease.lease_id)
+                .await;
+            let error = error.context("hydrate accepted Brain runtime");
+            return Err(self
+                .fail_handoff_and_restore_runner(&ipc, previous_runner, error)
+                .await);
+        }
+
+        self.runner_brain = Some(snapshot.name.clone());
+        self.home_runner_lease_id = Some(lease.lease_id);
+        self.home_runner_lease_active = true;
+        self.start_runner_lease_renewal(
+            ipc,
+            snapshot.name.clone(),
+            self.runner_subject.clone(),
+            snapshot.environment,
+            Some(lease.lease_id),
+            true,
+        );
+        self.output_manager.write_info(format!(
+            "accepted runner handoff {}; this frontend now serves {}",
+            &handoff.handoff_id.0.to_string()[..8],
+            snapshot.name
+        ));
+        self.update_remote_brain_status(true);
         self.render_tui().await
     }
 }

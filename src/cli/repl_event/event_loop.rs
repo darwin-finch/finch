@@ -254,6 +254,11 @@ pub struct EventLoop {
     /// This is deliberately separate from the Brain's name and opaque lease IDs.
     participant_subject: String,
 
+    /// Ephemeral identity of this exact frontend execution context. Human
+    /// participant identity is not precise enough for an addressed handoff
+    /// between two consoles owned by the same user.
+    runner_subject: String,
+
     /// Stable UUID for this session — assigned at startup, printed on exit.
     session_uuid: Uuid,
 
@@ -385,6 +390,14 @@ fn participant_subject_from(user: &str, machine: &str) -> String {
         .filter(|character| !character.is_control())
         .take(128)
         .collect()
+}
+
+fn runner_subject_from(participant: &str, frontend_id: Uuid) -> String {
+    let suffix = format!("/frontend-{}", &frontend_id.to_string()[..8]);
+    let keep = 128usize.saturating_sub(suffix.len());
+    let mut base = participant.chars().take(keep).collect::<String>();
+    base.push_str(&suffix);
+    base
 }
 
 fn approval_audience_summary(
@@ -948,6 +961,9 @@ impl EventLoop {
         let (peer_tx, peer_session_rx) =
             tokio::sync::broadcast::channel::<crate::session::SessionEvent>(128);
 
+        let participant_subject = local_participant_subject();
+        let runner_subject = runner_subject_from(&participant_subject, Uuid::new_v4());
+
         Self {
             event_rx,
             event_tx,
@@ -996,7 +1012,8 @@ impl EventLoop {
                 .map(Arc::new),
             memory_system,
             session_label,
-            participant_subject: local_participant_subject(),
+            participant_subject,
+            runner_subject,
             session_uuid: Uuid::new_v4(),
             cwd: String::new(), // populated at the start of run()
             context_lines,
@@ -2104,6 +2121,34 @@ Rules:\n\
                     }
                     Command::BrainDetach => {
                         self.handle_brain_detach().await?;
+                    }
+                    Command::BrainHandoff(target) => {
+                        if let Err(error) = self.handle_brain_handoff(target).await {
+                            self.output_manager
+                                .write_info(format!("brain handoff: {error}"));
+                            self.render_tui().await?;
+                        }
+                    }
+                    Command::BrainHandoffIdentity => {
+                        self.output_manager.write_info(format!(
+                            "this frontend's runner identity: {}",
+                            self.runner_subject
+                        ));
+                        self.render_tui().await?;
+                    }
+                    Command::BrainHandoffAccept(handoff) => {
+                        if let Err(error) = self.handle_brain_handoff_accept(handoff).await {
+                            self.output_manager
+                                .write_info(format!("brain handoff accept: {error}"));
+                            self.render_tui().await?;
+                        }
+                    }
+                    Command::BrainHandoffCancel(handoff) => {
+                        if let Err(error) = self.handle_brain_handoff_cancel(handoff).await {
+                            self.output_manager
+                                .write_info(format!("brain handoff cancel: {error}"));
+                            self.render_tui().await?;
+                        }
                     }
                     Command::BrainPassword(password) => {
                         self.handle_brain_password(password).await?;
@@ -4311,12 +4356,20 @@ Rules:\n\
             BrainEventKind::RunnerLeaseReleased { .. } => self
                 .output_manager
                 .write_info("environment runner disconnected"),
-            BrainEventKind::RunnerHandoffRequested { handoff } => self.output_manager.write_info(
-                format!(
-                    "{} requested runner handoff to {}",
-                    handoff.requested_by, handoff.target_subject
-                ),
-            ),
+            BrainEventKind::RunnerHandoffRequested { handoff } => {
+                let prompt = if handoff.target_subject == self.runner_subject {
+                    format!(
+                        "; addressed to this frontend — use /brain handoff accept {}",
+                        &handoff.handoff_id.0.to_string()[..8]
+                    )
+                } else {
+                    String::new()
+                };
+                self.output_manager.write_info(format!(
+                    "{} requested runner handoff to {}{}",
+                    handoff.requested_by, handoff.target_subject, prompt
+                ));
+            }
             BrainEventKind::RunnerHandoffCompleted { lease, .. } => self
                 .output_manager
                 .write_info(format!("runner handoff completed to {}", lease.subject)),
@@ -6406,6 +6459,22 @@ mod tests {
         assert!(!subject.chars().any(char::is_control));
         assert!(subject.chars().count() <= 128);
         assert!(subject.ends_with('x'));
+    }
+
+    #[test]
+    fn runner_subject_identifies_one_frontend_not_only_its_participant() {
+        let participant = "shammah@workstation.local";
+        let first = runner_subject_from(
+            participant,
+            Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+        );
+        let second = runner_subject_from(
+            participant,
+            Uuid::parse_str("11111111-0000-0000-0000-000000000001").unwrap(),
+        );
+        assert_ne!(first, second);
+        assert!(first.starts_with(participant));
+        assert!(first.chars().count() <= 128);
     }
     use crate::cli::repl_event::query_processor::apply_sliding_window;
     // format_elapsed and format_token_count moved to tool_display; import for status-bar tests.

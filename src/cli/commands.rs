@@ -57,6 +57,10 @@ pub enum Command {
     BrainArchive(String),          // /brain archive <name>
     BrainAttach(String),           // /brain attach <name@machine[:port]>
     BrainDetach,                   // /brain detach
+    BrainHandoff(String),          // /brain handoff <target-subject>
+    BrainHandoffIdentity,          // /brain handoff identity
+    BrainHandoffAccept(Option<String>), // /brain handoff accept [handoff-id]
+    BrainHandoffCancel(Option<String>), // /brain handoff cancel [handoff-id]
     BrainPassword(Option<String>), // /brain password [new-password]
     // Execution graph
     Graph, // /graph — show causal trace of last query
@@ -140,6 +144,9 @@ impl Command {
                 return Some(Command::Brains);
             }
             "/brain detach" => return Some(Command::BrainDetach),
+            "/brain handoff accept" => return Some(Command::BrainHandoffAccept(None)),
+            "/brain handoff cancel" => return Some(Command::BrainHandoffCancel(None)),
+            "/brain handoff identity" => return Some(Command::BrainHandoffIdentity),
             "/brain password" => return Some(Command::BrainPassword(None)),
             "/graph" => return Some(Command::Graph),
             // Co-Forth VM
@@ -248,6 +255,24 @@ impl Command {
             let target = rest.trim();
             if !target.is_empty() {
                 return Some(Command::BrainAttach(target.to_string()));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/brain handoff accept ") {
+            let handoff = rest.trim();
+            if !handoff.is_empty() {
+                return Some(Command::BrainHandoffAccept(Some(handoff.to_string())));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/brain handoff cancel ") {
+            let handoff = rest.trim();
+            if !handoff.is_empty() {
+                return Some(Command::BrainHandoffCancel(Some(handoff.to_string())));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/brain handoff ") {
+            let target = rest.trim();
+            if !target.is_empty() {
+                return Some(Command::BrainHandoff(target.to_string()));
             }
         }
         if let Some(rest) = trimmed.strip_prefix("/brain archive ") {
@@ -494,6 +519,10 @@ pub fn handle_command(
         | Command::BrainArchive(_)
         | Command::BrainAttach(_)
         | Command::BrainDetach
+        | Command::BrainHandoff(_)
+        | Command::BrainHandoffIdentity
+        | Command::BrainHandoffAccept(_)
+        | Command::BrainHandoffCancel(_)
         | Command::BrainPassword(_) => Ok(CommandOutput::Status(
             "Brain commands should be handled in REPL.".to_string(),
         )),
@@ -660,6 +689,10 @@ pub fn format_help() -> String {
          {cyan}  /brain list{reset}        List named Brain sessions ({gray}/brains{reset} also works)\n\
          {cyan}  /brain attach <name>[@machine]{reset} Attach locally or to a remote Brain\n\
          {cyan}  /brain detach{reset}      Return to this console's home Brain\n\
+         {cyan}  /brain handoff <subject>{reset} Request an addressed runner transfer\n\
+         {cyan}  /brain handoff identity{reset} Show this exact frontend's runner identity\n\
+         {cyan}  /brain handoff accept [id]{reset} Accept a transfer addressed to this frontend\n\
+         {cyan}  /brain handoff cancel [id]{reset} Cancel a pending transfer\n\
          {cyan}  /brain archive <name>{reset} Remove an inactive Brain but preserve its log\n\
          {cyan}  /brain password [new]{reset} Show or rotate the local brain credential\n\
          {reset}\n\
@@ -974,6 +1007,26 @@ mod tests {
         assert!(matches!(
             Command::parse("/brain archive old-project"),
             Some(Command::BrainArchive(name)) if name == "old-project"
+        ));
+        assert!(matches!(
+            Command::parse("/brain handoff runner-b@box.local"),
+            Some(Command::BrainHandoff(subject)) if subject == "runner-b@box.local"
+        ));
+        assert!(matches!(
+            Command::parse("/brain handoff identity"),
+            Some(Command::BrainHandoffIdentity)
+        ));
+        assert!(matches!(
+            Command::parse("/brain handoff accept"),
+            Some(Command::BrainHandoffAccept(None))
+        ));
+        assert!(matches!(
+            Command::parse("/brain handoff accept 1234"),
+            Some(Command::BrainHandoffAccept(Some(id))) if id == "1234"
+        ));
+        assert!(matches!(
+            Command::parse("/brain handoff cancel"),
+            Some(Command::BrainHandoffCancel(None))
         ));
         assert!(format_help().contains("/brain list"));
         assert!(!format_help().contains("Spawn a background research brain"));
