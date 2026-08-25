@@ -1019,6 +1019,26 @@ still blocks the corresponding Brain phase until it is unified.
 
 ## Client and model integration
 
+- [ ] Package an enterprise Finch deployment around the authoritative Brain/environment boundary:
+  reproducible developer-workspace bootstrap, organization model/provider profiles, OIDC/SSO and
+  secret-manager integration, policy-as-code capability grants, signed artifacts, audit export,
+  budget/rate controls, fleet health, and air-gapped/VPC/on-prem operation. Credentials remain
+  opaque environment-scoped references and are never baked into workspace images. Keep the open
+  local harness useful by itself; charge for managed deployment, governance, collaboration, and
+  support rather than weakening the local product.
+- [ ] Define a privacy and data-governance contract before collecting centralized model traffic.
+  Default to no upload and no secondary training/data-sale use. Any evaluation or training corpus
+  contribution must be separately opt-in, purpose-specific, revocable where feasible, visibly
+  redactable before transfer, tenant-isolated, retention-bounded, and auditable; do not describe
+  raw prompt/tool/workspace traces as anonymized merely because direct account identifiers were
+  removed. Prefer customer-owned evaluation reports, aggregate conformance metrics, synthetic
+  fixtures, and an explicit compensated data cooperative over covert prompt monetization.
+- [ ] Reassess automatic model routing only after provider conformance, cost, latency, privacy, and
+  task-success signals are measured reliably. A small local policy model may recommend or select a
+  compatible model/profile under an explicit user budget/privacy policy, with deterministic rules,
+  per-turn explanation, manual override, conservative escalation, and replayable outcomes. Routing
+  must not own conversation state: the Brain log remains authoritative, and changing provider/model
+  either uses a compatible continuation cursor or rebuilds the request from local state.
 - [ ] Keep the Brain event log and validated VM checkpoints authoritative while optionally retaining
   an expendable remote provider-continuation cursor keyed by Brain, provider identity, model, and
   language-package hash. When an API supports incremental continuation, send only new user/tool
