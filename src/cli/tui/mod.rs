@@ -359,6 +359,29 @@ fn live_viewport_lines(
     (selected, omitted_rows)
 }
 
+/// Rows available to the streaming WorkUnit after accounting for the rest of
+/// Finch's live region. Keeping the whole region within the terminal prevents
+/// redraws from scrolling their own clipped prefix into permanent scrollback.
+fn live_message_row_budget(terminal_height: usize, reserved_rows: usize) -> usize {
+    terminal_height.saturating_sub(reserved_rows).max(1)
+}
+
+fn input_physical_rows(lines: &[String], terminal_width: usize) -> usize {
+    let width = terminal_width.max(1);
+    if lines.is_empty() {
+        return 1;
+    }
+    lines
+        .iter()
+        .map(|line| {
+            let prefix_width = 2; // `❯ ` and continuation indentation are both two columns.
+            (prefix_width + shadow_buffer::visible_length(line))
+                .max(1)
+                .div_ceil(width)
+        })
+        .sum()
+}
+
 /// Return a plain visible suffix small enough to fit in `columns`. This is
 /// used only when one logical line is itself taller than the remaining live
 /// viewport; completed scrollback retains the original ANSI-bearing line.
@@ -833,12 +856,38 @@ impl TuiRenderer {
         let mut rows: usize = 0;
 
         // ── 1. Active WorkUnit ────────────────────────────────────────────────
-        // Leave a small fixed reserve for the separator, input, status, and a
-        // couple of transient task rows. The prior one-third logical-line cap
-        // erased most tool activity on tall terminals and ignored wrapping.
+        // Budget actual physical rows after reserving the separator, input,
+        // status, TODOs, and child tasks. A fixed reserve can overflow the
+        // viewport when context lines wrap, permanently duplicating live rows.
         let term_h = crossterm::terminal::size().unwrap_or((80, 24)).1 as usize;
         let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
-        let max_live_rows = term_h.saturating_sub(8).max(1);
+        let input_lines = self.input_textarea.lines().to_vec();
+        let raw_status = self
+            .status_bar
+            .get_status_without(&StatusLineType::SessionLabel);
+        let current_input = input_lines.join("\n");
+        let effective_status = compute_effective_status(
+            self.ghost_text.as_deref(),
+            &raw_status,
+            &current_input,
+            &self.command_registry,
+        );
+        let todo_rows = self
+            .todo_list
+            .as_ref()
+            .and_then(|todo| todo.try_read().ok().map(|todo| todo.active_items().len()))
+            .unwrap_or(0);
+        let status_rows = 1
+            + effective_status
+                .lines()
+                .map(|line| shadow_buffer::physical_rows(line, term_width))
+                .sum::<usize>();
+        let reserved_rows = 1 // upper separator
+            + input_physical_rows(&input_lines, term_width)
+            + status_rows
+            + todo_rows
+            + self.agent_tasks.len();
+        let max_live_rows = live_message_row_budget(term_h, reserved_rows);
         let live_messages = self.find_live_messages();
         if !live_messages.is_empty() {
             // A Brain can have more than one live work unit (for example a
@@ -1055,17 +1104,6 @@ impl TuiRenderer {
             // mode does not leave the cursor at the wrong column.
             // Session identity is projected into the upper separator. Keeping it
             // here as well wastes a row and makes the Brain appear twice.
-            let raw_status = self
-                .status_bar
-                .get_status_without(&StatusLineType::SessionLabel);
-            let current_input = self.input_textarea.lines().join("\n");
-            let effective_status = compute_effective_status(
-                self.ghost_text.as_deref(),
-                &raw_status,
-                &current_input,
-                &self.command_registry,
-            );
-
             // Thin separator between input area and status line(s) — full terminal width
             let status_sep: String = "─".repeat(term_width);
             execute!(
@@ -2392,6 +2430,24 @@ mod tests {
     #[test]
     fn test_redraw_predicate_triggers_when_in_progress() {
         assert!(should_redraw_live_area(true, false));
+    }
+
+    #[test]
+    fn live_budget_accounts_for_every_reserved_terminal_row() {
+        assert_eq!(live_message_row_budget(24, 9), 15);
+        assert_eq!(live_message_row_budget(24, 23), 1);
+        assert_eq!(live_message_row_budget(24, 30), 1);
+    }
+
+    #[test]
+    fn input_row_budget_counts_wrapping() {
+        assert_eq!(input_physical_rows(&[], 10), 1);
+        assert_eq!(input_physical_rows(&["hello".into()], 10), 1);
+        assert_eq!(input_physical_rows(&["123456789".into()], 10), 2);
+        assert_eq!(
+            input_physical_rows(&["one".into(), "123456789".into()], 10),
+            3
+        );
     }
 
     #[test]
