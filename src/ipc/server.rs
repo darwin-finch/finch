@@ -324,21 +324,15 @@ impl brain_service::Server for BrainServiceImpl {
             Ok(id) => id,
             Err(error) => return Promise::err(error),
         };
-        let snapshot = match self.server.shared_brains().snapshot(&brain) {
-            Ok(snapshot) => snapshot,
-            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
-        };
-        if let Err(error) = self
-            .server
-            .shared_brains()
-            .detach(&brain, attachment_id, connection_id)
-        {
+        if let Err(error) = crate::server::handlers::detach_named_brain_attachment(
+            self.server.shared_brains(),
+            self.server.brain_approvals(),
+            &brain,
+            attachment_id,
+            connection_id,
+        ) {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
-        self.server
-            .brain_approvals()
-            .cancel_attachment(snapshot.brain_id, attachment_id);
-        let _ = self.server.shared_brains().remove_if_unused(&brain);
         Promise::ok(())
     }
 

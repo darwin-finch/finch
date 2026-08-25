@@ -364,40 +364,20 @@ impl RemoteBrainClient {
     pub async fn disconnect(&self) -> Result<()> {
         use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
-        if self.session.lock().await.is_some() {
-            return match self
-                .send_remote_command(BrainRemoteCommandKind::Detach)
-                .await?
-            {
-                BrainRemoteReply::Detached { .. } => Ok(()),
-                reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
-            };
-        }
-
-        // Attachment persistence can fail before the watch stream is opened.
-        // Keep this authenticated bootstrap cleanup until attach itself moves
-        // behind the binary session.
-        let attachment = self
-            .attachment
-            .as_ref()
-            .context("client is not attached to a Brain")?;
-        let connection_id = attachment
-            .connection_id
-            .context("Brain attachment has no live connection")?;
-        self.http
-            .delete(format!(
-                "{}/{}/connections/{}",
-                self.target.attachments_url(),
-                attachment.attachment_id.0,
-                connection_id.0
-            ))
-            .bearer_auth(self.authorized_token().await?)
-            .send()
-            .await
-            .context("could not reach brain host")?
-            .error_for_status()
-            .context("brain detach rejected")?;
-        Ok(())
+        let temporary_events = if self.session.lock().await.is_none() {
+            Some(self.watch().await?)
+        } else {
+            None
+        };
+        let result = match self
+            .send_remote_command(BrainRemoteCommandKind::Detach)
+            .await?
+        {
+            BrainRemoteReply::Detached { .. } => Ok(()),
+            reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
+        };
+        drop(temporary_events);
+        result
     }
 
     /// Connect to the brain's snapshot/live-event stream.

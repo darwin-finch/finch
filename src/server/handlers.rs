@@ -69,9 +69,7 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         .route("/v1/brains/named", get(list_named_brains))
         .route(
             "/v1/brains/named/:name",
-            get(get_named_brain)
-                .post(push_named_brain_event)
-                .delete(archive_named_brain),
+            get(get_named_brain).delete(archive_named_brain),
         )
         .route(
             "/v1/brains/named/:name/attachments",
@@ -84,14 +82,6 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         .route(
             "/v1/brains/credentials/:credential_id",
             axum::routing::delete(revoke_named_brain_credential),
-        )
-        .route(
-            "/v1/brains/named/:name/attachments/:attachment_id/ack",
-            post(acknowledge_named_brain),
-        )
-        .route(
-            "/v1/brains/named/:name/attachments/:attachment_id/connections/:connection_id",
-            axum::routing::delete(detach_named_brain),
         )
         .route(
             "/v1/brains/named/:name/runner-lease",
@@ -451,92 +441,26 @@ async fn attach_named_brain(
     Ok(Json(attachment))
 }
 
-#[derive(Debug, Deserialize)]
-struct AcknowledgeNamedBrainRequest {
-    connection_id: crate::brain::shared::ConnectionId,
-    seq: u64,
-}
-
-async fn acknowledge_named_brain(
-    State(server): State<Arc<AgentServer>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Path((name, attachment_id)): Path<(String, uuid::Uuid)>,
-    Json(request): Json<AcknowledgeNamedBrainRequest>,
-) -> Result<Json<crate::brain::shared::BrainAttachment>, Response> {
-    let claims = authorize_named_brain(
-        &server,
-        addr,
-        &headers,
-        &name,
-        crate::brain::credential::BrainCredentialScope::BrainRead,
-    )?;
-    let attachment = server
-        .shared_brains()
-        .require_connection(
-            &name,
-            crate::brain::shared::AttachmentId(attachment_id),
-            request.connection_id,
-        )
-        .map_err(brain_state_conflict)?;
-    claims_match_attachment(claims.as_ref(), &attachment)?;
-    server
-        .shared_brains()
-        .acknowledge(
-            &name,
-            crate::brain::shared::AttachmentId(attachment_id),
-            request.connection_id,
-            request.seq,
-        )
-        .map(Json)
-        .map_err(brain_state_conflict)
-}
-
-async fn detach_named_brain(
-    State(server): State<Arc<AgentServer>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Path((name, attachment_id, connection_id)): Path<(String, uuid::Uuid, uuid::Uuid)>,
-) -> Result<StatusCode, Response> {
-    let claims = authorize_named_brain(
-        &server,
-        addr,
-        &headers,
-        &name,
-        crate::brain::credential::BrainCredentialScope::BrainControl,
-    )?;
-    let attachment_id = crate::brain::shared::AttachmentId(attachment_id);
-    let connection_id = crate::brain::shared::ConnectionId(connection_id);
-    let attachment = server
-        .shared_brains()
-        .require_connection(&name, attachment_id, connection_id)
-        .map_err(brain_state_conflict)?;
-    claims_match_attachment(claims.as_ref(), &attachment)?;
-    let brain_id = server
-        .shared_brains()
-        .snapshot(&name)
-        .map_err(brain_state_conflict)?
-        .brain_id;
-    server
-        .shared_brains()
-        .detach(&name, attachment_id, connection_id)
-        .map_err(brain_state_conflict)?;
-    server
-        .brain_approvals()
-        .cancel_attachment(brain_id, attachment_id);
-    server
-        .shared_brains()
-        .remove_if_unused(&name)
-        .map_err(brain_state_conflict)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 fn brain_state_conflict(error: anyhow::Error) -> Response {
     (
         StatusCode::CONFLICT,
         Json(serde_json::json!({ "error": error.to_string() })),
     )
         .into_response()
+}
+
+pub(crate) fn detach_named_brain_attachment(
+    store: &crate::brain::shared::SharedBrainStore,
+    approvals: &crate::server::BrainApprovalBroker,
+    name: &str,
+    attachment_id: crate::brain::shared::AttachmentId,
+    connection_id: crate::brain::shared::ConnectionId,
+) -> anyhow::Result<()> {
+    let brain_id = store.snapshot(name)?.brain_id;
+    store.detach(name, attachment_id, connection_id)?;
+    approvals.cancel_attachment(brain_id, attachment_id);
+    store.remove_if_unused(name)?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -662,23 +586,6 @@ async fn archive_named_brain(
     }))
 }
 
-#[derive(Debug, Deserialize)]
-struct PushNamedBrainEvent {
-    attachment_id: crate::brain::shared::AttachmentId,
-    connection_id: crate::brain::shared::ConnectionId,
-    #[serde(flatten)]
-    kind: crate::brain::shared::BrainEventKind,
-}
-
-#[derive(Debug, Serialize)]
-struct PushNamedBrainResponse {
-    accepted: crate::brain::shared::BrainEvent,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    run: Option<crate::brain::shared::BrainRun>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<crate::brain::shared::BrainEvent>,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BrainSubmissionError {
     #[error("{0}")]
@@ -717,58 +624,8 @@ fn attachment_can_submit(
     }
 }
 
-async fn push_named_brain_event(
-    State(server): State<Arc<AgentServer>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Path(name): Path<String>,
-    Json(request): Json<PushNamedBrainEvent>,
-) -> Result<Json<PushNamedBrainResponse>, Response> {
-    use crate::brain::shared::BrainEventKind;
-
-    let required_scope = if matches!(request.kind, BrainEventKind::ApprovalDecided { .. }) {
-        crate::brain::credential::BrainCredentialScope::BrainApprove
-    } else {
-        crate::brain::credential::BrainCredentialScope::BrainSubmit
-    };
-    let claims = authorize_named_brain(&server, addr, &headers, &name, required_scope)?;
-    let attachment = server
-        .shared_brains()
-        .require_connection(&name, request.attachment_id, request.connection_id)
-        .map_err(|error| AppError(error).into_response())?;
-    claims_match_attachment(claims.as_ref(), &attachment)?;
-    let outcome = submit_named_brain_event(
-        server.shared_brains(),
-        server.brain_runners(),
-        server.brain_approvals(),
-        &name,
-        &attachment,
-        request.kind,
-    )
-    .await
-    .map_err(brain_submission_error_response)?;
-    Ok(Json(PushNamedBrainResponse {
-        accepted: outcome.accepted,
-        run: outcome.run,
-        result: outcome.result,
-    }))
-}
-
-fn brain_submission_error_response(error: BrainSubmissionError) -> Response {
-    let status = match &error {
-        BrainSubmissionError::Invalid(_) => StatusCode::BAD_REQUEST,
-        BrainSubmissionError::Forbidden(_) => StatusCode::FORBIDDEN,
-        BrainSubmissionError::State(_) => StatusCode::CONFLICT,
-    };
-    (
-        status,
-        Json(serde_json::json!({ "error": error.to_string() })),
-    )
-        .into_response()
-}
-
 /// One transport-neutral mutation boundary for an authenticated Brain
-/// attachment. HTTP and Cap'n Proto adapters must both enter here so role
+/// attachment. Local RPC and remote binary adapters must both enter here so role
 /// checks, ordering, run creation, queueing, and terminal persistence cannot
 /// diverge by transport.
 pub(crate) async fn submit_named_brain_event(
@@ -1671,20 +1528,13 @@ async fn execute_remote_brain_command(
                     "Brain credential participant no longer matches this attachment",
                 );
             }
-            let brain_id = match server.shared_brains().snapshot(name) {
-                Ok(snapshot) => snapshot.brain_id,
-                Err(error) => return remote_brain_error(request_id, "conflict", error.to_string()),
-            };
-            if let Err(error) = server
-                .shared_brains()
-                .detach(name, attachment_id, connection_id)
-            {
-                return remote_brain_error(request_id, "conflict", error.to_string());
-            }
-            server
-                .brain_approvals()
-                .cancel_attachment(brain_id, attachment_id);
-            if let Err(error) = server.shared_brains().remove_if_unused(name) {
+            if let Err(error) = detach_named_brain_attachment(
+                server.shared_brains(),
+                server.brain_approvals(),
+                name,
+                attachment_id,
+                connection_id,
+            ) {
                 return remote_brain_error(request_id, "conflict", error.to_string());
             }
             BrainRemoteReply::Detached { request_id }
