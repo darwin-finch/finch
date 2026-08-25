@@ -122,6 +122,49 @@ pub struct AgentServer {
 }
 
 impl AgentServer {
+    #[cfg(test)]
+    pub(crate) fn for_brain_http_test(
+        machine: &str,
+        state_root: &std::path::Path,
+        brain_credentials: crate::brain::credential::BrainCredentialAuthority,
+    ) -> Result<Self> {
+        let generator_state = Arc::new(RwLock::new(GeneratorState::NotAvailable));
+        let (training_tx, training_rx) = tokio::sync::mpsc::unbounded_channel();
+        Ok(Self {
+            claude_client: Arc::new(ClaudeClient::new(String::new())?),
+            providers: Vec::new(),
+            router: Arc::new(RwLock::new(Router::new(
+                crate::models::ThresholdRouter::new(),
+            ))),
+            metrics_logger: Arc::new(MetricsLogger::new(state_root.join("metrics"))?),
+            config: ServerConfig::default(),
+            local_generator: Arc::new(RwLock::new(LocalGenerator::new())),
+            bootstrap_loader: Arc::new(BootstrapLoader::new(
+                Arc::clone(&generator_state),
+                None,
+            )),
+            generator_state,
+            training_coordinator: Arc::new(TrainingCoordinator::with_queue_path(
+                4,
+                4,
+                false,
+                state_root.join("training.jsonl"),
+            )),
+            training_tx: Arc::new(training_tx),
+            training_rx: std::sync::Mutex::new(Some(training_rx)),
+            brain_store: crate::brain::store::BrainStore::with_root(
+                machine,
+                Some(state_root.join("brains")),
+            ),
+            brain_runners: BrainRunnerBroker::default(),
+            brain_approvals: BrainApprovalBroker::default(),
+            brain_credentials,
+            mcp_servers: std::collections::HashMap::new(),
+            mcp_client: tokio::sync::OnceCell::new(),
+            brain_password: Arc::new(RwLock::new(String::new())),
+        })
+    }
+
     /// Create a new agent server.
     ///
     /// `providers` is the ordered list of cloud providers from `[[providers]]` config.

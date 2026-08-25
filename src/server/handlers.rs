@@ -15,6 +15,9 @@ use std::sync::Arc;
 use super::{AgentServer, BrainSubmissionError, BrainSubmissionOutcome};
 use crate::claude::{ContentBlock, Message};
 
+#[derive(Clone, Copy)]
+struct RestrictedBrainListener;
+
 /// Create the main application router
 pub fn create_router(server: Arc<AgentServer>) -> Router {
     use super::feedback_handler::{handle_feedback, handle_training_status};
@@ -87,7 +90,10 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
 /// endpoints remain on the loopback listener.
 pub fn create_remote_brain_router(server: Arc<AgentServer>) -> Router {
     Router::new()
-        .route("/v1/brains/named/:name", get(get_named_brain))
+        .route(
+            "/v1/brains/named/:name",
+            get(get_named_brain).delete(archive_named_brain),
+        )
         .route(
             "/v1/brains/named/:name/capabilities",
             get(get_named_brain_capabilities),
@@ -110,6 +116,7 @@ pub fn create_remote_brain_router(server: Arc<AgentServer>) -> Router {
         )
         .route("/v1/brains/named/:name/ws", get(watch_named_brain))
         .route("/health", get(health_check))
+        .layer(axum::Extension(RestrictedBrainListener))
         .with_state(server)
 }
 
@@ -273,6 +280,7 @@ fn claims_match_attachment(
 
 async fn issue_named_brain_credential(
     State(server): State<Arc<AgentServer>>,
+    restricted: Option<axum::Extension<RestrictedBrainListener>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(name): Path<String>,
@@ -289,7 +297,9 @@ async fn issue_named_brain_credential(
         .snapshot(&name)
         .map_err(|error| AppError(error).into_response())?;
     let now_ms = unix_epoch_millis();
-    let delegator = if has_brain_bootstrap_access(&server, addr, &headers).await {
+    let delegator = if restricted.is_none()
+        && has_brain_bootstrap_access(&server, addr, &headers).await
+    {
         None
     } else {
         let token = bearer_token(&headers).ok_or_else(|| {
@@ -359,6 +369,7 @@ async fn issue_named_brain_credential(
 
 async fn issue_named_brain_invitation(
     State(server): State<Arc<AgentServer>>,
+    restricted: Option<axum::Extension<RestrictedBrainListener>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(name): Path<String>,
@@ -375,7 +386,9 @@ async fn issue_named_brain_invitation(
         .snapshot(&name)
         .map_err(|error| AppError(error).into_response())?;
     let now_ms = unix_epoch_millis();
-    let delegator = if has_brain_bootstrap_access(&server, addr, &headers).await {
+    let delegator = if restricted.is_none()
+        && has_brain_bootstrap_access(&server, addr, &headers).await
+    {
         None
     } else {
         let token = bearer_token(&headers).ok_or_else(|| {
