@@ -1031,7 +1031,12 @@ still blocks the corresponding Brain phase until it is unified.
   contribution must be separately opt-in, purpose-specific, revocable where feasible, visibly
   redactable before transfer, tenant-isolated, retention-bounded, and auditable; do not describe
   raw prompt/tool/workspace traces as anonymized merely because direct account identifiers were
-  removed. Prefer customer-owned evaluation reports, aggregate conformance metrics, synthetic
+  removed. Build an on-device candidate extractor for high-signal learning records—user corrections,
+  rejected versus accepted programs/changesets, verifier-diagnostic repair traces, model
+  escalation/switches, reversions, and verified task outcomes—and require visible redaction and
+  per-batch contribution approval before upload. Preserve provider/model, license, consent,
+  provenance, execution evidence, and withdrawal identity with every derived preference pair or
+  trajectory. Prefer customer-owned evaluation reports, aggregate conformance metrics, synthetic
   fixtures, and an explicit compensated data cooperative over covert prompt monetization.
 - [ ] Reassess automatic model routing only after provider conformance, cost, latency, privacy, and
   task-success signals are measured reliably. A small local policy model may recommend or select a
