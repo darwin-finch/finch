@@ -161,42 +161,31 @@ pub fn create_remote_brain_router(server: Arc<AgentServer>) -> Router {
 // Brain route handlers
 // ---------------------------------------------------------------------------
 
-const BRAIN_PASSWORD_HEADER: &str = "x-finch-brain-password";
-
 async fn check_brain_bootstrap_access(
-    server: &AgentServer,
+    _server: &AgentServer,
     addr: SocketAddr,
-    headers: &HeaderMap,
+    _headers: &HeaderMap,
 ) -> Result<(), Response> {
-    if has_brain_bootstrap_access(server, addr, headers).await {
+    if is_local_brain_bootstrap(addr) {
         return Ok(());
     }
     Err((
         StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({"error": "brain password required"})),
+        Json(serde_json::json!({"error": "local Brain bootstrap access required"})),
     )
         .into_response())
 }
 
 async fn has_brain_bootstrap_access(
-    server: &AgentServer,
+    _server: &AgentServer,
     addr: SocketAddr,
-    headers: &HeaderMap,
+    _headers: &HeaderMap,
 ) -> bool {
-    if addr.ip().is_loopback() {
-        return true;
-    }
-    let supplied = headers
-        .get(BRAIN_PASSWORD_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .or_else(|| {
-            headers
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.strip_prefix("Bearer "))
-        })
-        .unwrap_or_default();
-    !supplied.is_empty() && server.check_brain_password(supplied).await
+    is_local_brain_bootstrap(addr)
+}
+
+fn is_local_brain_bootstrap(addr: SocketAddr) -> bool {
+    addr.ip().is_loopback()
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -3118,6 +3107,18 @@ mod named_brain_provider_context_tests {
         AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
         BrainEvent, BrainEventKind, BrainId, BrainSnapshot, ProgramLanguage,
     };
+
+    #[test]
+    fn daemon_bootstrap_authority_is_loopback_only() {
+        assert!(is_local_brain_bootstrap("127.0.0.1:11435".parse().unwrap()));
+        assert!(is_local_brain_bootstrap("[::1]:11435".parse().unwrap()));
+        assert!(!is_local_brain_bootstrap(
+            "192.168.1.40:11436".parse().unwrap()
+        ));
+        assert!(!is_local_brain_bootstrap(
+            "10.20.30.40:11436".parse().unwrap()
+        ));
+    }
 
     fn driver_attachment(subject: &str) -> BrainAttachment {
         BrainAttachment {
