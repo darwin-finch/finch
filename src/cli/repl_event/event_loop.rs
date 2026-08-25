@@ -134,6 +134,9 @@ pub struct EventLoop {
     /// Shared conversation history
     conversation: Arc<RwLock<ConversationHistory>>,
 
+    /// Persona used for request-local provider system instructions.
+    active_persona: Arc<RwLock<crate::config::Persona>>,
+
     /// Query state manager
     query_states: Arc<QueryStateManager>,
 
@@ -1103,6 +1106,7 @@ impl EventLoop {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         conversation: Arc<RwLock<ConversationHistory>>,
+        active_persona: Arc<RwLock<crate::config::Persona>>,
         _cloud_gen: Arc<dyn Generator>,
         qwen_gen: Arc<dyn Generator>,
         router: Arc<Router>,
@@ -1248,6 +1252,7 @@ impl EventLoop {
             event_tx,
             input_rx,
             conversation,
+            active_persona,
             query_states: Arc::new(QueryStateManager::new()),
             model_selection: ModelSelection::from_handle(
                 active_provider_index,
@@ -1527,6 +1532,7 @@ impl EventLoop {
                 Arc::clone(&self.active_tool_uses),
                 self.memory_system.clone(),
                 Arc::clone(&self.current_graph),
+                Arc::clone(&self.active_persona),
                 self.session_label.clone(),
                 self.cwd.clone(),
                 self.context_lines,
@@ -2107,6 +2113,59 @@ Rules:\n\
                                 .output_manager
                                 .write_info(format!("⚠️  Failed to read training stats: {}", e)),
                         }
+                        self.render_tui().await?;
+                    }
+                    Command::PersonaList => {
+                        let current = self.active_persona.read().await.name().to_string();
+                        let mut lines = vec!["Available personas:".to_string()];
+                        for name in crate::config::Persona::list_builtins() {
+                            let marker = if name.eq_ignore_ascii_case(&current) {
+                                "→"
+                            } else {
+                                " "
+                            };
+                            lines.push(format!("{marker} {name}"));
+                        }
+                        lines.push("Use /persona select <name> to switch.".to_string());
+                        self.output_manager.write_info(lines.join("\n"));
+                        self.render_tui().await?;
+                    }
+                    Command::PersonaSelect(name) => {
+                        match crate::config::Persona::load_by_name(&name) {
+                            Ok(persona) => {
+                                let old_name =
+                                    self.active_persona.read().await.name().to_string();
+                                *self.active_persona.write().await = persona;
+                                self.output_manager.write_info(format!(
+                                    "Switched persona: {old_name} → {name}"
+                                ));
+                                match crate::config::load_config() {
+                                    Ok(mut config) => {
+                                        config.active_persona = name.clone();
+                                        if let Err(error) = config.save() {
+                                            self.output_manager.write_info(format!(
+                                                "Could not save persona selection: {error}"
+                                            ));
+                                        }
+                                    }
+                                    Err(error) => self.output_manager.write_info(format!(
+                                        "Could not load settings to save persona selection: {error}"
+                                    )),
+                                }
+                            }
+                            Err(error) => self.output_manager.write_info(format!(
+                                "Failed to load persona '{name}': {error}"
+                            )),
+                        }
+                        self.render_tui().await?;
+                    }
+                    Command::PersonaShow => {
+                        let persona = self.active_persona.read().await;
+                        self.output_manager.write_info(format!(
+                            "Current persona: {}\n\n{}",
+                            persona.name(), persona.behavior.system_prompt
+                        ));
+                        drop(persona);
                         self.render_tui().await?;
                     }
                     Command::Memory => {

@@ -61,6 +61,10 @@ pub struct LlmLoop {
     active_tool_uses: ActiveToolUsesMap,
     memory_system: Option<Arc<crate::memory::MemorySystem>>,
     current_graph: Arc<tokio::sync::Mutex<crate::graph::ExecutionGraph>>,
+    /// Live persona selection. Each provider round trip snapshots this value,
+    /// so tool continuations and named-Brain turns receive the current persona
+    /// without adding frontend-only data to canonical conversation history.
+    active_persona: Arc<RwLock<crate::config::Persona>>,
 
     // ── Per-session config ─────────────────────────────────────────────────
     session_label: String,
@@ -102,6 +106,7 @@ impl LlmLoop {
         active_tool_uses: ActiveToolUsesMap,
         memory_system: Option<Arc<crate::memory::MemorySystem>>,
         current_graph: Arc<tokio::sync::Mutex<crate::graph::ExecutionGraph>>,
+        active_persona: Arc<RwLock<crate::config::Persona>>,
         session_label: String,
         cwd: String,
         context_lines: usize,
@@ -133,6 +138,7 @@ impl LlmLoop {
             active_tool_uses,
             memory_system,
             current_graph,
+            active_persona,
             session_label,
             cwd,
             context_lines,
@@ -204,6 +210,7 @@ impl LlmLoop {
         let enable_summarization = self.enable_summarization;
         let auto_compact_enabled = self.auto_compact_enabled;
         let wire_metrics_logger = self.wire_metrics_logger.clone();
+        let persona_system_prompt = self.active_persona.read().await.to_system_message();
         // Always use the capable cloud model for summarisation, regardless of routing.
         let summary_gen = Arc::clone(&claude_gen);
         let tool_call_history = Arc::clone(&self.tool_call_history);
@@ -241,6 +248,7 @@ impl LlmLoop {
                 summary_gen,
                 tool_call_history,
                 wire_metrics_logger,
+                persona_system_prompt,
             )
             .await;
 
