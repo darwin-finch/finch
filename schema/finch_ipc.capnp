@@ -279,6 +279,46 @@ struct BrainClientDetached {
   connectionId @1 :Text;
 }
 
+enum BrainRunKind {
+  interactive @0;
+  speculative @1;
+  scheduled   @2;
+  subagent    @3;
+  maintenance @4;
+}
+
+enum BrainRunStatus {
+  queuedForEnvironment @0;
+  running              @1;
+  awaitingApproval     @2;
+  completed            @3;
+  failed               @4;
+  cancelled            @5;
+  interrupted          @6;
+}
+
+struct BrainRun {
+  runId                  @0 :Text;
+  kind                   @1 :BrainRunKind;
+  hasParentRunId         @2 :Bool;
+  parentRunId            @3 :Text;
+  requestSeq             @4 :UInt64;
+  initiatingAttachmentId @5 :Text;
+  initiatedBy            @6 :Text;
+  status                 @7 :BrainRunStatus;
+  startedMs              @8 :UInt64;
+  updatedMs              @9 :UInt64;
+  hasDetail              @10 :Bool;
+  detail                 @11 :Text;
+}
+
+struct BrainRunStatusChanged {
+  runId     @0 :Text;
+  status    @1 :BrainRunStatus;
+  hasDetail @2 :Bool;
+  detail    @3 :Text;
+}
+
 struct BrainEvent {
   schemaVersion        @0 :UInt32;
   brainId              @1 :Text;
@@ -300,6 +340,8 @@ struct BrainEvent {
     programPopped       @16 :UInt64;
     result              @17 :BrainResult;
     runtimeCommitted    @18 :BrainRuntimeCommitted;
+    runStarted          @19 :BrainRun;
+    runStatusChanged    @20 :BrainRunStatusChanged;
   }
 }
 
@@ -313,6 +355,7 @@ struct BrainSnapshot {
   attachments     @6 :List(BrainAttachment);
   hasRunnerLease  @7 :Bool;
   runnerLease     @8 :BrainRunnerLease;
+  runs            @9 :List(BrainRun);
 }
 
 struct BrainWireMessage {

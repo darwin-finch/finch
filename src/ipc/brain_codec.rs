@@ -1,7 +1,8 @@
 use crate::brain::shared::{
     AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
-    BrainEvent, BrainEventKind, BrainId, BrainProgram, BrainRunnerLease, BrainSnapshot,
-    BrainWireMessage, ConnectionId, ProgramLanguage, RunnerLeaseId,
+    BrainEvent, BrainEventKind, BrainId, BrainProgram, BrainRun, BrainRunKind, BrainRunStatus,
+    BrainRunnerLease, BrainSnapshot, BrainWireMessage, ConnectionId, ProgramLanguage, RunId,
+    RunnerLeaseId,
 };
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_approval_audience};
 
@@ -34,6 +35,54 @@ fn language_from_capnp(language: finch_ipc_capnp::ProgramLanguage) -> ProgramLan
     match language {
         finch_ipc_capnp::ProgramLanguage::Forth => ProgramLanguage::Forth,
         finch_ipc_capnp::ProgramLanguage::Lisp => ProgramLanguage::Lisp,
+    }
+}
+
+fn run_kind_to_capnp(kind: BrainRunKind) -> finch_ipc_capnp::BrainRunKind {
+    match kind {
+        BrainRunKind::Interactive => finch_ipc_capnp::BrainRunKind::Interactive,
+        BrainRunKind::Speculative => finch_ipc_capnp::BrainRunKind::Speculative,
+        BrainRunKind::Scheduled => finch_ipc_capnp::BrainRunKind::Scheduled,
+        BrainRunKind::Subagent => finch_ipc_capnp::BrainRunKind::Subagent,
+        BrainRunKind::Maintenance => finch_ipc_capnp::BrainRunKind::Maintenance,
+    }
+}
+
+fn run_kind_from_capnp(kind: finch_ipc_capnp::BrainRunKind) -> BrainRunKind {
+    match kind {
+        finch_ipc_capnp::BrainRunKind::Interactive => BrainRunKind::Interactive,
+        finch_ipc_capnp::BrainRunKind::Speculative => BrainRunKind::Speculative,
+        finch_ipc_capnp::BrainRunKind::Scheduled => BrainRunKind::Scheduled,
+        finch_ipc_capnp::BrainRunKind::Subagent => BrainRunKind::Subagent,
+        finch_ipc_capnp::BrainRunKind::Maintenance => BrainRunKind::Maintenance,
+    }
+}
+
+fn run_status_to_capnp(status: BrainRunStatus) -> finch_ipc_capnp::BrainRunStatus {
+    match status {
+        BrainRunStatus::QueuedForEnvironment => {
+            finch_ipc_capnp::BrainRunStatus::QueuedForEnvironment
+        }
+        BrainRunStatus::Running => finch_ipc_capnp::BrainRunStatus::Running,
+        BrainRunStatus::AwaitingApproval => finch_ipc_capnp::BrainRunStatus::AwaitingApproval,
+        BrainRunStatus::Completed => finch_ipc_capnp::BrainRunStatus::Completed,
+        BrainRunStatus::Failed => finch_ipc_capnp::BrainRunStatus::Failed,
+        BrainRunStatus::Cancelled => finch_ipc_capnp::BrainRunStatus::Cancelled,
+        BrainRunStatus::Interrupted => finch_ipc_capnp::BrainRunStatus::Interrupted,
+    }
+}
+
+fn run_status_from_capnp(status: finch_ipc_capnp::BrainRunStatus) -> BrainRunStatus {
+    match status {
+        finch_ipc_capnp::BrainRunStatus::QueuedForEnvironment => {
+            BrainRunStatus::QueuedForEnvironment
+        }
+        finch_ipc_capnp::BrainRunStatus::Running => BrainRunStatus::Running,
+        finch_ipc_capnp::BrainRunStatus::AwaitingApproval => BrainRunStatus::AwaitingApproval,
+        finch_ipc_capnp::BrainRunStatus::Completed => BrainRunStatus::Completed,
+        finch_ipc_capnp::BrainRunStatus::Failed => BrainRunStatus::Failed,
+        finch_ipc_capnp::BrainRunStatus::Cancelled => BrainRunStatus::Cancelled,
+        finch_ipc_capnp::BrainRunStatus::Interrupted => BrainRunStatus::Interrupted,
     }
 }
 
@@ -115,7 +164,11 @@ fn encode_snapshot(
     }
     if let Some(lease) = &snapshot.runner_lease {
         builder.set_has_runner_lease(true);
-        encode_runner_lease(builder.init_runner_lease(), lease);
+        encode_runner_lease(builder.reborrow().init_runner_lease(), lease);
+    }
+    let mut runs = builder.reborrow().init_runs(snapshot.runs.len() as u32);
+    for (index, run) in snapshot.runs.iter().enumerate() {
+        encode_run(runs.reborrow().get(index as u32), run);
     }
     Ok(())
 }
@@ -138,6 +191,11 @@ fn decode_snapshot(
         .iter()
         .map(decode_attachment)
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let runs = reader
+        .get_runs()?
+        .iter()
+        .map(decode_run)
+        .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(BrainSnapshot {
         brain_id: parse_brain_id(reader.get_brain_id()?)?,
         name: text(reader.get_name()?)?,
@@ -152,6 +210,7 @@ fn decode_snapshot(
             .transpose()?
             .map(decode_runner_lease)
             .transpose()?,
+        runs,
     })
 }
 
@@ -252,6 +311,51 @@ fn decode_program(
     })
 }
 
+fn encode_run(mut builder: finch_ipc_capnp::brain_run::Builder<'_>, run: &BrainRun) {
+    builder.set_run_id(&run.run_id.0.to_string());
+    builder.set_kind(run_kind_to_capnp(run.kind));
+    if let Some(parent_run_id) = run.parent_run_id {
+        builder.set_has_parent_run_id(true);
+        builder.set_parent_run_id(&parent_run_id.0.to_string());
+    }
+    builder.set_request_seq(run.request_seq);
+    builder.set_initiating_attachment_id(&run.initiating_attachment_id.0.to_string());
+    builder.set_initiated_by(&run.initiated_by);
+    builder.set_status(run_status_to_capnp(run.status));
+    builder.set_started_ms(run.started_ms);
+    builder.set_updated_ms(run.updated_ms);
+    if let Some(detail) = &run.detail {
+        builder.set_has_detail(true);
+        builder.set_detail(detail);
+    }
+}
+
+fn decode_run(reader: finch_ipc_capnp::brain_run::Reader<'_>) -> anyhow::Result<BrainRun> {
+    Ok(BrainRun {
+        run_id: RunId(parse_uuid(reader.get_run_id()?)?),
+        kind: run_kind_from_capnp(reader.get_kind()?),
+        parent_run_id: reader
+            .get_has_parent_run_id()
+            .then(|| reader.get_parent_run_id())
+            .transpose()?
+            .map(parse_uuid)
+            .transpose()?
+            .map(RunId),
+        request_seq: reader.get_request_seq(),
+        initiating_attachment_id: AttachmentId(parse_uuid(reader.get_initiating_attachment_id()?)?),
+        initiated_by: text(reader.get_initiated_by()?)?,
+        status: run_status_from_capnp(reader.get_status()?),
+        started_ms: reader.get_started_ms(),
+        updated_ms: reader.get_updated_ms(),
+        detail: reader
+            .get_has_detail()
+            .then(|| reader.get_detail())
+            .transpose()?
+            .map(text)
+            .transpose()?,
+    })
+}
+
 fn encode_event(
     mut builder: finch_ipc_capnp::brain_event::Builder<'_>,
     event: &BrainEvent,
@@ -288,6 +392,20 @@ fn encode_event(
             let mut detached = builder.init_client_detached();
             detached.set_attachment_id(&attachment_id.0.to_string());
             detached.set_connection_id(&connection_id.0.to_string());
+        }
+        BrainEventKind::RunStarted { run } => encode_run(builder.init_run_started(), run),
+        BrainEventKind::RunStatusChanged {
+            run_id,
+            status,
+            detail,
+        } => {
+            let mut changed = builder.init_run_status_changed();
+            changed.set_run_id(&run_id.0.to_string());
+            changed.set_status(run_status_to_capnp(*status));
+            if let Some(detail) = detail {
+                changed.set_has_detail(true);
+                changed.set_detail(detail);
+            }
         }
         BrainEventKind::Prompt { text } => builder.set_prompt(text),
         BrainEventKind::ToolCall {
@@ -401,6 +519,22 @@ fn decode_event(reader: finch_ipc_capnp::brain_event::Reader<'_>) -> anyhow::Res
             BrainEventKind::ClientDetached {
                 attachment_id: AttachmentId(parse_uuid(detached.get_attachment_id()?)?),
                 connection_id: ConnectionId(parse_uuid(detached.get_connection_id()?)?),
+            }
+        }
+        Which::RunStarted(run) => BrainEventKind::RunStarted {
+            run: decode_run(run?)?,
+        },
+        Which::RunStatusChanged(changed) => {
+            let changed = changed?;
+            BrainEventKind::RunStatusChanged {
+                run_id: RunId(parse_uuid(changed.get_run_id()?)?),
+                status: run_status_from_capnp(changed.get_status()?),
+                detail: changed
+                    .get_has_detail()
+                    .then(|| changed.get_detail())
+                    .transpose()?
+                    .map(text)
+                    .transpose()?,
             }
         }
         Which::Prompt(value) => BrainEventKind::Prompt {
@@ -554,6 +688,25 @@ mod tests {
                 attachment_id,
                 connection_id,
             },
+            BrainEventKind::RunStarted {
+                run: BrainRun {
+                    run_id: RunId(uuid::Uuid::new_v4()),
+                    kind: BrainRunKind::Interactive,
+                    parent_run_id: None,
+                    request_seq: 5,
+                    initiating_attachment_id: attachment_id,
+                    initiated_by: "alice@laptop.local".into(),
+                    status: BrainRunStatus::Running,
+                    started_ms: 100,
+                    updated_ms: 100,
+                    detail: None,
+                },
+            },
+            BrainEventKind::RunStatusChanged {
+                run_id: RunId(uuid::Uuid::new_v4()),
+                status: BrainRunStatus::Interrupted,
+                detail: Some("runner disconnected".into()),
+            },
             BrainEventKind::Prompt {
                 text: "inspect it".into(),
             },
@@ -652,6 +805,18 @@ mod tests {
                     connection_id: Some(connection_id),
                 }],
                 runner_lease: Some(lease),
+                runs: vec![BrainRun {
+                    run_id: RunId(uuid::Uuid::new_v4()),
+                    kind: BrainRunKind::Interactive,
+                    parent_run_id: None,
+                    request_seq: 1,
+                    initiating_attachment_id: attachment_id,
+                    initiated_by: "alice@laptop.local".into(),
+                    status: BrainRunStatus::Completed,
+                    started_ms: 100,
+                    updated_ms: 200,
+                    detail: None,
+                }],
             },
         };
         let encoded = encode_brain_wire_message(&expected).unwrap();

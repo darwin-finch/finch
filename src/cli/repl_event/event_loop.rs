@@ -4412,6 +4412,7 @@ Rules:\n\
             BrainEventKind::ClientDetached { attachment_id, .. } => self
                 .output_manager
                 .write_info(format!("attachment {} disconnected", attachment_id.0)),
+            BrainEventKind::RunStarted { .. } | BrainEventKind::RunStatusChanged { .. } => {}
             BrainEventKind::Prompt { text } => self
                 .output_manager
                 .write_user(format!("{}: {text}", event.sender)),

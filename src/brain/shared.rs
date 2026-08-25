@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 7;
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 8;
 const BRAIN_METADATA_VERSION: u32 = 1;
 
 /// Stable identity of one durable Brain. Names are mutable human aliases;
@@ -70,6 +70,60 @@ impl RunnerLeaseId {
     fn new() -> Self {
         Self(uuid::Uuid::new_v4())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RunId(pub uuid::Uuid);
+
+impl RunId {
+    fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrainRunKind {
+    Interactive,
+    Speculative,
+    Scheduled,
+    Subagent,
+    Maintenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrainRunStatus {
+    QueuedForEnvironment,
+    Running,
+    AwaitingApproval,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl BrainRunStatus {
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainRun {
+    pub run_id: RunId,
+    pub kind: BrainRunKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<RunId>,
+    pub request_seq: u64,
+    pub initiating_attachment_id: AttachmentId,
+    pub initiated_by: String,
+    pub status: BrainRunStatus,
+    pub started_ms: u64,
+    pub updated_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +220,15 @@ pub enum BrainEventKind {
         #[serde(default)]
         connection_id: ConnectionId,
     },
+    RunStarted {
+        run: BrainRun,
+    },
+    RunStatusChanged {
+        run_id: RunId,
+        status: BrainRunStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     Prompt {
         text: String,
     },
@@ -254,6 +317,8 @@ pub struct BrainSnapshot {
     pub program_stack: Vec<BrainProgram>,
     pub attachments: Vec<BrainAttachment>,
     pub runner_lease: Option<BrainRunnerLease>,
+    #[serde(default)]
+    pub runs: Vec<BrainRun>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -268,6 +333,7 @@ struct BrainState {
     events: Vec<BrainEvent>,
     program_stack: Vec<BrainProgram>,
     attachments: HashMap<AttachmentId, BrainAttachment>,
+    runs: HashMap<RunId, BrainRun>,
     runner_lease: Option<BrainRunnerLease>,
     runtime_checkpoint: Option<RuntimeCheckpointState>,
     runtime_commit_count: u64,
@@ -289,6 +355,7 @@ impl BrainState {
             events: Vec::new(),
             program_stack: Vec::new(),
             attachments: HashMap::new(),
+            runs: HashMap::new(),
             runner_lease: None,
             runtime_checkpoint: None,
             runtime_commit_count: 0,
@@ -349,6 +416,20 @@ impl BrainState {
                         attachment.connected = false;
                         attachment.connection_id = None;
                     }
+                }
+            }
+            BrainEventKind::RunStarted { run } => {
+                self.runs.insert(run.run_id, run.clone());
+            }
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status,
+                detail,
+            } => {
+                if let Some(run) = self.runs.get_mut(run_id) {
+                    run.status = *status;
+                    run.updated_ms = event.created_ms;
+                    run.detail.clone_from(detail);
                 }
             }
             BrainEventKind::Program { language, source } => {
@@ -514,7 +595,72 @@ impl SharedBrainStore {
                 .runner_lease
                 .clone()
                 .filter(|lease| lease.expires_ms > unix_millis()),
+            runs: sorted_runs(&state.runs),
         })
+    }
+
+    pub fn start_run(
+        &self,
+        name: &str,
+        sender: &str,
+        kind: BrainRunKind,
+        request_seq: u64,
+        initiating_attachment_id: AttachmentId,
+        status: BrainRunStatus,
+    ) -> Result<BrainRun> {
+        let now = unix_millis();
+        let run = BrainRun {
+            run_id: RunId::new(),
+            kind,
+            parent_run_id: None,
+            request_seq,
+            initiating_attachment_id,
+            initiated_by: sender.trim().to_string(),
+            status,
+            started_ms: now,
+            updated_ms: now,
+            detail: None,
+        };
+        self.push(
+            name,
+            sender,
+            BrainEventKind::RunStarted { run: run.clone() },
+        )?;
+        Ok(run)
+    }
+
+    pub fn transition_run(
+        &self,
+        name: &str,
+        sender: &str,
+        run_id: RunId,
+        status: BrainRunStatus,
+        detail: Option<String>,
+    ) -> Result<BrainRun> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).expect("brain loaded above");
+        let current = state
+            .runs
+            .get(&run_id)
+            .with_context(|| format!("Brain run {} does not exist", run_id.0))?;
+        validate_run_transition(current.status, status)?;
+        self.push_locked(
+            name,
+            state,
+            sender,
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status,
+                detail,
+            },
+        )?;
+        Ok(state
+            .runs
+            .get(&run_id)
+            .expect("run transition was projected")
+            .clone())
     }
 
     pub fn acquire_runner_lease(
@@ -1496,6 +1642,33 @@ fn sorted_attachments(
     attachments
 }
 
+fn sorted_runs(runs: &HashMap<RunId, BrainRun>) -> Vec<BrainRun> {
+    let mut runs = runs.values().cloned().collect::<Vec<_>>();
+    runs.sort_by_key(|run| (run.request_seq, run.run_id.0));
+    runs
+}
+
+fn validate_run_transition(from: BrainRunStatus, to: BrainRunStatus) -> Result<()> {
+    use BrainRunStatus::*;
+    let allowed = match from {
+        QueuedForEnvironment => matches!(to, Running | Cancelled | Failed),
+        Running => matches!(
+            to,
+            AwaitingApproval | Completed | Failed | Cancelled | Interrupted
+        ),
+        AwaitingApproval => matches!(to, Running | Failed | Cancelled | Interrupted),
+        Interrupted => matches!(to, Running | Failed | Cancelled),
+        Completed | Failed | Cancelled => false,
+    };
+    if !allowed {
+        anyhow::bail!("invalid Brain run transition from {from:?} to {to:?}");
+    }
+    if from.is_terminal() {
+        anyhow::bail!("terminal Brain run cannot transition");
+    }
+    Ok(())
+}
+
 const fn initial_environment_generation() -> u64 {
     1
 }
@@ -1507,6 +1680,69 @@ const fn legacy_brain_event_schema_version() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_lifecycle_is_event_sourced_and_terminal_state_is_final() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let prompt = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "inspect".into(),
+                },
+            )
+            .unwrap();
+        let run = store
+            .start_run(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                prompt.seq,
+                attachment.attachment_id,
+                BrainRunStatus::QueuedForEnvironment,
+            )
+            .unwrap();
+        store
+            .transition_run(
+                "shared",
+                "runner",
+                run.run_id,
+                BrainRunStatus::Running,
+                None,
+            )
+            .unwrap();
+        store
+            .transition_run(
+                "shared",
+                "runner",
+                run.run_id,
+                BrainRunStatus::Completed,
+                None,
+            )
+            .unwrap();
+        assert!(store
+            .transition_run(
+                "shared",
+                "runner",
+                run.run_id,
+                BrainRunStatus::Running,
+                None,
+            )
+            .is_err());
+
+        drop(store);
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restored = &restarted.snapshot("shared").unwrap().runs[0];
+        assert_eq!(restored.run_id, run.run_id);
+        assert_eq!(restored.request_seq, prompt.seq);
+        assert_eq!(restored.status, BrainRunStatus::Completed);
+        assert!(restored.updated_ms >= restored.started_ms);
+    }
 
     #[test]
     fn program_stack_is_rebuilt_from_the_event_log() {

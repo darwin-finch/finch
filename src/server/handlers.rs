@@ -807,7 +807,9 @@ async fn push_named_brain_event(
         | BrainEventKind::RunnerLeaseAcquired { .. }
         | BrainEventKind::RunnerLeaseReleased { .. }
         | BrainEventKind::ClientAttached { .. }
-        | BrainEventKind::ClientDetached { .. } => None,
+        | BrainEventKind::ClientDetached { .. }
+        | BrainEventKind::RunStarted { .. }
+        | BrainEventKind::RunStatusChanged { .. } => None,
     };
     let result = match result {
         Some(result) => Some(result.map_err(|error| AppError(error).into_response())?),
@@ -1169,6 +1171,8 @@ fn named_brain_provider_messages(snapshot: &crate::brain::shared::BrainSnapshot)
                     | BrainEventKind::RunnerLeaseReleased { .. }
                     | BrainEventKind::ClientAttached { .. }
                     | BrainEventKind::ClientDetached { .. }
+                    | BrainEventKind::RunStarted { .. }
+                    | BrainEventKind::RunStatusChanged { .. }
             )
         })
         .take(80)
@@ -1241,7 +1245,9 @@ fn named_brain_provider_messages(snapshot: &crate::brain::shared::BrainSnapshot)
             | BrainEventKind::RunnerLeaseAcquired { .. }
             | BrainEventKind::RunnerLeaseReleased { .. }
             | BrainEventKind::ClientAttached { .. }
-            | BrainEventKind::ClientDetached { .. } => unreachable!("filtered above"),
+            | BrainEventKind::ClientDetached { .. }
+            | BrainEventKind::RunStarted { .. }
+            | BrainEventKind::RunStatusChanged { .. } => unreachable!("filtered above"),
         })
         .collect::<Vec<_>>();
 
@@ -2579,6 +2585,7 @@ mod named_brain_provider_context_tests {
             program_stack: Vec::new(),
             attachments: Vec::new(),
             runner_lease: None,
+            runs: Vec::new(),
         };
 
         let messages = named_brain_provider_messages(&snapshot);
@@ -2662,6 +2669,7 @@ mod named_brain_provider_context_tests {
             program_stack: Vec::new(),
             attachments: Vec::new(),
             runner_lease: None,
+            runs: Vec::new(),
         };
 
         let messages = named_brain_provider_messages(&snapshot);
