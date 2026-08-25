@@ -466,8 +466,9 @@ workspace against the Brain environment. VM host effects already resume against 
 `(execution_id, sequence)` pair; Brain approval continuations are now keyed by exact
 `(brain_id, request_seq, approval_id)` identity so a stale sequence cannot consume a live request.
 Tool inputs and approval detail/decision values use the recursive schema-native `JsonValue` union
-rather than opaque JSON bytes. Canonical provider context and typed-runtime checkpoints remain
-explicitly versioned payload boundaries pending native schemas. A cloneable in-process
+rather than opaque JSON bytes. Canonical provider context crosses the runner callback as typed
+`List(Message)`, with structured tool inputs preserved. Typed-runtime checkpoints remain the only
+transitional JSON blob in that callback pending a native schema. A cloneable in-process
 `BrainLifecycleService` now owns attachment
 reservation and expiry, watch activation, acknowledgement, detach cleanup, participant submission,
 queued-run resumption, and runner-lease lifetime. Embedded hosts call this boundary directly; local

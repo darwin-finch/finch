@@ -773,7 +773,9 @@ still blocks the corresponding Brain phase until it is unified.
   unsigned, float, string, list, and object preservation. VM effects resume against exact
   `(execution_id, sequence)` identity, and Brain approvals now use exact
   `(brain_id, request_seq, approval_id)` keys so stale decisions cannot consume live continuations.
-  Checkpoint/context blobs remain explicitly versioned payload boundaries pending native schemas.
+  Provider context now crosses the runner callback as typed `List(Message)`, and tool inputs in both
+  Brain context and ordinary query/stream IPC use `JsonValue`. Typed-runtime checkpoints remain the
+  only transitional JSON blob in the Brain callback, pending a native checkpoint schema.
 - [ ] Define Brain initialization as a reviewed typed program/module with an explicit capability
   budget and journaled effects. Deterministic VM vocabulary/module loading may occur before a
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work
