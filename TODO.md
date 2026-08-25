@@ -695,8 +695,11 @@ still blocks the corresponding Brain phase until it is unified.
   revision. A two-console test on 2026-08-24 also passed restart/checkpoint restoration and a real
   configured-Grok prompt. A subsequent live Grok test preserved an invalid first Lisp program and
   its `E-TYPE-006` result, accepted exactly one source-only correction, produced the expected value,
-  and restored the shared definition after another daemon restart. Durable per-client
-  acknowledgement cursors and scoped participant roles remain separate items below.
+  and restored the shared definition after another daemon restart. Attachments now also have
+  durable daemon-owned acknowledgement cursors, role-bound submission, per-connection identity,
+  conflict-safe reconnect/detach, and a status display derived from the authoritative role. A live
+  driver/consultant test shared a Lisp definition, rejected consultant program submission, retained
+  its cursor across reconnect, and observed a WebSocket close as a durable detach event.
 - [ ] After the VM gate, launch each local active Brain runner in a named `tmux` session by default
   on Unix. Keep the daemon as a durable event-log/coordinator with no workspace, accessibility, or
   credential handles; the master frontend runner is the only environment authority. Recover only
@@ -712,12 +715,19 @@ still blocks the corresponding Brain phase until it is unified.
   symbols acquire shared meaning. It may inform a provider manifest and be refined through
   explicit proposals, but it must never silently redefine core words or execute as ambient boot
   poetry.
-- [ ] Add per-brain control ownership/leases and participant roles. Make the current attachment
-  role explicit in every console status bar and permission/proposal view: `runner` (the one
-  environment-owning executor), `driver` (may queue prompts/programs), `consultant` (may push
-  bounded context/reviews), or `observer` (read-only). Approval/control scopes remain separate
-  from these roles. Only the bound environment may execute workspace effects or reveal/rotate its
-  credential.
+- [x] Add the first per-Brain runner lease and participant-role substrate. Attachments persist as
+  `runner`, `driver`, `consultant`, or `observer`; remote attachment creation cannot mint runners;
+  roles constrain submission; and the status/list projections report the authoritative role and
+  live runner. The exclusive runner lease expires, renews without event-log heartbeat spam, is
+  bound to an exact environment generation, and emits a durable release on expiry.
+- [ ] Complete Brain control and approval ownership above that substrate. Put the role and approval
+  audience on every permission/proposal view, add scoped participant credentials, and dispatch
+  actual execution to the leased environment frontend. The named-Brain HTTP handler still executes
+  pure compatibility programs inside the daemon; a lease currently reports liveness but does not
+  delegate ProgramRuns or grant workspace authority.
+- [ ] Persist a frontend attachment identity across frontend process restarts, not merely reconnects
+  in one process, while keeping the daemon cursor authoritative. Expire or clean up an attachment
+  that REST-attaches but crashes before its WebSocket activates, without advancing its cursor.
 - [ ] Add remote brain creation while preserving the invariant that one environment is an
   indivisible machine/workspace authority boundary.
 - [ ] Treat the global brain password as a local/bootstrap credential only. Mint scoped, revocable,

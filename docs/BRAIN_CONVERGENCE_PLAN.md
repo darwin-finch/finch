@@ -113,9 +113,12 @@ authoritative Brain.
 ### Transport-specific lifecycle paths
 
 Named-Brain HTTP/WebSocket attachment and local frontend registration currently address the one
-durable namespace. The ordinary frontend/daemon Cap'n Proto channel still lacks typed Brain event,
-cursor, lease, and effect-resume operations; those should become adapters over one service after the
-VM gate rather than reviving transport-owned spawn/list/respond lifecycles.
+durable namespace. Attachments now have daemon-authoritative identities, roles, connection leases,
+and monotonically acknowledged event cursors that survive reconnect and daemon restart. Each Brain
+also has an exclusive, expiring runner lease bound to its exact environment generation. The
+ordinary frontend/daemon Cap'n Proto channel still lacks typed Brain event, cursor, lease, and
+effect-resume operations; those should become adapters over one service rather than reviving
+transport-owned spawn/list/respond lifecycles.
 
 The named-Brain HTTP compatibility handler no longer replays the accumulated program stack through
 the old Co-Forth or native Lisp evaluators. Program events and raw provider-wire responses enter one
@@ -134,6 +137,13 @@ cancellation, or runtime-limit failures.
 This remains a compatibility adapter, not the final runner-lease architecture: it has no approval
 audience and therefore cannot acquire workspace/host grants. B2-B4 must move its runtime ownership
 to the leased environment runner and retain the daemon as durable coordinator only.
+
+On 2026-08-24 a live attachment test used separate driver and consultant consoles against one
+Brain. The driver defined and invoked a shared Lisp word, the consultant was forbidden from
+submitting a program, acknowledged cursors survived reconnect, stale connection acknowledgements
+returned a conflict, and WebSocket close produced a durable detach event. A short runner lease was
+also observed expiring into a durable release event. This validates the compatibility transport and
+lease state machine, not yet environment-runner execution delegation.
 
 ## Target model
 
@@ -329,7 +339,8 @@ Exit: existing behavior is measurable before consolidation.
 
 ### B1: Canonical identity and event schema
 
-- Add stable `BrainId`, `RunId`, attachment ID, request ID, and revision types.
+- Stable `BrainId`, attachment ID, connection ID, runner-lease ID, and revision types are present.
+  Add canonical `RunId` and request ID coverage to the remaining run lifecycle.
 - Version the expanded event envelope and projection rules.
 - Add migrations for existing named JSONL logs and ephemeral summaries.
 
@@ -363,6 +374,11 @@ Exit: every background activity has identical lifecycle and ancestry semantics.
   event/cursor/run service.
 
 Exit: the transport conformance suite produces equivalent events and outcomes.
+
+Current compatibility status: HTTP/WebSocket implement authenticated attachment, cursor, role, and
+runner-lease operations. They are test scaffolding for this phase, not permission to preserve a
+second service implementation. Cap'n Proto, embedded mode, and the ordinary local daemon client do
+not yet implement the same typed contract.
 
 ### B5: Client projections and shadow-buffer UI
 
