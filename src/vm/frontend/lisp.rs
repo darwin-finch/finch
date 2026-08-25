@@ -3557,6 +3557,38 @@ impl Compiler<'_> {
                 Some(origin),
             )]);
         };
+        if word == "str-cat" && arguments.len() > signature.input.values.len() {
+            // Lisp knows the complete call arity at compile time. Lower its
+            // natural variadic spelling to the same binary `str-cat` word
+            // used by Co-Forth; the runtime never guesses how much of an
+            // ambient operand stack belongs to one call.
+            self.compile_expression_at(
+                &arguments[0],
+                argument_sources.and_then(|sources| sources.first()),
+                builder,
+            )?;
+            for (index, argument) in arguments.iter().enumerate().skip(1) {
+                self.compile_expression_at(
+                    argument,
+                    argument_sources.and_then(|sources| sources.get(index)),
+                    builder,
+                )?;
+                let concrete_signature =
+                    instantiate_signature_types(&signature, &builder.stack, &origin)
+                        .map_err(|diagnostic| vec![diagnostic])?;
+                apply_signature_types(&signature, &mut builder.stack, &origin)
+                    .map_err(|diagnostic| vec![diagnostic])?;
+                builder.effects = builder.effects.union(&signature.effects);
+                builder.merge_suspension(concrete_signature.suspension.as_ref(), &origin)?;
+                builder.emit(
+                    Instruction::Call {
+                        function: word.to_string(),
+                    },
+                    origin.clone(),
+                );
+            }
+            return Ok(builder.stack.pop().expect("str-cat leaves one string"));
+        }
         if arguments.len() != signature.input.values.len() {
             return Err(vec![self.error(
                 "E-TYPE-006",
@@ -4284,6 +4316,14 @@ mod tests {
         assert_eq!(
             run("(let ((a 10) (b 5)) (- a b))").unwrap(),
             vec![TypedValue::Int(5)]
+        );
+    }
+
+    #[test]
+    fn lowers_variadic_lisp_str_cat_to_binary_calls() {
+        assert_eq!(
+            run("(str-cat \"one\" \"-\" \"two\" \"-\" \"three\")").unwrap(),
+            vec![TypedValue::String("one-two-three".into())]
         );
     }
 
