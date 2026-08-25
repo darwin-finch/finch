@@ -75,7 +75,7 @@ pub fn static_fallback(provider: &str) -> Vec<String> {
 pub fn fallback_catalog(provider: &str, models_url: &str) -> ModelCatalog {
     ModelCatalog {
         provider: provider.to_string(),
-        models_url: models_url.to_string(),
+        models_url: cache_safe_url(models_url),
         models: static_fallback(provider),
         source: CatalogSource::StaticFallback,
         refreshed_at: Utc::now(),
@@ -135,12 +135,12 @@ pub async fn refresh(profile: &ModelCatalogProfile, cache_dir: &Path) -> Result<
 
     let catalog = ModelCatalog {
         provider: profile.provider.clone(),
-        models_url: profile.endpoints.models_url.clone(),
+        models_url: cache_safe_url(&profile.endpoints.models_url),
         models,
         source: CatalogSource::Discovered,
         refreshed_at: Utc::now(),
     };
-    write_cache(&catalog, cache_dir)?;
+    write_cache(&catalog, profile, cache_dir)?;
     Ok(catalog)
 }
 
@@ -177,26 +177,23 @@ pub fn read_cache(profile: &ModelCatalogProfile, cache_dir: &Path) -> Result<Opt
     };
     let mut catalog: ModelCatalog = serde_json::from_str(&contents)
         .with_context(|| format!("Invalid model catalogue cache {}", path.display()))?;
-    if catalog.provider != profile.provider || catalog.models_url != profile.endpoints.models_url {
+    if catalog.provider != profile.provider
+        || catalog.models_url != cache_safe_url(&profile.endpoints.models_url)
+    {
         return Ok(None);
     }
     catalog.source = CatalogSource::Cache;
     Ok(Some(catalog))
 }
 
-fn write_cache(catalog: &ModelCatalog, cache_dir: &Path) -> Result<()> {
+fn write_cache(
+    catalog: &ModelCatalog,
+    profile: &ModelCatalogProfile,
+    cache_dir: &Path,
+) -> Result<()> {
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("Failed to create {}", cache_dir.display()))?;
-    let profile = ModelCatalogProfile {
-        provider: catalog.provider.clone(),
-        api_key: String::new(),
-        endpoints: ProviderEndpoints {
-            chat_url: String::new(),
-            models_url: catalog.models_url.clone(),
-        },
-        auth: CatalogAuth::Bearer,
-    };
-    let path = cache_path(&profile, cache_dir);
+    let path = cache_path(profile, cache_dir);
     let json =
         serde_json::to_vec_pretty(catalog).context("Failed to encode model catalogue cache")?;
     std::fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))
@@ -209,6 +206,10 @@ fn cache_path(profile: &ModelCatalogProfile, cache_dir: &Path) -> PathBuf {
     hasher.update(profile.endpoints.models_url.as_bytes());
     let digest = format!("{:x}", hasher.finalize());
     cache_dir.join(format!("{}-{}.json", profile.provider, &digest[..16]))
+}
+
+fn cache_safe_url(url: &str) -> String {
+    url.split(['?', '#']).next().unwrap_or(url).to_string()
 }
 
 #[cfg(test)]
@@ -276,6 +277,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endpoint_query_credentials_are_used_but_not_cached() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/custom/catalog/models")
+            .match_query(Matcher::UrlEncoded(
+                "access_token".to_string(),
+                "query-secret".to_string(),
+            ))
+            .with_status(200)
+            .with_body(r#"{"data":[{"id":"query-auth-model"}]}"#)
+            .create_async()
+            .await;
+        let cache = tempfile::tempdir().unwrap();
+        let mut profile = profile(&server.url(), "openai", CatalogAuth::Bearer);
+        profile
+            .endpoints
+            .models_url
+            .push_str("?access_token=query-secret");
+        let catalog = refresh(&profile, cache.path()).await.unwrap();
+        mock.assert_async().await;
+        assert!(!catalog.models_url.contains("query-secret"));
+
+        let contents = std::fs::read_to_string(cache_path(&profile, cache.path())).unwrap();
+        assert!(!contents.contains("query-secret"));
+        assert!(read_cache(&profile, cache.path()).unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn failed_refresh_prefers_matching_cache_then_static_fallback() {
         let mut server = mockito::Server::new_async().await;
         let ok = server
@@ -307,5 +336,13 @@ mod tests {
         assert!(!static_fallback("claude")
             .iter()
             .any(|model| model == "claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn cache_metadata_drops_endpoint_query_credentials() {
+        assert_eq!(
+            cache_safe_url("https://models.example/v1/models?access_token=secret#fragment"),
+            "https://models.example/v1/models"
+        );
     }
 }
