@@ -286,6 +286,19 @@ impl BrainInitialization {
             "Brain initialization schedule must be a coalesced one-shot");
         Ok(())
     }
+
+    fn validate_schedule_due(
+        &self,
+        schedule: &BrainSchedule,
+        due: &BrainScheduleDue,
+    ) -> Result<()> {
+        self.validate_schedule(schedule)?;
+        anyhow::ensure!(due.language == schedule.language
+                && due.source == schedule.source
+                && due.grant_ceiling == schedule.grant_ceiling,
+            "Brain initialization delivery does not match its reviewed schedule");
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2112,6 +2125,20 @@ impl BrainStore {
                 initialization.validate_schedule(schedule)?;
             }
         }
+        if let BrainEventKind::ScheduleDue { due } = &kind {
+            if let Some(schedule) = state.schedules.get(&due.schedule_id) {
+                if schedule.module_identity.is_some() {
+                    let initialization = self
+                        .initializations
+                        .read()
+                        .expect("shared Brain initialization lock poisoned")
+                        .get(name)
+                        .cloned()
+                        .context("reviewed Brain initialization contract is not loaded")?;
+                    initialization.validate_schedule_due(schedule, due)?;
+                }
+            }
+        }
         let event = BrainEvent {
             schema_version: BRAIN_EVENT_SCHEMA_VERSION,
             brain_id: state.brain_id,
@@ -2436,6 +2463,7 @@ impl BrainStore {
         let brain_id = self.load_or_create_metadata(name)?.brain_id;
         let initialization = self.load_or_create_initialization(name, brain_id)?;
         let events = self.read_events(name)?;
+        let mut reviewed_schedules = HashMap::new();
         for event in &events {
             if event.schema_version > BRAIN_EVENT_SCHEMA_VERSION {
                 anyhow::bail!(
@@ -2454,6 +2482,19 @@ impl BrainStore {
                     initialization.validate_schedule(schedule).with_context(|| {
                         format!(
                             "Brain '{name}' event #{} contains an invalid reviewed-module schedule",
+                            event.seq
+                        )
+                    })?;
+                    reviewed_schedules.insert(schedule.schedule_id, schedule.clone());
+                }
+            }
+        }
+        for event in &events {
+            if let BrainEventKind::ScheduleDue { due } = &event.kind {
+                if let Some(schedule) = reviewed_schedules.get(&due.schedule_id) {
+                    initialization.validate_schedule_due(schedule, due).with_context(|| {
+                        format!(
+                            "Brain '{name}' event #{} contains an invalid reviewed-module delivery",
                             event.seq
                         )
                     })?;
@@ -3796,6 +3837,46 @@ mod tests {
         assert!(error
             .to_string()
             .contains("invalid reviewed-module schedule"));
+    }
+
+    #[test]
+    fn invalid_initialization_delivery_is_rejected_during_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        store
+            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .unwrap();
+        store.queue_due_schedules("shared", 10).unwrap();
+        drop(store);
+
+        let path = temp.path().join("shared/events.jsonl");
+        let encoded = std::fs::read_to_string(&path).unwrap();
+        let mut changed = false;
+        let tampered = encoded
+            .lines()
+            .map(|line| {
+                let mut event: serde_json::Value = serde_json::from_str(line).unwrap();
+                if event["kind"] == "schedule_due" {
+                    event["due"]["source"] = serde_json::Value::String(
+                        "(define (unreviewed-delivery) : int 2)".into(),
+                    );
+                    changed = true;
+                }
+                serde_json::to_string(&event).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(changed);
+        std::fs::write(&path, format!("{tampered}\n")).unwrap();
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let error = restarted.snapshot("shared").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid reviewed-module delivery"));
     }
 
     #[test]
