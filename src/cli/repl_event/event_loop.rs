@@ -1649,7 +1649,7 @@ impl EventLoop {
                     self.cleanup_old_queries().await;
                 }
 
-                // Structured session events from peers (Diff proposals, edits, accepts, rejects)
+                // Structured diff-review events (proposals, edits, accepts, rejects)
                 ev = self.peer_session_rx.recv() => {
                     match ev {
                         Ok(crate::session::SessionEvent::Diff { id, label, patch, description }) => {
@@ -1706,8 +1706,8 @@ impl EventLoop {
                                 tracing::warn!("TUI render after DiffReject failed: {e}");
                             }
                         }
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            // Other session events or lag — ignore here (handled elsewhere)
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // A newer review update will trigger another redraw.
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             // Channel closed — nothing to do
