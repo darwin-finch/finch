@@ -710,25 +710,77 @@ impl SharedBrainStore {
         initiating_attachment_id: AttachmentId,
         status: BrainRunStatus,
     ) -> Result<BrainRun> {
+        self.start_run_with_parent(
+            name,
+            sender,
+            kind,
+            request_seq,
+            initiating_attachment_id,
+            status,
+            None,
+        )
+    }
+
+    pub fn start_run_with_parent(
+        &self,
+        name: &str,
+        sender: &str,
+        kind: BrainRunKind,
+        request_seq: u64,
+        initiating_attachment_id: AttachmentId,
+        status: BrainRunStatus,
+        parent_run_id: Option<RunId>,
+    ) -> Result<BrainRun> {
+        let name = Self::validate_name(name)?;
+        let sender = validate_participant_subject("run initiator", sender)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        if !state.events.iter().any(|event| event.seq == request_seq) {
+            anyhow::bail!("Brain run request event {request_seq} does not exist");
+        }
+        if let Some(parent_run_id) = parent_run_id {
+            let parent = state
+                .runs
+                .get(&parent_run_id)
+                .with_context(|| format!("parent Brain run {} does not exist", parent_run_id.0))?;
+            if parent.status.is_terminal() {
+                anyhow::bail!("terminal Brain run cannot start a child");
+            }
+        }
         let now = unix_millis();
         let run = BrainRun {
             run_id: RunId::new(),
             kind,
-            parent_run_id: None,
+            parent_run_id,
             request_seq,
             initiating_attachment_id,
-            initiated_by: sender.trim().to_string(),
+            initiated_by: sender.to_string(),
             status,
             started_ms: now,
             updated_ms: now,
             detail: None,
         };
-        self.push(
+        self.push_locked(
             name,
+            state,
             sender,
             BrainEventKind::RunStarted { run: run.clone() },
         )?;
         Ok(run)
+    }
+
+    pub fn inspect_run(&self, name: &str, run_id: RunId) -> Result<BrainRun> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brains = self.brains.read().expect("shared brain lock poisoned");
+        brains
+            .get(name)
+            .context("Brain was removed concurrently")?
+            .runs
+            .get(&run_id)
+            .cloned()
+            .with_context(|| format!("Brain run {} does not exist", run_id.0))
     }
 
     pub fn transition_run(
@@ -2068,6 +2120,108 @@ mod tests {
         assert_eq!(restored.request_seq, prompt.seq);
         assert_eq!(restored.status, BrainRunStatus::Completed);
         assert!(restored.updated_ms >= restored.started_ms);
+    }
+
+    #[test]
+    fn run_ancestry_is_validated_and_survives_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let parent_request = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "parent".into(),
+                },
+            )
+            .unwrap();
+        let parent = store
+            .start_run(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                parent_request.seq,
+                attachment.attachment_id,
+                BrainRunStatus::Running,
+            )
+            .unwrap();
+        let child_request = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "child".into(),
+                },
+            )
+            .unwrap();
+        let child = store
+            .start_run_with_parent(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                child_request.seq,
+                attachment.attachment_id,
+                BrainRunStatus::QueuedForEnvironment,
+                Some(parent.run_id),
+            )
+            .unwrap();
+        assert_eq!(
+            store.inspect_run("shared", child.run_id).unwrap().parent_run_id,
+            Some(parent.run_id)
+        );
+        assert!(store
+            .start_run_with_parent(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                child_request.seq,
+                attachment.attachment_id,
+                BrainRunStatus::QueuedForEnvironment,
+                Some(RunId::new()),
+            )
+            .is_err());
+
+        drop(store);
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        assert_eq!(
+            restarted
+                .inspect_run("shared", child.run_id)
+                .unwrap()
+                .parent_run_id,
+            Some(parent.run_id)
+        );
+        restarted
+            .transition_run(
+                "shared",
+                "runner",
+                parent.run_id,
+                BrainRunStatus::Running,
+                None,
+            )
+            .unwrap();
+        restarted
+            .transition_run(
+                "shared",
+                "runner",
+                parent.run_id,
+                BrainRunStatus::Completed,
+                None,
+            )
+            .unwrap();
+        assert!(restarted
+            .start_run_with_parent(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                child_request.seq,
+                attachment.attachment_id,
+                BrainRunStatus::QueuedForEnvironment,
+                Some(parent.run_id),
+            )
+            .is_err());
     }
 
     #[test]

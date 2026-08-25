@@ -9,8 +9,8 @@ use tokio::sync::broadcast;
 
 use crate::brain::shared::{
     AttachmentId, AttachmentRole, BrainAttachment, BrainEnvironment, BrainEvent, BrainEventKind,
-    BrainRunnerHandoff, BrainRunnerLease, BrainSnapshot, ConnectionId, RunnerHandoffId,
-    RunnerLeaseId, SharedBrainStore,
+    BrainRun, BrainRunKind, BrainRunStatus, BrainRunnerHandoff, BrainRunnerLease, BrainSnapshot,
+    ConnectionId, RunId, RunnerHandoffId, RunnerLeaseId, SharedBrainStore,
 };
 
 use super::{handlers, AgentServer, BrainApprovalBroker, BrainRunnerBroker};
@@ -78,6 +78,31 @@ impl BrainLifecycleService {
 
     pub fn list(&self) -> Result<Vec<String>> {
         self.store.list()
+    }
+
+    pub fn start_run_with_parent(
+        &self,
+        brain: &str,
+        sender: &str,
+        kind: BrainRunKind,
+        request_seq: u64,
+        initiating_attachment_id: AttachmentId,
+        status: BrainRunStatus,
+        parent_run_id: Option<RunId>,
+    ) -> Result<BrainRun> {
+        self.store.start_run_with_parent(
+            brain,
+            sender,
+            kind,
+            request_seq,
+            initiating_attachment_id,
+            status,
+            parent_run_id,
+        )
+    }
+
+    pub fn inspect_run(&self, brain: &str, run_id: RunId) -> Result<BrainRun> {
+        self.store.inspect_run(brain, run_id)
     }
 
     pub fn attach(
