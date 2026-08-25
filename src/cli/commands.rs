@@ -55,6 +55,7 @@ pub enum Command {
     // Durable Brain sessions
     Brains,                        // /brains — list named, detachable sessions
     BrainRuns,                     // /brain runs — list runs in the attached Brain
+    BrainInitialize,               // /brain initialize — schedule reviewed initialization
     BrainRunCancel(String),        // /brain cancel <run-id-prefix>
     BrainSay(String),              // /say <text> — relay without scheduling an LLM turn
     BrainWho,                      // /who — list connected Brain participants
@@ -189,6 +190,7 @@ impl Command {
                 return Some(Command::Brains);
             }
             "/brain runs" | "/brain run list" => return Some(Command::BrainRuns),
+            "/brain initialize" => return Some(Command::BrainInitialize),
             "/who" | "/brain who" => return Some(Command::BrainWho),
             "/brain detach" => return Some(Command::BrainDetach),
             "/brain invite" => {
@@ -600,6 +602,7 @@ pub fn handle_command(
         // Brain commands are handled directly in REPL
         Command::Brains
         | Command::BrainRuns
+        | Command::BrainInitialize
         | Command::BrainRunCancel(_)
         | Command::BrainSay(_)
         | Command::BrainWho
@@ -779,6 +782,7 @@ pub fn format_help() -> String {
          {yellow_bold}🧠 Detachable Brains:{reset}\n\
          {cyan}  /brain list{reset}        List named Brain sessions ({gray}/brains{reset} also works)\n\
          {cyan}  /brain runs{reset}        List runs in the attached Brain\n\
+         {cyan}  /brain initialize{reset}  Schedule reviewed initialization (driver only)\n\
          {cyan}  /brain cancel <run>{reset} Cancel an initiated run by id prefix\n\
          {cyan}  /say <text>{reset}         Relay text without invoking the model\n\
          {cyan}  @finch <prompt>{reset}      Explicitly address the model in shared conversation\n\
@@ -1125,7 +1129,13 @@ mod tests {
                 "legacy command {removed} remains in help"
             );
         }
-        for supported in ["/say <text>", "@finch <prompt>", "/who", "/whois <subject>"] {
+        for supported in [
+            "/say <text>",
+            "@finch <prompt>",
+            "/who",
+            "/whois <subject>",
+            "/brain initialize",
+        ] {
             assert!(help.contains(supported), "supported command {supported} missing");
         }
     }
@@ -1183,6 +1193,10 @@ mod tests {
         ));
         assert!(matches!(Command::parse("/brain ls"), Some(Command::Brains)));
         assert!(matches!(Command::parse("/brain runs"), Some(Command::BrainRuns)));
+        assert!(matches!(
+            Command::parse("/brain initialize"),
+            Some(Command::BrainInitialize)
+        ));
         assert!(matches!(Command::parse("/who"), Some(Command::BrainWho)));
         assert!(matches!(
             Command::parse("/whois alice@workstation.local"),

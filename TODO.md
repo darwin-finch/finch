@@ -967,15 +967,15 @@ still blocks the corresponding Brain phase until it is unified.
   native checkpoint bootstrap/result transport through the replacement frontend callback. Durable
   checkpoint blobs now use that same Cap'n Proto graph and content hash; JSON is read only to
   migrate already-journaled historical hashes.
-- [ ] Define Brain initialization as a reviewed typed program/module with an explicit capability
+- [x] Define Brain initialization as a reviewed typed program/module with an explicit capability
   budget and journaled effects. Deterministic VM vocabulary/module loading may occur before a
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work
   must be separately scheduled/approved BrainRuns. Do not revive the legacy mutable
   `boot = true` Co-Forth registry as an ambient startup hook. The persisted, inert reviewed-module
-  contract and its restart-safe one-shot scheduling substrate exist, but the authenticated
-  driver-facing Cap'n Proto/remote command and CLI affordance remain intentionally unexposed until
-  they can reuse the transport-neutral lifecycle authorization path without minting a second
-  scheduling or authority mechanism.
+  contract and its restart-safe one-shot scheduling substrate are exposed only by the explicit
+  authenticated `/brain initialize` command. Local Cap'n Proto and remote clients reuse the
+  transport-neutral lifecycle authorization path: the exact active Driver attachment may schedule
+  the reviewed module, without minting a second scheduling or authority mechanism.
 - [x] Add the first per-Brain runner lease and participant-role substrate. Attachments persist as
   `runner`, `driver`, `consultant`, or `observer`; remote attachment creation cannot mint runners;
   roles constrain submission; and the status/list projections report the authoritative role and

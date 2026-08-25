@@ -2524,6 +2524,13 @@ Rules:\n\
                     Command::BrainRuns => {
                         self.handle_brain_runs().await?;
                     }
+                    Command::BrainInitialize => {
+                        if let Err(error) = self.handle_brain_initialize().await {
+                            self.output_manager
+                                .write_info(format!("brain initialize: {error}"));
+                            self.render_tui().await?;
+                        }
+                    }
                     Command::BrainRunCancel(prefix) => {
                         if let Err(error) = self.handle_brain_run_cancel(prefix).await {
                             self.output_manager
