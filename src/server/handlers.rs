@@ -567,43 +567,50 @@ async fn execute_named_brain_program(
     language: crate::brain::shared::ProgramLanguage,
     source: &str,
 ) -> anyhow::Result<String> {
-    let snapshot = server.shared_brains().snapshot(name)?;
-    ensure_named_brain_environment(server, &snapshot)?;
-    let runtime = server.shared_brains().program_runtime(name)?;
-    if !runtime.has_mcp_client() {
-        if let Some(client) = server.mcp_client().await? {
-            for diagnostic in runtime.bind_mcp_client(client).await? {
-                tracing::warn!(
-                    brain = name,
-                    "MCP tool was not published to named-Brain typed VM: {diagnostic}"
-                );
-            }
-        }
-    }
-    let language = match language {
-        crate::brain::shared::ProgramLanguage::Forth => crate::programs::ProgramLanguage::Forth,
-        crate::brain::shared::ProgramLanguage::Lisp => crate::programs::ProgramLanguage::Lisp,
-    };
-    let submission = crate::runtime::ProgramSubmission {
+    dispatch_named_brain_program(
+        server.shared_brains(),
+        server.brain_runners(),
+        name,
+        request_seq,
         language,
-        source_id: Some(format!("brain:{name}:event:{request_seq}")),
-        source: source.to_string(),
-        intent: format!("named Brain program event {request_seq}"),
-        effect: crate::programs::ExecutionEffect::Pure,
-        declared_capabilities: Vec::new(),
-        manifest_generation: runtime.manifest_generation(),
-        expected_revision: Some(runtime.revision()),
-        budget: None,
-    };
-    let outcome = resume_named_brain_yields(&runtime, runtime.submit_typed_only(submission).await?)
+        source,
+    )
+    .await
+}
+
+async fn dispatch_named_brain_program(
+    store: &crate::brain::shared::SharedBrainStore,
+    runners: &crate::server::BrainRunnerBroker,
+    name: &str,
+    request_seq: u64,
+    language: crate::brain::shared::ProgramLanguage,
+    source: &str,
+) -> anyhow::Result<String> {
+    let snapshot = store.snapshot(name)?;
+    ensure_named_brain_store_environment(store, &snapshot)?;
+    let lease = snapshot
+        .runner_lease
+        .filter(|lease| {
+            lease.environment_generation == snapshot.environment.generation
+                && lease.expires_ms > crate::brain::shared::unix_millis()
+        })
+        .ok_or_else(|| anyhow::anyhow!("named Brain '{name}' has no live environment runner"))?;
+    let outcome = runners
+        .dispatch_program(
+            name,
+            lease.lease_id,
+            request_seq,
+            language,
+            source.to_string(),
+        )
         .await?;
-    if outcome.status != crate::runtime::outcome::ExecutionStatus::Completed {
-        anyhow::bail!(render_named_brain_failure(&outcome));
-    }
-    server
-        .shared_brains()
-        .commit_runtime(name, request_seq, outcome.output_revision, &runtime)?;
-    Ok(render_named_brain_output(&outcome))
+    store.commit_runner_runtime(
+        name,
+        request_seq,
+        outcome.runtime_revision,
+        outcome.checkpoint,
+    )?;
+    Ok(outcome.output)
 }
 
 async fn execute_named_brain_prompt(
@@ -804,51 +811,18 @@ fn named_brain_provider_messages(
         .collect()
 }
 
-async fn resume_named_brain_yields(
-    runtime: &crate::runtime::ProgramRuntime,
-    mut outcome: crate::runtime::outcome::ExecutionOutcome,
-) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
-    while outcome.status == crate::runtime::outcome::ExecutionStatus::Suspended
-        && matches!(
-            runtime.pending_typed_execution(outcome.execution_id)?,
-            Some(crate::runtime::PendingTypedExecutionInfo {
-                reason: crate::runtime::PendingTypedReason::Yielded,
-                yielded_value: Some(crate::programs::ProgramValue::Nil),
-                ..
-            })
-        )
-    {
-        tokio::task::yield_now().await;
-        outcome = runtime.resume_typed_execution(outcome.execution_id).await?;
-    }
-    Ok(outcome)
-}
-
-fn render_named_brain_output(outcome: &crate::runtime::outcome::ExecutionOutcome) -> String {
-    if !outcome.output.is_empty() {
-        outcome.output.clone()
-    } else if outcome.values.is_empty() {
-        String::new()
-    } else {
-        serde_json::to_string(&outcome.values).unwrap_or_else(|_| format!("{:?}", outcome.values))
-    }
-}
-
-fn render_named_brain_failure(outcome: &crate::runtime::outcome::ExecutionOutcome) -> String {
-    if !outcome.diagnostics.is_empty() {
-        outcome.diagnostics.join("; ")
-    } else if !outcome.required_capabilities.is_empty() {
-        format!("named Brain program requires approval: {:?}", outcome.required_capabilities)
-    } else {
-        format!("named Brain program stopped with {:?}", outcome.status)
-    }
-}
-
 fn ensure_named_brain_environment(
     server: &AgentServer,
     snapshot: &crate::brain::shared::BrainSnapshot,
 ) -> anyhow::Result<()> {
-    let configured = server.shared_brains().environment();
+    ensure_named_brain_store_environment(server.shared_brains(), snapshot)
+}
+
+fn ensure_named_brain_store_environment(
+    store: &crate::brain::shared::SharedBrainStore,
+    snapshot: &crate::brain::shared::BrainSnapshot,
+) -> anyhow::Result<()> {
+    let configured = store.environment();
     if &snapshot.environment != configured {
         anyhow::bail!("brain environment generation does not match this execution host");
     }
@@ -2137,5 +2111,116 @@ mod named_brain_provider_context_tests {
         ));
         assert!(!attachment_can_submit(AttachmentRole::Observer, &prompt));
         assert!(!attachment_can_submit(AttachmentRole::Runner, &program));
+    }
+
+    #[tokio::test]
+    async fn named_brain_program_runs_on_registered_frontend_and_commits_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::shared::SharedBrainStore::with_root(
+            "box.local",
+            Some(temp.path().into()),
+        );
+        let generation = store.environment().generation;
+        let lease = store
+            .acquire_runner_lease("shared", "console", generation, None, 60_000)
+            .unwrap();
+        let runners = crate::server::BrainRunnerBroker::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, tx);
+        tokio::spawn(async move {
+            let request = rx.recv().await.unwrap();
+            assert_eq!(request.source, "(define (double (n : int)) : int (* n 2))");
+            let runtime = crate::runtime::ProgramRuntime::new();
+            let outcome = runtime
+                .submit_typed_only(crate::runtime::ProgramSubmission {
+                    language: crate::programs::ProgramLanguage::Lisp,
+                    source_id: Some("frontend-test".into()),
+                    source: request.source,
+                    intent: "frontend runner test".into(),
+                    effect: crate::programs::ExecutionEffect::Pure,
+                    declared_capabilities: Vec::new(),
+                    manifest_generation: runtime.manifest_generation(),
+                    expected_revision: Some(runtime.revision()),
+                    budget: None,
+                })
+                .await
+                .unwrap();
+            let checkpoint = runtime
+                .revision_history()
+                .unwrap()
+                .into_iter()
+                .find(|snapshot| snapshot.revision == outcome.output_revision)
+                .and_then(|snapshot| snapshot.checkpoint)
+                .unwrap();
+            request
+                .response_tx
+                .send(Ok(crate::server::RunnerProgramResult {
+                    output: "frontend completed".into(),
+                    runtime_revision: outcome.output_revision,
+                    checkpoint,
+                }))
+                .unwrap();
+        });
+
+        let output = dispatch_named_brain_program(
+            &store,
+            &runners,
+            "shared",
+            41,
+            ProgramLanguage::Lisp,
+            "(define (double (n : int)) : int (* n 2))",
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, "frontend completed");
+
+        let restored = store.program_runtime("shared").unwrap();
+        let called = restored
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Forth,
+                source_id: Some("daemon-check".into()),
+                source: "21 double".into(),
+                intent: "verify committed runner checkpoint".into(),
+                effect: crate::programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: restored.manifest_generation(),
+                expected_revision: Some(restored.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            called.values.as_slice(),
+            [crate::programs::ProgramValue::Int(42)]
+        ));
+        assert!(store.snapshot("shared").unwrap().events.iter().any(|event| {
+            matches!(
+                event.kind,
+                BrainEventKind::RuntimeCommitted { request_seq: 41, .. }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn named_brain_program_requires_callback_for_the_live_lease() {
+        let store = crate::brain::shared::SharedBrainStore::with_root("box.local", None);
+        let generation = store.environment().generation;
+        store
+            .acquire_runner_lease("shared", "console", generation, None, 60_000)
+            .unwrap();
+        let error = dispatch_named_brain_program(
+            &store,
+            &crate::server::BrainRunnerBroker::default(),
+            "shared",
+            1,
+            ProgramLanguage::Forth,
+            "21 2 *",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("no connected runner callback"));
+        assert!(!store.snapshot("shared").unwrap().events.iter().any(|event| {
+            matches!(event.kind, BrainEventKind::RuntimeCommitted { .. })
+        }));
     }
 }
