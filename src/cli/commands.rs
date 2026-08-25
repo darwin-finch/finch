@@ -731,6 +731,7 @@ pub fn format_help() -> String {
          {cyan}  /brain runs{reset}        List runs in the attached Brain\n\
          {cyan}  /brain cancel <run>{reset} Cancel an initiated run by id prefix\n\
          {cyan}  /say <text>{reset}         Relay text without invoking the model\n\
+         {cyan}  @finch <prompt>{reset}      Explicitly address the model in shared conversation\n\
          {cyan}  /who{reset}                List connected participants in this Brain\n\
          {cyan}  /whois <subject>{reset}    Show public presence for one participant\n\
          {cyan}  /brain create <name>[@machine]{reset} Create an empty Brain in that environment\n\

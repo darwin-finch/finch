@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::cli::messages::{
-    LiveToolMessage, MessageRef, OperationMessage, StaticMessage, StreamingResponseMessage,
-    UserQueryMessage, WorkUnit,
+    BrainParticipantMessage, LiveToolMessage, MessageRef, OperationMessage, StaticMessage,
+    StreamingResponseMessage, UserQueryMessage, WorkUnit,
 };
 use crate::runtime::VmEffectEnvelope;
 use crate::vm::{HostSideEffect, TypedValue, UiOperation, VmSideEffect};
@@ -335,6 +335,22 @@ impl OutputManager {
     /// Write a user message
     pub fn write_user(&self, content: impl Into<String>) {
         let msg = Arc::new(UserQueryMessage::new(content));
+        self.add_trait_message(msg);
+    }
+
+    /// Project an attributed shared-Brain participant message. `invokes_model`
+    /// distinguishes an addressed prompt from relay-only conversation.
+    pub fn write_brain_participant(
+        &self,
+        subject: impl Into<String>,
+        content: impl Into<String>,
+        invokes_model: bool,
+    ) {
+        let msg = Arc::new(BrainParticipantMessage::new(
+            subject,
+            content,
+            invokes_model,
+        ));
         self.add_trait_message(msg);
     }
 

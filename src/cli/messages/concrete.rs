@@ -103,6 +103,95 @@ impl Message for UserQueryMessage {
 }
 
 // ============================================================================
+// BrainParticipantMessage - attributed shared-Brain conversation event
+// ============================================================================
+
+/// An attributed message projected from a shared Brain. Prompt messages are
+/// visibly addressed to the model; relay messages are conversation-only. A
+/// stable participant-derived background lets multiple humans share one
+/// transcript without conflating their turns with local system information.
+pub struct BrainParticipantMessage {
+    id: MessageId,
+    subject: String,
+    content: String,
+    invokes_model: bool,
+}
+
+impl BrainParticipantMessage {
+    pub fn new(
+        subject: impl Into<String>,
+        content: impl Into<String>,
+        invokes_model: bool,
+    ) -> Self {
+        Self {
+            id: MessageId::new(),
+            subject: subject.into(),
+            content: content.into(),
+            invokes_model,
+        }
+    }
+
+    fn palette_index(&self) -> usize {
+        // FNV-1a is deliberately tiny and stable across processes/platforms;
+        // DefaultHasher does not promise either property.
+        let hash = self
+            .subject
+            .as_bytes()
+            .iter()
+            .fold(0xcbf29ce484222325_u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+            });
+        (hash as usize) % PARTICIPANT_BACKGROUNDS.len()
+    }
+}
+
+const PARTICIPANT_BACKGROUNDS: [(u8, u8, u8); 8] = [
+    (226, 238, 255),
+    (232, 246, 230),
+    (255, 239, 219),
+    (243, 231, 255),
+    (224, 246, 246),
+    (255, 229, 235),
+    (241, 240, 218),
+    (231, 235, 242),
+];
+
+impl Message for BrainParticipantMessage {
+    fn id(&self) -> MessageId {
+        self.id
+    }
+
+    fn format(&self, colors: &ColorScheme) -> String {
+        let marker = if self.invokes_model { '❯' } else { '◆' };
+        format!(
+            "{} {marker} {}: {}{}",
+            color_to_ansi(&colors.messages.user),
+            self.subject,
+            self.content,
+            RESET
+        )
+    }
+
+    fn status(&self) -> MessageStatus {
+        MessageStatus::Complete
+    }
+
+    fn content(&self) -> String {
+        format!("{}: {}", self.subject, self.content)
+    }
+
+    fn background_style(&self) -> Option<ratatui::style::Style> {
+        use ratatui::style::{Color, Style};
+        let (red, green, blue) = PARTICIPANT_BACKGROUNDS[self.palette_index()];
+        Some(
+            Style::default()
+                .bg(Color::Rgb(red, green, blue))
+                .fg(Color::Black),
+        )
+    }
+}
+
+// ============================================================================
 // StreamingResponseMessage - Mutable message for Claude/Qwen responses
 // ============================================================================
 
@@ -1018,6 +1107,24 @@ impl Message for StaticMessage {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn brain_participant_messages_distinguish_prompt_from_relay() {
+        let colors = crate::config::ColorScheme::default();
+        let prompt = BrainParticipantMessage::new("alice@box", "please inspect", true);
+        let relay = BrainParticipantMessage::new("alice@box", "I agree", false);
+
+        assert!(prompt.format(&colors).contains("❯ alice@box: please inspect"));
+        assert!(relay.format(&colors).contains("◆ alice@box: I agree"));
+        assert_eq!(
+            prompt.background_style(),
+            BrainParticipantMessage::new("alice@box", "again", true).background_style()
+        );
+        assert_ne!(
+            prompt.background_style(),
+            BrainParticipantMessage::new("bob@box", "hello", false).background_style()
+        );
+    }
 
     #[test]
     fn test_streaming_message_handles_poisoned_lock() {

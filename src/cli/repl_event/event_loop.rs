@@ -404,6 +404,19 @@ fn runner_subject_from(participant: &str, frontend_id: Uuid) -> String {
     base
 }
 
+/// Strip the explicit model addressee used in collaborative Brain chatter.
+/// Requiring whitespace (or end-of-input) avoids treating ordinary handles
+/// such as `@finchbot` as model prompts.
+fn finch_addressed_prompt(input: &str) -> Option<&str> {
+    let input = input.trim();
+    let suffix = input.strip_prefix("@finch")?;
+    if !suffix.is_empty() && !suffix.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let prompt = suffix.trim();
+    (!prompt.is_empty()).then_some(prompt)
+}
+
 fn approval_audience_summary(
     audience: &crate::brain::shared::BrainApprovalAudience,
 ) -> String {
@@ -2229,6 +2242,13 @@ Rules:\n\
                 .send(ReplEvent::Shutdown)
                 .context("Failed to send shutdown event")?;
             return Ok(());
+        }
+
+        // `/say` is relay-only while `@finch` explicitly schedules a model
+        // turn in a collaborative Brain. The client-side addressee is not
+        // persisted in provider context.
+        if let Some(prompt) = finch_addressed_prompt(&input) {
+            return self.execute_query(prompt.to_string()).await;
         }
 
         // Forth word definition: `: word ... ;`
@@ -4517,12 +4537,14 @@ Rules:\n\
                 ));
             }
             BrainEventKind::RunStarted { .. } | BrainEventKind::RunStatusChanged { .. } => {}
-            BrainEventKind::Prompt { text } => self
-                .output_manager
-                .write_user(format!("{}: {text}", event.sender)),
+            BrainEventKind::Prompt { text } => self.output_manager.write_brain_participant(
+                event.sender.clone(),
+                text.clone(),
+                true,
+            ),
             BrainEventKind::ParticipantMessage { text } => self
                 .output_manager
-                .write_info(format!("{}: {text}", event.sender)),
+                .write_brain_participant(event.sender.clone(), text.clone(), false),
             BrainEventKind::ToolCall {
                 tool_id,
                 name,
@@ -6575,6 +6597,17 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with(participant));
         assert!(first.chars().count() <= 128);
+    }
+
+    #[test]
+    fn explicit_finch_address_strips_only_the_addressee() {
+        assert_eq!(
+            finch_addressed_prompt("  @finch   investigate this?!  "),
+            Some("investigate this?!")
+        );
+        assert_eq!(finch_addressed_prompt("@finchbot hello"), None);
+        assert_eq!(finch_addressed_prompt("@finch"), None);
+        assert_eq!(finch_addressed_prompt("ordinary prompt"), None);
     }
     use crate::cli::repl_event::query_processor::apply_sliding_window;
     // format_elapsed and format_token_count moved to tool_display; import for status-bar tests.
