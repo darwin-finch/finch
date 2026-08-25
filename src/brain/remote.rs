@@ -1208,6 +1208,25 @@ impl AttachedBrainClient {
         self.attachment.as_ref()
     }
 
+    pub async fn attach(
+        &mut self,
+        subject: &str,
+        role: AttachmentRole,
+        attachment_id: Option<AttachmentId>,
+    ) -> Result<BrainAttachment> {
+        let attachment = match &mut self.transport {
+            AttachedBrainTransport::Local(ipc) => {
+                ipc.brain_attach(&self.target.brain, subject, role, attachment_id)
+                    .await?
+            }
+            AttachedBrainTransport::Remote(client) => {
+                client.attach(subject, role, attachment_id).await?
+            }
+        };
+        self.attachment = Some(attachment.clone());
+        Ok(attachment)
+    }
+
     pub async fn attach_persistent(
         &mut self,
         subject: &str,
@@ -2221,6 +2240,204 @@ mod tests {
             .unwrap();
         client.disconnect().await.unwrap();
         fixture.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_initialization_client_uses_narrowed_websocket_authority() {
+        use axum::{
+            extract::{Path, Query, State, WebSocketUpgrade},
+            http::{HeaderMap, StatusCode},
+            response::{IntoResponse, Response},
+            routing::get,
+            Router,
+        };
+        use futures::StreamExt;
+
+        #[derive(Clone)]
+        struct Fixture {
+            lifecycle: crate::server::BrainLifecycleService,
+            credentials: super::super::credential::BrainCredentialAuthority,
+        }
+
+        #[derive(Deserialize)]
+        struct Connection {
+            attachment_id: uuid::Uuid,
+            connection_id: uuid::Uuid,
+        }
+
+        async fn websocket(
+            State(fixture): State<Fixture>,
+            headers: HeaderMap,
+            Path(name): Path<String>,
+            Query(connection): Query<Connection>,
+            ws: WebSocketUpgrade,
+        ) -> Response {
+            let attachment_id = AttachmentId(connection.attachment_id);
+            let connection_id = crate::brain::store::ConnectionId(connection.connection_id);
+            let claims = match crate::server::handlers::authorize_pending_remote_attachment(
+                &fixture.lifecycle,
+                &fixture.credentials,
+                &headers,
+                &name,
+                attachment_id,
+                connection_id,
+            ) {
+                Ok(claims) => claims,
+                Err(response) => return response,
+            };
+            let Ok(watch) = fixture
+                .lifecycle
+                .watch(&name, attachment_id, connection_id)
+            else {
+                return StatusCode::CONFLICT.into_response();
+            };
+            let initial = watch.snapshot;
+            let lifecycle = fixture.lifecycle.clone();
+            ws.on_upgrade(move |mut socket| async move {
+                let envelope = crate::ipc::brain_codec::BrainRemoteEnvelope::Projection(
+                    BrainWireMessage::Snapshot { brain: initial },
+                );
+                socket
+                    .send(axum::extract::ws::Message::Binary(
+                        crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope)
+                            .unwrap()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                while let Some(Ok(axum::extract::ws::Message::Binary(bytes))) = socket.next().await {
+                    let Ok(crate::ipc::brain_codec::BrainRemoteEnvelope::Command(command)) =
+                        crate::ipc::brain_codec::decode_brain_remote_envelope(&bytes)
+                    else {
+                        break;
+                    };
+                    let request_id = command.request_id;
+                    let reply = match command.kind {
+                        crate::ipc::brain_codec::BrainRemoteCommandKind::ScheduleInitialization {
+                            next_due_ms,
+                        } => crate::server::handlers::execute_authorized_remote_initialization(
+                            &lifecycle,
+                            &claims,
+                            &name,
+                            attachment_id,
+                            connection_id,
+                            request_id,
+                            next_due_ms,
+                        ),
+                        _ => break,
+                    };
+                    let envelope = crate::ipc::brain_codec::BrainRemoteEnvelope::Reply(reply);
+                    socket
+                        .send(axum::extract::ws::Message::Binary(
+                            crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope)
+                                .unwrap()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            })
+            .into_response()
+        }
+
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let lifecycle = crate::server::BrainLifecycleService::new(
+            store,
+            crate::server::BrainRunnerBroker::default(),
+            crate::server::BrainApprovalBroker::default(),
+        );
+        let credentials = super::super::credential::BrainCredentialAuthority::ephemeral([71; 32]);
+        let snapshot = lifecycle.snapshot("shared").unwrap();
+        let now_ms = unix_epoch_millis();
+        let bind = |attachment: &BrainAttachment| {
+            let role = attachment.role;
+            let parent_token = credentials
+                .issue(
+                    super::super::credential::BrainCredentialRequest {
+                        issuer: "box.local".into(),
+                        subject: attachment.subject.clone(),
+                        brain_id: snapshot.brain_id,
+                        brain: "shared".into(),
+                        environment_generation: snapshot.environment.generation,
+                        role,
+                        scopes: super::super::credential::default_participant_scopes(role),
+                        delegation_chain: Vec::new(),
+                        ttl_ms: 60_000,
+                    },
+                    now_ms,
+                )
+                .unwrap();
+            let parent = credentials.verify(&parent_token, now_ms).unwrap();
+            credentials
+                .bind_attachment(
+                    &parent,
+                    attachment.attachment_id,
+                    attachment.connection_id.unwrap(),
+                    now_ms,
+                )
+                .unwrap()
+        };
+        let driver = lifecycle
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let sibling = lifecycle
+            .attach("shared", "mallory", AttachmentRole::Driver, None)
+            .unwrap();
+        let consultant = lifecycle
+            .attach("shared", "bob", AttachmentRole::Consultant, None)
+            .unwrap();
+        let (driver_token, driver_claims) = bind(&driver);
+        let (sibling_token, sibling_claims) = bind(&sibling);
+        let (consultant_token, consultant_claims) = bind(&consultant);
+
+        let app = Router::new()
+            .route("/v1/brains/named/:name/ws", get(websocket))
+            .with_state(Fixture {
+                lifecycle,
+                credentials,
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let target = RemoteBrainTarget {
+            brain: "shared".into(),
+            machine: "box.local".into(),
+            address: address.to_string(),
+            secure: false,
+        };
+        let make_client = |attachment: BrainAttachment,
+                           token: String,
+                           claims: super::super::credential::BrainCredentialClaims| {
+            let mut client = RemoteBrainClient::new(target.clone(), "unused").unwrap();
+            client.attachment = Some(attachment);
+            (client, RemoteBrainCredential { token, claims })
+        };
+
+        let (stale, stale_credential) =
+            make_client(driver.clone(), sibling_token, sibling_claims);
+        *stale.credential.lock().await = Some(stale_credential);
+        assert!(stale.watch().await.is_err());
+
+        let (driver_client, driver_credential) =
+            make_client(driver, driver_token, driver_claims);
+        *driver_client.credential.lock().await = Some(driver_credential);
+        let mut driver_events = driver_client.watch().await.unwrap();
+        assert!(matches!(
+            driver_events.recv().await.unwrap(),
+            BrainWireMessage::Snapshot { .. }
+        ));
+        assert!(driver_client.schedule_initialization(1_000).await.unwrap().active);
+
+        let (consultant_client, consultant_credential) =
+            make_client(consultant, consultant_token, consultant_claims);
+        *consultant_client.credential.lock().await = Some(consultant_credential);
+        let mut consultant_events = consultant_client.watch().await.unwrap();
+        assert!(matches!(
+            consultant_events.recv().await.unwrap(),
+            BrainWireMessage::Snapshot { .. }
+        ));
+        assert!(consultant_client.schedule_initialization(2_000).await.is_err());
+        server.abort();
     }
 
     #[tokio::test]
