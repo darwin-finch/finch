@@ -187,34 +187,6 @@ pub struct Repl {
 
 }
 
-/// Adjectives used for session labels
-const SESSION_ADJECTIVES: &[&str] = &[
-    "swift", "amber", "calm", "bright", "crisp", "dark", "eager", "fair", "glad", "hard", "idle",
-    "jade", "keen", "lush", "mild", "neat", "open", "pale", "quiet", "rare",
-];
-
-/// Nouns used for session labels
-const SESSION_NOUNS: &[&str] = &[
-    "falcon", "creek", "ridge", "stone", "river", "grove", "brook", "field", "cliff", "dune",
-    "fern", "gate", "hill", "isle", "lake", "moon", "nest", "oak", "peak", "reef",
-];
-
-/// Generate a short human-readable session label seeded by the current timestamp.
-/// E.g. "swift-falcon", "amber-creek", "calm-ridge"
-fn generate_session_label_from_seed(seed: u128) -> String {
-    let adj = SESSION_ADJECTIVES[(seed >> 32) as usize % SESSION_ADJECTIVES.len()];
-    let noun = SESSION_NOUNS[(seed & 0xFFFF_FFFF) as usize % SESSION_NOUNS.len()];
-    format!("{}-{}", adj, noun)
-}
-
-fn generate_session_label() -> String {
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    generate_session_label_from_seed(seed)
-}
-
 /// Background training statistics
 struct BackgroundTrainingStats {
     examples_trained: usize,
@@ -229,6 +201,7 @@ impl Repl {
         router: Router,
         metrics_logger: MetricsLogger,
         daemon_client: Option<Arc<crate::client::DaemonClient>>,
+        session_label: String,
     ) -> Self {
         // Detect if we're in interactive mode (stdout is a TTY)
         let is_interactive = io::stdout().is_terminal();
@@ -763,7 +736,7 @@ impl Repl {
             todo_list,
 
             // Session identity
-            session_label: generate_session_label(),
+            session_label,
             memory_context_lines,
             max_verbatim_messages,
             context_recall_k,
@@ -4175,40 +4148,5 @@ impl Repl {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_generate_session_label_is_deterministic_for_seed() {
-        let label1 = generate_session_label_from_seed(12345678_u128);
-        let label2 = generate_session_label_from_seed(12345678_u128);
-        assert_eq!(label1, label2);
-    }
-
-    #[test]
-    fn test_generate_session_label_changes_across_sessions() {
-        // Different seeds should (usually) produce different labels.
-        // Using seeds that differ in both high and low bits to avoid collision.
-        let label1 = generate_session_label_from_seed(0_u128);
-        let label2 = generate_session_label_from_seed(u128::MAX);
-        assert_ne!(label1, label2);
-    }
-
-    #[test]
-    fn test_generate_session_label_format() {
-        let label = generate_session_label_from_seed(42_u128);
-        // Must be "adjective-noun" with a hyphen
-        assert!(label.contains('-'));
-        let parts: Vec<&str> = label.splitn(2, '-').collect();
-        assert_eq!(parts.len(), 2);
-        assert!(!parts[0].is_empty());
-        assert!(!parts[1].is_empty());
-        // Both parts must be in the word lists
-        assert!(SESSION_ADJECTIVES.contains(&parts[0]));
-        assert!(SESSION_NOUNS.contains(&parts[1]));
     }
 }

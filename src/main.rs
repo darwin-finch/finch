@@ -1134,44 +1134,23 @@ async fn main() -> Result<()> {
 
     // Create and run REPL (with full TUI support)
     // Pass daemon_client so Repl knows whether to suppress local model logs
-    // Session name and ID.
-    // --session <name>: join that named session (deterministic UUIDv5 from name).
-    // default: generate a cute name (quiet-hill etc.) and derive a UUID.
-    // Suppressed for pipe / non-interactive use.
-    let (session_name, session_id) = {
-        use finch::session::names;
+    // One name identifies the actual home Brain. Explicit names attach by name;
+    // generated names include a short uniqueness suffix so a new console cannot
+    // silently inherit an old Brain's memory and event history.
+    let session_name = args
+        .session
+        .clone()
+        .unwrap_or_else(finch::session::names::generate);
 
-        let (name, id) = match &args.session {
-            Some(given) => {
-                let id = names::to_uuid(given);
-                (given.clone(), id)
-            }
-            None => {
-                let name = names::generate();
-                let id = names::to_uuid(&name);
-                (name, id)
-            }
-        };
-
-        // If a daemon is running, register / join the session so other terminals
-        // with the same name can share the broadcast channel.
-        if let Some(ref client) = daemon_client {
-            let url = format!("{}/v1/session/join", client.base_url());
-            let body = serde_json::json!({ "name": name });
-            // Fire-and-forget — failure just means no cross-terminal broadcast.
-            let _ = reqwest::Client::new()
-                .post(&url)
-                .json(&body)
-                .timeout(std::time::Duration::from_secs(2))
-                .send()
-                .await;
-        }
-
-        (name, id)
-    };
-    let _ = (session_name, session_id); // available for future use (daemon routing, shared stacks)
-
-    let mut repl = Repl::new(config, claude_client, router, metrics_logger, daemon_client).await;
+    let mut repl = Repl::new(
+        config,
+        claude_client,
+        router,
+        metrics_logger,
+        daemon_client,
+        session_name,
+    )
+    .await;
 
     // Resolve --resume <uuid> → --restore-session ~/.finch/sessions/<uuid>.json
     let restore_session = args.restore_session.or_else(|| {

@@ -1,4 +1,5 @@
-/// Session name generator — adjective + landscape noun, e.g. "quiet-hill", "silver-lake".
+/// Session name generator — adjective + landscape noun + collision-resistant suffix,
+/// e.g. "quiet-hill-a13f09".
 ///
 /// Distinct word lists from node_name.rs so session names feel different from node names.
 /// Landscape nouns give a sense of place; good mnemonic for "where are we talking".
@@ -18,7 +19,7 @@ const NOUNS: &[&str] = &[
 /// Generated once; baked in so name → UUID is always deterministic.
 const SESSION_NS: Uuid = uuid::uuid!("a1b2c3d4-e5f6-7890-abcd-ef1234567890");
 
-/// Generate a random-ish cute session name: "quiet-hill", "silver-lake", etc.
+/// Generate a cute, practically unique session name: "quiet-hill-a13f09", etc.
 ///
 /// Uses thread-local randomness via rand.  Not deterministic — call `to_uuid`
 /// to get the stable UUID for a known name.
@@ -39,7 +40,8 @@ pub fn generate() -> String {
 
     let adj = ADJECTIVES[(v as usize) % ADJECTIVES.len()];
     let noun = NOUNS[((v >> 16) as usize) % NOUNS.len()];
-    format!("{adj}-{noun}")
+    let suffix = (v >> 32) & 0x00ff_ffff;
+    format!("{adj}-{noun}-{suffix:06x}")
 }
 
 /// Derive a stable UUIDv5 from a session name.
@@ -63,10 +65,12 @@ mod tests {
     #[test]
     fn generate_parts_from_wordlists() {
         let name = generate();
-        let parts: Vec<&str> = name.splitn(2, '-').collect();
-        assert_eq!(parts.len(), 2);
+        let parts: Vec<&str> = name.split('-').collect();
+        assert_eq!(parts.len(), 3);
         assert!(ADJECTIVES.contains(&parts[0]), "unknown adj: {}", parts[0]);
         assert!(NOUNS.contains(&parts[1]), "unknown noun: {}", parts[1]);
+        assert_eq!(parts[2].len(), 6);
+        assert!(parts[2].chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
