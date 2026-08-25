@@ -182,49 +182,104 @@ fn leave_editor_screen(writer: &mut impl std::io::Write) -> std::io::Result<()> 
     )
 }
 
-/// Owns the render-loop handoff for the whole editor lifecycle, including the
-/// async grace period before the blocking editor task starts. This matters
-/// when the proposal future is cancelled during that grace period: the TUI
-/// must not remain permanently gated just because no terminal mode changed.
-struct TerminalRestorer {
-    restore: Option<Box<dyn FnOnce() + Send>>,
+trait EditorTerminalControl: Send + Sync + 'static {
+    fn set_editor_active(&self, active: bool);
+    fn suspend(&self);
+    fn restore(&self, terminal_was_suspended: bool);
 }
 
-impl TerminalRestorer {
-    fn for_tui(tui_mode: bool) -> Self {
-        let restore = tui_mode.then(|| {
-            Box::new(|| {
-                crate::request_tui_rebuild();
-                crate::set_editor_active(false);
-            }) as Box<dyn FnOnce() + Send>
-        });
-        Self { restore }
+#[derive(Clone, Copy)]
+struct ProductionTerminalControl;
+
+impl EditorTerminalControl for ProductionTerminalControl {
+    fn set_editor_active(&self, active: bool) {
+        crate::set_editor_active(active);
     }
 
-    fn suspend(&mut self) {
-        if self.restore.is_none() {
-            return;
-        }
-        // Arm the full terminal restore before the first terminal mutation.
-        // A panic or I/O failure during suspension must still unwind to the
-        // primary screen and release the render loop.
-        self.restore = Some(Box::new(resume_terminal_after_editor));
+    fn suspend(&self) {
         suspend_terminal_for_editor();
     }
 
-    #[cfg(test)]
-    fn with_restore(restore: impl FnOnce() + Send + 'static) -> Self {
-        Self {
-            restore: Some(Box::new(restore)),
+    fn restore(&self, terminal_was_suspended: bool) {
+        if terminal_was_suspended {
+            resume_terminal_after_editor();
+        } else {
+            // The render loop may have skipped a frame while the handoff was
+            // pending even though the terminal itself was never mutated.
+            crate::request_tui_rebuild();
+            crate::set_editor_active(false);
         }
     }
 }
 
-impl Drop for TerminalRestorer {
-    fn drop(&mut self) {
-        if let Some(restore) = self.restore.take() {
-            restore();
+struct TerminalRestorer<C: EditorTerminalControl> {
+    control: C,
+    terminal_was_suspended: bool,
+}
+
+impl<C: EditorTerminalControl> TerminalRestorer<C> {
+    fn new(control: C) -> Self {
+        control.set_editor_active(true);
+        Self {
+            control,
+            terminal_was_suspended: false,
         }
+    }
+
+    fn suspend(&mut self) {
+        // Arm the full restore before the first terminal mutation. A panic in
+        // the terminal writer must still release the editor gate.
+        self.terminal_was_suspended = true;
+        self.control.suspend();
+    }
+}
+
+impl<C: EditorTerminalControl> Drop for TerminalRestorer<C> {
+    fn drop(&mut self) {
+        self.control.restore(self.terminal_was_suspended);
+    }
+}
+
+async fn run_editor_lifecycle<C, F, T>(
+    tui_mode: bool,
+    grace_period: Duration,
+    control: C,
+    editor_work: F,
+) -> Result<T>
+where
+    C: EditorTerminalControl,
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    if !tui_mode {
+        return spawn_blocking(editor_work).await?;
+    }
+
+    // Construct the guard before the only async cancellation point. Dropping
+    // this future during the grace period releases the gate and redraws once.
+    let mut restore = TerminalRestorer::new(control);
+    tokio::time::sleep(grace_period).await;
+    restore.suspend();
+
+    spawn_blocking(move || {
+        let _restore = restore;
+        editor_work()
+    })
+    .await?
+}
+
+#[cfg(test)]
+impl<T: EditorTerminalControl> EditorTerminalControl for std::sync::Arc<T> {
+    fn set_editor_active(&self, active: bool) {
+        (**self).set_editor_active(active);
+    }
+
+    fn suspend(&self) {
+        (**self).suspend();
+    }
+
+    fn restore(&self, terminal_was_suspended: bool) {
+        (**self).restore(terminal_was_suspended);
     }
 }
 
@@ -353,26 +408,13 @@ async fn propose_in_editor_with_suffix(
     let script = build_artifact(description, code, comment_prefix, executable);
     let tui_mode = crate::is_tui_active();
 
-    if tui_mode {
-        // Gate the render loop so it won't write crossterm sequences while the
-        // editor has the terminal.
-        crate::set_editor_active(true);
-    }
-    let mut restore = TerminalRestorer::for_tui(tui_mode);
-
-    if tui_mode {
-        // Give any in-flight render one tick (33 ms) to finish. The guard is
-        // already armed, so cancellation here cannot strand EDITOR_ACTIVE.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // The terminal restore runs inside spawn_blocking so that disable/enable
-    // raw mode are always paired even if the closure returns early via `?`.
-    spawn_blocking(move || {
-        restore.suspend();
-        edit_artifact(&script, suffix, executable, comment_prefix, run_editor)
-    })
-    .await?
+    run_editor_lifecycle(
+        tui_mode,
+        Duration::from_millis(50),
+        ProductionTerminalControl,
+        move || edit_artifact(&script, suffix, executable, comment_prefix, run_editor),
+    )
+    .await
 }
 
 /// Format the English description + code as a commented shell script.
@@ -460,20 +502,13 @@ pub async fn propose_forth_in_editor(description: &str, code: &str) -> Result<Op
     let content = format!("{header}\n{code}");
     let tui_mode = crate::is_tui_active();
 
-    if tui_mode {
-        crate::set_editor_active(true);
-    }
-    let mut restore = TerminalRestorer::for_tui(tui_mode);
-
-    if tui_mode {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    spawn_blocking(move || {
-        restore.suspend();
-        edit_artifact(&content, ".forth", false, "\\", run_editor)
-    })
-    .await?
+    run_editor_lifecycle(
+        tui_mode,
+        Duration::from_millis(50),
+        ProductionTerminalControl,
+        move || edit_artifact(&content, ".forth", false, "\\", run_editor),
+    )
+    .await
 }
 
 /// Run a shell script string via `bash -c`.
@@ -500,8 +535,73 @@ mod tests {
     use super::*;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
+
+    static LIFECYCLE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Debug, Default)]
+    struct LifecycleCounts {
+        gate_enabled: usize,
+        gate_disabled: usize,
+        suspends: usize,
+        restores: usize,
+        rebuilds: usize,
+    }
+
+    #[derive(Default)]
+    struct TestTerminalControl {
+        counts: Mutex<LifecycleCounts>,
+        output: Mutex<Vec<u8>>,
+    }
+
+    impl EditorTerminalControl for TestTerminalControl {
+        fn set_editor_active(&self, active: bool) {
+            let mut counts = self.counts.lock().unwrap();
+            if active {
+                counts.gate_enabled += 1;
+            } else {
+                counts.gate_disabled += 1;
+            }
+            crate::set_editor_active(active);
+        }
+
+        fn suspend(&self) {
+            self.counts.lock().unwrap().suspends += 1;
+            enter_editor_screen(&mut *self.output.lock().unwrap()).unwrap();
+        }
+
+        fn restore(&self, terminal_was_suspended: bool) {
+            let mut counts = self.counts.lock().unwrap();
+            counts.restores += 1;
+            counts.rebuilds += 1;
+            counts.gate_disabled += 1;
+            drop(counts);
+            if terminal_was_suspended {
+                leave_editor_screen(&mut *self.output.lock().unwrap()).unwrap();
+            }
+            crate::request_tui_rebuild();
+            crate::set_editor_active(false);
+        }
+    }
+
+    fn reset_terminal_globals() {
+        crate::set_editor_active(false);
+        crate::take_tui_rebuild();
+    }
+
+    fn assert_restored_once(control: &TestTerminalControl, suspended: bool) {
+        let counts = control.counts.lock().unwrap();
+        assert_eq!(counts.gate_enabled, 1);
+        assert_eq!(counts.gate_disabled, 1);
+        assert_eq!(counts.suspends, usize::from(suspended));
+        assert_eq!(counts.restores, 1);
+        assert_eq!(counts.rebuilds, 1);
+        drop(counts);
+        assert!(!crate::is_editor_active());
+        assert!(crate::take_tui_rebuild());
+        assert!(!crate::take_tui_rebuild());
+    }
 
     #[cfg(unix)]
     fn exit_status(code: i32) -> std::process::ExitStatus {
@@ -543,69 +643,130 @@ mod tests {
         assert!(split_editor_command("vi 'unfinished").is_err());
     }
 
-    #[test]
-    fn editor_screen_wrapper_finishes_on_primary_after_nested_nonstacking_editor() {
-        let mut output = Vec::new();
-        enter_editor_screen(&mut output).unwrap();
-        // Model a full-screen editor using the same non-stacking xterm mode.
-        execute!(&mut output, terminal::EnterAlternateScreen).unwrap();
-        execute!(&mut output, terminal::LeaveAlternateScreen).unwrap();
-        leave_editor_screen(&mut output).unwrap();
-
-        let output = String::from_utf8(output).unwrap();
-        assert_eq!(output.matches("\x1b[?1049h").count(), 2);
-        assert_eq!(output.matches("\x1b[?1049l").count(), 2);
-        assert!(output.ends_with("\x1b[0m"));
-        assert!(output.rfind("\x1b[?1049l").unwrap() > output.rfind("\x1b[?1049h").unwrap());
-    }
-
     #[cfg(unix)]
-    #[test]
-    fn fake_editor_covers_success_empty_nonzero_and_launch_error() {
-        let accepted = edit_artifact("before\n", ".txt", false, "#", |path| {
-            std::fs::write(path, "after\n")?;
-            Ok(exit_status(0))
-        })
-        .unwrap();
-        assert_eq!(accepted.as_deref(), Some("after\n"));
+    #[tokio::test]
+    async fn lifecycle_restores_after_every_fake_full_screen_editor_outcome() {
+        use nix::libc;
+        use std::os::unix::process::ExitStatusExt;
 
-        let empty = edit_artifact("before\n", ".txt", false, "#", |path| {
-            std::fs::write(path, "# review only\n\n")?;
-            Ok(exit_status(0))
-        })
-        .unwrap();
-        assert_eq!(empty, None);
-
-        let rejected =
-            edit_artifact("before\n", ".txt", false, "#", |_| Ok(exit_status(7))).unwrap();
-        assert_eq!(rejected, None);
-
-        let error = edit_artifact("before\n", ".txt", false, "#", |_| {
-            Err(anyhow::anyhow!("fake editor launch failed"))
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("fake editor launch failed"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn terminal_guard_restores_exactly_once_for_every_editor_outcome() {
-        for outcome in [
-            Ok(Some("accepted".to_string())),
-            Ok(None),
-            Err(anyhow::anyhow!("failed")),
-        ] {
-            let restores = Arc::new(AtomicUsize::new(0));
-            let observed = Arc::clone(&restores);
-            let result = {
-                let _restore = TerminalRestorer::with_restore(move || {
-                    observed.fetch_add(1, Ordering::SeqCst);
-                });
-                outcome
-            };
-            drop(result);
-            assert_eq!(restores.load(Ordering::SeqCst), 1);
+        #[derive(Clone, Copy)]
+        enum Outcome {
+            Success,
+            Empty,
+            Nonzero,
+            Signal,
+            LaunchError,
         }
+
+        let _serial = LIFECYCLE_TEST_LOCK.lock().unwrap();
+        for outcome in [
+            Outcome::Success,
+            Outcome::Empty,
+            Outcome::Nonzero,
+            Outcome::Signal,
+            Outcome::LaunchError,
+        ] {
+            reset_terminal_globals();
+            let control = Arc::new(TestTerminalControl::default());
+            let child = Arc::clone(&control);
+            let result =
+                run_editor_lifecycle(true, Duration::ZERO, Arc::clone(&control), move || {
+                    edit_artifact("before\n", ".txt", false, "#", |path| {
+                        if matches!(outcome, Outcome::LaunchError) {
+                            anyhow::bail!("fake editor launch failed");
+                        }
+                        {
+                            let mut output = child.output.lock().unwrap();
+                            execute!(&mut *output, terminal::EnterAlternateScreen)?;
+                            execute!(&mut *output, terminal::LeaveAlternateScreen)?;
+                        }
+                        match outcome {
+                            Outcome::Success => {
+                                std::fs::write(path, "after\n")?;
+                                Ok(exit_status(0))
+                            }
+                            Outcome::Empty => {
+                                std::fs::write(path, "# review only\n\n")?;
+                                Ok(exit_status(0))
+                            }
+                            Outcome::Nonzero => Ok(exit_status(7)),
+                            Outcome::Signal => {
+                                let status = std::process::ExitStatus::from_raw(libc::SIGTERM);
+                                assert_eq!(status.signal(), Some(libc::SIGTERM));
+                                Ok(status)
+                            }
+                            Outcome::LaunchError => unreachable!(),
+                        }
+                    })
+                })
+                .await;
+
+            match outcome {
+                Outcome::Success => assert_eq!(result.unwrap().as_deref(), Some("after\n")),
+                Outcome::Empty | Outcome::Nonzero | Outcome::Signal => {
+                    assert_eq!(result.unwrap(), None)
+                }
+                Outcome::LaunchError => {
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("fake editor launch failed"))
+                }
+            }
+            assert_restored_once(&control, true);
+
+            let output = String::from_utf8(control.output.lock().unwrap().clone()).unwrap();
+            let child_started = !matches!(outcome, Outcome::LaunchError);
+            assert_eq!(
+                output.matches("\x1b[?1049h").count(),
+                1 + usize::from(child_started)
+            );
+            assert_eq!(
+                output.matches("\x1b[?1049l").count(),
+                1 + usize::from(child_started)
+            );
+            assert!(output.rfind("\x1b[?1049l").unwrap() > output.rfind("\x1b[?1049h").unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_real_grace_period_releases_gate_without_terminal_restore() {
+        let _serial = LIFECYCLE_TEST_LOCK.lock().unwrap();
+        reset_terminal_globals();
+        let control = Arc::new(TestTerminalControl::default());
+        let editor_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&editor_calls);
+        let task_control = Arc::clone(&control);
+        let task = tokio::spawn(async move {
+            run_editor_lifecycle(true, Duration::from_millis(50), task_control, move || {
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(crate::is_editor_active());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert_eq!(editor_calls.load(Ordering::SeqCst), 0);
+        assert_restored_once(&control, false);
+        assert!(control.output.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocking_editor_panic_after_handoff_still_restores_once() {
+        let _serial = LIFECYCLE_TEST_LOCK.lock().unwrap();
+        reset_terminal_globals();
+        let control = Arc::new(TestTerminalControl::default());
+        let result: Result<()> =
+            run_editor_lifecycle(true, Duration::ZERO, Arc::clone(&control), || {
+                panic!("fake editor panic")
+            })
+            .await;
+
+        assert!(result.unwrap_err().to_string().contains("panicked"));
+        assert_restored_once(&control, true);
     }
 
     #[test]
