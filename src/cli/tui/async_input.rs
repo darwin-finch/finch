@@ -107,7 +107,7 @@ pub fn encode_quit_message() -> Vec<u8> {
 /// - Renders TUI periodically
 /// - Sends `InputEvent::TypingStarted` after 300 ms of typing silence (true debounce)
 ///
-/// `quit_tx`: binary channel for out-of-band quit signals (Cap'n Proto ControlMessage).
+/// `quit_tx`: binary channel for out-of-band `/quit` signals (Cap'n Proto ControlMessage).
 /// The quit watcher task (spawned separately) reads this channel and exits the process.
 pub fn spawn_input_task(
     tui_renderer: Arc<Mutex<TuiRenderer>>,
@@ -146,7 +146,7 @@ pub fn spawn_input_task(
                     // Process first event
                     let first_event_result = match crossterm::event::read() {
                         Ok(Event::Key(key)) => {
-                            // Priority 0: /quit and Ctrl+D always exit immediately.
+                            // Priority 0: /quit always exits immediately.
                             // Send a Cap'n Proto binary ControlMessage { quit } to the quit
                             // watcher task — do NOT go through the event loop channel, because
                             // the loop may be blocked on streaming/tool execution and would
@@ -158,9 +158,7 @@ pub fn spawn_input_task(
                                 && !key
                                     .modifiers
                                     .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
-                            let is_ctrl_d = key.code == KeyCode::Char('d')
-                                && key.modifiers.contains(KeyModifiers::CONTROL);
-                            if is_quit_enter || is_ctrl_d {
+                            if is_quit_enter {
                                 let _ = quit_tx.send(encode_quit_message());
                                 // Return Ok(None) — the watcher task will call process::exit(0).
                                 Ok(None)
@@ -333,8 +331,11 @@ pub fn spawn_input_task(
                                     (KeyCode::Char('d'), m)
                                         if m.contains(KeyModifiers::CONTROL) =>
                                     {
-                                        // Ctrl+D: handled in Priority 0 above — unreachable here.
-                                        let _ = m;
+                                        // Readline/Emacs semantics: delete the character under
+                                        // the cursor. On an empty buffer this is a no-op; Finch
+                                        // exits only through the explicit `/quit` command.
+                                        tui.input_textarea.delete_next_char();
+                                        first_event_modified_input = true;
                                         Ok(None)
                                     }
                                     (KeyCode::Char('/'), m)
@@ -775,6 +776,31 @@ mod tests {
         // A key event carrying a private-use-area character should be rejected
         let event = key(KeyCode::Char('\u{E000}'));
         assert!(!should_accept_key_event(&event));
+    }
+
+    #[test]
+    fn ctrl_d_deletes_the_character_under_the_prompt_cursor() {
+        use tui_textarea::CursorMove;
+
+        let mut textarea = TuiRenderer::create_clean_textarea_with_text("abc");
+        textarea.move_cursor(CursorMove::Head);
+        textarea.input(Event::Key(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+        )));
+
+        assert_eq!(textarea.lines(), ["bc"]);
+    }
+
+    #[test]
+    fn ctrl_d_is_a_noop_on_an_empty_prompt() {
+        let mut textarea = TuiRenderer::create_clean_textarea();
+        textarea.input(Event::Key(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+        )));
+
+        assert_eq!(textarea.lines(), [""]);
     }
 
     // --- encode_rgba_to_png ---

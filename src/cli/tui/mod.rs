@@ -1978,13 +1978,6 @@ impl TuiRenderer {
                         continue;
                     }
                     match (key.code, key.modifiers) {
-                        // Ctrl+D: hard exit — show_dialog holds the TUI lock so the async
-                        // input task is starved and can never deliver InputEvent::Submitted("/quit").
-                        // This is the only reliable escape hatch when a blocking dialog is open.
-                        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                            emergency_restore_terminal();
-                            std::process::exit(0);
-                        }
                         (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             let is_custom_mode = self
                                 .active_dialog
@@ -2049,14 +2042,6 @@ impl TuiRenderer {
                 if let Event::Key(key) = event::read()? {
                     if key.kind != crossterm::event::KeyEventKind::Press {
                         continue;
-                    }
-                    if key.code == crossterm::event::KeyCode::Char('d')
-                        && key
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL)
-                    {
-                        emergency_restore_terminal();
-                        std::process::exit(0);
                     }
                     if let Some(r) = dialog.handle_key_event(key) {
                         break r;
@@ -2242,13 +2227,9 @@ impl TuiRenderer {
                     if key.kind != crossterm::event::KeyEventKind::Press {
                         continue;
                     }
-                    use crossterm::event::{KeyCode, KeyModifiers};
+                    use crossterm::event::KeyCode;
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            emergency_restore_terminal();
-                            std::process::exit(0);
-                        }
                         KeyCode::Down | KeyCode::Char('j') => {
                             scroll = scroll.saturating_add(1);
                         }
