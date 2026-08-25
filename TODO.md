@@ -423,7 +423,12 @@ still blocks the corresponding Brain phase until it is unified.
   daemon process before transferring the socket/runner lease, reconnect frontends by durable Brain
   identity, and atomically promote or roll back. Frontends may re-exec themselves; daemon replacement
   requires a small stable supervisor or two-process takeover and must never rely on killing the only
-  process that can recover its state.
+  process that can recover its state. The reusable preflight primitive now stages hash-addressed
+  candidate/rollback binaries and proves a full shadow daemon against a fail-closed isolated
+  Brain-store snapshot, but deliberately stops before production handoff. Still add the detached
+  supervisor entrypoint and durable phase intent that can recover if its caller dies; only then wire
+  explicit approval, atomic promotion/rollback receipts, and automatic frontend reconnect of durable
+  attachment/runner identities after socket turnover.
 - [ ] Make the Finch-on-Finch gate terminate in a reproducible public release, not only a local
   dogfood run: select/version the release, generate a human-reviewed changelog from canonical
   commits, publish signed checksummed artifacts and package-manager metadata, migrate and update the

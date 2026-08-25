@@ -67,7 +67,12 @@ impl Drop for RpcTask {
 impl IpcClient {
     /// Connect to the daemon's Unix socket.
     pub async fn connect() -> Result<Self> {
-        let path = sock_path();
+        Self::connect_path(sock_path()).await
+    }
+
+    /// Connect to an explicitly isolated daemon socket. This is used by the
+    /// daemon-upgrade shadow preflight; ordinary clients always use `connect`.
+    pub(crate) async fn connect_path(path: std::path::PathBuf) -> Result<Self> {
         let stream = tokio::net::UnixStream::connect(&path)
             .await
             .with_context(|| format!("IPC connect failed: {}", path.display()))?;

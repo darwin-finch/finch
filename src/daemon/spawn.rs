@@ -171,7 +171,7 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
 }
 
 /// Check if daemon health endpoint responds
-async fn health_check_succeeds(base_url: &str) -> bool {
+pub(crate) async fn health_check_succeeds(base_url: &str) -> bool {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(500))
         .build()
