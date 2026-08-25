@@ -974,8 +974,8 @@ impl BrainStore {
     pub fn schedule_initialization(
         &self,
         name: &str,
-        sender: &str,
         initiating_attachment_id: AttachmentId,
+        connection_id: ConnectionId,
         next_due_ms: u64,
     ) -> Result<BrainSchedule> {
         let name = Self::validate_name(name)?;
@@ -984,10 +984,15 @@ impl BrainStore {
         let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         let attachment = state.attachments.get(&initiating_attachment_id)
             .context("initialization scheduler attachment does not exist")?;
-        anyhow::ensure!(attachment.subject == sender,
-            "initialization scheduler does not own the initiating attachment");
-        anyhow::ensure!(matches!(attachment.role, AttachmentRole::Runner | AttachmentRole::Driver),
-            "attachment role cannot schedule Brain initialization");
+        anyhow::ensure!(
+            attachment.connected && attachment.connection_id == Some(connection_id),
+            "Brain attachment connection is no longer current"
+        );
+        anyhow::ensure!(
+            attachment.role == AttachmentRole::Driver,
+            "only an active Brain driver can schedule initialization"
+        );
+        let sender = attachment.subject.clone();
         let module_identity = initialization.module_identity();
         let mut seen_attempts = std::collections::HashSet::new();
         let attempt_ids = state.events.iter().rev().filter_map(|event| match &event.kind {
@@ -1029,7 +1034,7 @@ impl BrainStore {
         let schedule = BrainSchedule {
             schedule_id: ScheduleId::new(),
             initiating_attachment_id,
-            created_by: sender.to_string(),
+            created_by: sender.clone(),
             grant_ceiling: initialization.capability_budget.clone(),
             language: initialization.language,
             source: initialization.source.clone(),
@@ -1040,7 +1045,7 @@ impl BrainStore {
             active: true,
         };
         initialization.validate_schedule(&schedule)?;
-        self.push_locked(name, state, sender, BrainEventKind::ScheduleChanged {
+        self.push_locked(name, state, &sender, BrainEventKind::ScheduleChanged {
             schedule: schedule.clone(),
         })?;
         Ok(schedule)
@@ -3572,7 +3577,7 @@ mod tests {
         ).unwrap();
         let contract = store.initialization("shared").unwrap();
         let schedule = store
-            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .schedule_initialization("shared", attachment.attachment_id, attachment.connection_id.unwrap(), 10)
             .unwrap();
         assert_eq!(schedule.source, contract.source);
         assert_eq!(schedule.grant_ceiling, contract.capability_budget);
@@ -3596,7 +3601,7 @@ mod tests {
             reattached.connection_id.unwrap(),
         ).unwrap();
         let same = restarted
-            .schedule_initialization("shared", "alice", attachment.attachment_id, 20)
+            .schedule_initialization("shared", reattached.attachment_id, reattached.connection_id.unwrap(), 20)
             .unwrap();
         assert_eq!(same.schedule_id, schedule.schedule_id);
         let snapshot = restarted.snapshot("shared").unwrap();
@@ -3608,11 +3613,83 @@ mod tests {
     }
 
     #[test]
+    fn stale_connection_cannot_win_initialization_scheduling_race() {
+        let store = BrainStore::with_root("box.local", None);
+        let first = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let stale_connection = first.connection_id.unwrap();
+        store
+            .activate_connection("shared", first.attachment_id, stale_connection)
+            .unwrap();
+        store
+            .detach("shared", first.attachment_id, stale_connection)
+            .unwrap();
+        let current = store
+            .attach(
+                "shared",
+                "alice",
+                AttachmentRole::Driver,
+                Some(first.attachment_id),
+            )
+            .unwrap();
+        let current_connection = current.connection_id.unwrap();
+        store
+            .activate_connection("shared", current.attachment_id, current_connection)
+            .unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let stale_store = store.clone();
+        let stale_barrier = barrier.clone();
+        let attachment_id = current.attachment_id;
+        let stale = std::thread::spawn(move || {
+            stale_barrier.wait();
+            stale_store.schedule_initialization(
+                "shared",
+                attachment_id,
+                stale_connection,
+                10,
+            )
+        });
+        let current_store = store.clone();
+        let current_barrier = barrier.clone();
+        let accepted = std::thread::spawn(move || {
+            current_barrier.wait();
+            current_store.schedule_initialization(
+                "shared",
+                attachment_id,
+                current_connection,
+                10,
+            )
+        });
+        barrier.wait();
+
+        assert!(stale.join().unwrap().is_err());
+        assert!(accepted.join().unwrap().is_ok());
+        let snapshot = store.snapshot("shared").unwrap();
+        assert_eq!(snapshot.schedules.len(), 1);
+        assert_eq!(snapshot.schedules[0].created_by, "alice");
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind, BrainEventKind::ScheduleChanged { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn public_source_collision_cannot_claim_initialization_identity() {
         let store = BrainStore::with_root("box.local", None);
         let attachment = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
+        store.activate_connection(
+            "shared",
+            attachment.attachment_id,
+            attachment.connection_id.unwrap(),
+        ).unwrap();
         let contract = store.initialization("shared").unwrap();
         let active_ordinary = store
             .create_schedule(
@@ -3667,7 +3744,7 @@ mod tests {
         assert_eq!(delivered_ordinary.module_identity, None);
 
         let initialization = store
-            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .schedule_initialization("shared", attachment.attachment_id, attachment.connection_id.unwrap(), 10)
             .unwrap();
         assert_ne!(initialization.schedule_id, active_ordinary.schedule_id);
         assert_ne!(initialization.schedule_id, cancelled_ordinary.schedule_id);
@@ -3685,14 +3762,19 @@ mod tests {
         let attachment = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
+        store.activate_connection(
+            "shared",
+            attachment.attachment_id,
+            attachment.connection_id.unwrap(),
+        ).unwrap();
         let cancelled = store
-            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .schedule_initialization("shared", attachment.attachment_id, attachment.connection_id.unwrap(), 10)
             .unwrap();
         assert!(store
             .cancel_schedule("shared", "alice", cancelled.schedule_id)
             .unwrap());
         let retry = store
-            .schedule_initialization("shared", "alice", attachment.attachment_id, 20)
+            .schedule_initialization("shared", attachment.attachment_id, attachment.connection_id.unwrap(), 20)
             .unwrap();
         assert_ne!(retry.schedule_id, cancelled.schedule_id);
 
@@ -3707,7 +3789,7 @@ mod tests {
             )
             .unwrap();
         let second_retry = store
-            .schedule_initialization("shared", "alice", attachment.attachment_id, 30)
+            .schedule_initialization("shared", attachment.attachment_id, attachment.connection_id.unwrap(), 30)
             .unwrap();
         assert_ne!(second_retry.schedule_id, retry.schedule_id);
         assert!(second_retry.active);
@@ -3720,8 +3802,13 @@ mod tests {
         let attachment = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
+        store.activate_connection(
+            "shared",
+            attachment.attachment_id,
+            attachment.connection_id.unwrap(),
+        ).unwrap();
         let first = store
-            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .schedule_initialization("shared", attachment.attachment_id, attachment.connection_id.unwrap(), 10)
             .unwrap();
         let run = store.queue_due_schedules("shared", 10).unwrap().remove(0);
         store
@@ -3754,7 +3841,7 @@ mod tests {
             BrainRunStatus::Interrupted
         );
         let retry = restarted
-            .schedule_initialization("shared", "alice", attachment.attachment_id, 20)
+            .schedule_initialization("shared", reattached.attachment_id, reattached.connection_id.unwrap(), 20)
             .unwrap();
         assert_ne!(retry.schedule_id, first.schedule_id);
         assert!(retry.active);
@@ -3773,7 +3860,7 @@ mod tests {
             attachment.connection_id.unwrap(),
         ).unwrap();
         store
-            .schedule_initialization("shared", "alice", attachment.attachment_id, 10_000)
+            .schedule_initialization("shared", attachment.attachment_id, attachment.connection_id.unwrap(), 10_000)
             .unwrap();
         store
             .detach(
@@ -3794,8 +3881,13 @@ mod tests {
         let attachment = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
+        store.activate_connection(
+            "shared",
+            attachment.attachment_id,
+            attachment.connection_id.unwrap(),
+        ).unwrap();
         let mut schedule = store
-            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .schedule_initialization("shared", attachment.attachment_id, attachment.connection_id.unwrap(), 10)
             .unwrap();
         schedule.source = "(define (unreviewed-startup) : int 2)".into();
 
@@ -3818,8 +3910,13 @@ mod tests {
         let attachment = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
+        store.activate_connection(
+            "shared",
+            attachment.attachment_id,
+            attachment.connection_id.unwrap(),
+        ).unwrap();
         store
-            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .schedule_initialization("shared", attachment.attachment_id, attachment.connection_id.unwrap(), 10)
             .unwrap();
         drop(store);
 
@@ -3846,8 +3943,13 @@ mod tests {
         let attachment = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
+        store.activate_connection(
+            "shared",
+            attachment.attachment_id,
+            attachment.connection_id.unwrap(),
+        ).unwrap();
         store
-            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .schedule_initialization("shared", attachment.attachment_id, attachment.connection_id.unwrap(), 10)
             .unwrap();
         store.queue_due_schedules("shared", 10).unwrap();
         drop(store);
@@ -3886,12 +3988,17 @@ mod tests {
         let attachment = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
+        store.activate_connection(
+            "shared",
+            attachment.attachment_id,
+            attachment.connection_id.unwrap(),
+        ).unwrap();
         let schedule = store
-            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .schedule_initialization("shared", attachment.attachment_id, attachment.connection_id.unwrap(), 10)
             .unwrap();
         let run = store.queue_due_schedules("shared", 10).unwrap().remove(0);
         let delivered = store
-            .schedule_initialization("shared", "alice", attachment.attachment_id, 20)
+            .schedule_initialization("shared", attachment.attachment_id, attachment.connection_id.unwrap(), 20)
             .unwrap();
         assert_eq!(delivered.schedule_id, schedule.schedule_id);
         store
@@ -3931,7 +4038,7 @@ mod tests {
             )
             .unwrap();
         let completed = restarted
-            .schedule_initialization("shared", "alice", attachment.attachment_id, 30)
+            .schedule_initialization("shared", reattached.attachment_id, reattached.connection_id.unwrap(), 30)
             .unwrap();
         assert_eq!(completed.schedule_id, schedule.schedule_id);
         assert_eq!(restarted.snapshot("shared").unwrap().schedules.len(), 1);

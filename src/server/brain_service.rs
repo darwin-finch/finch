@@ -93,15 +93,10 @@ impl BrainLifecycleService {
         connection_id: ConnectionId,
         next_due_ms: u64,
     ) -> Result<BrainSchedule> {
-        let attachment = self.connection(brain, attachment_id, connection_id)?;
-        ensure!(
-            attachment.role == AttachmentRole::Driver,
-            "only a Brain driver can schedule initialization"
-        );
         self.store.schedule_initialization(
             brain,
-            &attachment.subject,
             attachment_id,
+            connection_id,
             next_due_ms,
         )
     }
@@ -833,7 +828,25 @@ mod tests {
             )
             .unwrap_err()
             .to_string()
-            .contains("only a Brain driver"));
+            .contains("only an active Brain driver"));
+
+        let runner = service
+            .store
+            .attach("shared", "runner", AttachmentRole::Runner, None)
+            .unwrap();
+        let runner_connection = runner.connection_id.unwrap();
+        service
+            .store
+            .activate_connection("shared", runner.attachment_id, runner_connection)
+            .unwrap();
+        assert!(service
+            .schedule_initialization(
+                "shared",
+                runner.attachment_id,
+                runner_connection,
+                2_500,
+            )
+            .is_err());
 
         service
             .detach("shared", driver.attachment_id, driver_connection)
