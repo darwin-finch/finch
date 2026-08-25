@@ -23,6 +23,7 @@ const SIGNING_KEY_FILE: &str = "brain-credential.key";
 const REVOCATIONS_FILE: &str = "brain-credential-revocations.json";
 const CONSUMED_INVITATIONS_FILE: &str = "brain-invitation-consumed.json";
 const MAX_DELEGATION_DEPTH: usize = 8;
+pub(crate) const MAX_SIGNED_CLOCK_SKEW_MS: u64 = 5 * 60 * 1_000;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -717,10 +718,10 @@ pub fn verify_portable_invitation(
     if claims.version != CREDENTIAL_VERSION {
         anyhow::bail!("unsupported Brain invitation version {}", claims.version);
     }
-    if now_ms < claims.issued_ms {
+    if claims.issued_ms > now_ms.saturating_add(MAX_SIGNED_CLOCK_SKEW_MS) {
         anyhow::bail!("Brain invitation is not valid yet");
     }
-    if now_ms >= claims.expires_ms {
+    if now_ms >= claims.expires_ms.saturating_add(MAX_SIGNED_CLOCK_SKEW_MS) {
         anyhow::bail!("Brain invitation has expired");
     }
     if claims.role == AttachmentRole::Runner
