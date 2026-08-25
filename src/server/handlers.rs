@@ -679,6 +679,23 @@ struct PushNamedBrainResponse {
     result: Option<crate::brain::shared::BrainEvent>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BrainSubmissionError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    Forbidden(String),
+    #[error(transparent)]
+    State(#[from] anyhow::Error),
+}
+
+#[derive(Debug)]
+pub(crate) struct BrainSubmissionOutcome {
+    pub accepted: crate::brain::shared::BrainEvent,
+    pub run: Option<crate::brain::shared::BrainRun>,
+    pub result: Option<crate::brain::shared::BrainEvent>,
+}
+
 fn attachment_can_submit(
     role: crate::brain::shared::AttachmentRole,
     kind: &crate::brain::shared::BrainEventKind,
@@ -720,104 +737,124 @@ async fn push_named_brain_event(
         .require_connection(&name, request.attachment_id, request.connection_id)
         .map_err(|error| AppError(error).into_response())?;
     claims_match_attachment(claims.as_ref(), &attachment)?;
-    if !matches!(
+    let outcome = submit_named_brain_event(
+        server.shared_brains(),
+        server.brain_runners(),
+        server.brain_approvals(),
+        &name,
+        &attachment,
         request.kind,
+    )
+    .await
+    .map_err(brain_submission_error_response)?;
+    Ok(Json(PushNamedBrainResponse {
+        accepted: outcome.accepted,
+        run: outcome.run,
+        result: outcome.result,
+    }))
+}
+
+fn brain_submission_error_response(error: BrainSubmissionError) -> Response {
+    let status = match &error {
+        BrainSubmissionError::Invalid(_) => StatusCode::BAD_REQUEST,
+        BrainSubmissionError::Forbidden(_) => StatusCode::FORBIDDEN,
+        BrainSubmissionError::State(_) => StatusCode::CONFLICT,
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+        .into_response()
+}
+
+/// One transport-neutral mutation boundary for an authenticated Brain
+/// attachment. HTTP and Cap'n Proto adapters must both enter here so role
+/// checks, ordering, run creation, queueing, and terminal persistence cannot
+/// diverge by transport.
+pub(crate) async fn submit_named_brain_event(
+    store: &crate::brain::shared::SharedBrainStore,
+    runners: &crate::server::BrainRunnerBroker,
+    approvals: &crate::server::BrainApprovalBroker,
+    name: &str,
+    attachment: &crate::brain::shared::BrainAttachment,
+    kind: crate::brain::shared::BrainEventKind,
+) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
+    use crate::brain::shared::BrainEventKind;
+
+    if !matches!(
+        kind,
         BrainEventKind::Prompt { .. }
             | BrainEventKind::Program { .. }
             | BrainEventKind::ProgramPopped { .. }
             | BrainEventKind::ApprovalDecided { .. }
     ) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "internal Brain events cannot be submitted through the program endpoint"
-            })),
-        )
-            .into_response());
+        return Err(BrainSubmissionError::Invalid(
+            "internal Brain events cannot be submitted by a participant".into(),
+        ));
     }
-    if !attachment_can_submit(attachment.role, &request.kind) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "attachment role cannot submit this Brain event"
-            })),
-        )
-            .into_response());
+    if !attachment_can_submit(attachment.role, &kind) {
+        return Err(BrainSubmissionError::Forbidden(
+            "attachment role cannot submit this Brain event".into(),
+        ));
     }
     if let BrainEventKind::ApprovalDecided {
         request_seq,
         approval_id,
         decision,
-    } = &request.kind
+    } = &kind
     {
         let accepted = commit_named_brain_approval_decision(
-            server.shared_brains(),
-            server.brain_approvals(),
-            &name,
-            &attachment,
+            store,
+            approvals,
+            name,
+            attachment,
             *request_seq,
             approval_id,
             decision.clone(),
-        )
-        .map_err(brain_state_conflict)?;
-        return Ok(Json(PushNamedBrainResponse {
+        )?;
+        return Ok(BrainSubmissionOutcome {
             accepted,
             run: None,
             result: None,
-        }));
+        });
     }
     // A Brain is one ordered conversation and one authoritative VM revision.
     // Hold its lane from input acceptance through the corresponding result so
     // two attached consoles cannot race commits or interleave turn events.
-    let execution_lock = server
-        .shared_brains()
-        .execution_lock(&name)
-        .map_err(|error| AppError(error).into_response())?;
+    let execution_lock = store.execution_lock(name)?;
     let _turn = execution_lock.lock_owned().await;
-    let accepted = server
-        .shared_brains()
-        .push(&name, &attachment.subject, request.kind.clone())
-        .map_err(|error| AppError(error).into_response())?;
+    let accepted = store.push(name, &attachment.subject, kind.clone())?;
 
     let run = if matches!(
-        request.kind,
+        kind,
         BrainEventKind::Program { .. } | BrainEventKind::Prompt { .. }
     ) {
-        let status = if named_brain_runner_is_ready(
-            server.shared_brains(),
-            server.brain_runners(),
-            &name,
-        )
-        .map_err(|error| AppError(error).into_response())?
-        {
+        let status = if named_brain_runner_is_ready(store, runners, name)? {
             crate::brain::shared::BrainRunStatus::Running
         } else {
             crate::brain::shared::BrainRunStatus::QueuedForEnvironment
         };
         Some(
-            server
-                .shared_brains()
+            store
                 .start_run(
-                    &name,
+                    name,
                     &attachment.subject,
                     crate::brain::shared::BrainRunKind::Interactive,
                     accepted.seq,
                     attachment.attachment_id,
                     status,
-                )
-                .map_err(|error| AppError(error).into_response())?,
+                )?,
         )
     } else {
         None
     };
 
     let result = match run.as_ref() {
-        Some(run) if run.status == crate::brain::shared::BrainRunStatus::Running => Some(
-            dispatch_named_brain_run(server.shared_brains(), server.brain_runners(), &name, run)
-                .await,
-        ),
+        Some(run) if run.status == crate::brain::shared::BrainRunStatus::Running => {
+            Some(dispatch_named_brain_run(store, runners, name, run).await)
+        }
         Some(_) => None,
-        None => match request.kind {
+        None => match kind {
             BrainEventKind::ProgramPopped { .. }
             | BrainEventKind::ToolCall { .. }
             | BrainEventKind::ToolResult { .. }
@@ -837,15 +874,15 @@ async fn push_named_brain_event(
         },
     };
     let result = match result {
-        Some(result) => result.map_err(|error| AppError(error).into_response())?,
+        Some(result) => result?,
         None => None,
     };
 
-    Ok(Json(PushNamedBrainResponse {
+    Ok(BrainSubmissionOutcome {
         accepted,
         run,
         result,
-    }))
+    })
 }
 
 fn named_brain_runner_is_ready(
@@ -3836,5 +3873,67 @@ mod named_brain_provider_context_tests {
             crate::brain::shared::BrainRunStatus::Failed
         );
         assert_eq!(failed.detail.as_deref(), Some("frontend execution failed"));
+    }
+
+    #[tokio::test]
+    async fn transport_neutral_submission_enforces_roles_and_creates_one_queued_run() {
+        let store = crate::brain::shared::SharedBrainStore::with_root("box.local", None);
+        let runners = crate::server::BrainRunnerBroker::default();
+        let approvals = crate::server::BrainApprovalBroker::default();
+        let driver = store
+            .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
+            .unwrap();
+        let outcome = submit_named_brain_event(
+            &store,
+            &runners,
+            &approvals,
+            "shared",
+            &driver,
+            BrainEventKind::Prompt {
+                text: "inspect the workspace".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let run = outcome.run.unwrap();
+        assert_eq!(run.request_seq, outcome.accepted.seq);
+        assert_eq!(
+            run.status,
+            crate::brain::shared::BrainRunStatus::QueuedForEnvironment
+        );
+        assert!(outcome.result.is_none());
+        assert_eq!(store.snapshot("shared").unwrap().runs.len(), 1);
+
+        let observer = store
+            .attach("shared", "eve@box.local", AttachmentRole::Observer, None)
+            .unwrap();
+        assert!(matches!(
+            submit_named_brain_event(
+                &store,
+                &runners,
+                &approvals,
+                "shared",
+                &observer,
+                BrainEventKind::Prompt { text: "run".into() },
+            )
+            .await,
+            Err(BrainSubmissionError::Forbidden(_))
+        ));
+        assert!(matches!(
+            submit_named_brain_event(
+                &store,
+                &runners,
+                &approvals,
+                "shared",
+                &driver,
+                BrainEventKind::Result {
+                    request_seq: 1,
+                    output: "forged".into(),
+                    error: None,
+                },
+            )
+            .await,
+            Err(BrainSubmissionError::Invalid(_))
+        ));
     }
 }
