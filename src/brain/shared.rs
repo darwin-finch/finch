@@ -1602,7 +1602,7 @@ impl SharedBrainStore {
         let checkpoint = snapshot.checkpoint.context(
             "typed runtime revision contains host-owned handles and cannot be persisted yet",
         )?;
-        let encoded = serde_json::to_vec(&checkpoint)?;
+        let encoded = crate::ipc::checkpoint_codec::encode_checkpoint_bytes(&checkpoint)?;
         let checkpoint_sha256 = hex::encode(Sha256::digest(&encoded));
         self.write_runtime_checkpoint(name, &checkpoint_sha256, &encoded)?;
         self.runtime_checkpoints
@@ -1655,7 +1655,7 @@ impl SharedBrainStore {
             checkpoint.clone(),
             runtime_revision,
         )?;
-        let encoded = serde_json::to_vec(&checkpoint)?;
+        let encoded = crate::ipc::checkpoint_codec::encode_checkpoint_bytes(&checkpoint)?;
         let checkpoint_sha256 = hex::encode(Sha256::digest(&encoded));
         self.write_runtime_checkpoint(name, &checkpoint_sha256, &encoded)?;
         self.runtime_checkpoints
@@ -1695,18 +1695,34 @@ impl SharedBrainStore {
             .root
             .as_ref()
             .context("named Brain checkpoint is not available in this process")?;
-        let path = root
+        let directory = root
             .join(name)
-            .join("runtime")
-            .join(format!("{checkpoint_sha256}.json"));
+            .join("runtime");
+        let native_path = directory.join(format!("{checkpoint_sha256}.capnp"));
+        let legacy_path = directory.join(format!("{checkpoint_sha256}.json"));
+        let (path, native) = if native_path.exists() {
+            (native_path, true)
+        } else if legacy_path.exists() {
+            (legacy_path, false)
+        } else {
+            anyhow::bail!(
+                "named Brain checkpoint {checkpoint_sha256} is missing from {}",
+                directory.display()
+            );
+        };
         let encoded = std::fs::read(&path)
             .with_context(|| format!("read {}", path.display()))?;
         let actual = hex::encode(Sha256::digest(&encoded));
         if actual != checkpoint_sha256 {
             anyhow::bail!("typed runtime checkpoint hash mismatch for {checkpoint_sha256}");
         }
-        let checkpoint: crate::vm::TypedRuntimeCheckpoint = serde_json::from_slice(&encoded)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let checkpoint = if native {
+            crate::ipc::checkpoint_codec::decode_checkpoint_bytes(&encoded)
+                .with_context(|| format!("parse {}", path.display()))?
+        } else {
+            serde_json::from_slice(&encoded)
+                .with_context(|| format!("parse legacy checkpoint {}", path.display()))?
+        };
         self.runtime_checkpoints
             .write()
             .expect("shared brain checkpoint lock poisoned")
@@ -1726,7 +1742,7 @@ impl SharedBrainStore {
         let directory = root.join(name).join("runtime");
         std::fs::create_dir_all(&directory)
             .with_context(|| format!("create {}", directory.display()))?;
-        let path = directory.join(format!("{checkpoint_sha256}.json"));
+        let path = directory.join(format!("{checkpoint_sha256}.capnp"));
         if path.exists() {
             return Ok(());
         }
@@ -3203,18 +3219,26 @@ mod tests {
             crate::runtime::outcome::ExecutionStatus::Completed
         );
         let committed_revision = outcome.output_revision;
-        let checkpoint = runtime
-            .revision_history()
-            .unwrap()
-            .last()
-            .and_then(|revision| revision.checkpoint.clone())
-            .unwrap();
-        let encoded_checkpoint = serde_json::to_string(&checkpoint).unwrap();
-        serde_json::from_str::<crate::vm::TypedRuntimeCheckpoint>(&encoded_checkpoint)
-            .expect("checkpoint itself must round-trip through JSON");
-        store
+        let committed = store
             .commit_runtime("brain", 1, outcome.output_revision, &runtime)
             .unwrap();
+        let checkpoint_sha256 = match committed.kind {
+            BrainEventKind::RuntimeCommitted {
+                checkpoint_sha256,
+                ..
+            } => checkpoint_sha256,
+            other => panic!("expected runtime checkpoint, found {other:?}"),
+        };
+        assert!(temp
+            .path()
+            .join("brain/runtime")
+            .join(format!("{checkpoint_sha256}.capnp"))
+            .is_file());
+        assert!(!temp
+            .path()
+            .join("brain/runtime")
+            .join(format!("{checkpoint_sha256}.json"))
+            .exists());
 
         let event_log = std::fs::read_to_string(temp.path().join("brain/events.jsonl")).unwrap();
         for line in event_log.lines() {
@@ -3246,6 +3270,80 @@ mod tests {
         );
         assert_eq!(outcome.values, vec![crate::programs::ProgramValue::Int(49)]);
         assert_eq!(outcome.output_revision, committed_revision + 1);
+    }
+
+    #[tokio::test]
+    async fn named_brain_reads_legacy_json_checkpoint_without_rewriting_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        store.snapshot("brain").unwrap();
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let outcome = runtime
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Lisp,
+                source_id: Some("legacy-checkpoint.lisp".into()),
+                source: "(define (double (n : int)) (* n 2))".into(),
+                intent: "create legacy checkpoint".into(),
+                effect: crate::programs::ExecutionEffect::VmWrite,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        let checkpoint = runtime
+            .revision_history()
+            .unwrap()
+            .into_iter()
+            .find(|revision| revision.revision == outcome.output_revision)
+            .and_then(|revision| revision.checkpoint)
+            .unwrap();
+        let encoded = serde_json::to_vec(&checkpoint).unwrap();
+        let checkpoint_sha256 = hex::encode(Sha256::digest(&encoded));
+        let runtime_directory = temp.path().join("brain/runtime");
+        std::fs::create_dir_all(&runtime_directory).unwrap();
+        std::fs::write(
+            runtime_directory.join(format!("{checkpoint_sha256}.json")),
+            encoded,
+        )
+        .unwrap();
+        store
+            .push(
+                "brain",
+                "legacy-daemon",
+                BrainEventKind::RuntimeCommitted {
+                    request_seq: 1,
+                    runtime_revision: outcome.output_revision,
+                    checkpoint_sha256: checkpoint_sha256.clone(),
+                },
+            )
+            .unwrap();
+        drop(store);
+
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restored = restarted.program_runtime("brain").unwrap();
+        let called = restored
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Forth,
+                source_id: Some("legacy-checkpoint.forth".into()),
+                source: "21 double".into(),
+                intent: "restore legacy checkpoint".into(),
+                effect: crate::programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: restored.manifest_generation(),
+                expected_revision: Some(restored.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(called.values, vec![crate::programs::ProgramValue::Int(42)]);
+        assert!(runtime_directory
+            .join(format!("{checkpoint_sha256}.json"))
+            .is_file());
+        assert!(!runtime_directory
+            .join(format!("{checkpoint_sha256}.capnp"))
+            .exists());
     }
 
     #[tokio::test]

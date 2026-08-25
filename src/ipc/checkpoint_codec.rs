@@ -2167,6 +2167,31 @@ pub(super) fn decode_checkpoint(
     })
 }
 
+/// Encode one durable typed-runtime checkpoint using the same closed native
+/// schema used by runner registration and result transport.
+pub(crate) fn encode_checkpoint_bytes(value: &TypedRuntimeCheckpoint) -> Result<Vec<u8>> {
+    let mut message = capnp::message::Builder::new_default();
+    encode_checkpoint(
+        message.init_root::<wire::typed_runtime_checkpoint::Builder<'_>>(),
+        value,
+    )?;
+    let mut encoded = Vec::new();
+    capnp::serialize::write_message(&mut encoded, &message)?;
+    Ok(encoded)
+}
+
+/// Decode one durable typed-runtime checkpoint. Trailing bytes are rejected so
+/// a content-addressed checkpoint has exactly one unambiguous representation.
+pub(crate) fn decode_checkpoint_bytes(encoded: &[u8]) -> Result<TypedRuntimeCheckpoint> {
+    let mut cursor = std::io::Cursor::new(encoded);
+    let message =
+        capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
+    if cursor.position() != encoded.len() as u64 {
+        bail!("typed checkpoint contains trailing bytes");
+    }
+    decode_checkpoint(message.get_root::<wire::typed_runtime_checkpoint::Reader<'_>>()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2189,17 +2214,7 @@ mod tests {
     }
 
     fn round_trip_checkpoint(value: &TypedRuntimeCheckpoint) -> Result<TypedRuntimeCheckpoint> {
-        let mut message = capnp::message::Builder::new_default();
-        encode_checkpoint(
-            message.init_root::<wire::typed_runtime_checkpoint::Builder<'_>>(),
-            value,
-        )?;
-        let words = capnp::serialize::write_message_to_words(&message);
-        let reader = capnp::serialize::read_message_from_flat_slice(
-            &mut words.as_slice(),
-            capnp::message::ReaderOptions::new(),
-        )?;
-        decode_checkpoint(reader.get_root::<wire::typed_runtime_checkpoint::Reader<'_>>()?)
+        decode_checkpoint_bytes(&encode_checkpoint_bytes(value)?)
     }
 
     fn round_trip_type(value: &Type) -> Result<Type> {
@@ -2605,6 +2620,13 @@ mod tests {
             .map_err(|error| anyhow!(error.to_string()))?;
         assert!(!checkpoint.functions.is_empty());
         assert_eq!(checkpoint.producer_fibers.len(), 1);
+
+        let mut ambiguous = encode_checkpoint_bytes(&checkpoint)?;
+        ambiguous.extend_from_slice(&[0; 8]);
+        assert!(decode_checkpoint_bytes(&ambiguous)
+            .unwrap_err()
+            .to_string()
+            .contains("trailing bytes"));
 
         let decoded = round_trip_checkpoint(&checkpoint)?;
         assert_eq!(decoded, checkpoint);
