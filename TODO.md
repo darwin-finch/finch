@@ -480,9 +480,16 @@ still blocks the corresponding Brain phase until it is unified.
   process that can recover its state. The reusable preflight primitive now stages hash-addressed
   candidate/rollback binaries and proves a full shadow daemon against a fail-closed isolated
   Brain-store snapshot, but deliberately stops before production handoff. Still add the detached
-  supervisor entrypoint and durable phase intent that can recover if its caller dies; only then wire
-  explicit approval, atomic promotion/rollback receipts, and automatic frontend reconnect of durable
-  attachment/runner identities after socket turnover.
+  supervisor entrypoint and durable phase intent that can recover if its caller dies. The supervisor
+  must be relaunched automatically from unfinished intent, identify processes with a non-reusable
+  start identity/handle rather than PID plus executable hash, revalidate identity before every
+  signal, fsync staged binaries and directories portably, and reach an explicit terminal failure
+  state if rollback health fails. Schema-impact review must be an enforced compatibility gate with
+  a verified data snapshot/migration rollback strategy; restoring only the executable is not a safe
+  rollback after a candidate touched live data. Test real crash windows, takeover, PID reuse,
+  rollback failure, and Windows replacement semantics in an isolated daemon home. Only then wire
+  explicit approval, atomic promotion/rollback receipts, and automatic frontend reconnect of
+  durable attachment/runner identities after socket turnover.
 - [ ] Make the Finch-on-Finch gate terminate in a reproducible public release, not only a local
   dogfood run: select/version the release, generate a human-reviewed changelog from canonical
   commits, publish signed checksummed artifacts and package-manager metadata, migrate and update the
