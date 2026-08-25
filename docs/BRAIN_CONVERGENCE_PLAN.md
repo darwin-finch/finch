@@ -427,10 +427,14 @@ submission, cursor acknowledgement, and detach against a restarted daemon. Remot
 the same closed submission union and typed outcomes in correlated binary WebSocket envelopes;
 fixture and live-daemon tests cover attach, watch, submit, acknowledge, final detach projection, and
 cleanup, including detach before an explicit watch. Generalized approval/effect resumptions remain
-incomplete, and embedded mode likewise does not yet implement the same contract. The first ignored
-live conformance fixture now drives local RPC and remote binary clients through the same
-attach/watch/prompt/queued-run/acknowledge/detach script and compares normalized events and outcomes;
-it should become hermetic when the in-process adapter exists.
+incomplete, as does replacement of the remaining JSON-encoded detail/context/checkpoint values with
+explicit schema types. A cloneable in-process `BrainLifecycleService` now owns attachment
+reservation and expiry, watch activation, acknowledgement, detach cleanup, participant submission,
+queued-run resumption, and runner-lease lifetime. Embedded hosts call this boundary directly; local
+RPC and remote WebSocket code are encoding/authentication adapters over it. Hermetic service tests
+exercise attachment, watch, queueing, projection, and cleanup, while the ignored live conformance
+fixture drives local RPC and remote binary clients through the same
+attach/watch/prompt/queued-run/acknowledge/detach script and compares normalized events and outcomes.
 
 ### B5: Client projections and shadow-buffer UI
 

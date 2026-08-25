@@ -762,8 +762,13 @@ still blocks the corresponding Brain phase until it is unified.
   and runner-lease routes have been removed; HTTP now remains only for authenticated
   discovery/credential/attachment bootstrap and explicit administrative archive. An ignored live
   conformance fixture now drives local RPC and remote binary adapters through the same lifecycle and
-  compares their normalized events, submission outcomes, and queued run state. Still converge
-  embedded mode on the same service façade.
+  compares their normalized events, submission outcomes, and queued run state. A cloneable
+  in-process `BrainLifecycleService` now owns attachment reservation/expiry, atomic watch activation,
+  acknowledgement, detach cleanup, participant submission, queued-run resumption, and runner-lease
+  lifetime; embedded hosts can call it directly, while both transport adapters contain only
+  authentication, encoding, socket, and callback mechanics. Hermetic service tests and the live
+  cross-transport fixture exercise that same boundary. Still replace residual JSON-encoded values
+  inside typed messages with explicit schema types and generalize approval/effect resume correlation.
 - [ ] Define Brain initialization as a reviewed typed program/module with an explicit capability
   budget and journaled effects. Deterministic VM vocabulary/module loading may occur before a
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work
