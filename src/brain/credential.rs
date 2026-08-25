@@ -1,0 +1,449 @@
+//! Scoped, expiring credentials for named-Brain participants.
+//!
+//! The human-managed Brain password is only a bootstrap credential. Ordinary
+//! remote Brain operations use these narrower bearer credentials, signed by a
+//! daemon-owned secret and revocable by stable credential ID.
+
+use anyhow::{Context, Result};
+use base64::Engine as _;
+use hmac::{Hmac, Mac};
+use rand::RngCore as _;
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use super::shared::{AttachmentRole, BrainId};
+
+const CREDENTIAL_VERSION: u32 = 1;
+const TOKEN_PREFIX: &str = "finch-brain-v1";
+const SIGNING_KEY_FILE: &str = "brain-credential.key";
+const REVOCATIONS_FILE: &str = "brain-credential-revocations.json";
+
+type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum BrainCredentialScope {
+    #[serde(rename = "brain:read")]
+    BrainRead,
+    #[serde(rename = "brain:submit")]
+    BrainSubmit,
+    #[serde(rename = "brain:approve")]
+    BrainApprove,
+    #[serde(rename = "brain:control")]
+    BrainControl,
+    #[serde(rename = "environment:execute")]
+    EnvironmentExecute,
+    #[serde(rename = "environment:admin")]
+    EnvironmentAdmin,
+    #[serde(rename = "compute:submit")]
+    ComputeSubmit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainCredentialClaims {
+    pub version: u32,
+    pub credential_id: uuid::Uuid,
+    pub issuer: String,
+    pub subject: String,
+    pub brain_id: BrainId,
+    pub brain: String,
+    pub environment_generation: u64,
+    pub role: AttachmentRole,
+    pub scopes: BTreeSet<BrainCredentialScope>,
+    pub issued_ms: u64,
+    pub expires_ms: u64,
+}
+
+impl BrainCredentialClaims {
+    pub fn permits(&self, scope: BrainCredentialScope) -> bool {
+        self.scopes.contains(&scope)
+    }
+
+    pub fn require_audience(
+        &self,
+        brain_id: BrainId,
+        brain: &str,
+        environment_generation: u64,
+        scope: BrainCredentialScope,
+    ) -> Result<()> {
+        if self.brain_id != brain_id || self.brain != brain {
+            anyhow::bail!("Brain credential has a different Brain audience");
+        }
+        if self.environment_generation != environment_generation {
+            anyhow::bail!("Brain credential environment generation is no longer current");
+        }
+        if !self.permits(scope) {
+            anyhow::bail!("Brain credential does not grant the required scope");
+        }
+        Ok(())
+    }
+
+    pub fn require_participant(&self, subject: &str, role: AttachmentRole) -> Result<()> {
+        if self.subject != subject || self.role != role {
+            anyhow::bail!("Brain participant identity does not match the credential");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BrainCredentialRequest {
+    pub issuer: String,
+    pub subject: String,
+    pub brain_id: BrainId,
+    pub brain: String,
+    pub environment_generation: u64,
+    pub role: AttachmentRole,
+    pub scopes: BTreeSet<BrainCredentialScope>,
+    pub ttl_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RevocationFile {
+    version: u32,
+    credential_ids: BTreeSet<uuid::Uuid>,
+}
+
+#[derive(Clone)]
+pub struct BrainCredentialAuthority {
+    signing_key: Arc<[u8; 32]>,
+    revoked: Arc<Mutex<BTreeSet<uuid::Uuid>>>,
+    revocations_path: Option<Arc<PathBuf>>,
+}
+
+impl BrainCredentialAuthority {
+    /// Load the daemon credential authority from a private state directory.
+    /// The signing key is generated once and survives daemon restarts.
+    pub fn load_or_create(state_directory: &Path) -> Result<Self> {
+        std::fs::create_dir_all(state_directory)
+            .with_context(|| format!("create {}", state_directory.display()))?;
+        let key_path = state_directory.join(SIGNING_KEY_FILE);
+        let signing_key = load_or_create_signing_key(&key_path)?;
+        let revocations_path = state_directory.join(REVOCATIONS_FILE);
+        let revoked = load_revocations(&revocations_path)?;
+        Ok(Self {
+            signing_key: Arc::new(signing_key),
+            revoked: Arc::new(Mutex::new(revoked)),
+            revocations_path: Some(Arc::new(revocations_path)),
+        })
+    }
+
+    #[cfg(test)]
+    fn ephemeral(signing_key: [u8; 32]) -> Self {
+        Self {
+            signing_key: Arc::new(signing_key),
+            revoked: Arc::new(Mutex::new(BTreeSet::new())),
+            revocations_path: None,
+        }
+    }
+
+    pub fn issue(&self, request: BrainCredentialRequest, now_ms: u64) -> Result<String> {
+        if request.ttl_ms == 0 {
+            anyhow::bail!("Brain credential lifetime must be greater than zero");
+        }
+        if request.subject.trim().is_empty() {
+            anyhow::bail!("Brain credential subject cannot be empty");
+        }
+        if request.scopes.is_empty() {
+            anyhow::bail!("Brain credential must grant at least one scope");
+        }
+        let claims = BrainCredentialClaims {
+            version: CREDENTIAL_VERSION,
+            credential_id: uuid::Uuid::new_v4(),
+            issuer: request.issuer,
+            subject: request.subject,
+            brain_id: request.brain_id,
+            brain: request.brain,
+            environment_generation: request.environment_generation,
+            role: request.role,
+            scopes: request.scopes,
+            issued_ms: now_ms,
+            expires_ms: now_ms
+                .checked_add(request.ttl_ms)
+                .context("Brain credential expiry overflow")?,
+        };
+        self.sign(&claims)
+    }
+
+    pub fn verify(&self, token: &str, now_ms: u64) -> Result<BrainCredentialClaims> {
+        let mut parts = token.split('.');
+        let prefix = parts.next().unwrap_or_default();
+        let payload = parts
+            .next()
+            .context("Brain credential payload is missing")?;
+        let signature = parts
+            .next()
+            .context("Brain credential signature is missing")?;
+        if prefix != TOKEN_PREFIX || parts.next().is_some() {
+            anyhow::bail!("Brain credential envelope is invalid");
+        }
+
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(signature)
+            .context("Brain credential signature is invalid")?;
+        let mut mac = HmacSha256::new_from_slice(self.signing_key.as_slice())
+            .expect("HMAC accepts a 32-byte key");
+        mac.update(payload.as_bytes());
+        mac.verify_slice(&signature)
+            .map_err(|_| anyhow::anyhow!("Brain credential signature does not match"))?;
+
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .context("Brain credential payload is invalid")?;
+        let claims: BrainCredentialClaims =
+            serde_json::from_slice(&encoded).context("Brain credential claims are invalid")?;
+        if claims.version != CREDENTIAL_VERSION {
+            anyhow::bail!("unsupported Brain credential version {}", claims.version);
+        }
+        if now_ms < claims.issued_ms {
+            anyhow::bail!("Brain credential is not valid yet");
+        }
+        if now_ms >= claims.expires_ms {
+            anyhow::bail!("Brain credential has expired");
+        }
+        if self
+            .revoked
+            .lock()
+            .expect("Brain credential revocation lock poisoned")
+            .contains(&claims.credential_id)
+        {
+            anyhow::bail!("Brain credential has been revoked");
+        }
+        Ok(claims)
+    }
+
+    pub fn revoke(&self, credential_id: uuid::Uuid) -> Result<()> {
+        let mut revoked = self
+            .revoked
+            .lock()
+            .expect("Brain credential revocation lock poisoned");
+        if !revoked.insert(credential_id) {
+            return Ok(());
+        }
+        if let Some(path) = &self.revocations_path {
+            if let Err(error) = persist_revocations(path, &revoked) {
+                revoked.remove(&credential_id);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn sign(&self, claims: &BrainCredentialClaims) -> Result<String> {
+        let encoded = serde_json::to_vec(claims).context("serialize Brain credential")?;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encoded);
+        let mut mac = HmacSha256::new_from_slice(self.signing_key.as_slice())
+            .expect("HMAC accepts a 32-byte key");
+        mac.update(payload.as_bytes());
+        let signature =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        Ok(format!("{TOKEN_PREFIX}.{payload}.{signature}"))
+    }
+}
+
+fn load_or_create_signing_key(path: &Path) -> Result<[u8; 32]> {
+    match std::fs::read(path) {
+        Ok(bytes) => return key_from_bytes(path, bytes),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(error).with_context(|| format!("read {}", path.display()));
+        }
+        Err(_) => {}
+    }
+
+    let mut key = [0_u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(&key)
+                .with_context(|| format!("write {}", path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("sync {}", path.display()))?;
+            Ok(key)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            key_from_bytes(path, std::fs::read(path)?)
+        }
+        Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
+    }
+}
+
+fn key_from_bytes(path: &Path, bytes: Vec<u8>) -> Result<[u8; 32]> {
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        anyhow::anyhow!(
+            "Brain credential key {} has {} bytes; expected 32",
+            path.display(),
+            bytes.len()
+        )
+    })
+}
+
+fn load_revocations(path: &Path) -> Result<BTreeSet<uuid::Uuid>> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let file: RevocationFile = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse {}", path.display()))?;
+            if file.version != CREDENTIAL_VERSION {
+                anyhow::bail!("unsupported Brain revocation version {}", file.version);
+            }
+            Ok(file.credential_ids)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn persist_revocations(path: &Path, revoked: &BTreeSet<uuid::Uuid>) -> Result<()> {
+    let file = RevocationFile {
+        version: CREDENTIAL_VERSION,
+        credential_ids: revoked.clone(),
+    };
+    let encoded = serde_json::to_vec_pretty(&file)?;
+    let parent = path.parent().context("revocation path has no parent")?;
+    let temporary = parent.join(format!(
+        ".brain-credential-revocations.{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&temporary, encoded)
+        .with_context(|| format!("write {}", temporary.display()))?;
+    std::fs::rename(&temporary, path).with_context(|| format!("commit {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(ttl_ms: u64) -> BrainCredentialRequest {
+        BrainCredentialRequest {
+            issuer: "machine.local".into(),
+            subject: "alice@laptop.local".into(),
+            brain_id: BrainId(uuid::Uuid::new_v4()),
+            brain: "shared-work".into(),
+            environment_generation: 7,
+            role: AttachmentRole::Driver,
+            scopes: [
+                BrainCredentialScope::BrainRead,
+                BrainCredentialScope::BrainSubmit,
+            ]
+            .into_iter()
+            .collect(),
+            ttl_ms,
+        }
+    }
+
+    #[test]
+    fn issued_credential_round_trips_all_authority_boundaries() {
+        let authority = BrainCredentialAuthority::ephemeral([3; 32]);
+        let token = authority.issue(request(1_000), 10_000).unwrap();
+        let claims = authority.verify(&token, 10_500).unwrap();
+        assert_eq!(claims.subject, "alice@laptop.local");
+        assert_eq!(claims.brain, "shared-work");
+        assert_eq!(claims.environment_generation, 7);
+        assert_eq!(claims.role, AttachmentRole::Driver);
+        assert!(claims.permits(BrainCredentialScope::BrainRead));
+        assert!(claims.permits(BrainCredentialScope::BrainSubmit));
+        assert!(!claims.permits(BrainCredentialScope::BrainApprove));
+    }
+
+    #[test]
+    fn tampering_fails_before_claims_are_trusted() {
+        let authority = BrainCredentialAuthority::ephemeral([4; 32]);
+        let mut token = authority.issue(request(1_000), 10_000).unwrap();
+        let index = token.find('.').unwrap() + 2;
+        token.replace_range(index..=index, "x");
+        assert!(authority.verify(&token, 10_500).is_err());
+    }
+
+    #[test]
+    fn expiry_is_exclusive_and_future_credentials_fail() {
+        let authority = BrainCredentialAuthority::ephemeral([5; 32]);
+        let token = authority.issue(request(1_000), 10_000).unwrap();
+        assert!(authority.verify(&token, 9_999).is_err());
+        assert!(authority.verify(&token, 10_999).is_ok());
+        assert!(authority.verify(&token, 11_000).is_err());
+    }
+
+    #[test]
+    fn revocation_survives_authority_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let authority = BrainCredentialAuthority::load_or_create(temp.path()).unwrap();
+        let token = authority.issue(request(1_000), 10_000).unwrap();
+        let credential_id = authority.verify(&token, 10_500).unwrap().credential_id;
+        authority.revoke(credential_id).unwrap();
+
+        let restarted = BrainCredentialAuthority::load_or_create(temp.path()).unwrap();
+        assert!(restarted.verify(&token, 10_500).is_err());
+    }
+
+    #[test]
+    fn signing_key_survives_authority_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let token = BrainCredentialAuthority::load_or_create(temp.path())
+            .unwrap()
+            .issue(request(1_000), 10_000)
+            .unwrap();
+        let restarted = BrainCredentialAuthority::load_or_create(temp.path()).unwrap();
+        assert!(restarted.verify(&token, 10_500).is_ok());
+    }
+
+    #[test]
+    fn audience_scope_generation_and_participant_are_independent_boundaries() {
+        let authority = BrainCredentialAuthority::ephemeral([6; 32]);
+        let token = authority.issue(request(1_000), 10_000).unwrap();
+        let claims = authority.verify(&token, 10_500).unwrap();
+        assert!(claims
+            .require_audience(
+                claims.brain_id,
+                "shared-work",
+                7,
+                BrainCredentialScope::BrainRead,
+            )
+            .is_ok());
+        assert!(claims
+            .require_audience(
+                BrainId(uuid::Uuid::new_v4()),
+                "shared-work",
+                7,
+                BrainCredentialScope::BrainRead,
+            )
+            .is_err());
+        assert!(claims
+            .require_audience(claims.brain_id, "other", 7, BrainCredentialScope::BrainRead,)
+            .is_err());
+        assert!(claims
+            .require_audience(
+                claims.brain_id,
+                "shared-work",
+                8,
+                BrainCredentialScope::BrainRead,
+            )
+            .is_err());
+        assert!(claims
+            .require_audience(
+                claims.brain_id,
+                "shared-work",
+                7,
+                BrainCredentialScope::BrainApprove,
+            )
+            .is_err());
+        assert!(claims
+            .require_participant("alice@laptop.local", AttachmentRole::Driver)
+            .is_ok());
+        assert!(claims
+            .require_participant("mallory@laptop.local", AttachmentRole::Driver)
+            .is_err());
+        assert!(claims
+            .require_participant("alice@laptop.local", AttachmentRole::Observer)
+            .is_err());
+    }
+}

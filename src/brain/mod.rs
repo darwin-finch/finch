@@ -10,6 +10,7 @@
 
 mod action;
 mod ask_user;
+pub mod credential;
 pub mod remote;
 pub mod shared;
 pub use action::{execute_brain_command, BrainActionTool};
