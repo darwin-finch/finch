@@ -10,6 +10,7 @@
 
 pub mod identity;
 pub mod stats;
+pub mod tls;
 
 pub use identity::NodeIdentity;
 pub use stats::{WorkStats, WorkTracker};

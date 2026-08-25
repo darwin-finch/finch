@@ -7,6 +7,7 @@
 //   - Future: points and reputation on the worker network
 
 use anyhow::{Context, Result};
+use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -57,8 +58,7 @@ impl NodeSigningIdentity {
             }
             Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
         };
-        FileExt::unlock(&lock)
-            .with_context(|| format!("unlock {}", lock_path.display()))?;
+        FileExt::unlock(&lock).with_context(|| format!("unlock {}", lock_path.display()))?;
         result
     }
 
@@ -74,6 +74,15 @@ impl NodeSigningIdentity {
 
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
         self.signing_key.sign(message).to_bytes()
+    }
+
+    pub(crate) fn private_key_pkcs8_der(&self) -> Result<Vec<u8>> {
+        Ok(self
+            .signing_key
+            .to_pkcs8_der()
+            .context("encode node signing key as PKCS#8")?
+            .as_bytes()
+            .to_vec())
     }
 
     pub fn verify(public_key: [u8; 32], message: &[u8], signature: [u8; 64]) -> Result<()> {
