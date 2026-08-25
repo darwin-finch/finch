@@ -169,10 +169,6 @@ pub enum ReplEvent {
         result: Result<String>,
     },
 
-    /// mDNS background boot scan found finch instances on the LAN.
-    /// The event loop adds them to the Forth VM's peer list and shows a notice.
-    /// (host, port, friendly_name, token)
-    /// A message arrived from the peer event loop (the AI's own loop).
     /// Snapshot or live event from the currently attached named brain.
     RemoteBrainMessage {
         target: String,

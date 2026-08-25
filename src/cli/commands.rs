@@ -123,12 +123,17 @@ impl Command {
                 return Some(Command::ModelSwitch(profile_name.to_string()));
             }
         }
-        if let Some(rest) = raw
-            .strip_prefix("/say ")
-            .or_else(|| raw.strip_prefix("/brain say "))
-        {
+        if let Some(rest) = raw.strip_prefix("/brain say ") {
             let text = rest.trim();
             if !text.is_empty() {
+                return Some(Command::BrainSay(text.to_string()));
+            }
+        }
+        if let Some(rest) = raw.strip_prefix("/say ") {
+            let text = rest.trim();
+            // `/say #channel message` belonged to the removed IRC-style
+            // collaboration prototype. Do not reinterpret it as a Brain relay.
+            if !text.is_empty() && !text.starts_with('#') {
                 return Some(Command::BrainSay(text.to_string()));
             }
         }
@@ -1062,9 +1067,17 @@ mod tests {
     #[test]
     fn removed_legacy_room_and_proof_commands_do_not_enter_the_command_surface() {
         for source in [
+            "/join",
+            "/join engineering",
+            "/join #engineering",
+            "/part",
+            "/part engineering",
+            "/part #engineering",
             "/room",
+            "/room show",
             "/room new",
             "/room list",
+            "/rooms",
             "/room add peer.example",
             "/room remove peer.example",
             "/share",
@@ -1072,6 +1085,48 @@ mod tests {
             "/box-diff",
         ] {
             assert!(matches!(Command::parse(source), Some(Command::Help)));
+        }
+    }
+
+    #[test]
+    fn irc_shaped_say_does_not_become_a_brain_relay() {
+        assert!(matches!(
+            Command::parse("/say #engineering hello"),
+            Some(Command::Help)
+        ));
+        assert!(matches!(
+            Command::parse("/brain say #engineering hello"),
+            Some(Command::BrainSay(text)) if text == "#engineering hello"
+        ));
+    }
+
+    #[test]
+    fn help_does_not_advertise_legacy_collaboration_commands() {
+        let help = format_help();
+        for removed in [
+            "/join #",
+            "/part #",
+            "/room ",
+            "/connect ",
+            "/disconnect ",
+            "/discover",
+            "/machines",
+            "/peers",
+            "/nodes",
+            "/self-peer",
+            "/balance",
+            "/settle ",
+            "/join-registry ",
+            "/registry ",
+            "/gas-send",
+        ] {
+            assert!(
+                !help.contains(removed),
+                "legacy command {removed} remains in help"
+            );
+        }
+        for supported in ["/say <text>", "@finch <prompt>", "/who", "/whois <subject>"] {
+            assert!(help.contains(supported), "supported command {supported} missing");
         }
     }
 

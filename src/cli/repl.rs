@@ -181,10 +181,6 @@ pub struct Repl {
 
     // Enable sliding-window auto-compaction (from config.features.auto_compact_enabled)
     auto_compact_enabled: bool,
-
-    // Enable mDNS peer auto-discovery at startup
-    auto_discover: bool,
-
 }
 
 /// Background training statistics
@@ -543,7 +539,6 @@ impl Repl {
         let context_recall_k = config.features.context_recall_k;
         let enable_summarization = config.features.enable_summarization;
         let auto_compact_enabled = config.features.auto_compact_enabled;
-        let auto_discover = config.client.auto_discover;
 
         // Generate the legacy-path model manifest. VM-wire turns have their
         // own equivalent filtering below; keep both paths aligned while the
@@ -743,7 +738,6 @@ impl Repl {
             context_recall_k,
             enable_summarization,
             auto_compact_enabled,
-            auto_discover,
         }
     }
 
@@ -3829,58 +3823,6 @@ impl Repl {
         if let Some(ref memory) = self.memory_system {
             let stats = memory.stats().await?;
             self.output_status(format!("Memory: {} nodes", stats.tree_node_count));
-        }
-
-        Ok(())
-    }
-
-    /// Phase 3: Handle /discover command (mDNS service discovery)
-    async fn handle_discover(&self) -> Result<()> {
-        use crate::service::ServiceDiscoveryClient;
-        use std::time::Duration;
-
-        self.output_status("🔍 Discovering Finch instances on local network...\n");
-
-        // Create discovery client
-        let client = match ServiceDiscoveryClient::new() {
-            Ok(c) => c,
-            Err(e) => {
-                self.output_error(format!("Failed to create discovery client: {}", e));
-                return Ok(());
-            }
-        };
-
-        // Discover services (5 second timeout)
-        let services = match client.discover(Duration::from_secs(5)) {
-            Ok(s) => s,
-            Err(e) => {
-                self.output_error(format!("Failed to discover services: {}", e));
-                return Ok(());
-            }
-        };
-
-        if services.is_empty() {
-            self.output_status("No Finch instances found on the local network.");
-            self.output_status("\nTo start a daemon in advertising mode:");
-            self.output_status("  1. Edit ~/.finch/config.toml");
-            self.output_status("  2. Set [server] advertise = true");
-            self.output_status("  3. Run: finch daemon");
-        } else {
-            self.output_status(format!("Found {} Finch instance(s):\n", services.len()));
-
-            for (i, service) in services.iter().enumerate() {
-                self.output_status(format!("{}. {}", i + 1, service.name));
-                self.output_status(format!("   Host: {}:{}", service.host, service.port));
-                if !service.description.is_empty() {
-                    self.output_status(format!("   Description: {}", service.description));
-                }
-                self.output_status("");
-            }
-
-            self.output_status("To connect to a remote daemon:");
-            self.output_status("  1. Edit ~/.finch/config.toml");
-            self.output_status("  2. Set [client] daemon_address = \"HOST:PORT\"");
-            self.output_status("  3. Restart Finch");
         }
 
         Ok(())
