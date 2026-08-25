@@ -124,7 +124,7 @@ fn artifact_suffix(language: &str) -> &'static str {
     }
 }
 
-fn suspend_terminal_for_editor() {
+pub(crate) fn suspend_terminal_for_editor() {
     std::io::stdout().flush().ok();
     // Raw mode alone is not the whole TUI protocol. Leaving bracketed paste or
     // kitty keyboard enhancement enabled makes vi receive Finch's input dialect.
@@ -137,10 +137,27 @@ fn suspend_terminal_for_editor() {
     )
     .ok();
     terminal::disable_raw_mode().ok();
+    // Finch renders on the terminal's primary screen so conversation history
+    // remains useful shell scrollback. Give full-screen editors a disposable
+    // screen even when the selected editor does not enter one itself.
+    execute!(
+        std::io::stdout(),
+        terminal::EnterAlternateScreen,
+        terminal::Clear(terminal::ClearType::All),
+        cursor::MoveTo(0, 0),
+    )
+    .ok();
     std::io::stdout().flush().ok();
 }
 
-fn resume_terminal_after_editor() {
+pub(crate) fn resume_terminal_after_editor() {
+    execute!(
+        std::io::stdout(),
+        terminal::LeaveAlternateScreen,
+        cursor::Show,
+        ResetColor,
+    )
+    .ok();
     terminal::enable_raw_mode().ok();
     execute!(
         std::io::stdout(),
@@ -198,7 +215,7 @@ fn split_editor_command(value: &str) -> Result<Vec<String>> {
     Ok(args)
 }
 
-fn run_editor(path: &Path) -> Result<std::process::ExitStatus> {
+pub(crate) fn run_editor(path: &Path) -> Result<std::process::ExitStatus> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".to_string());

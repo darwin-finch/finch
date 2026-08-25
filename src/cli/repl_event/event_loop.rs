@@ -6414,25 +6414,25 @@ mod tests {
 /// edit it, and return the saved result.  Suspends the terminal while the editor
 /// runs and restores it afterwards.
 fn open_in_editor(content: &str) -> anyhow::Result<String> {
-    // Pick editor: $VISUAL > $EDITOR > vi
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".to_string());
-
     // Write proposed content to a temp file
     let tmp_path = std::env::temp_dir().join(format!("finch-edit-{}.txt", std::process::id()));
     std::fs::write(&tmp_path, content.as_bytes())?;
 
-    // Suspend raw mode so the editor has full terminal control
-    crossterm::terminal::disable_raw_mode()?;
+    // Prevent the asynchronous input/render tasks from writing while the
+    // editor owns the terminal. The restorer is deliberately armed before
+    // any terminal mutation so launch failures cannot strand Finch in the
+    // editor's mode or alternate screen.
+    crate::set_editor_active(true);
+    struct TerminalRestorer;
+    impl Drop for TerminalRestorer {
+        fn drop(&mut self) {
+            crate::tools::implementations::propose::resume_terminal_after_editor();
+        }
+    }
+    let _restore = TerminalRestorer;
+    crate::tools::implementations::propose::suspend_terminal_for_editor();
 
-    let status = std::process::Command::new(&editor)
-        .arg(&tmp_path)
-        .status()
-        .map_err(|e| anyhow::anyhow!("Failed to launch editor '{}': {}", editor, e))?;
-
-    // Restore raw mode
-    crossterm::terminal::enable_raw_mode()?;
+    let status = crate::tools::implementations::propose::run_editor(&tmp_path)?;
 
     if !status.success() {
         anyhow::bail!("Editor exited with status {}", status);
