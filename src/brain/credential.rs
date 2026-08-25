@@ -223,6 +223,9 @@ pub struct BrainInvitationClaims {
     pub scopes: BTreeSet<BrainCredentialScope>,
     #[serde(default)]
     pub delegation_chain: Vec<uuid::Uuid>,
+    /// Base64url DER for the exact self-signed TLS certificate the recipient
+    /// must trust. This value is covered by the node's invitation signature.
+    pub tls_certificate_der: String,
     pub issued_ms: u64,
     pub expires_ms: u64,
 }
@@ -276,6 +279,7 @@ impl ConsumedInvitations {
 pub struct BrainCredentialAuthority {
     signing_key: Arc<[u8; 32]>,
     invitation_signer: Arc<crate::node::identity::NodeSigningIdentity>,
+    invitation_tls: Arc<crate::node::tls::NodeTlsIdentity>,
     revoked: Arc<Mutex<BTreeSet<uuid::Uuid>>>,
     revocations_path: Option<Arc<PathBuf>>,
     consumed_invitations: Arc<Mutex<ConsumedInvitations>>,
@@ -296,6 +300,14 @@ impl BrainCredentialAuthority {
         let signing_key = load_or_create_signing_key(&key_path)?;
         let invitation_signer =
             crate::node::identity::NodeSigningIdentity::load_or_create(state_directory)?;
+        let hostname = hostname::get()
+            .ok()
+            .and_then(|name| name.into_string().ok())
+            .unwrap_or_else(|| "localhost".to_string());
+        let invitation_tls = crate::node::tls::NodeTlsIdentity::from_signing_identity(
+            &invitation_signer,
+            &hostname,
+        )?;
         let revocations_path = state_directory.join(REVOCATIONS_FILE);
         let revoked = load_revocations(&revocations_path)?;
         let consumed_invitations_path = state_directory.join(CONSUMED_INVITATIONS_FILE);
@@ -303,6 +315,7 @@ impl BrainCredentialAuthority {
         Ok(Self {
             signing_key: Arc::new(signing_key),
             invitation_signer: Arc::new(invitation_signer),
+            invitation_tls: Arc::new(invitation_tls),
             revoked: Arc::new(Mutex::new(revoked)),
             revocations_path: Some(Arc::new(revocations_path)),
             consumed_invitations: Arc::new(Mutex::new(consumed_invitations)),
@@ -312,11 +325,15 @@ impl BrainCredentialAuthority {
 
     #[cfg(test)]
     pub(crate) fn ephemeral(signing_key: [u8; 32]) -> Self {
+        let invitation_signer =
+            crate::node::identity::NodeSigningIdentity::from_secret(signing_key);
+        let invitation_tls =
+            crate::node::tls::NodeTlsIdentity::from_signing_identity(&invitation_signer, "test")
+                .expect("test node identity creates TLS material");
         Self {
             signing_key: Arc::new(signing_key),
-            invitation_signer: Arc::new(crate::node::identity::NodeSigningIdentity::from_secret(
-                signing_key,
-            )),
+            invitation_signer: Arc::new(invitation_signer),
+            invitation_tls: Arc::new(invitation_tls),
             revoked: Arc::new(Mutex::new(BTreeSet::new())),
             revocations_path: None,
             consumed_invitations: Arc::new(Mutex::new(ConsumedInvitations::default())),
@@ -406,6 +423,8 @@ impl BrainCredentialAuthority {
             role: request.role,
             scopes: request.scopes,
             delegation_chain: request.delegation_chain,
+            tls_certificate_der: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(self.invitation_tls.certificate_der()),
             issued_ms: now_ms,
             expires_ms: now_ms
                 .checked_add(request.ttl_ms)
@@ -707,7 +726,18 @@ pub fn verify_portable_invitation(
     {
         anyhow::bail!("Brain invitation claims have invalid participant authority");
     }
+    invitation_tls_certificate_der(&claims)?;
     Ok((claims, public_key))
+}
+
+pub fn invitation_tls_certificate_der(claims: &BrainInvitationClaims) -> Result<Vec<u8>> {
+    let certificate = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&claims.tls_certificate_der)
+        .context("Brain invitation TLS certificate is invalid")?;
+    if certificate.is_empty() {
+        anyhow::bail!("Brain invitation TLS certificate is empty");
+    }
+    Ok(certificate)
 }
 
 fn invitation_signature_message(payload: &str) -> Vec<u8> {
