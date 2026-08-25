@@ -681,11 +681,13 @@ still blocks the corresponding Brain phase until it is unified.
   and lifecycle diagnostics distinct structured presentation instead of mixing them as peer prose.
 - [ ] Add theme-aware author/channel backgrounds so user input, model-authored VM source, tool
   activity, and VM/user-visible output are distinguishable without relying on low-contrast cyan
-  foreground text alone. Keep output backgrounds subtle, preserve WCAG-like foreground contrast in
-  light and dark themes, emit plain text when copied, and make the styling part of structured
-  `OutputManager` rows so redraw, resize, scrollback, and concurrent WorkUnits remain stable. In a
-  shared Brain, assign stable distinguishable participant background accents from participant
-  identity and label the author; do not make every human console look like the same local user.
+  foreground text alone. Use subtle full-width turn bands like other modern coding harnesses rather
+  than coloring only glyphs; define theme-aware hover/selection/expanded states for interactive
+  WorkUnits. Preserve WCAG-like foreground contrast in light and dark themes, emit plain text when
+  copied, and make the styling part of structured `OutputManager` rows so redraw, resize,
+  scrollback, and concurrent WorkUnits remain stable. In a shared Brain, assign stable
+  distinguishable participant background accents from participant identity and label the author;
+  do not make every human console look like the same local user.
 - [ ] Give `$VISUAL`/`$EDITOR` a correct terminal-protocol handoff. Leave Finch raw/live rendering,
   enter a clean alternate screen for Vim and similar full-screen editors, restore terminal modes on
   every exit path, discard the editor screen instead of retaining its `~` rows in scrollback, then
@@ -694,8 +696,15 @@ still blocks the corresponding Brain phase until it is unified.
   turn. A later user prompt must remain a distinct queued WorkUnit and cannot appear inside the
   earlier repair's source or tool block; program source, diagnostics, bounded repair, tool activity,
   and VM output must stay grouped under one correlated Brain turn until its terminal event.
-- [x] Recompute the owned live-region geometry after terminal reflow before erasing on resize, so
-  shrinking a terminal no longer leaves one historical separator row per resize event.
+- [ ] Replace relative live-region resize repair with a full-viewport shadow-frame rebuild. The
+  controlled shadow buffer must always cover the whole visible terminal: on resize, invalidate its
+  dimensions, reflow retained structured transcript/WorkUnit rows at the new width, clear the
+  visible screen, and repaint the complete viewport using absolute coordinates. Rows that have
+  already left the viewport remain native terminal scrollback and are not repainted. Incremental
+  cell diffs are valid only between equal-sized frames. Add repeated shrink/grow regressions proving
+  iTerm reflow cannot strand separator/input/status fragments above the new live frame. The earlier
+  relative-geometry fix is insufficient because reflow can move owned rows above viewport row zero,
+  where `MoveUp`/line clearing cannot reach them.
 - [x] Queue VM-output completion behind every projected `say` event, so a WorkUnit cannot enter
   scrollback after its first chunk and silently lose later chunks from the same program.
 - [ ] Batch model-authored edits into one explicit multi-file changeset/proposal and request one
