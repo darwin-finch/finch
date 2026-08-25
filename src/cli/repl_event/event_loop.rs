@@ -7505,6 +7505,7 @@ mod tests {
                     next_due_ms,
                     interval_ms,
                     delivery_policy,
+                    module_identity: None,
                     active: true,
                 }))
                 .unwrap();

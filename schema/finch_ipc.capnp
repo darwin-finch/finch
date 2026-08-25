@@ -1124,6 +1124,10 @@ struct BrainSchedule {
   initiatingAttachmentId @8 :Text;
   createdBy      @9 :Text;
   grantCeiling   @10 :List(CapabilityRequirement);
+  hasModuleIdentity @11 :Bool;
+  moduleName     @12 :Text;
+  moduleRevision @13 :UInt32;
+  moduleSourceSha256 @14 :Text;
 }
 
 struct BrainScheduleDue {
