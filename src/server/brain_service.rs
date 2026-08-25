@@ -61,6 +61,16 @@ impl BrainLifecycleService {
     }
 
     #[cfg(test)]
+    pub(crate) fn register_test_runner(
+        &self,
+        brain: &str,
+        lease_id: RunnerLeaseId,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::server::RunnerRequest>,
+    ) {
+        self.runners.register(brain, lease_id, tx);
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         store: BrainStore,
         runners: BrainRunnerBroker,
@@ -690,17 +700,23 @@ impl BrainLifecycleService {
             attachment.role == AttachmentRole::Driver,
             "only a Brain driver can cancel a run"
         );
-        if let Some(receipt) = receipt.as_ref() {
-            if self.store.replay_mutation(brain, receipt)?.is_some() {
-                return self.inspect_run(brain, run_id);
-            }
-        }
-        let run = self.inspect_run(brain, run_id)?;
+        let reserved = match receipt {
+            Some(receipt) => Some(self.store.reserve_run_cancellation(
+                brain, &attachment.subject, attachment_id, run_id, receipt,
+            )?),
+            None => None,
+        };
+        let run = match &reserved {
+            Some(reserved) => reserved.run.clone(),
+            None => self.inspect_run(brain, run_id)?,
+        };
         ensure!(
             run.initiating_attachment_id == attachment_id,
             "a Brain run can only be cancelled by its initiating attachment"
         );
-        if run.status == BrainRunStatus::Cancelled {
+        if run.status == BrainRunStatus::Cancelled
+            || reserved.as_ref().is_some_and(|reserved| !reserved.needs_runner_cancel)
+        {
             return Ok(run);
         }
         ensure!(!run.status.is_terminal(), "Brain run has already finished");
@@ -733,9 +749,9 @@ impl BrainLifecycleService {
             }
         }
         let publication = self.store.acquire_run_publication(brain, run_id).await?;
-        let transition = match receipt {
-            Some(receipt) => self.store.cancel_run_with_receipt(
-                brain, &attachment.subject, attachment_id, run_id, receipt,
+        let transition = match reserved {
+            Some(_) => self.store.complete_reserved_run_cancellation(
+                brain, &attachment.subject, run_id,
             ),
             None => self.store.transition_run(
                 brain, &attachment.subject, run_id, BrainRunStatus::Cancelled,
@@ -1545,6 +1561,21 @@ mod tests {
             .unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         service.runners.register("shared", lease.lease_id, tx);
+
+        let stale_receipt = crate::brain::store::BrainMutationReceipt {
+            mutation_id: uuid::Uuid::new_v4(),
+            attachment_id: attachment.attachment_id,
+            expected_revision: 0,
+            environment_generation: environment.generation,
+            command_sha256: "cancel-run".into(),
+        };
+        assert!(service.cancel_run_with_receipt(
+            "shared", attachment.attachment_id, connection_id, run.run_id,
+            Some(stale_receipt),
+        ).await.is_err());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20), rx.recv(),
+        ).await.is_err(), "stale cancellation reached the runner");
 
         assert!(service
             .cancel_run(

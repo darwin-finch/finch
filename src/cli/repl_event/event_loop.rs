@@ -6021,6 +6021,7 @@ Rules:\n\
             .map(|client| client.target.machine.as_str());
         let sender = participant_display_name(&event.sender, local_machine);
         match &event.kind {
+            BrainEventKind::MutationRecorded { .. } => {}
             BrainEventKind::RunnerLeaseAcquired { lease } => self.output_manager.write_info(
                 format!("{} is the active environment runner", lease.subject),
             ),

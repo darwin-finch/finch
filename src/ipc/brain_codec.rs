@@ -1336,6 +1336,21 @@ pub(super) fn encode_event(
         mutation.set_command_sha256(&receipt.command_sha256);
     }
     match &event.kind {
+        BrainEventKind::MutationRecorded { outcome } => {
+            let mut recorded = builder.init_mutation_recorded();
+            match outcome {
+                crate::brain::store::BrainMutationOutcome::RunCancellationReserved { run_id } =>
+                    recorded.set_run_cancellation_reserved(&run_id.0.to_string()),
+                crate::brain::store::BrainMutationOutcome::RunAlreadyCancelled { run_id } =>
+                    recorded.set_run_already_cancelled(&run_id.0.to_string()),
+                crate::brain::store::BrainMutationOutcome::RunCancellationNoop { run_id } =>
+                    recorded.set_run_cancellation_noop(&run_id.0.to_string()),
+                crate::brain::store::BrainMutationOutcome::ScheduleCancellationNoop { schedule_id } =>
+                    recorded.set_schedule_cancellation_noop(&schedule_id.0.to_string()),
+                crate::brain::store::BrainMutationOutcome::HandoffCancellationNoop { handoff_id } =>
+                    recorded.set_handoff_cancellation_noop(&handoff_id.0.to_string()),
+            }
+        }
         BrainEventKind::RunnerLeaseAcquired { lease } => {
             encode_runner_lease(builder.init_runner_lease_acquired(), lease);
         }
@@ -1510,6 +1525,28 @@ pub(super) fn decode_event(
 ) -> anyhow::Result<BrainEvent> {
     use finch_ipc_capnp::brain_event::Which;
     let kind = match reader.which()? {
+        Which::MutationRecorded(recorded) => {
+            use crate::brain::store::BrainMutationOutcome;
+            use finch_ipc_capnp::brain_mutation_outcome::Which as Outcome;
+            let outcome = match recorded?.which()? {
+                Outcome::RunCancellationReserved(value) => BrainMutationOutcome::RunCancellationReserved {
+                    run_id: RunId(parse_uuid(value?)?),
+                },
+                Outcome::RunAlreadyCancelled(value) => BrainMutationOutcome::RunAlreadyCancelled {
+                    run_id: RunId(parse_uuid(value?)?),
+                },
+                Outcome::RunCancellationNoop(value) => BrainMutationOutcome::RunCancellationNoop {
+                    run_id: RunId(parse_uuid(value?)?),
+                },
+                Outcome::ScheduleCancellationNoop(value) => BrainMutationOutcome::ScheduleCancellationNoop {
+                    schedule_id: crate::brain::store::ScheduleId(parse_uuid(value?)?),
+                },
+                Outcome::HandoffCancellationNoop(value) => BrainMutationOutcome::HandoffCancellationNoop {
+                    handoff_id: RunnerHandoffId(parse_uuid(value?)?),
+                },
+            };
+            BrainEventKind::MutationRecorded { outcome }
+        }
         Which::RunnerLeaseAcquired(lease) => BrainEventKind::RunnerLeaseAcquired {
             lease: decode_runner_lease(lease?)?,
         },

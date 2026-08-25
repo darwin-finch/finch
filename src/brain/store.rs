@@ -74,6 +74,13 @@ pub struct BrainExecutableMutationAppend {
     pub replayed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrainRunCancellationReservation {
+    pub run: BrainRun,
+    pub needs_runner_cancel: bool,
+    pub replayed: bool,
+}
+
 /// Identity of one live transport connection for a durable attachment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -416,6 +423,11 @@ pub struct BrainApprovalAudience {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrainEventKind {
+    /// Durable typed result for an accepted mutation that either reserves an
+    /// external effect or makes no projection change.
+    MutationRecorded {
+        outcome: BrainMutationOutcome,
+    },
     RunnerLeaseAcquired {
         lease: BrainRunnerLease,
     },
@@ -532,6 +544,16 @@ pub enum BrainEventKind {
     ScheduleDue {
         due: BrainScheduleDue,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum BrainMutationOutcome {
+    RunCancellationReserved { run_id: RunId },
+    RunAlreadyCancelled { run_id: RunId },
+    RunCancellationNoop { run_id: RunId },
+    ScheduleCancellationNoop { schedule_id: ScheduleId },
+    HandoffCancellationNoop { handoff_id: RunnerHandoffId },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -859,6 +881,7 @@ impl BrainState {
             }
             BrainEventKind::Prompt { .. }
             | BrainEventKind::SpeculativePrompt { .. }
+            | BrainEventKind::MutationRecorded { .. }
             | BrainEventKind::ParticipantMessage { .. }
             | BrainEventKind::ToolCall { .. }
             | BrainEventKind::ToolResult { .. }
@@ -1518,17 +1541,36 @@ impl BrainStore {
             }) {
                 anyhow::ensure!(existing.mutation.as_ref() == Some(receipt),
                     "Brain mutation idempotency key was reused with a different command or precondition");
-                anyhow::ensure!(matches!(&existing.kind,
+                return match &existing.kind {
                     BrainEventKind::ScheduleChanged { schedule }
-                        if schedule.schedule_id == schedule_id && !schedule.active),
-                    "replayed mutation outcome does not match schedule cancellation");
-                return Ok(true);
+                        if schedule.schedule_id == schedule_id && !schedule.active => Ok(true),
+                    BrainEventKind::MutationRecorded {
+                        outcome: BrainMutationOutcome::ScheduleCancellationNoop {
+                            schedule_id: recorded,
+                        },
+                    } if *recorded == schedule_id => Ok(false),
+                    _ => anyhow::bail!(
+                        "replayed mutation outcome does not match schedule cancellation"
+                    ),
+                };
             }
         }
         let Some(mut schedule) = state.schedules.get(&schedule_id).cloned() else {
+            if let Some(receipt) = receipt {
+                self.push_idempotent_locked(name, state, cancelled_by,
+                    BrainEventKind::MutationRecorded {
+                        outcome: BrainMutationOutcome::ScheduleCancellationNoop { schedule_id },
+                    }, receipt)?;
+            }
             return Ok(false);
         };
         if !schedule.active {
+            if let Some(receipt) = receipt {
+                self.push_idempotent_locked(name, state, cancelled_by,
+                    BrainEventKind::MutationRecorded {
+                        outcome: BrainMutationOutcome::ScheduleCancellationNoop { schedule_id },
+                    }, receipt)?;
+            }
             return Ok(false);
         }
         if schedule.created_by != cancelled_by
@@ -1770,14 +1812,14 @@ impl BrainStore {
         Ok(transitioned)
     }
 
-    pub fn cancel_run_with_receipt(
+    pub fn reserve_run_cancellation(
         &self,
         name: &str,
         sender: &str,
         initiating_attachment_id: AttachmentId,
         run_id: RunId,
         receipt: BrainMutationReceipt,
-    ) -> Result<BrainRun> {
+    ) -> Result<BrainRunCancellationReservation> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
@@ -1790,29 +1832,78 @@ impl BrainStore {
         }) {
             anyhow::ensure!(existing.mutation.as_ref() == Some(&receipt),
                 "Brain mutation idempotency key was reused with a different command or precondition");
-            anyhow::ensure!(matches!(existing.kind,
-                BrainEventKind::RunStatusChanged { run_id: recorded, status: BrainRunStatus::Cancelled, .. }
-                    if recorded == run_id),
-                "replayed mutation outcome does not match run cancellation");
-            return state.runs.get(&run_id).cloned()
-                .with_context(|| format!("Brain run {} does not exist", run_id.0));
+            let needs_runner_cancel = match &existing.kind {
+                BrainEventKind::MutationRecorded {
+                    outcome: BrainMutationOutcome::RunCancellationReserved { run_id: recorded },
+                } if *recorded == run_id => state.runs.get(&run_id)
+                    .is_some_and(|run| run.status != BrainRunStatus::Cancelled),
+                BrainEventKind::MutationRecorded {
+                    outcome: BrainMutationOutcome::RunAlreadyCancelled { run_id: recorded },
+                } if *recorded == run_id => false,
+                BrainEventKind::MutationRecorded {
+                    outcome: BrainMutationOutcome::RunCancellationNoop { run_id: recorded },
+                } if *recorded == run_id => anyhow::bail!(
+                    "Brain run {} does not exist or has already finished", run_id.0
+                ),
+                _ => anyhow::bail!("replayed mutation outcome does not match run cancellation"),
+            };
+            let run = state.runs.get(&run_id).cloned()
+                .with_context(|| format!("Brain run {} does not exist", run_id.0))?;
+            return Ok(BrainRunCancellationReservation {
+                run, needs_runner_cancel, replayed: true,
+            });
         }
         anyhow::ensure!(receipt.attachment_id == initiating_attachment_id,
             "Brain mutation attachment does not match run initiator");
-        let current = state.runs.get(&run_id)
-            .with_context(|| format!("Brain run {} does not exist", run_id.0))?;
+        let Some(current) = state.runs.get(&run_id) else {
+            self.push_idempotent_locked(name, state, sender,
+                BrainEventKind::MutationRecorded {
+                    outcome: BrainMutationOutcome::RunCancellationNoop { run_id },
+                }, receipt)?;
+            anyhow::bail!("Brain run {} does not exist", run_id.0);
+        };
         anyhow::ensure!(current.initiating_attachment_id == initiating_attachment_id,
             "a Brain run can only be cancelled by its initiating attachment");
+        if current.status == BrainRunStatus::Cancelled {
+            let run = current.clone();
+            self.push_idempotent_locked(name, state, sender,
+                BrainEventKind::MutationRecorded {
+                    outcome: BrainMutationOutcome::RunAlreadyCancelled { run_id },
+                }, receipt)?;
+            return Ok(BrainRunCancellationReservation {
+                run, needs_runner_cancel: false, replayed: false,
+            });
+        }
+        if current.status.is_terminal() {
+            self.push_idempotent_locked(name, state, sender,
+                BrainEventKind::MutationRecorded {
+                    outcome: BrainMutationOutcome::RunCancellationNoop { run_id },
+                }, receipt)?;
+            anyhow::bail!("Brain run {} has already finished", run_id.0);
+        }
         validate_run_transition(current.status, BrainRunStatus::Cancelled)?;
-        self.push_idempotent_locked(
-            name, state, sender,
-            BrainEventKind::RunStatusChanged {
-                run_id, status: BrainRunStatus::Cancelled,
-                detail: Some("cancelled by initiating driver".into()),
-            },
-            receipt,
-        )?;
-        Ok(state.runs.get(&run_id).expect("cancelled run was projected").clone())
+        let run = current.clone();
+        self.push_idempotent_locked(name, state, sender,
+            BrainEventKind::MutationRecorded {
+                outcome: BrainMutationOutcome::RunCancellationReserved { run_id },
+            }, receipt)?;
+        Ok(BrainRunCancellationReservation {
+            run, needs_runner_cancel: true, replayed: false,
+        })
+    }
+
+    pub fn complete_reserved_run_cancellation(
+        &self,
+        name: &str,
+        sender: &str,
+        run_id: RunId,
+    ) -> Result<BrainRun> {
+        let current = self.inspect_run(name, run_id)?;
+        if current.status == BrainRunStatus::Cancelled {
+            return Ok(current);
+        }
+        self.transition_run(name, sender, run_id, BrainRunStatus::Cancelled,
+            Some("cancelled by initiating driver".into()))
     }
 
     pub fn acquire_runner_lease(
@@ -1950,10 +2041,9 @@ impl BrainStore {
                         && recorded.mutation_id == receipt.mutation_id
                 })
             }) {
-                let recorded = existing.mutation.as_ref().expect("matched mutation receipt");
                 anyhow::ensure!(
-                    recorded.command_sha256 == receipt.command_sha256,
-                    "Brain mutation idempotency key was reused with a different command"
+                    existing.mutation.as_ref() == Some(receipt),
+                    "Brain mutation idempotency key was reused with a different command or precondition"
                 );
                 return match &existing.kind {
                     BrainEventKind::RunnerHandoffRequested { handoff } => Ok(handoff.clone()),
@@ -2110,10 +2200,16 @@ impl BrainStore {
             }) {
                 anyhow::ensure!(existing.mutation.as_ref() == Some(receipt),
                     "Brain mutation idempotency key was reused with a different command or precondition");
-                anyhow::ensure!(matches!(existing.kind,
-                    BrainEventKind::RunnerHandoffCancelled { handoff_id: recorded }
-                        if recorded == handoff_id),
-                    "replayed mutation outcome does not match runner handoff cancellation");
+                anyhow::ensure!(match &existing.kind {
+                    BrainEventKind::RunnerHandoffCancelled { handoff_id: recorded } =>
+                        *recorded == handoff_id,
+                    BrainEventKind::MutationRecorded {
+                        outcome: BrainMutationOutcome::HandoffCancellationNoop {
+                            handoff_id: recorded,
+                        },
+                    } => *recorded == handoff_id,
+                    _ => false,
+                }, "replayed mutation outcome does not match runner handoff cancellation");
                 return Ok(());
             }
         }
@@ -2122,6 +2218,13 @@ impl BrainStore {
             .as_ref()
             .is_some_and(|handoff| handoff.handoff_id == handoff_id)
         {
+            if let Some(receipt) = receipt {
+                self.push_idempotent_locked(name, state, sender,
+                    BrainEventKind::MutationRecorded {
+                        outcome: BrainMutationOutcome::HandoffCancellationNoop { handoff_id },
+                    }, receipt)?;
+                return Ok(());
+            }
             anyhow::bail!("runner handoff is no longer current");
         }
         let kind = BrainEventKind::RunnerHandoffCancelled { handoff_id };
@@ -3084,7 +3187,7 @@ impl BrainStore {
             return Ok(());
         };
         let directory = root.join(name).join("runtime");
-        std::fs::create_dir_all(&directory)
+        create_dir_all_durable(&directory)
             .with_context(|| format!("create {}", directory.display()))?;
         let path = directory.join(format!("{checkpoint_sha256}.capnp"));
         if path.exists() {
@@ -3096,8 +3199,10 @@ impl BrainStore {
         ));
         std::fs::write(&temporary, encoded)
             .with_context(|| format!("write {}", temporary.display()))?;
+        std::fs::File::open(&temporary)?.sync_all()?;
         std::fs::rename(&temporary, &path)
             .with_context(|| format!("commit {}", path.display()))?;
+        sync_directory(&directory)?;
         Ok(())
     }
 
@@ -3137,6 +3242,13 @@ impl BrainStore {
                     event.schema_version
                 );
             }
+            if event.schema_version < 14 && event.mutation.is_some() {
+                anyhow::bail!(
+                    "Brain '{name}' event #{} carries a mutation receipt under legacy schema {}",
+                    event.seq,
+                    event.schema_version,
+                );
+            }
             if event.brain_id != BrainId::nil() && event.brain_id != brain_id {
                 anyhow::bail!(
                     "Brain '{name}' event #{} belongs to a different Brain identity",
@@ -3171,7 +3283,7 @@ impl BrainStore {
         // its first conversational event is appended.
         if let Some(root) = &self.root {
             let directory = root.join(name);
-            std::fs::create_dir_all(&directory)
+            create_dir_all_durable(&directory)
                 .with_context(|| format!("create {}", directory.display()))?;
         }
         let cursors = self.read_attachment_cursors(name, brain_id)?;
@@ -3245,7 +3357,7 @@ impl BrainStore {
             return Ok(BrainInitialization::reviewed_default(brain_id));
         };
         let directory = root.join(name);
-        std::fs::create_dir_all(&directory)
+        create_dir_all_durable(&directory)
             .with_context(|| format!("create {}", directory.display()))?;
         let path = directory.join("initialization.json");
         if path.exists() {
@@ -3260,9 +3372,11 @@ impl BrainStore {
         let temporary = directory.join(format!(".initialization.{}.tmp", uuid::Uuid::new_v4()));
         std::fs::write(&temporary, serde_json::to_vec_pretty(&initialization)?)
             .with_context(|| format!("write {}", temporary.display()))?;
+        std::fs::File::open(&temporary)?.sync_all()?;
         match std::fs::hard_link(&temporary, &path) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&temporary);
+                sync_directory(&directory)?;
                 Ok(initialization)
             }
             Err(_error) if path.exists() => {
@@ -3315,7 +3429,7 @@ impl BrainStore {
                 .collect(),
         };
         let directory = root.join(name);
-        std::fs::create_dir_all(&directory)
+        create_dir_all_durable(&directory)
             .with_context(|| format!("create {}", directory.display()))?;
         let path = directory.join("attachments.json");
         let temporary = directory.join(format!(".attachments.{}.tmp", uuid::Uuid::new_v4()));
@@ -3335,7 +3449,7 @@ impl BrainStore {
             });
         };
         let directory = root.join(name);
-        std::fs::create_dir_all(&directory)
+        create_dir_all_durable(&directory)
             .with_context(|| format!("create {}", directory.display()))?;
         let path = directory.join("metadata.json");
         if path.exists() {
@@ -3357,12 +3471,14 @@ impl BrainStore {
         let temporary = directory.join(format!(".metadata.{}.tmp", uuid::Uuid::new_v4()));
         std::fs::write(&temporary, encoded)
             .with_context(|| format!("write {}", temporary.display()))?;
+        std::fs::File::open(&temporary)?.sync_all()?;
         // A rename can replace a winner on Unix. Linking the fully written
         // temporary file creates the final name only if it is still absent,
         // so concurrent daemon starts cannot split one alias into two IDs.
         match std::fs::hard_link(&temporary, &path) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&temporary);
+                sync_directory(&directory)?;
                 Ok(metadata)
             }
             Err(_error) if path.exists() => {
@@ -3462,7 +3578,7 @@ impl BrainStore {
             return Ok(());
         };
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            create_dir_all_durable(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
         }
         let new_file = !path.exists();
@@ -3485,6 +3601,33 @@ impl BrainStore {
         }
         Ok(())
     }
+}
+
+fn sync_directory(path: &std::path::Path) -> Result<()> {
+    std::fs::File::open(path)
+        .with_context(|| format!("open {} for directory sync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync directory {}", path.display()))
+}
+
+/// Create and durably link every missing directory component, including the
+/// configured Brain root when it does not yet exist.
+fn create_dir_all_durable(path: &std::path::Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        let Some(parent) = cursor.parent() else { break };
+        cursor = parent;
+    }
+    std::fs::create_dir_all(path)?;
+    for directory in missing {
+        sync_directory(&directory)?;
+        if let Some(parent) = directory.parent() {
+            sync_directory(parent)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_participant_subject<'a>(label: &str, subject: &'a str) -> Result<&'a str> {
@@ -5442,6 +5585,7 @@ mod tests {
             sender: "alice".into(),
             created_ms: 1,
             run_id: Some(run_id),
+            mutation: None,
             kind: BrainEventKind::RunStarted { run },
         };
 
@@ -5484,6 +5628,7 @@ mod tests {
             sender: "daemon".into(),
             created_ms: 1,
             run_id: Some(run_id),
+            mutation: None,
             kind: BrainEventKind::RunStatusChanged {
                 run_id,
                 status: BrainRunStatus::Cancelled,
@@ -5493,6 +5638,48 @@ mod tests {
         let encoded = serde_json::to_string(&current).unwrap();
         let decoded: BrainEvent = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, current);
+    }
+
+    #[test]
+    fn schema_thirteen_without_mutation_receipts_remains_compatible() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let brain_id = store.snapshot("legacy-v13").unwrap().brain_id;
+        drop(store);
+        let mut event = journal_event(brain_id, 1, "legacy v13");
+        event.schema_version = 13;
+        std::fs::write(
+            temp.path().join("legacy-v13/events.jsonl"),
+            format!("{}\n", serde_json::to_string(&event).unwrap()),
+        ).unwrap();
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        assert_eq!(restarted.snapshot("legacy-v13").unwrap().revision, 1);
+    }
+
+    #[test]
+    fn schema_thirteen_cannot_silently_carry_mutation_receipts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let snapshot = store.snapshot("legacy-receipt").unwrap();
+        drop(store);
+        let mut event = journal_event(snapshot.brain_id, 1, "invalid legacy receipt");
+        event.schema_version = 13;
+        event.mutation = Some(BrainMutationReceipt {
+            mutation_id: uuid::Uuid::new_v4(),
+            attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            expected_revision: 0,
+            environment_generation: snapshot.environment.generation,
+            command_sha256: "sha256".into(),
+        });
+        std::fs::write(
+            temp.path().join("legacy-receipt/events.jsonl"),
+            format!("{}\n", serde_json::to_string(&event).unwrap()),
+        ).unwrap();
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let error = restarted.snapshot("legacy-receipt").unwrap_err();
+        assert!(error.to_string().contains("mutation receipt under legacy schema 13"));
     }
 
     #[test]
@@ -5882,6 +6069,35 @@ mod tests {
     }
 
     #[test]
+    fn handoff_replay_requires_exact_revision_and_environment_preconditions() {
+        let store = BrainStore::with_root("box.local", None);
+        let generation = store.environment().generation;
+        let source = store.acquire_runner_lease(
+            "shared", "runner-a", generation, None, 60_000,
+        ).unwrap();
+        let receipt = mutation_receipt(
+            &store, AttachmentId::new(), uuid::Uuid::new_v4(),
+            store.snapshot("shared").unwrap().revision, "request-handoff",
+        );
+        store.request_runner_handoff_with_receipt(
+            "shared", "controller", "runner-b", source.lease_id,
+            generation, 30_000, Some(receipt.clone()),
+        ).unwrap();
+        let mut changed_revision = receipt.clone();
+        changed_revision.expected_revision += 1;
+        assert!(store.request_runner_handoff_with_receipt(
+            "shared", "controller", "runner-b", source.lease_id,
+            generation, 30_000, Some(changed_revision),
+        ).unwrap_err().to_string().contains("different command or precondition"));
+        let mut changed_environment = receipt;
+        changed_environment.environment_generation += 1;
+        assert!(store.request_runner_handoff_with_receipt(
+            "shared", "controller", "runner-b", source.lease_id,
+            generation, 30_000, Some(changed_environment),
+        ).unwrap_err().to_string().contains("different command or precondition"));
+    }
+
+    #[test]
     fn releasing_or_cancelling_the_source_invalidates_a_runner_handoff() {
         let store = BrainStore::with_root("box.local", None);
         let generation = store.environment().generation;
@@ -5952,6 +6168,77 @@ mod tests {
             "shared", handoff.handoff_id, "controller", Some(receipt),
         ).unwrap();
         assert!(restarted.snapshot("shared").unwrap().runner_handoff.is_none());
+    }
+
+    #[test]
+    fn accepted_noop_mutations_consume_their_uuid_with_typed_outcomes() {
+        let store = BrainStore::with_root("box.local", None);
+        let attachment = AttachmentId::new();
+        let schedule_id = ScheduleId::new();
+        let schedule_receipt = mutation_receipt(
+            &store, attachment, uuid::Uuid::new_v4(), 0, "cancel-missing-schedule",
+        );
+        assert!(!store.cancel_schedule_with_receipt(
+            "shared", "alice", attachment, schedule_id, Some(schedule_receipt.clone()),
+        ).unwrap());
+        assert!(!store.cancel_schedule_with_receipt(
+            "shared", "alice", attachment, schedule_id, Some(schedule_receipt.clone()),
+        ).unwrap());
+        let mut changed = schedule_receipt;
+        changed.expected_revision += 1;
+        assert!(store.cancel_schedule_with_receipt(
+            "shared", "alice", attachment, schedule_id, Some(changed),
+        ).is_err());
+
+        let handoff_id = RunnerHandoffId::new();
+        let handoff_receipt = mutation_receipt(
+            &store, attachment, uuid::Uuid::new_v4(), 1, "cancel-missing-handoff",
+        );
+        store.cancel_runner_handoff_with_receipt(
+            "shared", handoff_id, "alice", Some(handoff_receipt.clone()),
+        ).unwrap();
+        store.cancel_runner_handoff_with_receipt(
+            "shared", handoff_id, "alice", Some(handoff_receipt),
+        ).unwrap();
+
+        let accepted = store.push(
+            "shared", "alice", BrainEventKind::Prompt { text: "queued".into() },
+        ).unwrap();
+        let run = store.start_run(
+            "shared", "alice", BrainRunKind::Interactive, accepted.seq, attachment,
+            BrainRunStatus::QueuedForEnvironment,
+        ).unwrap();
+        store.transition_run(
+            "shared", "alice", run.run_id, BrainRunStatus::Cancelled, None,
+        ).unwrap();
+        let run_receipt = mutation_receipt(
+            &store, attachment, uuid::Uuid::new_v4(),
+            store.snapshot("shared").unwrap().revision, "cancel-run-again",
+        );
+        let reserved = store.reserve_run_cancellation(
+            "shared", "alice", attachment, run.run_id, run_receipt.clone(),
+        ).unwrap();
+        assert!(!reserved.needs_runner_cancel);
+        assert!(store.reserve_run_cancellation(
+            "shared", "alice", attachment, run.run_id, run_receipt,
+        ).unwrap().replayed);
+
+        let missing_run = RunId::new();
+        let missing_receipt = mutation_receipt(
+            &store, attachment, uuid::Uuid::new_v4(),
+            store.snapshot("shared").unwrap().revision, "cancel-missing-run",
+        );
+        assert!(store.reserve_run_cancellation(
+            "shared", "alice", attachment, missing_run, missing_receipt.clone(),
+        ).unwrap_err().to_string().contains("does not exist"));
+        assert!(store.reserve_run_cancellation(
+            "shared", "alice", attachment, missing_run, missing_receipt.clone(),
+        ).unwrap_err().to_string().contains("does not exist or has already finished"));
+        let mut changed = missing_receipt;
+        changed.environment_generation += 1;
+        assert!(store.reserve_run_cancellation(
+            "shared", "alice", attachment, missing_run, changed,
+        ).unwrap_err().to_string().contains("different command or precondition"));
     }
 
     #[test]
