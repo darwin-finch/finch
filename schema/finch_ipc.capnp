@@ -365,6 +365,76 @@ struct BrainWireMessage {
   }
 }
 
+# A participant submits intent, never a complete BrainEvent envelope. The
+# daemon assigns identity, ordering, timestamps, run state, and every internal
+# lifecycle event.
+struct BrainSubmission {
+  union {
+    prompt          @0 :Text;
+    program         @1 :BrainProgramSubmitted;
+    programPopped   @2 :UInt64;
+    approvalDecided @3 :BrainApprovalDecided;
+  }
+}
+
+struct BrainSubmissionOutcome {
+  accepted  @0 :BrainEvent;
+  hasRun    @1 :Bool;
+  run       @2 :BrainRun;
+  hasResult @3 :Bool;
+  result    @4 :BrainEvent;
+}
+
+# Ordered projection callback. A watch call first sends one snapshot, then
+# every event after that snapshot on the same capability, with RPC
+# backpressure preserving delivery order.
+interface BrainWireReceiver {
+  onMessage @0 (message :BrainWireMessage) -> ();
+}
+
+# One versioned lifecycle contract shared by local Cap'n Proto IPC and remote
+# adapters. The local Unix-socket adapter trusts the host boundary but still
+# validates attachment identity, connection identity, and role on every
+# mutation. Remote transports add scoped credential checks before entering the
+# same service implementation.
+interface BrainService {
+  snapshot @0 (brain :Text) -> (snapshot :BrainSnapshot);
+
+  attach @1 (brain :Text,
+             subject :Text,
+             role :BrainAttachmentRole,
+             hasAttachmentId :Bool,
+             attachmentId :Text) -> (attachment :BrainAttachment);
+
+  acknowledge @2 (brain :Text,
+                  attachmentId :Text,
+                  connectionId :Text,
+                  seq :UInt64) -> (attachment :BrainAttachment);
+
+  detach @3 (brain :Text,
+             attachmentId :Text,
+             connectionId :Text) -> ();
+
+  submit @4 (brain :Text,
+             attachmentId :Text,
+             connectionId :Text,
+             submission :BrainSubmission) -> (outcome :BrainSubmissionOutcome);
+
+  watch @5 (brain :Text,
+            attachmentId :Text,
+            connectionId :Text,
+            receiver :BrainWireReceiver) -> ();
+
+  acquireRunner @6 (brain :Text,
+                    subject :Text,
+                    environment :BrainEnvironment,
+                    hasLeaseId :Bool,
+                    leaseId :Text,
+                    ttlMs :UInt64) -> (lease :BrainRunnerLease);
+
+  releaseRunner @7 (brain :Text, leaseId :Text) -> ();
+}
+
 # ---------------------------------------------------------------------------
 # Main daemon interface
 # ---------------------------------------------------------------------------
@@ -418,4 +488,9 @@ interface FinchDaemon {
   # hydrate before accepting work. Host authority is deliberately absent.
   registerBrainRunner @4 (brain :Text, leaseId :Text, runner :BrainRunner)
       -> (runtimeRevision :UInt64, checkpointJson :Data);
+
+  # Return the canonical named-Brain lifecycle capability. Keeping this as a
+  # capability allows later protocol evolution without adding every Brain
+  # operation directly to FinchDaemon.
+  brainService @5 () -> (service :BrainService);
 }

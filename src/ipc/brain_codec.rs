@@ -113,6 +113,61 @@ pub(super) fn decode_approval_audience(
     })
 }
 
+pub(super) fn encode_brain_submission(
+    mut builder: finch_ipc_capnp::brain_submission::Builder<'_>,
+    kind: &BrainEventKind,
+) -> anyhow::Result<()> {
+    match kind {
+        BrainEventKind::Prompt { text } => builder.set_prompt(text),
+        BrainEventKind::Program { language, source } => {
+            let mut program = builder.init_program();
+            program.set_language(language_to_capnp(*language));
+            program.set_source(source);
+        }
+        BrainEventKind::ProgramPopped { program_seq } => {
+            builder.set_program_popped(*program_seq);
+        }
+        BrainEventKind::ApprovalDecided {
+            request_seq,
+            approval_id,
+            decision,
+        } => {
+            let mut decided = builder.init_approval_decided();
+            decided.set_request_seq(*request_seq);
+            decided.set_approval_id(approval_id);
+            decided.set_decision_json(&serde_json::to_vec(decision)?);
+        }
+        _ => anyhow::bail!("internal Brain events cannot be encoded as participant submissions"),
+    }
+    Ok(())
+}
+
+pub(super) fn decode_brain_submission(
+    reader: finch_ipc_capnp::brain_submission::Reader<'_>,
+) -> anyhow::Result<BrainEventKind> {
+    use finch_ipc_capnp::brain_submission::Which;
+
+    Ok(match reader.which()? {
+        Which::Prompt(value) => BrainEventKind::Prompt { text: text(value?)? },
+        Which::Program(program) => {
+            let program = program?;
+            BrainEventKind::Program {
+                language: language_from_capnp(program.get_language()?),
+                source: text(program.get_source()?)?,
+            }
+        }
+        Which::ProgramPopped(program_seq) => BrainEventKind::ProgramPopped { program_seq },
+        Which::ApprovalDecided(decided) => {
+            let decided = decided?;
+            BrainEventKind::ApprovalDecided {
+                request_seq: decided.get_request_seq(),
+                approval_id: text(decided.get_approval_id()?)?,
+                decision: serde_json::from_slice(decided.get_decision_json()?)?,
+            }
+        }
+    })
+}
+
 pub(crate) fn encode_brain_wire_message(message: &BrainWireMessage) -> anyhow::Result<Vec<u8>> {
     let mut encoded = capnp::message::Builder::new_default();
     let root = encoded.init_root::<finch_ipc_capnp::brain_wire_message::Builder<'_>>();
@@ -649,6 +704,57 @@ mod tests {
             created_ms: 123_000 + seq,
             kind,
         }
+    }
+
+    #[test]
+    fn participant_submission_union_round_trips_only_client_intent() {
+        let submissions = vec![
+            BrainEventKind::Prompt {
+                text: "inspect the workspace".into(),
+            },
+            BrainEventKind::Program {
+                language: ProgramLanguage::Lisp,
+                source: "(say \"hello\")".into(),
+            },
+            BrainEventKind::ProgramPopped { program_seq: 41 },
+            BrainEventKind::ApprovalDecided {
+                request_seq: 17,
+                approval_id: "approval-1".into(),
+                decision: serde_json::json!({"kind": "allow_once"}),
+            },
+        ];
+
+        for expected in submissions {
+            let mut message = capnp::message::Builder::new_default();
+            encode_brain_submission(
+                message.init_root::<finch_ipc_capnp::brain_submission::Builder<'_>>(),
+                &expected,
+            )
+            .unwrap();
+            let encoded = capnp::serialize::write_message_to_words(&message);
+            let mut cursor = std::io::Cursor::new(encoded);
+            let decoded = capnp::serialize::read_message(
+                &mut cursor,
+                capnp::message::ReaderOptions::new(),
+            )
+            .unwrap();
+            let root = decoded
+                .get_root::<finch_ipc_capnp::brain_submission::Reader<'_>>()
+                .unwrap();
+            assert_eq!(decode_brain_submission(root).unwrap(), expected);
+        }
+
+        let mut message = capnp::message::Builder::new_default();
+        let builder = message.init_root::<finch_ipc_capnp::brain_submission::Builder<'_>>();
+        assert!(encode_brain_submission(
+            builder,
+            &BrainEventKind::Result {
+                request_seq: 1,
+                output: "forged".into(),
+                error: None,
+            },
+        )
+        .is_err());
     }
 
     #[test]
