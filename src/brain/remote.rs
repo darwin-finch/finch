@@ -3166,6 +3166,7 @@ mod tests {
             environment_generation: 1,
             sender: "bob@desktop.local".into(),
             created_ms: 10,
+            run_id: None,
             kind: BrainEventKind::Prompt {
                 text: "hello from another console".into(),
             },

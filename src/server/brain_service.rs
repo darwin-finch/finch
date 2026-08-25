@@ -461,6 +461,11 @@ impl BrainLifecycleService {
         connection_id: ConnectionId,
         kind: BrainEventKind,
     ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
+        if let BrainEventKind::SpeculativePrompt { text } = kind {
+            return self
+                .start_speculative(brain, attachment_id, connection_id, text)
+                .await;
+        }
         let attachment = self
             .connection(brain, attachment_id, connection_id)
             .map_err(BrainSubmissionError::State)?;
@@ -479,13 +484,45 @@ impl BrainLifecycleService {
         connection_id: ConnectionId,
         prompt: String,
     ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
-        self.submit(
-            brain,
-            attachment_id,
-            connection_id,
-            BrainEventKind::SpeculativePrompt { text: prompt },
-        )
-        .await
+        let attachment = self
+            .connection(brain, attachment_id, connection_id)
+            .map_err(BrainSubmissionError::State)?;
+        if attachment.role != AttachmentRole::Driver {
+            return Err(BrainSubmissionError::Forbidden(
+                "only a Brain driver can start a speculative run".into(),
+            ));
+        }
+        let execution_lock = self
+            .store
+            .execution_lock(brain)
+            .map_err(BrainSubmissionError::State)?;
+        let _turn = execution_lock.lock_owned().await;
+        let (accepted, run) = self
+            .store
+            .accept_speculative_run(brain, &attachment.subject, attachment_id, prompt)
+            .map_err(BrainSubmissionError::State)?;
+        let snapshot = self.snapshot(brain).map_err(BrainSubmissionError::State)?;
+        let ready_lease = snapshot.runner_lease.filter(|lease| {
+            lease.environment_generation == snapshot.environment.generation
+                && lease.expires_ms > crate::brain::store::unix_millis()
+                && self.runners.has_registration(brain, lease.lease_id)
+        });
+        drop(_turn);
+        if let Some(lease) = ready_lease {
+            let service = self.clone();
+            let brain = brain.to_string();
+            let run_id = run.run_id;
+            tokio::spawn(async move {
+                if let Err(error) = service.resume_queued_runs(brain.clone(), lease.lease_id).await {
+                    tracing::warn!(%brain, run_id = %run_id.0, %error, "speculative Brain supervisor failed");
+                }
+            });
+        }
+        Ok(BrainSubmissionOutcome {
+            accepted,
+            run: Some(run),
+            result: None,
+        })
     }
 
     pub(crate) async fn submit_with_authority(
@@ -496,6 +533,11 @@ impl BrainLifecycleService {
         kind: BrainEventKind,
         can_approve: bool,
     ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
+        if let BrainEventKind::SpeculativePrompt { text } = kind {
+            return self
+                .start_speculative(brain, attachment_id, connection_id, text)
+                .await;
+        }
         let attachment = self
             .connection(brain, attachment_id, connection_id)
             .map_err(BrainSubmissionError::State)?;
@@ -547,16 +589,31 @@ impl BrainLifecycleService {
             run.status,
             BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
         ) {
+            self.store.reserve_run_cancellation(brain, run_id).await?;
             let snapshot = self.snapshot(brain)?;
-            let lease = snapshot
+            let lease = match snapshot
                 .runner_lease
                 .filter(|lease| lease.expires_ms > crate::brain::store::unix_millis())
-                .ok_or_else(|| anyhow::anyhow!("named Brain '{brain}' has no live runner"))?;
-            ensure!(
-                self.runners.cancel_run(brain, lease.lease_id, run_id).await?,
-                "the environment runner is not executing this Brain run"
-            );
+            {
+                Some(lease) => lease,
+                None => {
+                    self.store.clear_run_cancellation(brain, run_id).await?;
+                    anyhow::bail!("named Brain '{brain}' has no live runner");
+                }
+            };
+            match self.runners.cancel_run(brain, lease.lease_id, run_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.store.clear_run_cancellation(brain, run_id).await?;
+                    anyhow::bail!("the environment runner is not executing this Brain run");
+                }
+                Err(error) => {
+                    self.store.clear_run_cancellation(brain, run_id).await?;
+                    return Err(error);
+                }
+            }
         }
+        let _publication = self.store.acquire_run_publication(brain, run_id).await?;
         match self.store.transition_run(
             brain,
             &attachment.subject,
@@ -798,6 +855,7 @@ mod tests {
             .await
             .unwrap();
         let run = outcome.run.unwrap();
+        assert_eq!(outcome.accepted.run_id, Some(run.run_id));
         assert_eq!(run.kind, BrainRunKind::Speculative);
         assert_eq!(run.status, BrainRunStatus::QueuedForEnvironment);
         assert_eq!(run.request_seq, outcome.accepted.seq);
@@ -820,6 +878,17 @@ mod tests {
         let restarted = make_service();
         let restored = restarted.inspect_run("shared", run.run_id).unwrap();
         assert_eq!(restored, run);
+        assert_eq!(
+            restarted
+                .snapshot("shared")
+                .unwrap()
+                .events
+                .iter()
+                .find(|event| event.seq == run.request_seq)
+                .unwrap()
+                .run_id,
+            Some(run.run_id)
+        );
         let driver = restarted
             .attach(
                 "shared",
@@ -857,23 +926,25 @@ mod tests {
         service.runners.register("shared", lease.lease_id, tx);
         let driver_id = driver.attachment_id;
 
-        let submitting = {
-            let service = service.clone();
-            tokio::spawn(async move {
-                service
-                    .start_speculative(
-                        "shared",
-                        driver_id,
-                        connection_id,
-                        "look ahead".into(),
-                    )
-                    .await
-            })
-        };
+        let accepted = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            service.start_speculative(
+                "shared",
+                driver_id,
+                connection_id,
+                "look ahead".into(),
+            ),
+        )
+        .await
+        .expect("speculative acceptance must not wait for runner completion")
+        .unwrap();
+        let accepted_run = accepted.run.unwrap();
+        assert_eq!(accepted_run.status, BrainRunStatus::QueuedForEnvironment);
         let crate::server::RunnerRequest::Turn(turn) = rx.recv().await.unwrap() else {
             panic!("expected speculative turn")
         };
         let run_id = turn.run_id;
+        assert_eq!(run_id, accepted_run.run_id);
         assert_eq!(turn.prompt, "look ahead");
 
         let cancelling = {
@@ -907,15 +978,18 @@ mod tests {
                 source: "(say \"late\")".into(),
                 language: ProgramLanguage::Lisp,
                 output: "late".into(),
-                turn_events: Vec::new(),
+                turn_events: vec![crate::server::RunnerTurnEvent::Call {
+                    tool_id: "late-tool".into(),
+                    name: "late-tool".into(),
+                    input: serde_json::json!({"late": true}),
+                }],
                 runtime_revision: 0,
                 checkpoint,
                 effect_journal: Vec::new(),
                 commit_ack: None,
             }))
             .unwrap();
-        let outcome = submitting.await.unwrap().unwrap();
-        assert!(outcome.result.is_none());
+        assert!(accepted.result.is_none());
         let snapshot = service.snapshot("shared").unwrap();
         assert_eq!(
             snapshot
@@ -927,10 +1001,117 @@ mod tests {
             BrainRunStatus::Cancelled
         );
         assert!(!snapshot.events.iter().any(|event| {
-            matches!(
-                &event.kind,
-                BrainEventKind::Result { output, .. } if output == "late"
-            )
+            event.run_id == Some(run_id)
+                && matches!(
+                    event.kind,
+                    BrainEventKind::ToolCall { .. }
+                        | BrainEventKind::Program { .. }
+                        | BrainEventKind::RuntimeCommitted { .. }
+                        | BrainEventKind::Result { .. }
+                )
+        }));
+    }
+
+    #[tokio::test]
+    async fn program_cancellation_atomically_suppresses_late_effect_checkpoint_and_result() {
+        let service = service();
+        let driver = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let connection_id = driver.connection_id.unwrap();
+        let _watch = service
+            .watch("shared", driver.attachment_id, connection_id)
+            .unwrap();
+        let environment = service.store.environment().clone();
+        let lease = service
+            .acquire_runner("shared", "runner", &environment, None, 60_000)
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        service.runners.register("shared", lease.lease_id, tx);
+        let driver_id = driver.attachment_id;
+        let submitting = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .submit(
+                        "shared",
+                        driver_id,
+                        connection_id,
+                        BrainEventKind::Program {
+                            language: ProgramLanguage::Lisp,
+                            source: "(say \"late-program\")".into(),
+                        },
+                    )
+                    .await
+            })
+        };
+        let crate::server::RunnerRequest::Program(program) = rx.recv().await.unwrap() else {
+            panic!("expected program request")
+        };
+        let run_id = program.run_id;
+        let cancelling = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .cancel_run("shared", driver_id, connection_id, run_id)
+                    .await
+            })
+        };
+        let crate::server::RunnerRequest::Cancel(cancel) = rx.recv().await.unwrap() else {
+            panic!("expected program cancellation")
+        };
+        cancel.response_tx.send(Ok(true)).unwrap();
+        assert_eq!(
+            cancelling.await.unwrap().unwrap().status,
+            BrainRunStatus::Cancelled
+        );
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let checkpoint = runtime
+            .revision_history()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let effect = crate::server::RunnerEffectRecord {
+            execution_id: uuid::Uuid::new_v4(),
+            entry: crate::vm::EffectJournalEntry {
+                effect: crate::vm::VmSideEffect {
+                    protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                    sequence: 0,
+                    requirement: crate::vm::CapabilityRequirement {
+                        capability: crate::vm::CapabilityKind::SessionEmit,
+                        selector: crate::vm::ResourceSelector::None,
+                    },
+                    event: crate::vm::HostSideEffect::Emit {
+                        text: "late effect".into(),
+                    },
+                    output: Vec::new(),
+                    origin: crate::vm::SourceOrigin::generated("late-program-test"),
+                },
+                state: crate::vm::EffectJournalState::Acknowledged { values: Vec::new() },
+            },
+        };
+        program
+            .response_tx
+            .send(Ok(crate::server::RunnerProgramResult {
+                output: "late-program".into(),
+                runtime_revision: 0,
+                checkpoint,
+                effect_journal: vec![effect],
+            }))
+            .unwrap();
+        submitting.await.unwrap().unwrap();
+        let snapshot = service.snapshot("shared").unwrap();
+        assert_eq!(service.inspect_run("shared", run_id).unwrap().status, BrainRunStatus::Cancelled);
+        assert!(!snapshot.events.iter().any(|event| {
+            event.run_id == Some(run_id)
+                && matches!(
+                    event.kind,
+                    BrainEventKind::EffectRecorded { .. }
+                        | BrainEventKind::RuntimeCommitted { .. }
+                        | BrainEventKind::Result { .. }
+                )
         }));
     }
 

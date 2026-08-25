@@ -5579,8 +5579,8 @@ Rules:\n\
             {
                 let run_id = run.run_id.0.to_string();
                 self.output_manager.write_info(format!(
-                    "run {} queued for the environment runner",
-                    &run_id[..8]
+                    "{:?} run {} queued for the environment runner",
+                    run.kind, &run_id[..8]
                 ));
             }
             BrainEventKind::RunStatusChanged {
@@ -5811,7 +5811,11 @@ Rules:\n\
                 if let Some(error) = error {
                     self.output_manager.write_info(format!("error: {error}"));
                 } else if !output.is_empty() {
-                    let unit = self.output_manager.start_work_unit("Brain program output");
+                    let label = event
+                        .run_id
+                        .map(|run_id| format!("Brain run {} output", &run_id.0.to_string()[..8]))
+                        .unwrap_or_else(|| "Brain program output".to_string());
+                    let unit = self.output_manager.start_work_unit(label);
                     unit.set_program_output();
                     unit.set_response(output);
                     unit.set_complete();
@@ -7129,13 +7133,7 @@ fn project_brain_context(
     depth: usize,
     local_machine: Option<&str>,
 ) {
-    let mut lines = events
-        .iter()
-        .rev()
-        .filter_map(|event| brain_context_text(event, local_machine))
-        .take(depth)
-        .collect::<Vec<_>>();
-    lines.reverse();
+    let lines = projected_brain_context_lines(events, depth, local_machine);
     let count = lines.len();
     for (index, text) in lines.into_iter().enumerate() {
         let label = if count == 1 || index + 1 == count {
@@ -7153,6 +7151,37 @@ fn project_brain_context(
     for index in count..8 {
         status_bar.remove_line(&crate::cli::status_bar::StatusLineType::BrainContextLine(index));
     }
+}
+
+fn projected_brain_context_lines(
+    events: &[crate::brain::store::BrainEvent],
+    depth: usize,
+    local_machine: Option<&str>,
+) -> Vec<String> {
+    let speculative_run_ids = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            crate::brain::store::BrainEventKind::RunStarted { run }
+                if run.kind == crate::brain::store::BrainRunKind::Speculative =>
+            {
+                Some(run.run_id)
+            }
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let mut lines = events
+        .iter()
+        .rev()
+        .filter(|event| {
+            event
+                .run_id
+                .is_none_or(|run_id| !speculative_run_ids.contains(&run_id))
+        })
+        .filter_map(|event| brain_context_text(event, local_machine))
+        .take(depth)
+        .collect::<Vec<_>>();
+    lines.reverse();
+    lines
 }
 
 /// Advance the visible projection's canonical cursor. Watch snapshots include
@@ -7831,6 +7860,7 @@ mod tests {
             environment_generation: 1,
             sender: sender.into(),
             created_ms: 0,
+            run_id: None,
             kind,
         }
     }
@@ -7980,6 +8010,58 @@ mod tests {
         assert!(lines[0].content.starts_with("   └─ now: alice: "));
         assert!(lines[0].content.ends_with('…'));
         assert!(!lines[0].content.contains("partial output"));
+    }
+
+    #[test]
+    fn canonical_brain_context_excludes_correlated_speculative_output() {
+        use crate::brain::store::{
+            AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
+        };
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let run = BrainRun {
+            run_id,
+            kind: BrainRunKind::Speculative,
+            parent_run_id: None,
+            request_seq: 1,
+            initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            initiated_by: "alice".into(),
+            status: BrainRunStatus::Completed,
+            started_ms: 1,
+            updated_ms: 2,
+            detail: None,
+        };
+        let mut request = brain_event(
+            1,
+            "alice",
+            BrainEventKind::SpeculativePrompt {
+                text: "hidden helper prompt".into(),
+            },
+        );
+        request.run_id = Some(run_id);
+        let mut started = brain_event(2, "alice", BrainEventKind::RunStarted { run });
+        started.run_id = Some(run_id);
+        let mut result = brain_event(
+            3,
+            "daemon",
+            BrainEventKind::Result {
+                request_seq: 1,
+                output: "hidden helper output".into(),
+                error: None,
+            },
+        );
+        result.run_id = Some(run_id);
+        let ordinary = brain_event(
+            4,
+            "bob",
+            BrainEventKind::ParticipantMessage {
+                text: "visible collaboration".into(),
+            },
+        );
+
+        assert_eq!(
+            projected_brain_context_lines(&[request, started, result, ordinary], 4, None),
+            vec!["bob: visible collaboration"]
+        );
     }
 
     #[test]

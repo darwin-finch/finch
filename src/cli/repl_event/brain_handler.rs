@@ -1465,6 +1465,7 @@ mod brain_handler_tests {
             environment_generation: 1,
             sender: "test".into(),
             created_ms: 10,
+            run_id: None,
             kind,
         }
     }

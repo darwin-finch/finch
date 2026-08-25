@@ -869,6 +869,12 @@ pub(crate) async fn submit_named_brain_event_with_authority(
 ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
     use crate::brain::store::BrainEventKind;
 
+    if matches!(kind, BrainEventKind::SpeculativePrompt { .. }) {
+        return Err(BrainSubmissionError::Invalid(
+            "speculative runs must start through BrainLifecycleService".into(),
+        ));
+    }
+
     if !matches!(
         kind,
         BrainEventKind::Prompt { .. }
@@ -1024,9 +1030,10 @@ async fn dispatch_named_brain_run(
         Some(request) => request,
         None => {
             let detail = format!("Brain run {} request event is missing", run.run_id.0);
-            let result = push_named_brain_result(
+            let result = push_named_brain_run_result(
                 store,
                 name,
+                run.run_id,
                 run.request_seq,
                 Err(anyhow::anyhow!(detail.clone())),
             )?;
@@ -1056,8 +1063,7 @@ async fn dispatch_named_brain_run(
             )
             .await
             {
-                Ok(output) => push_named_brain_result(store, name, request.seq, Ok(output))
-                    .map(|event| (event, None::<crate::server::RunnerTurnCommitAck>)),
+                Ok(result) => Ok((result, None::<crate::server::RunnerTurnCommitAck>)),
                 Err(error) => Err(error),
             }
         }
@@ -1075,8 +1081,7 @@ async fn dispatch_named_brain_run(
             )
             .await
             {
-                Ok(output) => push_named_brain_result(store, name, request.seq, Ok(output))
-                    .map(|event| (event, None::<crate::server::RunnerTurnCommitAck>)),
+                Ok(result) => Ok((result, None::<crate::server::RunnerTurnCommitAck>)),
                 Err(error) => Err(error),
             }
         }
@@ -1113,13 +1118,24 @@ async fn dispatch_named_brain_run(
     // Cancellation is authoritative once the initiating driver and exact
     // runner have acknowledged it. A callback that completes after that point
     // must not publish a stale result or overwrite the cancelled state.
-    if store.inspect_run(name, run.run_id)?.status == BrainRunStatus::Cancelled {
+    let published = store.inspect_run(name, run.run_id)?;
+    if published.status == BrainRunStatus::Cancelled {
         return Ok(None);
+    }
+    if execution.is_err() && published.status == BrainRunStatus::Failed {
+        return Ok(store
+            .snapshot(name)?
+            .events
+            .into_iter()
+            .rev()
+            .find(|event| event.run_id == Some(run.run_id) && matches!(event.kind, BrainEventKind::Result { .. })));
     }
 
     match execution {
         Ok((result, commit_ack)) => {
-            store.transition_run(name, "daemon", run.run_id, BrainRunStatus::Completed, None)?;
+            if published.status != BrainRunStatus::Completed {
+                store.transition_run(name, "daemon", run.run_id, BrainRunStatus::Completed, None)?;
+            }
             if projects_memory {
                 if let Err(error) =
                     project_committed_named_brain_memory(store, runners, name, run).await
@@ -1141,17 +1157,17 @@ async fn dispatch_named_brain_run(
         }
         Err(error) => {
             let detail = error.to_string();
-            let result = push_named_brain_result(
+            if detail == "named Brain run cancelled" {
+                return Ok(None);
+            }
+            let result = push_named_brain_run_result(
                 store,
                 name,
+                run.run_id,
                 request.seq,
                 Err(anyhow::anyhow!(detail.clone())),
             )?;
-            let status = if detail == "named Brain run cancelled" {
-                BrainRunStatus::Cancelled
-            } else {
-                BrainRunStatus::Failed
-            };
+            let status = BrainRunStatus::Failed;
             match store.transition_run(name, "daemon", run.run_id, status, Some(detail)) {
                 Ok(_) => {}
                 Err(_)
@@ -1406,15 +1422,21 @@ fn commit_named_brain_approval_decision(
         claimed.fail("approval decision no longer matches its addressed attachment");
         anyhow::bail!("approval decision no longer matches its addressed attachment");
     }
-    let accepted = match store.push(
-        name,
-        &attachment.subject,
-        crate::brain::store::BrainEventKind::ApprovalDecided {
-            request_seq,
-            approval_id: approval_id.to_string(),
-            decision: decision.clone(),
-        },
-    ) {
+    let kind = crate::brain::store::BrainEventKind::ApprovalDecided {
+        request_seq,
+        approval_id: approval_id.to_string(),
+        decision: decision.clone(),
+    };
+    let correlated_run = snapshot
+        .runs
+        .iter()
+        .find(|run| run.request_seq == request_seq)
+        .map(|run| run.run_id);
+    let persisted = match correlated_run {
+        Some(run_id) => store.push_for_run(name, &attachment.subject, run_id, kind),
+        None => store.push(name, &attachment.subject, kind),
+    };
+    let accepted = match persisted {
         Ok(accepted) => accepted,
         Err(error) => {
             claimed.fail(error.to_string());
@@ -1427,9 +1449,10 @@ fn commit_named_brain_approval_decision(
     Ok(accepted)
 }
 
-fn push_named_brain_result(
+fn push_named_brain_run_result(
     store: &crate::brain::store::BrainStore,
     name: &str,
+    run_id: crate::brain::store::RunId,
     request_seq: u64,
     result: anyhow::Result<String>,
 ) -> anyhow::Result<crate::brain::store::BrainEvent> {
@@ -1437,9 +1460,10 @@ fn push_named_brain_result(
         Ok(output) => (output, None),
         Err(error) => (String::new(), Some(error.to_string())),
     };
-    store.push(
+    store.push_for_run(
         name,
         "daemon",
+        run_id,
         crate::brain::store::BrainEventKind::Result {
             request_seq,
             output,
@@ -1458,7 +1482,7 @@ async fn dispatch_named_brain_program(
     source: &str,
     interaction: crate::server::RunnerProgramInteraction,
     grant_ceiling: Option<crate::vm::EffectSet>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<crate::brain::store::BrainEvent> {
     let snapshot = store.snapshot(name)?;
     ensure_named_brain_store_environment(store, &snapshot)?;
     let lease_id = snapshot
@@ -1486,36 +1510,70 @@ async fn dispatch_named_brain_program(
         Ok(outcome) => outcome,
         Err(error) => {
             if let Some(failure) = error.downcast_ref::<crate::server::RunnerProgramError>() {
+                let publication = store.acquire_run_publication(name, run_id).await?;
+                if publication.cancel_requested() {
+                    anyhow::bail!("named Brain run cancelled");
+                }
                 persist_named_brain_effect_journal(
                     store,
                     name,
+                    Some(run_id),
                     request_seq,
                     "runner",
                     &failure.effect_journal,
+                )?;
+                push_named_brain_run_result(
+                    store,
+                    name,
+                    run_id,
+                    request_seq,
+                    Err(anyhow::anyhow!(error.to_string())),
+                )?;
+                store.transition_run(
+                    name,
+                    "daemon",
+                    run_id,
+                    crate::brain::store::BrainRunStatus::Failed,
+                    Some(error.to_string()),
                 )?;
             }
             return Err(error);
         }
     };
-    if store.inspect_run(name, run_id)?.status
-        == crate::brain::store::BrainRunStatus::Cancelled
-    {
+    let publication = store.acquire_run_publication(name, run_id).await?;
+    if publication.cancel_requested() {
         anyhow::bail!("named Brain run cancelled");
     }
     persist_named_brain_effect_journal(
         store,
         name,
+        Some(run_id),
         request_seq,
         "runner",
         &outcome.effect_journal,
     )?;
-    store.commit_runner_runtime(
+    store.commit_runner_runtime_for_run(
         name,
+        run_id,
         request_seq,
         outcome.runtime_revision,
         outcome.checkpoint,
     )?;
-    Ok(outcome.output)
+    let result = push_named_brain_run_result(
+        store,
+        name,
+        run_id,
+        request_seq,
+        Ok(outcome.output),
+    )?;
+    store.transition_run(
+        name,
+        "daemon",
+        run_id,
+        crate::brain::store::BrainRunStatus::Completed,
+        None,
+    )?;
+    Ok(result)
 }
 
 async fn dispatch_named_brain_turn(
@@ -1565,9 +1623,14 @@ async fn dispatch_named_brain_turn(
         Ok(outcome) => outcome,
         Err(error) => {
             if let Some(failure) = error.downcast_ref::<crate::server::RunnerTurnError>() {
+                let publication = store.acquire_run_publication(name, run_id).await?;
+                if publication.cancel_requested() {
+                    anyhow::bail!("named Brain run cancelled");
+                }
                 persist_named_brain_turn_events(
                     store,
                     name,
+                    Some(run_id),
                     request_seq,
                     &lease.subject,
                     &approval_audience,
@@ -1576,23 +1639,38 @@ async fn dispatch_named_brain_turn(
                 persist_named_brain_effect_journal(
                     store,
                     name,
+                    Some(run_id),
                     request_seq,
                     &lease.subject,
                     &failure.effect_journal,
+                )?;
+                push_named_brain_run_result(
+                    store,
+                    name,
+                    run_id,
+                    request_seq,
+                    Err(anyhow::anyhow!(error.to_string())),
+                )?;
+                store.transition_run(
+                    name,
+                    "daemon",
+                    run_id,
+                    crate::brain::store::BrainRunStatus::Failed,
+                    Some(error.to_string()),
                 )?;
             }
             return Err(error);
         }
     };
-    if store.inspect_run(name, run_id)?.status
-        == crate::brain::store::BrainRunStatus::Cancelled
-    {
+    let publication = store.acquire_run_publication(name, run_id).await?;
+    if publication.cancel_requested() {
         anyhow::bail!("named Brain run cancelled");
     }
     let commit_ack = outcome.commit_ack.clone();
     persist_named_brain_turn_events(
         store,
         name,
+        Some(run_id),
         request_seq,
         &lease.subject,
         &approval_audience,
@@ -1601,31 +1679,42 @@ async fn dispatch_named_brain_turn(
     persist_named_brain_effect_journal(
         store,
         name,
+        Some(run_id),
         request_seq,
         &lease.subject,
         &outcome.effect_journal,
     )?;
-    let program = store.push(
+    let program = store.push_for_run(
         name,
         "provider",
+        run_id,
         crate::brain::store::BrainEventKind::Program {
             language: outcome.language,
             source: outcome.source,
         },
     )?;
-    store.commit_runner_runtime(
+    store.commit_runner_runtime_for_run(
         name,
+        run_id,
         program.seq,
         outcome.runtime_revision,
         outcome.checkpoint,
     )?;
-    let result = push_named_brain_result(store, name, program.seq, Ok(outcome.output))?;
+    let result = push_named_brain_run_result(store, name, run_id, program.seq, Ok(outcome.output))?;
+    store.transition_run(
+        name,
+        "daemon",
+        run_id,
+        crate::brain::store::BrainRunStatus::Completed,
+        None,
+    )?;
     Ok((result, commit_ack))
 }
 
 fn persist_named_brain_effect_journal(
     store: &crate::brain::store::BrainStore,
     name: &str,
+    run_id: Option<crate::brain::store::RunId>,
     request_seq: u64,
     sender: &str,
     records: &[crate::server::RunnerEffectRecord],
@@ -1661,16 +1750,17 @@ fn persist_named_brain_effect_journal(
             );
             continue;
         }
-        store.push(
-            name,
-            sender,
-            crate::brain::store::BrainEventKind::EffectRecorded {
+        let kind = crate::brain::store::BrainEventKind::EffectRecorded {
                 request_seq,
                 execution_id: record.execution_id,
                 effect: record.entry.effect.clone(),
                 state: record.entry.state.clone(),
-            },
-        )?;
+            };
+        if let Some(run_id) = run_id {
+            store.push_for_run(name, sender, run_id, kind)?;
+        } else {
+            store.push(name, sender, kind)?;
+        }
         persisted.insert(
             key,
             (
@@ -1686,6 +1776,7 @@ fn persist_named_brain_effect_journal(
 fn persist_named_brain_turn_events(
     store: &crate::brain::store::BrainStore,
     name: &str,
+    run_id: Option<crate::brain::store::RunId>,
     request_seq: u64,
     runner_subject: &str,
     expected_approval_audience: &crate::brain::store::BrainApprovalAudience,
@@ -1729,9 +1820,11 @@ fn persist_named_brain_turn_events(
                 if !persisted.insert(format!("call:{tool_id}")) {
                     continue;
                 }
-                store.push(
+                push_named_brain_correlated_event(
+                    store,
                     name,
                     "provider",
+                    run_id,
                     crate::brain::store::BrainEventKind::ToolCall {
                         request_seq,
                         tool_id,
@@ -1748,9 +1841,11 @@ fn persist_named_brain_turn_events(
                 if !persisted.insert(format!("result:{tool_id}")) {
                     continue;
                 }
-                store.push(
+                push_named_brain_correlated_event(
+                    store,
                     name,
                     "runner",
+                    run_id,
                     crate::brain::store::BrainEventKind::ToolResult {
                         request_seq,
                         tool_id,
@@ -1773,9 +1868,11 @@ fn persist_named_brain_turn_events(
                 if !persisted.insert(format!("approval:{approval_id}")) {
                     continue;
                 }
-                store.push(
+                push_named_brain_correlated_event(
+                    store,
                     name,
                     "runner",
+                    run_id,
                     crate::brain::store::BrainEventKind::ApprovalRequested {
                         request_seq,
                         approval_id,
@@ -1793,9 +1890,11 @@ fn persist_named_brain_turn_events(
                 if !persisted.insert(format!("decision:{approval_id}")) {
                     continue;
                 }
-                store.push(
+                push_named_brain_correlated_event(
+                    store,
                     name,
                     runner_subject,
+                    run_id,
                     crate::brain::store::BrainEventKind::ApprovalDecided {
                         request_seq,
                         approval_id,
@@ -1808,6 +1907,19 @@ fn persist_named_brain_turn_events(
     Ok(())
 }
 
+fn push_named_brain_correlated_event(
+    store: &crate::brain::store::BrainStore,
+    name: &str,
+    sender: &str,
+    run_id: Option<crate::brain::store::RunId>,
+    kind: crate::brain::store::BrainEventKind,
+) -> anyhow::Result<crate::brain::store::BrainEvent> {
+    match run_id {
+        Some(run_id) => store.push_for_run(name, sender, run_id, kind),
+        None => store.push(name, sender, kind),
+    }
+}
+
 fn named_brain_provider_messages_at(
     snapshot: &crate::brain::store::BrainSnapshot,
     request_seq: u64,
@@ -1815,39 +1927,14 @@ fn named_brain_provider_messages_at(
     use crate::brain::store::BrainEventKind;
 
     // Speculative helper transcripts are visible in the canonical log, but
-    // they are not conversation input. Exclude only events correlated to the
-    // helper; unrelated durable events remain context even if they interleave.
-    let speculative_runs = snapshot
+    // they are not conversation input. Correlation is an envelope identity,
+    // never inferred from sender, ordering, or adjacency.
+    let speculative_run_ids = snapshot
         .runs
         .iter()
         .filter(|run| run.kind == crate::brain::store::BrainRunKind::Speculative)
-        .map(|run| {
-            let end = snapshot
-                .events
-                .iter()
-                .find_map(|event| match &event.kind {
-                    BrainEventKind::RunStatusChanged { run_id, status, .. }
-                        if *run_id == run.run_id && status.is_terminal() =>
-                    {
-                        Some(event.seq)
-                    }
-                    _ => None,
-                })
-                .unwrap_or(request_seq);
-            let provider_program_seqs = snapshot
-                .events
-                .iter()
-                .filter(|event| {
-                    run.request_seq < event.seq
-                        && event.seq < end
-                        && event.sender == "provider"
-                        && matches!(event.kind, BrainEventKind::Program { .. })
-                })
-                .map(|event| event.seq)
-                .collect::<std::collections::HashSet<_>>();
-            (run.run_id, run.request_seq, end, provider_program_seqs)
-        })
-        .collect::<Vec<_>>();
+        .map(|run| run.run_id)
+        .collect::<std::collections::HashSet<_>>();
 
     // A queued run must see the conversation and task projection that existed
     // when its exact request was accepted. In particular, later queued prompts
@@ -1866,39 +1953,7 @@ fn named_brain_provider_messages_at(
         .iter()
         .rev()
         .filter(|event| event.seq <= request_seq)
-        .filter(|event| {
-            !speculative_runs
-                .iter()
-                .any(|(run_id, start, end, program_seqs)| {
-                    if event.seq == *start {
-                        return true;
-                    }
-                    if event.seq <= *start || event.seq >= *end {
-                        return false;
-                    }
-                    match &event.kind {
-                        BrainEventKind::RunStarted { run } => run.run_id == *run_id,
-                        BrainEventKind::RunStatusChanged {
-                            run_id: changed, ..
-                        } => changed == run_id,
-                        BrainEventKind::ToolCall { request_seq, .. }
-                        | BrainEventKind::ToolResult { request_seq, .. }
-                        | BrainEventKind::ApprovalRequested { request_seq, .. }
-                        | BrainEventKind::ApprovalDecided { request_seq, .. }
-                        | BrainEventKind::EffectRecorded { request_seq, .. } => {
-                            *request_seq == *start
-                        }
-                        BrainEventKind::Program { .. } => {
-                            event.sender == "provider" && program_seqs.contains(&event.seq)
-                        }
-                        BrainEventKind::RuntimeCommitted { request_seq, .. }
-                        | BrainEventKind::Result { request_seq, .. } => {
-                            *request_seq == *start || program_seqs.contains(request_seq)
-                        }
-                        _ => false,
-                    }
-                })
-        })
+        .filter(|event| event.run_id.is_none_or(|run_id| !speculative_run_ids.contains(&run_id)))
         .filter(|event| {
             !matches!(
                 event.kind,
@@ -3491,6 +3546,7 @@ mod handler_tests {
             environment_generation: 1,
             sender: sender.into(),
             created_ms: 0,
+            run_id: None,
             kind,
         }
     }
@@ -4454,6 +4510,7 @@ mod handler_tests {
         persist_named_brain_turn_events(
             &store,
             "shared",
+            None,
             request_seq,
             "runner@box.local",
             &audience,
@@ -4537,6 +4594,7 @@ mod handler_tests {
         let error = persist_named_brain_turn_events(
             &store,
             "shared",
+            None,
             1,
             "runner@box.local",
             &expected,
@@ -4568,6 +4626,7 @@ mod handler_tests {
         persist_named_brain_effect_journal(
             &store,
             "shared",
+            None,
             7,
             "runner",
             std::slice::from_ref(&record),
@@ -4576,6 +4635,7 @@ mod handler_tests {
         persist_named_brain_effect_journal(
             &store,
             "shared",
+            None,
             7,
             "runner",
             std::slice::from_ref(&record),
@@ -4595,6 +4655,7 @@ mod handler_tests {
         let error = persist_named_brain_effect_journal(
             &store,
             "shared",
+            None,
             8,
             "runner",
             std::slice::from_ref(&record),
@@ -4605,7 +4666,7 @@ mod handler_tests {
         let mut conflicting = record;
         conflicting.entry.state = crate::vm::EffectJournalState::Denied;
         let error =
-            persist_named_brain_effect_journal(&store, "shared", 7, "runner", &[conflicting])
+            persist_named_brain_effect_journal(&store, "shared", None, 7, "runner", &[conflicting])
                 .unwrap_err();
         assert!(error.to_string().contains("changed effect journal record"));
     }
@@ -4624,6 +4685,26 @@ mod handler_tests {
         let runners = crate::server::BrainRunnerBroker::default();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         runners.register("shared", lease.lease_id, tx);
+        let request = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Program {
+                    language: ProgramLanguage::Lisp,
+                    source: "(define (double (n : int)) : int (* n 2))".into(),
+                },
+            )
+            .unwrap();
+        let run = store
+            .start_run(
+                "shared",
+                "alice",
+                crate::brain::store::BrainRunKind::Interactive,
+                request.seq,
+                AttachmentId(uuid::Uuid::new_v4()),
+                crate::brain::store::BrainRunStatus::Running,
+            )
+            .unwrap();
         let effect_record = acknowledged_emit_effect("frontend completed");
         let expected_effect = effect_record.clone();
         tokio::spawn(async move {
@@ -4664,12 +4745,12 @@ mod handler_tests {
                 .unwrap();
         });
 
-        let output = dispatch_named_brain_program(
+        let result = dispatch_named_brain_program(
             &store,
             &runners,
             "shared",
-            crate::brain::store::RunId(uuid::Uuid::new_v4()),
-            41,
+            run.run_id,
+            request.seq,
             ProgramLanguage::Lisp,
             "(define (double (n : int)) : int (* n 2))",
             crate::server::RunnerProgramInteraction::Interactive,
@@ -4677,7 +4758,10 @@ mod handler_tests {
         )
         .await
         .unwrap();
-        assert_eq!(output, "frontend completed");
+        assert!(matches!(
+            result.kind,
+            BrainEventKind::Result { ref output, error: None, .. } if output == "frontend completed"
+        ));
 
         let restored = store.program_runtime("shared").unwrap();
         let called = restored
@@ -4706,11 +4790,13 @@ mod handler_tests {
                 matches!(
                     &event.kind,
                     BrainEventKind::EffectRecorded {
-                        request_seq: 41,
+                        request_seq,
                         execution_id,
                         effect,
                         state,
-                    } if *execution_id == expected_effect.execution_id
+                    } if *request_seq == run.request_seq
+                        && event.run_id == Some(run.run_id)
+                        && *execution_id == expected_effect.execution_id
                         && effect == &expected_effect.entry.effect
                         && state == &expected_effect.entry.state
                 )
@@ -4723,9 +4809,9 @@ mod handler_tests {
                 matches!(
                     event.kind,
                     BrainEventKind::RuntimeCommitted {
-                        request_seq: 41,
+                        request_seq,
                         ..
-                    }
+                    } if request_seq == run.request_seq && event.run_id == Some(run.run_id)
                 )
             })
             .expect("runtime commit event");
@@ -4771,6 +4857,16 @@ mod handler_tests {
             .unwrap();
         let prompt_seq = prompt.seq;
         let requester = driver_attachment("driver@box.local");
+        let run = store
+            .start_run(
+                "shared",
+                &requester.subject,
+                crate::brain::store::BrainRunKind::Interactive,
+                prompt_seq,
+                requester.attachment_id,
+                crate::brain::store::BrainRunStatus::Running,
+            )
+            .unwrap();
         let generation = store.environment().generation;
         let lease = store
             .acquire_runner_lease("shared", "runner@box.local", generation, None, 60_000)
@@ -4855,7 +4951,7 @@ mod handler_tests {
             &store,
             &runners,
             "shared",
-            crate::brain::store::RunId(uuid::Uuid::new_v4()),
+            run.run_id,
             prompt_seq,
             "define triple",
             &requester,
@@ -4957,6 +5053,16 @@ mod handler_tests {
             .unwrap()
             .seq;
         let requester = driver_attachment("driver@box.local");
+        let run = store
+            .start_run(
+                "shared",
+                &requester.subject,
+                crate::brain::store::BrainRunKind::Interactive,
+                prompt_seq,
+                requester.attachment_id,
+                crate::brain::store::BrainRunStatus::Running,
+            )
+            .unwrap();
         let lease = store
             .acquire_runner_lease(
                 "shared",
@@ -5002,7 +5108,7 @@ mod handler_tests {
             &store,
             &runners,
             "shared",
-            crate::brain::store::RunId(uuid::Uuid::new_v4()),
+            run.run_id,
             prompt_seq,
             "try an effect",
             &requester,
@@ -5011,8 +5117,8 @@ mod handler_tests {
         .unwrap_err();
         assert!(error.to_string().contains("provider failed after approval"));
         let snapshot = store.snapshot("shared").unwrap();
-        assert!(matches!(
-            &snapshot.events[snapshot.events.len() - 3].kind,
+        assert!(snapshot.events.iter().any(|event| matches!(
+            &event.kind,
             BrainEventKind::ApprovalRequested {
                 approval_id,
                 audience: Some(audience),
@@ -5022,14 +5128,14 @@ mod handler_tests {
                     && audience.attachment_id == requester.attachment_id
                     && audience.subject == "driver@box.local"
                     && audience.role == AttachmentRole::Driver
-        ));
-        assert!(matches!(
-            &snapshot.events[snapshot.events.len() - 2].kind,
+        )));
+        assert!(snapshot.events.iter().any(|event| matches!(
+            &event.kind,
             BrainEventKind::ApprovalDecided { approval_id, decision, .. }
                 if approval_id == "approval-1" && decision["choice"] == "allow_once"
-        ));
-        assert!(matches!(
-            &snapshot.events[snapshot.events.len() - 1].kind,
+        )));
+        assert!(snapshot.events.iter().any(|event| matches!(
+            &event.kind,
             BrainEventKind::EffectRecorded {
                 request_seq,
                 execution_id,
@@ -5039,7 +5145,7 @@ mod handler_tests {
                 && *execution_id == expected_effect.execution_id
                 && effect == &expected_effect.entry.effect
                 && state == &expected_effect.entry.state
-        ));
+        )));
 
         drop(store);
         let restarted = crate::brain::store::BrainStore::with_root(
@@ -5736,22 +5842,26 @@ mod handler_tests {
                 .unwrap();
         });
 
-        let speculative = submit_named_brain_event(
-            &store,
-            &runners,
-            &crate::server::BrainApprovalBroker::default(),
+        let (_accepted, queued) = store
+            .accept_speculative_run(
             "shared",
-            &driver,
-            BrainEventKind::SpeculativePrompt {
-                text: "spec-only-prompt".into(),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            speculative.run.unwrap().kind,
-            crate::brain::store::BrainRunKind::Speculative
-        );
+                &driver.subject,
+                driver.attachment_id,
+                "spec-only-prompt".into(),
+            )
+            .unwrap();
+        let speculative = store
+            .transition_run(
+                "shared",
+                "daemon",
+                queued.run_id,
+                crate::brain::store::BrainRunStatus::Running,
+                None,
+            )
+            .unwrap();
+        dispatch_named_brain_run(&store, &runners, "shared", &speculative)
+            .await
+            .unwrap();
         submit_named_brain_event(
             &store,
             &runners,
@@ -5924,17 +6034,24 @@ mod handler_tests {
             )
             .unwrap();
         let program = store
-            .push(
+            .push_for_run(
                 "shared",
                 "provider",
+                run.run_id,
                 BrainEventKind::Program {
                     language: ProgramLanguage::Lisp,
                     source: "(say \"after restart\")".into(),
                 },
             )
             .unwrap();
-        push_named_brain_result(&store, "shared", program.seq, Ok("after restart".into()))
-            .unwrap();
+        push_named_brain_run_result(
+            &store,
+            "shared",
+            run.run_id,
+            program.seq,
+            Ok("after restart".into()),
+        )
+        .unwrap();
         store
             .transition_run(
                 "shared",

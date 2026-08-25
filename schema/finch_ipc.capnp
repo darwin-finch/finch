@@ -1173,6 +1173,8 @@ struct BrainEvent {
   environmentGeneration @3 :UInt64;
   sender               @4 :Text;
   createdMs            @5 :UInt64;
+  hasRunId             @30 :Bool;
+  runId                @31 :Text;
   union {
     runnerLeaseAcquired @6  :BrainRunnerLease;
     runnerLeaseReleased @7  :Text;

@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 13;
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 14;
 const BRAIN_METADATA_VERSION: u32 = 1;
 const BRAIN_INITIALIZATION_VERSION: u32 = 1;
 const DEFAULT_INITIALIZATION_MODULE: &str = "finch.brain.initialization";
@@ -523,6 +523,13 @@ pub struct BrainEvent {
     pub environment_generation: u64,
     pub sender: String,
     pub created_ms: u64,
+    /// Canonical lifecycle correlation. Legacy and non-run events have none.
+    #[serde(
+        default,
+        rename = "correlation_run_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub run_id: Option<RunId>,
     #[serde(flatten)]
     pub kind: BrainEventKind,
 }
@@ -846,6 +853,19 @@ pub struct BrainStore {
     /// concurrently, but accepted input, VM commit, and its Result event must
     /// remain an indivisible sequence against the authoritative revision.
     execution_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    run_publication_gates:
+        Arc<RwLock<HashMap<(String, RunId), Arc<tokio::sync::Mutex<RunPublicationGate>>>>>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RunPublicationGate {
+    cancel_requested: bool,
+}
+
+impl RunPublicationGate {
+    pub(crate) fn cancel_requested(&self) -> bool {
+        self.cancel_requested
+    }
 }
 
 impl BrainStore {
@@ -878,6 +898,7 @@ impl BrainStore {
             runtimes: Arc::new(RwLock::new(HashMap::new())),
             runtime_checkpoints: Arc::new(RwLock::new(HashMap::new())),
             execution_locks: Arc::new(RwLock::new(HashMap::new())),
+            run_publication_gates: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -904,6 +925,58 @@ impl BrainStore {
             .entry(name.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone())
+    }
+
+    fn run_publication_gate(
+        &self,
+        name: &str,
+        run_id: RunId,
+    ) -> Result<Arc<tokio::sync::Mutex<RunPublicationGate>>> {
+        let name = Self::validate_name(name)?;
+        if let Some(gate) = self
+            .run_publication_gates
+            .read()
+            .expect("shared Brain run-gate map poisoned")
+            .get(&(name.to_string(), run_id))
+            .cloned()
+        {
+            return Ok(gate);
+        }
+        let mut gates = self
+            .run_publication_gates
+            .write()
+            .expect("shared Brain run-gate map poisoned");
+        Ok(gates
+            .entry((name.to_string(), run_id))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(RunPublicationGate::default())))
+            .clone())
+    }
+
+    pub(crate) async fn acquire_run_publication(
+        &self,
+        name: &str,
+        run_id: RunId,
+    ) -> Result<tokio::sync::OwnedMutexGuard<RunPublicationGate>> {
+        Ok(self.run_publication_gate(name, run_id)?.lock_owned().await)
+    }
+
+    pub(crate) async fn reserve_run_cancellation(
+        &self,
+        name: &str,
+        run_id: RunId,
+    ) -> Result<()> {
+        let mut gate = self.acquire_run_publication(name, run_id).await?;
+        let run = self.inspect_run(name, run_id)?;
+        anyhow::ensure!(!run.status.is_terminal(), "Brain run has already finished");
+        gate.cancel_requested = true;
+        Ok(())
+    }
+
+    pub(crate) async fn clear_run_cancellation(&self, name: &str, run_id: RunId) -> Result<()> {
+        self.acquire_run_publication(name, run_id)
+            .await?
+            .cancel_requested = false;
+        Ok(())
     }
 
     pub fn validate_name(name: &str) -> Result<&str> {
@@ -1339,6 +1412,52 @@ impl BrainStore {
         )
     }
 
+    /// Atomically allocate and journal an explicit speculative request and its
+    /// queued run under the aggregate lock. The request event carries the RunId
+    /// from its first durable appearance.
+    pub fn accept_speculative_run(
+        &self,
+        name: &str,
+        sender: &str,
+        initiating_attachment_id: AttachmentId,
+        text: String,
+    ) -> Result<(BrainEvent, BrainRun)> {
+        let name = Self::validate_name(name)?;
+        let sender = validate_participant_subject("run initiator", sender)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        let run_id = RunId::new();
+        let accepted = self.push_locked_for_run(
+            name,
+            state,
+            sender,
+            Some(run_id),
+            BrainEventKind::SpeculativePrompt { text },
+        )?;
+        let now = unix_millis();
+        let run = BrainRun {
+            run_id,
+            kind: BrainRunKind::Speculative,
+            parent_run_id: None,
+            request_seq: accepted.seq,
+            initiating_attachment_id,
+            initiated_by: sender.to_string(),
+            status: BrainRunStatus::QueuedForEnvironment,
+            started_ms: now,
+            updated_ms: now,
+            detail: None,
+        };
+        self.push_locked_for_run(
+            name,
+            state,
+            sender,
+            Some(run_id),
+            BrainEventKind::RunStarted { run: run.clone() },
+        )?;
+        Ok((accepted, run))
+    }
+
     pub fn start_run_with_parent(
         &self,
         name: &str,
@@ -1421,10 +1540,11 @@ impl BrainStore {
             updated_ms: now,
             detail,
         };
-        self.push_locked(
+        self.push_locked_for_run(
             name,
             state,
             sender,
+            Some(run_id),
             BrainEventKind::RunStarted { run: run.clone() },
         )?;
         Ok(run)
@@ -1460,10 +1580,11 @@ impl BrainStore {
             .get(&run_id)
             .with_context(|| format!("Brain run {} does not exist", run_id.0))?;
         validate_run_transition(current.status, status)?;
-        self.push_locked(
+        self.push_locked_for_run(
             name,
             state,
             sender,
+            Some(run_id),
             BrainEventKind::RunStatusChanged {
                 run_id,
                 status,
@@ -2128,6 +2249,17 @@ impl BrainStore {
         sender: &str,
         kind: BrainEventKind,
     ) -> Result<BrainEvent> {
+        self.push_locked_for_run(name, state, sender, None, kind)
+    }
+
+    fn push_locked_for_run(
+        &self,
+        name: &str,
+        state: &mut BrainState,
+        sender: &str,
+        run_id: Option<RunId>,
+        kind: BrainEventKind,
+    ) -> Result<BrainEvent> {
         if let BrainEventKind::ScheduleChanged { schedule } = &kind {
             if schedule.module_identity.is_some() {
                 let initialization = self
@@ -2161,12 +2293,28 @@ impl BrainStore {
             environment_generation: self.environment.generation,
             sender: sender.trim().to_string(),
             created_ms: unix_millis(),
+            run_id,
             kind,
         };
         self.append_event(name, &event)?;
         state.apply(event.clone());
         let _ = state.tx.send(event.clone());
         Ok(event)
+    }
+
+    pub fn push_for_run(
+        &self,
+        name: &str,
+        sender: &str,
+        run_id: RunId,
+        kind: BrainEventKind,
+    ) -> Result<BrainEvent> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        anyhow::ensure!(state.runs.contains_key(&run_id), "Brain run does not exist");
+        self.push_locked_for_run(name, state, sender, Some(run_id), kind)
     }
 
     pub fn pop_program(&self, name: &str, sender: &str) -> Result<Option<BrainEvent>> {
@@ -2329,6 +2477,34 @@ impl BrainStore {
         runtime_revision: u64,
         checkpoint: crate::vm::TypedRuntimeCheckpoint,
     ) -> Result<BrainEvent> {
+        self.commit_runner_runtime_inner(name, None, request_seq, runtime_revision, checkpoint)
+    }
+
+    pub fn commit_runner_runtime_for_run(
+        &self,
+        name: &str,
+        run_id: RunId,
+        request_seq: u64,
+        runtime_revision: u64,
+        checkpoint: crate::vm::TypedRuntimeCheckpoint,
+    ) -> Result<BrainEvent> {
+        self.commit_runner_runtime_inner(
+            name,
+            Some(run_id),
+            request_seq,
+            runtime_revision,
+            checkpoint,
+        )
+    }
+
+    fn commit_runner_runtime_inner(
+        &self,
+        name: &str,
+        run_id: Option<RunId>,
+        request_seq: u64,
+        runtime_revision: u64,
+        checkpoint: crate::vm::TypedRuntimeCheckpoint,
+    ) -> Result<BrainEvent> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
         if let Some(current) = self
@@ -2360,15 +2536,15 @@ impl BrainStore {
             .write()
             .expect("shared brain runtime lock poisoned")
             .insert(name.to_string(), Arc::new(restored));
-        self.push(
-            name,
-            "runner",
-            BrainEventKind::RuntimeCommitted {
+        let kind = BrainEventKind::RuntimeCommitted {
                 request_seq,
                 runtime_revision,
                 checkpoint_sha256,
-            },
-        )
+            };
+        match run_id {
+            Some(run_id) => self.push_for_run(name, "runner", run_id, kind),
+            None => self.push(name, "runner", kind),
+        }
     }
 
     fn read_runtime_checkpoint(
@@ -2561,6 +2737,7 @@ impl BrainStore {
                 environment_generation: self.environment.generation,
                 sender: "daemon".into(),
                 created_ms: unix_millis(),
+                run_id: Some(run_id),
                 kind: BrainEventKind::RunStatusChanged {
                     run_id,
                     status: BrainRunStatus::Interrupted,
@@ -4302,6 +4479,60 @@ mod tests {
             .unwrap();
         assert_eq!(appended.schema_version, BRAIN_EVENT_SCHEMA_VERSION);
         assert_eq!(appended.brain_id, snapshot.brain_id);
+    }
+
+    #[test]
+    fn v12_and_v13_event_logs_restart_without_run_correlation() {
+        for schema_version in [12, 13] {
+            let temp = tempfile::tempdir().unwrap();
+            let name = format!("legacy-v{schema_version}");
+            let directory = temp.path().join(&name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("events.jsonl"),
+                format!(
+                    "{{\"schema_version\":{schema_version},\"brain_id\":\"00000000-0000-0000-0000-000000000000\",\"seq\":1,\"environment_generation\":1,\"sender\":\"alice\",\"created_ms\":0,\"kind\":\"prompt\",\"text\":\"hello\"}}\n"
+                ),
+            )
+            .unwrap();
+
+            let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+            let snapshot = store.snapshot(&name).unwrap();
+            assert_eq!(snapshot.events[0].schema_version, schema_version);
+            assert_eq!(snapshot.events[0].run_id, None);
+        }
+    }
+
+    #[test]
+    fn correlated_run_started_json_roundtrip_uses_distinct_envelope_key() {
+        let run_id = RunId::new();
+        let run = BrainRun {
+            run_id,
+            kind: BrainRunKind::Speculative,
+            parent_run_id: None,
+            request_seq: 1,
+            initiating_attachment_id: AttachmentId::new(),
+            initiated_by: "alice".into(),
+            status: BrainRunStatus::QueuedForEnvironment,
+            started_ms: 1,
+            updated_ms: 1,
+            detail: None,
+        };
+        let event = BrainEvent {
+            schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+            brain_id: BrainId::new(),
+            seq: 2,
+            environment_generation: 1,
+            sender: "alice".into(),
+            created_ms: 1,
+            run_id: Some(run_id),
+            kind: BrainEventKind::RunStarted { run },
+        };
+
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(encoded.contains("\"correlation_run_id\""));
+        let decoded: BrainEvent = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, event);
     }
 
     #[test]

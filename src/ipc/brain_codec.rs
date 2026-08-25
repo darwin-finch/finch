@@ -1274,6 +1274,10 @@ pub(super) fn encode_event(
     builder.set_environment_generation(event.environment_generation);
     builder.set_sender(&event.sender);
     builder.set_created_ms(event.created_ms);
+    if let Some(run_id) = event.run_id {
+        builder.set_has_run_id(true);
+        builder.set_run_id(&run_id.0.to_string());
+    }
     match &event.kind {
         BrainEventKind::RunnerLeaseAcquired { lease } => {
             encode_runner_lease(builder.init_runner_lease_acquired(), lease);
@@ -1610,6 +1614,13 @@ pub(super) fn decode_event(
         environment_generation: reader.get_environment_generation(),
         sender: text(reader.get_sender()?)?,
         created_ms: reader.get_created_ms(),
+        run_id: reader
+            .get_has_run_id()
+            .then(|| reader.get_run_id())
+            .transpose()?
+            .map(parse_uuid)
+            .transpose()?
+            .map(RunId),
         kind,
     })
 }
@@ -1638,6 +1649,7 @@ mod tests {
             environment_generation: 7,
             sender: "alice@laptop.local".into(),
             created_ms: 123_000 + seq,
+            run_id: None,
             kind,
         }
     }
@@ -1933,8 +1945,13 @@ mod tests {
         ];
 
         for (index, kind) in kinds.into_iter().enumerate() {
+            let is_result = matches!(kind, BrainEventKind::Result { .. });
+            let mut event = event(brain_id, index as u64 + 1, kind);
+            if is_result {
+                event.run_id = Some(RunId(uuid::Uuid::new_v4()));
+            }
             let expected = BrainWireMessage::Event {
-                event: event(brain_id, index as u64 + 1, kind),
+                event,
             };
             let encoded = encode_brain_wire_message(&expected).unwrap();
             assert_eq!(decode_brain_wire_message(&encoded).unwrap(), expected);
