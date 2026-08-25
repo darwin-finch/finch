@@ -876,13 +876,16 @@ still blocks the corresponding Brain phase until it is unified.
   model are complete. The eventual channel should be a threaded/multi-participant projection of a
   Brain: people and models share one durable conversation, while programs run only on the remote
   environment-owning runner. Adding/removing VM definitions and borrowing CPU require explicit,
-  attenuated participant grants. Distinguish a canonical `ParticipantMessage` (relay/store only,
-  never schedules an LLM turn) from a `Prompt` explicitly addressed to Finch; an eventual `/say`
-  and `@finch` spelling can expose that boundary. Add `/who` as the current authenticated
-  participant/role projection and `/whois <subject>` for public identity, role, and presence
-  metadata, never credentials. Until then, quarantine the aspirational IRC/room/peer/gas command
-  surfaces (`/join`, `/part`, `/say`, `/room`, `/connect`, and related commands) rather than
-  presenting them as a second collaboration protocol.
+  attenuated participant grants. The base conversation boundary now exists: canonical
+  `ParticipantMessage` events are relay/store-only, enter later prompt context, and never schedule
+  an LLM turn; drivers and consultants can submit them while observers and runners cannot. `/say`
+  exposes that path without losing terminal punctuation, `/who` projects connected authenticated
+  attachments, and `/whois <subject>` reports public role/presence/cursor metadata but never
+  credentials. Still add an explicit `@finch` prompt spelling, participant-specific rendering,
+  threads/channels, and the corresponding collaboration authorization tests. Until then,
+  quarantine the remaining aspirational IRC/room/peer/gas command surfaces (`/join`, `/part`,
+  `/room`, `/connect`, and related commands) rather than presenting them as a second collaboration
+  protocol.
 
 ## Client and model integration
 

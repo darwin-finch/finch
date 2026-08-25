@@ -185,6 +185,10 @@ and runner-lease routes are gone; HTTP remains for authenticated discovery, cred
 bootstrap, and explicit administrative archive. Run budgets and generalized effect-resume
 correlation still need the unified service. Runtime ownership has moved to the leased
 environment runner; the daemon is now the durable coordinator for interactive prompt/program runs.
+Participant collaboration no longer has to masquerade as a model prompt: `ParticipantMessage` is a
+closed-schema submission/event that is durable and available to later provider context but creates
+no `BrainRun`. Drivers and consultants may relay it, observers and runners may not, and `/say`,
+`/who`, and `/whois` expose relay and public presence without revealing credentials.
 The obsolete client-local speculative agent and hidden context-injection path are absent, so they
 can no longer bypass this coordinator or consume a separate provider session while the user types.
 
