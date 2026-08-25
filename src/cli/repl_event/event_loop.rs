@@ -1103,12 +1103,49 @@ fn project_remote_brain_run_event(
 }
 
 struct LocalBrainProjection {
+    run_id: crate::brain::store::RunId,
     source: String,
     output: String,
     tool_ids: std::collections::HashSet<String>,
     approval_ids: std::collections::HashSet<String>,
     program_seq: Option<u64>,
     transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
+    failed: bool,
+}
+
+fn failed_local_brain_projection(
+    run_id: crate::brain::store::RunId,
+    turn_events: &[crate::server::RunnerTurnEvent],
+    transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
+) -> LocalBrainProjection {
+    let tool_ids = turn_events
+        .iter()
+        .filter_map(|event| match event {
+            crate::server::RunnerTurnEvent::Call { tool_id, .. }
+            | crate::server::RunnerTurnEvent::Result { tool_id, .. } => Some(tool_id.clone()),
+            _ => None,
+        })
+        .collect();
+    let approval_ids = turn_events
+        .iter()
+        .filter_map(|event| match event {
+            crate::server::RunnerTurnEvent::ApprovalRequested { approval_id, .. }
+            | crate::server::RunnerTurnEvent::ApprovalDecided { approval_id, .. } => {
+                Some(approval_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    LocalBrainProjection {
+        run_id,
+        source: String::new(),
+        output: String::new(),
+        tool_ids,
+        approval_ids,
+        program_seq: None,
+        transient_output_unit,
+        failed: true,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1120,6 +1157,9 @@ enum LocalProjectionMatch {
 
 impl LocalBrainProjection {
     fn observe(&mut self, event: &crate::brain::store::BrainEvent) -> LocalProjectionMatch {
+        if event.run_id != Some(self.run_id) {
+            return LocalProjectionMatch::None;
+        }
         match &event.kind {
             crate::brain::store::BrainEventKind::ToolCall { tool_id, .. }
             | crate::brain::store::BrainEventKind::ToolResult { tool_id, .. }
@@ -1149,6 +1189,9 @@ impl LocalBrainProjection {
                 && error.is_none()
                 && self.output == *output =>
             {
+                LocalProjectionMatch::SuppressAndComplete
+            }
+            crate::brain::store::BrainEventKind::Result { error: Some(_), .. } if self.failed => {
                 LocalProjectionMatch::SuppressAndComplete
             }
             _ => LocalProjectionMatch::None,
@@ -3691,6 +3734,11 @@ Rules:\n\
                     )
                     .await;
 
+                let transient_output_unit =
+                    self.query_states.brain_output_work_unit(query_id).await;
+                self.query_states
+                    .set_brain_output_work_unit(query_id, None)
+                    .await;
                 if let Some(unit) = self.query_states.tool_work_unit(query_id).await {
                     unit.set_failed();
                     self.query_states.set_tool_work_unit(query_id, None).await;
@@ -3702,6 +3750,12 @@ Rules:\n\
 
                 if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
                     self.agent_scheduler.set_active_brain_parent(None).await;
+                    self.local_brain_projections
+                        .push_back(failed_local_brain_projection(
+                            pending.run_id,
+                            &pending.turn_events,
+                            transient_output_unit,
+                        ));
                     let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
                         message: error.clone(),
                         turn_events: pending.turn_events,
@@ -4868,12 +4922,14 @@ Rules:\n\
                 })
                 .collect();
             self.local_brain_projections.push_back(LocalBrainProjection {
+                run_id,
                 source: result.source.clone(),
                 output: result.output.clone(),
                 tool_ids,
                 approval_ids,
                 program_seq: None,
                 transient_output_unit,
+                failed: false,
             });
         }
         let _ = response_tx.send(result);
@@ -5640,9 +5696,12 @@ Rules:\n\
                     .selected_brain()
                     .is_some_and(|client| !client.target.secure)
                     .then_some(brain.environment.machine.as_str());
+                let selected_brain_is_home = self.selected_brain_is_home();
                 project_remote_brain_snapshot_runs(
                     &self.output_manager,
                     &mut self.remote_brain_run_units,
+                    &mut self.local_brain_projections,
+                    selected_brain_is_home,
                     &brain.events,
                 );
                 self.todo_list
@@ -7649,6 +7708,8 @@ fn project_remote_brain_snapshot_runs(
         crate::brain::store::RunId,
         RemoteBrainRunProjection,
     >,
+    local_projections: &mut std::collections::VecDeque<LocalBrainProjection>,
+    selected_brain_is_home: bool,
     events: &[crate::brain::store::BrainEvent],
 ) {
     for group in projected_brain_run_groups(events) {
@@ -7661,7 +7722,13 @@ fn project_remote_brain_snapshot_runs(
         );
     }
     for event in events.iter().filter(|event| event.run_id.is_some()) {
-        project_remote_brain_run_event(output_manager, projections, event);
+        project_remote_brain_live_run_event(
+            output_manager,
+            projections,
+            local_projections,
+            selected_brain_is_home,
+            event,
+        );
     }
 }
 
@@ -8615,7 +8682,7 @@ mod tests {
     }
 
     #[test]
-    fn live_home_run_then_replacement_snapshot_keeps_one_complete_work_unit() {
+    fn snapshot_first_home_reconnect_reconciles_one_complete_work_unit() {
         use crate::brain::store::{
             AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, ProgramLanguage,
             RunId,
@@ -8726,31 +8793,27 @@ mod tests {
         transient_output_unit.set_complete();
         assert_eq!(output.get_messages().len(), 2);
         let mut local_projections = std::collections::VecDeque::from([LocalBrainProjection {
+            run_id,
             source: "(say \"cache checked\")".into(),
             output: "cache checked".into(),
             tool_ids: std::collections::HashSet::from(["tool-1".into()]),
             approval_ids: std::collections::HashSet::from(["approval-1".into()]),
             program_seq: None,
             transient_output_unit: Some(transient_output_unit),
+            failed: false,
         }]);
 
-        // These are the actual live EventLoop projection inputs for a home
-        // runner. Matching local state suppresses only the legacy rendering;
-        // correlated rows still enter their canonical run work unit.
-        for event in &events {
-            assert!(super::project_remote_brain_live_run_event(
-                &output,
-                &mut projections,
-                &mut local_projections,
-                true,
-                event,
-            ));
-        }
+        // No live canonical events arrive. A replacement snapshot containing
+        // the acknowledged history must reconcile the local rows, adopt the
+        // durable Result, and retire transient VM output by itself.
+        super::project_remote_brain_snapshot_runs(
+            &output,
+            &mut projections,
+            &mut local_projections,
+            true,
+            &events,
+        );
         assert!(local_projections.is_empty());
-
-        // A replacement snapshot can contain the now-acknowledged history and
-        // must update that same unit without adding a legacy unit or rows.
-        super::project_remote_brain_snapshot_runs(&output, &mut projections, &events);
 
         let messages = output.get_messages();
         assert_eq!(messages.len(), 1);
@@ -8780,16 +8843,186 @@ mod tests {
     }
 
     #[test]
+    fn failed_home_tool_rounds_reconcile_durable_error_without_duplicates() {
+        use crate::brain::store::{
+            AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
+        };
+
+        let output = crate::cli::output_manager::OutputManager::new(
+            crate::config::ColorScheme::default(),
+        );
+        output.disable_stdout();
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let run = BrainRun {
+            run_id,
+            kind: BrainRunKind::Speculative,
+            parent_run_id: None,
+            request_seq: 1,
+            initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            initiated_by: "alice".into(),
+            status: BrainRunStatus::Running,
+            started_ms: 1,
+            updated_ms: 1,
+            detail: None,
+        };
+        let mut projections = std::collections::HashMap::new();
+        let local_unit = super::ensure_remote_brain_run_projection(
+            &output,
+            &mut projections,
+            run_id,
+            Some(BrainRunKind::Speculative),
+            BrainRunStatus::Running,
+        )
+        .unit
+        .clone();
+        for (tool, summary) in [("tool-one", "first ok"), ("tool-two", "second ok")] {
+            let row = local_unit.add_row(tool);
+            local_unit.complete_row(row, summary);
+        }
+        let approval_row = local_unit.add_row("approval (tool) for write_cache");
+        local_unit.complete_row(approval_row, "approve_once by daemon");
+        let transient_output_unit = output.start_work_unit("VM program output");
+        transient_output_unit.set_program_output();
+        transient_output_unit.set_response("provider disconnected");
+        transient_output_unit.set_failed();
+        assert_eq!(output.get_messages().len(), 2);
+
+        let kinds = vec![
+            BrainEventKind::RunStarted { run },
+            BrainEventKind::ToolCall {
+                request_seq: 1,
+                tool_id: "tool-1".into(),
+                name: "tool-one".into(),
+                input: serde_json::json!({}),
+            },
+            BrainEventKind::ToolResult {
+                request_seq: 1,
+                tool_id: "tool-1".into(),
+                output: "first ok".into(),
+                is_error: false,
+            },
+            BrainEventKind::ToolCall {
+                request_seq: 1,
+                tool_id: "tool-2".into(),
+                name: "tool-two".into(),
+                input: serde_json::json!({}),
+            },
+            BrainEventKind::ToolResult {
+                request_seq: 1,
+                tool_id: "tool-2".into(),
+                output: "second ok".into(),
+                is_error: false,
+            },
+            BrainEventKind::ApprovalRequested {
+                request_seq: 1,
+                approval_id: "approval-1".into(),
+                approval_kind: "tool".into(),
+                subject: "write_cache".into(),
+                audience: None,
+                detail: serde_json::json!({}),
+            },
+            BrainEventKind::ApprovalDecided {
+                request_seq: 1,
+                approval_id: "approval-1".into(),
+                decision: serde_json::json!({"choice": "approve_once"}),
+            },
+            BrainEventKind::Result {
+                request_seq: 1,
+                output: String::new(),
+                error: Some("provider disconnected".into()),
+            },
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status: BrainRunStatus::Failed,
+                detail: None,
+            },
+        ];
+        let events = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                let mut event = brain_event(index as u64 + 1, "daemon", kind);
+                event.run_id = Some(run_id);
+                event
+            })
+            .collect::<Vec<_>>();
+        let failed_turn_events = vec![
+            crate::server::RunnerTurnEvent::Call {
+                tool_id: "tool-1".into(),
+                name: "tool-one".into(),
+                input: serde_json::json!({}),
+            },
+            crate::server::RunnerTurnEvent::Result {
+                tool_id: "tool-1".into(),
+                output: "first ok".into(),
+                is_error: false,
+            },
+            crate::server::RunnerTurnEvent::Call {
+                tool_id: "tool-2".into(),
+                name: "tool-two".into(),
+                input: serde_json::json!({}),
+            },
+            crate::server::RunnerTurnEvent::Result {
+                tool_id: "tool-2".into(),
+                output: "second ok".into(),
+                is_error: false,
+            },
+            crate::server::RunnerTurnEvent::ApprovalDecided {
+                approval_id: "approval-1".into(),
+                decision: serde_json::json!({"choice": "approve_once"}),
+            },
+        ];
+        let failed_projection = super::failed_local_brain_projection(
+            run_id,
+            &failed_turn_events,
+            Some(transient_output_unit),
+        );
+        assert_eq!(failed_projection.tool_ids.len(), 2);
+        assert_eq!(failed_projection.approval_ids.len(), 1);
+        let mut local_projections =
+            std::collections::VecDeque::from([failed_projection]);
+
+        for event in &events {
+            assert!(super::project_remote_brain_live_run_event(
+                &output,
+                &mut projections,
+                &mut local_projections,
+                true,
+                event,
+            ));
+        }
+        assert!(local_projections.is_empty());
+        super::project_remote_brain_snapshot_runs(
+            &output,
+            &mut projections,
+            &mut local_projections,
+            true,
+            &events,
+        );
+
+        let messages = output.get_messages();
+        assert_eq!(messages.len(), 1);
+        let rendered = messages[0].format(&crate::config::ColorScheme::default());
+        for expected in ["tool-one", "tool-two", "approval (tool)", "provider disconnected"] {
+            assert!(rendered.contains(expected), "missing {expected:?}:\n{rendered}");
+            assert_eq!(rendered.matches(expected).count(), 1, "duplicated {expected:?}");
+        }
+        assert_eq!(rendered.matches("result").count(), 1);
+    }
+
+    #[test]
     fn local_runner_projection_suppresses_matching_canonical_program_and_result() {
         let mut projection = LocalBrainProjection {
+            run_id: crate::brain::store::RunId(uuid::Uuid::nil()),
             source: "(say \"hello\")".into(),
             output: "hello".into(),
             tool_ids: std::collections::HashSet::new(),
             approval_ids: std::collections::HashSet::new(),
             program_seq: None,
             transient_output_unit: None,
+            failed: false,
         };
-        let program = brain_event(
+        let mut program = brain_event(
             12,
             "provider",
             crate::brain::store::BrainEventKind::Program {
@@ -8797,13 +9030,14 @@ mod tests {
                 source: "(say \"hello\")".into(),
             },
         );
+        program.run_id = Some(projection.run_id);
         assert_eq!(
             projection.observe(&program),
             LocalProjectionMatch::Suppress
         );
         assert_eq!(projection.program_seq, Some(12));
 
-        let result = brain_event(
+        let mut result = brain_event(
             14,
             "daemon",
             crate::brain::store::BrainEventKind::Result {
@@ -8812,6 +9046,7 @@ mod tests {
                 error: None,
             },
         );
+        result.run_id = Some(projection.run_id);
         assert_eq!(
             projection.observe(&result),
             LocalProjectionMatch::SuppressAndComplete
@@ -8821,14 +9056,16 @@ mod tests {
     #[test]
     fn local_runner_projection_does_not_hide_different_canonical_output() {
         let mut projection = LocalBrainProjection {
+            run_id: crate::brain::store::RunId(uuid::Uuid::nil()),
             source: "(say \"hello\")".into(),
             output: "hello".into(),
             tool_ids: std::collections::HashSet::new(),
             approval_ids: std::collections::HashSet::new(),
             program_seq: Some(12),
             transient_output_unit: None,
+            failed: false,
         };
-        let result = brain_event(
+        let mut result = brain_event(
             14,
             "daemon",
             crate::brain::store::BrainEventKind::Result {
@@ -8837,6 +9074,7 @@ mod tests {
                 error: None,
             },
         );
+        result.run_id = Some(projection.run_id);
         assert_eq!(projection.observe(&result), LocalProjectionMatch::None);
     }
 
