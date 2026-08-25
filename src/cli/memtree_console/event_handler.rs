@@ -86,6 +86,7 @@ impl EventHandler {
             ReplEvent::OutputReady { .. } => {}
             ReplEvent::VmEffect { .. } => {}
             ReplEvent::VmOutputComplete { .. } => {}
+            ReplEvent::VmEffectJournalComplete { .. } => {}
             ReplEvent::VmApprovalNeeded { .. } => {}
             ReplEvent::TypedProgramComplete { .. } => {}
             ReplEvent::StreamingComplete { .. } => {}

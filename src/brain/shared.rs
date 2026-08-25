@@ -315,6 +315,14 @@ pub enum BrainEventKind {
         runtime_revision: u64,
         checkpoint_sha256: String,
     },
+    /// Execute-once VM host-effect fact. This is deliberately stored in the
+    /// append-only event log rather than the reducible runtime checkpoint.
+    EffectRecorded {
+        request_seq: u64,
+        execution_id: uuid::Uuid,
+        effect: crate::vm::VmSideEffect,
+        state: crate::vm::EffectJournalState,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -579,6 +587,7 @@ impl BrainState {
             | BrainEventKind::ToolResult { .. }
             | BrainEventKind::ApprovalRequested { .. }
             | BrainEventKind::ApprovalDecided { .. }
+            | BrainEventKind::EffectRecorded { .. }
             | BrainEventKind::Result { .. } => {}
         }
         self.events.push(event);

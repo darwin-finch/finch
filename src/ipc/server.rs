@@ -1255,7 +1255,7 @@ async fn forward_runner_request(
                     decode_runner_program_result(reply.get().and_then(|r| r.get_result())),
                     false,
                 ),
-                Err(error) => (Err(error.to_string()), true),
+                Err(error) => (Err(error.to_string().into()), true),
             };
             let _ = request.response_tx.send(result);
             disconnected
@@ -1336,15 +1336,23 @@ async fn forward_runner_request(
 
 fn decode_runner_program_result(
     result: capnp::Result<finch_ipc_capnp::brain_program_result::Reader<'_>>,
-) -> Result<crate::server::RunnerProgramResult, String> {
+) -> Result<crate::server::RunnerProgramResult, crate::server::RunnerProgramError> {
     let result = result.map_err(|error| error.to_string())?;
+    let effect_journal = decode_runner_effect_records(
+        result
+            .get_effect_journal()
+            .map_err(|error| error.to_string())?,
+    )?;
     let error = result
         .get_error()
         .ok()
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     if !error.is_empty() {
-        return Err(error.to_string());
+        return Err(crate::server::RunnerProgramError {
+            message: error.to_string(),
+            effect_journal,
+        });
     }
     let checkpoint = decode_checkpoint(result.get_checkpoint().map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())?;
@@ -1357,6 +1365,7 @@ fn decode_runner_program_result(
             .to_string(),
         runtime_revision: result.get_runtime_revision(),
         checkpoint,
+        effect_journal,
     })
 }
 
@@ -1376,10 +1385,16 @@ fn decode_runner_turn_result(
     for encoded in encoded_turn_events.iter() {
         turn_events.push(decode_runner_turn_event(encoded)?);
     }
+    let effect_journal = decode_runner_effect_records(
+        result
+            .get_effect_journal()
+            .map_err(|error| error.to_string())?,
+    )?;
     if !error.is_empty() {
         return Err(crate::server::RunnerTurnError {
             message: error.to_string(),
             turn_events,
+            effect_journal,
         });
     }
     let checkpoint = decode_checkpoint(result.get_checkpoint().map_err(|error| error.to_string())?)
@@ -1403,7 +1418,25 @@ fn decode_runner_turn_result(
         turn_events,
         runtime_revision: result.get_runtime_revision(),
         checkpoint,
+        effect_journal,
     })
+}
+
+fn decode_runner_effect_records(
+    encoded: capnp::struct_list::Reader<'_, finch_ipc_capnp::brain_effect_record::Owned>,
+) -> Result<Vec<crate::server::RunnerEffectRecord>, String> {
+    encoded
+        .iter()
+        .map(|record| {
+            let (execution_id, entry) =
+                crate::ipc::checkpoint_codec::decode_effect_record(record)
+                    .map_err(|error| error.to_string())?;
+            Ok(crate::server::RunnerEffectRecord {
+                execution_id,
+                entry,
+            })
+        })
+        .collect()
 }
 
 fn decode_runner_turn_event(
@@ -1462,7 +1495,7 @@ fn decode_runner_turn_event(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_runner_turn_result, execute_typed_forth_ipc};
+    use super::{decode_runner_program_result, decode_runner_turn_result, execute_typed_forth_ipc};
     use crate::ipc::brain_codec::encode_approval_audience;
 
     fn test_approval_audience() -> crate::brain::shared::BrainApprovalAudience {
@@ -1480,8 +1513,31 @@ mod tests {
         }
     }
 
+    fn effect_record() -> crate::server::RunnerEffectRecord {
+        crate::server::RunnerEffectRecord {
+            execution_id: uuid::Uuid::new_v4(),
+            entry: crate::vm::EffectJournalEntry {
+                effect: crate::vm::VmSideEffect {
+                    protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                    sequence: 3,
+                    requirement: crate::vm::CapabilityRequirement {
+                        capability: crate::vm::CapabilityKind::SessionEmit,
+                        selector: crate::vm::ResourceSelector::None,
+                    },
+                    event: crate::vm::HostSideEffect::Emit {
+                        text: "done".into(),
+                    },
+                    output: Vec::new(),
+                    origin: crate::vm::SourceOrigin::generated("say"),
+                },
+                state: crate::vm::EffectJournalState::Acknowledged { values: Vec::new() },
+            },
+        }
+    }
+
     #[test]
     fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
+        let expected_effect = effect_record();
         let runtime = crate::runtime::ProgramRuntime::new();
         let checkpoint = runtime
             .revision_history()
@@ -1500,6 +1556,12 @@ mod tests {
             result.set_runtime_revision(1);
             super::encode_checkpoint(result.reborrow().init_checkpoint(), &checkpoint).unwrap();
             result.set_error("");
+            super::super::checkpoint_codec::encode_effect_record(
+                result.reborrow().init_effect_journal(1).get(0),
+                expected_effect.execution_id,
+                &expected_effect.entry,
+            )
+            .unwrap();
             let mut events = result.init_turn_events(4);
             let mut call = events.reborrow().get(0);
             call.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::Call);
@@ -1569,15 +1631,23 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(decoded.effect_journal, vec![expected_effect]);
     }
 
     #[test]
     fn runner_turn_error_keeps_partial_lifecycle() {
+        let expected_effect = effect_record();
         let mut message = capnp::message::Builder::new_default();
         {
             let mut result =
                 message.init_root::<super::finch_ipc_capnp::brain_turn_result::Builder>();
             result.set_error("provider failed after approval");
+            super::super::checkpoint_codec::encode_effect_record(
+                result.reborrow().init_effect_journal(1).get(0),
+                expected_effect.execution_id,
+                &expected_effect.entry,
+            )
+            .unwrap();
             let mut events = result.init_turn_events(1);
             let mut decision = events.reborrow().get(0);
             decision.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
@@ -1601,6 +1671,30 @@ mod tests {
                 decision: serde_json::json!({"choice": "deny"}),
             }]
         );
+        assert_eq!(error.effect_journal, vec![expected_effect]);
+    }
+
+    #[test]
+    fn runner_program_error_keeps_execute_once_effects() {
+        let expected_effect = effect_record();
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut result =
+                message.init_root::<super::finch_ipc_capnp::brain_program_result::Builder>();
+            result.set_error("program failed after emit");
+            super::super::checkpoint_codec::encode_effect_record(
+                result.reborrow().init_effect_journal(1).get(0),
+                expected_effect.execution_id,
+                &expected_effect.entry,
+            )
+            .unwrap();
+        }
+        let reader = message
+            .get_root_as_reader::<super::finch_ipc_capnp::brain_program_result::Reader>()
+            .unwrap();
+        let error = decode_runner_program_result(Ok(reader)).unwrap_err();
+        assert_eq!(error.message, "program failed after emit");
+        assert_eq!(error.effect_journal, vec![expected_effect]);
     }
 
     #[tokio::test]

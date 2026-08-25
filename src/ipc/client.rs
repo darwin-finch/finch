@@ -567,6 +567,16 @@ impl brain_runner::Server for BrainRunnerImpl {
                 .await
                 .map_err(|_| capnp::Error::failed("frontend dropped runner response".into()))?;
             let mut result = results.get().init_result();
+            let effect_journal = match &response {
+                Ok(response) => &response.effect_journal,
+                Err(error) => &error.effect_journal,
+            };
+            encode_runner_effect_records(
+                result
+                    .reborrow()
+                    .init_effect_journal(effect_journal.len() as u32),
+                effect_journal,
+            )?;
             match response {
                 Ok(response) => {
                     result.set_output(&response.output);
@@ -575,7 +585,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                         .map_err(|error| capnp::Error::failed(error.to_string()))?;
                     result.set_error("");
                 }
-                Err(error) => result.set_error(&error),
+                Err(error) => result.set_error(&error.message),
             }
             Ok(())
         })
@@ -676,6 +686,16 @@ impl brain_runner::Server for BrainRunnerImpl {
                 Err(error) => &error.turn_events,
             };
             encode_brain_turn_events(result.reborrow(), turn_events)?;
+            let effect_journal = match &response {
+                Ok(response) => &response.effect_journal,
+                Err(error) => &error.effect_journal,
+            };
+            encode_runner_effect_records(
+                result
+                    .reborrow()
+                    .init_effect_journal(effect_journal.len() as u32),
+                effect_journal,
+            )?;
             match response {
                 Ok(response) => {
                     result.set_source(&response.source);
@@ -755,6 +775,21 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(())
         })
     }
+}
+
+fn encode_runner_effect_records(
+    mut encoded: capnp::struct_list::Builder<'_, finch_ipc_capnp::brain_effect_record::Owned>,
+    records: &[crate::server::RunnerEffectRecord],
+) -> capnp::Result<()> {
+    for (index, record) in records.iter().enumerate() {
+        crate::ipc::checkpoint_codec::encode_effect_record(
+            encoded.reborrow().get(index as u32),
+            record.execution_id,
+            &record.entry,
+        )
+        .map_err(|error| capnp::Error::failed(error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn encode_brain_turn_events(

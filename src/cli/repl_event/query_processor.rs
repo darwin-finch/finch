@@ -70,6 +70,7 @@ async fn execute_direct_wire_response(
     output_manager: Arc<OutputManager>,
     work_unit: Arc<crate::cli::messages::WorkUnit>,
     event_tx: mpsc::UnboundedSender<ReplEvent>,
+    cancel: tokio_util::sync::CancellationToken,
     source: String,
 ) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
     let submission = direct_wire_submission(runtime, source)?;
@@ -87,7 +88,20 @@ async fn execute_direct_wire_response(
     let outcome = runtime
         .submit_with_deferred_program_effects(submission, sink)
         .await?;
-    resume_interactive_boundaries(runtime, event_tx, outcome).await
+    let execution_id = outcome.execution_id;
+    let mut resumed = Box::pin(resume_interactive_boundaries(runtime, event_tx, outcome));
+    tokio::select! {
+        biased;
+        result = &mut resumed => result,
+        _ = cancel.cancelled() => {
+            match runtime.cancel_typed_execution_with_outcome(execution_id)? {
+                Some(cancelled) => Ok(cancelled),
+                // Completion crossed the runtime boundary before cancellation
+                // acquired the retained continuation. Preserve that result.
+                None => resumed.await,
+            }
+        }
+    }
 }
 
 /// Drive only application-owned interactive boundaries. Cooperative yields
@@ -217,6 +231,21 @@ fn vm_manifest_query(messages: &[crate::claude::Message], query: &str) -> String
 struct WireExecution {
     source_for_history: String,
     response: String,
+    effect_journal: Vec<crate::server::RunnerEffectRecord>,
+}
+
+pub(super) fn runner_effect_records(
+    outcome: &crate::runtime::outcome::ExecutionOutcome,
+) -> Vec<crate::server::RunnerEffectRecord> {
+    outcome
+        .effect_journal
+        .iter()
+        .cloned()
+        .map(|entry| crate::server::RunnerEffectRecord {
+            execution_id: outcome.execution_id,
+            entry,
+        })
+        .collect()
 }
 
 fn record_wire_metric(
@@ -238,6 +267,7 @@ async fn execute_wire_with_single_repair(
     runtime: &crate::runtime::ProgramRuntime,
     output_manager: Arc<OutputManager>,
     event_tx: mpsc::UnboundedSender<ReplEvent>,
+    cancel: tokio_util::sync::CancellationToken,
     generator: Arc<dyn Generator>,
     messages: &[crate::claude::Message],
     source: String,
@@ -263,10 +293,12 @@ async fn execute_wire_with_single_repair(
         Arc::clone(&output_manager),
         Arc::clone(&output_unit),
         event_tx.clone(),
+        cancel.clone(),
         source.clone(),
     )
     .await;
 
+    let mut effect_journal = Vec::new();
     let (diagnostic, repairable) = match initial {
         Ok(outcome) if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {
             if outcome.output.is_empty() {
@@ -278,12 +310,15 @@ async fn execute_wire_with_single_repair(
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
                 output_unit: Arc::clone(&output_unit),
             });
+            let effect_journal = runner_effect_records(&outcome);
             return WireExecution {
                 source_for_history: source,
                 response: outcome.output,
+                effect_journal,
             };
         }
         Ok(outcome) => {
+            effect_journal.extend(runner_effect_records(&outcome));
             let detail = outcome
                 .diagnostics
                 .first()
@@ -311,6 +346,7 @@ async fn execute_wire_with_single_repair(
         return WireExecution {
             source_for_history: source,
             response: diagnostic,
+            effect_journal,
         };
     }
     metric.repair_attempted = true;
@@ -332,6 +368,7 @@ async fn execute_wire_with_single_repair(
         return WireExecution {
             source_for_history: source,
             response: diagnostic,
+            effect_journal,
         };
     };
     if !repair.tool_uses.is_empty() || repair.text.trim().is_empty() {
@@ -341,6 +378,7 @@ async fn execute_wire_with_single_repair(
         return WireExecution {
             source_for_history: source,
             response: diagnostic,
+            effect_journal,
         };
     }
     output_unit.set_complete();
@@ -368,11 +406,13 @@ async fn execute_wire_with_single_repair(
         output_manager,
         Arc::clone(&repair_output_unit),
         event_tx.clone(),
+        cancel,
         repaired_source.clone(),
     )
     .await
     {
         Ok(outcome) if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {
+            effect_journal.extend(runner_effect_records(&outcome));
             metric.repaired_successfully = !outcome.output.is_empty();
             metric.terminal_failure = outcome.output.is_empty();
             if outcome.output.is_empty() {
@@ -386,9 +426,11 @@ async fn execute_wire_with_single_repair(
             WireExecution {
                 source_for_history: repaired_source,
                 response: outcome.output,
+                effect_journal,
             }
         }
         Ok(outcome) => {
+            effect_journal.extend(runner_effect_records(&outcome));
             let detail = outcome
                 .diagnostics
                 .first()
@@ -403,6 +445,7 @@ async fn execute_wire_with_single_repair(
             WireExecution {
                 source_for_history: repaired_source,
                 response: detail,
+                effect_journal,
             }
         }
         Err(error) => {
@@ -416,6 +459,7 @@ async fn execute_wire_with_single_repair(
             WireExecution {
                 source_for_history: repaired_source,
                 response: detail,
+                effect_journal,
             }
         }
     }
@@ -1075,10 +1119,16 @@ pub(crate) async fn process_query_with_tools(
                 source_unit.set_program_source(wire_language.as_str());
                 source_unit.set_response(wire_source.clone());
                 source_unit.set_complete();
+                let cancel = query_states
+                    .get_metadata(query_id)
+                    .await
+                    .map(|metadata| metadata.cancellation_token)
+                    .unwrap_or_default();
                 let wire_execution = execute_wire_with_single_repair(
                     program_runtime.as_ref(),
                     Arc::clone(&output_manager),
                     event_tx.clone(),
+                    cancel,
                     Arc::clone(&generator),
                     &messages,
                     wire_source.clone(),
@@ -1087,6 +1137,7 @@ pub(crate) async fn process_query_with_tools(
                 .await;
                 let response = wire_execution.response;
                 let source_for_history = wire_execution.source_for_history;
+                let effect_journal = wire_execution.effect_journal;
                 conversation
                     .write()
                     .await
@@ -1099,6 +1150,10 @@ pub(crate) async fn process_query_with_tools(
                         },
                     )
                     .await;
+                let _ = event_tx.send(ReplEvent::VmEffectJournalComplete {
+                    query_id,
+                    records: effect_journal,
+                });
                 let _ = event_tx.send(ReplEvent::StreamingComplete {
                     query_id,
                     full_response: response,
@@ -1231,10 +1286,16 @@ pub(crate) async fn process_query_with_tools(
             source_unit.set_program_source(wire_language.as_str());
             source_unit.set_response(wire_source.clone());
             source_unit.set_complete();
+            let cancel = query_states
+                .get_metadata(query_id)
+                .await
+                .map(|metadata| metadata.cancellation_token)
+                .unwrap_or_default();
             let wire_execution = execute_wire_with_single_repair(
                 program_runtime.as_ref(),
                 Arc::clone(&output_manager),
                 event_tx.clone(),
+                cancel,
                 Arc::clone(&generator),
                 &messages,
                 wire_source.clone(),
@@ -1242,6 +1303,7 @@ pub(crate) async fn process_query_with_tools(
             )
             .await;
             let rendered_response = wire_execution.response;
+            let effect_journal = wire_execution.effect_journal;
             conversation
                 .write()
                 .await
@@ -1254,6 +1316,10 @@ pub(crate) async fn process_query_with_tools(
                     },
                 )
                 .await;
+            let _ = event_tx.send(ReplEvent::VmEffectJournalComplete {
+                query_id,
+                records: effect_journal,
+            });
             let _ = event_tx.send(ReplEvent::StreamingComplete {
                 query_id,
                 full_response: rendered_response,
@@ -1725,6 +1791,7 @@ mod tests {
             Arc::clone(&output),
             Arc::clone(&work_unit),
             event_tx.clone(),
+            tokio_util::sync::CancellationToken::new(),
             "(begin (say \"one\") (yield) (say \"two\") (yield) (say \"three\"))".to_string(),
         )
         .await
@@ -1765,6 +1832,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_wire_keeps_the_execute_once_effect_prefix() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let work_unit = output.start_work_unit("VM output");
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let outcome = execute_direct_wire_response(
+            &runtime,
+            output,
+            work_unit,
+            event_tx,
+            cancel,
+            "(begin (say \"before\") (yield) (say \"after\"))".to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Cancelled
+        );
+        assert_eq!(outcome.output, "before");
+        assert_eq!(outcome.effect_journal.len(), 1);
+        assert!(matches!(
+            outcome.effect_journal[0].state,
+            crate::vm::EffectJournalState::Acknowledged { .. }
+        ));
+        assert!(runtime
+            .pending_typed_execution(outcome.execution_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn interactive_wire_approval_resumes_the_exact_saved_program() {
         let runtime = crate::runtime::ProgramRuntime::new();
         let output = Arc::new(OutputManager::default());
@@ -1776,6 +1880,7 @@ mod tests {
             Arc::clone(&output),
             work_unit,
             event_tx,
+            tokio_util::sync::CancellationToken::new(),
             "(file-read (path \"Cargo.toml\"))".to_string(),
         );
         tokio::pin!(execution);
@@ -1862,6 +1967,7 @@ mod tests {
             &runtime,
             Arc::clone(&output),
             event_tx,
+            tokio_util::sync::CancellationToken::new(),
             generator.clone(),
             &[crate::claude::Message::user("reply")],
             source.clone(),

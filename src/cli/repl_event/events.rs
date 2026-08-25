@@ -106,6 +106,14 @@ pub enum ReplEvent {
         output_unit: Arc<WorkUnit>,
     },
 
+    /// Execute-once VM effects observed while running one provider response.
+    /// Named-Brain turns retain these separately from their reducible runtime
+    /// checkpoint so restoration cannot imply that an effect should replay.
+    VmEffectJournalComplete {
+        query_id: Uuid,
+        records: Vec<crate::server::RunnerEffectRecord>,
+    },
+
     /// An explicitly entered typed program finished on a background worker.
     /// Its output unit already exists in the shadow buffer; the event loop
     /// owns final status/error projection and the corresponding redraw.

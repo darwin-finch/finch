@@ -14,9 +14,14 @@ use crate::vm::effects::{
     FileSelectorTemplatePart, McpSelectorTemplate, NetworkSelectorTemplate,
     ProcessSelectorTemplate, ProgramSelectorTemplate, ResourceRoot, ResourceSelector,
 };
-use crate::vm::interpreter::{UiOperation, VmContinuation, VmFrame};
+use crate::vm::interpreter::{
+    HostSideEffect, UiOperation, UiProgress, VmContinuation, VmFrame, VmSideEffect,
+};
 use crate::vm::ir::{BasicBlock, Function, Instruction, LocatedInstruction, Module};
-use crate::vm::runtime::{ProducerFiberRecord, ProducerFiberState, TypedRuntimeCheckpoint};
+use crate::vm::runtime::{
+    EffectJournalEntry, EffectJournalState, ProducerFiberRecord, ProducerFiberState,
+    TypedRuntimeCheckpoint,
+};
 use crate::vm::signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
 use crate::vm::types::{TaskKind, Type, TypedValue};
 use crate::vm::verifier::{VerifiedFunction, VerifiedModule};
@@ -2120,6 +2125,161 @@ fn decode_producer(
     })
 }
 
+pub(super) fn encode_vm_side_effect(
+    mut builder: wire::vm_side_effect::Builder<'_>,
+    value: &VmSideEffect,
+) -> Result<()> {
+    builder.set_protocol_version(value.protocol_version);
+    builder.set_sequence(value.sequence);
+    encode_requirement(builder.reborrow().init_requirement(), &value.requirement);
+    let mut event = builder.reborrow().init_event();
+    match &value.event {
+        HostSideEffect::Emit { text } => event.set_emit(text),
+        HostSideEffect::Request { arguments } => {
+            encode_value_list(event.init_request(arguments.len() as u32), arguments, 0)?;
+        }
+        HostSideEffect::Ui {
+            operation,
+            target,
+            text,
+            progress,
+        } => {
+            let mut ui = event.init_ui();
+            ui.set_operation(ui_to_wire(*operation));
+            ui.set_has_target(target.is_some());
+            if let Some(target) = target {
+                encode_value(ui.reborrow().init_target(), target, 0)?;
+            }
+            ui.set_has_text(text.is_some());
+            if let Some(text) = text {
+                ui.set_text(text);
+            }
+            ui.set_has_progress(progress.is_some());
+            if let Some(progress) = progress {
+                let mut encoded = ui.reborrow().init_progress();
+                encoded.set_completed(progress.completed);
+                encoded.set_has_total(progress.total.is_some());
+                if let Some(total) = progress.total {
+                    encoded.set_total(total);
+                }
+            }
+        }
+    }
+    encode_type_list(
+        builder.reborrow().init_output(value.output.len() as u32),
+        &value.output,
+        0,
+    )?;
+    encode_origin(builder.reborrow().init_origin(), &value.origin, 0)
+}
+
+pub(super) fn decode_vm_side_effect(
+    reader: wire::vm_side_effect::Reader<'_>,
+) -> Result<VmSideEffect> {
+    use wire::vm_host_side_effect::Which;
+    let event = match reader.get_event()?.which()? {
+        Which::Emit(text_value) => HostSideEffect::Emit {
+            text: text(text_value?)?,
+        },
+        Which::Request(arguments) => HostSideEffect::Request {
+            arguments: decode_value_list(arguments?, 0)?,
+        },
+        Which::Ui(ui) => {
+            let ui = ui?;
+            HostSideEffect::Ui {
+                operation: ui_from_wire(ui.get_operation()?),
+                target: ui
+                    .get_has_target()
+                    .then(|| decode_value(ui.get_target()?, 0))
+                    .transpose()?,
+                text: ui
+                    .get_has_text()
+                    .then(|| text(ui.get_text()?))
+                    .transpose()?,
+                progress: ui
+                    .get_has_progress()
+                    .then(|| {
+                        let progress = ui.get_progress()?;
+                        Ok::<UiProgress, anyhow::Error>(UiProgress {
+                            completed: progress.get_completed(),
+                            total: progress.get_has_total().then(|| progress.get_total()),
+                        })
+                    })
+                    .transpose()?,
+            }
+        }
+    };
+    Ok(VmSideEffect {
+        protocol_version: reader.get_protocol_version(),
+        sequence: reader.get_sequence(),
+        requirement: decode_requirement(reader.get_requirement()?)?,
+        event,
+        output: decode_type_list(reader.get_output()?, 0)?,
+        origin: decode_origin(reader.get_origin()?, 0)?,
+    })
+}
+
+pub(super) fn encode_effect_journal_state(
+    mut builder: wire::vm_effect_journal_state::Builder<'_>,
+    value: &EffectJournalState,
+) -> Result<()> {
+    match value {
+        EffectJournalState::Proposed => builder.set_proposed(()),
+        EffectJournalState::AwaitingApproval => builder.set_awaiting_approval(()),
+        EffectJournalState::AwaitingHostResult => builder.set_awaiting_host_result(()),
+        EffectJournalState::Acknowledged { values } => {
+            encode_value_list(builder.init_acknowledged(values.len() as u32), values, 0)?;
+        }
+        EffectJournalState::Denied => builder.set_denied(()),
+        EffectJournalState::Cancelled => builder.set_cancelled(()),
+        EffectJournalState::Failed { diagnostic } => {
+            encode_diagnostic(builder.init_failed(), diagnostic, 0)?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn decode_effect_journal_state(
+    reader: wire::vm_effect_journal_state::Reader<'_>,
+) -> Result<EffectJournalState> {
+    use wire::vm_effect_journal_state::Which;
+    Ok(match reader.which()? {
+        Which::Proposed(()) => EffectJournalState::Proposed,
+        Which::AwaitingApproval(()) => EffectJournalState::AwaitingApproval,
+        Which::AwaitingHostResult(()) => EffectJournalState::AwaitingHostResult,
+        Which::Acknowledged(values) => EffectJournalState::Acknowledged {
+            values: decode_value_list(values?, 0)?,
+        },
+        Which::Denied(()) => EffectJournalState::Denied,
+        Which::Cancelled(()) => EffectJournalState::Cancelled,
+        Which::Failed(diagnostic) => EffectJournalState::Failed {
+            diagnostic: decode_diagnostic(diagnostic?, 0)?,
+        },
+    })
+}
+
+pub(super) fn encode_effect_record(
+    mut builder: wire::brain_effect_record::Builder<'_>,
+    execution_id: uuid::Uuid,
+    entry: &EffectJournalEntry,
+) -> Result<()> {
+    builder.set_execution_id(&execution_id.to_string());
+    encode_vm_side_effect(builder.reborrow().init_effect(), &entry.effect)?;
+    encode_effect_journal_state(builder.reborrow().init_state(), &entry.state)
+}
+
+pub(super) fn decode_effect_record(
+    reader: wire::brain_effect_record::Reader<'_>,
+) -> Result<(uuid::Uuid, EffectJournalEntry)> {
+    Ok((
+        text(reader.get_execution_id()?)?.parse()?,
+        EffectJournalEntry {
+            effect: decode_vm_side_effect(reader.get_effect()?)?,
+            state: decode_effect_journal_state(reader.get_state()?)?,
+        },
+    ))
+}
+
 pub(super) fn encode_checkpoint(
     mut builder: wire::typed_runtime_checkpoint::Builder<'_>,
     value: &TypedRuntimeCheckpoint,
@@ -2217,6 +2377,24 @@ mod tests {
         decode_checkpoint_bytes(&encode_checkpoint_bytes(value)?)
     }
 
+    fn round_trip_effect_record(
+        execution_id: uuid::Uuid,
+        entry: &EffectJournalEntry,
+    ) -> Result<(uuid::Uuid, EffectJournalEntry)> {
+        let mut message = capnp::message::Builder::new_default();
+        encode_effect_record(
+            message.init_root::<wire::brain_effect_record::Builder<'_>>(),
+            execution_id,
+            entry,
+        )?;
+        let words = capnp::serialize::write_message_to_words(&message);
+        let reader = capnp::serialize::read_message_from_flat_slice(
+            &mut words.as_slice(),
+            capnp::message::ReaderOptions::new(),
+        )?;
+        decode_effect_record(reader.get_root::<wire::brain_effect_record::Reader<'_>>()?)
+    }
+
     fn round_trip_type(value: &Type) -> Result<Type> {
         let mut message = capnp::message::Builder::new_default();
         encode_type(
@@ -2268,6 +2446,76 @@ mod tests {
             control: ControlEffect::MaySuspend,
             suspension: Some(SuspensionSignature::one_way(Type::String)),
         }
+    }
+
+    #[test]
+    fn execute_once_effect_records_round_trip_without_json() -> Result<()> {
+        let execution_id = uuid::Uuid::new_v4();
+        let effects = vec![
+            EffectJournalEntry {
+                effect: VmSideEffect {
+                    protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                    sequence: 1,
+                    requirement: CapabilityRequirement {
+                        capability: CapabilityKind::SessionEmit,
+                        selector: ResourceSelector::None,
+                    },
+                    event: HostSideEffect::Emit {
+                        text: "hello".into(),
+                    },
+                    output: Vec::new(),
+                    origin: SourceOrigin::generated("say"),
+                },
+                state: EffectJournalState::Acknowledged { values: Vec::new() },
+            },
+            EffectJournalEntry {
+                effect: VmSideEffect {
+                    protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                    sequence: 2,
+                    requirement: sample_requirement(),
+                    event: HostSideEffect::Request {
+                        arguments: vec![TypedValue::String("src/lib.rs".into())],
+                    },
+                    output: vec![Type::Bytes],
+                    origin: SourceOrigin::generated("file-read"),
+                },
+                state: EffectJournalState::AwaitingHostResult,
+            },
+            EffectJournalEntry {
+                effect: VmSideEffect {
+                    protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                    sequence: 3,
+                    requirement: CapabilityRequirement {
+                        capability: CapabilityKind::SessionEmit,
+                        selector: ResourceSelector::None,
+                    },
+                    event: HostSideEffect::Ui {
+                        operation: UiOperation::Progress,
+                        target: Some(TypedValue::Resource {
+                            kind: "output-handle".into(),
+                            handle: "h1".into(),
+                            generation: 4,
+                        }),
+                        text: Some("working".into()),
+                        progress: Some(UiProgress {
+                            completed: 2,
+                            total: Some(5),
+                        }),
+                    },
+                    output: Vec::new(),
+                    origin: SourceOrigin::generated("output-progress"),
+                },
+                state: EffectJournalState::Cancelled,
+            },
+        ];
+
+        for effect in effects {
+            assert_eq!(
+                round_trip_effect_record(execution_id, &effect)?,
+                (execution_id, effect)
+            );
+        }
+        Ok(())
     }
 
     #[test]

@@ -745,6 +745,57 @@ struct ProducerFiberState {
   }
 }
 
+struct VmUiProgress {
+  completed @0 :UInt64;
+  hasTotal @1 :Bool;
+  total @2 :UInt64;
+}
+
+struct VmUiSideEffect {
+  operation @0 :UiOperation;
+  hasTarget @1 :Bool;
+  target @2 :TypedValue;
+  hasText @3 :Bool;
+  text @4 :Text;
+  hasProgress @5 :Bool;
+  progress @6 :VmUiProgress;
+}
+
+struct VmHostSideEffect {
+  union {
+    emit @0 :Text;
+    ui @1 :VmUiSideEffect;
+    request @2 :List(TypedValue);
+  }
+}
+
+struct VmSideEffect {
+  protocolVersion @0 :UInt32;
+  sequence @1 :UInt64;
+  requirement @2 :CapabilityRequirement;
+  event @3 :VmHostSideEffect;
+  output @4 :List(TypedType);
+  origin @5 :SourceOrigin;
+}
+
+struct VmEffectJournalState {
+  union {
+    proposed @0 :Void;
+    awaitingApproval @1 :Void;
+    awaitingHostResult @2 :Void;
+    acknowledged @3 :List(TypedValue);
+    denied @4 :Void;
+    cancelled @5 :Void;
+    failed @6 :VmDiagnostic;
+  }
+}
+
+struct BrainEffectRecord {
+  executionId @0 :Text;
+  effect @1 :VmSideEffect;
+  state @2 :VmEffectJournalState;
+}
+
 struct BrainProgramRequest {
   brain      @0 :Text;
   requestSeq @1 :UInt64;
@@ -758,6 +809,7 @@ struct BrainProgramResult {
   runtimeRevision @1 :UInt64;
   checkpoint      @2 :TypedRuntimeCheckpoint;
   error           @3 :Text;
+  effectJournal   @4 :List(BrainEffectRecord);
 }
 
 struct BrainTurnRequest {
@@ -794,6 +846,7 @@ struct BrainTurnResult {
   checkpoint      @4 :TypedRuntimeCheckpoint;
   error           @5 :Text;
   turnEvents      @6 :List(BrainTurnEvent);
+  effectJournal   @7 :List(BrainEffectRecord);
 }
 
 enum BrainTurnEventKind {
@@ -931,6 +984,13 @@ struct BrainRuntimeCommitted {
   checkpointSha256 @2 :Text;
 }
 
+struct BrainEffectRecorded {
+  requestSeq @0 :UInt64;
+  executionId @1 :Text;
+  effect @2 :VmSideEffect;
+  state @3 :VmEffectJournalState;
+}
+
 struct BrainClientAttached {
   attachmentId @0 :Text;
   connectionId @1 :Text;
@@ -1010,6 +1070,7 @@ struct BrainEvent {
     runnerHandoffCompleted @22 :BrainRunnerHandoffCompleted;
     runnerHandoffCancelled @23 :Text;
     participantMessage     @24 :Text;
+    effectRecorded         @25 :BrainEffectRecorded;
   }
 }
 

@@ -527,6 +527,12 @@ struct PendingNamedBrainTurn {
     /// Exact lifecycle order observed by this frontend while servicing the
     /// delegated turn. The daemon persists these as canonical Brain events.
     turn_events: Vec<crate::server::RunnerTurnEvent>,
+    /// Execute-once VM effects are returned independently of the reducible
+    /// checkpoint, including when the provider program ultimately fails.
+    effect_journal: Vec<crate::server::RunnerEffectRecord>,
+    /// Keep the correlation record until cancellation reaches a terminal VM
+    /// boundary and all execute-once effects have been collected.
+    cancellation_requested: bool,
     approval_audience: crate::brain::shared::BrainApprovalAudience,
     approval_tx: Option<
         tokio::sync::mpsc::UnboundedSender<crate::server::RunnerApprovalRequest>,
@@ -622,6 +628,19 @@ fn deferred_vm_approval_from_tool_result(
     Some(DeferredVmApproval {
         prompt: outcome.approval_prompts.into_iter().next()?,
     })
+}
+
+fn runner_effect_records_from_tool_result(
+    result: &anyhow::Result<String>,
+) -> Vec<crate::server::RunnerEffectRecord> {
+    result
+        .as_ref()
+        .ok()
+        .and_then(|output| {
+            serde_json::from_str::<crate::runtime::outcome::ExecutionOutcome>(output).ok()
+        })
+        .map(|outcome| super::query_processor::runner_effect_records(&outcome))
+        .unwrap_or_default()
 }
 
 fn deferred_proposal_from_tool_result(
@@ -745,6 +764,13 @@ mod deferred_proposal_tests {
         assert_eq!(proposal.language, "python");
         assert_eq!(proposal.intent, "inspect artifact");
         assert_eq!(proposal.source, "print('ok')");
+        let records =
+            runner_effect_records_from_tool_result(&Ok(serde_json::to_string(&outcome).unwrap()));
+        assert_eq!(records.len(), outcome.effect_journal.len());
+        assert!(records.iter().all(|record| {
+            record.execution_id == outcome.execution_id
+                && outcome.effect_journal.contains(&record.entry)
+        }));
     }
 
     #[tokio::test]
@@ -1311,6 +1337,9 @@ impl EventLoop {
                         ReplEvent::OutputReady { .. } => "OutputReady",
                         ReplEvent::VmEffect { .. } => "VmEffect",
                         ReplEvent::VmOutputComplete { .. } => "VmOutputComplete",
+                        ReplEvent::VmEffectJournalComplete { .. } => {
+                            "VmEffectJournalComplete"
+                        }
                         ReplEvent::TypedProgramComplete { .. } => "TypedProgramComplete",
                         ReplEvent::UserInput { .. } => "UserInput",
                         ReplEvent::StatsUpdate { .. } => "StatsUpdate",
@@ -2953,6 +2982,7 @@ Rules:\n\
                     let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
                         message: error.clone(),
                         turn_events: pending.turn_events,
+                        effect_journal: pending.effect_journal,
                     }));
                 }
 
@@ -3077,6 +3107,12 @@ Rules:\n\
             ReplEvent::VmOutputComplete { output_unit } => {
                 output_unit.set_complete();
                 self.render_tui().await?;
+            }
+
+            ReplEvent::VmEffectJournalComplete { query_id, records } => {
+                if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
+                    turn.effect_journal.extend(records);
+                }
             }
 
             ReplEvent::TypedProgramComplete {
@@ -3238,16 +3274,18 @@ Rules:\n\
                     // Fire the per-query cancellation token so handle_present_plan
                     // (and any other token-aware loops) can detect the cancel immediately.
                     self.query_states.cancel_query(qid).await;
+                    let named_turn = if let Some(pending) =
+                        self.pending_named_brain_turns.get_mut(&qid)
+                    {
+                        pending.cancellation_requested = true;
+                        true
+                    } else {
+                        false
+                    };
 
-                    // Clear active query
-                    *self.active_query_id.write().await = None;
-                    // Clear tool-call history for cancelled query
-                    self.tool_call_history.write().await.remove(&qid);
-                    if let Some(pending) = self.pending_named_brain_turns.remove(&qid) {
-                        let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
-                            message: "named Brain turn cancelled by runner user".into(),
-                            turn_events: pending.turn_events,
-                        }));
+                    if !named_turn {
+                        *self.active_query_id.write().await = None;
+                        self.tool_call_history.write().await.remove(&qid);
                     }
 
                     // If we were in plan/executing mode, cancel that too so the
@@ -3261,11 +3299,14 @@ Rules:\n\
                     }
 
                     // Show cancellation message
-                    self.output_manager
-                        .write_info("⚠️  Query cancelled by user (Ctrl+C)");
+                    self.output_manager.write_info(if named_turn {
+                        "⚠️  Cancellation requested; waiting for the named Brain turn to reach a safe boundary"
+                    } else {
+                        "⚠️  Query cancelled by user (Ctrl+C)"
+                    });
                     self.render_tui().await?;
 
-                    tracing::info!("Query {} cancelled by user", qid);
+                    tracing::info!("Query {} cancellation requested by user", qid);
                 } else {
                     // No active query — Ctrl+C when idle:
                     //   • in plan/executing mode → exit that mode, stay in finch
@@ -3461,7 +3502,8 @@ Rules:\n\
             let _ = request.response_tx.send(Err(format!(
                 "frontend does not hold the runner lease for named Brain '{}'",
                 request.brain
-            )));
+            )
+            .into()));
             return;
         }
         let runtime = Arc::clone(&self.program_runtime);
@@ -3494,42 +3536,72 @@ Rules:\n\
                 budget: None,
             };
             let execution = async {
-                let outcome = runtime.submit_typed_only(submission).await?;
-                let outcome = super::query_processor::resume_interactive_boundaries(
+                let outcome = runtime
+                    .submit_typed_only(submission)
+                    .await
+                    .map_err(|error| crate::server::RunnerProgramError::from(error.to_string()))?;
+                let execution_id = outcome.execution_id;
+                let mut resumed = Box::pin(super::query_processor::resume_interactive_boundaries(
                     runtime.as_ref(),
                     event_tx.clone(),
                     outcome,
-                )
-                .await?;
+                ));
+                let outcome = tokio::select! {
+                    biased;
+                    result = &mut resumed => result.map_err(|error| {
+                        crate::server::RunnerProgramError::from(error.to_string())
+                    })?,
+                    _ = cancel.cancelled() => {
+                        match runtime
+                            .cancel_typed_execution_with_outcome(execution_id)
+                            .map_err(|error| crate::server::RunnerProgramError::from(error.to_string()))?
+                        {
+                            Some(cancelled) => {
+                                return Err(crate::server::RunnerProgramError {
+                                    message: "named Brain run cancelled".into(),
+                                    effect_journal: super::query_processor::runner_effect_records(
+                                        &cancelled,
+                                    ),
+                                });
+                            }
+                            None => resumed.await.map_err(|error| {
+                                crate::server::RunnerProgramError::from(error.to_string())
+                            })?,
+                        }
+                    }
+                };
+                let effect_journal = super::query_processor::runner_effect_records(&outcome);
                 if outcome.status != crate::runtime::outcome::ExecutionStatus::Completed {
-                    anyhow::bail!(
-                        "named Brain ProgramRun ended as {:?}: {}",
-                        outcome.status,
-                        outcome.diagnostics.join("; ")
-                    );
+                    return Err(crate::server::RunnerProgramError {
+                        message: format!(
+                            "named Brain ProgramRun ended as {:?}: {}",
+                            outcome.status,
+                            outcome.diagnostics.join("; ")
+                        ),
+                        effect_journal,
+                    });
                 }
                 let checkpoint = runtime
-                    .revision_history()?
+                    .revision_history()
+                    .map_err(|error| crate::server::RunnerProgramError::from(error.to_string()))?
                     .into_iter()
                     .find(|snapshot| snapshot.revision == outcome.output_revision)
                     .and_then(|snapshot| snapshot.checkpoint)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
+                    .ok_or_else(|| crate::server::RunnerProgramError {
+                        message: format!(
                             "named Brain revision {} is not checkpointable",
                             outcome.output_revision
-                        )
+                        ),
+                        effect_journal: effect_journal.clone(),
                     })?;
                 Ok(crate::server::RunnerProgramResult {
                     output: outcome.output,
                     runtime_revision: outcome.output_revision,
                     checkpoint,
+                    effect_journal,
                 })
             };
-            let result = tokio::select! {
-                _ = cancel.cancelled() => Err(anyhow::anyhow!("named Brain run cancelled")),
-                result = execution => result,
-            }
-            .map_err(|error: anyhow::Error| error.to_string());
+            let result = execution.await;
             let _ = request.response_tx.send(result);
             let _ = event_tx.send(ReplEvent::NamedBrainProgramFinished(run_id));
         });
@@ -3548,6 +3620,7 @@ Rules:\n\
                     request.brain
                 ),
                 turn_events: Vec::new(),
+                effect_journal: Vec::new(),
             }));
             return Ok(());
         }
@@ -3558,6 +3631,7 @@ Rules:\n\
                     request.brain
                 ),
                 turn_events: Vec::new(),
+                effect_journal: Vec::new(),
             }));
             return Ok(());
         }
@@ -3578,6 +3652,8 @@ Rules:\n\
                 run_id: request.run_id,
                 response_tx: request.response_tx,
                 turn_events: Vec::new(),
+                effect_journal: Vec::new(),
+                cancellation_requested: false,
                 approval_audience: request.approval_audience,
                 approval_tx: request.approval_tx,
             },
@@ -3597,6 +3673,7 @@ Rules:\n\
                 let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
                     message: "frontend LLM worker is unavailable".to_string(),
                     turn_events: pending.turn_events,
+                    effect_journal: pending.effect_journal,
                 }));
             }
         }
@@ -3626,15 +3703,8 @@ Rules:\n\
             return;
         };
         self.query_states.cancel_query(query_id).await;
-        if *self.active_query_id.read().await == Some(query_id) {
-            *self.active_query_id.write().await = None;
-        }
-        self.tool_call_history.write().await.remove(&query_id);
-        if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
-            let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
-                message: "named Brain run cancelled".into(),
-                turn_events: pending.turn_events,
-            }));
+        if let Some(pending) = self.pending_named_brain_turns.get_mut(&query_id) {
+            pending.cancellation_requested = true;
         }
         let _ = request.response_tx.send(Ok(true));
     }
@@ -3646,8 +3716,18 @@ Rules:\n\
         let PendingNamedBrainTurn {
             response_tx,
             turn_events,
+            effect_journal,
+            cancellation_requested,
             ..
         } = pending;
+        if cancellation_requested {
+            let _ = response_tx.send(Err(crate::server::RunnerTurnError {
+                message: "named Brain run cancelled".into(),
+                turn_events,
+                effect_journal,
+            }));
+            return;
+        }
         let result = (|| -> anyhow::Result<crate::server::RunnerTurnResult> {
             let messages = self
                 .conversation
@@ -3688,11 +3768,13 @@ Rules:\n\
                 turn_events: turn_events.clone(),
                 runtime_revision,
                 checkpoint,
+                effect_journal: effect_journal.clone(),
             })
         })()
         .map_err(|error| crate::server::RunnerTurnError {
             message: error.to_string(),
             turn_events,
+            effect_journal,
         });
         if let Ok(result) = &result {
             let tool_ids = result
@@ -4743,7 +4825,7 @@ Rules:\n\
             // Internal durable VM state is intentionally not rendered as a
             // chat item. The adjacent Program/Result events are its visible
             // projection.
-            BrainEventKind::RuntimeCommitted { .. } => {}
+            BrainEventKind::RuntimeCommitted { .. } | BrainEventKind::EffectRecorded { .. } => {}
         }
     }
 
@@ -4826,6 +4908,8 @@ Rules:\n\
         };
 
         if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
+            turn.effect_journal
+                .extend(runner_effect_records_from_tool_result(&result));
             let (output, is_error) = match &result {
                 Ok(output) => (output.clone(), false),
                 Err(error) => (error.to_string(), true),

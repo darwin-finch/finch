@@ -19,8 +19,8 @@ pub use brain_service::{
 };
 pub use brain_runner::{
     BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerProgramRequest,
-    RunnerProgramResult, RunnerRegistrationId, RunnerRequest, RunnerTurnError, RunnerTurnEvent,
-    RunnerTurnRequest, RunnerTurnResult,
+    RunnerEffectRecord, RunnerProgramError, RunnerProgramResult, RunnerRegistrationId,
+    RunnerRequest, RunnerTurnError, RunnerTurnEvent, RunnerTurnRequest, RunnerTurnResult,
 };
 pub use feedback_handler::{handle_feedback, handle_training_status};
 pub use handlers::{

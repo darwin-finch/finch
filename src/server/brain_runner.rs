@@ -32,7 +32,7 @@ pub struct RunnerProgramRequest {
     pub request_seq: u64,
     pub language: ProgramLanguage,
     pub source: String,
-    pub response_tx: oneshot::Sender<Result<RunnerProgramResult, String>>,
+    pub response_tx: oneshot::Sender<Result<RunnerProgramResult, RunnerProgramError>>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +40,29 @@ pub struct RunnerProgramResult {
     pub output: String,
     pub runtime_revision: u64,
     pub checkpoint: crate::vm::TypedRuntimeCheckpoint,
+    pub effect_journal: Vec<RunnerEffectRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunnerEffectRecord {
+    pub execution_id: uuid::Uuid,
+    pub entry: crate::vm::EffectJournalEntry,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
+pub struct RunnerProgramError {
+    pub message: String,
+    pub effect_journal: Vec<RunnerEffectRecord>,
+}
+
+impl From<String> for RunnerProgramError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            effect_journal: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -70,6 +93,7 @@ pub struct RunnerTurnResult {
     pub turn_events: Vec<RunnerTurnEvent>,
     pub runtime_revision: u64,
     pub checkpoint: crate::vm::TypedRuntimeCheckpoint,
+    pub effect_journal: Vec<RunnerEffectRecord>,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -77,6 +101,7 @@ pub struct RunnerTurnResult {
 pub struct RunnerTurnError {
     pub message: String,
     pub turn_events: Vec<RunnerTurnEvent>,
+    pub effect_journal: Vec<RunnerEffectRecord>,
 }
 
 impl From<String> for RunnerTurnError {
@@ -84,6 +109,7 @@ impl From<String> for RunnerTurnError {
         Self {
             message,
             turn_events: Vec::new(),
+            effect_journal: Vec::new(),
         }
     }
 }
@@ -426,7 +452,7 @@ impl BrainRunnerBroker {
         response_rx
             .await
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
-            .map_err(anyhow::Error::msg)
+            .map_err(anyhow::Error::new)
     }
 
     pub async fn dispatch_turn(
@@ -615,6 +641,7 @@ mod tests {
                     output: "42".into(),
                     runtime_revision: 1,
                     checkpoint,
+                    effect_journal: Vec::new(),
                 }))
                 .unwrap();
         });
@@ -688,6 +715,7 @@ mod tests {
                     turn_events: Vec::new(),
                     runtime_revision: 1,
                     checkpoint,
+                    effect_journal: Vec::new(),
                 }))
                 .unwrap();
         });

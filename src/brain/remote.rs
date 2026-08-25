@@ -1648,6 +1648,7 @@ mod tests {
                     output: "handoff-live".into(),
                     runtime_revision: bootstrap.runtime_revision,
                     checkpoint: bootstrap.checkpoint,
+                    effect_journal: Vec::new(),
                 }))
                 .unwrap();
             submission.await.unwrap().unwrap();

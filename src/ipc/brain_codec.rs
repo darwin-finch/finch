@@ -1054,6 +1054,24 @@ pub(super) fn encode_event(
             committed.set_runtime_revision(*runtime_revision);
             committed.set_checkpoint_sha256(checkpoint_sha256);
         }
+        BrainEventKind::EffectRecorded {
+            request_seq,
+            execution_id,
+            effect,
+            state,
+        } => {
+            let mut recorded = builder.init_effect_recorded();
+            recorded.set_request_seq(*request_seq);
+            recorded.set_execution_id(&execution_id.to_string());
+            crate::ipc::checkpoint_codec::encode_vm_side_effect(
+                recorded.reborrow().init_effect(),
+                effect,
+            )?;
+            crate::ipc::checkpoint_codec::encode_effect_journal_state(
+                recorded.reborrow().init_state(),
+                state,
+            )?;
+        }
     }
     Ok(())
 }
@@ -1189,6 +1207,19 @@ pub(super) fn decode_event(
                 request_seq: committed.get_request_seq(),
                 runtime_revision: committed.get_runtime_revision(),
                 checkpoint_sha256: text(committed.get_checkpoint_sha256()?)?,
+            }
+        }
+        Which::EffectRecorded(recorded) => {
+            let recorded = recorded?;
+            BrainEventKind::EffectRecorded {
+                request_seq: recorded.get_request_seq(),
+                execution_id: parse_uuid(recorded.get_execution_id()?)?,
+                effect: crate::ipc::checkpoint_codec::decode_vm_side_effect(
+                    recorded.get_effect()?,
+                )?,
+                state: crate::ipc::checkpoint_codec::decode_effect_journal_state(
+                    recorded.get_state()?,
+                )?,
             }
         }
     };
@@ -1478,6 +1509,26 @@ mod tests {
                 source: "(say \"done\")".into(),
             },
             BrainEventKind::ProgramPopped { program_seq: 9 },
+            BrainEventKind::EffectRecorded {
+                request_seq: 5,
+                execution_id: uuid::Uuid::new_v4(),
+                effect: crate::vm::VmSideEffect {
+                    protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                    sequence: 2,
+                    requirement: crate::vm::CapabilityRequirement {
+                        capability: crate::vm::CapabilityKind::SessionEmit,
+                        selector: crate::vm::ResourceSelector::None,
+                    },
+                    event: crate::vm::HostSideEffect::Emit {
+                        text: "done".into(),
+                    },
+                    output: Vec::new(),
+                    origin: crate::vm::SourceOrigin::generated("say"),
+                },
+                state: crate::vm::EffectJournalState::Acknowledged {
+                    values: Vec::new(),
+                },
+            },
             BrainEventKind::Result {
                 request_seq: 5,
                 output: "done".into(),
