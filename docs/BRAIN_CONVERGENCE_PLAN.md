@@ -462,8 +462,12 @@ addressed handoff with scoped remote control authority, accepts it through local
 revokes that controller before its next command, replaces the registered callback, and proves a
 fresh ordinary driver sends the next ProgramRun only to the target runner.
 Frontend acceptance also verifies the local Unix-socket host, normalized hostname, and canonical
-workspace against the Brain environment. VM host effects already resume against an exact
-`(execution_id, sequence)` pair; Brain approval continuations are now keyed by exact
+workspace against the Brain environment. The frontend runner identity and its acquired lease are
+additionally confined to the Cap'n Proto
+connection that claimed them. Public snapshot knowledge of a lease ID cannot register, renew, or
+release its callback; disconnect removes the callback authority immediately while the durable lease
+expires normally. VM host effects already resume against an exact `(execution_id, sequence)` pair;
+Brain approval continuations are now keyed by exact
 `(brain_id, request_seq, approval_id)` identity so a stale sequence cannot consume a live request.
 Tool inputs and approval detail/decision values use the recursive schema-native `JsonValue` union
 rather than opaque JSON bytes. Canonical provider context crosses the runner callback as typed

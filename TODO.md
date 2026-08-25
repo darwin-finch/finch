@@ -884,7 +884,11 @@ still blocks the corresponding Brain phase until it is unified.
   correlated durable result. The transport-neutral submission gate now also rejects consultant
   prompts before they can append an event or create a run; consultants contribute relay-only
   `ParticipantMessage` context unless separately granted approval authority. Close the remaining
-  scope-specific hostile/replay cases before completing this least-privilege milestone.
+  scope-specific hostile/replay cases before completing this least-privilege milestone. Local
+  runner identities are now first-claim bound to one Cap'n Proto connection; acquisition, renewal,
+  handoff acceptance, release, and callback registration require that connection's lease authority,
+  and disconnect atomically removes its callback. A live two-connection test proves a client that
+  merely learns the public lease ID cannot claim, renew, register, or release it.
 - [ ] Revisit shared channels only after the Brain event log, runner lease, and participant-role
   model are complete. The eventual channel should be a threaded/multi-participant projection of a
   Brain: people and models share one durable conversation, while programs run only on the remote
