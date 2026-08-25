@@ -367,6 +367,22 @@ impl BrainLifecycleService {
         )
     }
 
+    pub fn cancel_schedule_with_receipt(
+        &self,
+        brain: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        schedule_id: ScheduleId,
+        receipt: Option<crate::brain::store::BrainMutationReceipt>,
+    ) -> Result<bool> {
+        let attachment = self.connection(brain, attachment_id, connection_id)?;
+        ensure!(attachment.role == AttachmentRole::Driver,
+            "only a Brain driver can cancel a schedule");
+        self.store.cancel_schedule_with_receipt(
+            brain, &attachment.subject, attachment.attachment_id, schedule_id, receipt,
+        )
+    }
+
     pub fn attach(
         &self,
         brain: &str,
@@ -643,11 +659,29 @@ impl BrainLifecycleService {
         connection_id: ConnectionId,
         run_id: RunId,
     ) -> Result<BrainRun> {
+        self.cancel_run_with_receipt(
+            brain, attachment_id, connection_id, run_id, None,
+        ).await
+    }
+
+    pub async fn cancel_run_with_receipt(
+        &self,
+        brain: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        run_id: RunId,
+        receipt: Option<crate::brain::store::BrainMutationReceipt>,
+    ) -> Result<BrainRun> {
         let attachment = self.connection(brain, attachment_id, connection_id)?;
         ensure!(
             attachment.role == AttachmentRole::Driver,
             "only a Brain driver can cancel a run"
         );
+        if let Some(receipt) = receipt.as_ref() {
+            if self.store.replay_mutation(brain, receipt)?.is_some() {
+                return self.inspect_run(brain, run_id);
+            }
+        }
         let run = self.inspect_run(brain, run_id)?;
         ensure!(
             run.initiating_attachment_id == attachment_id,
@@ -686,13 +720,16 @@ impl BrainLifecycleService {
             }
         }
         let publication = self.store.acquire_run_publication(brain, run_id).await?;
-        let transitioned = match self.store.transition_run(
-            brain,
-            &attachment.subject,
-            run_id,
-            BrainRunStatus::Cancelled,
-            Some("cancelled by initiating driver".into()),
-        ) {
+        let transition = match receipt {
+            Some(receipt) => self.store.cancel_run_with_receipt(
+                brain, &attachment.subject, attachment_id, run_id, receipt,
+            ),
+            None => self.store.transition_run(
+                brain, &attachment.subject, run_id, BrainRunStatus::Cancelled,
+                Some("cancelled by initiating driver".into()),
+            ),
+        };
+        let transitioned = match transition {
             Ok(run) => Ok(run),
             Err(error) => {
                 let current = self.inspect_run(brain, run_id)?;
@@ -868,6 +905,20 @@ impl BrainLifecycleService {
     ) -> Result<()> {
         self.store
             .cancel_runner_handoff(brain, handoff_id, sender)?;
+        self.store.remove_if_unused(brain)?;
+        Ok(())
+    }
+
+    pub fn cancel_runner_handoff_with_receipt(
+        &self,
+        brain: &str,
+        handoff_id: RunnerHandoffId,
+        sender: &str,
+        receipt: Option<crate::brain::store::BrainMutationReceipt>,
+    ) -> Result<()> {
+        self.store.cancel_runner_handoff_with_receipt(
+            brain, handoff_id, sender, receipt,
+        )?;
         self.store.remove_if_unused(brain)?;
         Ok(())
     }

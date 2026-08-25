@@ -1113,6 +1113,29 @@ impl RemoteBrainClient {
         }
     }
 
+    pub async fn prepare_cancel_runner_handoff_mutation(
+        &self,
+        handoff_id: super::store::RunnerHandoffId,
+    ) -> Result<BrainMutationHandle> {
+        self.prepare_mutation(
+            &crate::ipc::brain_codec::BrainRemoteCommandKind::CancelRunnerHandoff(handoff_id),
+        ).await
+    }
+
+    pub async fn cancel_runner_handoff_with_handle(
+        &self,
+        handoff_id: super::store::RunnerHandoffId,
+        handle: &BrainMutationHandle,
+    ) -> Result<()> {
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+        match self.send_remote_command_with_handle(
+            BrainRemoteCommandKind::CancelRunnerHandoff(handoff_id), Some(handle),
+        ).await? {
+            BrainRemoteReply::HandoffCancelled { .. } => Ok(()),
+            reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
+        }
+    }
+
     pub async fn cancel_run(
         &self,
         run_id: super::store::RunId,
@@ -1123,6 +1146,29 @@ impl RemoteBrainClient {
             .send_remote_command(BrainRemoteCommandKind::CancelRun(run_id))
             .await?
         {
+            BrainRemoteReply::RunCancelled { run, .. } => Ok(run),
+            reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
+        }
+    }
+
+    pub async fn prepare_cancel_run_mutation(
+        &self,
+        run_id: super::store::RunId,
+    ) -> Result<BrainMutationHandle> {
+        self.prepare_mutation(
+            &crate::ipc::brain_codec::BrainRemoteCommandKind::CancelRun(run_id),
+        ).await
+    }
+
+    pub async fn cancel_run_with_handle(
+        &self,
+        run_id: super::store::RunId,
+        handle: &BrainMutationHandle,
+    ) -> Result<super::store::BrainRun> {
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+        match self.send_remote_command_with_handle(
+            BrainRemoteCommandKind::CancelRun(run_id), Some(handle),
+        ).await? {
             BrainRemoteReply::RunCancelled { run, .. } => Ok(run),
             reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
         }
@@ -1166,6 +1212,29 @@ impl RemoteBrainClient {
             .send_remote_command(BrainRemoteCommandKind::CancelSchedule(schedule_id))
             .await?
         {
+            BrainRemoteReply::ScheduleCancelled { cancelled, .. } => Ok(cancelled),
+            reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
+        }
+    }
+
+    pub async fn prepare_cancel_schedule_mutation(
+        &self,
+        schedule_id: super::store::ScheduleId,
+    ) -> Result<BrainMutationHandle> {
+        self.prepare_mutation(
+            &crate::ipc::brain_codec::BrainRemoteCommandKind::CancelSchedule(schedule_id),
+        ).await
+    }
+
+    pub async fn cancel_schedule_with_handle(
+        &self,
+        schedule_id: super::store::ScheduleId,
+        handle: &BrainMutationHandle,
+    ) -> Result<bool> {
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+        match self.send_remote_command_with_handle(
+            BrainRemoteCommandKind::CancelSchedule(schedule_id), Some(handle),
+        ).await? {
             BrainRemoteReply::ScheduleCancelled { cancelled, .. } => Ok(cancelled),
             reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
         }

@@ -1451,11 +1451,40 @@ impl BrainStore {
         initiating_attachment_id: AttachmentId,
         schedule_id: ScheduleId,
     ) -> Result<bool> {
+        self.cancel_schedule_with_receipt(
+            name, cancelled_by, initiating_attachment_id, schedule_id, None,
+        )
+    }
+
+    pub fn cancel_schedule_with_receipt(
+        &self,
+        name: &str,
+        cancelled_by: &str,
+        initiating_attachment_id: AttachmentId,
+        schedule_id: ScheduleId,
+        receipt: Option<BrainMutationReceipt>,
+    ) -> Result<bool> {
         let name = Self::validate_name(name)?;
         let cancelled_by = validate_participant_subject("schedule canceller", cancelled_by)?;
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        if let Some(receipt) = receipt.as_ref() {
+            if let Some(existing) = state.events.iter().find(|event| {
+                event.mutation.as_ref().is_some_and(|recorded| {
+                    recorded.attachment_id == receipt.attachment_id
+                        && recorded.mutation_id == receipt.mutation_id
+                })
+            }) {
+                anyhow::ensure!(existing.mutation.as_ref() == Some(receipt),
+                    "Brain mutation idempotency key was reused with a different command or precondition");
+                anyhow::ensure!(matches!(&existing.kind,
+                    BrainEventKind::ScheduleChanged { schedule }
+                        if schedule.schedule_id == schedule_id && !schedule.active),
+                    "replayed mutation outcome does not match schedule cancellation");
+                return Ok(true);
+            }
+        }
         let Some(mut schedule) = state.schedules.get(&schedule_id).cloned() else {
             return Ok(false);
         };
@@ -1468,12 +1497,13 @@ impl BrainStore {
             anyhow::bail!("only the schedule creator attachment may cancel this schedule");
         }
         schedule.active = false;
-        self.push_locked(
-            name,
-            state,
-            cancelled_by,
-            BrainEventKind::ScheduleChanged { schedule },
-        )?;
+        let kind = BrainEventKind::ScheduleChanged { schedule };
+        match receipt {
+            Some(receipt) => { self.push_idempotent_locked(
+                name, state, cancelled_by, kind, receipt,
+            )?; }
+            None => { self.push_locked(name, state, cancelled_by, kind)?; }
+        }
         Ok(true)
     }
 
@@ -1698,6 +1728,51 @@ impl BrainStore {
             }
         }
         Ok(transitioned)
+    }
+
+    pub fn cancel_run_with_receipt(
+        &self,
+        name: &str,
+        sender: &str,
+        initiating_attachment_id: AttachmentId,
+        run_id: RunId,
+        receipt: BrainMutationReceipt,
+    ) -> Result<BrainRun> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        if let Some(existing) = state.events.iter().find(|event| {
+            event.mutation.as_ref().is_some_and(|recorded| {
+                recorded.attachment_id == receipt.attachment_id
+                    && recorded.mutation_id == receipt.mutation_id
+            })
+        }) {
+            anyhow::ensure!(existing.mutation.as_ref() == Some(&receipt),
+                "Brain mutation idempotency key was reused with a different command or precondition");
+            anyhow::ensure!(matches!(existing.kind,
+                BrainEventKind::RunStatusChanged { run_id: recorded, status: BrainRunStatus::Cancelled, .. }
+                    if recorded == run_id),
+                "replayed mutation outcome does not match run cancellation");
+            return state.runs.get(&run_id).cloned()
+                .with_context(|| format!("Brain run {} does not exist", run_id.0));
+        }
+        anyhow::ensure!(receipt.attachment_id == initiating_attachment_id,
+            "Brain mutation attachment does not match run initiator");
+        let current = state.runs.get(&run_id)
+            .with_context(|| format!("Brain run {} does not exist", run_id.0))?;
+        anyhow::ensure!(current.initiating_attachment_id == initiating_attachment_id,
+            "a Brain run can only be cancelled by its initiating attachment");
+        validate_run_transition(current.status, BrainRunStatus::Cancelled)?;
+        self.push_idempotent_locked(
+            name, state, sender,
+            BrainEventKind::RunStatusChanged {
+                run_id, status: BrainRunStatus::Cancelled,
+                detail: Some("cancelled by initiating driver".into()),
+            },
+            receipt,
+        )?;
+        Ok(state.runs.get(&run_id).expect("cancelled run was projected").clone())
     }
 
     pub fn acquire_runner_lease(
@@ -1971,11 +2046,37 @@ impl BrainStore {
         handoff_id: RunnerHandoffId,
         sender: &str,
     ) -> Result<()> {
+        self.cancel_runner_handoff_with_receipt(name, handoff_id, sender, None)
+    }
+
+    pub fn cancel_runner_handoff_with_receipt(
+        &self,
+        name: &str,
+        handoff_id: RunnerHandoffId,
+        sender: &str,
+        receipt: Option<BrainMutationReceipt>,
+    ) -> Result<()> {
         let name = Self::validate_name(name)?;
         let sender = validate_participant_subject("handoff canceller", sender)?;
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        if let Some(receipt) = receipt.as_ref() {
+            if let Some(existing) = state.events.iter().find(|event| {
+                event.mutation.as_ref().is_some_and(|recorded| {
+                    recorded.attachment_id == receipt.attachment_id
+                        && recorded.mutation_id == receipt.mutation_id
+                })
+            }) {
+                anyhow::ensure!(existing.mutation.as_ref() == Some(receipt),
+                    "Brain mutation idempotency key was reused with a different command or precondition");
+                anyhow::ensure!(matches!(existing.kind,
+                    BrainEventKind::RunnerHandoffCancelled { handoff_id: recorded }
+                        if recorded == handoff_id),
+                    "replayed mutation outcome does not match runner handoff cancellation");
+                return Ok(());
+            }
+        }
         if !state
             .runner_handoff
             .as_ref()
@@ -1983,12 +2084,11 @@ impl BrainStore {
         {
             anyhow::bail!("runner handoff is no longer current");
         }
-        self.push_locked(
-            name,
-            state,
-            sender,
-            BrainEventKind::RunnerHandoffCancelled { handoff_id },
-        )?;
+        let kind = BrainEventKind::RunnerHandoffCancelled { handoff_id };
+        match receipt {
+            Some(receipt) => { self.push_idempotent_locked(name, state, sender, kind, receipt)?; }
+            None => { self.push_locked(name, state, sender, kind)?; }
+        }
         Ok(())
     }
 
@@ -5750,6 +5850,32 @@ mod tests {
                 60_000,
             )
             .is_err());
+    }
+
+    #[test]
+    fn cancelled_handoff_replays_success_after_response_loss_and_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let generation = store.environment().generation;
+        let source = store.acquire_runner_lease(
+            "shared", "runner-a", generation, None, 60_000,
+        ).unwrap();
+        let handoff = store.request_runner_handoff(
+            "shared", "controller", "runner-b", source.lease_id, generation, 30_000,
+        ).unwrap();
+        let receipt = mutation_receipt(
+            &store, AttachmentId::new(), uuid::Uuid::new_v4(),
+            store.snapshot("shared").unwrap().revision, "cancel-handoff",
+        );
+        store.cancel_runner_handoff_with_receipt(
+            "shared", handoff.handoff_id, "controller", Some(receipt.clone()),
+        ).unwrap();
+        drop(store);
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        restarted.cancel_runner_handoff_with_receipt(
+            "shared", handoff.handoff_id, "controller", Some(receipt),
+        ).unwrap();
+        assert!(restarted.snapshot("shared").unwrap().runner_handoff.is_none());
     }
 
     #[test]

@@ -2578,7 +2578,10 @@ async fn execute_remote_brain_command(
         let journals_created_identity = match &command.kind {
             BrainRemoteCommandKind::Submit(_) => true,
             BrainRemoteCommandKind::RequestRunnerHandoff { .. }
-            | BrainRemoteCommandKind::CreateSchedule { .. } => true,
+            | BrainRemoteCommandKind::CreateSchedule { .. }
+            | BrainRemoteCommandKind::CancelRunnerHandoff(_)
+            | BrainRemoteCommandKind::CancelRun(_)
+            | BrainRemoteCommandKind::CancelSchedule(_) => true,
             _ => false,
         };
         // Target-addressed cancellations and initialization scheduling are
@@ -2820,7 +2823,9 @@ async fn execute_remote_brain_command(
                     "Brain credential participant no longer matches this attachment",
                 );
             }
-            match lifecycle.cancel_runner_handoff(name, handoff_id, &claims.subject) {
+            match lifecycle.cancel_runner_handoff_with_receipt(
+                name, handoff_id, &claims.subject, mutation_receipt,
+            ) {
                 Ok(()) => BrainRemoteReply::HandoffCancelled { request_id },
                 Err(error) => remote_brain_error(request_id, "conflict", error.to_string()),
             }
@@ -2853,7 +2858,9 @@ async fn execute_remote_brain_command(
                 );
             }
             match lifecycle
-                .cancel_run(name, attachment_id, connection_id, run_id)
+                .cancel_run_with_receipt(
+                    name, attachment_id, connection_id, run_id, mutation_receipt,
+                )
                 .await
             {
                 Ok(run) => BrainRemoteReply::RunCancelled { request_id, run },
@@ -2940,11 +2947,12 @@ async fn execute_remote_brain_command(
                     "Brain credential participant no longer matches this attachment",
                 );
             }
-            match lifecycle.cancel_schedule(
+            match lifecycle.cancel_schedule_with_receipt(
                 name,
                 attachment_id,
                 connection_id,
                 schedule_id,
+                mutation_receipt,
             ) {
                 Ok(cancelled) => BrainRemoteReply::ScheduleCancelled {
                     request_id,
