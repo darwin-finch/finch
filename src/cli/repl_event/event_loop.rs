@@ -406,6 +406,22 @@ fn runner_subject_from(participant: &str, frontend_id: Uuid) -> String {
     base
 }
 
+fn participant_display_name(subject: &str, local_machine: Option<&str>) -> String {
+    let Some(machine) = local_machine else {
+        return subject.to_string();
+    };
+    let Some((user, qualified)) = subject.split_once('@') else {
+        return subject.to_string();
+    };
+    let Some(suffix) = qualified.strip_prefix(machine) else {
+        return subject.to_string();
+    };
+    if !suffix.is_empty() && !suffix.starts_with('/') {
+        return subject.to_string();
+    }
+    format!("{user}{suffix}")
+}
+
 /// Strip the explicit model addressee used in collaborative Brain chatter.
 /// Requiring whitespace (or end-of-input) avoids treating ordinary handles
 /// such as `@finchbot` as model prompts.
@@ -4936,10 +4952,15 @@ Rules:\n\
         match message {
             crate::brain::store::BrainWireMessage::Snapshot { brain } => {
                 self.update_remote_brain_status(brain.runner_lease.is_some());
+                let local_machine = self
+                    .selected_brain()
+                    .is_some_and(|client| !client.target.secure)
+                    .then_some(brain.environment.machine.as_str());
                 project_brain_context(
                     &self.status_bar,
                     &brain.events,
                     self.context_lines.saturating_sub(1),
+                    local_machine,
                 );
                 let acknowledged_seq = self
                     .selected_brain()
@@ -4967,13 +4988,16 @@ Rules:\n\
                     }
                     _ => {}
                 }
-                if brain_context_text(&event).is_some() {
+                if brain_context_text(&event, None).is_some() {
                     if let Some(client) = self.selected_brain().cloned() {
                         if let Ok(snapshot) = client.snapshot().await {
+                            let local_machine = (!client.target.secure)
+                                .then_some(snapshot.environment.machine.as_str());
                             project_brain_context(
                                 &self.status_bar,
                                 &snapshot.events,
                                 self.context_lines.saturating_sub(1),
+                                local_machine,
                             );
                         }
                     }
@@ -5148,6 +5172,11 @@ Rules:\n\
 
     fn render_remote_brain_event(&mut self, event: &crate::brain::store::BrainEvent) {
         use crate::brain::store::BrainEventKind;
+        let local_machine = self
+            .selected_brain()
+            .filter(|client| !client.target.secure)
+            .map(|client| client.target.machine.as_str());
+        let sender = participant_display_name(&event.sender, local_machine);
         match &event.kind {
             BrainEventKind::RunnerLeaseAcquired { lease } => self.output_manager.write_info(
                 format!("{} is the active environment runner", lease.subject),
@@ -5220,13 +5249,13 @@ Rules:\n\
             }
             BrainEventKind::RunStarted { .. } | BrainEventKind::RunStatusChanged { .. } => {}
             BrainEventKind::Prompt { text } => self.output_manager.write_brain_participant(
-                event.sender.clone(),
+                sender.clone(),
                 text.clone(),
                 true,
             ),
             BrainEventKind::ParticipantMessage { text } => self
                 .output_manager
-                .write_brain_participant(event.sender.clone(), text.clone(), false),
+                .write_brain_participant(sender, text.clone(), false),
             BrainEventKind::ToolCall {
                 tool_id,
                 name,
@@ -6698,7 +6727,10 @@ Rules:\n\
     }
 }
 
-fn brain_context_text(event: &crate::brain::store::BrainEvent) -> Option<String> {
+fn brain_context_text(
+    event: &crate::brain::store::BrainEvent,
+    local_machine: Option<&str>,
+) -> Option<String> {
     use crate::brain::store::BrainEventKind;
 
     let text = match &event.kind {
@@ -6719,18 +6751,22 @@ fn brain_context_text(event: &crate::brain::store::BrainEvent) -> Option<String>
     } else {
         format!("{}…", compact.chars().take(69).collect::<String>())
     };
-    Some(format!("{}: {compact}", event.sender))
+    Some(format!(
+        "{}: {compact}",
+        participant_display_name(&event.sender, local_machine)
+    ))
 }
 
 fn project_brain_context(
     status_bar: &crate::cli::status_bar::StatusBar,
     events: &[crate::brain::store::BrainEvent],
     depth: usize,
+    local_machine: Option<&str>,
 ) {
     let mut lines = events
         .iter()
         .rev()
-        .filter_map(brain_context_text)
+        .filter_map(|event| brain_context_text(event, local_machine))
         .take(depth)
         .collect::<Vec<_>>();
     lines.reverse();
@@ -7401,7 +7437,7 @@ mod tests {
         ];
         let status = StatusBar::new();
 
-        super::project_brain_context(&status, &events, 2);
+        super::project_brain_context(&status, &events, 2, None);
 
         let lines = status
             .get_lines()
@@ -7417,7 +7453,7 @@ mod tests {
             ]
         );
 
-        super::project_brain_context(&status, &[], 2);
+        super::project_brain_context(&status, &[], 2, None);
         assert!(status
             .get_lines()
             .iter()
@@ -7449,7 +7485,7 @@ mod tests {
         ];
         let status = StatusBar::new();
 
-        super::project_brain_context(&status, &events, 4);
+        super::project_brain_context(&status, &events, 4, None);
 
         let lines = status
             .get_lines()
@@ -7551,6 +7587,32 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with(participant));
         assert!(first.chars().count() <= 128);
+    }
+
+    #[test]
+    fn local_participant_display_omits_only_the_matching_machine() {
+        assert_eq!(
+            participant_display_name(
+                "shammah@Shammahs-MacBook-Air.local",
+                Some("Shammahs-MacBook-Air.local")
+            ),
+            "shammah"
+        );
+        assert_eq!(
+            participant_display_name(
+                "shammah@Shammahs-MacBook-Air.local/frontend-12345678",
+                Some("Shammahs-MacBook-Air.local")
+            ),
+            "shammah/frontend-12345678"
+        );
+        assert_eq!(
+            participant_display_name("alice@remote.example", Some("local.example")),
+            "alice@remote.example"
+        );
+        assert_eq!(
+            participant_display_name("alice@remote.example", None),
+            "alice@remote.example"
+        );
     }
 
     #[test]
