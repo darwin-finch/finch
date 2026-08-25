@@ -680,7 +680,10 @@ still blocks the corresponding Brain phase until it is unified.
   optional actions (`expand source`, `collapse source`, `open tool transcript`, later approval
   actions); have the shadow buffer retain visible cell/row hit regions keyed by WorkUnit ID; enable
   mouse reporting only while Finch owns the live viewport and route clicks through that map. Keep
-  keyboard equivalents and stable short IDs for terminals without mouse support. Completed VM
+  keyboard equivalents and stable short IDs for terminals without mouse support. Collapse completed
+  tool groups to a compact outcome such as `Ran 2 commands · click or Ctrl+T to view transcript`;
+  both actions open the same retained structured rows rather than rerunning tools or scraping
+  scrollback. Completed VM
   source should be sealed before execution, then retain its execution ID, output handle/chunks, and
   terminal result in the same correlated `ProgramWorkUnit`; only the terminal result completes the
   WorkUnit. After success its collapsed rendering shows user-visible output plus a compact `program
