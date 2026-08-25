@@ -4850,7 +4850,7 @@ impl TypedHostHandler {
             .cloned()
             .ok_or_else(|| {
                 format!(
-                    "file selector root '{}' is not installed by this host",
+                    "{} root is not installed by this host",
                     selector.root
                 )
             })?;
