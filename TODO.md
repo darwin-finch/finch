@@ -413,6 +413,14 @@ still blocks the corresponding Brain phase until it is unified.
   identity, and atomically promote or roll back. Frontends may re-exec themselves; daemon replacement
   requires a small stable supervisor or two-process takeover and must never rely on killing the only
   process that can recover its state.
+- [ ] Make the Finch-on-Finch gate terminate in a reproducible public release, not only a local
+  dogfood run: select/version the release, generate a human-reviewed changelog from canonical
+  commits, publish signed checksummed artifacts and package-manager metadata, migrate and update the
+  website/docs/examples, include current conformance and Brain-collaboration evidence, run clean
+  install/upgrade/rollback smoke tests, and push the source tag plus release only after every
+  published URL and artifact verifies. Keep credentials, signing authority, DNS, package registries,
+  and website deployment behind explicit scoped approvals; a self-improving Brain may prepare the
+  release proposal but cannot silently publish itself.
 - [ ] Normalize model-facing naming and manifests. `todo_read`/`todo_write`, `enter_plan_mode`,
   `present_plan`, and `ask_user_question` now advertise canonical snake_case names while
   dispatch-only PascalCase aliases preserve compatibility; extend that audited migration to every
