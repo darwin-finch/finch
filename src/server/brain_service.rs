@@ -242,6 +242,60 @@ impl BrainLifecycleService {
         .await
     }
 
+    pub async fn cancel_run(
+        &self,
+        brain: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        run_id: RunId,
+    ) -> Result<BrainRun> {
+        let attachment = self.connection(brain, attachment_id, connection_id)?;
+        ensure!(
+            attachment.role == AttachmentRole::Driver,
+            "only a Brain driver can cancel a run"
+        );
+        let run = self.inspect_run(brain, run_id)?;
+        ensure!(
+            run.initiating_attachment_id == attachment_id,
+            "a Brain run can only be cancelled by its initiating attachment"
+        );
+        if run.status == BrainRunStatus::Cancelled {
+            return Ok(run);
+        }
+        ensure!(!run.status.is_terminal(), "Brain run has already finished");
+        if matches!(
+            run.status,
+            BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
+        ) {
+            let snapshot = self.snapshot(brain)?;
+            let lease = snapshot
+                .runner_lease
+                .filter(|lease| lease.expires_ms > crate::brain::shared::unix_millis())
+                .ok_or_else(|| anyhow::anyhow!("named Brain '{brain}' has no live runner"))?;
+            ensure!(
+                self.runners.cancel_run(brain, lease.lease_id, run_id).await?,
+                "the environment runner is not executing this Brain run"
+            );
+        }
+        match self.store.transition_run(
+            brain,
+            &attachment.subject,
+            run_id,
+            BrainRunStatus::Cancelled,
+            Some("cancelled by initiating driver".into()),
+        ) {
+            Ok(run) => Ok(run),
+            Err(error) => {
+                let current = self.inspect_run(brain, run_id)?;
+                if current.status == BrainRunStatus::Cancelled {
+                    Ok(current)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     pub fn acquire_runner(
         &self,
         brain: &str,
@@ -445,6 +499,79 @@ mod tests {
             .detach("shared", attachment.attachment_id, connection_id)
             .unwrap();
         assert!(!service.list().unwrap().iter().any(|name| name == "shared"));
+    }
+
+    #[tokio::test]
+    async fn only_the_initiating_driver_can_cancel_a_running_run() {
+        let service = service();
+        let attachment = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let connection_id = attachment.connection_id.unwrap();
+        let _watch = service
+            .watch("shared", attachment.attachment_id, connection_id)
+            .unwrap();
+        let other = service
+            .attach("shared", "bob", AttachmentRole::Driver, None)
+            .unwrap();
+        let other_connection_id = other.connection_id.unwrap();
+        let _other_watch = service
+            .watch("shared", other.attachment_id, other_connection_id)
+            .unwrap();
+        let request = service
+            .store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "keep working".into(),
+                },
+            )
+            .unwrap();
+        let run = service
+            .start_run_with_parent(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                request.seq,
+                attachment.attachment_id,
+                BrainRunStatus::Running,
+                None,
+            )
+            .unwrap();
+        let environment = service.store.environment().clone();
+        let lease = service
+            .acquire_runner("shared", "runner", &environment, None, 60_000)
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        service.runners.register("shared", lease.lease_id, tx);
+
+        assert!(service
+            .cancel_run(
+                "shared",
+                other.attachment_id,
+                other_connection_id,
+                run.run_id,
+            )
+            .await
+            .is_err());
+        tokio::spawn(async move {
+            let crate::server::RunnerRequest::Cancel(request) = rx.recv().await.unwrap() else {
+                panic!("expected cancellation request")
+            };
+            assert_eq!(request.run_id, run.run_id);
+            request.response_tx.send(Ok(true)).unwrap();
+        });
+        let cancelled = service
+            .cancel_run(
+                "shared",
+                attachment.attachment_id,
+                connection_id,
+                run.run_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status, BrainRunStatus::Cancelled);
     }
 
     #[tokio::test]

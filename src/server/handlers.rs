@@ -715,13 +715,19 @@ async fn dispatch_named_brain_run(
                 request.seq,
                 Err(anyhow::anyhow!(detail.clone())),
             )?;
-            store.transition_run(
-                name,
-                "daemon",
-                run.run_id,
-                BrainRunStatus::Failed,
-                Some(detail),
-            )?;
+            let status = if detail == "named Brain run cancelled" {
+                BrainRunStatus::Cancelled
+            } else {
+                BrainRunStatus::Failed
+            };
+            match store.transition_run(name, "daemon", run.run_id, status, Some(detail)) {
+                Ok(_) => {}
+                Err(_)
+                    if status == BrainRunStatus::Cancelled
+                        && store.inspect_run(name, run.run_id)?.status
+                            == BrainRunStatus::Cancelled => {}
+                Err(error) => return Err(error),
+            }
             Ok(Some(result))
         }
     }
