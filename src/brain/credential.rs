@@ -18,8 +18,10 @@ use super::shared::{AttachmentId, AttachmentRole, BrainId, ConnectionId};
 
 const CREDENTIAL_VERSION: u32 = 1;
 const TOKEN_PREFIX: &str = "finch-brain-v1";
+const INVITATION_PREFIX: &str = "finch-brain-invite-v1";
 const SIGNING_KEY_FILE: &str = "brain-credential.key";
 const REVOCATIONS_FILE: &str = "brain-credential-revocations.json";
+const CONSUMED_INVITATIONS_FILE: &str = "brain-invitation-consumed.json";
 const MAX_DELEGATION_DEPTH: usize = 8;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -207,10 +209,48 @@ pub struct BrainCredentialRequest {
     pub ttl_ms: u64,
 }
 
+/// A short-lived, single-use bootstrap grant that can be handed to a
+/// collaborator without disclosing the daemon-wide Brain password. The
+/// recipient chooses only its participant subject; role, audience, scopes,
+/// environment generation, and expiry are fixed by the issuer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainInvitationClaims {
+    pub version: u32,
+    pub invitation_id: uuid::Uuid,
+    pub issuer: String,
+    pub brain_id: BrainId,
+    pub brain: String,
+    pub environment_generation: u64,
+    pub role: AttachmentRole,
+    pub scopes: BTreeSet<BrainCredentialScope>,
+    #[serde(default)]
+    pub delegation_chain: Vec<uuid::Uuid>,
+    pub issued_ms: u64,
+    pub expires_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BrainInvitationRequest {
+    pub issuer: String,
+    pub brain_id: BrainId,
+    pub brain: String,
+    pub environment_generation: u64,
+    pub role: AttachmentRole,
+    pub scopes: BTreeSet<BrainCredentialScope>,
+    pub delegation_chain: Vec<uuid::Uuid>,
+    pub ttl_ms: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RevocationFile {
     version: u32,
     credential_ids: BTreeSet<uuid::Uuid>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ConsumedInvitationFile {
+    version: u32,
+    invitation_ids: BTreeSet<uuid::Uuid>,
 }
 
 #[derive(Clone)]
@@ -218,6 +258,8 @@ pub struct BrainCredentialAuthority {
     signing_key: Arc<[u8; 32]>,
     revoked: Arc<Mutex<BTreeSet<uuid::Uuid>>>,
     revocations_path: Option<Arc<PathBuf>>,
+    consumed_invitations: Arc<Mutex<BTreeSet<uuid::Uuid>>>,
+    consumed_invitations_path: Option<Arc<PathBuf>>,
 }
 
 impl BrainCredentialAuthority {
@@ -230,10 +272,14 @@ impl BrainCredentialAuthority {
         let signing_key = load_or_create_signing_key(&key_path)?;
         let revocations_path = state_directory.join(REVOCATIONS_FILE);
         let revoked = load_revocations(&revocations_path)?;
+        let consumed_invitations_path = state_directory.join(CONSUMED_INVITATIONS_FILE);
+        let consumed_invitations = load_consumed_invitations(&consumed_invitations_path)?;
         Ok(Self {
             signing_key: Arc::new(signing_key),
             revoked: Arc::new(Mutex::new(revoked)),
             revocations_path: Some(Arc::new(revocations_path)),
+            consumed_invitations: Arc::new(Mutex::new(consumed_invitations)),
+            consumed_invitations_path: Some(Arc::new(consumed_invitations_path)),
         })
     }
 
@@ -243,6 +289,8 @@ impl BrainCredentialAuthority {
             signing_key: Arc::new(signing_key),
             revoked: Arc::new(Mutex::new(BTreeSet::new())),
             revocations_path: None,
+            consumed_invitations: Arc::new(Mutex::new(BTreeSet::new())),
+            consumed_invitations_path: None,
         }
     }
 
@@ -286,6 +334,113 @@ impl BrainCredentialAuthority {
                 .context("Brain credential expiry overflow")?,
         };
         self.sign(&claims)
+    }
+
+    pub fn issue_invitation(
+        &self,
+        request: BrainInvitationRequest,
+        now_ms: u64,
+    ) -> Result<(String, BrainInvitationClaims)> {
+        if request.ttl_ms == 0 {
+            anyhow::bail!("Brain invitation lifetime must be greater than zero");
+        }
+        if request.role == AttachmentRole::Runner {
+            anyhow::bail!("runner authority cannot be delegated through a Brain invitation");
+        }
+        if request.scopes.is_empty()
+            || !request
+                .scopes
+                .is_subset(&permitted_participant_scopes(request.role))
+            || !request.scopes.contains(&BrainCredentialScope::BrainAttach)
+        {
+            anyhow::bail!("Brain invitation scopes are invalid for its participant role");
+        }
+        if request.delegation_chain.len() > MAX_DELEGATION_DEPTH
+            || request.delegation_chain.iter().copied().collect::<BTreeSet<_>>().len()
+                != request.delegation_chain.len()
+        {
+            anyhow::bail!("Brain invitation delegation chain is invalid");
+        }
+        let claims = BrainInvitationClaims {
+            version: CREDENTIAL_VERSION,
+            invitation_id: uuid::Uuid::new_v4(),
+            issuer: request.issuer,
+            brain_id: request.brain_id,
+            brain: request.brain,
+            environment_generation: request.environment_generation,
+            role: request.role,
+            scopes: request.scopes,
+            delegation_chain: request.delegation_chain,
+            issued_ms: now_ms,
+            expires_ms: now_ms
+                .checked_add(request.ttl_ms)
+                .context("Brain invitation expiry overflow")?,
+        };
+        Ok((self.sign_invitation(&claims)?, claims))
+    }
+
+    /// Verify an invitation without consuming it. This is suitable for UI
+    /// preview only; authority is created exclusively by `redeem_invitation`.
+    pub fn inspect_invitation(
+        &self,
+        token: &str,
+        now_ms: u64,
+    ) -> Result<BrainInvitationClaims> {
+        let claims = self.decode_invitation(token, now_ms)?;
+        if self
+            .consumed_invitations
+            .lock()
+            .expect("Brain invitation lock poisoned")
+            .contains(&claims.invitation_id)
+        {
+            anyhow::bail!("Brain invitation has already been redeemed");
+        }
+        Ok(claims)
+    }
+
+    /// Atomically burn one invitation and mint the ordinary participant
+    /// credential used by every later attachment operation. Concurrent or
+    /// post-restart replays fail before producing a second credential.
+    pub fn redeem_invitation(
+        &self,
+        token: &str,
+        subject: &str,
+        now_ms: u64,
+    ) -> Result<(String, BrainCredentialClaims)> {
+        if subject.trim().is_empty() {
+            anyhow::bail!("Brain invitation subject cannot be empty");
+        }
+        let invitation = self.decode_invitation(token, now_ms)?;
+        let mut consumed = self
+            .consumed_invitations
+            .lock()
+            .expect("Brain invitation lock poisoned");
+        if consumed.contains(&invitation.invitation_id) {
+            anyhow::bail!("Brain invitation has already been redeemed");
+        }
+        let credential = self.issue(
+            BrainCredentialRequest {
+                issuer: invitation.issuer.clone(),
+                subject: subject.to_string(),
+                brain_id: invitation.brain_id,
+                brain: invitation.brain.clone(),
+                environment_generation: invitation.environment_generation,
+                role: invitation.role,
+                scopes: invitation.scopes.clone(),
+                delegation_chain: invitation.delegation_chain.clone(),
+                ttl_ms: invitation.expires_ms - now_ms,
+            },
+            now_ms,
+        )?;
+        let claims = self.verify(&credential, now_ms)?;
+        consumed.insert(invitation.invitation_id);
+        if let Some(path) = &self.consumed_invitations_path {
+            if let Err(error) = persist_consumed_invitations(path, &consumed) {
+                consumed.remove(&invitation.invitation_id);
+                return Err(error);
+            }
+        }
+        Ok((credential, claims))
     }
 
     /// Narrow an already verified participant credential to one pending
@@ -415,6 +570,80 @@ impl BrainCredentialAuthority {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
         Ok(format!("{TOKEN_PREFIX}.{payload}.{signature}"))
     }
+
+    fn sign_invitation(&self, claims: &BrainInvitationClaims) -> Result<String> {
+        let encoded = serde_json::to_vec(claims).context("serialize Brain invitation")?;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encoded);
+        let signature = self.invitation_signature(&payload);
+        Ok(format!("{INVITATION_PREFIX}.{payload}.{signature}"))
+    }
+
+    fn decode_invitation(&self, token: &str, now_ms: u64) -> Result<BrainInvitationClaims> {
+        let mut parts = token.split('.');
+        let prefix = parts.next().unwrap_or_default();
+        let payload = parts.next().context("Brain invitation payload is missing")?;
+        let signature = parts
+            .next()
+            .context("Brain invitation signature is missing")?;
+        if prefix != INVITATION_PREFIX || parts.next().is_some() {
+            anyhow::bail!("Brain invitation envelope is invalid");
+        }
+        let supplied = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(signature)
+            .context("Brain invitation signature is invalid")?;
+        let mut mac = HmacSha256::new_from_slice(self.signing_key.as_slice())
+            .expect("HMAC accepts a 32-byte key");
+        mac.update(INVITATION_PREFIX.as_bytes());
+        mac.update(&[0]);
+        mac.update(payload.as_bytes());
+        mac.verify_slice(&supplied)
+            .map_err(|_| anyhow::anyhow!("Brain invitation signature does not match"))?;
+
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .context("Brain invitation payload is invalid")?;
+        let claims: BrainInvitationClaims =
+            serde_json::from_slice(&encoded).context("Brain invitation claims are invalid")?;
+        if claims.version != CREDENTIAL_VERSION {
+            anyhow::bail!("unsupported Brain invitation version {}", claims.version);
+        }
+        if now_ms < claims.issued_ms {
+            anyhow::bail!("Brain invitation is not valid yet");
+        }
+        if now_ms >= claims.expires_ms {
+            anyhow::bail!("Brain invitation has expired");
+        }
+        if claims.role == AttachmentRole::Runner
+            || claims.scopes.is_empty()
+            || !claims
+                .scopes
+                .is_subset(&permitted_participant_scopes(claims.role))
+            || !claims.scopes.contains(&BrainCredentialScope::BrainAttach)
+        {
+            anyhow::bail!("Brain invitation claims have invalid participant authority");
+        }
+        let revoked = self
+            .revoked
+            .lock()
+            .expect("Brain credential revocation lock poisoned");
+        if claims
+            .delegation_chain
+            .iter()
+            .any(|ancestor| revoked.contains(ancestor))
+        {
+            anyhow::bail!("Brain invitation delegator has been revoked");
+        }
+        Ok(claims)
+    }
+
+    fn invitation_signature(&self, payload: &str) -> String {
+        let mut mac = HmacSha256::new_from_slice(self.signing_key.as_slice())
+            .expect("HMAC accepts a 32-byte key");
+        mac.update(INVITATION_PREFIX.as_bytes());
+        mac.update(&[0]);
+        mac.update(payload.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    }
 }
 
 fn load_or_create_signing_key(path: &Path) -> Result<[u8; 32]> {
@@ -493,6 +722,46 @@ fn persist_revocations(path: &Path, revoked: &BTreeSet<uuid::Uuid>) -> Result<()
     Ok(())
 }
 
+fn load_consumed_invitations(path: &Path) -> Result<BTreeSet<uuid::Uuid>> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let file: ConsumedInvitationFile = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse {}", path.display()))?;
+            if file.version != CREDENTIAL_VERSION {
+                anyhow::bail!(
+                    "unsupported consumed Brain invitation version {}",
+                    file.version
+                );
+            }
+            Ok(file.invitation_ids)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn persist_consumed_invitations(
+    path: &Path,
+    consumed: &BTreeSet<uuid::Uuid>,
+) -> Result<()> {
+    let file = ConsumedInvitationFile {
+        version: CREDENTIAL_VERSION,
+        invitation_ids: consumed.clone(),
+    };
+    let encoded = serde_json::to_vec_pretty(&file)?;
+    let parent = path
+        .parent()
+        .context("consumed Brain invitation path has no parent")?;
+    let temporary = parent.join(format!(
+        ".brain-invitation-consumed.{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::write(&temporary, encoded)
+        .with_context(|| format!("write {}", temporary.display()))?;
+    std::fs::rename(&temporary, path).with_context(|| format!("commit {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,6 +780,19 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            delegation_chain: Vec::new(),
+            ttl_ms,
+        }
+    }
+
+    fn invitation_request(ttl_ms: u64) -> BrainInvitationRequest {
+        BrainInvitationRequest {
+            issuer: "machine.local".into(),
+            brain_id: BrainId(uuid::Uuid::new_v4()),
+            brain: "shared-work".into(),
+            environment_generation: 7,
+            role: AttachmentRole::Consultant,
+            scopes: default_participant_scopes(AttachmentRole::Consultant),
             delegation_chain: Vec::new(),
             ttl_ms,
         }
@@ -733,5 +1015,127 @@ mod tests {
         assert!(claims
             .require_participant("alice@laptop.local", AttachmentRole::Observer)
             .is_err());
+    }
+
+    #[test]
+    fn invitation_redeems_once_into_an_ordinary_scoped_credential() {
+        let authority = BrainCredentialAuthority::ephemeral([11; 32]);
+        let (invitation, invitation_claims) = authority
+            .issue_invitation(invitation_request(1_000), 10_000)
+            .unwrap();
+        assert_eq!(
+            authority.inspect_invitation(&invitation, 10_100).unwrap(),
+            invitation_claims
+        );
+
+        let (credential, claims) = authority
+            .redeem_invitation(&invitation, "bob@desktop.local", 10_100)
+            .unwrap();
+        assert_eq!(claims.subject, "bob@desktop.local");
+        assert_eq!(claims.role, AttachmentRole::Consultant);
+        assert_eq!(claims.scopes, invitation_claims.scopes);
+        assert_eq!(claims.expires_ms, invitation_claims.expires_ms);
+        assert_eq!(authority.verify(&credential, 10_200).unwrap(), claims);
+        assert!(authority.inspect_invitation(&invitation, 10_200).is_err());
+        assert!(authority
+            .redeem_invitation(&invitation, "mallory@box.local", 10_200)
+            .is_err());
+    }
+
+    #[test]
+    fn invitation_consumption_survives_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let authority = BrainCredentialAuthority::load_or_create(temp.path()).unwrap();
+        let (invitation, _) = authority
+            .issue_invitation(invitation_request(10_000), 10_000)
+            .unwrap();
+        authority
+            .redeem_invitation(&invitation, "bob@desktop.local", 10_100)
+            .unwrap();
+
+        let restarted = BrainCredentialAuthority::load_or_create(temp.path()).unwrap();
+        assert!(restarted
+            .redeem_invitation(&invitation, "mallory@box.local", 10_200)
+            .is_err());
+    }
+
+    #[test]
+    fn concurrent_invitation_replay_mints_exactly_one_credential() {
+        let authority = BrainCredentialAuthority::ephemeral([12; 32]);
+        let (invitation, _) = authority
+            .issue_invitation(invitation_request(10_000), 10_000)
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let attempts = ["bob@one.local", "carol@two.local"]
+            .into_iter()
+            .map(|subject| {
+                let authority = authority.clone();
+                let invitation = invitation.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    authority.redeem_invitation(&invitation, subject, 10_100)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        assert_eq!(
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.join().unwrap())
+                .filter(Result::is_ok)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn invitation_tampering_expiry_and_invalid_role_fail_closed() {
+        let authority = BrainCredentialAuthority::ephemeral([13; 32]);
+        let (mut invitation, _) = authority
+            .issue_invitation(invitation_request(1_000), 10_000)
+            .unwrap();
+        let index = invitation.find('.').unwrap() + 2;
+        invitation.replace_range(index..=index, "x");
+        assert!(authority.inspect_invitation(&invitation, 10_100).is_err());
+
+        let (expired, _) = authority
+            .issue_invitation(invitation_request(1_000), 10_000)
+            .unwrap();
+        assert!(authority.inspect_invitation(&expired, 11_000).is_err());
+
+        let mut runner = invitation_request(1_000);
+        runner.role = AttachmentRole::Runner;
+        runner.scopes = [BrainCredentialScope::BrainAttach].into_iter().collect();
+        assert!(authority.issue_invitation(runner, 10_000).is_err());
+    }
+
+    #[test]
+    fn revoking_inviter_invalidates_invitation_and_redeemed_descendant() {
+        let authority = BrainCredentialAuthority::ephemeral([14; 32]);
+        let mut controller_request = request(10_000);
+        controller_request.scopes = default_participant_scopes(AttachmentRole::Driver);
+        controller_request
+            .scopes
+            .insert(BrainCredentialScope::BrainControl);
+        let controller_token = authority.issue(controller_request, 10_000).unwrap();
+        let controller = authority.verify(&controller_token, 10_100).unwrap();
+
+        let mut invited = invitation_request(5_000);
+        invited.brain_id = controller.brain_id;
+        invited.brain = controller.brain.clone();
+        invited.environment_generation = controller.environment_generation;
+        invited.delegation_chain = controller
+            .attenuate(&invited.scopes, invited.ttl_ms, 10_100)
+            .unwrap();
+        let (invitation, _) = authority.issue_invitation(invited.clone(), 10_100).unwrap();
+        let (credential, _) = authority
+            .redeem_invitation(&invitation, "bob@desktop.local", 10_200)
+            .unwrap();
+
+        let (unredeemed, _) = authority.issue_invitation(invited, 10_200).unwrap();
+        authority.revoke(controller.credential_id).unwrap();
+        assert!(authority.inspect_invitation(&unredeemed, 10_300).is_err());
+        assert!(authority.verify(&credential, 10_300).is_err());
     }
 }

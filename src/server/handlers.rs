@@ -84,6 +84,14 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
             post(issue_named_brain_credential),
         )
         .route(
+            "/v1/brains/named/:name/invitations",
+            post(issue_named_brain_invitation),
+        )
+        .route(
+            "/v1/brains/invitations/redeem",
+            post(redeem_named_brain_invitation),
+        )
+        .route(
             "/v1/brains/credentials/:credential_id",
             axum::routing::delete(revoke_named_brain_credential),
         )
@@ -208,6 +216,8 @@ fn authorize_named_brain(
 
 const DEFAULT_BRAIN_CREDENTIAL_TTL_MS: u64 = 8 * 60 * 60 * 1_000;
 const MAX_BRAIN_CREDENTIAL_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_BRAIN_INVITATION_TTL_MS: u64 = 15 * 60 * 1_000;
+const MAX_BRAIN_INVITATION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Deserialize)]
 struct IssueNamedBrainCredentialRequest {
@@ -223,6 +233,27 @@ struct IssueNamedBrainCredentialRequest {
 struct IssueNamedBrainCredentialResponse {
     token: String,
     claims: crate::brain::credential::BrainCredentialClaims,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueNamedBrainInvitationRequest {
+    role: crate::brain::shared::AttachmentRole,
+    scopes: Option<
+        std::collections::BTreeSet<crate::brain::credential::BrainCredentialScope>,
+    >,
+    ttl_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IssueNamedBrainInvitationResponse {
+    invitation: String,
+    claims: crate::brain::credential::BrainInvitationClaims,
+}
+
+#[derive(Debug, Deserialize)]
+struct RedeemNamedBrainInvitationRequest {
+    invitation: String,
+    subject: String,
 }
 
 fn claims_match_attachment(
@@ -323,6 +354,120 @@ async fn issue_named_brain_credential(
         .brain_credentials()
         .verify(&token, now_ms)
         .map_err(|error| AppError(error).into_response())?;
+    Ok(Json(IssueNamedBrainCredentialResponse { token, claims }))
+}
+
+async fn issue_named_brain_invitation(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(request): Json<IssueNamedBrainInvitationRequest>,
+) -> Result<Json<IssueNamedBrainInvitationResponse>, Response> {
+    if request.role == crate::brain::shared::AttachmentRole::Runner {
+        return Err(brain_auth_error(
+            StatusCode::BAD_REQUEST,
+            "runner authority cannot be delegated through a Brain invitation",
+        ));
+    }
+    let snapshot = server
+        .shared_brains()
+        .snapshot(&name)
+        .map_err(|error| AppError(error).into_response())?;
+    let now_ms = unix_epoch_millis();
+    let delegator = if has_brain_bootstrap_access(&server, addr, &headers).await {
+        None
+    } else {
+        let token = bearer_token(&headers).ok_or_else(|| {
+            brain_auth_error(
+                StatusCode::UNAUTHORIZED,
+                "Brain bootstrap password or controlling credential required",
+            )
+        })?;
+        let claims = server
+            .brain_credentials()
+            .verify(token, now_ms)
+            .map_err(|error| brain_auth_error(StatusCode::UNAUTHORIZED, error.to_string()))?;
+        claims
+            .require_audience(
+                snapshot.brain_id,
+                &name,
+                snapshot.environment.generation,
+                crate::brain::credential::BrainCredentialScope::BrainControl,
+            )
+            .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
+        Some(claims)
+    };
+    let ttl_ms = request
+        .ttl_ms
+        .unwrap_or(DEFAULT_BRAIN_INVITATION_TTL_MS)
+        .min(MAX_BRAIN_INVITATION_TTL_MS);
+    let scopes = request
+        .scopes
+        .unwrap_or_else(|| crate::brain::credential::default_participant_scopes(request.role));
+    if !scopes.is_subset(&crate::brain::credential::permitted_participant_scopes(
+        request.role,
+    )) || !scopes.contains(&crate::brain::credential::BrainCredentialScope::BrainAttach)
+    {
+        return Err(brain_auth_error(
+            StatusCode::FORBIDDEN,
+            "requested Brain invitation scopes are invalid for this participant role",
+        ));
+    }
+    let delegation_chain = if let Some(delegator) = &delegator {
+        delegator
+            .attenuate(&scopes, ttl_ms, now_ms)
+            .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?
+    } else {
+        Vec::new()
+    };
+    let (invitation, claims) = server
+        .brain_credentials()
+        .issue_invitation(
+            crate::brain::credential::BrainInvitationRequest {
+                issuer: snapshot.environment.machine.clone(),
+                brain_id: snapshot.brain_id,
+                brain: name,
+                environment_generation: snapshot.environment.generation,
+                role: request.role,
+                scopes,
+                delegation_chain,
+                ttl_ms,
+            },
+            now_ms,
+        )
+        .map_err(|error| AppError(error).into_response())?;
+    Ok(Json(IssueNamedBrainInvitationResponse {
+        invitation,
+        claims,
+    }))
+}
+
+async fn redeem_named_brain_invitation(
+    State(server): State<Arc<AgentServer>>,
+    Json(request): Json<RedeemNamedBrainInvitationRequest>,
+) -> Result<Json<IssueNamedBrainCredentialResponse>, Response> {
+    let now_ms = unix_epoch_millis();
+    let invitation = server
+        .brain_credentials()
+        .inspect_invitation(&request.invitation, now_ms)
+        .map_err(|error| brain_auth_error(StatusCode::UNAUTHORIZED, error.to_string()))?;
+    let snapshot = server
+        .shared_brains()
+        .snapshot(&invitation.brain)
+        .map_err(|error| AppError(error).into_response())?;
+    if invitation.brain_id != snapshot.brain_id
+        || invitation.environment_generation != snapshot.environment.generation
+    {
+        return Err(brain_auth_error(
+            StatusCode::CONFLICT,
+            "Brain invitation audience is no longer current",
+        ));
+    }
+    let (token, claims) = server
+        .brain_credentials()
+        .redeem_invitation(&request.invitation, &request.subject, now_ms)
+        .map_err(|error| brain_auth_error(StatusCode::UNAUTHORIZED, error.to_string()))?;
     Ok(Json(IssueNamedBrainCredentialResponse { token, claims }))
 }
 
