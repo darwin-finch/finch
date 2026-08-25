@@ -221,8 +221,8 @@ Brain. The driver defined and invoked a shared Lisp word, the consultant was for
 submitting a program, acknowledged cursors survived reconnect, stale connection acknowledgements
 returned a conflict, and WebSocket close produced a durable detach event. A short runner lease was
 also observed expiring into a durable release event. This validates the compatibility transport and
-lease state machine. Automated callback/dispatch tests now cover environment-runner delegation;
-another live two-console smoke test remains required for the new path.
+lease state machine. Automated callback/dispatch tests cover environment-runner delegation, and the
+live two-console smoke exercises that same leased-runner path.
 
 ## Target model
 
@@ -364,9 +364,9 @@ Do not make Cap'n Proto the VM's internal value representation or require every 
 The runtime stays transport-neutral. Ordinary word-aligned Cap'n Proto encoding is the default for
 zero-copy-friendly event access; packed encoding is optional where measured bandwidth savings
 justify unpacking. Large blobs remain content-addressed or separately streamed rather than embedded
-in Brain events. The current JSON HTTP/WebSocket lifecycle payloads and legacy `AnyPointer`/JSON IPC
-path are migration compatibility surfaces; B4 replaces them with explicit versioned schema fields
-and cross-transport conformance fixtures.
+in Brain events. The former JSON HTTP/WebSocket lifecycle payloads and legacy `AnyPointer`/JSON IPC
+path have been replaced by explicit versioned schema fields and cross-transport conformance
+fixtures. HTTP remains only for authenticated bootstrap, discovery, and administrative operations.
 
 Every mutating request includes `BrainId`, caller identity, expected Brain revision, environment
 generation, and an idempotency key. Names are aliases resolved to IDs, not durable identity.
@@ -476,6 +476,9 @@ Exit: every background activity has identical lifecycle and ancestry semantics.
   event/cursor/run service.
 
 Exit: the transport conformance suite produces equivalent events and outcomes.
+
+Status: complete. Local RPC, embedded service calls, and remote binary sessions share the same
+`BrainLifecycleService`; the conformance fixture compares their normalized lifecycle outcomes.
 
 Current compatibility status: HTTP performs authenticated remote discovery, credential issuance,
 and attachment bootstrap. Local Cap'n Proto has a typed `BrainService` for the complete event

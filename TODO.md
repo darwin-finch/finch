@@ -840,7 +840,7 @@ still blocks the corresponding Brain phase until it is unified.
   conflict-safe reconnect/detach, and a status display derived from the authoritative role. A live
   driver/consultant test shared a Lisp definition, rejected consultant program submission, retained
   its cursor across reconnect, and observed a WebSocket close as a durable detach event.
-- [ ] Replace the transitional JSON named-Brain lifecycle protocol with one versioned Cap'n Proto
+- [x] Replace the transitional JSON named-Brain lifecycle protocol with one versioned Cap'n Proto
   `BrainService` schema. Use Cap'n Proto RPC over the local Unix socket and ordinary Cap'n Proto
   messages in ordered binary WebSocket frames remotely; retain HTTP only for authenticated
   discovery/bootstrap. Prefer the zero-copy-friendly word-aligned encoding, use packed encoding
@@ -908,7 +908,7 @@ still blocks the corresponding Brain phase until it is unified.
   binary transports expose the same inspect/cancel operation, `/brain runs` and `/brain cancel
   <id-prefix>` use that shared client surface, and live-daemon tests cover both queued cancellation
   and cancellation of a still-running callback.
-- [ ] Route the ordinary home-console conversation and its complete coding-agent/tool loop through
+- [x] Route the ordinary home-console conversation and its complete coding-agent/tool loop through
   the same named-Brain event log. Ordinary home prompts now use a durable driver attachment and the
   daemon turn lane; the leased frontend runs the complete provider/tool/VM callback, while both home
   and remote consoles replay its canonical prompt/program/result events. A live two-console test
