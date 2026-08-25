@@ -1635,6 +1635,11 @@ fn persist_named_brain_turn_events(
 fn named_brain_provider_messages(snapshot: &crate::brain::store::BrainSnapshot) -> Vec<Message> {
     use crate::brain::store::BrainEventKind;
 
+    let task_context = named_brain_task_context(&snapshot.tasks);
+    let current_prompt_seq =
+        snapshot.events.iter().rev().find_map(|event| {
+            matches!(event.kind, BrainEventKind::Prompt { .. }).then_some(event.seq)
+        });
     let events = snapshot
         .events
         .iter()
@@ -1666,7 +1671,16 @@ fn named_brain_provider_messages(snapshot: &crate::brain::store::BrainSnapshot) 
         .into_iter()
         .rev()
         .map(|event| match &event.kind {
-            BrainEventKind::Prompt { text } => Message::user(format!("[{}]\n{text}", event.sender)),
+            BrainEventKind::Prompt { text } => {
+                let prompt = format!("[{}]\n{text}", event.sender);
+                Message::user(
+                    task_context
+                        .as_ref()
+                        .filter(|_| Some(event.seq) == current_prompt_seq)
+                        .map(|context| format!("{context}\n\n{prompt}"))
+                        .unwrap_or(prompt),
+                )
+            }
             BrainEventKind::ParticipantMessage { text } => {
                 Message::user(format!("[participant {}]\n{text}", event.sender))
             }
@@ -1779,6 +1793,126 @@ fn named_brain_provider_messages(snapshot: &crate::brain::store::BrainSnapshot) 
         }
     }
     messages
+}
+
+const MAX_PROVIDER_TASKS: usize = 12;
+const MAX_PROVIDER_TASK_ID_CHARS: usize = 48;
+const MAX_PROVIDER_TASK_CONTENT_CHARS: usize = 160;
+
+/// Build bounded, deterministic request context from the authoritative task
+/// projection. Completed work is deliberately omitted. Unfinished work is
+/// ordered by lifecycle (in progress, then pending), priority, and finally its
+/// stable list position. The first in-progress item is the only state the
+/// current task model permits us to identify as current.
+fn named_brain_task_context(tasks: &[crate::brain::tasks::BrainTask]) -> Option<String> {
+    use crate::brain::tasks::{BrainTaskPriority, BrainTaskStatus};
+
+    let status_rank = |status: &BrainTaskStatus| match status {
+        BrainTaskStatus::InProgress => 0,
+        BrainTaskStatus::Pending => 1,
+        BrainTaskStatus::Completed => 2,
+    };
+    let priority_rank = |priority: &BrainTaskPriority| match priority {
+        BrainTaskPriority::High => 0,
+        BrainTaskPriority::Medium => 1,
+        BrainTaskPriority::Low => 2,
+    };
+    let priority_name = |priority: &BrainTaskPriority| match priority {
+        BrainTaskPriority::High => "high",
+        BrainTaskPriority::Medium => "medium",
+        BrainTaskPriority::Low => "low",
+    };
+
+    let mut unfinished = tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| task.status != BrainTaskStatus::Completed)
+        .collect::<Vec<_>>();
+    if unfinished.is_empty() {
+        return None;
+    }
+    unfinished.sort_by_key(|(position, task)| {
+        (
+            status_rank(&task.status),
+            priority_rank(&task.priority),
+            *position,
+        )
+    });
+
+    let in_progress = unfinished
+        .iter()
+        .filter(|(_, task)| task.status == BrainTaskStatus::InProgress)
+        .count();
+    let pending = unfinished.len() - in_progress;
+    let omitted = unfinished.len().saturating_sub(MAX_PROVIDER_TASKS);
+    unfinished.truncate(MAX_PROVIDER_TASKS);
+
+    let render = |task: &crate::brain::tasks::BrainTask| {
+        format!(
+            "[{}] {} — {}",
+            priority_name(&task.priority),
+            bounded_task_field(&task.id, MAX_PROVIDER_TASK_ID_CHARS),
+            bounded_task_field(&task.content, MAX_PROVIDER_TASK_CONTENT_CHARS),
+        )
+    };
+
+    let mut lines = vec![
+        "[Active Brain task plan — authoritative snapshot]".to_string(),
+        format!("Unfinished: {in_progress} in progress, {pending} pending."),
+    ];
+    let mut remaining = unfinished.as_slice();
+    if let Some((_, current)) = remaining
+        .first()
+        .filter(|(_, task)| task.status == BrainTaskStatus::InProgress)
+    {
+        lines.push(format!("Current task: {}", render(current)));
+        remaining = &remaining[1..];
+    } else {
+        lines.push("Current task: none marked in progress.".to_string());
+    }
+
+    let other_in_progress = remaining
+        .iter()
+        .take_while(|(_, task)| task.status == BrainTaskStatus::InProgress)
+        .collect::<Vec<_>>();
+    if !other_in_progress.is_empty() {
+        lines.push("Other in-progress tasks:".to_string());
+        lines.extend(
+            other_in_progress
+                .iter()
+                .map(|(_, task)| format!("- {}", render(task))),
+        );
+    }
+    let pending_tasks = remaining
+        .iter()
+        .filter(|(_, task)| task.status == BrainTaskStatus::Pending)
+        .collect::<Vec<_>>();
+    if !pending_tasks.is_empty() {
+        lines.push("Pending tasks:".to_string());
+        lines.extend(
+            pending_tasks
+                .iter()
+                .map(|(_, task)| format!("- {}", render(task))),
+        );
+    }
+    if omitted > 0 {
+        lines.push(format!("… {omitted} more unfinished task(s) omitted."));
+    }
+    Some(lines.join("\n"))
+}
+
+fn bounded_task_field(value: &str, max_chars: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        normalized
+    } else {
+        let mut bounded = normalized
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
+        bounded.push('…');
+        bounded
+    }
 }
 
 fn ensure_named_brain_store_environment(
@@ -2792,6 +2926,7 @@ mod handler_tests {
         AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
         BrainEvent, BrainEventKind, BrainId, BrainSnapshot, ProgramLanguage,
     };
+    use crate::brain::tasks::{BrainTask, BrainTaskPriority, BrainTaskStatus};
 
     #[test]
     fn messages_endpoint_forwards_the_complete_caller_owned_context() {
@@ -2923,6 +3058,200 @@ mod handler_tests {
             created_ms: 0,
             kind,
         }
+    }
+
+    fn provider_context_snapshot(tasks: Vec<BrainTask>) -> BrainSnapshot {
+        BrainSnapshot {
+            brain_id: BrainId(uuid::Uuid::nil()),
+            name: "shared".into(),
+            environment: BrainEnvironment {
+                machine: "box.local".into(),
+                workspace: "/workspace".into(),
+                generation: 1,
+            },
+            revision: 2,
+            events: vec![
+                event(
+                    1,
+                    "driver",
+                    BrainEventKind::TaskListReplaced {
+                        tasks: vec![BrainTask {
+                            id: "raw-completed-event".into(),
+                            content: "must not enter provider history".into(),
+                            status: BrainTaskStatus::Completed,
+                            priority: BrainTaskPriority::High,
+                        }],
+                    },
+                ),
+                event(
+                    2,
+                    "driver",
+                    BrainEventKind::Prompt {
+                        text: "continue the work".into(),
+                    },
+                ),
+            ],
+            program_stack: Vec::new(),
+            attachments: Vec::new(),
+            runner_lease: None,
+            runner_handoff: None,
+            runs: Vec::new(),
+            tasks,
+            schedules: Vec::new(),
+            pending_schedule_dues: Vec::new(),
+        }
+    }
+
+    fn task(
+        id: impl Into<String>,
+        content: impl Into<String>,
+        status: BrainTaskStatus,
+        priority: BrainTaskPriority,
+    ) -> BrainTask {
+        BrainTask {
+            id: id.into(),
+            content: content.into(),
+            status,
+            priority,
+        }
+    }
+
+    #[test]
+    fn provider_context_distinguishes_current_plan_and_pending_work() {
+        let snapshot = provider_context_snapshot(vec![
+            task(
+                "done",
+                "already finished",
+                BrainTaskStatus::Completed,
+                BrainTaskPriority::High,
+            ),
+            task(
+                "later-low",
+                "pending low",
+                BrainTaskStatus::Pending,
+                BrainTaskPriority::Low,
+            ),
+            task(
+                "current-low",
+                "second in progress",
+                BrainTaskStatus::InProgress,
+                BrainTaskPriority::Low,
+            ),
+            task(
+                "current-high",
+                "first\n\t in progress",
+                BrainTaskStatus::InProgress,
+                BrainTaskPriority::High,
+            ),
+            task(
+                "later-high",
+                "pending high",
+                BrainTaskStatus::Pending,
+                BrainTaskPriority::High,
+            ),
+        ]);
+
+        let messages = named_brain_provider_messages(&snapshot);
+        assert_eq!(messages.len(), 1, "task journal events stay out of history");
+        let text = messages[0].text_content();
+        assert!(text.contains("Unfinished: 2 in progress, 2 pending."));
+        assert!(text.contains("Current task: [high] current-high — first in progress"));
+        assert!(text.contains("Other in-progress tasks:\n- [low] current-low"));
+        assert!(text.contains("Pending tasks:\n- [high] later-high"));
+        assert!(text.find("later-high").unwrap() < text.find("later-low").unwrap());
+        assert!(!text.contains("already finished"));
+        assert!(!text.contains("raw-completed-event"));
+        assert!(!text.contains("TaskListReplaced"));
+    }
+
+    #[test]
+    fn provider_task_context_is_bounded_and_reports_truncation() {
+        let tasks = (0..15)
+            .map(|index| {
+                task(
+                    format!("pending-{index}-{}", "i".repeat(80)),
+                    format!("task {index} {}", "content ".repeat(40)),
+                    BrainTaskStatus::Pending,
+                    BrainTaskPriority::Medium,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let context = named_brain_task_context(&tasks).expect("unfinished task context");
+        assert!(context.contains("Current task: none marked in progress."));
+        assert!(context.contains("… 3 more unfinished task(s) omitted."));
+        assert_eq!(
+            context
+                .lines()
+                .filter(|line| line.starts_with("- ["))
+                .count(),
+            12
+        );
+        assert!(context.find("pending-0-").unwrap() < context.find("pending-1-").unwrap());
+        assert!(context.contains("pending-11-"));
+        assert!(!context.contains("pending-12-"));
+        assert!(context.lines().all(|line| line.chars().count() < 230));
+    }
+
+    #[test]
+    fn empty_and_completed_only_lists_add_no_provider_context() {
+        for tasks in [
+            Vec::new(),
+            vec![task(
+                "done",
+                "finished",
+                BrainTaskStatus::Completed,
+                BrainTaskPriority::High,
+            )],
+        ] {
+            let messages = named_brain_provider_messages(&provider_context_snapshot(tasks));
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].text_content(), "[driver]\ncontinue the work");
+        }
+    }
+
+    #[test]
+    fn restarted_snapshot_reinjects_durable_task_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let tasks = vec![task(
+            "resume",
+            "verify the restored task projection",
+            BrainTaskStatus::InProgress,
+            BrainTaskPriority::High,
+        )];
+        {
+            let store =
+                crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+            store
+                .push(
+                    "shared",
+                    "provider",
+                    BrainEventKind::TaskListReplaced {
+                        tasks: tasks.clone(),
+                    },
+                )
+                .unwrap();
+        }
+
+        let restarted =
+            crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().into()));
+        restarted
+            .push(
+                "shared",
+                "driver",
+                BrainEventKind::Prompt {
+                    text: "resume after reconnect".into(),
+                },
+            )
+            .unwrap();
+        let snapshot = restarted.snapshot("shared").unwrap();
+        assert_eq!(snapshot.tasks, tasks);
+
+        let messages = named_brain_provider_messages(&snapshot);
+        assert_eq!(messages.len(), 1);
+        let text = messages[0].text_content();
+        assert!(text.contains("Current task: [high] resume"));
+        assert!(text.contains("resume after reconnect"));
     }
 
     #[test]
