@@ -838,7 +838,11 @@ still blocks the corresponding Brain phase until it is unified.
 - [ ] Give `$VISUAL`/`$EDITOR` a correct terminal-protocol handoff. Leave Finch raw/live rendering,
   enter a clean alternate screen for Vim and similar full-screen editors, restore terminal modes on
   every exit path, discard the editor screen instead of retaining its `~` rows in scrollback, then
-  invalidate and redraw Finch's live region exactly once.
+  invalidate and redraw Finch's live region exactly once. Reproduce the observed iTerm path where
+  Finch enters an alternate screen and Vim enters/leaves its own non-stacking alternate screen:
+  the proposal buffer and `~` rows currently leak into primary scrollback, followed by duplicated
+  clipped live rows. Test editor success, rejection, nonzero exit, and signal/error restoration
+  against a fake full-screen editor that emits the relevant terminal sequences.
 - [ ] Preserve visible turn ownership while input queues behind an active provider/repair/tool
   turn. A later user prompt must remain a distinct queued WorkUnit and cannot appear inside the
   earlier repair's source or tool block; program source, diagnostics, bounded repair, tool activity,
