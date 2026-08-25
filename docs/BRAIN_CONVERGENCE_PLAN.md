@@ -264,7 +264,11 @@ consultants do not receive `brain:approve`, default observers receive only read
 and attach authority, and elevated scopes require an explicit bootstrap grant
 within the role's ceiling. A `brain:control` holder can delegate only a subset of
 its live authority and remaining lifetime; bounded signed ancestry makes
-revoking any ancestor revoke every descendant. A compact status form should make the live condition obvious, for
+revoking any ancestor revoke every descendant. A remote bootstrap credential is
+used only to reserve an attachment. The daemon then returns an attenuated child
+credential signed over the exact attachment and connection identities, with
+`brain:attach` removed. It cannot create or operate a sibling connection, and
+revoking its bootstrap ancestor invalidates it. A compact status form should make the live condition obvious, for
 example `brain: compiler-work · driver · runner online` or
 `brain: compiler-work · consultant · read-only`.
 
@@ -473,6 +477,14 @@ values, not bearer authority: a second local client cannot watch, submit, acknow
 detach through them, and transport disconnect drops that in-memory authority. A live
 two-connection regression exercises the hostile replay path while the owning connection remains
 usable.
+Remote participant attachments use the corresponding cryptographic boundary:
+the attachment bootstrap response replaces the broad participant credential
+with a signed child bound to that exact attachment and connection. Ordinary
+WebSocket commands require that binding, an attachment-bound child cannot
+reserve another attachment, and a live same-subject/two-connection regression
+proves that copying the sibling's public IDs does not confer authority. Pending
+reservations also count as live participants during provisional-Brain cleanup,
+so one disconnect cannot erase a concurrently authenticating console.
 Brain approval continuations are now keyed by exact
 `(brain_id, request_seq, approval_id)` identity so a stale sequence cannot consume a live request.
 Tool inputs and approval detail/decision values use the recursive schema-native `JsonValue` union

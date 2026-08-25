@@ -836,8 +836,11 @@ still blocks the corresponding Brain phase until it is unified.
   canonical log; disconnect/cancellation fails the suspended continuation closed. Remote clients
   now bootstrap into signed, expiring, revocable credentials bound to Brain ID, environment
   generation, subject, role, and independent scopes; every ordinary route rechecks that live
-  audience and the exact attachment identity. Still define explicit delegation and handoff
-  semantics.
+  audience and the exact attachment identity. Attachment bootstrap now attenuates that credential
+  into a signed child bound to the exact attachment/connection pair and removes `brain:attach`;
+  sibling replay fails even for the same subject, ancestor revocation reaches the child, and a
+  pending authenticated reservation prevents another detach from deleting the provisional Brain.
+  Still finish the remaining explicit invitation/delegation and handoff semantics.
 - [x] Persist a frontend attachment identity across frontend process restarts, not merely reconnects
   in one process, while keeping the daemon cursor authoritative. The client stores only the opaque
   attachment ID, keyed by durable Brain ID plus console slot/subject/role; the daemon still owns the
