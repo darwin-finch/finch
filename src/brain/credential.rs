@@ -20,6 +20,7 @@ const CREDENTIAL_VERSION: u32 = 1;
 const TOKEN_PREFIX: &str = "finch-brain-v1";
 const SIGNING_KEY_FILE: &str = "brain-credential.key";
 const REVOCATIONS_FILE: &str = "brain-credential-revocations.json";
+const MAX_DELEGATION_DEPTH: usize = 8;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -101,6 +102,11 @@ pub struct BrainCredentialClaims {
     pub environment_generation: u64,
     pub role: AttachmentRole,
     pub scopes: BTreeSet<BrainCredentialScope>,
+    /// Oldest-to-newest credential IDs that delegated this credential.
+    /// Revoking any ancestor therefore revokes every descendant without a
+    /// mutable child index.
+    #[serde(default)]
+    pub delegation_chain: Vec<uuid::Uuid>,
     pub issued_ms: u64,
     pub expires_ms: u64,
 }
@@ -135,6 +141,32 @@ impl BrainCredentialClaims {
         }
         Ok(())
     }
+
+    /// Derive the ancestry for an attenuated child credential. Delegation is
+    /// itself controlled authority: a child may neither gain scopes nor
+    /// outlive its parent.
+    pub fn attenuate(
+        &self,
+        child_scopes: &BTreeSet<BrainCredentialScope>,
+        child_ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<Vec<uuid::Uuid>> {
+        if !self.permits(BrainCredentialScope::BrainControl) {
+            anyhow::bail!("Brain credential does not grant delegation control");
+        }
+        if !child_scopes.is_subset(&self.scopes) {
+            anyhow::bail!("delegated Brain credential scopes exceed the delegator");
+        }
+        if child_ttl_ms > self.expires_ms.saturating_sub(now_ms) {
+            anyhow::bail!("delegated Brain credential outlives the delegator");
+        }
+        let mut chain = self.delegation_chain.clone();
+        chain.push(self.credential_id);
+        if chain.len() > MAX_DELEGATION_DEPTH {
+            anyhow::bail!("Brain credential delegation chain is too deep");
+        }
+        Ok(chain)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +178,7 @@ pub struct BrainCredentialRequest {
     pub environment_generation: u64,
     pub role: AttachmentRole,
     pub scopes: BTreeSet<BrainCredentialScope>,
+    pub delegation_chain: Vec<uuid::Uuid>,
     pub ttl_ms: u64,
 }
 
@@ -198,6 +231,17 @@ impl BrainCredentialAuthority {
         if request.scopes.is_empty() {
             anyhow::bail!("Brain credential must grant at least one scope");
         }
+        if request.delegation_chain.len() > MAX_DELEGATION_DEPTH {
+            anyhow::bail!("Brain credential delegation chain is too deep");
+        }
+        let unique_ancestors = request
+            .delegation_chain
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if unique_ancestors.len() != request.delegation_chain.len() {
+            anyhow::bail!("Brain credential delegation chain contains a cycle");
+        }
         let claims = BrainCredentialClaims {
             version: CREDENTIAL_VERSION,
             credential_id: uuid::Uuid::new_v4(),
@@ -208,6 +252,7 @@ impl BrainCredentialAuthority {
             environment_generation: request.environment_generation,
             role: request.role,
             scopes: request.scopes,
+            delegation_chain: request.delegation_chain,
             issued_ms: now_ms,
             expires_ms: now_ms
                 .checked_add(request.ttl_ms)
@@ -252,11 +297,15 @@ impl BrainCredentialAuthority {
         if now_ms >= claims.expires_ms {
             anyhow::bail!("Brain credential has expired");
         }
-        if self
+        let revoked = self
             .revoked
             .lock()
-            .expect("Brain credential revocation lock poisoned")
-            .contains(&claims.credential_id)
+            .expect("Brain credential revocation lock poisoned");
+        if revoked.contains(&claims.credential_id)
+            || claims
+                .delegation_chain
+                .iter()
+                .any(|ancestor| revoked.contains(ancestor))
         {
             anyhow::bail!("Brain credential has been revoked");
         }
@@ -386,6 +435,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            delegation_chain: Vec::new(),
             ttl_ms,
         }
     }
@@ -432,6 +482,80 @@ mod tests {
 
         let restarted = BrainCredentialAuthority::load_or_create(temp.path()).unwrap();
         assert!(restarted.verify(&token, 10_500).is_err());
+    }
+
+    #[test]
+    fn revoking_an_ancestor_revokes_every_delegated_descendant() {
+        let authority = BrainCredentialAuthority::ephemeral([7; 32]);
+        let parent_token = authority.issue(request(10_000), 10_000).unwrap();
+        let parent = authority.verify(&parent_token, 10_100).unwrap();
+
+        let mut child_request = request(5_000);
+        child_request.subject = "bob@desktop.local".into();
+        child_request.role = AttachmentRole::Observer;
+        child_request.scopes = default_participant_scopes(AttachmentRole::Observer);
+        child_request.delegation_chain = vec![parent.credential_id];
+        let child_token = authority.issue(child_request, 10_100).unwrap();
+        let child = authority.verify(&child_token, 10_200).unwrap();
+
+        let mut grandchild_request = request(1_000);
+        grandchild_request.subject = "carol@tablet.local".into();
+        grandchild_request.role = AttachmentRole::Observer;
+        grandchild_request.scopes = default_participant_scopes(AttachmentRole::Observer);
+        grandchild_request.delegation_chain = vec![parent.credential_id, child.credential_id];
+        let grandchild_token = authority.issue(grandchild_request, 10_200).unwrap();
+        assert!(authority.verify(&grandchild_token, 10_300).is_ok());
+
+        authority.revoke(parent.credential_id).unwrap();
+        assert!(authority.verify(&child_token, 10_300).is_err());
+        assert!(authority.verify(&grandchild_token, 10_300).is_err());
+    }
+
+    #[test]
+    fn malformed_or_unbounded_delegation_chains_fail_closed() {
+        let authority = BrainCredentialAuthority::ephemeral([8; 32]);
+        let repeated = uuid::Uuid::new_v4();
+        let mut cyclic = request(1_000);
+        cyclic.delegation_chain = vec![repeated, repeated];
+        assert!(authority.issue(cyclic, 10_000).is_err());
+
+        let mut too_deep = request(1_000);
+        too_deep.delegation_chain = (0..=MAX_DELEGATION_DEPTH)
+            .map(|_| uuid::Uuid::new_v4())
+            .collect();
+        assert!(authority.issue(too_deep, 10_000).is_err());
+    }
+
+    #[test]
+    fn attenuation_cannot_add_authority_or_outlive_its_parent() {
+        let authority = BrainCredentialAuthority::ephemeral([9; 32]);
+        let mut parent_request = request(5_000);
+        parent_request.scopes.insert(BrainCredentialScope::BrainControl);
+        parent_request.scopes.insert(BrainCredentialScope::BrainApprove);
+        let parent_token = authority.issue(parent_request, 10_000).unwrap();
+        let parent = authority.verify(&parent_token, 10_100).unwrap();
+
+        let child_scopes = [BrainCredentialScope::BrainRead]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            parent.attenuate(&child_scopes, 1_000, 10_100).unwrap(),
+            vec![parent.credential_id]
+        );
+
+        let expanded = [
+            BrainCredentialScope::BrainRead,
+            BrainCredentialScope::EnvironmentAdmin,
+        ]
+        .into_iter()
+        .collect();
+        assert!(parent.attenuate(&expanded, 1_000, 10_100).is_err());
+        assert!(parent.attenuate(&child_scopes, 5_000, 10_100).is_err());
+
+        let ordinary = authority
+            .verify(&authority.issue(request(5_000), 10_000).unwrap(), 10_100)
+            .unwrap();
+        assert!(ordinary.attenuate(&child_scopes, 1_000, 10_100).is_err());
     }
 
     #[test]

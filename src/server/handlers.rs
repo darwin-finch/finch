@@ -129,8 +129,23 @@ async fn check_brain_bootstrap_access(
     addr: SocketAddr,
     headers: &HeaderMap,
 ) -> Result<(), Response> {
-    if addr.ip().is_loopback() {
+    if has_brain_bootstrap_access(server, addr, headers).await {
         return Ok(());
+    }
+    Err((
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({"error": "brain password required"})),
+    )
+        .into_response())
+}
+
+async fn has_brain_bootstrap_access(
+    server: &AgentServer,
+    addr: SocketAddr,
+    headers: &HeaderMap,
+) -> bool {
+    if addr.ip().is_loopback() {
+        return true;
     }
     let supplied = headers
         .get(BRAIN_PASSWORD_HEADER)
@@ -142,15 +157,7 @@ async fn check_brain_bootstrap_access(
                 .and_then(|value| value.strip_prefix("Bearer "))
         })
         .unwrap_or_default();
-    if !supplied.is_empty() && server.check_brain_password(supplied).await {
-        Ok(())
-    } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "brain password required"})),
-        )
-            .into_response())
-    }
+    !supplied.is_empty() && server.check_brain_password(supplied).await
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -230,7 +237,6 @@ async fn issue_named_brain_credential(
     Path(name): Path<String>,
     Json(request): Json<IssueNamedBrainCredentialRequest>,
 ) -> Result<Json<IssueNamedBrainCredentialResponse>, Response> {
-    check_brain_bootstrap_access(&server, addr, &headers).await?;
     if request.role == crate::brain::shared::AttachmentRole::Runner {
         return Err(brain_auth_error(
             StatusCode::BAD_REQUEST,
@@ -241,6 +247,30 @@ async fn issue_named_brain_credential(
         .shared_brains()
         .snapshot(&name)
         .map_err(|error| AppError(error).into_response())?;
+    let now_ms = unix_epoch_millis();
+    let delegator = if has_brain_bootstrap_access(&server, addr, &headers).await {
+        None
+    } else {
+        let token = bearer_token(&headers).ok_or_else(|| {
+            brain_auth_error(
+                StatusCode::UNAUTHORIZED,
+                "Brain bootstrap password or delegating credential required",
+            )
+        })?;
+        let claims = server
+            .brain_credentials()
+            .verify(token, now_ms)
+            .map_err(|error| brain_auth_error(StatusCode::UNAUTHORIZED, error.to_string()))?;
+        claims
+            .require_audience(
+                snapshot.brain_id,
+                &name,
+                snapshot.environment.generation,
+                crate::brain::credential::BrainCredentialScope::BrainControl,
+            )
+            .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
+        Some(claims)
+    };
     let ttl_ms = request
         .ttl_ms
         .unwrap_or(DEFAULT_BRAIN_CREDENTIAL_TTL_MS)
@@ -255,6 +285,13 @@ async fn issue_named_brain_credential(
             "requested Brain credential scopes exceed this participant role",
         ));
     }
+    let delegation_chain = if let Some(delegator) = &delegator {
+        delegator
+            .attenuate(&scopes, ttl_ms, now_ms)
+            .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?
+    } else {
+        Vec::new()
+    };
     let token = server
         .brain_credentials()
         .issue(
@@ -266,14 +303,15 @@ async fn issue_named_brain_credential(
                 environment_generation: snapshot.environment.generation,
                 role: request.role,
                 scopes,
+                delegation_chain,
                 ttl_ms,
             },
-            unix_epoch_millis(),
+            now_ms,
         )
         .map_err(|error| AppError(error).into_response())?;
     let claims = server
         .brain_credentials()
-        .verify(&token, unix_epoch_millis())
+        .verify(&token, now_ms)
         .map_err(|error| AppError(error).into_response())?;
     Ok(Json(IssueNamedBrainCredentialResponse { token, claims }))
 }

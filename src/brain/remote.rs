@@ -985,6 +985,7 @@ mod tests {
                 scopes: super::super::credential::default_participant_scopes(
                     AttachmentRole::Driver,
                 ),
+                delegation_chain: Vec::new(),
                 issued_ms: 0,
                 expires_ms: u64::MAX,
             },
@@ -1236,6 +1237,7 @@ mod tests {
                 scopes: super::super::credential::default_participant_scopes(
                     AttachmentRole::Driver,
                 ),
+                delegation_chain: Vec::new(),
                 issued_ms: 0,
                 expires_ms: u64::MAX,
             },
