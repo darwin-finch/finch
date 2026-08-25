@@ -64,19 +64,7 @@ impl ServiceDiscovery {
             .and_then(|h| h.into_string().ok())
             .unwrap_or_else(|| "localhost".to_string());
 
-        // Build TXT record properties
-        let mut properties = HashMap::new();
-        properties.insert("model".to_string(), self.config.model.clone());
-        properties.insert("description".to_string(), self.config.description.clone());
-        properties.insert(
-            "capabilities".to_string(),
-            self.config.capabilities.join(","),
-        );
-        properties.insert("version".to_string(), env!("CARGO_PKG_VERSION").to_string());
-        // Peer token — so auto-discovered machines can authenticate without manual setup
-        properties.insert("token".to_string(), crate::peer_token::TOKEN.clone());
-        // Cute node name — shown in the TUI when this machine is discovered
-        properties.insert("name".to_string(), crate::node_name::NAME.clone());
+        let properties = advertised_properties(&self.config);
 
         // Create service info
         let service_info = ServiceInfo::new(
@@ -118,5 +106,51 @@ impl ServiceDiscovery {
 
         tracing::info!("Stopped advertising service: {}", self.instance_name);
         Ok(())
+    }
+}
+
+/// Public discovery metadata is deliberately an authority-free allowlist.
+///
+/// mDNS TXT records are visible to every listener on the local network. They
+/// may describe how to reach Finch, but must never contain credentials that
+/// authorize a listener to use it.
+fn advertised_properties(config: &ServiceConfig) -> HashMap<String, String> {
+    HashMap::from([
+        ("model".to_string(), config.model.clone()),
+        ("description".to_string(), config.description.clone()),
+        ("capabilities".to_string(), config.capabilities.join(",")),
+        (
+            "version".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ),
+        // Cute node name — shown in the TUI when this machine is discovered.
+        ("name".to_string(), crate::node_name::NAME.clone()),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mdns_properties_are_an_authority_free_allowlist() {
+        let config = ServiceConfig {
+            name: "test-finch".into(),
+            description: "test service".into(),
+            model: "test-model".into(),
+            capabilities: vec!["chat".into(), "brain".into()],
+        };
+
+        let properties = advertised_properties(&config);
+        let mut keys = properties.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+
+        assert_eq!(
+            keys,
+            ["capabilities", "description", "model", "name", "version"]
+        );
+        for forbidden in ["token", "password", "credential", "secret", "api_key"] {
+            assert!(!properties.contains_key(forbidden));
+        }
     }
 }

@@ -1,8 +1,9 @@
 /// Peer authentication token for legacy peer-administration endpoints.
 ///
 /// Generated once at first daemon start, stored in `~/.finch/peer_token`,
-/// and reused across restarts.  Broadcast in the mDNS TXT record so that
-/// auto-discovered machines receive it automatically.
+/// and reused across restarts. It is never advertised through mDNS; callers
+/// using these compatibility endpoints must receive it through an explicit
+/// trusted configuration path.
 ///
 /// This token does not grant typed ProgramRuntime or named-Brain authority. The
 /// header name is `X-Finch-Token`.

@@ -6212,18 +6212,13 @@ impl Forth {
                     self.out
                         .push_str("peers-discover: no finch instances found on LAN\n");
                 } else {
-                    for (host, port, name, token) in &found {
+                    for (host, port, name) in &found {
                         let addr = format!("{host}:{port}");
                         if !self.peers.contains(&addr) {
                             self.peers.push(addr.clone());
                             let meta = self.peer_meta.entry(addr.clone()).or_default();
                             if !name.is_empty() && meta.label.is_none() {
                                 meta.label = Some(name.clone());
-                            }
-                            if let Some(t) = token {
-                                if meta.token.is_none() {
-                                    meta.token = Some(t.clone());
-                                }
                             }
                             self.out.push_str(&format!(
                                 "  + {}\n",
@@ -6248,7 +6243,7 @@ impl Forth {
                     ));
                 } else {
                     let mut added = 0usize;
-                    for (host, port, name, token) in &found {
+                    for (host, port, name) in &found {
                         let addr = format!("{host}:{port}");
                         if !self.peers.contains(&addr) {
                             self.peers.push(addr.clone());
@@ -6257,11 +6252,6 @@ impl Forth {
                         let meta = self.peer_meta.entry(addr).or_default();
                         if !name.is_empty() && meta.label.is_none() {
                             meta.label = Some(name.clone());
-                        }
-                        if let Some(t) = token {
-                            if meta.token.is_none() {
-                                meta.token = Some(t.clone());
-                            }
                         }
                         if !meta.tags.contains(&"all".to_string()) {
                             meta.tags.push("all".to_string());
@@ -10924,26 +10914,25 @@ fn friendly_peer_name(full_name: &str) -> String {
 }
 
 /// Public entry point for background boot discovery (called from event_loop).
-/// Returns (host, port, friendly_name) triples.
-/// (host, port, friendly_name, token)
-pub fn run_peers_discover_pub(timeout_ms: u64) -> Vec<(String, u16, String, Option<String>)> {
+/// Returns authority-free (host, port, friendly_name) triples.
+pub fn run_peers_discover_pub(timeout_ms: u64) -> Vec<(String, u16, String)> {
     run_peers_discover(timeout_ms)
 }
 
-/// Synchronous mDNS discovery — returns (host, port, friendly_name, token) tuples.
+/// Synchronous mDNS discovery — returns authority-free endpoint metadata.
 /// Blocks for at most `timeout_ms` milliseconds.
-fn run_peers_discover(timeout_ms: u64) -> Vec<(String, u16, String, Option<String>)> {
+fn run_peers_discover(timeout_ms: u64) -> Vec<(String, u16, String)> {
     use std::time::Duration;
     let timeout = Duration::from_millis(timeout_ms);
 
-    let inner = || -> anyhow::Result<Vec<(String, u16, String, Option<String>)>> {
+    let inner = || -> anyhow::Result<Vec<(String, u16, String)>> {
         let client = crate::service::discovery_client::ServiceDiscoveryClient::new()?;
         let services = client.discover(timeout)?;
         Ok(services
             .into_iter()
             .map(|s| {
                 let name = friendly_peer_name(&s.name);
-                (s.host, s.port, name, s.token)
+                (s.host, s.port, name)
             })
             .collect())
     };
