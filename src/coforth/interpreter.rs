@@ -7873,7 +7873,7 @@ impl Forth {
                         .header("Content-Type", "application/zip")
                         .body(zip_bytes);
                     if let Some(t) = token {
-                        req = req.header(crate::peer_token::HEADER, t);
+                        req = req.header(super::scatter::LEGACY_PEER_TOKEN_HEADER, t);
                     }
                     req.send().await?.text().await
                 });
@@ -7929,7 +7929,7 @@ impl Forth {
                         .unwrap_or_default();
                     let mut req = client.get(&url);
                     if let Some(t) = token {
-                        req = req.header(crate::peer_token::HEADER, t);
+                        req = req.header(super::scatter::LEGACY_PEER_TOKEN_HEADER, t);
                     }
                     let resp = req.send().await?;
                     if !resp.status().is_success() {
@@ -10521,7 +10521,7 @@ fn run_push_one(addr: &str, text: &str, from: Option<&str>, token: Option<&str>)
             .unwrap_or_default();
         let mut req = client.post(&url);
         if let Some(t) = &token {
-            req = req.header(crate::peer_token::HEADER, t.as_str());
+            req = req.header(super::scatter::LEGACY_PEER_TOKEN_HEADER, t.as_str());
         }
         let _ = req.json(&body).send().await;
     };
@@ -10586,7 +10586,7 @@ fn run_hash_scatter(
                 };
                 let mut req = client.post(&url).json(&body);
                 if let Some(t) = tokens.get(peer) {
-                    req = req.header(crate::peer_token::HEADER, t.as_str());
+                    req = req.header(super::scatter::LEGACY_PEER_TOKEN_HEADER, t.as_str());
                 }
                 async move {
                     let _ = req.send().await;

@@ -6,6 +6,9 @@
 /// All requests fire concurrently and results are labelled by peer address.
 use futures::future::join_all;
 
+/// Header spelling retained for outbound requests to legacy Co-Forth peers.
+pub(super) const LEGACY_PEER_TOKEN_HEADER: &str = "x-finch-token";
+
 pub struct PeerResult {
     pub peer: String,
     pub output: String,
@@ -158,7 +161,7 @@ async fn exec_on_peer(
 
     let mut req = client.post(&url);
     if let Some(t) = token {
-        req = req.header(crate::peer_token::HEADER, t);
+        req = req.header(LEGACY_PEER_TOKEN_HEADER, t);
     }
     let resp = req
         .json(&serde_json::json!({ "cmd": "bash", "args": ["-c", cmd] }))
@@ -248,7 +251,7 @@ async fn define_on_peer(addr: &str, source: &str, token: Option<&str>) -> anyhow
 
     let mut req = client.post(&url);
     if let Some(t) = token {
-        req = req.header(crate::peer_token::HEADER, t);
+        req = req.header(LEGACY_PEER_TOKEN_HEADER, t);
     }
     let resp = req
         .json(&serde_json::json!({ "source": source }))
@@ -295,7 +298,7 @@ async fn eval_on_peer(
 
     let mut req = client.post(&url);
     if let Some(t) = token {
-        req = req.header(crate::peer_token::HEADER, t);
+        req = req.header(LEGACY_PEER_TOKEN_HEADER, t);
     }
     let resp = req
         .json(&body)
@@ -315,4 +318,14 @@ async fn eval_on_peer(
         .unwrap_or_default();
 
     Ok((output, stack, error, compute_ms, debt_warning, forth_back))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LEGACY_PEER_TOKEN_HEADER;
+
+    #[test]
+    fn legacy_peer_token_header_spelling_is_preserved() {
+        assert_eq!(LEGACY_PEER_TOKEN_HEADER, "x-finch-token");
+    }
 }
