@@ -229,6 +229,8 @@ impl EventLoop {
     /// environment-runner lease it owns. Runner authority and conversation
     /// participation remain distinct, but both now observe one event stream.
     async fn attach_home_brain(&mut self) -> Result<()> {
+        self.home_watch_epoch = self.home_watch_epoch.wrapping_add(1);
+        let watch_epoch = self.home_watch_epoch;
         let base = self
             .daemon_base_url
             .as_deref()
@@ -247,42 +249,107 @@ impl EventLoop {
                 &self.session_label,
             )
             .await?;
-        let mut incoming = client.watch().await?;
+        let mut incoming = client.watch_with_errors().await?;
         let snapshot = match incoming.recv().await {
-            Some(crate::brain::store::BrainWireMessage::Snapshot { brain }) => brain,
-            Some(crate::brain::store::BrainWireMessage::Event { .. }) => {
+            Some(Ok(crate::brain::store::BrainWireMessage::Snapshot { brain })) => brain,
+            Some(Ok(crate::brain::store::BrainWireMessage::Event { .. })) => {
                 anyhow::bail!("home Brain event stream did not begin with a snapshot")
+            }
+            Some(Err(error)) => {
+                return Err(error.context("home Brain event stream failed before its snapshot"));
             }
             None => anyhow::bail!("home Brain event stream closed before its snapshot"),
         };
         client.target.machine = snapshot.environment.machine.clone();
         let target_name = client.target.display_name();
+        client.acknowledge(snapshot.revision).await?;
         self.home_brain = Some(client);
         self.render_remote_brain_message(crate::brain::store::BrainWireMessage::Snapshot {
             brain: snapshot.clone(),
         })
         .await?;
-        if let Some(client) = self.home_brain.as_mut() {
-            client.acknowledge(snapshot.revision).await?;
-        }
-
         let event_tx = self.event_tx.clone();
         tokio::task::spawn_local(async move {
+            let mut watch_error = None;
             while let Some(message) = incoming.recv().await {
-                if event_tx
-                    .send(ReplEvent::RemoteBrainMessage {
-                        target: target_name.clone(),
-                        message,
-                    })
-                    .is_err()
-                {
-                    break;
+                match message {
+                    Ok(message) => {
+                        if event_tx
+                            .send(ReplEvent::HomeBrainMessage {
+                                epoch: watch_epoch,
+                                message,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        watch_error = Some(error.to_string());
+                        break;
+                    }
                 }
             }
-            let _ = event_tx.send(ReplEvent::RemoteBrainDisconnected {
-                target: target_name,
+            let _ = event_tx.send(ReplEvent::HomeBrainWatchFailed {
+                epoch: watch_epoch,
+                error: watch_error.map(|error| format!("{target_name}: {error}")),
             });
         });
+        Ok(())
+    }
+
+    fn schedule_home_brain_reconnect(&self, epoch: u64, attempt: u32) {
+        let event_tx = self.event_tx.clone();
+        let delay_ms = match attempt {
+            0 => 100,
+            1 => 250,
+            2 => 500,
+            3 => 1_000,
+            4 => 2_000,
+            _ => 5_000,
+        };
+        tokio::task::spawn_local(async move {
+            tokio::select! {
+                _ = event_tx.closed() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {
+                    let _ = event_tx.send(ReplEvent::ReconnectHomeBrain { epoch, attempt });
+                }
+            }
+        });
+    }
+
+    /// Restore both connection-scoped capabilities from durable identities.
+    async fn reconnect_home_brain(&mut self) -> Result<()> {
+        // A watch can end while the IPC connection and runner callback remain
+        // healthy. Repair that path first without disturbing runner authority.
+        if self.ipc_client.is_some() {
+            self.home_brain = None;
+            if self.attach_home_brain().await.is_ok() {
+                self.last_home_watch_error = None;
+                self.update_remote_brain_status(self.home_runner_lease_active);
+                return Ok(());
+            }
+        }
+
+        let ipc = crate::ipc::IpcClient::connect()
+            .await
+            .context("reconnect local daemon IPC")?;
+        self.ipc_client = Some(ipc);
+        let runner_state = self
+            .register_home_brain()
+            .await?
+            .context("local daemon disappeared during home Brain reconnect")?;
+        self.home_runner_lease_id = runner_state.as_ref().ok().copied();
+        self.home_runner_lease_active = self.home_runner_lease_id.is_some();
+        self.runner_brain = self
+            .home_runner_lease_active
+            .then(|| self.session_label.clone());
+        self.last_home_runner_error = runner_state.err();
+
+        self.home_brain = None;
+        self.attach_home_brain().await?;
+        self.last_home_watch_error = None;
+        self.update_remote_brain_status(self.home_runner_lease_active);
         Ok(())
     }
 

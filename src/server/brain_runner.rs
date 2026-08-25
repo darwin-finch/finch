@@ -461,11 +461,27 @@ impl BrainRunnerBroker {
         Ok(id)
     }
 
-    pub(crate) fn disconnect_connection(&self, connection_id: uuid::Uuid) {
+    pub(crate) fn disconnect_connection(
+        &self,
+        connection_id: uuid::Uuid,
+    ) -> Vec<(String, AttachmentId, ConnectionId)> {
         let mut authority = self
             .connection_authority
             .lock()
             .expect("runner connection-authority lock poisoned");
+        let attachments = authority
+            .attachments
+            .iter()
+            .filter_map(|((brain, attachment_id, attachment_connection_id), owner)| {
+                (*owner == connection_id).then(|| {
+                    (
+                        brain.clone(),
+                        *attachment_id,
+                        *attachment_connection_id,
+                    )
+                })
+            })
+            .collect();
         authority
             .identities
             .retain(|_, owner| *owner != connection_id);
@@ -478,6 +494,7 @@ impl BrainRunnerBroker {
             .write()
             .expect("runner broker lock poisoned")
             .retain(|_, registration| registration.connection_id != Some(connection_id));
+        attachments
     }
 
     /// Remove a registration only if it is still the connection that created
@@ -725,7 +742,15 @@ mod tests {
             )
             .is_err());
 
-        broker.disconnect_connection(owner);
+        let disconnected = broker.disconnect_connection(owner);
+        assert_eq!(
+            disconnected,
+            vec![(
+                "brain".to_string(),
+                attachment_id,
+                attachment_connection_id,
+            )]
+        );
         assert!(!broker.has_registration("brain", lease_id));
         assert!(broker
             .require_connection_lease(owner, "brain", lease_id)

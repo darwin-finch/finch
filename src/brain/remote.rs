@@ -1420,6 +1420,34 @@ impl AttachedBrainClient {
             }
         }
     }
+
+    /// Connect while retaining a transport failure as data. The home-console
+    /// supervisor uses this to distinguish its event watch from runner health.
+    pub async fn watch_with_errors(
+        &self,
+    ) -> Result<mpsc::UnboundedReceiver<Result<BrainWireMessage>>> {
+        let attachment = self
+            .attachment
+            .as_ref()
+            .context("client is not attached to a Brain")?;
+        match &self.transport {
+            AttachedBrainTransport::Remote(client) => {
+                let mut source = client.watch().await?;
+                let (tx, rx) = mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    while let Some(message) = source.recv().await {
+                        if tx.send(Ok(message)).is_err() {
+                            break;
+                        }
+                    }
+                });
+                Ok(rx)
+            }
+            AttachedBrainTransport::Local(ipc) => {
+                ipc.brain_watch(&self.target.brain, attachment).await
+            }
+        }
+    }
 }
 
 fn unix_epoch_millis() -> u64 {
