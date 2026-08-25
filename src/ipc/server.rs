@@ -14,7 +14,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use crate::ipc::brain_codec::{
     decode_approval_audience, decode_brain_submission, decode_environment, encode_approval_audience,
     encode_attachment, encode_brain_submission_outcome, encode_event, encode_runner_handoff,
-    encode_runner_lease, encode_snapshot,
+    encode_run, encode_runner_lease, encode_snapshot,
 };
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_service, finch_daemon};
 use crate::server::AgentServer;
@@ -571,6 +571,55 @@ impl brain_service::Server for BrainRpcService {
         }
         Promise::ok(())
     }
+
+    fn inspect_run(
+        &mut self,
+        params: brain_service::InspectRunParams,
+        mut results: brain_service::InspectRunResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let run_id = match parse_run_id(params.get_run_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let run = match self.lifecycle.inspect_run(&brain, run_id) {
+            Ok(run) => run,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        encode_run(results.get().init_run(), &run);
+        Promise::ok(())
+    }
+
+    fn cancel_run(
+        &mut self,
+        params: brain_service::CancelRunParams,
+        mut results: brain_service::CancelRunResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let connection_id = match parse_connection_id(params.get_connection_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let run_id = match parse_run_id(params.get_run_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let lifecycle = self.lifecycle.clone();
+        Promise::from_future(async move {
+            let run = lifecycle
+                .cancel_run(&brain, attachment_id, connection_id, run_id)
+                .await
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            encode_run(results.get().init_run(), &run);
+            Ok(())
+        })
+    }
 }
 
 fn parse_attachment_id(
@@ -588,6 +637,15 @@ fn parse_connection_id(
     let value = value?.to_str()?;
     uuid::Uuid::parse_str(value)
         .map(crate::brain::shared::ConnectionId)
+        .map_err(|error| capnp::Error::failed(error.to_string()))
+}
+
+fn parse_run_id(
+    value: capnp::Result<capnp::text::Reader<'_>>,
+) -> Result<crate::brain::shared::RunId, capnp::Error> {
+    let value = value?.to_str()?;
+    uuid::Uuid::parse_str(value)
+        .map(crate::brain::shared::RunId)
         .map_err(|error| capnp::Error::failed(error.to_string()))
 }
 

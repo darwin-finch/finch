@@ -419,6 +419,21 @@ impl RemoteBrainClient {
         }
     }
 
+    pub async fn cancel_run(
+        &self,
+        run_id: super::shared::RunId,
+    ) -> Result<super::shared::BrainRun> {
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+
+        match self
+            .send_remote_command(BrainRemoteCommandKind::CancelRun(run_id))
+            .await?
+        {
+            BrainRemoteReply::RunCancelled { run, .. } => Ok(run),
+            reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
+        }
+    }
+
     pub async fn disconnect(&self) -> Result<()> {
         use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
@@ -801,6 +816,20 @@ impl AttachedBrainClient {
                 Ok(())
             }
             AttachedBrainTransport::Remote(client) => client.push(kind).await,
+        }
+    }
+
+    pub async fn cancel_run(&self, run_id: super::shared::RunId) -> Result<super::shared::BrainRun> {
+        let attachment = self
+            .attachment
+            .as_ref()
+            .context("client is not attached to a Brain")?;
+        match &self.transport {
+            AttachedBrainTransport::Local(ipc) => {
+                ipc.brain_cancel_run(&self.target.brain, attachment, run_id)
+                    .await
+            }
+            AttachedBrainTransport::Remote(client) => client.cancel_run(run_id).await,
         }
     }
 

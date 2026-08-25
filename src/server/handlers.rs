@@ -1491,6 +1491,43 @@ async fn execute_remote_brain_command(
                 Err(error) => remote_brain_error(request_id, "conflict", error.to_string()),
             }
         }
+        BrainRemoteCommandKind::CancelRun(run_id) => {
+            let claims = match authorize_named_brain(
+                server,
+                headers,
+                name,
+                BrainCredentialScope::BrainSubmit,
+            ) {
+                Ok(claims) => claims,
+                Err(_) => {
+                    return remote_brain_error(
+                        request_id,
+                        "forbidden",
+                        "Brain credential no longer authorizes run cancellation",
+                    );
+                }
+            };
+            let attachment = match lifecycle.connection(name, attachment_id, connection_id) {
+                Ok(attachment) => attachment,
+                Err(error) => {
+                    return remote_brain_error(request_id, "conflict", error.to_string())
+                }
+            };
+            if claims_match_attachment(&claims, &attachment).is_err() {
+                return remote_brain_error(
+                    request_id,
+                    "forbidden",
+                    "Brain credential participant no longer matches this attachment",
+                );
+            }
+            match lifecycle
+                .cancel_run(name, attachment_id, connection_id, run_id)
+                .await
+            {
+                Ok(run) => BrainRemoteReply::RunCancelled { request_id, run },
+                Err(error) => remote_brain_error(request_id, "conflict", error.to_string()),
+            }
+        }
     }
 }
 

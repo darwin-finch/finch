@@ -399,6 +399,7 @@ struct BrainRemoteCommand {
     detach      @3 :Void;
     requestRunnerHandoff @4 :BrainRunnerHandoffRequest;
     cancelRunnerHandoff  @5 :Text;
+    cancelRun            @6 :Text;
   }
 }
 
@@ -423,6 +424,7 @@ struct BrainRemoteReply {
     error        @4 :BrainRemoteError;
     handoffRequested @5 :BrainRunnerHandoff;
     handoffCancelled @6 :Void;
+    runCancelled     @7 :BrainRun;
   }
 }
 
@@ -521,6 +523,13 @@ interface BrainService {
   cancelRunnerHandoff @10 (brain :Text,
                            handoffId :Text,
                            sender :Text) -> ();
+
+  inspectRun @11 (brain :Text, runId :Text) -> (run :BrainRun);
+
+  cancelRun @12 (brain :Text,
+                 attachmentId :Text,
+                 connectionId :Text,
+                 runId :Text) -> (run :BrainRun);
 }
 
 # ---------------------------------------------------------------------------

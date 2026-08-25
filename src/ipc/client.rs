@@ -165,6 +165,41 @@ impl IpcClient {
         decode_snapshot(reply.get()?.get_snapshot()?)
     }
 
+    pub async fn brain_inspect_run(
+        &self,
+        brain: &str,
+        run_id: crate::brain::shared::RunId,
+    ) -> Result<crate::brain::shared::BrainRun> {
+        let service = self.brain_service().await?;
+        let mut request = service.inspect_run_request();
+        request.get().set_brain(brain);
+        request.get().set_run_id(&run_id.0.to_string());
+        let reply = request.send().promise.await?;
+        decode_run(reply.get()?.get_run()?)
+    }
+
+    pub async fn brain_cancel_run(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::shared::BrainAttachment,
+        run_id: crate::brain::shared::RunId,
+    ) -> Result<crate::brain::shared::BrainRun> {
+        let connection_id = attachment
+            .connection_id
+            .context("Brain attachment has no live connection")?;
+        let service = self.brain_service().await?;
+        let mut request = service.cancel_run_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_attachment_id(&attachment.attachment_id.0.to_string());
+            params.set_connection_id(&connection_id.0.to_string());
+            params.set_run_id(&run_id.0.to_string());
+        }
+        let reply = request.send().promise.await?;
+        decode_run(reply.get()?.get_run()?)
+    }
+
     pub async fn brain_attach(
         &self,
         brain: &str,

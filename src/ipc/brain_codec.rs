@@ -24,6 +24,7 @@ pub(crate) enum BrainRemoteCommandKind {
         ttl_ms: u64,
     },
     CancelRunnerHandoff(RunnerHandoffId),
+    CancelRun(RunId),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +49,10 @@ pub(crate) enum BrainRemoteReply {
     HandoffCancelled {
         request_id: u64,
     },
+    RunCancelled {
+        request_id: u64,
+        run: BrainRun,
+    },
     Error {
         request_id: u64,
         code: String,
@@ -63,6 +68,7 @@ impl BrainRemoteReply {
             | Self::Detached { request_id }
             | Self::HandoffRequested { request_id, .. }
             | Self::HandoffCancelled { request_id }
+            | Self::RunCancelled { request_id, .. }
             | Self::Error { request_id, .. } => *request_id,
         }
     }
@@ -342,6 +348,9 @@ pub(crate) fn encode_brain_remote_envelope(
                 BrainRemoteCommandKind::CancelRunnerHandoff(handoff_id) => {
                     builder.set_cancel_runner_handoff(&handoff_id.0.to_string())
                 }
+                BrainRemoteCommandKind::CancelRun(run_id) => {
+                    builder.set_cancel_run(&run_id.0.to_string())
+                }
             }
         }
         BrainRemoteEnvelope::Reply(reply) => {
@@ -368,6 +377,9 @@ pub(crate) fn encode_brain_remote_envelope(
                 }
                 BrainRemoteReply::HandoffCancelled { .. } => {
                     builder.set_handoff_cancelled(())
+                }
+                BrainRemoteReply::RunCancelled { run, .. } => {
+                    encode_run(builder.init_run_cancelled(), run)
                 }
                 BrainRemoteReply::Error { code, message, .. } => {
                     let mut error = builder.init_error();
@@ -418,6 +430,9 @@ pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<Brain
                         handoff_id?,
                     )?))
                 }
+                CommandWhich::CancelRun(run_id) => {
+                    BrainRemoteCommandKind::CancelRun(RunId(parse_uuid(run_id?)?))
+                }
             };
             BrainRemoteEnvelope::Command(BrainRemoteCommand { request_id, kind })
         }
@@ -446,6 +461,10 @@ pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<Brain
                 ReplyWhich::HandoffCancelled(()) => {
                     BrainRemoteReply::HandoffCancelled { request_id }
                 }
+                ReplyWhich::RunCancelled(run) => BrainRemoteReply::RunCancelled {
+                    request_id,
+                    run: decode_run(run?)?,
+                },
                 ReplyWhich::Error(error) => {
                     let error = error?;
                     BrainRemoteReply::Error {
@@ -1225,6 +1244,18 @@ mod tests {
             requested_ms: 100,
             expires_ms: 200,
         };
+        let run = BrainRun {
+            run_id: RunId(uuid::Uuid::new_v4()),
+            kind: BrainRunKind::Interactive,
+            parent_run_id: None,
+            request_seq: 5,
+            initiating_attachment_id: attachment.attachment_id,
+            initiated_by: attachment.subject.clone(),
+            status: BrainRunStatus::Cancelled,
+            started_ms: 100,
+            updated_ms: 200,
+            detail: Some("cancelled by initiating driver".into()),
+        };
         let envelopes = vec![
             BrainRemoteEnvelope::Command(BrainRemoteCommand {
                 request_id: 1,
@@ -1253,6 +1284,10 @@ mod tests {
                 request_id: 5,
                 kind: BrainRemoteCommandKind::CancelRunnerHandoff(handoff.handoff_id),
             }),
+            BrainRemoteEnvelope::Command(BrainRemoteCommand {
+                request_id: 6,
+                kind: BrainRemoteCommandKind::CancelRun(run.run_id),
+            }),
             BrainRemoteEnvelope::Reply(BrainRemoteReply::Submitted {
                 request_id: 1,
                 accepted,
@@ -1269,8 +1304,12 @@ mod tests {
                 handoff,
             }),
             BrainRemoteEnvelope::Reply(BrainRemoteReply::HandoffCancelled { request_id: 5 }),
-            BrainRemoteEnvelope::Reply(BrainRemoteReply::Error {
+            BrainRemoteEnvelope::Reply(BrainRemoteReply::RunCancelled {
                 request_id: 6,
+                run,
+            }),
+            BrainRemoteEnvelope::Reply(BrainRemoteReply::Error {
+                request_id: 7,
                 code: "forbidden".into(),
                 message: "scope denied".into(),
             }),
