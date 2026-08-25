@@ -665,29 +665,29 @@ async fn archive_named_brain(
 fn attachment_can_submit(
     role: crate::brain::store::AttachmentRole,
     kind: &crate::brain::store::BrainEventKind,
+    can_approve: bool,
 ) -> bool {
     use crate::brain::store::{AttachmentRole, BrainEventKind};
-    match role {
+    (match role {
         AttachmentRole::Driver => matches!(
             kind,
             BrainEventKind::Prompt { .. }
                 | BrainEventKind::ParticipantMessage { .. }
                 | BrainEventKind::Program { .. }
                 | BrainEventKind::ProgramPopped { .. }
-                | BrainEventKind::ApprovalDecided { .. }
         ),
-        AttachmentRole::Consultant => matches!(
-            kind,
-            BrainEventKind::ParticipantMessage { .. } | BrainEventKind::ApprovalDecided { .. }
-        ),
+        AttachmentRole::Consultant => matches!(kind, BrainEventKind::ParticipantMessage { .. }),
         AttachmentRole::Observer | AttachmentRole::Runner => false,
-    }
+    }) || can_approve
+        && matches!(role, AttachmentRole::Driver | AttachmentRole::Consultant)
+        && matches!(kind, BrainEventKind::ApprovalDecided { .. })
 }
 
 /// One transport-neutral mutation boundary for an authenticated Brain
 /// attachment. Local RPC and remote binary adapters must both enter here so role
 /// checks, ordering, run creation, queueing, and terminal persistence cannot
 /// diverge by transport.
+#[cfg(test)]
 pub(crate) async fn submit_named_brain_event(
     store: &crate::brain::store::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
@@ -695,6 +695,29 @@ pub(crate) async fn submit_named_brain_event(
     name: &str,
     attachment: &crate::brain::store::BrainAttachment,
     kind: crate::brain::store::BrainEventKind,
+) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
+    let can_approve = crate::brain::credential::default_participant_scopes(attachment.role)
+        .contains(&crate::brain::credential::BrainCredentialScope::BrainApprove);
+    submit_named_brain_event_with_authority(
+        store,
+        runners,
+        approvals,
+        name,
+        attachment,
+        kind,
+        can_approve,
+    )
+    .await
+}
+
+pub(crate) async fn submit_named_brain_event_with_authority(
+    store: &crate::brain::store::BrainStore,
+    runners: &crate::server::BrainRunnerBroker,
+    approvals: &crate::server::BrainApprovalBroker,
+    name: &str,
+    attachment: &crate::brain::store::BrainAttachment,
+    kind: crate::brain::store::BrainEventKind,
+    can_approve: bool,
 ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
     use crate::brain::store::BrainEventKind;
 
@@ -710,7 +733,7 @@ pub(crate) async fn submit_named_brain_event(
             "internal Brain events cannot be submitted by a participant".into(),
         ));
     }
-    if !attachment_can_submit(attachment.role, &kind) {
+    if !attachment_can_submit(attachment.role, &kind, can_approve) {
         return Err(BrainSubmissionError::Forbidden(
             "attachment role cannot submit this Brain event".into(),
         ));
@@ -1814,7 +1837,13 @@ async fn execute_remote_brain_command(
                 );
             }
             match lifecycle
-                .submit(name, attachment_id, connection_id, kind)
+                .submit_with_authority(
+                    name,
+                    attachment_id,
+                    connection_id,
+                    kind,
+                    claims.permits(BrainCredentialScope::BrainApprove),
+                )
                 .await
             {
                 Ok(outcome) => BrainRemoteReply::Submitted {
@@ -3084,26 +3113,60 @@ mod handler_tests {
             approval_id: "approval-1".into(),
             decision: serde_json::json!({"choice": "deny"}),
         };
-        assert!(attachment_can_submit(AttachmentRole::Driver, &prompt));
+        assert!(attachment_can_submit(AttachmentRole::Driver, &prompt, false));
         assert!(attachment_can_submit(
             AttachmentRole::Driver,
-            &participant_message
+            &participant_message,
+            false,
         ));
-        assert!(attachment_can_submit(AttachmentRole::Driver, &program));
-        assert!(attachment_can_submit(AttachmentRole::Driver, &decision));
-        assert!(!attachment_can_submit(AttachmentRole::Consultant, &prompt));
+        assert!(attachment_can_submit(AttachmentRole::Driver, &program, false));
+        assert!(!attachment_can_submit(AttachmentRole::Driver, &decision, false));
+        assert!(attachment_can_submit(AttachmentRole::Driver, &decision, true));
+        assert!(!attachment_can_submit(
+            AttachmentRole::Consultant,
+            &prompt,
+            false,
+        ));
         assert!(attachment_can_submit(
             AttachmentRole::Consultant,
-            &participant_message
+            &participant_message,
+            false,
         ));
-        assert!(attachment_can_submit(AttachmentRole::Consultant, &decision));
-        assert!(!attachment_can_submit(AttachmentRole::Consultant, &program));
-        assert!(!attachment_can_submit(AttachmentRole::Observer, &prompt));
+        assert!(!attachment_can_submit(
+            AttachmentRole::Consultant,
+            &decision,
+            false,
+        ));
+        assert!(attachment_can_submit(
+            AttachmentRole::Consultant,
+            &decision,
+            true,
+        ));
+        assert!(!attachment_can_submit(
+            AttachmentRole::Consultant,
+            &program,
+            true,
+        ));
         assert!(!attachment_can_submit(
             AttachmentRole::Observer,
-            &participant_message
+            &prompt,
+            false,
         ));
-        assert!(!attachment_can_submit(AttachmentRole::Runner, &program));
+        assert!(!attachment_can_submit(
+            AttachmentRole::Observer,
+            &participant_message,
+            false,
+        ));
+        assert!(!attachment_can_submit(
+            AttachmentRole::Observer,
+            &decision,
+            true,
+        ));
+        assert!(!attachment_can_submit(
+            AttachmentRole::Runner,
+            &program,
+            false,
+        ));
     }
 
     #[tokio::test]

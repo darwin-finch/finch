@@ -381,13 +381,42 @@ impl BrainLifecycleService {
         let attachment = self
             .connection(brain, attachment_id, connection_id)
             .map_err(BrainSubmissionError::State)?;
-        handlers::submit_named_brain_event(
+        let can_approve = crate::brain::credential::default_participant_scopes(attachment.role)
+            .contains(&crate::brain::credential::BrainCredentialScope::BrainApprove);
+        self.submit_for_attachment(brain, &attachment, kind, can_approve)
+            .await
+    }
+
+    pub(crate) async fn submit_with_authority(
+        &self,
+        brain: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        kind: BrainEventKind,
+        can_approve: bool,
+    ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
+        let attachment = self
+            .connection(brain, attachment_id, connection_id)
+            .map_err(BrainSubmissionError::State)?;
+        self.submit_for_attachment(brain, &attachment, kind, can_approve)
+            .await
+    }
+
+    async fn submit_for_attachment(
+        &self,
+        brain: &str,
+        attachment: &BrainAttachment,
+        kind: BrainEventKind,
+        can_approve: bool,
+    ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
+        handlers::submit_named_brain_event_with_authority(
             &self.store,
             &self.runners,
             &self.approvals,
             brain,
-            &attachment,
+            attachment,
             kind,
+            can_approve,
         )
         .await
     }
@@ -756,6 +785,76 @@ mod tests {
             .attach("shared", "runner", AttachmentRole::Runner, None)
             .unwrap_err();
         assert!(error.to_string().contains("runner lease"));
+    }
+
+    #[tokio::test]
+    async fn approval_is_independent_from_the_consultant_role() {
+        let service = service();
+        let consultant = service
+            .attach("shared", "alice", AttachmentRole::Consultant, None)
+            .unwrap();
+        let connection_id = consultant.connection_id.unwrap();
+        service
+            .watch("shared", consultant.attachment_id, connection_id)
+            .unwrap();
+        let request_seq = service
+            .store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::ParticipantMessage {
+                    text: "reviewing".into(),
+                },
+            )
+            .unwrap()
+            .seq;
+        let snapshot = service.snapshot("shared").unwrap();
+        let registration = service
+            .approvals
+            .register(
+                request_seq,
+                "approval-1",
+                crate::brain::store::BrainApprovalAudience {
+                    brain_id: snapshot.brain_id,
+                    brain: snapshot.name,
+                    attachment_id: consultant.attachment_id,
+                    subject: consultant.subject.clone(),
+                    role: consultant.role,
+                    environment_generation: snapshot.environment.generation,
+                },
+            )
+            .unwrap();
+        let decision = BrainEventKind::ApprovalDecided {
+            request_seq,
+            approval_id: "approval-1".into(),
+            decision: serde_json::json!({"choice": "approve_once"}),
+        };
+
+        assert!(matches!(
+            service
+                .submit(
+                    "shared",
+                    consultant.attachment_id,
+                    connection_id,
+                    decision.clone(),
+                )
+                .await,
+            Err(BrainSubmissionError::Forbidden(_))
+        ));
+        service
+            .submit_with_authority(
+                "shared",
+                consultant.attachment_id,
+                connection_id,
+                decision,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            registration.wait().await.unwrap()["choice"],
+            "approve_once"
+        );
     }
 
     #[tokio::test]

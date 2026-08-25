@@ -282,4 +282,29 @@ mod tests {
         claimed.complete(serde_json::json!({"choice": "allow_once"}));
         assert_eq!(registration.wait().await.unwrap()["choice"], "allow_once");
     }
+
+    #[tokio::test]
+    async fn another_brain_cannot_consume_a_pending_approval() {
+        let broker = BrainApprovalBroker::default();
+        let attachment_id = AttachmentId(uuid::Uuid::new_v4());
+        let audience = audience(attachment_id);
+        let registration = broker.register(7, "approval-1", audience.clone()).unwrap();
+
+        let error = match broker.claim(
+            BrainId(uuid::Uuid::new_v4()),
+            7,
+            "approval-1",
+            attachment_id,
+        ) {
+            Ok(_) => panic!("another Brain consumed the pending approval"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not pending"));
+
+        let claimed = broker
+            .claim(audience.brain_id, 7, "approval-1", attachment_id)
+            .unwrap();
+        claimed.complete(serde_json::json!({"choice": "allow_once"}));
+        assert_eq!(registration.wait().await.unwrap()["choice"], "allow_once");
+    }
 }
