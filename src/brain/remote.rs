@@ -2,12 +2,13 @@
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use super::shared::{
@@ -213,12 +214,25 @@ pub struct RemoteBrainClient {
     credential: std::sync::Arc<tokio::sync::Mutex<Option<RemoteBrainCredential>>>,
     http: Client,
     attachment: Option<BrainAttachment>,
+    session: std::sync::Arc<tokio::sync::Mutex<Option<RemoteBrainSession>>>,
 }
 
 #[derive(Clone)]
 struct RemoteBrainCredential {
     token: String,
     claims: super::credential::BrainCredentialClaims,
+}
+
+#[derive(Clone)]
+struct RemoteBrainSession {
+    id: uuid::Uuid,
+    commands: mpsc::UnboundedSender<RemoteBrainRequest>,
+}
+
+struct RemoteBrainRequest {
+    kind: crate::ipc::brain_codec::BrainRemoteCommandKind,
+    response:
+        oneshot::Sender<std::result::Result<crate::ipc::brain_codec::BrainRemoteReply, String>>,
 }
 
 impl RemoteBrainClient {
@@ -231,6 +245,7 @@ impl RemoteBrainClient {
                 .timeout(std::time::Duration::from_secs(180))
                 .build()?,
             attachment: None,
+            session: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -320,71 +335,48 @@ impl RemoteBrainClient {
     }
 
     pub async fn push(&self, kind: BrainEventKind) -> Result<()> {
-        #[derive(Serialize)]
-        struct Push {
-            attachment_id: AttachmentId,
-            connection_id: super::shared::ConnectionId,
-            #[serde(flatten)]
-            kind: BrainEventKind,
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+
+        match self
+            .send_remote_command(BrainRemoteCommandKind::Submit(kind))
+            .await?
+        {
+            BrainRemoteReply::Submitted { .. } => Ok(()),
+            reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
         }
-
-        let attachment = self
-            .attachment
-            .as_ref()
-            .context("client is not attached to a Brain")?;
-        let connection_id = attachment
-            .connection_id
-            .context("Brain attachment has no live connection")?;
-
-        self.http
-            .post(self.target.http_url())
-            .bearer_auth(self.authorized_token().await?)
-            .json(&Push {
-                attachment_id: attachment.attachment_id,
-                connection_id,
-                kind,
-            })
-            .send()
-            .await
-            .context("could not reach brain host")?
-            .error_for_status()
-            .context("brain push rejected")?;
-        Ok(())
     }
 
     pub async fn acknowledge(&mut self, seq: u64) -> Result<()> {
-        let attachment = self
-            .attachment
-            .as_ref()
-            .context("client is not attached to a Brain")?;
-        let connection_id = attachment
-            .connection_id
-            .context("Brain attachment has no live connection")?;
-        let updated = self
-            .http
-            .post(format!(
-                "{}/{}/ack",
-                self.target.attachments_url(),
-                attachment.attachment_id.0
-            ))
-            .bearer_auth(self.authorized_token().await?)
-            .json(&serde_json::json!({
-                "connection_id": connection_id,
-                "seq": seq
-            }))
-            .send()
-            .await
-            .context("could not reach brain host")?
-            .error_for_status()
-            .context("brain acknowledgement rejected")?
-            .json::<BrainAttachment>()
-            .await
-            .context("invalid brain acknowledgement")?;
-        self.attachment = Some(updated);
-        Ok(())
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+
+        match self
+            .send_remote_command(BrainRemoteCommandKind::Acknowledge(seq))
+            .await?
+        {
+            BrainRemoteReply::Acknowledged { attachment, .. } => {
+                self.attachment = Some(attachment);
+                Ok(())
+            }
+            reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
+        }
     }
 
     pub async fn disconnect(&self) -> Result<()> {
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+
+        if self.session.lock().await.is_some() {
+            return match self
+                .send_remote_command(BrainRemoteCommandKind::Detach)
+                .await?
+            {
+                BrainRemoteReply::Detached { .. } => Ok(()),
+                reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
+            };
+        }
+
+        // Attachment persistence can fail before the watch stream is opened.
+        // Keep this authenticated bootstrap cleanup until attach itself moves
+        // behind the binary session.
         let attachment = self
             .attachment
             .as_ref()
@@ -410,10 +402,15 @@ impl RemoteBrainClient {
 
     /// Connect to the brain's snapshot/live-event stream.
     pub async fn watch(&self) -> Result<mpsc::UnboundedReceiver<BrainWireMessage>> {
+        use crate::ipc::brain_codec::{BrainRemoteCommand, BrainRemoteEnvelope, BrainRemoteReply};
+
         let attachment = self
             .attachment
             .as_ref()
             .context("client is not attached to a Brain")?;
+        if self.session.lock().await.is_some() {
+            anyhow::bail!("remote Brain event stream is already connected");
+        }
         let mut request = self.target.ws_url(attachment)?.into_client_request()?;
         request.headers_mut().insert(
             tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
@@ -422,31 +419,131 @@ impl RemoteBrainClient {
         let (mut socket, _) = tokio_tungstenite::connect_async(request)
             .await
             .context("could not open brain event stream")?;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<RemoteBrainRequest>();
+        let session_id = uuid::Uuid::new_v4();
+        *self.session.lock().await = Some(RemoteBrainSession {
+            id: session_id,
+            commands: command_tx,
+        });
+        let session = self.session.clone();
         tokio::spawn(async move {
+            let mut next_request_id = 1_u64;
+            let mut pending = HashMap::<
+                u64,
+                oneshot::Sender<std::result::Result<BrainRemoteReply, String>>,
+            >::new();
             loop {
                 tokio::select! {
-                    _ = tx.closed() => {
+                    _ = event_tx.closed() => {
                         let _ = socket.close(None).await;
                         break;
+                    }
+                    request = command_rx.recv() => {
+                        let Some(request) = request else {
+                            break;
+                        };
+                        let request_id = next_request_id;
+                        next_request_id = next_request_id.checked_add(1).unwrap_or(1);
+                        let envelope = BrainRemoteEnvelope::Command(BrainRemoteCommand {
+                            request_id,
+                            kind: request.kind,
+                        });
+                        let encoded = match crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope) {
+                            Ok(encoded) => encoded,
+                            Err(error) => {
+                                let _ = request.response.send(Err(error.to_string()));
+                                continue;
+                            }
+                        };
+                        pending.insert(request_id, request.response);
+                        if let Err(error) = socket
+                            .send(tokio_tungstenite::tungstenite::Message::Binary(encoded.into()))
+                            .await
+                        {
+                            if let Some(response) = pending.remove(&request_id) {
+                                let _ = response.send(Err(error.to_string()));
+                            }
+                            break;
+                        }
                     }
                     incoming = socket.next() => {
                         let Some(Ok(message)) = incoming else {
                             break;
                         };
-                        if let tokio_tungstenite::tungstenite::Message::Binary(bytes) = message {
-                            let Ok(message) = crate::ipc::brain_codec::decode_brain_wire_message(&bytes) else {
-                                break;
-                            };
-                            if tx.send(message).is_err() {
-                                break;
+                        match message {
+                            tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                                match crate::ipc::brain_codec::decode_brain_remote_envelope(&bytes) {
+                                    Ok(BrainRemoteEnvelope::Projection(message)) => {
+                                        if event_tx.send(message).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Ok(BrainRemoteEnvelope::Reply(reply)) => {
+                                        if let Some(response) = pending.remove(&reply.request_id()) {
+                                            let result = match reply {
+                                                BrainRemoteReply::Error { code, message, .. } => {
+                                                    Err(format!("{code}: {message}"))
+                                                }
+                                                reply => Ok(reply),
+                                            };
+                                            let _ = response.send(result);
+                                        }
+                                    }
+                                    _ => break,
+                                }
                             }
+                            tokio_tungstenite::tungstenite::Message::Ping(payload) => {
+                                if socket
+                                    .send(tokio_tungstenite::tungstenite::Message::Pong(payload))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                            _ => {}
                         }
                     }
                 }
             }
+            for (_, response) in pending {
+                let _ = response.send(Err("remote Brain connection closed".into()));
+            }
+            let mut active = session.lock().await;
+            if active
+                .as_ref()
+                .is_some_and(|current| current.id == session_id)
+            {
+                *active = None;
+            }
         });
-        Ok(rx)
+        Ok(event_rx)
+    }
+
+    async fn send_remote_command(
+        &self,
+        kind: crate::ipc::brain_codec::BrainRemoteCommandKind,
+    ) -> Result<crate::ipc::brain_codec::BrainRemoteReply> {
+        let session = self
+            .session
+            .lock()
+            .await
+            .clone()
+            .context("remote Brain event stream is not connected")?;
+        let (response_tx, response_rx) = oneshot::channel();
+        session
+            .commands
+            .send(RemoteBrainRequest {
+                kind,
+                response: response_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("remote Brain connection closed"))?;
+        response_rx
+            .await
+            .context("remote Brain connection closed before replying")?
+            .map_err(anyhow::Error::msg)
     }
 
     async fn ensure_credential(&self, subject: &str, role: AttachmentRole) -> Result<()> {
@@ -710,6 +807,241 @@ mod tests {
         assert!(RemoteBrainTarget::parse("brain-only").is_err());
         assert!(RemoteBrainTarget::parse("../brain@host").is_err());
         assert!(RemoteBrainTarget::parse("brain@host/path").is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_binary_session_correlates_mutations_while_streaming_events() {
+        use crate::brain::shared::{BrainEvent, ConnectionId};
+        use crate::ipc::brain_codec::{
+            BrainRemoteCommandKind, BrainRemoteEnvelope, BrainRemoteReply,
+        };
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let brain_id = BrainId(uuid::Uuid::new_v4());
+        let attachment = BrainAttachment {
+            attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            subject: "alice@laptop.local".into(),
+            role: AttachmentRole::Driver,
+            acknowledged_seq: 0,
+            connected: true,
+            connection_id: Some(ConnectionId(uuid::Uuid::new_v4())),
+        };
+        let streamed = BrainEvent {
+            schema_version: 2,
+            brain_id,
+            seq: 1,
+            environment_generation: 1,
+            sender: "bob@desktop.local".into(),
+            created_ms: 10,
+            kind: BrainEventKind::Prompt {
+                text: "hello from another console".into(),
+            },
+        };
+        let fixture_attachment = attachment.clone();
+        let fixture_event = streamed.clone();
+        let fixture = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let projection = BrainRemoteEnvelope::Projection(BrainWireMessage::Event {
+                event: fixture_event.clone(),
+            });
+            socket
+                .send(Message::Binary(
+                    crate::ipc::brain_codec::encode_brain_remote_envelope(&projection)
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+
+            let submit = socket.next().await.unwrap().unwrap().into_data();
+            let BrainRemoteEnvelope::Command(submit) =
+                crate::ipc::brain_codec::decode_brain_remote_envelope(&submit).unwrap()
+            else {
+                panic!("expected submit command")
+            };
+            assert!(matches!(
+                submit.kind,
+                BrainRemoteCommandKind::Submit(BrainEventKind::Prompt { ref text })
+                    if text == "inspect it"
+            ));
+            let reply = BrainRemoteEnvelope::Reply(BrainRemoteReply::Submitted {
+                request_id: submit.request_id,
+                accepted: fixture_event,
+                run: None,
+                result: None,
+            });
+            socket
+                .send(Message::Binary(
+                    crate::ipc::brain_codec::encode_brain_remote_envelope(&reply)
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+
+            let acknowledge = socket.next().await.unwrap().unwrap().into_data();
+            let BrainRemoteEnvelope::Command(acknowledge) =
+                crate::ipc::brain_codec::decode_brain_remote_envelope(&acknowledge).unwrap()
+            else {
+                panic!("expected acknowledge command")
+            };
+            assert_eq!(acknowledge.kind, BrainRemoteCommandKind::Acknowledge(1));
+            let mut acknowledged = fixture_attachment;
+            acknowledged.acknowledged_seq = 1;
+            let reply = BrainRemoteEnvelope::Reply(BrainRemoteReply::Acknowledged {
+                request_id: acknowledge.request_id,
+                attachment: acknowledged,
+            });
+            socket
+                .send(Message::Binary(
+                    crate::ipc::brain_codec::encode_brain_remote_envelope(&reply)
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+
+            let detach = socket.next().await.unwrap().unwrap().into_data();
+            let BrainRemoteEnvelope::Command(detach) =
+                crate::ipc::brain_codec::decode_brain_remote_envelope(&detach).unwrap()
+            else {
+                panic!("expected detach command")
+            };
+            assert_eq!(detach.kind, BrainRemoteCommandKind::Detach);
+            let reply = BrainRemoteEnvelope::Reply(BrainRemoteReply::Detached {
+                request_id: detach.request_id,
+            });
+            socket
+                .send(Message::Binary(
+                    crate::ipc::brain_codec::encode_brain_remote_envelope(&reply)
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            socket.close(None).await.unwrap();
+        });
+
+        let target = RemoteBrainTarget {
+            brain: "shared".into(),
+            machine: "fixture".into(),
+            address: address.to_string(),
+        };
+        let mut client = RemoteBrainClient::new(target, "unused").unwrap();
+        client.attachment = Some(attachment);
+        *client.credential.lock().await = Some(RemoteBrainCredential {
+            token: "scoped-token".into(),
+            claims: crate::brain::credential::BrainCredentialClaims {
+                version: 1,
+                credential_id: uuid::Uuid::new_v4(),
+                issuer: "fixture".into(),
+                subject: "alice@laptop.local".into(),
+                brain_id,
+                brain: "shared".into(),
+                environment_generation: 1,
+                role: AttachmentRole::Driver,
+                scopes: std::collections::BTreeSet::new(),
+                issued_ms: 0,
+                expires_ms: u64::MAX,
+            },
+        });
+
+        let mut events = client.watch().await.unwrap();
+        assert_eq!(
+            events.recv().await.unwrap(),
+            BrainWireMessage::Event { event: streamed }
+        );
+        client
+            .push(BrainEventKind::Prompt {
+                text: "inspect it".into(),
+            })
+            .await
+            .unwrap();
+        client.acknowledge(1).await.unwrap();
+        assert_eq!(client.attachment().unwrap().acknowledged_seq, 1);
+        client.disconnect().await.unwrap();
+        fixture.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Finch daemon on the default loopback port"]
+    async fn live_remote_binary_session_attaches_submits_acknowledges_and_detaches() {
+        let brain = "codex-remote-binary-smoke-20260824";
+        let target = RemoteBrainTarget::parse(&format!(
+            "{brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}"
+        ))
+        .unwrap();
+        let mut client = RemoteBrainClient::new(target, "loopback").unwrap();
+        let _ = client
+            .http
+            .delete(client.target.http_url())
+            .send()
+            .await;
+
+        client
+            .attach("codex-smoke@localhost", AttachmentRole::Driver, None)
+            .await
+            .unwrap();
+        let mut events = client.watch().await.unwrap();
+        let initial = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(initial, BrainWireMessage::Snapshot { .. }));
+
+        client
+            .push(BrainEventKind::Prompt {
+                text: "remote binary lifecycle smoke".into(),
+            })
+            .await
+            .unwrap();
+        let prompt_seq = loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let BrainWireMessage::Event { event } = message {
+                if matches!(event.kind, BrainEventKind::Prompt { .. }) {
+                    break event.seq;
+                }
+            }
+        };
+        client.acknowledge(prompt_seq).await.unwrap();
+        assert_eq!(
+            client.attachment().unwrap().acknowledged_seq,
+            prompt_seq
+        );
+        client.disconnect().await.unwrap();
+
+        let detached = loop {
+            let Some(message) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                events.recv(),
+            )
+            .await
+            .unwrap()
+            else {
+                panic!("remote stream closed before projecting detach")
+            };
+            if let BrainWireMessage::Event { event } = message {
+                if matches!(event.kind, BrainEventKind::ClientDetached { .. }) {
+                    break true;
+                }
+            }
+        };
+        assert!(detached);
+
+        client
+            .http
+            .delete(client.target.http_url())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
     }
 
     #[tokio::test]

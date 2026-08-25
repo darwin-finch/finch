@@ -1504,6 +1504,194 @@ fn ensure_named_brain_store_environment(
     Ok(())
 }
 
+fn remote_brain_error(
+    request_id: u64,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> crate::ipc::brain_codec::BrainRemoteReply {
+    crate::ipc::brain_codec::BrainRemoteReply::Error {
+        request_id,
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+async fn execute_remote_brain_command(
+    server: &Arc<AgentServer>,
+    addr: SocketAddr,
+    headers: &HeaderMap,
+    name: &str,
+    attachment_id: crate::brain::shared::AttachmentId,
+    connection_id: crate::brain::shared::ConnectionId,
+    command: crate::ipc::brain_codec::BrainRemoteCommand,
+) -> crate::ipc::brain_codec::BrainRemoteReply {
+    use crate::brain::credential::BrainCredentialScope;
+    use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+
+    let request_id = command.request_id;
+    match command.kind {
+        BrainRemoteCommandKind::Submit(kind) => {
+            let required_scope = if matches!(
+                &kind,
+                crate::brain::shared::BrainEventKind::ApprovalDecided { .. }
+            ) {
+                BrainCredentialScope::BrainApprove
+            } else {
+                BrainCredentialScope::BrainSubmit
+            };
+            let claims = match authorize_named_brain(server, addr, headers, name, required_scope) {
+                Ok(claims) => claims,
+                Err(_) => {
+                    return remote_brain_error(
+                        request_id,
+                        "forbidden",
+                        "Brain credential no longer authorizes this submission",
+                    );
+                }
+            };
+            let attachment =
+                match server
+                    .shared_brains()
+                    .require_connection(name, attachment_id, connection_id)
+                {
+                    Ok(attachment) => attachment,
+                    Err(error) => {
+                        return remote_brain_error(request_id, "conflict", error.to_string())
+                    }
+                };
+            if claims_match_attachment(claims.as_ref(), &attachment).is_err() {
+                return remote_brain_error(
+                    request_id,
+                    "forbidden",
+                    "Brain credential participant no longer matches this attachment",
+                );
+            }
+            match submit_named_brain_event(
+                server.shared_brains(),
+                server.brain_runners(),
+                server.brain_approvals(),
+                name,
+                &attachment,
+                kind,
+            )
+            .await
+            {
+                Ok(outcome) => BrainRemoteReply::Submitted {
+                    request_id,
+                    accepted: outcome.accepted,
+                    run: outcome.run,
+                    result: outcome.result,
+                },
+                Err(error) => {
+                    let code = match &error {
+                        BrainSubmissionError::Invalid(_) => "invalid",
+                        BrainSubmissionError::Forbidden(_) => "forbidden",
+                        BrainSubmissionError::State(_) => "conflict",
+                    };
+                    remote_brain_error(request_id, code, error.to_string())
+                }
+            }
+        }
+        BrainRemoteCommandKind::Acknowledge(seq) => {
+            let claims = match authorize_named_brain(
+                server,
+                addr,
+                headers,
+                name,
+                BrainCredentialScope::BrainRead,
+            ) {
+                Ok(claims) => claims,
+                Err(_) => {
+                    return remote_brain_error(
+                        request_id,
+                        "forbidden",
+                        "Brain credential no longer authorizes acknowledgement",
+                    );
+                }
+            };
+            let attachment =
+                match server
+                    .shared_brains()
+                    .require_connection(name, attachment_id, connection_id)
+                {
+                    Ok(attachment) => attachment,
+                    Err(error) => {
+                        return remote_brain_error(request_id, "conflict", error.to_string())
+                    }
+                };
+            if claims_match_attachment(claims.as_ref(), &attachment).is_err() {
+                return remote_brain_error(
+                    request_id,
+                    "forbidden",
+                    "Brain credential participant no longer matches this attachment",
+                );
+            }
+            match server
+                .shared_brains()
+                .acknowledge(name, attachment_id, connection_id, seq)
+            {
+                Ok(attachment) => BrainRemoteReply::Acknowledged {
+                    request_id,
+                    attachment,
+                },
+                Err(error) => remote_brain_error(request_id, "conflict", error.to_string()),
+            }
+        }
+        BrainRemoteCommandKind::Detach => {
+            let claims = match authorize_named_brain(
+                server,
+                addr,
+                headers,
+                name,
+                BrainCredentialScope::BrainControl,
+            ) {
+                Ok(claims) => claims,
+                Err(_) => {
+                    return remote_brain_error(
+                        request_id,
+                        "forbidden",
+                        "Brain credential no longer authorizes detach",
+                    );
+                }
+            };
+            let attachment =
+                match server
+                    .shared_brains()
+                    .require_connection(name, attachment_id, connection_id)
+                {
+                    Ok(attachment) => attachment,
+                    Err(error) => {
+                        return remote_brain_error(request_id, "conflict", error.to_string())
+                    }
+                };
+            if claims_match_attachment(claims.as_ref(), &attachment).is_err() {
+                return remote_brain_error(
+                    request_id,
+                    "forbidden",
+                    "Brain credential participant no longer matches this attachment",
+                );
+            }
+            let brain_id = match server.shared_brains().snapshot(name) {
+                Ok(snapshot) => snapshot.brain_id,
+                Err(error) => return remote_brain_error(request_id, "conflict", error.to_string()),
+            };
+            if let Err(error) = server
+                .shared_brains()
+                .detach(name, attachment_id, connection_id)
+            {
+                return remote_brain_error(request_id, "conflict", error.to_string());
+            }
+            server
+                .brain_approvals()
+                .cancel_attachment(brain_id, attachment_id);
+            if let Err(error) = server.shared_brains().remove_if_unused(name) {
+                return remote_brain_error(request_id, "conflict", error.to_string());
+            }
+            BrainRemoteReply::Detached { request_id }
+        }
+    }
+}
+
 async fn watch_named_brain(
     State(server): State<Arc<AgentServer>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -1523,7 +1711,16 @@ async fn watch_named_brain(
     let connection_id = crate::brain::shared::ConnectionId(connection.connection_id);
     let attachment = server
         .shared_brains()
-        .require_connection(&name, attachment_id, connection_id)
+        .snapshot(&name)
+        .map_err(brain_state_conflict)?
+        .attachments
+        .into_iter()
+        .find(|attachment| {
+            attachment.attachment_id == attachment_id
+                && attachment.connection_id == Some(connection_id)
+                && !attachment.connected
+        })
+        .ok_or_else(|| anyhow::anyhow!("unknown pending Brain attachment connection"))
         .map_err(brain_state_conflict)?;
     claims_match_attachment(claims.as_ref(), &attachment)?;
     server
@@ -1545,11 +1742,43 @@ async fn watch_named_brain(
     let brain_id = snapshot.brain_id;
     let store = server.shared_brains().clone();
     let approvals = server.brain_approvals().clone();
+    let command_server = server.clone();
     Ok(ws
         .on_upgrade(move |mut socket| async move {
             use axum::extract::ws::Message as WsMessage;
-            let initial = crate::brain::shared::BrainWireMessage::Snapshot { brain: snapshot };
-            if let Ok(encoded) = crate::ipc::brain_codec::encode_brain_wire_message(&initial) {
+            use crate::ipc::brain_codec::{
+                BrainRemoteCommand, BrainRemoteEnvelope, BrainRemoteReply,
+            };
+
+            let (command_tx, mut command_rx) =
+                tokio::sync::mpsc::unbounded_channel::<BrainRemoteCommand>();
+            let (reply_tx, mut reply_rx) =
+                tokio::sync::mpsc::unbounded_channel::<BrainRemoteReply>();
+            let worker_name = name.clone();
+            let worker_headers = headers.clone();
+            let worker = tokio::spawn(async move {
+                while let Some(command) = command_rx.recv().await {
+                    let reply = execute_remote_brain_command(
+                        &command_server,
+                        addr,
+                        &worker_headers,
+                        &worker_name,
+                        attachment_id,
+                        connection_id,
+                        command,
+                    )
+                    .await;
+                    let detached = matches!(reply, BrainRemoteReply::Detached { .. });
+                    if reply_tx.send(reply).is_err() || detached {
+                        break;
+                    }
+                }
+            });
+
+            let initial = BrainRemoteEnvelope::Projection(
+                crate::brain::shared::BrainWireMessage::Snapshot { brain: snapshot },
+            );
+            if let Ok(encoded) = crate::ipc::brain_codec::encode_brain_remote_envelope(&initial) {
                 if socket
                     .send(WsMessage::Binary(encoded.into()))
                     .await
@@ -1561,8 +1790,12 @@ async fn watch_named_brain(
                     return;
                 }
             }
+            let mut authority_tick =
+                tokio::time::interval(std::time::Duration::from_secs(5));
+            authority_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut replies_open = true;
             loop {
-                let wire = tokio::select! {
+                tokio::select! {
                     incoming = socket.recv() => match incoming {
                         Some(Ok(WsMessage::Ping(payload))) => {
                             if socket.send(WsMessage::Pong(payload)).await.is_err() {
@@ -1571,36 +1804,83 @@ async fn watch_named_brain(
                             continue;
                         }
                         Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
-                        Some(Ok(_)) => continue,
+                        Some(Ok(WsMessage::Binary(bytes))) => {
+                            match crate::ipc::brain_codec::decode_brain_remote_envelope(&bytes) {
+                                Ok(BrainRemoteEnvelope::Command(command)) => {
+                                    if command_tx.send(command).is_err() {
+                                        break;
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+                        Some(Ok(WsMessage::Pong(_))) => continue,
+                        Some(Ok(_)) => break,
                     },
-                    event = events.recv() => match event {
-                        Ok(event) => crate::brain::shared::BrainWireMessage::Event { event },
+                    reply = reply_rx.recv(), if replies_open => {
+                        let Some(reply) = reply else {
+                            replies_open = false;
+                            continue;
+                        };
+                        let envelope = BrainRemoteEnvelope::Reply(reply);
+                        let Ok(encoded) = crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope) else {
+                            break;
+                        };
+                        if socket.send(WsMessage::Binary(encoded.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    event = events.recv() => {
+                        let (wire, closes_attachment) = match event {
+                        Ok(event) => {
+                            let closes_attachment = matches!(
+                                &event.kind,
+                                crate::brain::shared::BrainEventKind::ClientDetached {
+                                    attachment_id: detached,
+                                    connection_id: disconnected,
+                                } if *detached == attachment_id && *disconnected == connection_id
+                            );
+                            (crate::brain::shared::BrainWireMessage::Event { event }, closes_attachment)
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             let Ok(brain) = store.snapshot(&name) else {
                                 break;
                             };
-                            crate::brain::shared::BrainWireMessage::Snapshot { brain }
+                            (crate::brain::shared::BrainWireMessage::Snapshot { brain }, false)
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
-                };
-                if store
-                    .require_connection(&name, attachment_id, connection_id)
-                    .is_err()
-                {
-                    break;
-                }
-                let Ok(encoded) = crate::ipc::brain_codec::encode_brain_wire_message(&wire) else {
-                    continue;
-                };
-                if socket
-                    .send(WsMessage::Binary(encoded.into()))
-                    .await
-                    .is_err()
-                {
-                    break;
+                        };
+                        let envelope = BrainRemoteEnvelope::Projection(wire);
+                        let Ok(encoded) = crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope) else {
+                            break;
+                        };
+                        if socket.send(WsMessage::Binary(encoded.into())).await.is_err()
+                            || closes_attachment
+                        {
+                            break;
+                        }
+                    }
+                    _ = authority_tick.tick() => {
+                        if authorize_named_brain(
+                            &server,
+                            addr,
+                            &headers,
+                            &name,
+                            crate::brain::credential::BrainCredentialScope::BrainRead,
+                        ).is_err()
+                            || store.require_connection(
+                                &name,
+                                attachment_id,
+                                connection_id,
+                            ).is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
             }
+            drop(command_tx);
+            let _ = worker.await;
             let _ = store.detach(&name, attachment_id, connection_id);
             approvals.cancel_attachment(brain_id, attachment_id);
             let _ = store.remove_if_unused(&name);

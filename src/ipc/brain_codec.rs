@@ -254,6 +254,7 @@ fn decode_brain_submission_outcome(
     Ok((accepted, run, result))
 }
 
+#[cfg(test)]
 pub(crate) fn encode_brain_wire_message(message: &BrainWireMessage) -> anyhow::Result<Vec<u8>> {
     let mut encoded = capnp::message::Builder::new_default();
     let root = encoded.init_root::<finch_ipc_capnp::brain_wire_message::Builder<'_>>();
@@ -264,6 +265,7 @@ pub(crate) fn encode_brain_wire_message(message: &BrainWireMessage) -> anyhow::R
     Ok(capnp::serialize::write_message_to_words(&encoded))
 }
 
+#[cfg(test)]
 pub(crate) fn decode_brain_wire_message(bytes: &[u8]) -> anyhow::Result<BrainWireMessage> {
     let mut cursor = std::io::Cursor::new(bytes);
     let encoded =
@@ -289,8 +291,7 @@ pub(crate) fn encode_brain_remote_envelope(
     envelope: &BrainRemoteEnvelope,
 ) -> anyhow::Result<Vec<u8>> {
     let mut encoded = capnp::message::Builder::new_default();
-    let mut root =
-        encoded.init_root::<finch_ipc_capnp::brain_remote_envelope::Builder<'_>>();
+    let mut root = encoded.init_root::<finch_ipc_capnp::brain_remote_envelope::Builder<'_>>();
     match envelope {
         BrainRemoteEnvelope::Projection(message) => {
             let projection = root.reborrow().init_projection();
@@ -342,9 +343,7 @@ pub(crate) fn encode_brain_remote_envelope(
     Ok(capnp::serialize::write_message_to_words(&encoded))
 }
 
-pub(crate) fn decode_brain_remote_envelope(
-    bytes: &[u8],
-) -> anyhow::Result<BrainRemoteEnvelope> {
+pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<BrainRemoteEnvelope> {
     use finch_ipc_capnp::brain_remote_command::Which as CommandWhich;
     use finch_ipc_capnp::brain_remote_envelope::Which as EnvelopeWhich;
     use finch_ipc_capnp::brain_remote_reply::Which as ReplyWhich;
@@ -374,8 +373,7 @@ pub(crate) fn decode_brain_remote_envelope(
             let request_id = reply.get_request_id();
             BrainRemoteEnvelope::Reply(match reply.which()? {
                 ReplyWhich::Submitted(outcome) => {
-                    let (accepted, run, result) =
-                        decode_brain_submission_outcome(outcome?)?;
+                    let (accepted, run, result) = decode_brain_submission_outcome(outcome?)?;
                     BrainRemoteReply::Submitted {
                         request_id,
                         accepted,
