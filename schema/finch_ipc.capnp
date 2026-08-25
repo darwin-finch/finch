@@ -365,6 +365,43 @@ struct BrainWireMessage {
   }
 }
 
+# Once a remote WebSocket has authenticated and bound one exact attachment,
+# participant mutations carry only intent. Attachment and connection identity
+# come from the socket authority boundary rather than forgeable message fields.
+struct BrainRemoteCommand {
+  requestId @0 :UInt64;
+  union {
+    submit      @1 :BrainSubmission;
+    acknowledge @2 :UInt64;
+    detach      @3 :Void;
+  }
+}
+
+struct BrainRemoteError {
+  code    @0 :Text;
+  message @1 :Text;
+}
+
+struct BrainRemoteReply {
+  requestId @0 :UInt64;
+  union {
+    submitted    @1 :BrainSubmissionOutcome;
+    acknowledged @2 :BrainAttachment;
+    detached     @3 :Void;
+    error        @4 :BrainRemoteError;
+  }
+}
+
+# One framing type in both directions. The server sends ordered Brain
+# projections and correlated command replies; the client sends commands.
+struct BrainRemoteEnvelope {
+  union {
+    projection @0 :BrainWireMessage;
+    command    @1 :BrainRemoteCommand;
+    reply      @2 :BrainRemoteReply;
+  }
+}
+
 # A participant submits intent, never a complete BrainEvent envelope. The
 # daemon assigns identity, ordering, timestamps, run state, and every internal
 # lifecycle event.

@@ -6,6 +6,59 @@ use crate::brain::shared::{
 };
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_approval_audience};
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BrainRemoteCommand {
+    pub request_id: u64,
+    pub kind: BrainRemoteCommandKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BrainRemoteCommandKind {
+    Submit(BrainEventKind),
+    Acknowledge(u64),
+    Detach,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BrainRemoteReply {
+    Submitted {
+        request_id: u64,
+        accepted: BrainEvent,
+        run: Option<BrainRun>,
+        result: Option<BrainEvent>,
+    },
+    Acknowledged {
+        request_id: u64,
+        attachment: BrainAttachment,
+    },
+    Detached {
+        request_id: u64,
+    },
+    Error {
+        request_id: u64,
+        code: String,
+        message: String,
+    },
+}
+
+impl BrainRemoteReply {
+    pub(crate) fn request_id(&self) -> u64 {
+        match self {
+            Self::Submitted { request_id, .. }
+            | Self::Acknowledged { request_id, .. }
+            | Self::Detached { request_id }
+            | Self::Error { request_id, .. } => *request_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BrainRemoteEnvelope {
+    Projection(BrainWireMessage),
+    Command(BrainRemoteCommand),
+    Reply(BrainRemoteReply),
+}
+
 fn attachment_role_to_capnp(role: AttachmentRole) -> finch_ipc_capnp::BrainAttachmentRole {
     match role {
         AttachmentRole::Runner => finch_ipc_capnp::BrainAttachmentRole::Runner,
@@ -186,6 +239,21 @@ pub(super) fn encode_brain_submission_outcome(
     Ok(())
 }
 
+fn decode_brain_submission_outcome(
+    reader: finch_ipc_capnp::brain_submission_outcome::Reader<'_>,
+) -> anyhow::Result<(BrainEvent, Option<BrainRun>, Option<BrainEvent>)> {
+    let accepted = decode_event(reader.get_accepted()?)?;
+    let run = reader
+        .get_has_run()
+        .then(|| decode_run(reader.get_run()?))
+        .transpose()?;
+    let result = reader
+        .get_has_result()
+        .then(|| decode_event(reader.get_result()?))
+        .transpose()?;
+    Ok((accepted, run, result))
+}
+
 pub(crate) fn encode_brain_wire_message(message: &BrainWireMessage) -> anyhow::Result<Vec<u8>> {
     let mut encoded = capnp::message::Builder::new_default();
     let root = encoded.init_root::<finch_ipc_capnp::brain_wire_message::Builder<'_>>();
@@ -215,6 +283,122 @@ pub(super) fn decode_brain_wire_reader(
             event: decode_event(event?)?,
         }),
     }
+}
+
+pub(crate) fn encode_brain_remote_envelope(
+    envelope: &BrainRemoteEnvelope,
+) -> anyhow::Result<Vec<u8>> {
+    let mut encoded = capnp::message::Builder::new_default();
+    let mut root =
+        encoded.init_root::<finch_ipc_capnp::brain_remote_envelope::Builder<'_>>();
+    match envelope {
+        BrainRemoteEnvelope::Projection(message) => {
+            let projection = root.reborrow().init_projection();
+            match message {
+                BrainWireMessage::Snapshot { brain } => {
+                    encode_snapshot(projection.init_snapshot(), brain)?
+                }
+                BrainWireMessage::Event { event } => encode_event(projection.init_event(), event)?,
+            }
+        }
+        BrainRemoteEnvelope::Command(command) => {
+            let mut builder = root.reborrow().init_command();
+            builder.set_request_id(command.request_id);
+            match &command.kind {
+                BrainRemoteCommandKind::Submit(kind) => {
+                    encode_brain_submission(builder.init_submit(), kind)?
+                }
+                BrainRemoteCommandKind::Acknowledge(seq) => builder.set_acknowledge(*seq),
+                BrainRemoteCommandKind::Detach => builder.set_detach(()),
+            }
+        }
+        BrainRemoteEnvelope::Reply(reply) => {
+            let mut builder = root.reborrow().init_reply();
+            builder.set_request_id(reply.request_id());
+            match reply {
+                BrainRemoteReply::Submitted {
+                    accepted,
+                    run,
+                    result,
+                    ..
+                } => encode_brain_submission_outcome(
+                    builder.init_submitted(),
+                    accepted,
+                    run.as_ref(),
+                    result.as_ref(),
+                )?,
+                BrainRemoteReply::Acknowledged { attachment, .. } => {
+                    encode_attachment(builder.init_acknowledged(), attachment)
+                }
+                BrainRemoteReply::Detached { .. } => builder.set_detached(()),
+                BrainRemoteReply::Error { code, message, .. } => {
+                    let mut error = builder.init_error();
+                    error.set_code(code);
+                    error.set_message(message);
+                }
+            }
+        }
+    }
+    Ok(capnp::serialize::write_message_to_words(&encoded))
+}
+
+pub(crate) fn decode_brain_remote_envelope(
+    bytes: &[u8],
+) -> anyhow::Result<BrainRemoteEnvelope> {
+    use finch_ipc_capnp::brain_remote_command::Which as CommandWhich;
+    use finch_ipc_capnp::brain_remote_envelope::Which as EnvelopeWhich;
+    use finch_ipc_capnp::brain_remote_reply::Which as ReplyWhich;
+
+    let mut cursor = std::io::Cursor::new(bytes);
+    let encoded =
+        capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
+    let root = encoded.get_root::<finch_ipc_capnp::brain_remote_envelope::Reader<'_>>()?;
+    Ok(match root.which()? {
+        EnvelopeWhich::Projection(projection) => {
+            BrainRemoteEnvelope::Projection(decode_brain_wire_reader(projection?)?)
+        }
+        EnvelopeWhich::Command(command) => {
+            let command = command?;
+            let request_id = command.get_request_id();
+            let kind = match command.which()? {
+                CommandWhich::Submit(submission) => {
+                    BrainRemoteCommandKind::Submit(decode_brain_submission(submission?)?)
+                }
+                CommandWhich::Acknowledge(seq) => BrainRemoteCommandKind::Acknowledge(seq),
+                CommandWhich::Detach(()) => BrainRemoteCommandKind::Detach,
+            };
+            BrainRemoteEnvelope::Command(BrainRemoteCommand { request_id, kind })
+        }
+        EnvelopeWhich::Reply(reply) => {
+            let reply = reply?;
+            let request_id = reply.get_request_id();
+            BrainRemoteEnvelope::Reply(match reply.which()? {
+                ReplyWhich::Submitted(outcome) => {
+                    let (accepted, run, result) =
+                        decode_brain_submission_outcome(outcome?)?;
+                    BrainRemoteReply::Submitted {
+                        request_id,
+                        accepted,
+                        run,
+                        result,
+                    }
+                }
+                ReplyWhich::Acknowledged(attachment) => BrainRemoteReply::Acknowledged {
+                    request_id,
+                    attachment: decode_attachment(attachment?)?,
+                },
+                ReplyWhich::Detached(()) => BrainRemoteReply::Detached { request_id },
+                ReplyWhich::Error(error) => {
+                    let error = error?;
+                    BrainRemoteReply::Error {
+                        request_id,
+                        code: text(error.get_code()?)?,
+                        message: text(error.get_message()?)?,
+                    }
+                }
+            })
+        }
+    })
 }
 
 pub(super) fn encode_snapshot(
@@ -892,6 +1076,63 @@ mod tests {
             };
             let encoded = encode_brain_wire_message(&expected).unwrap();
             assert_eq!(decode_brain_wire_message(&encoded).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn remote_brain_envelopes_round_trip_commands_and_correlated_replies() {
+        let brain_id = BrainId(uuid::Uuid::new_v4());
+        let attachment = BrainAttachment {
+            attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            subject: "alice@laptop.local".into(),
+            role: AttachmentRole::Driver,
+            acknowledged_seq: 4,
+            connected: true,
+            connection_id: Some(ConnectionId(uuid::Uuid::new_v4())),
+        };
+        let accepted = event(
+            brain_id,
+            5,
+            BrainEventKind::Prompt {
+                text: "inspect it".into(),
+            },
+        );
+        let envelopes = vec![
+            BrainRemoteEnvelope::Command(BrainRemoteCommand {
+                request_id: 1,
+                kind: BrainRemoteCommandKind::Submit(BrainEventKind::Prompt {
+                    text: "inspect it".into(),
+                }),
+            }),
+            BrainRemoteEnvelope::Command(BrainRemoteCommand {
+                request_id: 2,
+                kind: BrainRemoteCommandKind::Acknowledge(5),
+            }),
+            BrainRemoteEnvelope::Command(BrainRemoteCommand {
+                request_id: 3,
+                kind: BrainRemoteCommandKind::Detach,
+            }),
+            BrainRemoteEnvelope::Reply(BrainRemoteReply::Submitted {
+                request_id: 1,
+                accepted,
+                run: None,
+                result: None,
+            }),
+            BrainRemoteEnvelope::Reply(BrainRemoteReply::Acknowledged {
+                request_id: 2,
+                attachment,
+            }),
+            BrainRemoteEnvelope::Reply(BrainRemoteReply::Detached { request_id: 3 }),
+            BrainRemoteEnvelope::Reply(BrainRemoteReply::Error {
+                request_id: 4,
+                code: "forbidden".into(),
+                message: "scope denied".into(),
+            }),
+        ];
+
+        for expected in envelopes {
+            let encoded = encode_brain_remote_envelope(&expected).unwrap();
+            assert_eq!(decode_brain_remote_envelope(&encoded).unwrap(), expected);
         }
     }
 
