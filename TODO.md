@@ -806,8 +806,11 @@ still blocks the corresponding Brain phase until it is unified.
   startup regression that reaches a live runner without requiring a daemon restart. The home watch
   and runner callback now have independent epoch/backoff supervisors: watch repair never renews a
   healthy runner, transient callback loss retains the durable lease identity, and either supervisor
-  can replace a dead shared IPC socket before the other restores its own capability. The isolated
-  rebuilt-daemon preflight now registers a runner and receives the attachment's snapshot-first watch.
+  can replace a dead shared IPC socket before the other restores its own capability. Runner retries
+  carry the exact served Brain, environment, and lease across handoff instead of falling back to the
+  session's home Brain, and publish scheduler authority only after checkpoint hydration succeeds.
+  The isolated rebuilt-daemon preflight now executes through the callback, transfers the runner,
+  forces callback loss, restores that exact non-home Brain, and observes the result on the live watch.
 - [x] Restore the memory/context status projection after fresh Brain attachment. `tfidf · recalled 0`
   must not replace or erase available conversation-context rows merely because semantic recall
   returned no matches; render the recall engine/count and canonical conversation context as distinct

@@ -182,7 +182,10 @@ async fn wait_for_shadow_health(bind: SocketAddr, socket: PathBuf) -> Result<()>
 async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<()> {
     let suffix = uuid::Uuid::new_v4();
     let brain = format!("preflight-{}", suffix.simple());
+    let home_brain = format!("preflight-home-{}", suffix.simple());
     let subject = format!("preflight/frontend-{suffix}");
+    let driver_subject = format!("preflight-driver-{suffix}");
+    let _home_snapshot = client.brain_snapshot(&home_brain).await?;
     let snapshot = client.brain_snapshot(&brain).await?;
     client.brain_claim_runner_identity(&subject).await?;
     let lease = client
@@ -194,15 +197,15 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
             30_000,
         )
         .await?;
-    let (runner_tx, _runner_rx) = tokio::sync::mpsc::unbounded_channel();
-    let _runner = client
+    let (runner_tx, mut runner_rx) = tokio::sync::mpsc::unbounded_channel();
+    let runner = client
         .register_brain_runner(&brain, lease.lease_id, runner_tx)
         .await
         .context("fresh daemon rejected runner callback")?;
     let attachment = client
         .brain_attach(
             &brain,
-            &format!("preflight-driver-{suffix}"),
+            &driver_subject,
             crate::brain::store::AttachmentRole::Driver,
             None,
         )
@@ -222,8 +225,184 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
             .is_some_and(|runner| runner.lease_id == lease.lease_id),
         "fresh daemon snapshot lost its registered runner lease"
     );
+
+    let submit_client = client.clone();
+    let submit_brain = brain.clone();
+    let submit_attachment = attachment.clone();
+    let submission = tokio::task::spawn_local(async move {
+        submit_client
+            .brain_submit(
+                &submit_brain,
+                &submit_attachment,
+                crate::brain::store::BrainEventKind::Program {
+                    language: crate::brain::store::ProgramLanguage::Lisp,
+                    source: "(say \"preflight callback live\")".into(),
+                },
+            )
+            .await
+    });
+    let request = tokio::time::timeout(Duration::from_secs(2), runner_rx.recv())
+        .await
+        .context("fresh daemon runner callback timed out")?
+        .context("fresh daemon runner callback closed")?;
+    let crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(request) = request else {
+        anyhow::bail!("fresh daemon delivered the wrong runner callback");
+    };
+    anyhow::ensure!(request.brain == brain, "runner callback targeted the wrong Brain");
+    request
+        .response_tx
+        .send(Ok(crate::server::RunnerProgramResult {
+            output: "preflight callback live".into(),
+            runtime_revision: runner.runtime_revision.saturating_add(1),
+            checkpoint: runner.checkpoint.clone(),
+            effect_journal: Vec::new(),
+        }))
+        .map_err(|_| anyhow::anyhow!("fresh daemon dropped the runner response"))?;
+    let outcome = tokio::time::timeout(Duration::from_secs(2), submission)
+        .await
+        .context("fresh daemon submission did not complete")??
+        .context("fresh daemon rejected the runner response")?;
+    anyhow::ensure!(
+        outcome.result.as_ref().is_some_and(|event| matches!(
+            &event.kind,
+            crate::brain::store::BrainEventKind::Result { error: None, .. }
+        )),
+        "fresh daemon did not complete runner output"
+    );
+    let watched_event = tokio::time::timeout(Duration::from_secs(2), watch.recv())
+        .await
+        .context("fresh daemon watch did not remain live after callback")?
+        .context("fresh daemon watch closed after callback")??;
+    anyhow::ensure!(
+        matches!(watched_event, crate::brain::store::BrainWireMessage::Event { .. }),
+        "fresh daemon watch did not publish the callback-backed program"
+    );
+
+    // Transfer this non-home Brain, deliberately lose the accepted callback,
+    // then restore that exact Brain/lease and prove it executes again.
+    let target_subject = format!("preflight-target/frontend-{suffix}");
+    let handoff = client
+        .brain_request_runner_handoff(
+            &brain,
+            &driver_subject,
+            &target_subject,
+            lease.lease_id,
+            &snapshot.environment,
+            30_000,
+        )
+        .await?;
+    client.brain_claim_runner_identity(&target_subject).await?;
+    let target_lease = client
+        .brain_accept_runner_handoff(
+            &brain,
+            &target_subject,
+            handoff.handoff_id,
+            &snapshot.environment,
+            30_000,
+        )
+        .await?;
+    let (lost_tx, lost_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _lost = client
+        .register_brain_runner(&brain, target_lease.lease_id, lost_tx)
+        .await?;
+    drop(lost_rx);
+    let lost = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.brain_submit(
+            &brain,
+            &attachment,
+            crate::brain::store::BrainEventKind::Program {
+                language: crate::brain::store::ProgramLanguage::Lisp,
+                source: "(say \"force callback loss\")".into(),
+            },
+        ),
+    )
+    .await
+    .context("lost callback submission hung")??;
+    anyhow::ensure!(
+        lost.result.as_ref().is_some_and(|event| matches!(
+            &event.kind,
+            crate::brain::store::BrainEventKind::Result { error: Some(error), .. }
+                if error.contains("disconnected") || error.contains("stopped")
+        )),
+        "closed runner callback did not become an observable failure"
+    );
+
+    let (restored_tx, mut restored_rx) = tokio::sync::mpsc::unbounded_channel();
+    let restored = client
+        .register_brain_runner(&brain, target_lease.lease_id, restored_tx)
+        .await
+        .context("could not restore handed-off runner callback")?;
+    let submit_client = client.clone();
+    let submit_brain = brain.clone();
+    let submit_attachment = attachment.clone();
+    let restored_submission = tokio::task::spawn_local(async move {
+        submit_client
+            .brain_submit(
+                &submit_brain,
+                &submit_attachment,
+                crate::brain::store::BrainEventKind::Program {
+                    language: crate::brain::store::ProgramLanguage::Lisp,
+                    source: "(say \"handoff callback restored\")".into(),
+                },
+            )
+            .await
+    });
+    let request = tokio::time::timeout(Duration::from_secs(2), restored_rx.recv())
+        .await
+        .context("restored handed-off callback timed out")?
+        .context("restored handed-off callback closed")?;
+    let crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(request) = request else {
+        anyhow::bail!("restored callback delivered the wrong request");
+    };
+    anyhow::ensure!(request.brain == brain, "restored callback targeted the home Brain");
+    anyhow::ensure!(request.brain != home_brain, "handoff target collapsed to session home");
+    request
+        .response_tx
+        .send(Ok(crate::server::RunnerProgramResult {
+            output: "handoff callback restored".into(),
+            runtime_revision: restored.runtime_revision.saturating_add(1),
+            checkpoint: restored.checkpoint,
+            effect_journal: Vec::new(),
+        }))
+        .map_err(|_| anyhow::anyhow!("daemon dropped restored runner response"))?;
+    let restored_outcome = tokio::time::timeout(Duration::from_secs(2), restored_submission)
+        .await
+        .context("restored handed-off submission did not complete")??
+        .context("restored handed-off submission failed")?;
+    anyhow::ensure!(
+        restored_outcome.result.as_ref().is_some_and(|event| matches!(
+            &event.kind,
+            crate::brain::store::BrainEventKind::Result { error: None, .. }
+        )),
+        "restored handed-off run was rejected"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let message = tokio::time::timeout_at(deadline, watch.recv())
+            .await
+            .context("watch did not remain live after handed-off callback restoration")?
+            .context("watch closed after handed-off callback restoration")??;
+        if matches!(
+            message,
+            crate::brain::store::BrainWireMessage::Event {
+                event: crate::brain::store::BrainEvent {
+                    kind: crate::brain::store::BrainEventKind::Result {
+                        output,
+                        error: None,
+                        ..
+                    },
+                    ..
+                }
+            } if output == "handoff callback restored"
+        ) {
+            break;
+        }
+    }
     client.brain_detach(&brain, &attachment).await?;
-    client.brain_release_runner(&brain, lease.lease_id).await?;
+    client
+        .brain_release_runner(&brain, target_lease.lease_id)
+        .await?;
     Ok(())
 }
 
