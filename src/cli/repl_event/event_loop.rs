@@ -195,6 +195,10 @@ pub struct EventLoop {
     /// so tool continuations use the exact same pipeline as local turns.
     pending_named_brain_turns: std::collections::HashMap<Uuid, PendingNamedBrainTurn>,
 
+    /// Cancellation controls for typed programs delegated by the Brain daemon.
+    pending_named_brain_programs:
+        std::collections::HashMap<crate::brain::shared::RunId, tokio_util::sync::CancellationToken>,
+
     /// Source/output already rendered while this frontend serviced its home
     /// Brain callback. Matching canonical events advance this marker without
     /// drawing a second copy in the runner console.
@@ -503,6 +507,7 @@ struct DeferredVmApproval {
 }
 
 struct PendingNamedBrainTurn {
+    run_id: crate::brain::shared::RunId,
     response_tx: tokio::sync::oneshot::Sender<
         std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError>,
     >,
@@ -990,6 +995,7 @@ impl EventLoop {
             active_query_id: Arc::new(RwLock::new(None)),
             pending_queries: std::collections::VecDeque::new(),
             pending_named_brain_turns: std::collections::HashMap::new(),
+            pending_named_brain_programs: std::collections::HashMap::new(),
             local_brain_projections: std::collections::VecDeque::new(),
             remote_brain_tool_unit: None,
             remote_brain_tool_rows: std::collections::HashMap::new(),
@@ -1309,6 +1315,10 @@ impl EventLoop {
                         ReplEvent::RunnerLeaseStatus { .. } => "RunnerLeaseStatus",
                         ReplEvent::NamedBrainProgramRequested(_) => "NamedBrainProgramRequested",
                         ReplEvent::NamedBrainTurnRequested(_) => "NamedBrainTurnRequested",
+                        ReplEvent::NamedBrainRunCancelRequested(_) => {
+                            "NamedBrainRunCancelRequested"
+                        }
+                        ReplEvent::NamedBrainProgramFinished(_) => "NamedBrainProgramFinished",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
                     tracing::debug!("Received event: {:?}", event);
@@ -3367,6 +3377,12 @@ Rules:\n\
             ReplEvent::NamedBrainTurnRequested(request) => {
                 self.dispatch_named_brain_turn(request).await?;
             }
+            ReplEvent::NamedBrainRunCancelRequested(request) => {
+                self.cancel_named_brain_run(request).await;
+            }
+            ReplEvent::NamedBrainProgramFinished(run_id) => {
+                self.pending_named_brain_programs.remove(&run_id);
+            }
             ReplEvent::ShowDialog {
                 dialog: _,
                 response_tx,
@@ -3382,7 +3398,7 @@ Rules:\n\
         Ok(())
     }
 
-    fn dispatch_named_brain_program(&self, request: crate::server::RunnerProgramRequest) {
+    fn dispatch_named_brain_program(&mut self, request: crate::server::RunnerProgramRequest) {
         if self.runner_brain.as_deref() != Some(request.brain.as_str())
             || !self.home_runner_lease_active
         {
@@ -3394,6 +3410,10 @@ Rules:\n\
         }
         let runtime = Arc::clone(&self.program_runtime);
         let event_tx = self.event_tx.clone();
+        let run_id = request.run_id;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.pending_named_brain_programs
+            .insert(run_id, cancel.clone());
         tokio::spawn(async move {
             let language = match request.language {
                 crate::brain::shared::ProgramLanguage::Forth => {
@@ -3417,11 +3437,11 @@ Rules:\n\
                 expected_revision: Some(runtime.revision()),
                 budget: None,
             };
-            let result = async {
+            let execution = async {
                 let outcome = runtime.submit_typed_only(submission).await?;
                 let outcome = super::query_processor::resume_interactive_boundaries(
                     runtime.as_ref(),
-                    event_tx,
+                    event_tx.clone(),
                     outcome,
                 )
                 .await?;
@@ -3448,10 +3468,14 @@ Rules:\n\
                     runtime_revision: outcome.output_revision,
                     checkpoint,
                 })
+            };
+            let result = tokio::select! {
+                _ = cancel.cancelled() => Err(anyhow::anyhow!("named Brain run cancelled")),
+                result = execution => result,
             }
-            .await
             .map_err(|error: anyhow::Error| error.to_string());
             let _ = request.response_tx.send(result);
+            let _ = event_tx.send(ReplEvent::NamedBrainProgramFinished(run_id));
         });
     }
 
@@ -3495,6 +3519,7 @@ Rules:\n\
         self.pending_named_brain_turns.insert(
             query_id,
             PendingNamedBrainTurn {
+                run_id: request.run_id,
                 response_tx: request.response_tx,
                 turn_events: Vec::new(),
                 approval_audience: request.approval_audience,
@@ -3520,6 +3545,42 @@ Rules:\n\
             }
         }
         Ok(())
+    }
+
+    async fn cancel_named_brain_run(&mut self, request: crate::server::RunnerCancelRequest) {
+        if self.runner_brain.as_deref() != Some(request.brain.as_str())
+            || !self.home_runner_lease_active
+        {
+            let _ = request.response_tx.send(Err(format!(
+                "frontend does not hold the runner lease for named Brain '{}'",
+                request.brain
+            )));
+            return;
+        }
+        if let Some(cancel) = self.pending_named_brain_programs.get(&request.run_id) {
+            cancel.cancel();
+            let _ = request.response_tx.send(Ok(true));
+            return;
+        }
+        let query_id = self.pending_named_brain_turns.iter().find_map(|(query_id, turn)| {
+            (turn.run_id == request.run_id).then_some(*query_id)
+        });
+        let Some(query_id) = query_id else {
+            let _ = request.response_tx.send(Ok(false));
+            return;
+        };
+        self.query_states.cancel_query(query_id).await;
+        if *self.active_query_id.read().await == Some(query_id) {
+            *self.active_query_id.write().await = None;
+        }
+        self.tool_call_history.write().await.remove(&query_id);
+        if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
+            let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
+                message: "named Brain run cancelled".into(),
+                turn_events: pending.turn_events,
+            }));
+        }
+        let _ = request.response_tx.send(Ok(true));
     }
 
     fn finish_named_brain_turn(&mut self, query_id: Uuid, output: String) {

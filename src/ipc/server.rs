@@ -962,74 +962,15 @@ impl finch_daemon::Server for FinchDaemonImpl {
         let queued_brain = brain.clone();
         tokio::task::spawn_local(async move {
             while let Some(request) = rx.recv().await {
-                let disconnected = match request {
-                    crate::server::RunnerRequest::Program(request) => {
-                        let mut call = runner.run_program_request();
-                        {
-                            let mut payload = call.get().init_request();
-                            payload.set_brain(&request.brain);
-                            payload.set_run_id(&request.run_id.0.to_string());
-                            payload.set_request_seq(request.request_seq);
-                            payload.set_language(program_language_to_capnp(request.language));
-                            payload.set_source(&request.source);
-                        }
-                        let (result, disconnected) = match call.send().promise.await {
-                            Ok(reply) => (
-                                decode_runner_program_result(
-                                    reply.get().and_then(|r| r.get_result()),
-                                ),
-                                false,
-                            ),
-                            Err(error) => (Err(error.to_string()), true),
-                        };
-                        let _ = request.response_tx.send(result);
-                        disconnected
+                let runner = runner.clone();
+                let server = Arc::clone(&server);
+                let broker = broker.clone();
+                let brain = brain.clone();
+                tokio::task::spawn_local(async move {
+                    if forward_runner_request(runner, server, request).await {
+                        broker.unregister(&brain, registration_id);
                     }
-                    crate::server::RunnerRequest::Turn(request) => {
-                        let context_json =
-                            serde_json::to_vec(&request.context).map_err(|error| error.to_string());
-                        let (result, disconnected) = match context_json {
-                            Ok(context_json) => {
-                                let mut call = runner.run_turn_request();
-                                {
-                                    let mut payload = call.get().init_request();
-                                    payload.set_brain(&request.brain);
-                                    payload.set_run_id(&request.run_id.0.to_string());
-                                    payload.set_request_seq(request.request_seq);
-                                    payload.set_prompt(&request.prompt);
-                                    payload.set_context_json(&context_json);
-                                    encode_approval_audience(
-                                        payload.reborrow().init_approval_audience(),
-                                        &request.approval_audience,
-                                    );
-                                    let control: finch_ipc_capnp::brain_turn_control::Client =
-                                        capnp_rpc::new_client(BrainTurnControlImpl {
-                                            server: Arc::clone(&server),
-                                            brain: request.brain.clone(),
-                                            request_seq: request.request_seq,
-                                            expected_audience: request.approval_audience.clone(),
-                                        });
-                                    payload.set_control(control);
-                                }
-                                match call.send().promise.await {
-                                    Ok(reply) => (
-                                        decode_runner_turn_result(
-                                            reply.get().and_then(|r| r.get_result()),
-                                        ),
-                                        false,
-                                    ),
-                                    Err(error) => (Err(error.to_string().into()), true),
-                                }
-                            }
-                            Err(error) => (Err(error.into()), false),
-                        };
-                        let _ = request.response_tx.send(result);
-                        disconnected
-                    }
-                };
-                if disconnected {
-                    break;
-                }
+                });
             }
             broker.unregister(&brain, registration_id);
         });
@@ -1108,6 +1049,99 @@ fn program_language_from_capnp(
     match language {
         finch_ipc_capnp::ProgramLanguage::Forth => crate::brain::shared::ProgramLanguage::Forth,
         finch_ipc_capnp::ProgramLanguage::Lisp => crate::brain::shared::ProgramLanguage::Lisp,
+    }
+}
+
+async fn forward_runner_request(
+    runner: finch_ipc_capnp::brain_runner::Client,
+    server: Arc<AgentServer>,
+    request: crate::server::RunnerRequest,
+) -> bool {
+    match request {
+        crate::server::RunnerRequest::Program(request) => {
+            let mut call = runner.run_program_request();
+            {
+                let mut payload = call.get().init_request();
+                payload.set_brain(&request.brain);
+                payload.set_run_id(&request.run_id.0.to_string());
+                payload.set_request_seq(request.request_seq);
+                payload.set_language(program_language_to_capnp(request.language));
+                payload.set_source(&request.source);
+            }
+            let (result, disconnected) = match call.send().promise.await {
+                Ok(reply) => (
+                    decode_runner_program_result(reply.get().and_then(|r| r.get_result())),
+                    false,
+                ),
+                Err(error) => (Err(error.to_string()), true),
+            };
+            let _ = request.response_tx.send(result);
+            disconnected
+        }
+        crate::server::RunnerRequest::Turn(request) => {
+            let context_json =
+                serde_json::to_vec(&request.context).map_err(|error| error.to_string());
+            let (result, disconnected) = match context_json {
+                Ok(context_json) => {
+                    let mut call = runner.run_turn_request();
+                    {
+                        let mut payload = call.get().init_request();
+                        payload.set_brain(&request.brain);
+                        payload.set_run_id(&request.run_id.0.to_string());
+                        payload.set_request_seq(request.request_seq);
+                        payload.set_prompt(&request.prompt);
+                        payload.set_context_json(&context_json);
+                        encode_approval_audience(
+                            payload.reborrow().init_approval_audience(),
+                            &request.approval_audience,
+                        );
+                        let control: finch_ipc_capnp::brain_turn_control::Client =
+                            capnp_rpc::new_client(BrainTurnControlImpl {
+                                server,
+                                brain: request.brain.clone(),
+                                request_seq: request.request_seq,
+                                expected_audience: request.approval_audience.clone(),
+                            });
+                        payload.set_control(control);
+                    }
+                    match call.send().promise.await {
+                        Ok(reply) => (
+                            decode_runner_turn_result(reply.get().and_then(|r| r.get_result())),
+                            false,
+                        ),
+                        Err(error) => (Err(error.to_string().into()), true),
+                    }
+                }
+                Err(error) => (Err(error.into()), false),
+            };
+            let _ = request.response_tx.send(result);
+            disconnected
+        }
+        crate::server::RunnerRequest::Cancel(request) => {
+            let mut call = runner.cancel_run_request();
+            call.get().set_brain(&request.brain);
+            call.get().set_run_id(&request.run_id.0.to_string());
+            let (result, disconnected) = match call.send().promise.await {
+                Ok(reply) => match reply.get() {
+                    Ok(reply) => {
+                        let error = reply
+                            .get_error()
+                            .ok()
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or("");
+                        if error.is_empty() {
+                            (Ok(reply.get_cancelled()), false)
+                        } else {
+                            (Err(error.to_string()), false)
+                        }
+                    }
+                    Err(error) => (Err(error.to_string()), false),
+                },
+                Err(error) => (Err(error.to_string()), true),
+            };
+            let _ = request.response_tx.send(result);
+            disconnected
+        }
     }
 }
 

@@ -651,6 +651,63 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(())
         })
     }
+
+    fn cancel_run(
+        &mut self,
+        params: brain_runner::CancelRunParams,
+        mut results: brain_runner::CancelRunResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(params) => params,
+            Err(error) => return Promise::err(error),
+        };
+        let brain = params
+            .get_brain()
+            .ok()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let run_id = match params
+            .get_run_id()
+            .map_err(anyhow::Error::new)
+            .and_then(|value| value.to_str().map_err(anyhow::Error::new))
+            .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::new))
+        {
+            Ok(run_id) => crate::brain::shared::RunId(run_id),
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if self
+            .event_tx
+            .send(crate::cli::repl_event::ReplEvent::NamedBrainRunCancelRequested(
+                crate::server::RunnerCancelRequest {
+                    brain,
+                    run_id,
+                    response_tx,
+                },
+            ))
+            .is_err()
+        {
+            return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));
+        }
+        Promise::from_future(async move {
+            let response = response_rx
+                .await
+                .map_err(|_| capnp::Error::failed("frontend dropped cancel response".into()))?;
+            let mut result = results.get();
+            match response {
+                Ok(cancelled) => {
+                    result.set_cancelled(cancelled);
+                    result.set_error("");
+                }
+                Err(error) => {
+                    result.set_cancelled(false);
+                    result.set_error(&error);
+                }
+            }
+            Ok(())
+        })
+    }
 }
 
 fn encode_brain_turn_events(

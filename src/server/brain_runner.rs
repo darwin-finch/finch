@@ -13,6 +13,14 @@ use crate::brain::shared::{ProgramLanguage, RunId, RunnerLeaseId};
 pub enum RunnerRequest {
     Program(RunnerProgramRequest),
     Turn(RunnerTurnRequest),
+    Cancel(RunnerCancelRequest),
+}
+
+#[derive(Debug)]
+pub struct RunnerCancelRequest {
+    pub brain: String,
+    pub run_id: RunId,
+    pub response_tx: oneshot::Sender<Result<bool, String>>,
 }
 
 #[derive(Debug)]
@@ -232,6 +240,37 @@ impl BrainRunnerBroker {
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
             .map_err(anyhow::Error::new)
     }
+
+    pub async fn cancel_run(
+        &self,
+        brain: &str,
+        lease_id: RunnerLeaseId,
+        run_id: RunId,
+    ) -> Result<bool> {
+        let registration = self
+            .registrations
+            .read()
+            .expect("runner broker lock poisoned")
+            .get(brain)
+            .cloned()
+            .with_context(|| format!("named Brain '{brain}' has no connected runner callback"))?;
+        if registration.lease_id != lease_id {
+            anyhow::bail!("named Brain '{brain}' runner callback belongs to a stale lease");
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        registration
+            .tx
+            .send(RunnerRequest::Cancel(RunnerCancelRequest {
+                brain: brain.to_string(),
+                run_id,
+                response_tx,
+            }))
+            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped cancel response"))?
+            .map_err(anyhow::Error::msg)
+    }
 }
 
 #[cfg(test)]
@@ -372,6 +411,24 @@ mod tests {
             .unwrap();
         assert_eq!(result.source, "(say \"42\")");
         assert_eq!(result.output, "42");
+    }
+
+    #[tokio::test]
+    async fn cancellation_targets_one_registered_run() {
+        let broker = BrainRunnerBroker::default();
+        let lease_id = lease();
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        broker.register("brain", lease_id, tx);
+        tokio::spawn(async move {
+            let RunnerRequest::Cancel(request) = rx.recv().await.unwrap() else {
+                panic!("expected cancellation request")
+            };
+            assert_eq!(request.run_id, run_id);
+            request.response_tx.send(Ok(true)).unwrap();
+        });
+
+        assert!(broker.cancel_run("brain", lease_id, run_id).await.unwrap());
     }
 
     #[test]

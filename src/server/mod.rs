@@ -18,9 +18,9 @@ pub use brain_service::{
     BrainLifecycleService, BrainSubmissionError, BrainSubmissionOutcome, BrainWatch,
 };
 pub use brain_runner::{
-    BrainRunnerBroker, RunnerApprovalRequest, RunnerProgramRequest, RunnerProgramResult,
-    RunnerRegistrationId, RunnerRequest, RunnerTurnError, RunnerTurnEvent, RunnerTurnRequest,
-    RunnerTurnResult,
+    BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerProgramRequest,
+    RunnerProgramResult, RunnerRegistrationId, RunnerRequest, RunnerTurnError, RunnerTurnEvent,
+    RunnerTurnRequest, RunnerTurnResult,
 };
 pub use feedback_handler::{handle_feedback, handle_training_status};
 pub use handlers::{

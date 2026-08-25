@@ -178,6 +178,7 @@ struct BrainTurnEvent {
 interface BrainRunner {
   runProgram @0 (request :BrainProgramRequest) -> (result :BrainProgramResult);
   runTurn    @1 (request :BrainTurnRequest) -> (result :BrainTurnResult);
+  cancelRun  @2 (brain :Text, runId :Text) -> (cancelled :Bool, error :Text);
 }
 
 # Per-turn reverse capability. The runner publishes an addressed approval and
