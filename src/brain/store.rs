@@ -3411,6 +3411,17 @@ impl BrainStore {
         let Ok(bytes) = std::fs::read(&path) else {
             return Ok(Vec::new());
         };
+        if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+            let committed_len = bytes.iter().rposition(|byte| *byte == b'\n')
+                .map(|offset| offset + 1)
+                .unwrap_or(0);
+            let file = OpenOptions::new().write(true).open(&path)
+                .with_context(|| format!("open {} for torn-tail recovery", path.display()))?;
+            file.set_len(committed_len as u64)
+                .with_context(|| format!("truncate torn tail in {}", path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("sync recovered {}", path.display()))?;
+        }
         let mut events = Vec::new();
         for (line_no, terminated) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
             // Committed records are newline-terminated. A torn final append
@@ -3738,6 +3749,12 @@ mod tests {
         drop(store);
         let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         assert_eq!(restarted.snapshot("shared").unwrap().revision, 1);
+        restarted.push("shared", "alice", BrainEventKind::Prompt {
+            text: "after recovery".into(),
+        }).unwrap();
+        drop(restarted);
+        let restarted_again = BrainStore::with_root("box.local", Some(temp.path().into()));
+        assert_eq!(restarted_again.snapshot("shared").unwrap().revision, 2);
     }
 
     fn mutation_receipt(
