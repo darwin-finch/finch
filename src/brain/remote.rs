@@ -3886,7 +3886,7 @@ mod tests {
             });
             let (runner_tx, runner_rx) = mpsc::unbounded_channel();
             lifecycle.register_test_runner("shared", lease.lease_id, runner_tx);
-            let app = crate::server::handlers::create_remote_brain_router(server);
+            let app = crate::server::handlers::create_router(server);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let task = tokio::spawn(async move {

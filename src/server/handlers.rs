@@ -935,6 +935,8 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
         decision,
     } = &kind
     {
+        let execution_lock = store.execution_lock(name)?;
+        let _turn = execution_lock.lock_owned().await;
         let accepted = commit_named_brain_approval_decision(
             store,
             approvals,
@@ -1526,58 +1528,79 @@ fn commit_named_brain_approval_decision(
     decision: serde_json::Value,
     mutation: Option<crate::brain::store::BrainMutationReceipt>,
 ) -> anyhow::Result<crate::brain::store::BrainEvent> {
-    if let Some(receipt) = mutation.as_ref() {
-        if let Some(replayed) = store.replay_mutation(name, receipt)? {
-            return Ok(replayed);
-        }
-    }
     let snapshot = store.snapshot(name)?;
-    let claimed = approvals.claim(
-        snapshot.brain_id,
-        request_seq,
-        approval_id,
-        attachment.attachment_id,
-    )?;
-    if claimed.request_seq != request_seq
-        || claimed.audience.brain_id != snapshot.brain_id
-        || claimed.audience.brain != name
-        || claimed.audience.attachment_id != attachment.attachment_id
-        || claimed.audience.subject != attachment.subject
-        || claimed.audience.role != attachment.role
-        || claimed.audience.environment_generation != snapshot.environment.generation
-    {
-        claimed.fail("approval decision no longer matches its addressed attachment");
-        anyhow::bail!("approval decision no longer matches its addressed attachment");
+    let validate_pending = || -> anyhow::Result<()> {
+        let audience = approvals.inspect(
+            snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
+        )?;
+        anyhow::ensure!(audience.brain_id == snapshot.brain_id
+            && audience.brain == name
+            && audience.attachment_id == attachment.attachment_id
+            && audience.subject == attachment.subject
+            && audience.role == attachment.role
+            && audience.environment_generation == snapshot.environment.generation,
+            "approval decision no longer matches its addressed attachment");
+        Ok(())
+    };
+    if let Some(receipt) = mutation {
+        let mutation_id = receipt.mutation_id;
+        if let Some(event) = store.replay_mutation(name, &receipt)? {
+            anyhow::ensure!(matches!(&event.kind, crate::brain::store::BrainEventKind::ApprovalDecided {
+                request_seq: recorded_seq, approval_id: recorded_id,
+                decision: recorded_decision,
+            } if *recorded_seq == request_seq && recorded_id == approval_id
+                && recorded_decision == &decision),
+                "replayed mutation outcome is not this approval decision");
+            if store.approval_decision_delivery_completed(name, mutation_id)? {
+                return Ok(event);
+            }
+            validate_pending()?;
+            approvals.deliver(
+                snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
+                decision,
+            )?;
+            store.complete_approval_decision_delivery(
+                name, &attachment.subject, request_seq, approval_id, mutation_id,
+            )?;
+            return Ok(event);
+        }
+        validate_pending()?;
+        let reservation = store.reserve_approval_decision(
+            name, &attachment.subject, request_seq, approval_id, decision.clone(), receipt,
+        )?;
+        if reservation.delivered {
+            return Ok(reservation.event);
+        }
+        approvals.deliver(
+            snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
+            decision,
+        )?;
+        store.complete_approval_decision_delivery(
+            name, &attachment.subject, request_seq, approval_id, mutation_id,
+        )?;
+        return Ok(reservation.event);
     }
-    let kind = crate::brain::store::BrainEventKind::ApprovalDecided {
-        request_seq,
-        approval_id: approval_id.to_string(),
-        decision: decision.clone(),
-    };
-    let correlated_run = snapshot
-        .runs
-        .iter()
-        .find(|run| run.request_seq == request_seq)
-        .map(|run| run.run_id);
-    let accepted = match mutation {
-        Some(receipt) => store.push_idempotent(name, &attachment.subject, kind, receipt)
-            .map(|append| append.event),
-        None => match correlated_run {
-            Some(run_id) => store.push_for_run(name, &attachment.subject, run_id, kind),
-            None => store.push(name, &attachment.subject, kind),
-        },
-    };
-    let accepted = match accepted {
-        Ok(accepted) => accepted,
+
+    // In-process callers without a durable mutation envelope retain the
+    // legacy one-shot path. Remote decisions always carry a receipt.
+    validate_pending()?;
+    let claimed = approvals.claim(
+        snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
+    )?;
+    let accepted = store.push(name, &attachment.subject,
+        crate::brain::store::BrainEventKind::ApprovalDecided {
+            request_seq, approval_id: approval_id.to_string(), decision: decision.clone(),
+        });
+    match accepted {
+        Ok(accepted) => {
+            claimed.complete(decision);
+            Ok(accepted)
+        }
         Err(error) => {
             claimed.fail(error.to_string());
-            return Err(error);
+            Err(error)
         }
-    };
-    // The canonical event is durable before the suspended runner sees the
-    // decision, so reconnect/replay cannot observe an unaudited grant.
-    claimed.complete(decision);
-    Ok(accepted)
+    }
 }
 
 fn push_named_brain_run_result(
@@ -4564,6 +4587,132 @@ mod handler_tests {
                     )
             }));
         assert_eq!(registration.wait().await.unwrap(), decision);
+    }
+
+    #[tokio::test]
+    async fn durable_approval_delivery_rejects_stale_and_recovers_uncertain_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local", Some(temp.path().into()),
+        );
+        let request_seq = store.push(
+            "shared", "alice", BrainEventKind::Prompt { text: "approve".into() },
+        ).unwrap().seq;
+        let snapshot = store.snapshot("shared").unwrap();
+        let attachment = driver_attachment("alice");
+        let audience = BrainApprovalAudience {
+            brain_id: snapshot.brain_id, brain: snapshot.name,
+            attachment_id: attachment.attachment_id, subject: attachment.subject.clone(),
+            role: attachment.role,
+            environment_generation: snapshot.environment.generation,
+        };
+        let approvals = crate::server::BrainApprovalBroker::default();
+        let registration = approvals.register(request_seq, "approval", audience.clone()).unwrap();
+        let decision = serde_json::json!({"choice": "approve_once"});
+        let mutation_id = uuid::Uuid::new_v4();
+        let receipt = crate::brain::store::BrainMutationReceipt {
+            mutation_id, attachment_id: attachment.attachment_id,
+            expected_revision: snapshot.revision,
+            environment_generation: snapshot.environment.generation,
+            command_sha256: "approval-decision".into(),
+        };
+        let mut stale = receipt.clone();
+        stale.expected_revision = 0;
+        assert!(commit_named_brain_approval_decision(
+            &store, &approvals, "shared", &attachment, request_seq, "approval",
+            decision.clone(), Some(stale),
+        ).is_err());
+        assert!(approvals.inspect(snapshot.brain_id, request_seq, "approval",
+            attachment.attachment_id).is_ok(), "stale receipt consumed pending approval");
+        let mut stale_environment = receipt.clone();
+        stale_environment.environment_generation += 1;
+        assert!(commit_named_brain_approval_decision(
+            &store, &approvals, "shared", &attachment, request_seq, "approval",
+            decision.clone(), Some(stale_environment),
+        ).is_err());
+        assert!(approvals.inspect(snapshot.brain_id, request_seq, "approval",
+            attachment.attachment_id).is_ok(), "stale environment consumed pending approval");
+
+        let retry = |store: crate::brain::store::BrainStore,
+                     approvals: crate::server::BrainApprovalBroker,
+                     attachment: crate::brain::store::BrainAttachment,
+                     decision: serde_json::Value,
+                     receipt: crate::brain::store::BrainMutationReceipt| {
+            std::thread::spawn(move || commit_named_brain_approval_decision(
+                &store, &approvals, "shared", &attachment, request_seq, "approval",
+                decision, Some(receipt),
+            ))
+        };
+        let first = retry(store.clone(), approvals.clone(), attachment.clone(),
+            decision.clone(), receipt.clone());
+        let second = retry(store.clone(), approvals.clone(), attachment.clone(),
+            decision.clone(), receipt.clone());
+        let first = first.join().unwrap().unwrap();
+        let second = second.join().unwrap().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(registration.wait().await.unwrap(), decision);
+        assert!(commit_named_brain_approval_decision(
+            &store, &approvals, "shared", &attachment, request_seq, "approval",
+            serde_json::json!({"choice": "deny"}), Some(receipt.clone()),
+        ).is_err());
+        let mut changed = receipt.clone();
+        changed.environment_generation += 1;
+        assert!(commit_named_brain_approval_decision(
+            &store, &approvals, "shared", &attachment, request_seq, "approval",
+            serde_json::json!({"choice": "deny"}), Some(changed),
+        ).is_err());
+
+        let request_seq = store.push(
+            "shared", "alice", BrainEventKind::Prompt { text: "uncertain".into() },
+        ).unwrap().seq;
+        let snapshot = store.snapshot("shared").unwrap();
+        let receipt = crate::brain::store::BrainMutationReceipt {
+            mutation_id: uuid::Uuid::new_v4(), attachment_id: attachment.attachment_id,
+            expected_revision: snapshot.revision,
+            environment_generation: snapshot.environment.generation,
+            command_sha256: "uncertain-decision".into(),
+        };
+        let original = crate::server::BrainApprovalBroker::default();
+        let original_registration = original.register(
+            request_seq, "uncertain", BrainApprovalAudience {
+                brain_id: snapshot.brain_id, brain: "shared".into(),
+                attachment_id: attachment.attachment_id, subject: attachment.subject.clone(),
+                role: attachment.role,
+                environment_generation: snapshot.environment.generation,
+            },
+        ).unwrap();
+        store.reserve_approval_decision(
+            "shared", &attachment.subject, request_seq, "uncertain",
+            decision.clone(), receipt.clone(),
+        ).unwrap();
+        let after_restart = crate::server::BrainApprovalBroker::default();
+        assert!(commit_named_brain_approval_decision(
+            &store, &after_restart, "shared", &attachment, request_seq, "uncertain",
+            decision.clone(), Some(receipt.clone()),
+        ).is_err(), "reservation without delivery marker falsely replayed success");
+        original.deliver(snapshot.brain_id, request_seq, "uncertain",
+            attachment.attachment_id, decision.clone()).unwrap();
+        assert_eq!(original_registration.wait().await.unwrap(), decision);
+        assert!(commit_named_brain_approval_decision(
+            &store, &original, "shared", &attachment, request_seq, "uncertain",
+            decision.clone(), Some(receipt.clone()),
+        ).is_err(), "delivery uncertainty without durable terminal falsely succeeded");
+        let resumed = crate::server::BrainApprovalBroker::default();
+        let resumed_registration = resumed.register(
+            request_seq, "uncertain", audience,
+        ).unwrap();
+        commit_named_brain_approval_decision(
+            &store, &resumed, "shared", &attachment, request_seq, "uncertain",
+            decision.clone(), Some(receipt.clone()),
+        ).unwrap();
+        assert_eq!(resumed_registration.wait().await.unwrap(), decision);
+        assert!(store.approval_decision_delivery_completed(
+            "shared", receipt.mutation_id,
+        ).unwrap());
+        assert!(commit_named_brain_approval_decision(
+            &store, &crate::server::BrainApprovalBroker::default(), "shared", &attachment,
+            request_seq, "uncertain", decision, Some(receipt),
+        ).is_ok(), "durable terminal did not replay after response loss");
     }
 
     #[tokio::test]

@@ -1363,6 +1363,14 @@ pub(super) fn encode_event(
                     recorded.set_schedule_cancellation_noop(&schedule_id.0.to_string()),
                 crate::brain::store::BrainMutationOutcome::HandoffCancellationNoop { handoff_id } =>
                     recorded.set_handoff_cancellation_noop(&handoff_id.0.to_string()),
+                crate::brain::store::BrainMutationOutcome::ApprovalDecisionDelivered {
+                    request_seq, approval_id, mutation_id,
+                } => {
+                    let mut progress = recorded.init_approval_decision_delivered();
+                    progress.set_request_seq(*request_seq);
+                    progress.set_approval_id(approval_id);
+                    progress.set_mutation_id(&mutation_id.to_string());
+                }
             }
         }
         BrainEventKind::RunnerLeaseAcquired { lease } => {
@@ -1572,6 +1580,14 @@ pub(super) fn decode_event(
                 Outcome::HandoffCancellationNoop(value) => BrainMutationOutcome::HandoffCancellationNoop {
                     handoff_id: RunnerHandoffId(parse_uuid(value?)?),
                 },
+                Outcome::ApprovalDecisionDelivered(progress) => {
+                    let progress = progress?;
+                    BrainMutationOutcome::ApprovalDecisionDelivered {
+                        request_seq: progress.get_request_seq(),
+                        approval_id: text(progress.get_approval_id()?)?,
+                        mutation_id: parse_uuid(progress.get_mutation_id()?)?,
+                    }
+                }
             };
             BrainEventKind::MutationRecorded { outcome }
         }

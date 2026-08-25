@@ -1215,7 +1215,14 @@ struct BrainMutationOutcome {
     runCancellationNoop    @4 :Text;
     runCancellationDispatching @5 :BrainRunCancellationProgress;
     runCancellationReconciled @6 :BrainRunCancellationProgress;
+    approvalDecisionDelivered @7 :BrainApprovalDecisionProgress;
   }
+}
+
+struct BrainApprovalDecisionProgress {
+  requestSeq @0 :UInt64;
+  approvalId @1 :Text;
+  mutationId @2 :Text;
 }
 
 struct BrainRunCancellationProgress {

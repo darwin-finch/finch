@@ -81,6 +81,13 @@ pub struct BrainRunCancellationReservation {
     pub replayed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrainApprovalDecisionReservation {
+    pub event: BrainEvent,
+    pub delivered: bool,
+    pub replayed: bool,
+}
+
 /// Identity of one live transport connection for a durable attachment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -556,6 +563,11 @@ pub enum BrainMutationOutcome {
     RunCancellationNoop { run_id: RunId },
     ScheduleCancellationNoop { schedule_id: ScheduleId },
     HandoffCancellationNoop { handoff_id: RunnerHandoffId },
+    ApprovalDecisionDelivered {
+        request_seq: u64,
+        approval_id: String,
+        mutation_id: uuid::Uuid,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2726,6 +2738,101 @@ impl BrainStore {
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         self.push_idempotent_locked(name, state, sender, kind, receipt)
+    }
+
+    pub fn reserve_approval_decision(
+        &self,
+        name: &str,
+        sender: &str,
+        request_seq: u64,
+        approval_id: &str,
+        decision: serde_json::Value,
+        receipt: BrainMutationReceipt,
+    ) -> Result<BrainApprovalDecisionReservation> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        let expected_decision = decision.clone();
+        let append = self.push_idempotent_locked(
+            name,
+            state,
+            sender,
+            BrainEventKind::ApprovalDecided {
+                request_seq,
+                approval_id: approval_id.to_string(),
+                decision,
+            },
+            receipt.clone(),
+        )?;
+        anyhow::ensure!(matches!(&append.event.kind,
+            BrainEventKind::ApprovalDecided {
+                request_seq: recorded_seq, approval_id: recorded_id,
+                decision: recorded_decision,
+            } if *recorded_seq == request_seq && recorded_id == approval_id
+                && recorded_decision == &expected_decision),
+            "replayed mutation outcome is not this approval decision");
+        let delivered = state.events.iter().any(|event| matches!(&event.kind,
+            BrainEventKind::MutationRecorded {
+                outcome: BrainMutationOutcome::ApprovalDecisionDelivered {
+                    request_seq: recorded_seq, approval_id: recorded_id, mutation_id,
+                },
+            } if *recorded_seq == request_seq && recorded_id == approval_id
+                && *mutation_id == receipt.mutation_id));
+        Ok(BrainApprovalDecisionReservation {
+            event: append.event,
+            delivered,
+            replayed: append.replayed,
+        })
+    }
+
+    pub fn complete_approval_decision_delivery(
+        &self,
+        name: &str,
+        sender: &str,
+        request_seq: u64,
+        approval_id: &str,
+        mutation_id: uuid::Uuid,
+    ) -> Result<()> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        anyhow::ensure!(state.events.iter().any(|event| {
+            event.mutation.as_ref().is_some_and(|receipt| receipt.mutation_id == mutation_id)
+                && matches!(&event.kind, BrainEventKind::ApprovalDecided {
+                    request_seq: recorded_seq, approval_id: recorded_id, ..
+                } if *recorded_seq == request_seq && recorded_id == approval_id)
+        }), "approval decision reservation does not exist");
+        if state.events.iter().any(|event| matches!(&event.kind,
+            BrainEventKind::MutationRecorded {
+                outcome: BrainMutationOutcome::ApprovalDecisionDelivered {
+                    request_seq: recorded_seq, approval_id: recorded_id,
+                    mutation_id: recorded_mutation,
+                },
+            } if *recorded_seq == request_seq && recorded_id == approval_id
+                && *recorded_mutation == mutation_id))
+        {
+            return Ok(());
+        }
+        self.push_locked(name, state, sender, BrainEventKind::MutationRecorded {
+            outcome: BrainMutationOutcome::ApprovalDecisionDelivered {
+                request_seq, approval_id: approval_id.to_string(), mutation_id,
+            },
+        })?;
+        Ok(())
+    }
+
+    pub fn approval_decision_delivery_completed(
+        &self, name: &str, mutation_id: uuid::Uuid,
+    ) -> Result<bool> {
+        let snapshot = self.snapshot(name)?;
+        Ok(snapshot.events.iter().any(|event| matches!(&event.kind,
+            BrainEventKind::MutationRecorded {
+                outcome: BrainMutationOutcome::ApprovalDecisionDelivered {
+                    mutation_id: recorded, ..
+                },
+            } if *recorded == mutation_id)))
     }
 
     /// Resolve an exact durable replay without applying a new transition.

@@ -23,7 +23,8 @@ struct ApprovalKey {
 struct PendingApproval {
     request_seq: u64,
     audience: BrainApprovalAudience,
-    response_tx: oneshot::Sender<Result<serde_json::Value, String>>,
+    response_tx: Option<oneshot::Sender<Result<serde_json::Value, String>>>,
+    delivered_decision: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Default)]
@@ -69,7 +70,8 @@ impl BrainApprovalBroker {
             PendingApproval {
                 request_seq,
                 audience,
-                response_tx,
+                response_tx: Some(response_tx),
+                delivered_decision: None,
             },
         );
         Ok(ApprovalRegistration {
@@ -107,8 +109,46 @@ impl BrainApprovalBroker {
         Ok(ClaimedApproval {
             request_seq: request.request_seq,
             audience: request.audience,
-            response_tx: Some(request.response_tx),
+            response_tx: request.response_tx,
         })
+    }
+
+    pub fn inspect(
+        &self, brain_id: BrainId, request_seq: u64, approval_id: &str,
+        attachment_id: AttachmentId,
+    ) -> Result<BrainApprovalAudience> {
+        let key = ApprovalKey { brain_id, request_seq, approval_id: approval_id.to_string() };
+        let pending = self.pending.lock().expect("approval broker lock poisoned");
+        let request = pending.get(&key).with_context(|| {
+            format!("approval '{approval_id}' is not pending for request {request_seq}")
+        })?;
+        anyhow::ensure!(request.audience.attachment_id == attachment_id,
+            "attachment is not the approval audience");
+        Ok(request.audience.clone())
+    }
+
+    pub fn deliver(
+        &self, brain_id: BrainId, request_seq: u64, approval_id: &str,
+        attachment_id: AttachmentId, decision: serde_json::Value,
+    ) -> Result<()> {
+        let key = ApprovalKey { brain_id, request_seq, approval_id: approval_id.to_string() };
+        let mut pending = self.pending.lock().expect("approval broker lock poisoned");
+        let request = pending.get_mut(&key).with_context(|| {
+            format!("approval '{approval_id}' is not pending for request {request_seq}")
+        })?;
+        anyhow::ensure!(request.audience.attachment_id == attachment_id,
+            "attachment is not the approval audience");
+        if let Some(delivered) = &request.delivered_decision {
+            anyhow::ensure!(delivered == &decision,
+                "approval was already delivered with a different decision");
+            return Ok(());
+        }
+        let response_tx = request.response_tx.take()
+            .context("approval continuation is no longer deliverable")?;
+        response_tx.send(Ok(decision.clone()))
+            .map_err(|_| anyhow::anyhow!("approval continuation closed before delivery"))?;
+        request.delivered_decision = Some(decision);
+        Ok(())
     }
 
     pub fn cancel_attachment(&self, brain_id: BrainId, attachment_id: AttachmentId) -> usize {
@@ -122,9 +162,9 @@ impl BrainApprovalBroker {
             .collect::<Vec<_>>();
         for key in &keys {
             if let Some(request) = pending.remove(key) {
-                let _ = request
-                    .response_tx
-                    .send(Err("approval audience disconnected".into()));
+                if let Some(response_tx) = request.response_tx {
+                    let _ = response_tx.send(Err("approval audience disconnected".into()));
+                }
             }
         }
         keys.len()
@@ -137,7 +177,9 @@ impl BrainApprovalBroker {
             .expect("approval broker lock poisoned")
             .remove(key)
         {
-            let _ = request.response_tx.send(Err(reason.to_string()));
+            if let Some(response_tx) = request.response_tx {
+                let _ = response_tx.send(Err(reason.to_string()));
+            }
         }
     }
 }
