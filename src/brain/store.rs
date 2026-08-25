@@ -1284,6 +1284,7 @@ impl BrainStore {
         &self,
         name: &str,
         cancelled_by: &str,
+        initiating_attachment_id: AttachmentId,
         schedule_id: ScheduleId,
     ) -> Result<bool> {
         let name = Self::validate_name(name)?;
@@ -1297,8 +1298,10 @@ impl BrainStore {
         if !schedule.active {
             return Ok(false);
         }
-        if schedule.created_by != cancelled_by {
-            anyhow::bail!("only the schedule creator may cancel this schedule");
+        if schedule.created_by != cancelled_by
+            || schedule.initiating_attachment_id != initiating_attachment_id
+        {
+            anyhow::bail!("only the schedule creator attachment may cancel this schedule");
         }
         schedule.active = false;
         self.push_locked(
@@ -3050,6 +3053,9 @@ mod tests {
         let attachment = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
+        let sibling = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
         let schedule = store
             .create_schedule(
                 "shared",
@@ -3068,15 +3074,40 @@ mod tests {
             Some(schedule.clone())
         );
         assert!(store
-            .cancel_schedule("shared", "bob", schedule.schedule_id)
+            .cancel_schedule(
+                "shared",
+                "bob",
+                attachment.attachment_id,
+                schedule.schedule_id,
+            )
             .unwrap_err()
             .to_string()
-            .contains("only the schedule creator"));
+            .contains("only the schedule creator attachment"));
         assert!(store
-            .cancel_schedule("shared", "alice", schedule.schedule_id)
+            .cancel_schedule(
+                "shared",
+                "alice",
+                sibling.attachment_id,
+                schedule.schedule_id,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("only the schedule creator attachment"));
+        assert!(store
+            .cancel_schedule(
+                "shared",
+                "alice",
+                attachment.attachment_id,
+                schedule.schedule_id,
+            )
             .unwrap());
         assert!(!store
-            .cancel_schedule("shared", "alice", schedule.schedule_id)
+            .cancel_schedule(
+                "shared",
+                "alice",
+                attachment.attachment_id,
+                schedule.schedule_id,
+            )
             .unwrap());
         assert!(store
             .queue_due_schedules("shared", 20_000)
@@ -3718,7 +3749,12 @@ mod tests {
             )
             .unwrap();
         assert!(store
-            .cancel_schedule("shared", "alice", cancelled_ordinary.schedule_id)
+            .cancel_schedule(
+                "shared",
+                "alice",
+                attachment.attachment_id,
+                cancelled_ordinary.schedule_id,
+            )
             .unwrap());
         let delivered_ordinary = store
             .create_schedule(
@@ -3771,7 +3807,12 @@ mod tests {
             .schedule_initialization("shared", attachment.attachment_id, attachment.connection_id.unwrap(), 10)
             .unwrap();
         assert!(store
-            .cancel_schedule("shared", "alice", cancelled.schedule_id)
+            .cancel_schedule(
+                "shared",
+                "alice",
+                attachment.attachment_id,
+                cancelled.schedule_id,
+            )
             .unwrap());
         let retry = store
             .schedule_initialization("shared", attachment.attachment_id, attachment.connection_id.unwrap(), 20)

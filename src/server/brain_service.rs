@@ -265,7 +265,10 @@ impl BrainLifecycleService {
         Ok(self
             .store
             .inspect_schedule(brain, schedule_id)?
-            .filter(|schedule| schedule.created_by == run.initiated_by))
+            .filter(|schedule| {
+                schedule.created_by == run.initiated_by
+                    && schedule.initiating_attachment_id == run.initiating_attachment_id
+            }))
     }
 
     pub fn cancel_schedule_for_run(
@@ -276,8 +279,12 @@ impl BrainLifecycleService {
         schedule_id: ScheduleId,
     ) -> Result<bool> {
         let run = self.schedule_principal_for_run(brain, run_id, request_seq)?;
-        self.store
-            .cancel_schedule(brain, &run.initiated_by, schedule_id)
+        self.store.cancel_schedule(
+            brain,
+            &run.initiated_by,
+            run.initiating_attachment_id,
+            schedule_id,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -323,8 +330,12 @@ impl BrainLifecycleService {
             attachment.role == AttachmentRole::Driver,
             "only a Brain driver can cancel a schedule"
         );
-        self.store
-            .cancel_schedule(brain, &attachment.subject, schedule_id)
+        self.store.cancel_schedule(
+            brain,
+            &attachment.subject,
+            attachment.attachment_id,
+            schedule_id,
+        )
     }
 
     pub fn attach(
@@ -1136,6 +1147,13 @@ mod tests {
         let _driver_watch = service
             .watch("shared", driver.attachment_id, driver_connection)
             .unwrap();
+        let sibling = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let sibling_connection = sibling.connection_id.unwrap();
+        let _sibling_watch = service
+            .watch("shared", sibling.attachment_id, sibling_connection)
+            .unwrap();
         let observer = service
             .attach("shared", "eve", AttachmentRole::Observer, None)
             .unwrap();
@@ -1191,6 +1209,16 @@ mod tests {
         assert!(service
             .cancel_schedule(
                 "shared",
+                sibling.attachment_id,
+                sibling_connection,
+                created.schedule_id,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("only the schedule creator attachment"));
+        assert!(service
+            .cancel_schedule(
+                "shared",
                 driver.attachment_id,
                 driver_connection,
                 created.schedule_id,
@@ -1213,12 +1241,12 @@ mod tests {
         service
             .watch("shared", alice.attachment_id, alice_connection)
             .unwrap();
-        let bob = service
-            .attach("shared", "bob", AttachmentRole::Driver, None)
+        let sibling = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
-        let bob_connection = bob.connection_id.unwrap();
+        let sibling_connection = sibling.connection_id.unwrap();
         service
-            .watch("shared", bob.attachment_id, bob_connection)
+            .watch("shared", sibling.attachment_id, sibling_connection)
             .unwrap();
         let request = service
             .store
@@ -1294,10 +1322,10 @@ mod tests {
         let foreign = service
             .create_schedule(
                 "shared",
-                bob.attachment_id,
-                bob_connection,
+                sibling.attachment_id,
+                sibling_connection,
                 ProgramLanguage::Lisp,
-                "(say \"bob\")".into(),
+                "(say \"sibling\")".into(),
                 crate::vm::EffectSet::pure(),
                 100,
                 None,
