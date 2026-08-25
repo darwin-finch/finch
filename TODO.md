@@ -781,15 +781,19 @@ still blocks the corresponding Brain phase until it is unified.
   persist as versioned canonical events attributed to the runner participant, and replay as
   approval rows without being injected into the provider protocol. A failed or cancelled callback
   returns and persists its partial lifecycle before the terminal Brain error; keep workspace
-  execution and provider tools in the frontend runner.
+  execution and provider tools in the frontend runner. The daemon now also exposes a per-turn
+  reverse Cap'n Proto approval capability: it publishes the triggering call and addressed request
+  immediately, accepts a decision only from that attachment, persists the decision before resuming
+  the runner, and deduplicates the final lifecycle flush.
 - [ ] Complete Brain control and approval ownership above that substrate. Put the role and approval
   audience on every permission/proposal view and add scoped participant credentials. ProgramRuns
   now execute on the leased frontend. Each approval request now carries the daemon-selected
   initiating attachment ID, subject, actual participant role, Brain identity, and environment
   generation through Cap'n Proto into tool, VM-capability, and editor-backed proposal views; the
-  daemon rejects a runner that substitutes that audience before journaling it. Still route the
-  decision to that attachment, authorize it with scoped credentials, and define disconnect,
-  cancellation, delegation, and handoff semantics instead of relying on the runner-local dialog.
+  daemon rejects a runner that substitutes that audience before journaling it. The exact addressed
+  console now presents the ordinary tool/VM dialog and returns its structured decision through the
+  canonical log; disconnect/cancellation fails the suspended continuation closed. Still authorize
+  participants with scoped credentials and define explicit delegation and handoff semantics.
 - [x] Persist a frontend attachment identity across frontend process restarts, not merely reconnects
   in one process, while keeping the daemon cursor authoritative. The client stores only the opaque
   attachment ID, keyed by durable Brain ID plus console slot/subject/role; the daemon still owns the
