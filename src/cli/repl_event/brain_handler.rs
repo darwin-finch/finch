@@ -41,6 +41,13 @@ fn verify_frontend_environment(
     Ok(())
 }
 
+fn participant_attachment_label(
+    attachment: &crate::brain::shared::BrainAttachment,
+) -> String {
+    let id = attachment.attachment_id.0.to_string();
+    format!("{} [{}]", attachment.subject, &id[..8])
+}
+
 fn verify_local_frontend_environment(
     expected: &crate::brain::shared::BrainEnvironment,
 ) -> Result<()> {
@@ -511,7 +518,7 @@ impl EventLoop {
                     .unwrap_or_default();
                 lines.push(format!(
                     "  {}  {} · acknowledged event {}{}",
-                    attachment.subject,
+                    participant_attachment_label(attachment),
                     format!("{:?}", attachment.role).to_ascii_lowercase(),
                     attachment.acknowledged_seq,
                     you,
@@ -553,7 +560,8 @@ impl EventLoop {
         let mut lines = vec![format!("{canonical_subject} in {}:", client.target.display_name())];
         for attachment in attachments {
             lines.push(format!(
-                "  {} · {} · acknowledged event {}",
+                "  {} · {} · {} · acknowledged event {}",
+                participant_attachment_label(attachment),
                 format!("{:?}", attachment.role).to_ascii_lowercase(),
                 if attachment.connected {
                     "connected"
@@ -931,5 +939,23 @@ mod brain_handler_tests {
             .unwrap_err()
             .to_string();
         assert!(wrong_workspace.contains("workspace does not match"));
+    }
+
+    #[test]
+    fn participant_label_distinguishes_two_consoles_for_one_subject() {
+        let attachment = crate::brain::shared::BrainAttachment {
+            attachment_id: crate::brain::shared::AttachmentId(
+                uuid::Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap(),
+            ),
+            subject: "alice@workstation.local".into(),
+            role: crate::brain::shared::AttachmentRole::Driver,
+            acknowledged_seq: 0,
+            connected: true,
+            connection_id: None,
+        };
+        assert_eq!(
+            participant_attachment_label(&attachment),
+            "alice@workstation.local [12345678]"
+        );
     }
 }
