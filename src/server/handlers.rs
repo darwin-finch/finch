@@ -853,6 +853,7 @@ async fn dispatch_named_brain_run(
             return Ok(Some(result));
         }
     };
+    let projects_memory = matches!(&request.kind, BrainEventKind::Prompt { .. });
     let execution = match request.kind {
         BrainEventKind::Program { language, source } => {
             match dispatch_named_brain_program(
@@ -903,6 +904,18 @@ async fn dispatch_named_brain_run(
     match execution {
         Ok(result) => {
             store.transition_run(name, "daemon", run.run_id, BrainRunStatus::Completed, None)?;
+            if projects_memory {
+                if let Err(error) =
+                    project_committed_named_brain_memory(store, runners, name, run).await
+                {
+                    tracing::warn!(
+                        brain = name,
+                        run_id = %run.run_id.0,
+                        %error,
+                        "could not project committed Brain turn into memory"
+                    );
+                }
+            }
             Ok(Some(result))
         }
         Err(error) => {
@@ -929,6 +942,143 @@ async fn dispatch_named_brain_run(
             Ok(Some(result))
         }
     }
+}
+
+async fn project_committed_named_brain_memory(
+    store: &crate::brain::store::BrainStore,
+    runners: &crate::server::BrainRunnerBroker,
+    name: &str,
+    run: &crate::brain::store::BrainRun,
+) -> anyhow::Result<usize> {
+    let snapshot = store.snapshot(name)?;
+    let (prompt, source) = committed_named_brain_memory_pair(&snapshot, run)?;
+    let lease = snapshot
+        .runner_lease
+        .as_ref()
+        .filter(|lease| {
+            lease.environment_generation == snapshot.environment.generation
+                && lease.expires_ms > crate::brain::store::unix_millis()
+        })
+        .ok_or_else(|| anyhow::anyhow!("committed Brain turn has no live environment runner"))?;
+    runners
+        .project_memory(
+            name,
+            lease.lease_id,
+            snapshot.brain_id,
+            run.run_id,
+            run.request_seq,
+            prompt,
+            source,
+        )
+        .await
+}
+
+fn committed_named_brain_memory_pair(
+    snapshot: &crate::brain::store::BrainSnapshot,
+    run: &crate::brain::store::BrainRun,
+) -> anyhow::Result<(String, String)> {
+    use crate::brain::store::{BrainEventKind, BrainRunStatus};
+
+    anyhow::ensure!(
+        run.status == BrainRunStatus::Completed,
+        "only completed Brain runs can be projected into memory"
+    );
+    let prompt = snapshot
+        .events
+        .iter()
+        .find_map(|event| {
+            (event.seq == run.request_seq)
+                .then_some(&event.kind)
+                .and_then(|kind| match kind {
+                    BrainEventKind::Prompt { text } => Some(text.clone()),
+                    _ => None,
+                })
+        })
+        .ok_or_else(|| anyhow::anyhow!("completed Brain turn has no correlated Prompt event"))?;
+    let completed_seq = snapshot
+        .events
+        .iter()
+        .find_map(|event| match &event.kind {
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status: BrainRunStatus::Completed,
+                ..
+            } if *run_id == run.run_id => Some(event.seq),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow::anyhow!("completed Brain turn has no terminal run event"))?;
+    let program = snapshot
+        .events
+        .iter()
+        .find(|event| {
+            event.seq > run.request_seq
+                && event.seq < completed_seq
+                && event.sender == "provider"
+                && matches!(event.kind, BrainEventKind::Program { .. })
+        })
+        .ok_or_else(|| anyhow::anyhow!("completed Brain turn has no provider Program event"))?;
+    anyhow::ensure!(
+        snapshot.events.iter().any(|event| {
+            matches!(
+                event.kind,
+                BrainEventKind::Result {
+                    request_seq,
+                    error: None,
+                    ..
+                } if request_seq == program.seq
+            )
+        }),
+        "completed Brain turn has no successful correlated Result event"
+    );
+    let BrainEventKind::Program { source, .. } = &program.kind else {
+        unreachable!("provider Program predicate checked above")
+    };
+    Ok((prompt, source.clone()))
+}
+
+/// Reissue semantic-memory projection from the canonical Brain log whenever
+/// a runner registers. Deterministic Brain/run/role identities make exact
+/// replays no-ops, while a missed callback or rebuilt memory index recovers.
+pub(crate) async fn replay_committed_named_brain_memory(
+    store: crate::brain::store::BrainStore,
+    runners: crate::server::BrainRunnerBroker,
+    name: String,
+    lease_id: crate::brain::store::RunnerLeaseId,
+) -> anyhow::Result<usize> {
+    let execution_lock = store.execution_lock(&name)?;
+    let _turn = execution_lock.lock_owned().await;
+    let snapshot = store.snapshot(&name)?;
+    let lease_is_current = snapshot.runner_lease.as_ref().is_some_and(|lease| {
+        lease.lease_id == lease_id
+            && lease.environment_generation == snapshot.environment.generation
+            && lease.expires_ms > crate::brain::store::unix_millis()
+    });
+    if !lease_is_current || !runners.has_registration(&name, lease_id) {
+        return Ok(0);
+    }
+    let mut projected = 0;
+    for run in snapshot
+        .runs
+        .iter()
+        .filter(|run| run.status == crate::brain::store::BrainRunStatus::Completed)
+    {
+        let Ok((prompt, source)) = committed_named_brain_memory_pair(&snapshot, run) else {
+            continue;
+        };
+        runners
+            .project_memory(
+                &name,
+                lease_id,
+                snapshot.brain_id,
+                run.run_id,
+                run.request_seq,
+                prompt,
+                source,
+            )
+            .await?;
+        projected += 1;
+    }
+    Ok(projected)
 }
 
 /// Drain durable work that arrived while the environment runner was absent.
@@ -3996,6 +4146,209 @@ mod handler_tests {
             .await,
             Err(BrainSubmissionError::Invalid(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn daemon_projects_memory_only_after_the_successful_turn_is_committed() {
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let driver = store
+            .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
+            .unwrap();
+        let lease = store
+            .acquire_runner_lease(
+                "shared",
+                "runner@box.local",
+                store.environment().generation,
+                None,
+                60_000,
+            )
+            .unwrap();
+        let runners = crate::server::BrainRunnerBroker::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, tx);
+        let callback_store = store.clone();
+        let expected_brain_id = store.snapshot("shared").unwrap().brain_id;
+        tokio::spawn(async move {
+            let crate::server::RunnerRequest::Turn(request) = rx.recv().await.unwrap() else {
+                panic!("expected full turn request")
+            };
+            let run_id = request.run_id;
+            let request_seq = request.request_seq;
+            let runtime = crate::runtime::ProgramRuntime::new();
+            let source = "(say \"remembered\")";
+            let outcome = runtime
+                .submit_typed_only(crate::runtime::ProgramSubmission {
+                    language: crate::programs::ProgramLanguage::Lisp,
+                    source_id: Some("memory-projection-test".into()),
+                    source: source.into(),
+                    intent: "test committed memory projection".into(),
+                    effect: crate::programs::ExecutionEffect::Pure,
+                    declared_capabilities: Vec::new(),
+                    manifest_generation: runtime.manifest_generation(),
+                    expected_revision: Some(runtime.revision()),
+                    budget: None,
+                })
+                .await
+                .unwrap();
+            let checkpoint = runtime
+                .revision_history()
+                .unwrap()
+                .into_iter()
+                .find(|snapshot| snapshot.revision == outcome.output_revision)
+                .and_then(|snapshot| snapshot.checkpoint)
+                .unwrap();
+            request
+                .response_tx
+                .send(Ok(crate::server::RunnerTurnResult {
+                    source: source.into(),
+                    language: ProgramLanguage::Lisp,
+                    output: "remembered".into(),
+                    turn_events: Vec::new(),
+                    runtime_revision: outcome.output_revision,
+                    checkpoint,
+                    effect_journal: Vec::new(),
+                }))
+                .unwrap();
+
+            let crate::server::RunnerRequest::ProjectMemory(request) = rx.recv().await.unwrap()
+            else {
+                panic!("expected post-commit memory projection")
+            };
+            assert_eq!(request.brain_id, expected_brain_id);
+            assert_eq!(request.run_id, run_id);
+            assert_eq!(request.request_seq, request_seq);
+            assert_eq!(request.prompt, "remember this");
+            assert_eq!(request.source, source);
+            let snapshot = callback_store.snapshot("shared").unwrap();
+            assert_eq!(
+                snapshot
+                    .runs
+                    .iter()
+                    .find(|run| run.run_id == run_id)
+                    .unwrap()
+                    .status,
+                crate::brain::store::BrainRunStatus::Completed
+            );
+            assert!(snapshot.events.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    BrainEventKind::Result {
+                        output,
+                        error: None,
+                        ..
+                    } if output == "remembered"
+                )
+            }));
+            request.response_tx.send(Ok(2)).unwrap();
+        });
+
+        let outcome = submit_named_brain_event(
+            &store,
+            &runners,
+            &crate::server::BrainApprovalBroker::default(),
+            "shared",
+            &driver,
+            BrainEventKind::Prompt {
+                text: "remember this".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.run.unwrap().status,
+            crate::brain::store::BrainRunStatus::Running
+        );
+        assert!(matches!(
+            outcome.result.unwrap().kind,
+            BrainEventKind::Result { error: None, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn runner_registration_can_replay_committed_memory_idempotently() {
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let driver = store
+            .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
+            .unwrap();
+        let prompt = store
+            .push(
+                "shared",
+                &driver.subject,
+                BrainEventKind::Prompt {
+                    text: "remember after restart".into(),
+                },
+            )
+            .unwrap();
+        let run = store
+            .start_run(
+                "shared",
+                &driver.subject,
+                crate::brain::store::BrainRunKind::Interactive,
+                prompt.seq,
+                driver.attachment_id,
+                crate::brain::store::BrainRunStatus::Running,
+            )
+            .unwrap();
+        let program = store
+            .push(
+                "shared",
+                "provider",
+                BrainEventKind::Program {
+                    language: ProgramLanguage::Lisp,
+                    source: "(say \"after restart\")".into(),
+                },
+            )
+            .unwrap();
+        push_named_brain_result(&store, "shared", program.seq, Ok("after restart".into()))
+            .unwrap();
+        store
+            .transition_run(
+                "shared",
+                "daemon",
+                run.run_id,
+                crate::brain::store::BrainRunStatus::Completed,
+                None,
+            )
+            .unwrap();
+        let lease = store
+            .acquire_runner_lease(
+                "shared",
+                "runner@box.local",
+                store.environment().generation,
+                None,
+                60_000,
+            )
+            .unwrap();
+        let runners = crate::server::BrainRunnerBroker::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, tx);
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let crate::server::RunnerRequest::ProjectMemory(request) = rx.recv().await.unwrap()
+                else {
+                    panic!("expected replayed memory projection")
+                };
+                assert_eq!(request.run_id, run.run_id);
+                assert_eq!(request.request_seq, prompt.seq);
+                assert_eq!(request.prompt, "remember after restart");
+                assert_eq!(request.source, "(say \"after restart\")");
+                request.response_tx.send(Ok(0)).unwrap();
+            }
+        });
+
+        for _ in 0..2 {
+            assert_eq!(
+                replay_committed_named_brain_memory(
+                    store.clone(),
+                    runners.clone(),
+                    "shared".into(),
+                    lease.lease_id,
+                )
+                .await
+                .unwrap(),
+                1
+            );
+        }
     }
 
     #[tokio::test]

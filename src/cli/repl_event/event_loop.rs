@@ -1357,6 +1357,9 @@ impl EventLoop {
                         ReplEvent::RunnerLeaseStatus { .. } => "RunnerLeaseStatus",
                         ReplEvent::NamedBrainProgramRequested(_) => "NamedBrainProgramRequested",
                         ReplEvent::NamedBrainTurnRequested(_) => "NamedBrainTurnRequested",
+                        ReplEvent::NamedBrainMemoryProjectionRequested(_) => {
+                            "NamedBrainMemoryProjectionRequested"
+                        }
                         ReplEvent::NamedBrainRunCancelRequested(_) => {
                             "NamedBrainRunCancelRequested"
                         }
@@ -3483,6 +3486,9 @@ Rules:\n\
             ReplEvent::NamedBrainTurnRequested(request) => {
                 self.dispatch_named_brain_turn(request).await?;
             }
+            ReplEvent::NamedBrainMemoryProjectionRequested(request) => {
+                self.project_named_brain_memory(request).await;
+            }
             ReplEvent::NamedBrainRunCancelRequested(request) => {
                 self.cancel_named_brain_run(request).await;
             }
@@ -3655,13 +3661,12 @@ Rules:\n\
             .restore_snapshot(context.clone());
         let query_id = self.query_states.create_query(context).await;
         self.query_states
-            .bind_brain_memory_provenance(
+            .bind_brain_turn_provenance(
                 query_id,
-                super::query_state::BrainTurnMemoryProvenance {
+                super::query_state::BrainTurnProvenance {
                     brain_id: request.approval_audience.brain_id,
                     run_id: request.run_id,
                     request_seq: request.request_seq,
-                    original_prompt: request.prompt.clone(),
                 },
             )
             .await;
@@ -3727,6 +3732,54 @@ Rules:\n\
             pending.cancellation_requested = true;
         }
         let _ = request.response_tx.send(Ok(true));
+    }
+
+    async fn project_named_brain_memory(
+        &self,
+        request: crate::server::RunnerMemoryProjectionRequest,
+    ) {
+        let result = async {
+            if self.runner_brain.as_deref() != Some(request.brain.as_str())
+                || !self.home_runner_lease_active
+            {
+                anyhow::bail!(
+                    "frontend does not hold the runner lease for named Brain '{}'",
+                    request.brain
+                );
+            }
+            let memory = self
+                .memory_system
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("memory is disabled on the environment runner"))?;
+            let provenance = crate::memory::BrainConversationProvenance {
+                brain_id: request.brain_id.0.to_string(),
+                run_id: request.run_id.0.to_string(),
+                request_seq: request.request_seq,
+            };
+            let mut inserted = 0;
+            for (role, content) in [
+                ("user", request.prompt.as_str()),
+                ("assistant", request.source.as_str()),
+            ] {
+                if !content.trim().is_empty()
+                    && memory
+                        .insert_brain_conversation(
+                            role,
+                            content,
+                            None,
+                            Some(&request.brain),
+                            &provenance,
+                        )
+                        .await?
+                {
+                    inserted += 1;
+                }
+            }
+            Ok::<usize, anyhow::Error>(inserted)
+        }
+        .await
+        .map_err(|error| error.to_string());
+        let _ = request.response_tx.send(result);
     }
 
     fn finish_named_brain_turn(&mut self, query_id: Uuid, output: String) {

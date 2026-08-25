@@ -849,6 +849,15 @@ struct BrainTurnResult {
   effectJournal   @7 :List(BrainEffectRecord);
 }
 
+struct BrainMemoryProjectionRequest {
+  brainId    @0 :Text;
+  brain      @1 :Text;
+  runId      @2 :Text;
+  requestSeq @3 :UInt64;
+  prompt     @4 :Text;
+  source     @5 :Text;
+}
+
 enum BrainTurnEventKind {
   call              @0;
   result            @1;
@@ -878,6 +887,7 @@ interface BrainRunner {
   runProgram @0 (request :BrainProgramRequest) -> (result :BrainProgramResult);
   runTurn    @1 (request :BrainTurnRequest) -> (result :BrainTurnResult);
   cancelRun  @2 (brain :Text, runId :Text) -> (cancelled :Bool, error :Text);
+  projectMemory @3 (request :BrainMemoryProjectionRequest) -> (inserted :UInt32, error :Text);
 }
 
 # Per-turn reverse capability. The runner publishes an addressed approval and

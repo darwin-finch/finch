@@ -101,6 +101,7 @@ impl EventHandler {
             | ReplEvent::RunnerLeaseStatus { .. }
             | ReplEvent::NamedBrainProgramRequested(_)
             | ReplEvent::NamedBrainTurnRequested(_)
+            | ReplEvent::NamedBrainMemoryProjectionRequested(_)
             | ReplEvent::NamedBrainRunCancelRequested(_)
             | ReplEvent::NamedBrainProgramFinished(_)
             | ReplEvent::AgentLifecycle(_) => {}

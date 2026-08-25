@@ -986,9 +986,12 @@ still blocks the corresponding Brain phase until it is unified.
   frontend queries now retain `BrainId`, `RunId`, request-event sequence, and the original prompt
   across provider tool continuations; their user/assistant memory rows use a deterministic
   Brain/run/role identity, identical retries are no-ops, and conflicting reuse fails. A regression
-  proves that the original prompt—not the final tool-result message—is indexed once. Still move the
-  projection trigger out of frontend provider completion and into daemon consumption of committed
-  successful Brain events, then add stable recall-source inspection.
+  proves that the original prompt—not the final tool-result message—is indexed once. The daemon now
+  triggers projection only after the canonical Program, checkpoint, Result, and completed-run state
+  are durable, using a typed callback to the exact leased frontend so there is still only one
+  MemTree writer. Runner registration replays completed prompt runs from the Brain log; deterministic
+  Brain/run/role identities make reconnect/restart recovery idempotent. Still add stable
+  recall-source inspection.
 - [ ] Make OpenAI tool-call behavior respect control ownership: a participant client must not
   accidentally execute workspace tools on its own machine.
 

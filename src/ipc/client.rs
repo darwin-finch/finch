@@ -775,6 +775,73 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(())
         })
     }
+
+    fn project_memory(
+        &mut self,
+        params: brain_runner::ProjectMemoryParams,
+        mut results: brain_runner::ProjectMemoryResults,
+    ) -> Promise<(), capnp::Error> {
+        let request = match params.get().and_then(|params| params.get_request()) {
+            Ok(request) => request,
+            Err(error) => return Promise::err(error),
+        };
+        let parse_uuid = |value: capnp::text::Reader<'_>| {
+            value
+                .to_str()
+                .map_err(anyhow::Error::new)
+                .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::new))
+        };
+        let brain_id = match request.get_brain_id().map_err(anyhow::Error::new).and_then(parse_uuid)
+        {
+            Ok(value) => crate::brain::store::BrainId(value),
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let run_id = match request.get_run_id().map_err(anyhow::Error::new).and_then(parse_uuid) {
+            Ok(value) => crate::brain::store::RunId(value),
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let text = |value: capnp::Result<capnp::text::Reader<'_>>| {
+            value
+                .ok()
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string()
+        };
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if self
+            .event_tx
+            .send(
+                crate::cli::repl_event::ReplEvent::NamedBrainMemoryProjectionRequested(
+                    crate::server::RunnerMemoryProjectionRequest {
+                        brain_id,
+                        brain: text(request.get_brain()),
+                        run_id,
+                        request_seq: request.get_request_seq(),
+                        prompt: text(request.get_prompt()),
+                        source: text(request.get_source()),
+                        response_tx,
+                    },
+                ),
+            )
+            .is_err()
+        {
+            return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));
+        }
+        Promise::from_future(async move {
+            let response = response_rx
+                .await
+                .map_err(|_| capnp::Error::failed("frontend dropped memory response".into()))?;
+            let mut result = results.get();
+            match response {
+                Ok(inserted) => {
+                    result.set_inserted(inserted.try_into().unwrap_or(u32::MAX));
+                    result.set_error("");
+                }
+                Err(error) => result.set_error(&error),
+            }
+            Ok(())
+        })
+    }
 }
 
 fn encode_runner_effect_records(

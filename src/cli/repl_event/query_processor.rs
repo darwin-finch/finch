@@ -571,15 +571,19 @@ async fn persist_completed_turn_memory(
     let brain_provenance = query_states
         .get_metadata(query_id)
         .await
-        .and_then(|metadata| metadata.brain_memory_provenance);
+        .and_then(|metadata| metadata.brain_turn_provenance);
+    // Named-Brain memory is projected only after the daemon has committed the
+    // canonical Program/checkpoint/Result sequence. The daemon then calls the
+    // exact leased runner back with that durable Brain/run provenance.
+    if brain_provenance.is_some() {
+        return;
+    }
     let explicit_query = query
         .split_once("\n\n[Context:")
         .map(|(raw, _)| raw)
         .unwrap_or(query)
         .trim();
-    let user_text = if let Some(provenance) = &brain_provenance {
-        provenance.original_prompt.clone()
-    } else if explicit_query.is_empty() {
+    let user_text = if explicit_query.is_empty() {
         conversation
             .read()
             .await
@@ -592,49 +596,20 @@ async fn persist_completed_turn_memory(
     } else {
         explicit_query.to_string()
     };
-    if let Some(identity) = brain_provenance {
-        let provenance = crate::memory::BrainConversationProvenance {
-            brain_id: identity.brain_id.0.to_string(),
-            run_id: identity.run_id.0.to_string(),
-            request_seq: identity.request_seq,
-        };
-        for (role, content) in [("user", user_text.as_str()), ("assistant", assistant_source)] {
-            if !content.trim().is_empty() {
-                if let Err(error) = memory_system
-                    .insert_brain_conversation(
-                        role,
-                        content,
-                        Some(model),
-                        Some(session_label),
-                        &provenance,
-                    )
-                    .await
-                {
-                    tracing::warn!(%error, role, "failed to persist named-Brain memory");
-                }
-            }
-        }
-    } else {
-        if !user_text.is_empty() {
-            let _ = memory_system
-                .insert_conversation(
-                    "user",
-                    &user_text,
-                    Some(model),
-                    Some(session_label),
-                )
-                .await;
-        }
-        if !assistant_source.trim().is_empty() {
-            let _ = memory_system
-                .insert_conversation(
-                    "assistant",
-                    assistant_source,
-                    Some(model),
-                    Some(session_label),
-                )
-                .await;
-        }
+    if !user_text.is_empty() {
+        let _ = memory_system
+            .insert_conversation("user", &user_text, Some(model), Some(session_label))
+            .await;
+    }
+    if !assistant_source.trim().is_empty() {
+        let _ = memory_system
+            .insert_conversation(
+                "assistant",
+                assistant_source,
+                Some(model),
+                Some(session_label),
+            )
+            .await;
     }
     status_bar.update_line(
         crate::cli::status_bar::StatusLineType::MemoryContext,
@@ -1669,7 +1644,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn named_brain_tool_turn_remembers_original_prompt_once() {
+    async fn named_brain_provider_completion_waits_for_daemon_memory_projection() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let memory = crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
             db_path: temp.path().to_path_buf(),
@@ -1695,13 +1670,12 @@ mod tests {
             .create_query(conversation.read().await.get_messages())
             .await;
         query_states
-            .bind_brain_memory_provenance(
+            .bind_brain_turn_provenance(
                 query_id,
-                super::super::query_state::BrainTurnMemoryProvenance {
+                super::super::query_state::BrainTurnProvenance {
                     brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
                     run_id: crate::brain::store::RunId(uuid::Uuid::new_v4()),
                     request_seq: 9,
-                    original_prompt: "original prompt".into(),
                 },
             )
             .await;
@@ -1725,10 +1699,10 @@ mod tests {
             .await;
         }
 
-        assert_eq!(memory.stats().await.unwrap().conversation_count, 2);
+        assert_eq!(memory.stats().await.unwrap().conversation_count, 0);
         let recent = memory.get_recent_conversations(10).await.unwrap();
-        assert!(recent.iter().any(|(_, text)| text == "original prompt"));
-        assert!(recent.iter().any(|(_, text)| text == "(say \"done\")"));
+        assert!(!recent.iter().any(|(_, text)| text == "original prompt"));
+        assert!(!recent.iter().any(|(_, text)| text == "(say \"done\")"));
         assert!(!recent.iter().any(|(_, text)| text == "transient tool output"));
     }
 

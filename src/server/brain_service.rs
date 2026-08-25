@@ -458,6 +458,20 @@ impl BrainLifecycleService {
         )
         .await
     }
+
+    pub async fn replay_committed_memory(
+        &self,
+        brain: String,
+        lease_id: RunnerLeaseId,
+    ) -> Result<usize> {
+        handlers::replay_committed_named_brain_memory(
+            self.store.clone(),
+            self.runners.clone(),
+            brain,
+            lease_id,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]

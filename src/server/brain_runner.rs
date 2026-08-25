@@ -15,7 +15,19 @@ use crate::brain::store::{
 pub enum RunnerRequest {
     Program(RunnerProgramRequest),
     Turn(RunnerTurnRequest),
+    ProjectMemory(RunnerMemoryProjectionRequest),
     Cancel(RunnerCancelRequest),
+}
+
+#[derive(Debug)]
+pub struct RunnerMemoryProjectionRequest {
+    pub brain_id: crate::brain::store::BrainId,
+    pub brain: String,
+    pub run_id: RunId,
+    pub request_seq: u64,
+    pub prompt: String,
+    pub source: String,
+    pub response_tx: oneshot::Sender<Result<usize, String>>,
 }
 
 #[derive(Debug)]
@@ -525,6 +537,49 @@ impl BrainRunnerBroker {
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped cancel response"))?
             .map_err(anyhow::Error::msg)
     }
+
+    /// Ask the exact leased environment runner to project one already
+    /// committed Brain turn into its semantic-memory store. The daemon owns
+    /// the trigger and source identity; the frontend remains the sole MemTree
+    /// writer.
+    pub async fn project_memory(
+        &self,
+        brain: &str,
+        lease_id: RunnerLeaseId,
+        brain_id: crate::brain::store::BrainId,
+        run_id: RunId,
+        request_seq: u64,
+        prompt: String,
+        source: String,
+    ) -> Result<usize> {
+        let registration = self
+            .registrations
+            .read()
+            .expect("runner broker lock poisoned")
+            .get(brain)
+            .cloned()
+            .with_context(|| format!("named Brain '{brain}' has no connected runner callback"))?;
+        if registration.lease_id != lease_id {
+            anyhow::bail!("named Brain '{brain}' runner callback belongs to a stale lease");
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        registration
+            .tx
+            .send(RunnerRequest::ProjectMemory(RunnerMemoryProjectionRequest {
+                brain_id,
+                brain: brain.to_string(),
+                run_id,
+                request_seq,
+                prompt,
+                source,
+                response_tx,
+            }))
+            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
+        response_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped memory response"))?
+            .map_err(anyhow::Error::msg)
+    }
 }
 
 #[cfg(test)]
@@ -680,6 +735,61 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("stale lease"));
+    }
+
+    #[tokio::test]
+    async fn memory_projection_is_correlated_to_the_registered_lease_and_run() {
+        let broker = BrainRunnerBroker::default();
+        let lease_id = lease();
+        let brain_id = crate::brain::store::BrainId(uuid::Uuid::new_v4());
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        broker.register("brain", lease_id, tx);
+        tokio::spawn(async move {
+            let RunnerRequest::ProjectMemory(request) = rx.recv().await.unwrap() else {
+                panic!("expected memory projection request")
+            };
+            assert_eq!(request.brain_id, brain_id);
+            assert_eq!(request.run_id, run_id);
+            assert_eq!(request.request_seq, 9);
+            assert_eq!(request.prompt, "remember this");
+            assert_eq!(request.source, "(say \"remembered\")");
+            request.response_tx.send(Ok(2)).unwrap();
+        });
+
+        assert_eq!(
+            broker
+                .project_memory(
+                    "brain",
+                    lease_id,
+                    brain_id,
+                    run_id,
+                    9,
+                    "remember this".into(),
+                    "(say \"remembered\")".into(),
+                )
+                .await
+                .unwrap(),
+            2
+        );
+
+        let replacement = lease();
+        let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
+        broker.register("brain", replacement, replacement_tx);
+        assert!(broker
+            .project_memory(
+                "brain",
+                lease_id,
+                brain_id,
+                run_id,
+                9,
+                "remember this".into(),
+                "(say \"remembered\")".into(),
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("stale lease"));
     }
 
     #[tokio::test]

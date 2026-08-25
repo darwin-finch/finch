@@ -1162,6 +1162,16 @@ impl finch_daemon::Server for FinchDaemonImpl {
             {
                 tracing::warn!(brain = %queued_brain, %error, "could not resume queued Brain runs");
             }
+            if let Err(error) = queued_lifecycle
+                .replay_committed_memory(queued_brain.clone(), lease_id)
+                .await
+            {
+                tracing::warn!(
+                    brain = %queued_brain,
+                    %error,
+                    "could not replay committed Brain memory"
+                );
+            }
         });
         let mut response = results.get();
         response.set_runtime_revision(runtime_revision);
@@ -1302,6 +1312,38 @@ async fn forward_runner_request(
                     },
                     Err(error) => (Err(error.into()), false),
                 }
+            };
+            let _ = request.response_tx.send(result);
+            disconnected
+        }
+        crate::server::RunnerRequest::ProjectMemory(request) => {
+            let mut call = runner.project_memory_request();
+            {
+                let mut payload = call.get().init_request();
+                payload.set_brain_id(&request.brain_id.0.to_string());
+                payload.set_brain(&request.brain);
+                payload.set_run_id(&request.run_id.0.to_string());
+                payload.set_request_seq(request.request_seq);
+                payload.set_prompt(&request.prompt);
+                payload.set_source(&request.source);
+            }
+            let (result, disconnected) = match call.send().promise.await {
+                Ok(reply) => match reply.get() {
+                    Ok(reply) => {
+                        let error = reply
+                            .get_error()
+                            .ok()
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or("");
+                        if error.is_empty() {
+                            (Ok(reply.get_inserted() as usize), false)
+                        } else {
+                            (Err(error.to_string()), false)
+                        }
+                    }
+                    Err(error) => (Err(error.to_string()), false),
+                },
+                Err(error) => (Err(error.to_string()), true),
             };
             let _ = request.response_tx.send(result);
             disconnected
