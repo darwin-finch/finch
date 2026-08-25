@@ -1042,7 +1042,7 @@ impl BrainStore {
         Ok(self.run_publication_gate(name, run_id)?.lock_owned().await)
     }
 
-    pub(crate) async fn reserve_run_cancellation(
+    pub(crate) async fn reserve_run_publication_cancellation(
         &self,
         name: &str,
         run_id: RunId,
@@ -2948,16 +2948,17 @@ impl BrainStore {
             "Brain mutation expected revision {} but current revision is {revision}",
             receipt.expected_revision);
         let now = unix_millis();
+        let run_id = RunId::new();
         let accepted = BrainEvent {
             schema_version: BRAIN_EVENT_SCHEMA_VERSION,
             brain_id: state.brain_id,
             seq: revision + 1,
             environment_generation: self.environment.generation,
             sender: sender.to_string(), created_ms: now,
-            mutation: Some(receipt), kind,
+            run_id: Some(run_id), mutation: Some(receipt), kind,
         };
         let run = BrainRun {
-            run_id: RunId::new(), kind: BrainRunKind::Interactive,
+            run_id, kind: BrainRunKind::Interactive,
             parent_run_id: None, request_seq: accepted.seq,
             initiating_attachment_id, initiated_by: sender.to_string(), status,
             started_ms: now, updated_ms: now, detail: None,
@@ -2966,7 +2967,8 @@ impl BrainStore {
             schema_version: BRAIN_EVENT_SCHEMA_VERSION,
             brain_id: state.brain_id, seq: revision + 2,
             environment_generation: self.environment.generation,
-            sender: sender.to_string(), created_ms: now, mutation: None,
+            sender: sender.to_string(), created_ms: now,
+            run_id: Some(run_id), mutation: None,
             kind: BrainEventKind::RunStarted { run: run.clone() },
         };
         self.append_event_batch(name, &[accepted.clone(), started.clone()])?;
@@ -4033,7 +4035,7 @@ mod tests {
         BrainEvent {
             schema_version: BRAIN_EVENT_SCHEMA_VERSION, brain_id, seq,
             environment_generation: 1, sender: "alice".into(), created_ms: seq,
-            mutation: None, kind: BrainEventKind::Prompt { text: text.into() },
+            run_id: None, mutation: None, kind: BrainEventKind::Prompt { text: text.into() },
         }
     }
 

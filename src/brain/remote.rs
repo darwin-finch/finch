@@ -3737,6 +3737,7 @@ mod tests {
             environment_generation: 1,
             sender: "daemon".into(),
             created_ms: 10,
+            run_id: None,
             mutation: None,
             kind: BrainEventKind::ParticipantMessage {
                 text: "ready".into(),

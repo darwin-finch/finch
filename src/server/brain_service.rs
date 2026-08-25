@@ -748,7 +748,7 @@ impl BrainLifecycleService {
             run.status,
             BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
         ) || needs_runner_reconciliation {
-            self.store.reserve_run_cancellation(brain, run_id).await?;
+            self.store.reserve_run_publication_cancellation(brain, run_id).await?;
             let snapshot = self.snapshot(brain)?;
             let lease = match snapshot
                 .runner_lease

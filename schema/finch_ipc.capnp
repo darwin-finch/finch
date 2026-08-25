@@ -1199,11 +1199,11 @@ struct BrainEvent {
     scheduleChanged        @26 :BrainSchedule;
     scheduleDue            @27 :BrainScheduleDue;
     taskListReplaced       @28 :BrainTaskList;
-    mutationRecorded       @31 :BrainMutationOutcome;
-    speculativePrompt      @32 :Text;
+    speculativePrompt      @29 :Text;
+    mutationRecorded       @34 :BrainMutationOutcome;
   }
-  hasMutation @29 :Bool;
-  mutation    @30 :BrainMutationReceipt;
+  hasMutation @32 :Bool;
+  mutation    @33 :BrainMutationReceipt;
 }
 
 struct BrainMutationOutcome {
