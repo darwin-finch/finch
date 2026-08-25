@@ -361,6 +361,14 @@ impl IpcClient {
         decode_runner_lease(reply.get()?.get_lease()?)
     }
 
+    pub async fn brain_claim_runner_identity(&self, subject: &str) -> Result<()> {
+        let service = self.brain_service().await?;
+        let mut request = service.claim_runner_identity_request();
+        request.get().set_subject(subject);
+        request.send().promise.await?;
+        Ok(())
+    }
+
     pub async fn brain_release_runner(
         &self,
         brain: &str,
@@ -1274,6 +1282,10 @@ mod tests {
                 .await
                 .unwrap();
             let _incoming = client.brain_watch(&brain, &attachment).await.unwrap();
+            client
+                .brain_claim_runner_identity("codex-blocking-runner@localhost")
+                .await
+                .unwrap();
             let lease = client
                 .brain_acquire_runner(
                     &brain,
@@ -1334,6 +1346,61 @@ mod tests {
             );
             client.brain_release_runner(&brain, lease.lease_id).await.unwrap();
             client.brain_detach(&brain, &attachment).await.unwrap();
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires a running Finch daemon on the default local socket"]
+    fn test_brain_runner_lease_cannot_be_hijacked_by_another_ipc_connection() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(async {
+            let owner = IpcClient::connect().await.unwrap();
+            let intruder = IpcClient::connect().await.unwrap();
+            let brain = format!("codex-runner-authority-{}", uuid::Uuid::new_v4());
+            let subject = "owner/frontend-authority";
+            let snapshot = owner.brain_snapshot(&brain).await.unwrap();
+
+            owner.brain_claim_runner_identity(subject).await.unwrap();
+            assert!(intruder.brain_claim_runner_identity(subject).await.is_err());
+            let lease = owner
+                .brain_acquire_runner(
+                    &brain,
+                    subject,
+                    &snapshot.environment,
+                    None,
+                    60_000,
+                )
+                .await
+                .unwrap();
+
+            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            assert!(intruder
+                .register_brain_runner(&brain, lease.lease_id, event_tx)
+                .await
+                .is_err());
+            assert!(intruder
+                .brain_acquire_runner(
+                    &brain,
+                    subject,
+                    &snapshot.environment,
+                    Some(lease.lease_id),
+                    60_000,
+                )
+                .await
+                .is_err());
+            assert!(intruder
+                .brain_release_runner(&brain, lease.lease_id)
+                .await
+                .is_err());
+
+            owner
+                .brain_release_runner(&brain, lease.lease_id)
+                .await
+                .unwrap();
         }));
     }
 }

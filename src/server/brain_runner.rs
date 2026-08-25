@@ -2,7 +2,7 @@
 //! frontend process that owns one named Brain's execution environment.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, oneshot};
@@ -118,7 +118,14 @@ pub struct RunnerRegistrationId(uuid::Uuid);
 struct Registration {
     id: RunnerRegistrationId,
     lease_id: RunnerLeaseId,
+    connection_id: Option<uuid::Uuid>,
     tx: mpsc::UnboundedSender<RunnerRequest>,
+}
+
+#[derive(Default)]
+struct ConnectionAuthority {
+    identities: HashMap<String, uuid::Uuid>,
+    leases: HashMap<(String, RunnerLeaseId), uuid::Uuid>,
 }
 
 /// Registrations contain only Tokio channels and portable values. Cap'n Proto
@@ -127,6 +134,7 @@ struct Registration {
 #[derive(Clone, Default)]
 pub struct BrainRunnerBroker {
     registrations: Arc<RwLock<HashMap<String, Registration>>>,
+    connection_authority: Arc<Mutex<ConnectionAuthority>>,
 }
 
 impl BrainRunnerBroker {
@@ -140,8 +148,152 @@ impl BrainRunnerBroker {
         self.registrations
             .write()
             .expect("runner broker lock poisoned")
-            .insert(brain.into(), Registration { id, lease_id, tx });
+            .insert(
+                brain.into(),
+                Registration {
+                    id,
+                    lease_id,
+                    connection_id: None,
+                    tx,
+                },
+            );
         id
+    }
+
+    pub(crate) fn claim_connection_identity(
+        &self,
+        connection_id: uuid::Uuid,
+        subject: &str,
+    ) -> Result<()> {
+        let subject = subject.trim();
+        if subject.is_empty() || subject.len() > 128 || subject.chars().any(char::is_control) {
+            anyhow::bail!("runner subject must be 1-128 printable characters");
+        }
+        let mut authority = self
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        match authority.identities.get(subject) {
+            Some(owner) if *owner != connection_id => {
+                anyhow::bail!("runner subject is already claimed by another IPC connection")
+            }
+            _ => {
+                authority
+                    .identities
+                    .insert(subject.to_string(), connection_id);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn require_connection_identity(
+        &self,
+        connection_id: uuid::Uuid,
+        subject: &str,
+    ) -> Result<()> {
+        let authority = self
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        if authority.identities.get(subject) != Some(&connection_id) {
+            anyhow::bail!("runner subject is not owned by this IPC connection");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn claim_connection_lease(
+        &self,
+        connection_id: uuid::Uuid,
+        brain: &str,
+        lease_id: RunnerLeaseId,
+    ) -> Result<()> {
+        let key = (brain.to_string(), lease_id);
+        let mut authority = self
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        match authority.leases.get(&key) {
+            Some(owner) if *owner != connection_id => {
+                anyhow::bail!("runner lease is owned by another IPC connection")
+            }
+            _ => {
+                authority.leases.insert(key, connection_id);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn require_connection_lease(
+        &self,
+        connection_id: uuid::Uuid,
+        brain: &str,
+        lease_id: RunnerLeaseId,
+    ) -> Result<()> {
+        let authority = self
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        if authority.leases.get(&(brain.to_string(), lease_id)) != Some(&connection_id) {
+            anyhow::bail!("runner lease is not owned by this IPC connection");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_connection_lease(
+        &self,
+        connection_id: uuid::Uuid,
+        brain: &str,
+        lease_id: RunnerLeaseId,
+    ) {
+        let key = (brain.to_string(), lease_id);
+        let mut authority = self
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        if authority.leases.get(&key) == Some(&connection_id) {
+            authority.leases.remove(&key);
+        }
+    }
+
+    pub(crate) fn register_for_connection(
+        &self,
+        connection_id: uuid::Uuid,
+        brain: impl Into<String>,
+        lease_id: RunnerLeaseId,
+        tx: mpsc::UnboundedSender<RunnerRequest>,
+    ) -> Result<RunnerRegistrationId> {
+        let brain = brain.into();
+        self.require_connection_lease(connection_id, &brain, lease_id)?;
+        let id = RunnerRegistrationId(uuid::Uuid::new_v4());
+        self.registrations
+            .write()
+            .expect("runner broker lock poisoned")
+            .insert(
+                brain,
+                Registration {
+                    id,
+                    lease_id,
+                    connection_id: Some(connection_id),
+                    tx,
+                },
+            );
+        Ok(id)
+    }
+
+    pub(crate) fn disconnect_connection(&self, connection_id: uuid::Uuid) {
+        let mut authority = self
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        authority
+            .identities
+            .retain(|_, owner| *owner != connection_id);
+        authority.leases.retain(|_, owner| *owner != connection_id);
+        drop(authority);
+        self.registrations
+            .write()
+            .expect("runner broker lock poisoned")
+            .retain(|_, registration| registration.connection_id != Some(connection_id));
     }
 
     /// Remove a registration only if it is still the connection that created
@@ -290,6 +442,46 @@ mod tests {
             role: crate::brain::shared::AttachmentRole::Driver,
             environment_generation: 1,
         }
+    }
+
+    #[test]
+    fn runner_identity_lease_and_callback_are_connection_scoped() {
+        let broker = BrainRunnerBroker::default();
+        let owner = uuid::Uuid::new_v4();
+        let intruder = uuid::Uuid::new_v4();
+        let lease_id = lease();
+
+        broker
+            .claim_connection_identity(owner, "runner-a@box.local")
+            .unwrap();
+        assert!(broker
+            .claim_connection_identity(intruder, "runner-a@box.local")
+            .is_err());
+        assert!(broker
+            .require_connection_identity(intruder, "runner-a@box.local")
+            .is_err());
+
+        broker
+            .claim_connection_lease(owner, "brain", lease_id)
+            .unwrap();
+        let (intruder_tx, _intruder_rx) = mpsc::unbounded_channel();
+        assert!(broker
+            .register_for_connection(intruder, "brain", lease_id, intruder_tx)
+            .is_err());
+        let (owner_tx, _owner_rx) = mpsc::unbounded_channel();
+        broker
+            .register_for_connection(owner, "brain", lease_id, owner_tx)
+            .unwrap();
+        assert!(broker.has_registration("brain", lease_id));
+
+        broker.disconnect_connection(owner);
+        assert!(!broker.has_registration("brain", lease_id));
+        assert!(broker
+            .require_connection_lease(owner, "brain", lease_id)
+            .is_err());
+        broker
+            .claim_connection_identity(intruder, "runner-a@box.local")
+            .unwrap();
     }
 
     #[tokio::test]

@@ -553,6 +553,11 @@ interface BrainService {
                  attachmentId :Text,
                  connectionId :Text,
                  runId :Text) -> (run :BrainRun);
+
+  # Bind an opaque frontend runner identity to this exact Cap'n Proto
+  # connection before acquiring or accepting a lease. The claim disappears
+  # with the connection and cannot be replayed by another local client.
+  claimRunnerIdentity @13 (subject :Text) -> ();
 }
 
 # ---------------------------------------------------------------------------

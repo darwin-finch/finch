@@ -26,17 +26,23 @@ use crate::server::AgentServer;
 #[derive(Clone)]
 struct FinchDaemonImpl {
     server: Arc<AgentServer>,
+    connection_id: uuid::Uuid,
 }
 
 impl FinchDaemonImpl {
-    fn new(server: Arc<AgentServer>) -> Self {
-        Self { server }
+    fn new(server: Arc<AgentServer>, connection_id: uuid::Uuid) -> Self {
+        Self {
+            server,
+            connection_id,
+        }
     }
 }
 
 #[derive(Clone)]
 struct BrainRpcService {
     lifecycle: crate::server::BrainLifecycleService,
+    runners: crate::server::BrainRunnerBroker,
+    connection_id: uuid::Uuid,
 }
 
 /// Reverse per-turn capability used by the leased frontend runner to suspend
@@ -441,6 +447,21 @@ impl brain_service::Server for BrainRpcService {
         } else {
             None
         };
+        if let Err(error) = self
+            .runners
+            .require_connection_identity(self.connection_id, &subject)
+        {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        if let Some(lease_id) = lease_id {
+            if let Err(error) = self.runners.require_connection_lease(
+                self.connection_id,
+                &brain,
+                lease_id,
+            ) {
+                return Promise::err(capnp::Error::failed(error.to_string()));
+            }
+        }
         let lease = match self.lifecycle.acquire_runner(
             &brain,
             &subject,
@@ -451,6 +472,14 @@ impl brain_service::Server for BrainRpcService {
             Ok(lease) => lease,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
+        if let Err(error) = self.runners.claim_connection_lease(
+            self.connection_id,
+            &brain,
+            lease.lease_id,
+        ) {
+            let _ = self.lifecycle.release_runner(&brain, lease.lease_id);
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         encode_runner_lease(results.get().init_lease(), &lease);
         Promise::ok(())
     }
@@ -466,9 +495,18 @@ impl brain_service::Server for BrainRpcService {
             Ok(id) => id,
             Err(error) => return Promise::err(error),
         };
+        if let Err(error) = self.runners.require_connection_lease(
+            self.connection_id,
+            &brain,
+            lease_id,
+        ) {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         if let Err(error) = self.lifecycle.release_runner(&brain, lease_id) {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
+        self.runners
+            .release_connection_lease(self.connection_id, &brain, lease_id);
         Promise::ok(())
     }
 
@@ -537,6 +575,12 @@ impl brain_service::Server for BrainRpcService {
             Ok(environment) => environment,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
+        if let Err(error) = self
+            .runners
+            .require_connection_identity(self.connection_id, &target_subject)
+        {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         let lease = match self.lifecycle.accept_runner_handoff(
             &brain,
             &target_subject,
@@ -547,6 +591,14 @@ impl brain_service::Server for BrainRpcService {
             Ok(lease) => lease,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
+        if let Err(error) = self.runners.claim_connection_lease(
+            self.connection_id,
+            &brain,
+            lease.lease_id,
+        ) {
+            let _ = self.lifecycle.release_runner(&brain, lease.lease_id);
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         encode_runner_lease(results.get().init_lease(), &lease);
         Promise::ok(())
     }
@@ -619,6 +671,24 @@ impl brain_service::Server for BrainRpcService {
             encode_run(results.get().init_run(), &run);
             Ok(())
         })
+    }
+
+    fn claim_runner_identity(
+        &mut self,
+        params: brain_service::ClaimRunnerIdentityParams,
+        _results: brain_service::ClaimRunnerIdentityResults,
+    ) -> Promise<(), capnp::Error> {
+        let subject = pry!(pry!(params.get()).get_subject())
+            .to_str()
+            .unwrap_or("")
+            .to_string();
+        match self
+            .runners
+            .claim_connection_identity(self.connection_id, &subject)
+        {
+            Ok(()) => Promise::ok(()),
+            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+        }
     }
 }
 
@@ -951,6 +1021,13 @@ impl finch_daemon::Server for FinchDaemonImpl {
         };
         let lease_id = crate::brain::shared::RunnerLeaseId(lease_uuid);
         let runner = pry!(params.get_runner());
+        if let Err(error) = self.server.brain_runners().require_connection_lease(
+            self.connection_id,
+            &brain,
+            lease_id,
+        ) {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         let snapshot = match self.server.shared_brains().snapshot(&brain) {
             Ok(snapshot) => snapshot,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -978,7 +1055,15 @@ impl finch_daemon::Server for FinchDaemonImpl {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let broker = self.server.brain_runners().clone();
         let server = Arc::clone(&self.server);
-        let registration_id = broker.register(brain.clone(), lease_id, tx);
+        let registration_id = match broker.register_for_connection(
+            self.connection_id,
+            brain.clone(),
+            lease_id,
+            tx,
+        ) {
+            Ok(registration_id) => registration_id,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
         let queued_lifecycle = crate::server::BrainLifecycleService::from_server(&server);
         let queued_brain = brain.clone();
         tokio::task::spawn_local(async move {
@@ -1019,6 +1104,8 @@ impl finch_daemon::Server for FinchDaemonImpl {
     ) -> Promise<(), capnp::Error> {
         let service: brain_service::Client = capnp_rpc::new_client(BrainRpcService {
             lifecycle: crate::server::BrainLifecycleService::from_server(&self.server),
+            runners: self.server.brain_runners().clone(),
+            connection_id: self.connection_id,
         });
         results.get().set_service(service);
         Promise::ok(())
@@ -1555,10 +1642,15 @@ async fn handle_connection(stream: tokio::net::UnixStream, server: Arc<AgentServ
         Default::default(),
     );
 
-    let daemon_impl = FinchDaemonImpl::new(server);
+    let connection_id = uuid::Uuid::new_v4();
+    let daemon_impl = FinchDaemonImpl::new(Arc::clone(&server), connection_id);
     let daemon_client: finch_daemon::Client = capnp_rpc::new_client(daemon_impl);
 
-    RpcSystem::new(Box::new(network), Some(daemon_client.client))
+    let result = RpcSystem::new(Box::new(network), Some(daemon_client.client))
         .await
-        .map_err(anyhow::Error::from)
+        .map_err(anyhow::Error::from);
+    server
+        .brain_runners()
+        .disconnect_connection(connection_id);
+    result
 }

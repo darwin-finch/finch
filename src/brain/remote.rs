@@ -1444,6 +1444,13 @@ mod tests {
             let ipc = crate::ipc::IpcClient::connect().await.unwrap();
             let snapshot = ipc.brain_snapshot(&brain).await.unwrap();
 
+            ipc.brain_claim_runner_identity(source_subject)
+                .await
+                .unwrap();
+            ipc.brain_claim_runner_identity(target_subject)
+                .await
+                .unwrap();
+
             let source_lease = ipc
                 .brain_acquire_runner(
                     &brain,

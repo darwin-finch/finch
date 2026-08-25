@@ -89,6 +89,9 @@ impl EventLoop {
         let Some(ipc) = self.ipc_client.as_ref().cloned() else {
             return Ok(None);
         };
+        ipc.brain_claim_runner_identity(&self.runner_subject)
+            .await
+            .context("claim this frontend's runner identity")?;
         let snapshot = ipc.brain_snapshot(&self.session_label).await?;
         verify_local_frontend_environment(&snapshot.environment)?;
         let initial = ipc
