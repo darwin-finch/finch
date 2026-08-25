@@ -399,6 +399,10 @@ still blocks the corresponding Brain phase until it is unified.
   `created → awaiting-edit → accepted|chat|cancelled → submitted` events and reconnectable
   proposal views. It must support Finch, Bash, Python, and other source artifacts without forcing
   an editor for ordinary individually authorized VM calls.
+- [ ] Make every proposal review expose explicit `accept`, `reject`, and `request changes` actions
+  in both keyboard navigation and the typed decision result. Reject must resume the exact suspended
+  proposal with a cancellation/denial value, never execute accepted-looking source, and remain
+  available even when `$EDITOR` is unset, exits unsuccessfully, or the provider proposed Bash.
 - [ ] Separate tool execution budgets from human/editor waits. The legacy universal 30-second
   timeout currently wraps `$EDITOR` proposal review and reports “try restarting” while waiting for
   a person. Model the lifecycle explicitly as `awaiting-approval|awaiting-edit → executing`;
@@ -652,7 +656,21 @@ still blocks the corresponding Brain phase until it is unified.
   activity, and VM/user-visible output are distinguishable without relying on low-contrast cyan
   foreground text alone. Keep output backgrounds subtle, preserve WCAG-like foreground contrast in
   light and dark themes, emit plain text when copied, and make the styling part of structured
-  `OutputManager` rows so redraw, resize, scrollback, and concurrent WorkUnits remain stable.
+  `OutputManager` rows so redraw, resize, scrollback, and concurrent WorkUnits remain stable. In a
+  shared Brain, assign stable distinguishable participant background accents from participant
+  identity and label the author; do not make every human console look like the same local user.
+- [ ] Give `$VISUAL`/`$EDITOR` a correct terminal-protocol handoff. Leave Finch raw/live rendering,
+  enter a clean alternate screen for Vim and similar full-screen editors, restore terminal modes on
+  every exit path, discard the editor screen instead of retaining its `~` rows in scrollback, then
+  invalidate and redraw Finch's live region exactly once.
+- [ ] Preserve visible turn ownership while input queues behind an active provider/repair/tool
+  turn. A later user prompt must remain a distinct queued WorkUnit and cannot appear inside the
+  earlier repair's source or tool block; program source, diagnostics, bounded repair, tool activity,
+  and VM output must stay grouped under one correlated Brain turn until its terminal event.
+- [x] Recompute the owned live-region geometry after terminal reflow before erasing on resize, so
+  shrinking a terminal no longer leaves one historical separator row per resize event.
+- [x] Queue VM-output completion behind every projected `say` event, so a WorkUnit cannot enter
+  scrollback after its first chunk and silently lose later chunks from the same program.
 - [ ] Batch model-authored edits into one explicit multi-file changeset/proposal and request one
   approval before applying it to the real workspace. Keep the familiar model-facing edit/write
   tools, but make them target a per-run proposal overlay by default: later reads, searches, and test
@@ -678,6 +696,15 @@ still blocks the corresponding Brain phase until it is unified.
   semantics are correct. Select the grammar from the path/language metadata, compose token color
   with added/removed backgrounds legibly across themes, and fall back to plain code without
   changing layout when the language is unknown.
+
+## Typed stream/range library
+
+- [ ] Build ordinary typed range combinators over `stream<T>` and producer fibers: `map`, `filter`,
+  `take`, `drop`, `first`, `last`, `fold`, `collect`, `any`, and `all`, with bounded/fuel-aware
+  variants for model-authored analysis. Reuse the same contracts for lists and host-backed streams
+  through concepts/evidence rather than interpreter special cases. Make `tree-list` plus these
+  words the discoverable typed replacement for routine `find | head`/`tail` shell pipelines, and
+  add provider fixtures proving models choose the bounded native path for large trees and files.
 
 ## Shared brains and environments
 
