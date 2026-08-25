@@ -142,14 +142,16 @@ snapshot/event projections plus submit, acknowledge, and detach commands. Comman
 exact socket attachment rather than accepting client-authored attachment IDs, and the daemon
 revalidates the signed credential for each mutation and periodically while the connection is idle.
 An owner can now issue a role- and Brain-scoped invitation without disclosing the bootstrap
-password. Invitations are short-lived, signed under a domain-separated credential key, fix the
+password. Invitations are short-lived, signed under the persistent Ed25519 node identity, fix the
 Brain ID, environment generation, role, scope ceiling, delegation ancestry, and expiry, and cannot
 mint runner authority. Redemption binds one participant subject and produces the ordinary scoped
 credential used by attachment bootstrap. The binding is persisted before response, is idempotently
 recoverable by that same subject after response loss or daemon restart, rejects every different
 subject, and inherits ancestor revocation. `/brain invite` and `/brain join` expose this exchange;
-the remaining remote-security gap is channel encryption and cryptographic peer identity, not a
-second invitation authentication path.
+the same node key produces the listener's deterministic self-signed TLS certificate, whose exact
+DER is covered by every invitation signature. Remote invitation clients pin HTTPS and WSS to that
+certificate. The daemon advertises the restricted TLS-only collaboration listener rather than its
+loopback administration listener, and remote password bootstrap is disabled.
 
 The daemon's transport-neutral submission operation never executes ProgramRuns inside the daemon.
 It serializes the accepted event, requires the active environment lease's registered callback, and
@@ -400,9 +402,9 @@ or schedule work. Receiver-local policy decides whether to surface, ingest, or r
 
 mDNS is advisory discovery only. TXT records now use an explicit metadata allowlist and contain no
 reusable peer credential; discovery clients likewise cannot import authority from hostile legacy
-`token` properties. Remote attachment requires an authenticated encrypted channel, cryptographic
-peer identity, replay protection, Brain-level ACLs, and auditable invitation/revocation. A `.local`
-name is not identity.
+`token` properties. The advertised Ed25519 public key is an identity hint, while the signed
+invitation binds the exact TLS trust root used by the authenticated encrypted channel. Brain-level
+ACLs and auditable invitation/revocation remain authoritative. A `.local` name is not identity.
 
 ## UI projection
 
@@ -548,11 +550,11 @@ Exit: local, daemon, and remote attachment render the same event history.
 
 ### B6: Remote security and discovery
 
-- Keep the completed removal of advertised peer tokens covered by an authority-free allowlist test,
-  and replace the remaining plaintext remote Brain authentication.
+- Keep the completed removal of advertised peer tokens covered by an authority-free allowlist test.
+- Keep the completed restricted TLS listener, signed certificate pin, HTTPS/WSS invitation client,
+  and rejection of remote password bootstrap covered end to end.
 - Keep the completed signed, expiring, retry-safe, single-participant invitation/ACL and descendant
-  revocation path covered while adding cryptographic node identity and encrypted authenticated
-  channels.
+  revocation path covered under the persistent cryptographic node identity.
 - Advertise only stable discovery metadata; retrieve live capabilities after authentication.
 
 Exit: hostile-LAN, replay, confused-deputy, and cross-Brain authorization tests pass.

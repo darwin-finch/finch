@@ -887,8 +887,13 @@ still blocks the corresponding Brain phase until it is unified.
   into the existing scoped credential and attachment path. Redemption persists a subject binding
   before responding, returns the exact same credential to same-subject retries after response loss
   or daemon restart, rejects a different subject, and inherits ancestor revocation. This completes
-  invitation bootstrap, not B6: remote HTTP/WebSocket traffic still needs cryptographic node
-  identity and an encrypted authenticated channel.
+  invitation bootstrap. The persistent Ed25519 node identity now also signs a deterministic
+  self-signed TLS certificate; each signed invitation carries that exact DER trust root. Opt-in LAN
+  collaboration uses a restricted TLS-only listener on port 11436, advertised through mDNS without
+  authority, and invitation clients pin HTTPS and WSS to the signed certificate. The plaintext
+  daemon/admin listener remains loopback-only and remote password bootstrap is rejected. B6 still
+  requires the remaining hostile-LAN, certificate-substitution, replay, confused-deputy, and
+  cross-Brain authorization coverage.
 - [ ] Enforce least privilege independently for event visibility, prompt/program submission,
   approval, control-lease ownership, workspace effects, environment changes, credential minting,
   and distributed inference. mDNS advertisement and discovery now use an authority-free metadata
