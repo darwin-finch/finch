@@ -6,6 +6,97 @@ use crate::brain::shared::{
 };
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_approval_audience};
 
+const MAX_JSON_VALUE_DEPTH: usize = 64;
+
+pub(super) fn encode_json_value(
+    builder: finch_ipc_capnp::json_value::Builder<'_>,
+    value: &serde_json::Value,
+) -> anyhow::Result<()> {
+    encode_json_value_at(builder, value, 0)
+}
+
+fn encode_json_value_at(
+    mut builder: finch_ipc_capnp::json_value::Builder<'_>,
+    value: &serde_json::Value,
+    depth: usize,
+) -> anyhow::Result<()> {
+    if depth > MAX_JSON_VALUE_DEPTH {
+        anyhow::bail!("dynamic value exceeds the maximum nesting depth");
+    }
+    match value {
+        serde_json::Value::Null => builder.set_null_value(()),
+        serde_json::Value::Bool(value) => builder.set_bool_value(*value),
+        serde_json::Value::Number(value) if value.is_i64() => {
+            builder.set_signed(value.as_i64().expect("checked signed JSON number"));
+        }
+        serde_json::Value::Number(value) if value.is_u64() => {
+            builder.set_unsigned(value.as_u64().expect("checked unsigned JSON number"));
+        }
+        serde_json::Value::Number(value) => {
+            builder.set_float(value.as_f64().expect("JSON number is representable as f64"));
+        }
+        serde_json::Value::String(value) => builder.set_text(value),
+        serde_json::Value::Array(values) => {
+            let mut encoded = builder.reborrow().init_array(values.len() as u32);
+            for (index, value) in values.iter().enumerate() {
+                encode_json_value_at(encoded.reborrow().get(index as u32), value, depth + 1)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            let mut encoded = builder.reborrow().init_object(values.len() as u32);
+            for (index, (name, value)) in values.iter().enumerate() {
+                let mut field = encoded.reborrow().get(index as u32);
+                field.set_name(name);
+                encode_json_value_at(field.reborrow().init_value(), value, depth + 1)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn decode_json_value(
+    reader: finch_ipc_capnp::json_value::Reader<'_>,
+) -> anyhow::Result<serde_json::Value> {
+    decode_json_value_at(reader, 0)
+}
+
+fn decode_json_value_at(
+    reader: finch_ipc_capnp::json_value::Reader<'_>,
+    depth: usize,
+) -> anyhow::Result<serde_json::Value> {
+    if depth > MAX_JSON_VALUE_DEPTH {
+        anyhow::bail!("dynamic value exceeds the maximum nesting depth");
+    }
+    use finch_ipc_capnp::json_value::Which;
+    Ok(match reader.which()? {
+        Which::NullValue(()) => serde_json::Value::Null,
+        Which::BoolValue(value) => serde_json::Value::Bool(value),
+        Which::Signed(value) => serde_json::Value::Number(value.into()),
+        Which::Unsigned(value) => serde_json::Value::Number(value.into()),
+        Which::Float(value) => serde_json::Value::Number(
+            serde_json::Number::from_f64(value)
+                .ok_or_else(|| anyhow::anyhow!("dynamic value contains a non-finite float"))?,
+        ),
+        Which::Text(value) => serde_json::Value::String(text(value?)?),
+        Which::Array(values) => serde_json::Value::Array(
+            values?
+                .iter()
+                .map(|value| decode_json_value_at(value, depth + 1))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        ),
+        Which::Object(fields) => {
+            let mut values = serde_json::Map::new();
+            for field in fields?.iter() {
+                values.insert(
+                    text(field.get_name()?)?,
+                    decode_json_value_at(field.get_value()?, depth + 1)?,
+                );
+            }
+            serde_json::Value::Object(values)
+        }
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BrainRemoteCommand {
     pub request_id: u64,
@@ -211,7 +302,7 @@ pub(super) fn encode_brain_submission(
             let mut decided = builder.init_approval_decided();
             decided.set_request_seq(*request_seq);
             decided.set_approval_id(approval_id);
-            decided.set_decision_json(&serde_json::to_vec(decision)?);
+            encode_json_value(decided.reborrow().init_decision(), decision)?;
         }
         _ => anyhow::bail!("internal Brain events cannot be encoded as participant submissions"),
     }
@@ -241,7 +332,7 @@ pub(super) fn decode_brain_submission(
             BrainEventKind::ApprovalDecided {
                 request_seq: decided.get_request_seq(),
                 approval_id: text(decided.get_approval_id()?)?,
-                decision: serde_json::from_slice(decided.get_decision_json()?)?,
+                decision: decode_json_value(decided.get_decision()?)?,
             }
         }
     })
@@ -813,7 +904,7 @@ pub(super) fn encode_event(
             call.set_request_seq(*request_seq);
             call.set_tool_id(tool_id);
             call.set_name(name);
-            call.set_input_json(&serde_json::to_vec(input)?);
+            encode_json_value(call.reborrow().init_input(), input)?;
         }
         BrainEventKind::ToolResult {
             request_seq,
@@ -840,7 +931,7 @@ pub(super) fn encode_event(
             requested.set_approval_id(approval_id);
             requested.set_approval_kind(approval_kind);
             requested.set_subject(subject);
-            requested.set_detail_json(&serde_json::to_vec(detail)?);
+            encode_json_value(requested.reborrow().init_detail(), detail)?;
             if let Some(audience) = audience {
                 requested.set_has_audience(true);
                 encode_approval_audience(requested.init_audience(), audience);
@@ -854,7 +945,7 @@ pub(super) fn encode_event(
             let mut decided = builder.init_approval_decided();
             decided.set_request_seq(*request_seq);
             decided.set_approval_id(approval_id);
-            decided.set_decision_json(&serde_json::to_vec(decision)?);
+            encode_json_value(decided.reborrow().init_decision(), decision)?;
         }
         BrainEventKind::Program { language, source } => {
             let mut program = builder.init_program();
@@ -959,7 +1050,7 @@ pub(super) fn decode_event(
                 request_seq: call.get_request_seq(),
                 tool_id: text(call.get_tool_id()?)?,
                 name: text(call.get_name()?)?,
-                input: serde_json::from_slice(call.get_input_json()?)?,
+                input: decode_json_value(call.get_input()?)?,
             }
         }
         Which::ToolResult(result) => {
@@ -984,7 +1075,7 @@ pub(super) fn decode_event(
                     .transpose()?
                     .map(decode_approval_audience)
                     .transpose()?,
-                detail: serde_json::from_slice(requested.get_detail_json()?)?,
+                detail: decode_json_value(requested.get_detail()?)?,
             }
         }
         Which::ApprovalDecided(decided) => {
@@ -992,7 +1083,7 @@ pub(super) fn decode_event(
             BrainEventKind::ApprovalDecided {
                 request_seq: decided.get_request_seq(),
                 approval_id: text(decided.get_approval_id()?)?,
-                decision: serde_json::from_slice(decided.get_decision_json()?)?,
+                decision: decode_json_value(decided.get_decision()?)?,
             }
         }
         Which::Program(program) => {
@@ -1062,6 +1153,38 @@ mod tests {
             created_ms: 123_000 + seq,
             kind,
         }
+    }
+
+    #[test]
+    fn schema_native_dynamic_values_preserve_json_types() {
+        let expected = serde_json::json!({
+            "null": null,
+            "bool": true,
+            "signed": -17,
+            "unsigned": u64::MAX,
+            "float": 1.25,
+            "text": "hello",
+            "nested": [1, {"answer": 42}],
+        });
+        let mut message = capnp::message::Builder::new_default();
+        encode_json_value(
+            message.init_root::<finch_ipc_capnp::json_value::Builder<'_>>(),
+            &expected,
+        )
+        .unwrap();
+
+        let encoded = capnp::serialize::write_message_to_words(&message);
+        let mut cursor = std::io::Cursor::new(encoded);
+        let decoded = capnp::serialize::read_message(
+            &mut cursor,
+            capnp::message::ReaderOptions::new(),
+        )
+        .unwrap();
+        let root = decoded
+            .get_root::<finch_ipc_capnp::json_value::Reader<'_>>()
+            .unwrap();
+
+        assert_eq!(decode_json_value(root).unwrap(), expected);
     }
 
     #[test]

@@ -194,9 +194,9 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
                     return Err(capnp::Error::failed(error.to_string()));
                 }
             };
-            let decision = serde_json::to_vec(&decision)
+            let mut response = results.get();
+            super::brain_codec::encode_json_value(response.reborrow().init_decision(), &decision)
                 .map_err(|error| capnp::Error::failed(error.to_string()))?;
-            results.get().set_decision_json(&decision);
             Ok(())
         })
     }
@@ -1298,10 +1298,8 @@ fn decode_runner_turn_event(
         finch_ipc_capnp::BrainTurnEventKind::Call => Ok(crate::server::RunnerTurnEvent::Call {
             tool_id,
             name: text(encoded.get_name()),
-            input: serde_json::from_slice(
-                encoded
-                    .get_input_json()
-                    .map_err(|error| error.to_string())?,
+            input: super::brain_codec::decode_json_value(
+                encoded.get_input().map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?,
         }),
@@ -1321,10 +1319,8 @@ fn decode_runner_turn_event(
                         .map_err(|error| error.to_string())?,
                 )
                 .map_err(|error| error.to_string())?,
-                detail: serde_json::from_slice(
-                    encoded
-                        .get_detail_json()
-                        .map_err(|error| error.to_string())?,
+                detail: super::brain_codec::decode_json_value(
+                    encoded.get_detail().map_err(|error| error.to_string())?,
                 )
                 .map_err(|error| error.to_string())?,
             })
@@ -1332,10 +1328,8 @@ fn decode_runner_turn_event(
         finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided => {
             Ok(crate::server::RunnerTurnEvent::ApprovalDecided {
                 approval_id: text(encoded.get_approval_id()),
-                decision: serde_json::from_slice(
-                    encoded
-                        .get_decision_json()
-                        .map_err(|error| error.to_string())?,
+                decision: super::brain_codec::decode_json_value(
+                    encoded.get_decision().map_err(|error| error.to_string())?,
                 )
                 .map_err(|error| error.to_string())?,
             })
@@ -1389,7 +1383,11 @@ mod tests {
             call.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::Call);
             call.set_tool_id("tool-1");
             call.set_name("search_word");
-            call.set_input_json(br#"{"query":"fib"}"#);
+            super::super::brain_codec::encode_json_value(
+                call.reborrow().init_input(),
+                &serde_json::json!({"query": "fib"}),
+            )
+            .unwrap();
             let mut approval = events.reborrow().get(1);
             approval.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::ApprovalRequested);
             approval.set_approval_id("tool-1");
@@ -1399,11 +1397,19 @@ mod tests {
                 approval.reborrow().init_approval_audience(),
                 &test_approval_audience(),
             );
-            approval.set_detail_json(br#"{"input":{"query":"fib"}}"#);
+            super::super::brain_codec::encode_json_value(
+                approval.reborrow().init_detail(),
+                &serde_json::json!({"input": {"query": "fib"}}),
+            )
+            .unwrap();
             let mut decision = events.reborrow().get(2);
             decision.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
             decision.set_approval_id("tool-1");
-            decision.set_decision_json(br#"{"choice":"approve_once"}"#);
+            super::super::brain_codec::encode_json_value(
+                decision.reborrow().init_decision(),
+                &serde_json::json!({"choice": "approve_once"}),
+            )
+            .unwrap();
             let mut tool_result = events.reborrow().get(3);
             tool_result.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::Result);
             tool_result.set_tool_id("tool-1");
@@ -1454,7 +1460,11 @@ mod tests {
             let mut decision = events.reborrow().get(0);
             decision.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
             decision.set_approval_id("approval-1");
-            decision.set_decision_json(br#"{"choice":"deny"}"#);
+            super::super::brain_codec::encode_json_value(
+                decision.reborrow().init_decision(),
+                &serde_json::json!({"choice": "deny"}),
+            )
+            .unwrap();
         }
 
         let reader = message

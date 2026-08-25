@@ -625,8 +625,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                     let mut call = control.request_approval_request();
                     encode_brain_turn_event(call.get().init_event(), &request.event)?;
                     let response = call.send().promise.await?;
-                    let decision = response.get()?.get_decision_json()?;
-                    serde_json::from_slice(decision)
+                    super::brain_codec::decode_json_value(response.get()?.get_decision()?)
                         .map_err(|error| capnp::Error::failed(error.to_string()))
                 }
                 .await
@@ -769,9 +768,8 @@ fn encode_brain_turn_event(
             encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::Call);
             encoded.set_tool_id(tool_id);
             encoded.set_name(name);
-            let input = serde_json::to_vec(input)
+            super::brain_codec::encode_json_value(encoded.reborrow().init_input(), input)
                 .map_err(|error| capnp::Error::failed(error.to_string()))?;
-            encoded.set_input_json(&input);
         }
         crate::server::RunnerTurnEvent::Result {
             tool_id,
@@ -795,9 +793,8 @@ fn encode_brain_turn_event(
             encoded.set_approval_kind(approval_kind);
             encoded.set_subject(subject);
             encode_approval_audience(encoded.reborrow().init_approval_audience(), audience);
-            let detail = serde_json::to_vec(detail)
+            super::brain_codec::encode_json_value(encoded.reborrow().init_detail(), detail)
                 .map_err(|error| capnp::Error::failed(error.to_string()))?;
-            encoded.set_detail_json(&detail);
         }
         crate::server::RunnerTurnEvent::ApprovalDecided {
             approval_id,
@@ -805,9 +802,8 @@ fn encode_brain_turn_event(
         } => {
             encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
             encoded.set_approval_id(approval_id);
-            let decision = serde_json::to_vec(decision)
+            super::brain_codec::encode_json_value(encoded.reborrow().init_decision(), decision)
                 .map_err(|error| capnp::Error::failed(error.to_string()))?;
-            encoded.set_decision_json(&decision);
         }
     }
     Ok(())

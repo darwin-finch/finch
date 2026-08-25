@@ -99,6 +99,27 @@ enum ProgramLanguage {
   lisp  @1;
 }
 
+# Schema-native representation for JSON-compatible dynamic values. This keeps
+# arbitrary tool/provider payloads structured on the wire without serializing
+# an opaque JSON byte string.
+struct JsonValue {
+  union {
+    nullValue @0 :Void;
+    boolValue @1 :Bool;
+    signed    @2 :Int64;
+    unsigned  @3 :UInt64;
+    float     @4 :Float64;
+    text      @5 :Text;
+    array     @6 :List(JsonValue);
+    object    @7 :List(JsonField);
+  }
+}
+
+struct JsonField {
+  name  @0 :Text;
+  value @1 :JsonValue;
+}
+
 struct BrainProgramRequest {
   brain      @0 :Text;
   requestSeq @1 :UInt64;
@@ -158,20 +179,20 @@ enum BrainTurnEventKind {
 }
 
 # Ordered provider/runner lifecycle produced while servicing one Brain prompt.
-# Arbitrary provider arguments and policy details remain JSON values at their
-# respective boundaries, while the event envelope and ordering are typed.
+# Arbitrary provider arguments and policy details use the schema-native
+# JsonValue union while the event envelope and ordering remain typed.
 struct BrainTurnEvent {
   kind         @0 :BrainTurnEventKind;
   toolId       @1 :Text;
   name         @2 :Text; # Present for call events.
-  inputJson    @3 :Data; # Present for call events.
+  input        @3 :JsonValue; # Present for call events.
   output       @4 :Text; # Present for result events.
   isError      @5 :Bool; # Present for result events.
   approvalId   @6 :Text;
   approvalKind @7 :Text; # "tool" or "vm_capability".
   subject      @8 :Text; # Tool name or capability name.
-  detailJson   @9 :Data; # Present for approval requests.
-  decisionJson @10 :Data; # Present for approval decisions.
+  detail       @9 :JsonValue; # Present for approval requests.
+  decision     @10 :JsonValue; # Present for approval decisions.
   approvalAudience @11 :BrainApprovalAudience; # Present for approval requests.
 }
 
@@ -184,7 +205,7 @@ interface BrainRunner {
 # Per-turn reverse capability. The runner publishes an addressed approval and
 # suspends until the daemon returns the decision submitted by that attachment.
 interface BrainTurnControl {
-  requestApproval @0 (event :BrainTurnEvent) -> (decisionJson :Data);
+  requestApproval @0 (event :BrainTurnEvent) -> (decision :JsonValue);
 }
 
 # ---------------------------------------------------------------------------
@@ -241,7 +262,7 @@ struct BrainToolCall {
   requestSeq @0 :UInt64;
   toolId     @1 :Text;
   name       @2 :Text;
-  inputJson  @3 :Data;
+  input      @3 :JsonValue;
 }
 
 struct BrainToolResult {
@@ -258,13 +279,13 @@ struct BrainApprovalRequested {
   subject         @3 :Text;
   hasAudience     @4 :Bool;
   audience        @5 :BrainApprovalAudience;
-  detailJson      @6 :Data;
+  detail          @6 :JsonValue;
 }
 
 struct BrainApprovalDecided {
   requestSeq  @0 :UInt64;
   approvalId  @1 :Text;
-  decisionJson @2 :Data;
+  decision     @2 :JsonValue;
 }
 
 struct BrainProgramSubmitted {
