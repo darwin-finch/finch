@@ -16,6 +16,9 @@ pub struct ServiceConfig {
     pub description: String,
     pub model: String,
     pub capabilities: Vec<String>,
+    /// Public Ed25519 transport identity. Safe to advertise; it grants no
+    /// authority and is compared against authenticated invitation/channel data.
+    pub node_public_key: [u8; 32],
 }
 
 /// Service discovery via mDNS (Bonjour)
@@ -125,6 +128,10 @@ fn advertised_properties(config: &ServiceConfig) -> HashMap<String, String> {
         ),
         // Cute node name — shown in the TUI when this machine is discovered.
         ("name".to_string(), crate::node_name::NAME.clone()),
+        (
+            "node_key".to_string(),
+            hex::encode(config.node_public_key),
+        ),
     ])
 }
 
@@ -139,6 +146,7 @@ mod tests {
             description: "test service".into(),
             model: "test-model".into(),
             capabilities: vec!["chat".into(), "brain".into()],
+            node_public_key: [7; 32],
         };
 
         let properties = advertised_properties(&config);
@@ -147,8 +155,16 @@ mod tests {
 
         assert_eq!(
             keys,
-            ["capabilities", "description", "model", "name", "version"]
+            [
+                "capabilities",
+                "description",
+                "model",
+                "name",
+                "node_key",
+                "version"
+            ]
         );
+        assert_eq!(properties["node_key"], hex::encode([7; 32]));
         for forbidden in ["token", "password", "credential", "secret", "api_key"] {
             assert!(!properties.contains_key(forbidden));
         }

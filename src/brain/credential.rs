@@ -283,6 +283,10 @@ pub struct BrainCredentialAuthority {
 }
 
 impl BrainCredentialAuthority {
+    pub fn invitation_public_key(&self) -> [u8; 32] {
+        self.invitation_signer.public_key_bytes()
+    }
+
     /// Load the daemon credential authority from a private state directory.
     /// The signing key is generated once and survives daemon restarts.
     pub fn load_or_create(state_directory: &Path) -> Result<Self> {

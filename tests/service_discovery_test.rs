@@ -12,6 +12,7 @@ fn test_service_discovery_creation() -> Result<()> {
         description: "Test Finch instance".to_string(),
         model: "Qwen-2.5-7B".to_string(),
         capabilities: vec!["code".to_string(), "general".to_string()],
+        node_public_key: [1; 32],
     };
 
     let discovery = ServiceDiscovery::new(config)?;
@@ -29,6 +30,7 @@ fn test_service_config_builder() -> Result<()> {
         description: "Finch on test machine".to_string(),
         model: "Qwen-2.5-1.5B".to_string(),
         capabilities: vec!["code".to_string()],
+        node_public_key: [2; 32],
     };
 
     assert_eq!(config.name, "finch-test-machine");
@@ -77,6 +79,7 @@ fn test_service_config_empty_name() -> Result<()> {
         description: "Test".to_string(),
         model: "Qwen-2.5-3B".to_string(),
         capabilities: vec![],
+        node_public_key: [3; 32],
     };
 
     // Should create discovery even with empty name (will use hostname)
@@ -100,6 +103,7 @@ fn test_service_capabilities_list() -> Result<()> {
             description: "Test".to_string(),
             model: "Qwen".to_string(),
             capabilities: caps.iter().map(|s| s.to_string()).collect(),
+            node_public_key: [4; 32],
         };
 
         // Should create successfully with any capability list

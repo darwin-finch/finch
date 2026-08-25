@@ -17,6 +17,7 @@ pub struct DiscoveredService {
     pub model: String,
     pub description: String,
     pub capabilities: Vec<String>,
+    pub node_public_key: Option<[u8; 32]>,
 }
 
 /// Client for discovering Finch services
@@ -72,6 +73,10 @@ impl ServiceDiscoveryClient {
                     } else {
                         capabilities_str.split(',').map(|s| s.to_string()).collect()
                     };
+                    let node_public_key = info
+                        .get_property_val_str("node_key")
+                        .and_then(|encoded| hex::decode(encoded).ok())
+                        .and_then(|bytes| bytes.try_into().ok());
 
                     // Get first IP address (prefer IPv4)
                     let host = info
@@ -89,6 +94,7 @@ impl ServiceDiscoveryClient {
                         model,
                         description,
                         capabilities,
+                        node_public_key,
                     };
 
                     tracing::debug!("Discovered service: {:?}", service);

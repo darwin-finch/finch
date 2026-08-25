@@ -1759,7 +1759,9 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                 "code".to_string(),
                 "general".to_string(),
                 "tool-use".to_string(),
+                "brain".to_string(),
             ],
+            node_public_key: server.brain_credentials().invitation_public_key(),
         };
 
         match ServiceDiscovery::new(service_config) {
