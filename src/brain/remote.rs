@@ -1349,6 +1349,146 @@ mod tests {
         }));
     }
 
+    #[test]
+    #[ignore = "requires a running Finch daemon on the default local IPC and HTTP endpoints"]
+    fn live_addressed_handoff_moves_program_dispatch_to_the_target_runner() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local_set = tokio::task::LocalSet::new();
+        runtime.block_on(local_set.run_until(async {
+            let brain = format!("codex-handoff-live-{}", uuid::Uuid::new_v4());
+            let source_subject = "codex-source/frontend-live";
+            let target_subject = "codex-target/frontend-live";
+            let ipc = crate::ipc::IpcClient::connect().await.unwrap();
+            let snapshot = ipc.brain_snapshot(&brain).await.unwrap();
+
+            let source_lease = ipc
+                .brain_acquire_runner(
+                    &brain,
+                    source_subject,
+                    &snapshot.environment,
+                    None,
+                    30_000,
+                )
+                .await
+                .unwrap();
+            let (source_tx, mut source_rx) = tokio::sync::mpsc::unbounded_channel();
+            ipc.register_brain_runner(&brain, source_lease.lease_id, source_tx)
+                .await
+                .unwrap();
+
+            let target = RemoteBrainTarget::parse(&format!(
+                "{brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}"
+            ))
+            .unwrap();
+            let mut controller = RemoteBrainClient::new(target, "loopback").unwrap();
+            controller
+                .authorize_runner_handoff_control(
+                    "codex-control@localhost",
+                    AttachmentRole::Driver,
+                )
+                .await
+                .unwrap();
+            controller
+                .attach(
+                    "codex-control@localhost",
+                    AttachmentRole::Driver,
+                    None,
+                )
+                .await
+                .unwrap();
+            let _events = controller.watch().await.unwrap();
+            let handoff = controller
+                .request_runner_handoff(
+                    target_subject,
+                    source_lease.lease_id,
+                    snapshot.environment.generation,
+                    30_000,
+                )
+                .await
+                .unwrap();
+
+            let target_lease = ipc
+                .brain_accept_runner_handoff(
+                    &brain,
+                    target_subject,
+                    handoff.handoff_id,
+                    &snapshot.environment,
+                    30_000,
+                )
+                .await
+                .unwrap();
+            let (target_tx, mut target_rx) = tokio::sync::mpsc::unbounded_channel();
+            let bootstrap = ipc
+                .register_brain_runner(&brain, target_lease.lease_id, target_tx)
+                .await
+                .unwrap();
+
+            let submitter = controller.clone();
+            let submission = tokio::task::spawn_local(async move {
+                submitter
+                    .push(BrainEventKind::Program {
+                        language: crate::brain::shared::ProgramLanguage::Lisp,
+                        source: "(say \"handoff-live\")".into(),
+                    })
+                    .await
+            });
+            let request = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                target_rx.recv(),
+            )
+            .await
+            .unwrap()
+            .expect("target runner callback closed");
+            let crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(request) = request
+            else {
+                panic!("target callback received the wrong frontend event")
+            };
+            assert_eq!(request.brain, brain);
+            assert_eq!(request.source, "(say \"handoff-live\")");
+            request
+                .response_tx
+                .send(Ok(crate::server::RunnerProgramResult {
+                    output: "handoff-live".into(),
+                    runtime_revision: bootstrap.runtime_revision,
+                    checkpoint: bootstrap.checkpoint,
+                }))
+                .unwrap();
+            submission.await.unwrap().unwrap();
+
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                source_rx.recv(),
+            )
+            .await
+            {
+                Err(_) | Ok(None) => {}
+                Ok(Some(event)) => panic!("stale source runner received {event:?}"),
+            }
+            let final_snapshot = ipc.brain_snapshot(&brain).await.unwrap();
+            assert_eq!(
+                final_snapshot.runner_lease.as_ref().map(|lease| lease.subject.as_str()),
+                Some(target_subject)
+            );
+            assert!(final_snapshot.events.iter().any(|event| matches!(
+                &event.kind,
+                BrainEventKind::Result {
+                    output,
+                    error: None,
+                    ..
+                } if output == "handoff-live"
+            )));
+
+            ipc.brain_release_runner(&brain, target_lease.lease_id)
+                .await
+                .unwrap();
+            controller.disconnect().await.unwrap();
+            controller.archive("codex-control@localhost").await.unwrap();
+        }));
+    }
+
     #[tokio::test]
     async fn cloned_client_reuses_a_live_scoped_credential() {
         let client = RemoteBrainClient::new(
