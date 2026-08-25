@@ -1128,6 +1128,31 @@ impl LocalBrainProjection {
     }
 }
 
+fn project_remote_brain_live_run_event(
+    output_manager: &crate::cli::output_manager::OutputManager,
+    projections: &mut std::collections::HashMap<
+        crate::brain::store::RunId,
+        RemoteBrainRunProjection,
+    >,
+    local_projections: &mut std::collections::VecDeque<LocalBrainProjection>,
+    selected_brain_is_home: bool,
+    event: &crate::brain::store::BrainEvent,
+) -> bool {
+    if event.run_id.is_none() {
+        return false;
+    }
+    let projection_match = selected_brain_is_home
+        .then(|| local_projections.front_mut())
+        .flatten()
+        .map(|projection| projection.observe(event))
+        .unwrap_or(LocalProjectionMatch::None);
+    let projected = project_remote_brain_run_event(output_manager, projections, event);
+    if projected && projection_match == LocalProjectionMatch::SuppressAndComplete {
+        local_projections.pop_front();
+    }
+    projected
+}
+
 fn deferred_vm_approval_from_tool_result(
     result: &anyhow::Result<String>,
 ) -> Option<DeferredVmApproval> {
@@ -5796,33 +5821,15 @@ Rules:\n\
 
     async fn render_remote_brain_event(&mut self, event: &crate::brain::store::BrainEvent) {
         use crate::brain::store::BrainEventKind;
-        if event.run_id.is_some() {
-            let projection_match = self
-                .selected_brain_is_home()
-                .then(|| self.local_brain_projections.front_mut())
-                .flatten()
-                .map(|projection| projection.observe(event))
-                .unwrap_or(LocalProjectionMatch::None);
-            let locally_owned_tool_event = matches!(
-                event.kind,
-                BrainEventKind::ToolCall { .. }
-                    | BrainEventKind::ToolResult { .. }
-                    | BrainEventKind::ApprovalRequested { .. }
-                    | BrainEventKind::ApprovalDecided { .. }
-            ) && projection_match != LocalProjectionMatch::None;
-            if locally_owned_tool_event {
-                return;
-            }
-            if project_remote_brain_run_event(
-                &self.output_manager,
-                &mut self.remote_brain_run_units,
-                event,
-            ) {
-                if projection_match == LocalProjectionMatch::SuppressAndComplete {
-                    self.local_brain_projections.pop_front();
-                }
-                return;
-            }
+        let selected_brain_is_home = self.selected_brain_is_home();
+        if project_remote_brain_live_run_event(
+            &self.output_manager,
+            &mut self.remote_brain_run_units,
+            &mut self.local_brain_projections,
+            selected_brain_is_home,
+            event,
+        ) {
+            return;
         }
         let local_machine = self
             .selected_brain()
@@ -8537,7 +8544,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledged_snapshot_reattaches_complete_run_as_one_work_unit() {
+    fn live_home_run_then_replacement_snapshot_keeps_one_complete_work_unit() {
         use crate::brain::store::{
             AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, ProgramLanguage,
             RunId,
@@ -8595,7 +8602,7 @@ mod tests {
                 source: "(say \"cache checked\")".into(),
             },
             BrainEventKind::Result {
-                request_seq: 1,
+                request_seq: 7,
                 output: "cache checked".into(),
                 error: None,
             },
@@ -8609,17 +8616,41 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, kind)| {
-                let mut event = brain_event(index as u64 + 1, "daemon", kind);
+                let sender = if matches!(kind, BrainEventKind::Program { .. }) {
+                    "provider"
+                } else {
+                    "daemon"
+                };
+                let mut event = brain_event(index as u64 + 1, sender, kind);
                 event.run_id = Some(run_id);
                 event
             })
             .collect::<Vec<_>>();
         let mut projections = std::collections::HashMap::new();
+        let mut local_projections = std::collections::VecDeque::from([LocalBrainProjection {
+            source: "(say \"cache checked\")".into(),
+            output: "cache checked".into(),
+            tool_ids: std::collections::HashSet::from(["tool-1".into()]),
+            approval_ids: std::collections::HashSet::from(["approval-1".into()]),
+            program_seq: None,
+        }]);
 
-        // All events may be at or below the attachment acknowledgement. The
-        // snapshot projector must still rebuild their selectable run group.
-        super::project_remote_brain_snapshot_runs(&output, &mut projections, &events);
-        // A replacement snapshot is idempotent and does not duplicate rows.
+        // These are the actual live EventLoop projection inputs for a home
+        // runner. Matching local state suppresses only the legacy rendering;
+        // correlated rows still enter their canonical run work unit.
+        for event in &events {
+            assert!(super::project_remote_brain_live_run_event(
+                &output,
+                &mut projections,
+                &mut local_projections,
+                true,
+                event,
+            ));
+        }
+        assert!(local_projections.is_empty());
+
+        // A replacement snapshot can contain the now-acknowledged history and
+        // must update that same unit without adding a legacy unit or rows.
         super::project_remote_brain_snapshot_runs(&output, &mut projections, &events);
 
         let messages = output.get_messages();
