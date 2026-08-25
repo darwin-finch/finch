@@ -306,6 +306,7 @@ impl ProviderEntry {
                 model,
                 base_url,
                 name,
+                ..
             } => Some(TeacherEntry {
                 provider: "claude".to_string(),
                 api_key: api_key.clone(),
@@ -329,12 +330,14 @@ impl ProviderEntry {
             Self::Grok {
                 api_key,
                 model,
+                base_url,
                 name,
+                ..
             } => Some(TeacherEntry {
                 provider: "grok".to_string(),
                 api_key: api_key.clone(),
                 model: model.clone(),
-                base_url: None,
+                base_url: base_url.clone(),
                 name: name.clone(),
             }),
             Self::Gemini {
@@ -353,6 +356,7 @@ impl ProviderEntry {
                 model,
                 base_url,
                 name,
+                ..
             } => Some(TeacherEntry {
                 provider: "mistral".to_string(),
                 api_key: api_key.clone(),
@@ -382,18 +386,25 @@ impl ProviderEntry {
                 api_key: entry.api_key.clone(),
                 model: entry.model.clone(),
                 base_url: entry.base_url.clone(),
+                chat_path: None,
+                models_path: None,
                 name: entry.name.clone(),
             },
             "openai" => Self::Openai {
                 api_key: entry.api_key.clone(),
                 model: entry.model.clone(),
                 base_url: entry.base_url.clone(),
+                chat_path: None,
+                models_path: None,
                 name: entry.name.clone(),
                 reasoning_effort: None,
             },
             "grok" => Self::Grok {
                 api_key: entry.api_key.clone(),
                 model: entry.model.clone(),
+                base_url: entry.base_url.clone(),
+                chat_path: None,
+                models_path: None,
                 name: entry.name.clone(),
             },
             "gemini" => Self::Gemini {
@@ -405,6 +416,8 @@ impl ProviderEntry {
                 api_key: entry.api_key.clone(),
                 model: entry.model.clone(),
                 base_url: entry.base_url.clone(),
+                chat_path: None,
+                models_path: None,
                 name: entry.name.clone(),
             },
             "groq" => Self::Groq {
@@ -418,6 +431,8 @@ impl ProviderEntry {
                     api_key: entry.api_key.clone(),
                     model: entry.model.clone(),
                     base_url: entry.base_url.clone(),
+                    chat_path: None,
+                    models_path: None,
                     name: entry.name.clone(),
                 }
             }
@@ -890,6 +905,8 @@ mod tests {
             api_key: "sk-ant-test".to_string(),
             model: None,
             base_url: None,
+            chat_path: None,
+            models_path: None,
             name: Some("Claude".to_string()),
         }];
         let config = Config::with_providers(providers);
@@ -936,6 +953,9 @@ mod tests {
             ProviderEntry::Grok {
                 api_key: "xai-key".to_string(),
                 model: None,
+                base_url: None,
+                chat_path: None,
+                models_path: None,
                 name: None,
             },
             ProviderEntry::Local {

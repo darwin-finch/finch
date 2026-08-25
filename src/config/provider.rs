@@ -83,6 +83,12 @@ pub enum ProviderEntry {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_url: Option<String>,
+        /// Messages path relative to `base_url`, or a complete URL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_path: Option<String>,
+        /// Model-list path relative to `base_url`, or a complete URL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        models_path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
@@ -92,6 +98,12 @@ pub enum ProviderEntry {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_url: Option<String>,
+        /// Chat-completions path relative to `base_url`, or a complete URL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_path: Option<String>,
+        /// Model-list path relative to `base_url`, or a complete URL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        models_path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,6 +113,12 @@ pub enum ProviderEntry {
         api_key: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        models_path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
@@ -117,6 +135,10 @@ pub enum ProviderEntry {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        models_path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
@@ -293,6 +315,8 @@ mod tests {
             api_key: "sk-ant-test".to_string(),
             model: Some("claude-sonnet-4-6".to_string()),
             base_url: None,
+            chat_path: None,
+            models_path: None,
             name: Some("Claude Primary".to_string()),
         };
         let toml = toml::to_string(&entry).unwrap();
@@ -306,6 +330,8 @@ mod tests {
             api_key: "test-key".to_string(),
             model: Some("claude-haiku".to_string()),
             base_url: None,
+            chat_path: None,
+            models_path: None,
             name: Some("fast".to_string()),
         };
         assert_eq!(entry.profile_name(), "fast");
@@ -317,6 +343,8 @@ mod tests {
             api_key: "test-key".to_string(),
             model: Some("claude-haiku".to_string()),
             base_url: None,
+            chat_path: None,
+            models_path: None,
             name: None,
         };
         assert_eq!(entry.profile_name(), "claude-haiku");
@@ -328,6 +356,8 @@ mod tests {
             api_key: "test-key".to_string(),
             model: Some("gpt-5.6-sol".to_string()),
             base_url: None,
+            chat_path: None,
+            models_path: None,
             name: Some("deep".to_string()),
             reasoning_effort: Some(ReasoningEffort::Xhigh),
         };
@@ -358,6 +388,9 @@ mod tests {
         let entry = ProviderEntry::Grok {
             api_key: "xai-test".to_string(),
             model: Some("grok-code-fast-1".to_string()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
             name: None,
         };
         let toml = toml::to_string(&entry).unwrap();
@@ -371,6 +404,8 @@ mod tests {
             api_key: "key".to_string(),
             model: None,
             base_url: None,
+            chat_path: None,
+            models_path: None,
             name: None,
         };
         assert_eq!(entry.display_name(), "Claude");
@@ -381,6 +416,9 @@ mod tests {
         let entry = ProviderEntry::Grok {
             api_key: "key".to_string(),
             model: None,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
             name: Some("Grok (Primary)".to_string()),
         };
         assert_eq!(entry.display_name(), "Grok (Primary)");
@@ -404,6 +442,8 @@ mod tests {
             api_key: "key".to_string(),
             model: None,
             base_url: None,
+            chat_path: None,
+            models_path: None,
             name: None,
         };
         assert!(!cloud.is_local());
@@ -431,6 +471,8 @@ mod tests {
                 api_key: "k".to_string(),
                 model: None,
                 base_url: None,
+                chat_path: None,
+                models_path: None,
                 name: None
             }
             .provider_type(),
@@ -440,6 +482,9 @@ mod tests {
             ProviderEntry::Grok {
                 api_key: "k".to_string(),
                 model: None,
+                base_url: None,
+                chat_path: None,
+                models_path: None,
                 name: None
             }
             .provider_type(),
@@ -467,12 +512,17 @@ mod tests {
             ProviderEntry::Grok {
                 api_key: "xai-test".to_string(),
                 model: Some("grok-code-fast-1".to_string()),
+                base_url: None,
+                chat_path: None,
+                models_path: None,
                 name: Some("Grok (Primary)".to_string()),
             },
             ProviderEntry::Claude {
                 api_key: "sk-ant-test".to_string(),
                 model: None,
                 base_url: None,
+                chat_path: None,
+                models_path: None,
                 name: None,
             },
             ProviderEntry::Local {

@@ -8,6 +8,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc::Receiver;
 
+pub mod endpoints;
 pub mod types;
 
 // Provider implementations

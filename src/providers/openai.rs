@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use super::endpoints::ProviderEndpoints;
 use super::types::{ProviderRequest, ProviderResponse, StreamChunk};
 use super::LlmProvider;
 use crate::claude::retry::{with_retry, NonRetriableError};
@@ -106,7 +107,7 @@ fn finalize_tool_calls(acc: &[(String, String, String)]) -> Vec<ContentBlock> {
 pub struct OpenAIProvider {
     client: Client,
     api_key: String,
-    base_url: String,
+    endpoints: ProviderEndpoints,
     default_model: String,
     provider_name: String,
     reasoning_effort: Option<ReasoningEffort>,
@@ -118,6 +119,8 @@ impl OpenAIProvider {
         Self::new(
             api_key,
             "https://api.openai.com".to_string(),
+            "/v1/chat/completions",
+            "/v1/models",
             "gpt-4o".to_string(),
             "openai".to_string(),
         )
@@ -128,6 +131,8 @@ impl OpenAIProvider {
         Self::new(
             api_key,
             "https://api.x.ai".to_string(),
+            "/v1/chat/completions",
+            "/v1/models",
             "grok-2".to_string(),
             "grok".to_string(),
         )
@@ -138,6 +143,8 @@ impl OpenAIProvider {
         Self::new(
             api_key,
             "https://api.mistral.ai".to_string(),
+            "/v1/chat/completions",
+            "/v1/models",
             "mistral-large-latest".to_string(),
             "mistral".to_string(),
         )
@@ -149,6 +156,8 @@ impl OpenAIProvider {
         Self::new(
             api_key,
             "https://api.groq.com".to_string(),
+            "/openai/v1/chat/completions",
+            "/openai/v1/models",
             "llama-3.1-70b-versatile".to_string(),
             "groq".to_string(),
         )
@@ -162,6 +171,8 @@ impl OpenAIProvider {
         Self::new(
             "ollama".to_string(), // Ollama ignores the Authorization header
             base_url,
+            "/v1/chat/completions",
+            "/v1/models",
             model,
             "ollama".to_string(),
         )
@@ -174,6 +185,8 @@ impl OpenAIProvider {
         Self::new(
             String::new(), // no API key for the local/remote daemon
             address,
+            "/v1/chat/completions",
+            "/v1/models",
             "default".to_string(),
             "remote_daemon".to_string(),
         )
@@ -191,10 +204,32 @@ impl OpenAIProvider {
         self
     }
 
+    /// Create an OpenAI-compatible provider with explicit endpoint paths.
+    /// Paths may be relative to `base_url` or complete URLs.
+    pub fn new_compatible(
+        api_key: String,
+        base_url: String,
+        chat_path: impl AsRef<str>,
+        models_path: impl AsRef<str>,
+        default_model: String,
+        provider_name: String,
+    ) -> Result<Self> {
+        Self::new(
+            api_key,
+            base_url,
+            chat_path.as_ref(),
+            models_path.as_ref(),
+            default_model,
+            provider_name,
+        )
+    }
+
     /// Create a provider with custom settings
     fn new(
         api_key: String,
         base_url: String,
+        chat_path: &str,
+        models_path: &str,
         default_model: String,
         provider_name: String,
     ) -> Result<Self> {
@@ -206,7 +241,7 @@ impl OpenAIProvider {
         Ok(Self {
             client,
             api_key,
-            base_url,
+            endpoints: ProviderEndpoints::new(&base_url, chat_path, models_path),
             default_model,
             provider_name,
             reasoning_effort: None,
@@ -417,7 +452,7 @@ impl OpenAIProvider {
     /// Send a single message request (no retry)
     async fn send_message_once(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let openai_request = self.to_openai_request(request);
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = &self.endpoints.chat_url;
 
         tracing::debug!(
             provider = %self.provider_name,
@@ -430,7 +465,7 @@ impl OpenAIProvider {
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("content-type", "application/json")
             .json(&openai_request)
@@ -475,13 +510,13 @@ impl OpenAIProvider {
         let mut openai_request = self.to_openai_request(request);
         openai_request.stream = true;
 
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = &self.endpoints.chat_url;
 
         tracing::debug!("Sending streaming request to OpenAI API");
 
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("content-type", "application/json")
             .json(&openai_request)
@@ -817,6 +852,38 @@ struct OpenAIFunctionDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn compatible_provider_posts_to_exact_chat_path_with_bearer_auth() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/coding/paas/v4/chat/completions")
+            .match_header("authorization", "Bearer endpoint-secret")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "model": "custom-model"
+            })))
+            .with_status(200)
+            .with_body(r#"{"id":"chat-1","object":"chat.completion","created":1,"model":"custom-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#)
+            .create_async()
+            .await;
+        let provider = OpenAIProvider::new_compatible(
+            "endpoint-secret".to_string(),
+            server.url(),
+            "/api/coding/paas/v4/chat/completions",
+            "/api/coding/paas/v4/models",
+            "custom-model".to_string(),
+            "compatible-test".to_string(),
+        )
+        .unwrap();
+
+        provider
+            .send_message(&ProviderRequest::new(vec![
+                crate::claude::types::Message::user("hello"),
+            ]))
+            .await
+            .unwrap();
+        mock.assert_async().await;
+    }
 
     #[test]
     fn test_openai_provider_creation() {

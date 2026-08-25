@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use super::endpoints::ProviderEndpoints;
 use super::types::{ProviderRequest, ProviderResponse, StreamChunk};
 use super::LlmProvider;
 use crate::claude::retry::{with_retry, NonRetriableError};
@@ -15,7 +16,7 @@ use crate::claude::streaming::StreamEvent;
 use crate::claude::types::{ContentBlock, MessageRequest};
 use crate::config::constants::DEFAULT_CLAUDE_MODEL;
 
-const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
+const CLAUDE_API_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const REQUEST_TIMEOUT_SECS: u64 = 120;
 
@@ -62,11 +63,23 @@ pub struct ClaudeProvider {
     client: Client,
     api_key: String,
     default_model: String,
+    endpoints: ProviderEndpoints,
 }
 
 impl ClaudeProvider {
     /// Create a new Claude provider
     pub fn new(api_key: String) -> Result<Self> {
+        Self::new_with_endpoints(api_key, CLAUDE_API_BASE_URL, "/v1/messages", "/v1/models")
+    }
+
+    /// Create a Claude provider with endpoint paths relative to `base_url` or
+    /// complete endpoint URLs.
+    pub fn new_with_endpoints(
+        api_key: String,
+        base_url: &str,
+        chat_path: &str,
+        models_path: &str,
+    ) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .build()
@@ -76,6 +89,7 @@ impl ClaudeProvider {
             client,
             api_key,
             default_model: DEFAULT_CLAUDE_MODEL.to_string(),
+            endpoints: ProviderEndpoints::new(base_url, chat_path, models_path),
         })
     }
 
@@ -115,7 +129,7 @@ impl ClaudeProvider {
 
         let response = self
             .client
-            .post(CLAUDE_API_URL)
+            .post(&self.endpoints.chat_url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
@@ -176,7 +190,7 @@ impl ClaudeProvider {
 
         let response = self
             .client
-            .post(CLAUDE_API_URL)
+            .post(&self.endpoints.chat_url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
@@ -416,6 +430,35 @@ impl LlmProvider for ClaudeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn configured_claude_endpoint_and_auth_are_honored() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/gateway/anthropic/messages")
+            .match_header("x-api-key", "endpoint-secret")
+            .match_header("anthropic-version", ANTHROPIC_VERSION)
+            .with_status(200)
+            .with_body(r#"{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-test","stop_reason":"end_turn"}"#)
+            .create_async()
+            .await;
+        let provider = ClaudeProvider::new_with_endpoints(
+            "endpoint-secret".to_string(),
+            &server.url(),
+            "/gateway/anthropic/messages",
+            "/gateway/anthropic/models",
+        )
+        .unwrap()
+        .with_model("claude-test");
+
+        provider
+            .send_message(&ProviderRequest::new(vec![
+                crate::claude::types::Message::user("hello"),
+            ]))
+            .await
+            .unwrap();
+        mock.assert_async().await;
+    }
 
     #[test]
     fn test_provider_creation() {

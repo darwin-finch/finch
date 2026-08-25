@@ -8111,6 +8111,8 @@ mod tests {
             api_key: "test-key".to_string(),
             model: Some(model.to_string()),
             base_url: None,
+            chat_path: None,
+            models_path: None,
             name: Some(name.to_string()),
         }
     }

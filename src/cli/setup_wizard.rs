@@ -367,26 +367,45 @@ fn provider_entry_from_remote_model(
     let model = (!model.is_empty()).then(|| model.to_string());
     let name = Some(name.to_string());
     match persisted {
-        Some(ProviderEntry::Claude { base_url, .. }) => ProviderEntry::Claude {
+        Some(ProviderEntry::Claude {
+            base_url,
+            chat_path,
+            models_path,
+            ..
+        }) => ProviderEntry::Claude {
             api_key: api_key.to_string(),
             model,
             base_url: base_url.clone(),
+            chat_path: chat_path.clone(),
+            models_path: models_path.clone(),
             name,
         },
         Some(ProviderEntry::Openai {
             base_url,
+            chat_path,
+            models_path,
             reasoning_effort,
             ..
         }) => ProviderEntry::Openai {
             api_key: api_key.to_string(),
             model,
             base_url: base_url.clone(),
+            chat_path: chat_path.clone(),
+            models_path: models_path.clone(),
             name,
             reasoning_effort: *reasoning_effort,
         },
-        Some(ProviderEntry::Grok { .. }) => ProviderEntry::Grok {
+        Some(ProviderEntry::Grok {
+            base_url,
+            chat_path,
+            models_path,
+            ..
+        }) => ProviderEntry::Grok {
             api_key: api_key.to_string(),
             model,
+            base_url: base_url.clone(),
+            chat_path: chat_path.clone(),
+            models_path: models_path.clone(),
             name,
         },
         Some(ProviderEntry::Gemini { .. }) => ProviderEntry::Gemini {
@@ -394,10 +413,17 @@ fn provider_entry_from_remote_model(
             model,
             name,
         },
-        Some(ProviderEntry::Mistral { base_url, .. }) => ProviderEntry::Mistral {
+        Some(ProviderEntry::Mistral {
+            base_url,
+            chat_path,
+            models_path,
+            ..
+        }) => ProviderEntry::Mistral {
             api_key: api_key.to_string(),
             model,
             base_url: base_url.clone(),
+            chat_path: chat_path.clone(),
+            models_path: models_path.clone(),
             name,
         },
         Some(ProviderEntry::Groq { .. }) => ProviderEntry::Groq {
@@ -4906,6 +4932,9 @@ mod tests {
             ProviderEntry::Grok {
                 api_key: "xai-test-key".to_string(),
                 model: Some("grok-code-fast-1".to_string()),
+                base_url: None,
+                chat_path: None,
+                models_path: None,
                 name: Some("grok-code-fast-1".to_string()),
             },
             ProviderEntry::Local {
@@ -4972,6 +5001,8 @@ mod tests {
                 api_key: "openai-key".to_string(),
                 model: Some("gpt-test".to_string()),
                 base_url: Some("https://compatible.example/api".to_string()),
+                chat_path: Some("/custom/chat".to_string()),
+                models_path: Some("/custom/models".to_string()),
                 name: Some("reasoning-profile".to_string()),
                 reasoning_effort: Some(ReasoningEffort::High),
             },

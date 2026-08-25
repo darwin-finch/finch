@@ -23,6 +23,8 @@ pub fn load_config() -> Result<Config> {
                 api_key,
                 model: None,
                 base_url: None,
+                chat_path: None,
+                models_path: None,
                 name: Some("Claude (Environment)".to_string()),
             }];
             return Ok(Config::with_providers(providers));

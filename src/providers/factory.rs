@@ -20,8 +20,20 @@ use crate::config::{ProviderEntry, TeacherEntry};
 /// (`create_local_generator`).
 pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmProvider>> {
     match entry {
-        ProviderEntry::Claude { api_key, model, .. } => {
-            let mut provider = ClaudeProvider::new(api_key.clone())?;
+        ProviderEntry::Claude {
+            api_key,
+            model,
+            base_url,
+            chat_path,
+            models_path,
+            ..
+        } => {
+            let mut provider = ClaudeProvider::new_with_endpoints(
+                api_key.clone(),
+                base_url.as_deref().unwrap_or("https://api.anthropic.com"),
+                chat_path.as_deref().unwrap_or("/v1/messages"),
+                models_path.as_deref().unwrap_or("/v1/models"),
+            )?;
             if let Some(m) = model {
                 provider = provider.with_model(m.clone());
             }
@@ -31,6 +43,9 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
         ProviderEntry::Openai {
             api_key,
             model,
+            base_url,
+            chat_path,
+            models_path,
             reasoning_effort,
             ..
         } => {
@@ -41,7 +56,16 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
             } else {
                 api_key.clone()
             };
-            let mut provider = OpenAIProvider::new_openai(api_key)?;
+            let mut provider = OpenAIProvider::new_compatible(
+                api_key,
+                base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.openai.com".to_string()),
+                chat_path.as_deref().unwrap_or("/v1/chat/completions"),
+                models_path.as_deref().unwrap_or("/v1/models"),
+                "gpt-4o".to_string(),
+                "openai".to_string(),
+            )?;
             if let Some(m) = model {
                 provider = provider.with_model(m.clone());
             }
@@ -51,8 +75,24 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
             Ok(Box::new(provider))
         }
 
-        ProviderEntry::Grok { api_key, model, .. } => {
-            let mut provider = OpenAIProvider::new_grok(api_key.clone())?;
+        ProviderEntry::Grok {
+            api_key,
+            model,
+            base_url,
+            chat_path,
+            models_path,
+            ..
+        } => {
+            let mut provider = OpenAIProvider::new_compatible(
+                api_key.clone(),
+                base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.x.ai".to_string()),
+                chat_path.as_deref().unwrap_or("/v1/chat/completions"),
+                models_path.as_deref().unwrap_or("/v1/models"),
+                "grok-2".to_string(),
+                "grok".to_string(),
+            )?;
             if let Some(m) = model {
                 provider = provider.with_model(m.clone());
             }
@@ -67,8 +107,24 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
             Ok(Box::new(provider))
         }
 
-        ProviderEntry::Mistral { api_key, model, .. } => {
-            let mut provider = OpenAIProvider::new_mistral(api_key.clone())?;
+        ProviderEntry::Mistral {
+            api_key,
+            model,
+            base_url,
+            chat_path,
+            models_path,
+            ..
+        } => {
+            let mut provider = OpenAIProvider::new_compatible(
+                api_key.clone(),
+                base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.mistral.ai".to_string()),
+                chat_path.as_deref().unwrap_or("/v1/chat/completions"),
+                models_path.as_deref().unwrap_or("/v1/models"),
+                "mistral-large-latest".to_string(),
+                "mistral".to_string(),
+            )?;
             if let Some(m) = model {
                 provider = provider.with_model(m.clone());
             }
@@ -158,7 +214,12 @@ pub fn create_providers(teachers: &[TeacherEntry]) -> Result<Vec<Box<dyn LlmProv
 pub fn create_provider_from_teacher(entry: &TeacherEntry) -> Result<Box<dyn LlmProvider>> {
     match entry.provider.to_lowercase().as_str() {
         "claude" => {
-            let mut provider = ClaudeProvider::new(entry.api_key.clone())?;
+            let mut provider = ClaudeProvider::new_with_endpoints(
+                entry.api_key.clone(),
+                entry.base_url.as_deref().unwrap_or("https://api.anthropic.com"),
+                "/v1/messages",
+                "/v1/models",
+            )?;
             if let Some(model) = &entry.model {
                 provider = provider.with_model(model.clone());
             }
@@ -166,7 +227,17 @@ pub fn create_provider_from_teacher(entry: &TeacherEntry) -> Result<Box<dyn LlmP
         }
 
         "openai" => {
-            let mut provider = OpenAIProvider::new_openai(entry.api_key.clone())?;
+            let mut provider = OpenAIProvider::new_compatible(
+                entry.api_key.clone(),
+                entry
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.openai.com".to_string()),
+                "/v1/chat/completions",
+                "/v1/models",
+                "gpt-4o".to_string(),
+                "openai".to_string(),
+            )?;
             if let Some(model) = &entry.model {
                 provider = provider.with_model(model.clone());
             }
@@ -174,7 +245,17 @@ pub fn create_provider_from_teacher(entry: &TeacherEntry) -> Result<Box<dyn LlmP
         }
 
         "grok" => {
-            let mut provider = OpenAIProvider::new_grok(entry.api_key.clone())?;
+            let mut provider = OpenAIProvider::new_compatible(
+                entry.api_key.clone(),
+                entry
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.x.ai".to_string()),
+                "/v1/chat/completions",
+                "/v1/models",
+                "grok-2".to_string(),
+                "grok".to_string(),
+            )?;
             if let Some(model) = &entry.model {
                 provider = provider.with_model(model.clone());
             }
@@ -190,7 +271,17 @@ pub fn create_provider_from_teacher(entry: &TeacherEntry) -> Result<Box<dyn LlmP
         }
 
         "mistral" => {
-            let mut provider = OpenAIProvider::new_mistral(entry.api_key.clone())?;
+            let mut provider = OpenAIProvider::new_compatible(
+                entry.api_key.clone(),
+                entry
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.mistral.ai".to_string()),
+                "/v1/chat/completions",
+                "/v1/models",
+                "mistral-large-latest".to_string(),
+                "mistral".to_string(),
+            )?;
             if let Some(model) = &entry.model {
                 provider = provider.with_model(model.clone());
             }
@@ -394,6 +485,8 @@ mod tests {
             api_key: "sk-ant-test".to_string(),
             model: None,
             base_url: None,
+            chat_path: None,
+            models_path: None,
             name: None,
         });
         let provider = create_provider_from_entry(&p).unwrap();
@@ -405,6 +498,9 @@ mod tests {
         let p = pentry(ProviderEntry::Grok {
             api_key: "xai-test".to_string(),
             model: Some("grok-code-fast-1".to_string()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
             name: None,
         });
         let provider = create_provider_from_entry(&p).unwrap();
@@ -435,6 +531,8 @@ mod tests {
                 api_key: "key".to_string(),
                 model: None,
                 base_url: None,
+                chat_path: None,
+                models_path: None,
                 name: None,
             },
             ProviderEntry::Local {
