@@ -521,6 +521,7 @@ struct DeferredVmApproval {
 }
 
 struct PendingNamedBrainTurn {
+    brain: String,
     run_id: crate::brain::store::RunId,
     response_tx: tokio::sync::oneshot::Sender<
         std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError>,
@@ -538,6 +539,7 @@ struct PendingNamedBrainTurn {
     approval_tx: Option<
         tokio::sync::mpsc::UnboundedSender<crate::server::RunnerApprovalRequest>,
     >,
+    restart: Option<crate::tools::implementations::restart::DeferredFrontendRestart>,
 }
 
 async fn resume_named_brain_program_boundaries(
@@ -1564,6 +1566,7 @@ impl EventLoop {
                             "NamedBrainRunCancelRequested"
                         }
                         ReplEvent::NamedBrainProgramFinished(_) => "NamedBrainProgramFinished",
+                        ReplEvent::FrontendRestartReady { .. } => "FrontendRestartReady",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
                     tracing::debug!("Received event: {:?}", event);
@@ -3217,8 +3220,30 @@ Rules:\n\
             ReplEvent::ToolResult {
                 query_id,
                 tool_id,
-                result,
+                mut result,
             } => {
+                if let Some(restart) =
+                    crate::tools::implementations::restart::deferred_frontend_restart_from_tool_result(
+                        &result,
+                    )
+                {
+                    result = match self.pending_named_brain_turns.get_mut(&query_id) {
+                        Some(turn) if turn.restart.is_none() => {
+                            let path = restart.binary_path.display().to_string();
+                            let digest = restart.binary_sha256.clone();
+                            turn.restart = Some(restart);
+                            Ok(format!(
+                                "Frontend restart prepared for {path} (sha256:{digest}). Finish this turn normally; Finch will replace the frontend only after the daemon commits the Brain run."
+                            ))
+                        }
+                        Some(_) => Err(anyhow::anyhow!(
+                            "this Brain turn already has a pending frontend restart"
+                        )),
+                        None => Err(anyhow::anyhow!(
+                            "frontend restart requires a canonical named-Brain turn"
+                        )),
+                    };
+                }
                 if let Some(proposal) = deferred_proposal_from_tool_result(&result) {
                     self.output_manager.write_status(format!(
                         "Proposal {} is awaiting editor review",
@@ -3704,6 +3729,14 @@ Rules:\n\
             ReplEvent::NamedBrainProgramFinished(run_id) => {
                 self.pending_named_brain_programs.remove(&run_id);
             }
+            ReplEvent::FrontendRestartReady {
+                brain,
+                run_id,
+                restart,
+            } => {
+                self.restart_frontend_after_brain_commit(brain, run_id, restart)
+                    .await?;
+            }
             ReplEvent::ShowDialog {
                 dialog: _,
                 response_tx,
@@ -3909,6 +3942,7 @@ Rules:\n\
         self.pending_named_brain_turns.insert(
             query_id,
             PendingNamedBrainTurn {
+                brain: request.brain,
                 run_id: request.run_id,
                 response_tx: request.response_tx,
                 turn_events: Vec::new(),
@@ -3916,6 +3950,7 @@ Rules:\n\
                 cancellation_requested: false,
                 approval_audience: request.approval_audience,
                 approval_tx: request.approval_tx,
+                restart: None,
             },
         );
         self.agent_scheduler
@@ -4032,10 +4067,13 @@ Rules:\n\
         };
         self.agent_scheduler.set_active_brain_parent(None).await;
         let PendingNamedBrainTurn {
+            brain,
+            run_id,
             response_tx,
             turn_events,
             effect_journal,
             cancellation_requested,
+            restart,
             ..
         } = pending;
         if cancellation_requested {
@@ -4046,6 +4084,32 @@ Rules:\n\
             }));
             return;
         }
+        let commit_ack = restart.map(|restart| {
+            let (commit_tx, mut commit_rx) = tokio::sync::mpsc::unbounded_channel::<
+                crate::server::RunnerTurnCommitNotice,
+            >();
+            let event_tx = self.event_tx.clone();
+            tokio::spawn(async move {
+                let Some(notice) = commit_rx.recv().await else {
+                    return;
+                };
+                if notice.status == crate::brain::store::BrainRunStatus::Completed {
+                    let _ = event_tx.send(ReplEvent::FrontendRestartReady {
+                        brain,
+                        run_id,
+                        restart,
+                    });
+                } else {
+                    let _ = event_tx.send(ReplEvent::OutputReady {
+                        message: format!(
+                            "Frontend restart cancelled because Brain run {} ended as {:?}: {}",
+                            run_id.0, notice.status, notice.detail
+                        ),
+                    });
+                }
+            });
+            crate::server::RunnerTurnCommitAck::new(commit_tx)
+        });
         let result = (|| -> anyhow::Result<crate::server::RunnerTurnResult> {
             let messages = self
                 .conversation
@@ -4087,7 +4151,7 @@ Rules:\n\
                 runtime_revision,
                 checkpoint,
                 effect_journal: effect_journal.clone(),
-                commit_ack: None,
+                commit_ack,
             })
         })()
         .map_err(|error| crate::server::RunnerTurnError {
@@ -4129,6 +4193,91 @@ Rules:\n\
             });
         }
         let _ = response_tx.send(result);
+    }
+
+    /// Replace this frontend only after the daemon has acknowledged the
+    /// canonical turn as complete. The old callback lease is released
+    /// explicitly so the replacement can immediately acquire the same Brain;
+    /// no legacy conversation file participates in restoration.
+    async fn restart_frontend_after_brain_commit(
+        &mut self,
+        brain: String,
+        run_id: crate::brain::store::RunId,
+        restart: crate::tools::implementations::restart::DeferredFrontendRestart,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.runner_brain.as_deref() == Some(brain.as_str())
+                && self.home_runner_lease_active,
+            "cannot restart after Brain run {}: this frontend no longer owns '{}'",
+            run_id.0,
+            brain
+        );
+        let lease_id = self.home_runner_lease_id.context(
+            "cannot restart the frontend without its exact runner lease identity",
+        )?;
+        let ipc = self
+            .ipc_client
+            .as_ref()
+            .context("cannot restart the frontend without the Cap'n Proto daemon connection")?
+            .clone();
+
+        // Check both the approved digest and basic loadability before giving
+        // up the callback authority that can recover this Brain.
+        restart.preflight()?;
+        self.output_manager.write_info(format!(
+            "Brain run {} committed; restarting this frontend with {} ({})",
+            run_id.0,
+            restart.binary_path.display(),
+            restart.reason
+        ));
+        self.render_tui().await?;
+
+        self.runner_renewal_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ipc.brain_release_runner(&brain, lease_id),
+        )
+        .await
+        .context("timed out releasing the current Brain runner lease")??;
+        self.home_runner_lease_active = false;
+        self.home_runner_lease_id = None;
+        self.runner_brain = None;
+        self.agent_scheduler.clear_brain_control().await;
+
+        // Recheck after the asynchronous lease release narrows the replacement
+        // race. A fully race-free future implementation can exec an already
+        // opened descriptor on platforms that support it.
+        restart.verify()?;
+        let args = crate::tools::implementations::restart::frontend_replacement_args(
+            std::env::args_os(),
+            &brain,
+        );
+        crate::set_tui_active(false);
+        crate::cli::tui::emergency_restore_terminal();
+
+        let mut command = std::process::Command::new(&restart.binary_path);
+        command.args(args);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let error = command.exec();
+            anyhow::bail!(
+                "failed to exec restart candidate '{}': {}",
+                restart.binary_path.display(),
+                error
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            command.spawn().with_context(|| {
+                format!(
+                    "failed to start restart candidate '{}'",
+                    restart.binary_path.display()
+                )
+            })?;
+            std::process::exit(0);
+        }
     }
 
     /// The editor runs outside the VM; once it finishes, resume precisely the

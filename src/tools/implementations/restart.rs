@@ -1,30 +1,107 @@
-// Restart tool - allows Claude to restart Shammah with a new binary
+// Restart tool - prepares a frontend replacement after its Brain turn commits.
 
-use crate::output_status;
 use crate::tools::registry::Tool;
 use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::ffi::OsString;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
 
-pub struct RestartTool {
-    session_state_file: PathBuf,
+const DEFERRED_RESTART_KEY: &str = "finch_deferred_frontend_restart_v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredFrontendRestart {
+    pub reason: String,
+    pub binary_path: PathBuf,
+    pub binary_sha256: String,
 }
 
-impl RestartTool {
-    pub fn new(session_state_file: PathBuf) -> Self {
-        Self { session_state_file }
+impl DeferredFrontendRestart {
+    pub(crate) fn verify(&self) -> Result<()> {
+        let current = hash_file(&self.binary_path)?;
+        anyhow::ensure!(
+            current == self.binary_sha256,
+            "restart candidate '{}' changed after approval (expected {}, found {})",
+            self.binary_path.display(),
+            self.binary_sha256,
+            current
+        );
+        Ok(())
+    }
+
+    /// Prove that the approved artifact can at least be loaded and execute its
+    /// argument parser before the current frontend gives up its runner lease.
+    pub(crate) fn preflight(&self) -> Result<()> {
+        self.verify()?;
+        let output = std::process::Command::new(&self.binary_path)
+            .arg("--version")
+            .output()
+            .with_context(|| {
+                format!(
+                    "could not start restart candidate '{}'",
+                    self.binary_path.display()
+                )
+            })?;
+        anyhow::ensure!(
+            output.status.success(),
+            "restart candidate '{}' failed its --version health check: {}",
+            self.binary_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(())
     }
 }
+
+/// A Brain restart deliberately does not carry the legacy conversation-file,
+/// resume, prompt, or one-shot execution flags into the replacement process.
+/// The canonical Brain log/checkpoint is the only restoration source. Preserve
+/// only the user's terminal presentation choice.
+pub(crate) fn frontend_replacement_args<I>(current: I, brain: &str) -> Vec<OsString>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = Vec::new();
+    for argument in current.into_iter().skip(1) {
+        if argument == "--raw" || argument == "--no-tui" {
+            args.push(argument);
+        }
+    }
+    args.push(OsString::from("--brain"));
+    args.push(OsString::from(brain));
+    args
+}
+
+pub struct RestartTool;
 
 impl Default for RestartTool {
     fn default() -> Self {
-        let home = dirs::home_dir().expect("Could not determine home directory");
-        let session_state_file = home.join(".finch/restart_state.json");
-        Self::new(session_state_file)
+        Self
     }
+}
+
+pub(crate) fn deferred_frontend_restart_from_tool_result(
+    result: &std::result::Result<String, anyhow::Error>,
+) -> Option<DeferredFrontendRestart> {
+    let value: serde_json::Value = serde_json::from_str(result.as_ref().ok()?).ok()?;
+    serde_json::from_value(value.get(DEFERRED_RESTART_KEY)?.clone()).ok()
+}
+
+fn hash_file(path: &std::path::Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[async_trait]
@@ -34,11 +111,11 @@ impl Tool for RestartTool {
     }
 
     fn description(&self) -> &str {
-        "Restart Shammah with a newly built binary, preserving the current conversation.
-        Use this after modifying code and running 'cargo build --release'.
-        The current process will terminate and restart with the new binary.
+        "Prepare a verified Finch frontend binary for restart after the current canonical Brain run is durably committed.
+        Use this only after building and testing the replacement binary. The tool records its exact path and SHA-256;
+        Finch performs the replacement later, after the daemon acknowledges the completed Brain turn.
 
-        IMPORTANT: Only use after successfully building the new binary."
+        IMPORTANT: this does not restart the daemon or bypass the Brain lifecycle."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -54,7 +131,7 @@ impl Tool for RestartTool {
         ])
     }
 
-    async fn execute(&self, input: Value, context: &ToolContext<'_>) -> Result<String> {
+    async fn execute(&self, input: Value, _context: &ToolContext<'_>) -> Result<String> {
         let reason = input["reason"]
             .as_str()
             .context("Missing reason parameter")?;
@@ -63,11 +140,14 @@ impl Tool for RestartTool {
             .as_str()
             .unwrap_or("./target/release/finch");
 
-        // Verify new binary exists
-        if !std::path::Path::new(binary_path).exists() {
+        let binary_path = std::fs::canonicalize(binary_path).with_context(|| {
+            format!("Binary not found at '{}'. Did you forget to build it?", binary_path)
+        })?;
+        let metadata = std::fs::metadata(&binary_path)?;
+        if !metadata.is_file() {
             anyhow::bail!(
-                "Binary not found at '{}'. Did you forget to run 'cargo build --release'?",
-                binary_path
+                "Restart candidate '{}' is not a regular file",
+                binary_path.display()
             );
         }
 
@@ -75,68 +155,53 @@ impl Tool for RestartTool {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let metadata = std::fs::metadata(binary_path)?;
             let permissions = metadata.permissions();
             if permissions.mode() & 0o111 == 0 {
-                anyhow::bail!("Binary at '{}' is not executable", binary_path);
+                anyhow::bail!("Binary at '{}' is not executable", binary_path.display());
             }
         }
-
-        output_status!("\n🔄 Restarting Shammah...");
-        output_status!("   Reason: {}", reason);
-        output_status!("   Binary: {}", binary_path);
-        output_status!("   Conversation will be preserved");
-
-        // Save conversation state
-        let session_state_file = self.session_state_file.clone();
-        if let Some(conversation) = context.conversation {
-            std::fs::create_dir_all(session_state_file.parent().unwrap())?;
-            conversation.save(&session_state_file)?;
-            output_status!(
-                "✓ Saved conversation state to {}",
-                session_state_file.display()
-            );
-        }
-
-        // Save model weights before restart
-        if let Some(ref save_models_fn) = context.save_models {
-            save_models_fn()?;
-            output_status!("✓ Saved model weights");
-        }
-
-        // Prepare restart command with session restoration
-        let mut cmd = Command::new(binary_path);
-        cmd.arg("--restore-session").arg(&session_state_file);
-
-        // On Unix, use exec to replace current process
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-
-            output_status!("\n→ Executing new binary...\n");
-
-            // This will replace the current process - never returns
-            let err = cmd.exec();
-
-            // If we get here, exec failed
-            anyhow::bail!("Failed to exec new binary: {}", err);
-        }
-
-        // On Windows, spawn and exit
-        #[cfg(not(unix))]
-        {
-            output_status!("\n→ Starting new binary...\n");
-
-            cmd.spawn().context("Failed to spawn new binary")?;
-
-            std::process::exit(0);
-        }
+        let intent = DeferredFrontendRestart {
+            reason: reason.to_string(),
+            binary_sha256: hash_file(&binary_path)?,
+            binary_path,
+        };
+        Ok(serde_json::to_string(&serde_json::json!({
+            DEFERRED_RESTART_KEY: intent,
+        }))?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_args_use_brain_as_the_only_state_source() {
+        let args = frontend_replacement_args(
+            [
+                "finch",
+                "--restore-session",
+                "old.json",
+                "--initial-prompt",
+                "repeat me",
+                "--raw",
+                "--brain",
+                "old-brain",
+                "--lisp",
+                "(+ 1 2)",
+            ]
+            .into_iter()
+            .map(OsString::from),
+            "durable-brain",
+        );
+        assert_eq!(
+            args,
+            ["--raw", "--brain", "durable-brain"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[tokio::test]
     async fn test_restart_requires_reason() {
@@ -183,5 +248,76 @@ mod tests {
         let result = tool.execute(input, &context).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn restart_tool_returns_a_hashed_deferred_intent() {
+        let tool = RestartTool;
+        let context = ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+            live_output: None,
+            poset: None,
+        };
+        let binary = std::env::current_exe().unwrap();
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "reason": "exercise the durable Brain restart path",
+                    "binary_path": binary,
+                }),
+                &context,
+            )
+            .await;
+        let intent = deferred_frontend_restart_from_tool_result(&result).unwrap();
+
+        assert_eq!(intent.reason, "exercise the durable Brain restart path");
+        assert_eq!(intent.binary_path, std::fs::canonicalize(binary).unwrap());
+        assert_eq!(intent.binary_sha256.len(), 64);
+        intent.verify().unwrap();
+    }
+
+    #[test]
+    fn changed_restart_artifact_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("finch-candidate");
+        std::fs::write(&binary, b"first").unwrap();
+        let intent = DeferredFrontendRestart {
+            reason: "test".into(),
+            binary_path: binary.clone(),
+            binary_sha256: hash_file(&binary).unwrap(),
+        };
+        std::fs::write(&binary, b"second").unwrap();
+
+        assert!(intent
+            .verify()
+            .unwrap_err()
+            .to_string()
+            .contains("changed after approval"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_executes_the_approved_candidate_before_lease_release() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("finch-candidate");
+        std::fs::write(&binary, b"#!/bin/sh\nprintf 'finch test\\n'\n").unwrap();
+        let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).unwrap();
+        let intent = DeferredFrontendRestart {
+            reason: "test".into(),
+            binary_path: binary.clone(),
+            binary_sha256: hash_file(&binary).unwrap(),
+        };
+
+        intent.preflight().unwrap();
     }
 }

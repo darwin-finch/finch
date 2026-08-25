@@ -212,6 +212,14 @@ pub enum ReplEvent {
     /// Release frontend-local cancellation state after a delegated program ends.
     NamedBrainProgramFinished(crate::brain::store::RunId),
 
+    /// The daemon has durably committed the exact named-Brain turn that
+    /// requested this frontend replacement. It is now safe to leave the
+    /// runner lease and exec the verified candidate binary.
+    FrontendRestartReady {
+        brain: String,
+        run_id: crate::brain::store::RunId,
+        restart: crate::tools::implementations::restart::DeferredFrontendRestart,
+    },
 }
 
 /// Requests sent from the TUI event loop to the LLM worker loop.

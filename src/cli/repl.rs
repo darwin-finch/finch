@@ -322,7 +322,7 @@ impl Repl {
             .map(|home| home.join(".finch").join("restart_state.json"))
             .unwrap_or_else(|| PathBuf::from(".finch/restart_state.json"));
 
-        tool_registry.register(Box::new(RestartTool::new(session_state_file.clone())));
+        tool_registry.register(Box::new(RestartTool));
         tool_registry.register(Box::new(SaveAndExecTool::new(session_state_file.clone())));
 
         // Plan mode tools
@@ -500,7 +500,7 @@ impl Repl {
                 fallback_registry.register_alias("inspect_vm_word", "inspect_word");
                 fallback_registry.register_alias("search_vocabulary", "search_word");
                 fallback_registry.register_alias("inspect_program", "inspect_word");
-                fallback_registry.register(Box::new(RestartTool::new(session_state_file.clone())));
+                fallback_registry.register(Box::new(RestartTool));
                 fallback_registry
                     .register(Box::new(SaveAndExecTool::new(session_state_file.clone())));
                 // Plan mode tools
