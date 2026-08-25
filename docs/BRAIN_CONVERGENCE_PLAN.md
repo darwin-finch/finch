@@ -5,9 +5,9 @@ Status: active as of 2026-08-24 on the tested shared typed runtime.
 ## Goal
 
 Make `Brain` one daemon-authoritative logical entity. The daemon owns only durable coordination
-state and the event log; it has **no** workspace/environment authority. By default on Unix, one
-named master frontend runner lives in a supervised `tmux` session and exclusively owns the active
-VM, provider/task execution, workspace, accessibility, credentials, and host-effect capabilities.
+state and the event log; it has **no** workspace/environment authority. One long-lived master
+frontend runner exclusively owns the active VM, provider/task execution, workspace, accessibility,
+credentials, and host-effect capabilities.
 Other clients are attachments and projections. A speculative typing helper, normal model turn,
 scheduled callback, and subagent are `BrainRun` instances within a Brain rather than different kinds
 of Brain.
@@ -41,12 +41,10 @@ run metadata until explicit archival or retention-policy deletion. Reopening Fin
 projection to the same named Brain and resumes its visible history; interrupted runs are surfaced
 as recoverable state rather than silently forgotten.
 
-`tmux` provides terminal-disconnect survival, not crash or reboot durability. The runner therefore
-checkpoints serializable VM state and execute-once host-effect records at committed boundaries. If
-the runner or `tmux` server dies, the daemon marks the run interrupted and a newly launched runner
-may resume only from a validated checkpoint; it never replays already-recorded external effects.
-`tmux` is a preferred Unix launcher, not a semantic dependency: headless/service runners remain a
-supported deployment option.
+Runner crash and reboot recovery are Brain/runtime concerns independent of the process supervisor.
+The runner checkpoints serializable VM state and execute-once host-effect records at committed
+boundaries. If it dies, the daemon marks the run interrupted and a newly launched runner may resume
+only from a validated checkpoint; it never replays already-recorded external effects.
 
 This work must consolidate the existing implementations. It must not create another registry,
 session abstraction, or transport-specific lifecycle.
@@ -158,7 +156,7 @@ BrainAggregate (daemon-authoritative)
   grants/policies          policy metadata only; no usable host handles
   runs                     active and historical BrainRun records
   attachments              authenticated client cursors
-  runner lease             current tmux/headless runner identity and liveness
+  runner lease             current environment runner identity and liveness
 
 BrainRun
   RunId
@@ -253,26 +251,29 @@ move_projection / inspect_vm
 push_context
 ```
 
-Implement adapters for in-process calls, Cap'n Proto IPC, HTTP/WebSocket, and future authenticated
-peer RPC. Handlers perform decoding, authentication, and presentation only; lifecycle logic stays in
+Implement adapters for in-process calls, Cap'n Proto over local IPC, the same Cap'n Proto schema in
+binary WebSocket frames, and future authenticated peer RPC. HTTP may remain a discovery/bootstrap
+surface. Handlers perform framing, authentication, and presentation only; lifecycle logic stays in
 the service.
 
-### Local frontend/daemon contract
+### Frontend/daemon contract
 
 The local Finch frontend and daemon are separate processes, so their normal control and event path
-is a versioned Cap'n Proto contract over the Unix socket.  It is the binary local representation of
-`BrainService`, not merely a faster encoding of a few legacy RPC methods.  In particular, the
-schema must carry structured `BrainEvent` records, attachment cursors, role/lease state,
+is a versioned Cap'n Proto contract over the Unix socket. Remote frontends carry messages from that
+same schema in ordered binary WebSocket frames. This is the binary representation of `BrainService`,
+not merely a faster encoding of a few legacy RPC methods. In particular, the schema must carry
+structured `BrainEvent` records, attachment cursors, role/lease state,
 `ProgramRun` snapshots/outcomes, and correlated typed VM records equivalent to
 `VmEffectEnvelope { execution_id, sequence, kind, arguments, origin }` and
 `VmResume { execution_id, sequence, response }`.
 
 Do not make Cap'n Proto the VM's internal value representation or require every embedder to use it.
-The runtime stays transport-neutral and HTTP/WebSocket remain suitable remote adapters.  But the
-local CLI/daemon boundary must not fall back to free-form JSON event payloads for state that the
-daemon has to validate, replay, or resume.  The existing legacy `AnyPointer`/JSON event path is a
-migration compatibility surface; B4 replaces it with explicit versioned schema fields and
-cross-transport conformance fixtures.
+The runtime stays transport-neutral. Ordinary word-aligned Cap'n Proto encoding is the default for
+zero-copy-friendly event access; packed encoding is optional where measured bandwidth savings
+justify unpacking. Large blobs remain content-addressed or separately streamed rather than embedded
+in Brain events. The current JSON HTTP/WebSocket lifecycle payloads and legacy `AnyPointer`/JSON IPC
+path are migration compatibility surfaces; B4 replaces them with explicit versioned schema fields
+and cross-transport conformance fixtures.
 
 Every mutating request includes `BrainId`, caller identity, expected Brain revision, environment
 generation, and an idempotency key. Names are aliases resolved to IDs, not durable identity.
@@ -369,7 +370,9 @@ Exit: every background activity has identical lifecycle and ancestry semantics.
 - Implement `BrainService` once.
 - Version the Cap'n Proto frontend/daemon schema for typed Brain events, attachment cursors, run
   outcomes, and VM effect/resume correlation; eliminate its JSON-shaped lifecycle payloads.
-- Convert HTTP, WebSocket, Cap'n Proto, daemon client, remote client, and embedded mode into adapters.
+- Use that schema over local Cap'n Proto RPC and ordered binary WebSocket frames; keep HTTP only for
+  authenticated discovery/bootstrap operations that do not duplicate Brain lifecycle semantics.
+- Convert daemon client, remote client, and embedded mode into adapters over the same service.
 - Keep the removed legacy route/IPC spawn orchestration absent while adding only the canonical
   event/cursor/run service.
 

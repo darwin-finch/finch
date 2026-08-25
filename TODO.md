@@ -584,7 +584,8 @@ still blocks the corresponding Brain phase until it is unified.
   the Finch application supplies Brain, UI, approval, provider, MCP, scheduler, and OS adapters.
   When the later Brain gate opens, make the normal local frontend/daemon path a versioned Cap'n
   Proto projection of those structured records (including attachment cursors and effect/resume
-  correlation), not a free-form JSON event bus; HTTP/WebSocket remain remote adapters.
+  correlation), not a free-form JSON event bus. Carry the same schema in binary WebSocket frames for
+  remote clients so local and remote paths reuse message definitions and conformance fixtures.
 - [x] Complete the fiber/task split: `(defer :cpu (lambda () ...))` / `defer-cpu` has private-stack,
   immutable-capture CPU work with typed `task<T>` poll/join/cancel operations. A running join
   suspends the parent VM continuation rather than blocking the event loop; CPU fibers reject
@@ -700,11 +701,12 @@ still blocks the corresponding Brain phase until it is unified.
   conflict-safe reconnect/detach, and a status display derived from the authoritative role. A live
   driver/consultant test shared a Lisp definition, rejected consultant program submission, retained
   its cursor across reconnect, and observed a WebSocket close as a durable detach event.
-- [ ] After the VM gate, launch each local active Brain runner in a named `tmux` session by default
-  on Unix. Keep the daemon as a durable event-log/coordinator with no workspace, accessibility, or
-  credential handles; the master frontend runner is the only environment authority. Recover only
-  from validated checkpoints on that environment and never replay recorded external effects after
-  runner or `tmux` failure.
+- [ ] Replace the transitional JSON named-Brain lifecycle protocol with one versioned Cap'n Proto
+  `BrainService` schema. Use Cap'n Proto RPC over the local Unix socket and ordinary Cap'n Proto
+  messages in ordered binary WebSocket frames remotely; retain HTTP only for authenticated
+  discovery/bootstrap. Prefer the zero-copy-friendly word-aligned encoding, use packed encoding
+  only when measured bandwidth savings justify unpacking, and keep large blobs content-addressed or
+  separately streamed.
 - [ ] Define Brain initialization as a reviewed typed program/module with an explicit capability
   budget and journaled effects. Deterministic VM vocabulary/module loading may occur before a
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work
