@@ -2,6 +2,7 @@
 // HTTP daemon mode for multi-tenant agent serving
 
 mod brain_approval;
+mod brain_service;
 mod brain_runner;
 mod feedback_handler;
 pub mod handlers;
@@ -13,6 +14,9 @@ pub mod session_registry;
 mod training_worker;
 
 pub use brain_approval::BrainApprovalBroker;
+pub use brain_service::{
+    BrainLifecycleService, BrainSubmissionError, BrainSubmissionOutcome, BrainWatch,
+};
 pub use brain_runner::{
     BrainRunnerBroker, RunnerApprovalRequest, RunnerProgramRequest, RunnerProgramResult,
     RunnerRegistrationId, RunnerRequest, RunnerTurnError, RunnerTurnEvent, RunnerTurnRequest,

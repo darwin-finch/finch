@@ -35,8 +35,8 @@ impl FinchDaemonImpl {
 }
 
 #[derive(Clone)]
-struct BrainServiceImpl {
-    server: Arc<AgentServer>,
+struct BrainRpcService {
+    lifecycle: crate::server::BrainLifecycleService,
 }
 
 /// Reverse per-turn capability used by the leased frontend runner to suspend
@@ -202,7 +202,7 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
     }
 }
 
-impl brain_service::Server for BrainServiceImpl {
+impl brain_service::Server for BrainRpcService {
     fn snapshot(
         &mut self,
         params: brain_service::SnapshotParams,
@@ -212,7 +212,7 @@ impl brain_service::Server for BrainServiceImpl {
             .to_str()
             .unwrap_or("")
             .to_string();
-        let snapshot = match self.server.shared_brains().snapshot(&brain) {
+        let snapshot = match self.lifecycle.snapshot(&brain) {
             Ok(snapshot) => snapshot,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
@@ -237,11 +237,6 @@ impl brain_service::Server for BrainServiceImpl {
             Ok(role) => attachment_role_from_capnp(role),
             Err(error) => return Promise::err(error.into()),
         };
-        if role == crate::brain::shared::AttachmentRole::Runner {
-            return Promise::err(capnp::Error::failed(
-                "runner authority requires a runner lease, not a client attachment".into(),
-            ));
-        }
         let attachment_id = if params.get_has_attachment_id() {
             match parse_attachment_id(params.get_attachment_id()) {
                 Ok(id) => Some(id),
@@ -250,33 +245,10 @@ impl brain_service::Server for BrainServiceImpl {
         } else {
             None
         };
-        let attachment = match self
-            .server
-            .shared_brains()
-            .attach(&brain, &subject, role, attachment_id)
-        {
+        let attachment = match self.lifecycle.attach(&brain, &subject, role, attachment_id) {
             Ok(attachment) => attachment,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        let store = self.server.shared_brains().clone();
-        let pending_brain = brain.clone();
-        let pending_attachment_id = attachment.attachment_id;
-        let pending_connection_id = attachment
-            .connection_id
-            .expect("new Brain attachment has a pending connection");
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            if store
-                .expire_pending_connection(
-                    &pending_brain,
-                    pending_attachment_id,
-                    pending_connection_id,
-                )
-                .unwrap_or(false)
-            {
-                let _ = store.remove_if_unused(&pending_brain);
-            }
-        });
         encode_attachment(results.get().init_attachment(), &attachment);
         Promise::ok(())
     }
@@ -296,7 +268,7 @@ impl brain_service::Server for BrainServiceImpl {
             Ok(id) => id,
             Err(error) => return Promise::err(error),
         };
-        let attachment = match self.server.shared_brains().acknowledge(
+        let attachment = match self.lifecycle.acknowledge(
             &brain,
             attachment_id,
             connection_id,
@@ -324,9 +296,7 @@ impl brain_service::Server for BrainServiceImpl {
             Ok(id) => id,
             Err(error) => return Promise::err(error),
         };
-        if let Err(error) = crate::server::handlers::detach_named_brain_attachment(
-            self.server.shared_brains(),
-            self.server.brain_approvals(),
+        if let Err(error) = self.lifecycle.detach(
             &brain,
             attachment_id,
             connection_id,
@@ -359,24 +329,13 @@ impl brain_service::Server for BrainServiceImpl {
             Ok(kind) => kind,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        let attachment = match self.server.shared_brains().require_connection(
-            &brain,
-            attachment_id,
-            connection_id,
-        ) {
-            Ok(attachment) => attachment,
-            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
-        };
-        let store = self.server.shared_brains().clone();
-        let runners = self.server.brain_runners().clone();
-        let approvals = self.server.brain_approvals().clone();
+        let lifecycle = self.lifecycle.clone();
         Promise::from_future(async move {
-            let outcome = crate::server::handlers::submit_named_brain_event(
-                &store,
-                &runners,
-                &approvals,
+            let outcome = lifecycle
+                .submit(
                 &brain,
-                &attachment,
+                attachment_id,
+                connection_id,
                 kind,
             )
             .await
@@ -408,24 +367,17 @@ impl brain_service::Server for BrainServiceImpl {
             Err(error) => return Promise::err(error),
         };
         let receiver = pry!(params.get_receiver());
-        if let Err(error) = self.server.shared_brains().activate_connection(
+        let watch = match self.lifecycle.watch(
             &brain,
             attachment_id,
             connection_id,
         ) {
-            return Promise::err(capnp::Error::failed(error.to_string()));
-        }
-        let mut events = match self.server.shared_brains().subscribe(&brain) {
-            Ok(events) => events,
+            Ok(watch) => watch,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        let snapshot = match self.server.shared_brains().snapshot(&brain) {
-            Ok(snapshot) => snapshot,
-            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
-        };
-        let brain_id = snapshot.brain_id;
-        let store = self.server.shared_brains().clone();
-        let approvals = self.server.brain_approvals().clone();
+        let snapshot = watch.snapshot;
+        let mut events = watch.events;
+        let lifecycle = self.lifecycle.clone();
         Promise::from_future(async move {
             let mut initial = receiver.on_message_request();
             let initial_result = encode_snapshot(
@@ -439,9 +391,7 @@ impl brain_service::Server for BrainServiceImpl {
                 Err(error) => Some(error),
             };
             if let Some(error) = initial_error {
-                let _ = store.detach(&brain, attachment_id, connection_id);
-                approvals.cancel_attachment(brain_id, attachment_id);
-                let _ = store.remove_if_unused(&brain);
+                let _ = lifecycle.detach(&brain, attachment_id, connection_id);
                 return Err(error);
             }
             let watch_error = loop {
@@ -459,9 +409,7 @@ impl brain_service::Server for BrainServiceImpl {
                     break None;
                 }
             };
-            let _ = store.detach(&brain, attachment_id, connection_id);
-            approvals.cancel_attachment(brain_id, attachment_id);
-            let _ = store.remove_if_unused(&brain);
+            let _ = lifecycle.detach(&brain, attachment_id, connection_id);
             watch_error.map_or(Ok(()), Err)
         })
     }
@@ -485,11 +433,6 @@ impl brain_service::Server for BrainServiceImpl {
             Ok(environment) => environment,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        if &environment != self.server.shared_brains().environment() {
-            return Promise::err(capnp::Error::failed(
-                "runner environment does not match the daemon Brain environment".into(),
-            ));
-        }
         let lease_id = if params.get_has_lease_id() {
             match parse_runner_lease_id(params.get_lease_id()) {
                 Ok(id) => Some(id),
@@ -498,35 +441,16 @@ impl brain_service::Server for BrainServiceImpl {
         } else {
             None
         };
-        let lease = match self.server.shared_brains().acquire_runner_lease(
+        let lease = match self.lifecycle.acquire_runner(
             &brain,
             &subject,
-            environment.generation,
+            &environment,
             lease_id,
             params.get_ttl_ms(),
         ) {
             Ok(lease) => lease,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        let store = self.server.shared_brains().clone();
-        let lease_brain = brain.clone();
-        let lease_id = lease.lease_id;
-        let expires_ms = lease.expires_ms;
-        tokio::spawn(async move {
-            loop {
-                let delay_ms = expires_ms.saturating_sub(unix_epoch_millis());
-                if delay_ms == 0 {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            }
-            if store
-                .expire_runner_lease(&lease_brain, lease_id, unix_epoch_millis())
-                .is_ok_and(|expired| expired)
-            {
-                let _ = store.remove_if_unused(&lease_brain);
-            }
-        });
         encode_runner_lease(results.get().init_lease(), &lease);
         Promise::ok(())
     }
@@ -542,14 +466,9 @@ impl brain_service::Server for BrainServiceImpl {
             Ok(id) => id,
             Err(error) => return Promise::err(error),
         };
-        if let Err(error) = self
-            .server
-            .shared_brains()
-            .release_runner_lease(&brain, lease_id)
-        {
+        if let Err(error) = self.lifecycle.release_runner(&brain, lease_id) {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
-        let _ = self.server.shared_brains().remove_if_unused(&brain);
         Promise::ok(())
     }
 }
@@ -579,13 +498,6 @@ fn parse_runner_lease_id(
     uuid::Uuid::parse_str(value)
         .map(crate::brain::shared::RunnerLeaseId)
         .map_err(|error| capnp::Error::failed(error.to_string()))
-}
-
-fn unix_epoch_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -937,8 +849,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
         let broker = self.server.brain_runners().clone();
         let server = Arc::clone(&self.server);
         let registration_id = broker.register(brain.clone(), lease_id, tx);
-        let queued_store = server.shared_brains().clone();
-        let queued_broker = broker.clone();
+        let queued_lifecycle = crate::server::BrainLifecycleService::from_server(&server);
         let queued_brain = brain.clone();
         tokio::task::spawn_local(async move {
             while let Some(request) = rx.recv().await {
@@ -1015,13 +926,9 @@ impl finch_daemon::Server for FinchDaemonImpl {
         // this lease active before the queued callback reaches its event loop.
         tokio::task::spawn_local(async move {
             tokio::task::yield_now().await;
-            if let Err(error) = crate::server::handlers::resume_queued_named_brain_runs(
-                queued_store,
-                queued_broker,
-                queued_brain.clone(),
-                lease_id,
-            )
-            .await
+            if let Err(error) = queued_lifecycle
+                .resume_queued_runs(queued_brain.clone(), lease_id)
+                .await
             {
                 tracing::warn!(brain = %queued_brain, %error, "could not resume queued Brain runs");
             }
@@ -1037,8 +944,8 @@ impl finch_daemon::Server for FinchDaemonImpl {
         _params: finch_daemon::BrainServiceParams,
         mut results: finch_daemon::BrainServiceResults,
     ) -> Promise<(), capnp::Error> {
-        let service: brain_service::Client = capnp_rpc::new_client(BrainServiceImpl {
-            server: Arc::clone(&self.server),
+        let service: brain_service::Client = capnp_rpc::new_client(BrainRpcService {
+            lifecycle: crate::server::BrainLifecycleService::from_server(&self.server),
         });
         results.get().set_service(service);
         Promise::ok(())

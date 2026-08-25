@@ -36,7 +36,7 @@ fn check_peer_token(headers: &HeaderMap, peer_ip: &str, endpoint: &str) -> Resul
     }
 }
 
-use super::AgentServer;
+use super::{AgentServer, BrainSubmissionError, BrainSubmissionOutcome};
 use crate::claude::{ContentBlock, Message};
 
 /// Create the main application router
@@ -381,8 +381,6 @@ struct AttachNamedBrainRequest {
     attachment_id: Option<crate::brain::shared::AttachmentId>,
 }
 
-const PENDING_BRAIN_ATTACHMENT_TTL: std::time::Duration = std::time::Duration::from_secs(15);
-
 async fn attach_named_brain(
     State(server): State<Arc<AgentServer>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -402,34 +400,9 @@ async fn attach_named_brain(
             .require_participant(&request.subject, request.role)
             .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
     }
-    if request.role == crate::brain::shared::AttachmentRole::Runner {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "runner authority requires a runner lease, not a client attachment"
-            })),
-        )
-            .into_response());
-    }
-    let attachment = server
-        .shared_brains()
+    let attachment = crate::server::BrainLifecycleService::from_server(&server)
         .attach(&name, &request.subject, request.role, request.attachment_id)
         .map_err(brain_state_conflict)?;
-    let store = server.shared_brains().clone();
-    let pending_name = name.clone();
-    let attachment_id = attachment.attachment_id;
-    let connection_id = attachment
-        .connection_id
-        .expect("new Brain attachment has a pending connection");
-    tokio::spawn(async move {
-        tokio::time::sleep(PENDING_BRAIN_ATTACHMENT_TTL).await;
-        if store
-            .expire_pending_connection(&pending_name, attachment_id, connection_id)
-            .unwrap_or(false)
-        {
-            let _ = store.remove_if_unused(&pending_name);
-        }
-    });
     Ok(Json(attachment))
 }
 
@@ -439,20 +412,6 @@ fn brain_state_conflict(error: anyhow::Error) -> Response {
         Json(serde_json::json!({ "error": error.to_string() })),
     )
         .into_response()
-}
-
-pub(crate) fn detach_named_brain_attachment(
-    store: &crate::brain::shared::SharedBrainStore,
-    approvals: &crate::server::BrainApprovalBroker,
-    name: &str,
-    attachment_id: crate::brain::shared::AttachmentId,
-    connection_id: crate::brain::shared::ConnectionId,
-) -> anyhow::Result<()> {
-    let brain_id = store.snapshot(name)?.brain_id;
-    store.detach(name, attachment_id, connection_id)?;
-    approvals.cancel_attachment(brain_id, attachment_id);
-    store.remove_if_unused(name)?;
-    Ok(())
 }
 
 fn unix_epoch_millis() -> u64 {
@@ -494,23 +453,6 @@ async fn archive_named_brain(
         name,
         archived_to: archived_to.map(|path| path.display().to_string()),
     }))
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum BrainSubmissionError {
-    #[error("{0}")]
-    Invalid(String),
-    #[error("{0}")]
-    Forbidden(String),
-    #[error(transparent)]
-    State(#[from] anyhow::Error),
-}
-
-#[derive(Debug)]
-pub(crate) struct BrainSubmissionOutcome {
-    pub accepted: crate::brain::shared::BrainEvent,
-    pub run: Option<crate::brain::shared::BrainRun>,
-    pub result: Option<crate::brain::shared::BrainEvent>,
 }
 
 fn attachment_can_submit(
@@ -1296,6 +1238,7 @@ async fn execute_remote_brain_command(
     use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
     let request_id = command.request_id;
+    let lifecycle = crate::server::BrainLifecycleService::from_server(server);
     match command.kind {
         BrainRemoteCommandKind::Submit(kind) => {
             let required_scope = if matches!(
@@ -1316,16 +1259,12 @@ async fn execute_remote_brain_command(
                     );
                 }
             };
-            let attachment =
-                match server
-                    .shared_brains()
-                    .require_connection(name, attachment_id, connection_id)
-                {
-                    Ok(attachment) => attachment,
-                    Err(error) => {
-                        return remote_brain_error(request_id, "conflict", error.to_string())
-                    }
-                };
+            let attachment = match lifecycle.connection(name, attachment_id, connection_id) {
+                Ok(attachment) => attachment,
+                Err(error) => {
+                    return remote_brain_error(request_id, "conflict", error.to_string())
+                }
+            };
             if claims_match_attachment(claims.as_ref(), &attachment).is_err() {
                 return remote_brain_error(
                     request_id,
@@ -1333,15 +1272,9 @@ async fn execute_remote_brain_command(
                     "Brain credential participant no longer matches this attachment",
                 );
             }
-            match submit_named_brain_event(
-                server.shared_brains(),
-                server.brain_runners(),
-                server.brain_approvals(),
-                name,
-                &attachment,
-                kind,
-            )
-            .await
+            match lifecycle
+                .submit(name, attachment_id, connection_id, kind)
+                .await
             {
                 Ok(outcome) => BrainRemoteReply::Submitted {
                     request_id,
@@ -1376,16 +1309,12 @@ async fn execute_remote_brain_command(
                     );
                 }
             };
-            let attachment =
-                match server
-                    .shared_brains()
-                    .require_connection(name, attachment_id, connection_id)
-                {
-                    Ok(attachment) => attachment,
-                    Err(error) => {
-                        return remote_brain_error(request_id, "conflict", error.to_string())
-                    }
-                };
+            let attachment = match lifecycle.connection(name, attachment_id, connection_id) {
+                Ok(attachment) => attachment,
+                Err(error) => {
+                    return remote_brain_error(request_id, "conflict", error.to_string())
+                }
+            };
             if claims_match_attachment(claims.as_ref(), &attachment).is_err() {
                 return remote_brain_error(
                     request_id,
@@ -1393,10 +1322,7 @@ async fn execute_remote_brain_command(
                     "Brain credential participant no longer matches this attachment",
                 );
             }
-            match server
-                .shared_brains()
-                .acknowledge(name, attachment_id, connection_id, seq)
-            {
+            match lifecycle.acknowledge(name, attachment_id, connection_id, seq) {
                 Ok(attachment) => BrainRemoteReply::Acknowledged {
                     request_id,
                     attachment,
@@ -1421,16 +1347,12 @@ async fn execute_remote_brain_command(
                     );
                 }
             };
-            let attachment =
-                match server
-                    .shared_brains()
-                    .require_connection(name, attachment_id, connection_id)
-                {
-                    Ok(attachment) => attachment,
-                    Err(error) => {
-                        return remote_brain_error(request_id, "conflict", error.to_string())
-                    }
-                };
+            let attachment = match lifecycle.connection(name, attachment_id, connection_id) {
+                Ok(attachment) => attachment,
+                Err(error) => {
+                    return remote_brain_error(request_id, "conflict", error.to_string())
+                }
+            };
             if claims_match_attachment(claims.as_ref(), &attachment).is_err() {
                 return remote_brain_error(
                     request_id,
@@ -1438,13 +1360,7 @@ async fn execute_remote_brain_command(
                     "Brain credential participant no longer matches this attachment",
                 );
             }
-            if let Err(error) = detach_named_brain_attachment(
-                server.shared_brains(),
-                server.brain_approvals(),
-                name,
-                attachment_id,
-                connection_id,
-            ) {
+            if let Err(error) = lifecycle.detach(name, attachment_id, connection_id) {
                 return remote_brain_error(request_id, "conflict", error.to_string());
             }
             BrainRemoteReply::Detached { request_id }
@@ -1469,39 +1385,16 @@ async fn watch_named_brain(
     )?;
     let attachment_id = crate::brain::shared::AttachmentId(connection.attachment_id);
     let connection_id = crate::brain::shared::ConnectionId(connection.connection_id);
-    let attachment = server
-        .shared_brains()
-        .snapshot(&name)
-        .map_err(brain_state_conflict)?
-        .attachments
-        .into_iter()
-        .find(|attachment| {
-            attachment.attachment_id == attachment_id
-                && attachment.connection_id == Some(connection_id)
-                && !attachment.connected
-        })
-        .ok_or_else(|| anyhow::anyhow!("unknown pending Brain attachment connection"))
+    let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
+    let attachment = lifecycle
+        .pending_attachment(&name, attachment_id, connection_id)
         .map_err(brain_state_conflict)?;
     claims_match_attachment(claims.as_ref(), &attachment)?;
-    server
-        .shared_brains()
-        .activate_connection(&name, attachment_id, connection_id)
+    let watch = lifecycle
+        .watch(&name, attachment_id, connection_id)
         .map_err(|error| AppError(error).into_response())?;
-    // Subscribe before taking the snapshot. Events appended after the
-    // snapshot revision then wait in this receiver and are sent immediately
-    // afterward, so an attaching console cannot miss the gap between two
-    // independent HTTP/WebSocket requests.
-    let mut events = server
-        .shared_brains()
-        .subscribe(&name)
-        .map_err(|error| AppError(error).into_response())?;
-    let snapshot = server
-        .shared_brains()
-        .snapshot(&name)
-        .map_err(|error| AppError(error).into_response())?;
-    let brain_id = snapshot.brain_id;
-    let store = server.shared_brains().clone();
-    let approvals = server.brain_approvals().clone();
+    let snapshot = watch.snapshot;
+    let mut events = watch.events;
     let command_server = server.clone();
     Ok(ws
         .on_upgrade(move |mut socket| async move {
@@ -1544,9 +1437,7 @@ async fn watch_named_brain(
                     .await
                     .is_err()
                 {
-                    let _ = store.detach(&name, attachment_id, connection_id);
-                    approvals.cancel_attachment(brain_id, attachment_id);
-                    let _ = store.remove_if_unused(&name);
+                    let _ = lifecycle.detach(&name, attachment_id, connection_id);
                     return;
                 }
             }
@@ -1628,7 +1519,7 @@ async fn watch_named_brain(
                             (crate::brain::shared::BrainWireMessage::Event { event }, closes_attachment)
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            let Ok(brain) = store.snapshot(&name) else {
+                            let Ok(brain) = lifecycle.snapshot(&name) else {
                                 break;
                             };
                             (crate::brain::shared::BrainWireMessage::Snapshot { brain }, false)
@@ -1657,7 +1548,7 @@ async fn watch_named_brain(
                             &name,
                             crate::brain::credential::BrainCredentialScope::BrainRead,
                         ).is_err()
-                            || store.require_connection(
+                            || lifecycle.connection(
                                 &name,
                                 attachment_id,
                                 connection_id,
@@ -1670,9 +1561,7 @@ async fn watch_named_brain(
             }
             drop(command_tx);
             let _ = worker.await;
-            let _ = store.detach(&name, attachment_id, connection_id);
-            approvals.cancel_attachment(brain_id, attachment_id);
-            let _ = store.remove_if_unused(&name);
+            let _ = lifecycle.detach(&name, attachment_id, connection_id);
         })
         .into_response())
 }
