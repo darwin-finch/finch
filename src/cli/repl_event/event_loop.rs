@@ -205,6 +205,12 @@ pub struct EventLoop {
     /// drawing a second copy in the runner console.
     local_brain_projections: std::collections::VecDeque<LocalBrainProjection>,
 
+    /// Highest canonical revision already incorporated into the visible
+    /// projection for each Brain. A watch snapshot and its buffered live tail
+    /// can overlap; suppress that overlap here without changing the durable
+    /// event log or hiding later lifecycle transitions.
+    brain_projection_revisions: std::collections::HashMap<crate::brain::store::BrainId, u64>,
+
     /// Canonical tool calls replay into one grouped unit per Brain turn.
     remote_brain_tool_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
     remote_brain_tool_rows: std::collections::HashMap<String, usize>,
@@ -1266,6 +1272,7 @@ impl EventLoop {
             pending_named_brain_turns: std::collections::HashMap::new(),
             pending_named_brain_programs: std::collections::HashMap::new(),
             local_brain_projections: std::collections::VecDeque::new(),
+            brain_projection_revisions: std::collections::HashMap::new(),
             remote_brain_tool_unit: None,
             remote_brain_tool_rows: std::collections::HashMap::new(),
             remote_brain_approval_rows: std::collections::HashMap::new(),
@@ -5081,8 +5088,20 @@ Rules:\n\
                     }
                     self.observe_remote_brain_approval(event);
                 }
+                advance_brain_projection_revision(
+                    &mut self.brain_projection_revisions,
+                    brain.brain_id,
+                    brain.revision,
+                );
             }
             crate::brain::store::BrainWireMessage::Event { event } => {
+                if !advance_brain_projection_revision(
+                    &mut self.brain_projection_revisions,
+                    event.brain_id,
+                    event.seq,
+                ) {
+                    return Ok(());
+                }
                 match &event.kind {
                     crate::brain::store::BrainEventKind::RunnerLeaseAcquired { .. } => {
                         self.update_remote_brain_status(true);
@@ -6896,6 +6915,23 @@ fn project_brain_context(
     }
 }
 
+/// Advance the visible projection's canonical cursor. Watch snapshots include
+/// every event through their revision, while the live receiver may already
+/// have buffered some of those same events. Sequence numbers are authoritative
+/// within a Brain, so only a strictly newer event should affect UI chrome.
+fn advance_brain_projection_revision(
+    revisions: &mut std::collections::HashMap<crate::brain::store::BrainId, u64>,
+    brain_id: crate::brain::store::BrainId,
+    revision: u64,
+) -> bool {
+    let projected = revisions.entry(brain_id).or_default();
+    if revision <= *projected {
+        return false;
+    }
+    *projected = revision;
+    true
+}
+
 /// Snapshot replay reconstructs conversation, not transient connection chrome.
 /// Presence and runner ownership are projected into the status line from the
 /// snapshot itself; replaying their historical transitions pollutes scrollback
@@ -7509,6 +7545,39 @@ mod tests {
 
         assert!(replay_event_belongs_in_transcript(&prompt));
         assert!(!replay_event_belongs_in_transcript(&attached));
+    }
+
+    #[test]
+    fn brain_projection_suppresses_snapshot_live_overlap() {
+        let brain_id = crate::brain::store::BrainId(uuid::Uuid::new_v4());
+        let mut revisions = std::collections::HashMap::new();
+
+        assert!(advance_brain_projection_revision(
+            &mut revisions,
+            brain_id,
+            12
+        ));
+        assert!(!advance_brain_projection_revision(
+            &mut revisions,
+            brain_id,
+            12
+        ));
+        assert!(!advance_brain_projection_revision(
+            &mut revisions,
+            brain_id,
+            11
+        ));
+    }
+
+    #[test]
+    fn brain_projection_keeps_later_transitions_and_brains_independent() {
+        let first = crate::brain::store::BrainId(uuid::Uuid::new_v4());
+        let second = crate::brain::store::BrainId(uuid::Uuid::new_v4());
+        let mut revisions = std::collections::HashMap::new();
+
+        assert!(advance_brain_projection_revision(&mut revisions, first, 20));
+        assert!(advance_brain_projection_revision(&mut revisions, first, 21));
+        assert!(advance_brain_projection_revision(&mut revisions, second, 1));
     }
 
     #[test]
