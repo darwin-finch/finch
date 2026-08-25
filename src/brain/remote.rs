@@ -1522,7 +1522,7 @@ mod tests {
                     source_subject,
                     &snapshot.environment,
                     None,
-                    30_000,
+                    120_000,
                 )
                 .await
                 .unwrap();
@@ -1557,7 +1557,7 @@ mod tests {
                     target_subject,
                     source_lease.lease_id,
                     snapshot.environment.generation,
-                    30_000,
+                    120_000,
                 )
                 .await
                 .unwrap();
@@ -1599,7 +1599,7 @@ mod tests {
                     target_subject,
                     handoff.handoff_id,
                     &snapshot.environment,
-                    30_000,
+                    120_000,
                 )
                 .await
                 .unwrap();
