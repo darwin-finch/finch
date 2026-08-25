@@ -5,6 +5,8 @@
 
 pub mod lifecycle;
 pub mod spawn;
+pub mod upgrade;
 
 pub use lifecycle::DaemonLifecycle;
 pub use spawn::{ensure_daemon_running, spawn_daemon};
+pub use upgrade::{DaemonUpgradePlan, VerifiedDaemonUpgrade};
