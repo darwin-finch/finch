@@ -183,6 +183,10 @@ impl RemoteBrainTarget {
         format!("http://{}/v1/brains/named/{}", self.address, self.brain)
     }
 
+    fn collection_url(&self) -> String {
+        format!("http://{}/v1/brains/named", self.address)
+    }
+
     fn attachments_url(&self) -> String {
         format!("{}/attachments", self.http_url())
     }
@@ -251,6 +255,30 @@ impl RemoteBrainClient {
 
     pub fn attachment(&self) -> Option<&BrainAttachment> {
         self.attachment.as_ref()
+    }
+
+    /// Explicitly create this target alias in the remote daemon's own
+    /// environment. The request deliberately contains no machine/workspace.
+    pub async fn create(&self) -> Result<BrainSnapshot> {
+        #[derive(Serialize)]
+        struct Create<'a> {
+            name: &'a str,
+        }
+
+        self.http
+            .post(self.target.collection_url())
+            .bearer_auth(&self.bootstrap_password)
+            .json(&Create {
+                name: &self.target.brain,
+            })
+            .send()
+            .await
+            .context("could not reach brain host")?
+            .error_for_status()
+            .context("remote Brain creation rejected")?
+            .json()
+            .await
+            .context("invalid created Brain snapshot")
     }
 
     pub async fn attach(
@@ -933,6 +961,29 @@ mod tests {
         assert!(RemoteBrainTarget::parse("brain-only").is_err());
         assert!(RemoteBrainTarget::parse("../brain@host").is_err());
         assert!(RemoteBrainTarget::parse("brain@host/path").is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a running Finch daemon on the default loopback port"]
+    fn live_remote_creation_is_explicit_and_environment_owned() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let brain = format!("codex-create-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+            let target = RemoteBrainTarget::parse(&format!(
+                "{brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}"
+            ))
+            .unwrap();
+            let client = RemoteBrainClient::new(target, "loopback").unwrap();
+            let created = client.create().await.unwrap();
+            assert_eq!(created.name, brain);
+            assert_eq!(created.revision, 0);
+            assert!(created.events.is_empty());
+            assert!(client.create().await.is_err());
+            client.archive("codex-create@localhost").await.unwrap();
+        });
     }
 
     #[tokio::test]

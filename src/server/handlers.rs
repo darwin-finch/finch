@@ -66,7 +66,10 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
         .route("/v1/node/info", get(handle_node_info))
         .route("/v1/node/stats", get(handle_node_stats))
         // Durable named Brain sessions
-        .route("/v1/brains/named", get(list_named_brains))
+        .route(
+            "/v1/brains/named",
+            get(list_named_brains).post(create_named_brain),
+        )
         .route(
             "/v1/brains/named/:name",
             get(get_named_brain).delete(archive_named_brain),
@@ -337,6 +340,25 @@ struct NamedBrainListEntry {
     event_revision: u64,
     retained_programs: usize,
     runner: Option<crate::brain::shared::BrainRunnerLease>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateNamedBrainRequest {
+    name: String,
+}
+
+async fn create_named_brain(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<CreateNamedBrainRequest>,
+) -> Result<(StatusCode, Json<crate::brain::shared::BrainSnapshot>), Response> {
+    check_brain_bootstrap_access(&server, addr, &headers).await?;
+    let snapshot = crate::server::BrainLifecycleService::from_server(&server)
+        .create(&request.name)
+        .await
+        .map_err(brain_state_conflict)?;
+    Ok((StatusCode::CREATED, Json(snapshot)))
 }
 
 async fn list_named_brains(

@@ -80,6 +80,19 @@ impl BrainLifecycleService {
         self.store.list()
     }
 
+    /// Create one empty Brain in this daemon's indivisible environment.
+    /// Callers provide only the alias; machine/workspace authority always
+    /// comes from the owning store.
+    pub async fn create(&self, brain: &str) -> Result<BrainSnapshot> {
+        let lock = self.store.execution_lock(brain)?;
+        let _creation = lock.lock_owned().await;
+        ensure!(
+            !self.store.list()?.iter().any(|name| name == brain),
+            "Brain '{brain}' already exists"
+        );
+        self.store.snapshot(brain)
+    }
+
     pub fn start_run_with_parent(
         &self,
         brain: &str,
@@ -461,6 +474,18 @@ mod tests {
             BrainRunnerBroker::default(),
             BrainApprovalBroker::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn explicit_creation_uses_the_daemon_environment_and_rejects_alias_reuse() {
+        let service = service();
+        let created = service.create("review").await.unwrap();
+        assert_eq!(created.name, "review");
+        assert_eq!(created.environment.machine, "box.local");
+        assert_eq!(created.environment, *service.store.environment());
+        assert_eq!(created.revision, 0);
+        assert!(created.events.is_empty());
+        assert!(service.create("review").await.is_err());
     }
 
     #[tokio::test]
