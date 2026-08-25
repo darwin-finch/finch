@@ -59,7 +59,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Require the shared API key on model endpoints using the standard OpenAI
-/// bearer format. Health and Finch peer-protocol endpoints remain unaffected.
+/// bearer format. Health remains unaffected.
 pub async fn auth_middleware(
     State(auth): State<DaemonAuth>,
     request: Request<Body>,
@@ -212,13 +212,12 @@ mod auth_tests {
     }
 
     #[test]
-    fn disabled_auth_health_and_peer_protocol_do_not_require_a_key() {
+    fn disabled_auth_and_health_do_not_require_a_key() {
         let disabled = DaemonAuth::new(false, vec![]);
         let enabled = DaemonAuth::new(true, vec!["custom-secret".to_string()]);
 
         assert!(disabled.authorizes("/v1/models", &headers(None)));
         assert!(enabled.authorizes("/health", &headers(None)));
-        assert!(enabled.authorizes("/v1/registry/join", &headers(None)));
     }
 }
 

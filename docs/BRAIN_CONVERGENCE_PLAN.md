@@ -581,8 +581,13 @@ helpers are gone. Reviewed changesets now have a separate local `ReviewEvent` pr
 durable collaboration remains exclusively in the Brain event log. The sole aggregate is named
 `brain::store::BrainStore`. The legacy `/v1/messages` compatibility endpoint is stateless and
 accepts caller-owned message history; its in-memory `SessionManager` and `/v1/session/:id` lifecycle
-were removed rather than retained as a second conversation authority. The older peer/gas registry
-still requires an explicit distributed-compute disposition before this phase can close.
+were removed rather than retained as a second conversation authority. The old peer registry, gas
+ledger, global-token file transfer, self-registration, and heartbeat are no longer mounted by the
+daemon. Remaining registry/scatter source is migration-only legacy-interpreter code and must be
+deleted with that runtime, not revived as a Brain or compute service.
+
+Status: complete. The canonical Brain aggregate, run, attachment, store, and service have one live
+meaning and one lifecycle path; historical logs remain explicit versioned migration input.
 
 ## Test matrix
 

@@ -900,7 +900,8 @@ still blocks the corresponding Brain phase until it is unified.
   approval, control-lease ownership, workspace effects, environment changes, credential minting,
   and distributed inference. mDNS advertisement and discovery now use an authority-free metadata
   allowlist; the reusable legacy peer token is neither broadcast nor copied into discovered peer
-  state. Self attachment creation uses `brain:attach` and exact bound-connection teardown uses
+  state, and its registry/gas/file-transfer routes are no longer mounted by the daemon. Self
+  attachment creation uses `brain:attach` and exact bound-connection teardown uses
   `brain:detach`, rather than either operation requiring `brain:control`; default consultant
   credentials no longer approve, default observer credentials are read/attach/detach only,
   elevated participant scopes must be requested explicitly within a role-specific ceiling, and

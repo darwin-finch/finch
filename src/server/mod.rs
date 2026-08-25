@@ -221,43 +221,6 @@ impl AgentServer {
 
         tracing::info!("Training worker spawned");
 
-        // Background task: expire stale registry entries every 30 seconds.
-        let registry = std::sync::Arc::clone(&crate::server::handlers::REGISTRY);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                registry.expire();
-            }
-        });
-
-        // Auto-register this daemon in its own registry.
-        // Every finch node is a registry by default — it accepts peers and is itself a peer.
-        let self_addr = self.config.bind_address.clone();
-        let specs = crate::node::collect_machine_specs();
-        let self_entry = crate::registry::PeerEntry {
-            addr: self_addr.clone(),
-            label: Some(hostname_or_default()),
-            tags: vec!["self".to_string()],
-            load: None,
-            region: None,
-            cpu_cores: Some(specs.0),
-            ram_mb: Some(specs.1),
-            bench_ms: Some(specs.2),
-        };
-        let registry2 = std::sync::Arc::clone(&crate::server::handlers::REGISTRY);
-        registry2.join(self_entry.clone());
-        tracing::info!("Registered self in registry: {}", self_addr);
-
-        // Heartbeat: keep this node alive in its own registry.
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                registry2.heartbeat(&self_addr);
-            }
-        });
-
         // Monitor generator state and inject model when ready
         let local_gen_clone = Arc::clone(&self.local_generator);
         let state_monitor = Arc::clone(&self.generator_state);
