@@ -30,6 +30,8 @@ pub enum BrainCredentialScope {
     BrainRead,
     #[serde(rename = "brain:attach")]
     BrainAttach,
+    #[serde(rename = "brain:detach")]
+    BrainDetach,
     #[serde(rename = "brain:submit")]
     BrainSubmit,
     #[serde(rename = "brain:approve")]
@@ -52,6 +54,7 @@ pub fn default_participant_scopes(role: AttachmentRole) -> BTreeSet<BrainCredent
         AttachmentRole::Driver => [
             BrainCredentialScope::BrainRead,
             BrainCredentialScope::BrainAttach,
+            BrainCredentialScope::BrainDetach,
             BrainCredentialScope::BrainSubmit,
             BrainCredentialScope::BrainApprove,
         ]
@@ -60,6 +63,7 @@ pub fn default_participant_scopes(role: AttachmentRole) -> BTreeSet<BrainCredent
         AttachmentRole::Consultant => [
             BrainCredentialScope::BrainRead,
             BrainCredentialScope::BrainAttach,
+            BrainCredentialScope::BrainDetach,
             BrainCredentialScope::BrainSubmit,
         ]
         .into_iter()
@@ -67,6 +71,7 @@ pub fn default_participant_scopes(role: AttachmentRole) -> BTreeSet<BrainCredent
         AttachmentRole::Observer => [
             BrainCredentialScope::BrainRead,
             BrainCredentialScope::BrainAttach,
+            BrainCredentialScope::BrainDetach,
         ]
         .into_iter()
         .collect(),
@@ -533,6 +538,9 @@ mod tests {
         credential_request
             .scopes
             .insert(BrainCredentialScope::BrainAttach);
+        credential_request
+            .scopes
+            .insert(BrainCredentialScope::BrainDetach);
         let parent_token = authority.issue(credential_request, now).unwrap();
         let parent = authority.verify(&parent_token, now).unwrap();
         let attachment_id = AttachmentId(uuid::Uuid::new_v4());
@@ -545,6 +553,7 @@ mod tests {
             .require_attachment(attachment_id, connection_id)
             .is_ok());
         assert!(!bound.permits(BrainCredentialScope::BrainAttach));
+        assert!(bound.permits(BrainCredentialScope::BrainDetach));
         assert!(bound
             .require_attachment(
                 AttachmentId(uuid::Uuid::new_v4()),

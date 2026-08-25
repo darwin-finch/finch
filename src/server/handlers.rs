@@ -1441,7 +1441,7 @@ async fn execute_remote_brain_command(
                 server,
                 headers,
                 name,
-                BrainCredentialScope::BrainAttach,
+                BrainCredentialScope::BrainDetach,
             ) {
                 Ok(claims) => claims,
                 Err(_) => {
@@ -2902,6 +2902,7 @@ mod named_brain_provider_context_tests {
         let driver = crate::brain::credential::default_participant_scopes(AttachmentRole::Driver);
         assert!(driver.contains(&BrainCredentialScope::BrainRead));
         assert!(driver.contains(&BrainCredentialScope::BrainAttach));
+        assert!(driver.contains(&BrainCredentialScope::BrainDetach));
         assert!(driver.contains(&BrainCredentialScope::BrainSubmit));
         assert!(driver.contains(&BrainCredentialScope::BrainApprove));
         assert!(!driver.contains(&BrainCredentialScope::BrainControl));
@@ -2913,6 +2914,7 @@ mod named_brain_provider_context_tests {
             crate::brain::credential::default_participant_scopes(AttachmentRole::Consultant);
         assert!(consultant.contains(&BrainCredentialScope::BrainRead));
         assert!(consultant.contains(&BrainCredentialScope::BrainAttach));
+        assert!(consultant.contains(&BrainCredentialScope::BrainDetach));
         assert!(consultant.contains(&BrainCredentialScope::BrainSubmit));
         assert!(!consultant.contains(&BrainCredentialScope::BrainApprove));
         assert!(!consultant.contains(&BrainCredentialScope::BrainControl));
@@ -2923,6 +2925,7 @@ mod named_brain_provider_context_tests {
             crate::brain::credential::default_participant_scopes(AttachmentRole::Observer);
         assert!(observer.contains(&BrainCredentialScope::BrainRead));
         assert!(observer.contains(&BrainCredentialScope::BrainAttach));
+        assert!(observer.contains(&BrainCredentialScope::BrainDetach));
         assert!(!observer.contains(&BrainCredentialScope::BrainControl));
         assert!(!observer.contains(&BrainCredentialScope::BrainSubmit));
         assert!(!observer.contains(&BrainCredentialScope::BrainApprove));
