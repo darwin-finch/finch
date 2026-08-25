@@ -119,6 +119,7 @@ struct BrainTurnRequest {
   prompt      @2 :Text;
   contextJson @3 :Data; # Transitional canonical Message list; schema becomes native later.
   approvalAudience @4 :BrainApprovalAudience;
+  control          @5 :BrainTurnControl;
 }
 
 enum BrainAttachmentRole {
@@ -175,6 +176,12 @@ struct BrainTurnEvent {
 interface BrainRunner {
   runProgram @0 (request :BrainProgramRequest) -> (result :BrainProgramResult);
   runTurn    @1 (request :BrainTurnRequest) -> (result :BrainTurnResult);
+}
+
+# Per-turn reverse capability. The runner publishes an addressed approval and
+# suspends until the daemon returns the decision submitted by that attachment.
+interface BrainTurnControl {
+  requestApproval @0 (event :BrainTurnEvent) -> (decisionJson :Data);
 }
 
 # ---------------------------------------------------------------------------

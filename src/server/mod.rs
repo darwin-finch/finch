@@ -1,6 +1,7 @@
 // Shammah - Agent Server Module
 // HTTP daemon mode for multi-tenant agent serving
 
+mod brain_approval;
 mod brain_runner;
 mod feedback_handler;
 pub mod handlers;
@@ -11,11 +12,13 @@ mod session;
 pub mod session_registry;
 mod training_worker;
 
-pub use feedback_handler::{handle_feedback, handle_training_status};
+pub use brain_approval::BrainApprovalBroker;
 pub use brain_runner::{
-    BrainRunnerBroker, RunnerProgramRequest, RunnerProgramResult, RunnerRegistrationId,
-    RunnerRequest, RunnerTurnError, RunnerTurnEvent, RunnerTurnRequest, RunnerTurnResult,
+    BrainRunnerBroker, RunnerApprovalRequest, RunnerProgramRequest, RunnerProgramResult,
+    RunnerRegistrationId, RunnerRequest, RunnerTurnError, RunnerTurnEvent, RunnerTurnRequest,
+    RunnerTurnResult,
 };
+pub use feedback_handler::{handle_feedback, handle_training_status};
 pub use handlers::{
     create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint,
 };
@@ -107,13 +110,12 @@ pub struct AgentServer {
     shared_brains: crate::brain::shared::SharedBrainStore,
     /// Send-safe bridge to frontend-owned Cap'n Proto runner callbacks.
     brain_runners: BrainRunnerBroker,
+    /// Pending approval continuations keyed to their exact Brain attachment.
+    brain_approvals: BrainApprovalBroker,
     /// Application-owned MCP configuration and lazily connected transport for
     /// daemon-executed named-Brain programs. The transport is shared, while
     /// each Brain runtime installs its own verified vocabulary metadata.
-    mcp_servers: std::collections::HashMap<
-        String,
-        crate::tools::mcp::McpServerConfig,
-    >,
+    mcp_servers: std::collections::HashMap<String, crate::tools::mcp::McpServerConfig>,
     mcp_client: tokio::sync::OnceCell<Arc<crate::tools::mcp::McpClient>>,
     /// Runtime-rotatable password for remote named-brain access.
     brain_password: Arc<RwLock<String>>,
@@ -182,6 +184,7 @@ impl AgentServer {
             training_rx: std::sync::Mutex::new(Some(training_rx)),
             shared_brains: crate::brain::shared::SharedBrainStore::new(machine),
             brain_runners: BrainRunnerBroker::default(),
+            brain_approvals: BrainApprovalBroker::default(),
             mcp_servers,
             mcp_client: tokio::sync::OnceCell::new(),
             brain_password: Arc::new(RwLock::new(brain_password)),
@@ -410,6 +413,10 @@ impl AgentServer {
 
     pub fn brain_runners(&self) -> &BrainRunnerBroker {
         &self.brain_runners
+    }
+
+    pub fn brain_approvals(&self) -> &BrainApprovalBroker {
+        &self.brain_approvals
     }
 
     /// Return the daemon-owned MCP transport, connecting it on first use.

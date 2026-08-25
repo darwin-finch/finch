@@ -241,12 +241,7 @@ async fn attach_named_brain(
     }
     let attachment = server
         .shared_brains()
-        .attach(
-            &name,
-            &request.subject,
-            request.role,
-            request.attachment_id,
-        )
+        .attach(&name, &request.subject, request.role, request.attachment_id)
         .map_err(brain_state_conflict)?;
     let store = server.shared_brains().clone();
     let pending_name = name.clone();
@@ -299,14 +294,23 @@ async fn detach_named_brain(
     Path((name, attachment_id, connection_id)): Path<(String, uuid::Uuid, uuid::Uuid)>,
 ) -> Result<StatusCode, Response> {
     check_brain_access(&server, addr, &headers).await?;
+    let attachment_id = crate::brain::shared::AttachmentId(attachment_id);
+    let brain_id = server
+        .shared_brains()
+        .snapshot(&name)
+        .map_err(brain_state_conflict)?
+        .brain_id;
     server
         .shared_brains()
         .detach(
             &name,
-            crate::brain::shared::AttachmentId(attachment_id),
+            attachment_id,
             crate::brain::shared::ConnectionId(connection_id),
         )
         .map_err(brain_state_conflict)?;
+    server
+        .brain_approvals()
+        .cancel_attachment(brain_id, attachment_id);
     server
         .shared_brains()
         .remove_if_unused(&name)
@@ -402,10 +406,7 @@ async fn release_named_brain_runner(
     }
     server
         .shared_brains()
-        .release_runner_lease(
-            &name,
-            crate::brain::shared::RunnerLeaseId(lease_id),
-        )
+        .release_runner_lease(&name, crate::brain::shared::RunnerLeaseId(lease_id))
         .map_err(|error| AppError(error).into_response())?;
     server
         .shared_brains()
@@ -468,8 +469,12 @@ fn attachment_can_submit(
             BrainEventKind::Prompt { .. }
                 | BrainEventKind::Program { .. }
                 | BrainEventKind::ProgramPopped { .. }
+                | BrainEventKind::ApprovalDecided { .. }
         ),
-        AttachmentRole::Consultant => matches!(kind, BrainEventKind::Prompt { .. }),
+        AttachmentRole::Consultant => matches!(
+            kind,
+            BrainEventKind::Prompt { .. } | BrainEventKind::ApprovalDecided { .. }
+        ),
         AttachmentRole::Observer | AttachmentRole::Runner => false,
     }
 }
@@ -493,6 +498,7 @@ async fn push_named_brain_event(
         BrainEventKind::Prompt { .. }
             | BrainEventKind::Program { .. }
             | BrainEventKind::ProgramPopped { .. }
+            | BrainEventKind::ApprovalDecided { .. }
     ) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -511,6 +517,27 @@ async fn push_named_brain_event(
         )
             .into_response());
     }
+    if let BrainEventKind::ApprovalDecided {
+        request_seq,
+        approval_id,
+        decision,
+    } = &request.kind
+    {
+        let accepted = commit_named_brain_approval_decision(
+            server.shared_brains(),
+            server.brain_approvals(),
+            &name,
+            &attachment,
+            *request_seq,
+            approval_id,
+            decision.clone(),
+        )
+        .map_err(brain_state_conflict)?;
+        return Ok(Json(PushNamedBrainResponse {
+            accepted,
+            result: None,
+        }));
+    }
     // A Brain is one ordered conversation and one authoritative VM revision.
     // Hold its lane from input acceptance through the corresponding result so
     // two attached consoles cannot race commits or interleave turn events.
@@ -526,14 +553,8 @@ async fn push_named_brain_event(
 
     let result = match request.kind {
         BrainEventKind::Program { language, source } => {
-            let execution = execute_named_brain_program(
-                &server,
-                &name,
-                accepted.seq,
-                language,
-                &source,
-            )
-            .await;
+            let execution =
+                execute_named_brain_program(&server, &name, accepted.seq, language, &source).await;
             Some(push_named_brain_result(
                 server.shared_brains(),
                 &name,
@@ -542,22 +563,13 @@ async fn push_named_brain_event(
             ))
         }
         BrainEventKind::Prompt { text } => {
-            let execution = execute_named_brain_prompt(
-                &server,
-                &name,
-                accepted.seq,
-                &text,
-                &attachment,
-            )
-            .await;
+            let execution =
+                execute_named_brain_prompt(&server, &name, accepted.seq, &text, &attachment).await;
             Some(match execution {
                 Ok(result) => Ok(result),
-                Err(error) => push_named_brain_result(
-                    server.shared_brains(),
-                    &name,
-                    accepted.seq,
-                    Err(error),
-                ),
+                Err(error) => {
+                    push_named_brain_result(server.shared_brains(), &name, accepted.seq, Err(error))
+                }
             })
         }
         BrainEventKind::ProgramPopped { .. }
@@ -578,6 +590,49 @@ async fn push_named_brain_event(
     };
 
     Ok(Json(PushNamedBrainResponse { accepted, result }))
+}
+
+fn commit_named_brain_approval_decision(
+    store: &crate::brain::shared::SharedBrainStore,
+    approvals: &crate::server::BrainApprovalBroker,
+    name: &str,
+    attachment: &crate::brain::shared::BrainAttachment,
+    request_seq: u64,
+    approval_id: &str,
+    decision: serde_json::Value,
+) -> anyhow::Result<crate::brain::shared::BrainEvent> {
+    let snapshot = store.snapshot(name)?;
+    let claimed = approvals.claim(snapshot.brain_id, approval_id, attachment.attachment_id)?;
+    if claimed.request_seq != request_seq
+        || claimed.audience.brain_id != snapshot.brain_id
+        || claimed.audience.brain != name
+        || claimed.audience.attachment_id != attachment.attachment_id
+        || claimed.audience.subject != attachment.subject
+        || claimed.audience.role != attachment.role
+        || claimed.audience.environment_generation != snapshot.environment.generation
+    {
+        claimed.fail("approval decision no longer matches its addressed attachment");
+        anyhow::bail!("approval decision no longer matches its addressed attachment");
+    }
+    let accepted = match store.push(
+        name,
+        &attachment.subject,
+        crate::brain::shared::BrainEventKind::ApprovalDecided {
+            request_seq,
+            approval_id: approval_id.to_string(),
+            decision: decision.clone(),
+        },
+    ) {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            claimed.fail(error.to_string());
+            return Err(error);
+        }
+    };
+    // The canonical event is durable before the suspended runner sees the
+    // decision, so reconnect/replay cannot observe an unaudited grant.
+    claimed.complete(decision);
+    Ok(accepted)
 }
 
 fn push_named_brain_result(
@@ -639,13 +694,7 @@ async fn dispatch_named_brain_program(
         .map(|lease| lease.lease_id)
         .ok_or_else(|| anyhow::anyhow!("named Brain '{name}' has no live environment runner"))?;
     let outcome = runners
-        .dispatch_program(
-            name,
-            lease_id,
-            request_seq,
-            language,
-            source.to_string(),
-        )
+        .dispatch_program(name, lease_id, request_seq, language, source.to_string())
         .await?;
     store.commit_runner_runtime(
         name,
@@ -838,9 +887,7 @@ fn persist_named_brain_turn_events(
     Ok(())
 }
 
-fn named_brain_provider_messages(
-    snapshot: &crate::brain::shared::BrainSnapshot,
-) -> Vec<Message> {
+fn named_brain_provider_messages(snapshot: &crate::brain::shared::BrainSnapshot) -> Vec<Message> {
     use crate::brain::shared::BrainEventKind;
 
     let events = snapshot
@@ -865,9 +912,7 @@ fn named_brain_provider_messages(
         .into_iter()
         .rev()
         .map(|event| match &event.kind {
-            BrainEventKind::Prompt { text } => {
-                Message::user(format!("[{}]\n{text}", event.sender))
-            }
+            BrainEventKind::Prompt { text } => Message::user(format!("[{}]\n{text}", event.sender)),
             BrainEventKind::ToolCall {
                 tool_id,
                 name,
@@ -1018,7 +1063,9 @@ async fn watch_named_brain(
         .shared_brains()
         .snapshot(&name)
         .map_err(|error| AppError(error).into_response())?;
+    let brain_id = snapshot.brain_id;
     let store = server.shared_brains().clone();
+    let approvals = server.brain_approvals().clone();
     Ok(ws
         .on_upgrade(move |mut socket| async move {
             use axum::extract::ws::Message as WsMessage;
@@ -1026,6 +1073,7 @@ async fn watch_named_brain(
             if let Ok(json) = serde_json::to_string(&initial) {
                 if socket.send(WsMessage::Text(json.into())).await.is_err() {
                     let _ = store.detach(&name, attachment_id, connection_id);
+                    approvals.cancel_attachment(brain_id, attachment_id);
                     let _ = store.remove_if_unused(&name);
                     return;
                 }
@@ -1067,6 +1115,7 @@ async fn watch_named_brain(
                 }
             }
             let _ = store.detach(&name, attachment_id, connection_id);
+            approvals.cancel_attachment(brain_id, attachment_id);
             let _ = store.remove_if_unused(&name);
         })
         .into_response())
@@ -2364,20 +2413,139 @@ mod named_brain_provider_context_tests {
     fn attachment_roles_bound_which_events_the_client_may_submit() {
         use crate::brain::shared::AttachmentRole;
 
-        let prompt = BrainEventKind::Prompt { text: "hello".into() };
+        let prompt = BrainEventKind::Prompt {
+            text: "hello".into(),
+        };
         let program = BrainEventKind::Program {
             language: ProgramLanguage::Lisp,
             source: "(say \"hello\")".into(),
         };
+        let decision = BrainEventKind::ApprovalDecided {
+            request_seq: 1,
+            approval_id: "approval-1".into(),
+            decision: serde_json::json!({"choice": "deny"}),
+        };
         assert!(attachment_can_submit(AttachmentRole::Driver, &prompt));
         assert!(attachment_can_submit(AttachmentRole::Driver, &program));
+        assert!(attachment_can_submit(AttachmentRole::Driver, &decision));
         assert!(attachment_can_submit(AttachmentRole::Consultant, &prompt));
-        assert!(!attachment_can_submit(
-            AttachmentRole::Consultant,
-            &program
-        ));
+        assert!(attachment_can_submit(AttachmentRole::Consultant, &decision));
+        assert!(!attachment_can_submit(AttachmentRole::Consultant, &program));
         assert!(!attachment_can_submit(AttachmentRole::Observer, &prompt));
         assert!(!attachment_can_submit(AttachmentRole::Runner, &program));
+    }
+
+    #[tokio::test]
+    async fn approval_decision_is_durable_before_the_runner_resumes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::shared::SharedBrainStore::with_root(
+            "box.local",
+            Some(temp.path().into()),
+        );
+        let request_seq = store
+            .push(
+                "shared",
+                "alice@box.local",
+                BrainEventKind::Prompt {
+                    text: "read it".into(),
+                },
+            )
+            .unwrap()
+            .seq;
+        let snapshot = store.snapshot("shared").unwrap();
+        let attachment = driver_attachment("alice@box.local");
+        let audience = BrainApprovalAudience {
+            brain_id: snapshot.brain_id,
+            brain: snapshot.name,
+            attachment_id: attachment.attachment_id,
+            subject: attachment.subject.clone(),
+            role: attachment.role,
+            environment_generation: snapshot.environment.generation,
+        };
+        let approvals = crate::server::BrainApprovalBroker::default();
+        let registration = approvals
+            .register(request_seq, "approval-1", audience)
+            .unwrap();
+        let decision = serde_json::json!({"choice": "approve_once"});
+
+        let accepted = commit_named_brain_approval_decision(
+            &store,
+            &approvals,
+            "shared",
+            &attachment,
+            request_seq,
+            "approval-1",
+            decision.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            accepted.kind,
+            BrainEventKind::ApprovalDecided { .. }
+        ));
+        assert!(store
+            .snapshot("shared")
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| {
+                event.seq == accepted.seq
+                    && matches!(
+                        &event.kind,
+                        BrainEventKind::ApprovalDecided { approval_id, .. }
+                            if approval_id == "approval-1"
+                    )
+            }));
+        assert_eq!(registration.wait().await.unwrap(), decision);
+    }
+
+    #[tokio::test]
+    async fn wrong_attachment_cannot_consume_an_approval_decision() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::shared::SharedBrainStore::with_root(
+            "box.local",
+            Some(temp.path().into()),
+        );
+        let request_seq = store
+            .push(
+                "shared",
+                "alice@box.local",
+                BrainEventKind::Prompt {
+                    text: "read it".into(),
+                },
+            )
+            .unwrap()
+            .seq;
+        let snapshot = store.snapshot("shared").unwrap();
+        let attachment = driver_attachment("alice@box.local");
+        let audience = BrainApprovalAudience {
+            brain_id: snapshot.brain_id,
+            brain: snapshot.name,
+            attachment_id: attachment.attachment_id,
+            subject: attachment.subject.clone(),
+            role: attachment.role,
+            environment_generation: snapshot.environment.generation,
+        };
+        let approvals = crate::server::BrainApprovalBroker::default();
+        let registration = approvals
+            .register(request_seq, "approval-1", audience)
+            .unwrap();
+        let intruder = driver_attachment("mallory@box.local");
+
+        assert!(commit_named_brain_approval_decision(
+            &store,
+            &approvals,
+            "shared",
+            &intruder,
+            request_seq,
+            "approval-1",
+            serde_json::json!({"choice": "approve_once"}),
+        )
+        .is_err());
+        let claimed = approvals
+            .claim(snapshot.brain_id, "approval-1", attachment.attachment_id)
+            .unwrap();
+        claimed.complete(serde_json::json!({"choice": "deny"}));
+        assert_eq!(registration.wait().await.unwrap()["choice"], "deny");
     }
 
     #[test]
@@ -2416,10 +2584,15 @@ mod named_brain_provider_context_tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("substituted the approval audience"));
-        assert!(!store.snapshot("shared").unwrap().events.iter().any(|event| {
-            matches!(event.kind, BrainEventKind::ApprovalRequested { .. })
-        }));
+        assert!(error
+            .to_string()
+            .contains("substituted the approval audience"));
+        assert!(!store
+            .snapshot("shared")
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| { matches!(event.kind, BrainEventKind::ApprovalRequested { .. }) }));
     }
 
     #[tokio::test]
@@ -2504,12 +2677,20 @@ mod named_brain_provider_context_tests {
             called.values.as_slice(),
             [crate::programs::ProgramValue::Int(42)]
         ));
-        assert!(store.snapshot("shared").unwrap().events.iter().any(|event| {
-            matches!(
-                event.kind,
-                BrainEventKind::RuntimeCommitted { request_seq: 41, .. }
-            )
-        }));
+        assert!(store
+            .snapshot("shared")
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| {
+                matches!(
+                    event.kind,
+                    BrainEventKind::RuntimeCommitted {
+                        request_seq: 41,
+                        ..
+                    }
+                )
+            }));
     }
 
     #[tokio::test]
@@ -2633,9 +2814,7 @@ mod named_brain_provider_context_tests {
             .iter()
             .filter_map(|event| match &event.kind {
                 BrainEventKind::ToolCall { tool_id, .. } => Some(("call", tool_id.as_str())),
-                BrainEventKind::ToolResult { tool_id, .. } => {
-                    Some(("result", tool_id.as_str()))
-                }
+                BrainEventKind::ToolResult { tool_id, .. } => Some(("result", tool_id.as_str())),
                 BrainEventKind::ApprovalRequested {
                     approval_id,
                     audience: Some(audience),
@@ -2795,8 +2974,11 @@ mod named_brain_provider_context_tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("no connected runner callback"));
-        assert!(!store.snapshot("shared").unwrap().events.iter().any(|event| {
-            matches!(event.kind, BrainEventKind::RuntimeCommitted { .. })
-        }));
+        assert!(!store
+            .snapshot("shared")
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| { matches!(event.kind, BrainEventKind::RuntimeCommitted { .. }) }));
     }
 }

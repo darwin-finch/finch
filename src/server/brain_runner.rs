@@ -38,7 +38,16 @@ pub struct RunnerTurnRequest {
     pub prompt: String,
     pub context: Vec<crate::claude::Message>,
     pub approval_audience: crate::brain::shared::BrainApprovalAudience,
+    /// Reverse approval bridge installed by the Cap'n Proto client adapter.
+    /// Daemon-side broker requests leave this unset until they cross IPC.
+    pub approval_tx: Option<mpsc::UnboundedSender<RunnerApprovalRequest>>,
     pub response_tx: oneshot::Sender<Result<RunnerTurnResult, RunnerTurnError>>,
+}
+
+#[derive(Debug)]
+pub struct RunnerApprovalRequest {
+    pub event: RunnerTurnEvent,
+    pub response_tx: oneshot::Sender<Result<serde_json::Value, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,14 +130,7 @@ impl BrainRunnerBroker {
         self.registrations
             .write()
             .expect("runner broker lock poisoned")
-            .insert(
-                brain.into(),
-                Registration {
-                    id,
-                    lease_id,
-                    tx,
-                },
-            );
+            .insert(brain.into(), Registration { id, lease_id, tx });
         id
     }
 
@@ -215,6 +217,7 @@ impl BrainRunnerBroker {
                 prompt,
                 context,
                 approval_audience,
+                approval_tx: None,
                 response_tx,
             }))
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
@@ -296,13 +299,7 @@ mod tests {
         broker.register("brain", current, tx);
 
         let error = broker
-            .dispatch_program(
-                "brain",
-                stale,
-                1,
-                ProgramLanguage::Lisp,
-                "(+ 1 1)".into(),
-            )
+            .dispatch_program("brain", stale, 1, ProgramLanguage::Lisp, "(+ 1 1)".into())
             .await
             .unwrap_err();
         assert!(error.to_string().contains("stale lease"));

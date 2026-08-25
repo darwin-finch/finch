@@ -13,9 +13,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use crate::claude::{ContentBlock, Message};
 use crate::generators::StreamChunk;
 use crate::ipc::brain_codec::{decode_approval_audience, encode_approval_audience};
-use crate::ipc::schema::finch_ipc_capnp::{
-    self, brain_runner, finch_daemon, stream_receiver,
-};
+use crate::ipc::schema::finch_ipc_capnp::{self, brain_runner, finch_daemon, stream_receiver};
 use crate::ipc::transport::sock_path;
 use crate::tools::types::{ToolDefinition, ToolUse};
 
@@ -157,8 +155,7 @@ impl IpcClient {
         lease_id: crate::brain::shared::RunnerLeaseId,
         event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
     ) -> Result<BrainRunnerBootstrap> {
-        let runner: brain_runner::Client =
-            capnp_rpc::new_client(BrainRunnerImpl { event_tx });
+        let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl { event_tx });
         let mut request = self.client.register_brain_runner_request();
         {
             let mut params = request.get();
@@ -228,15 +225,17 @@ impl brain_runner::Server for BrainRunnerImpl {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if self
             .event_tx
-            .send(crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(
-                crate::server::RunnerProgramRequest {
-                    brain,
-                    request_seq: request.get_request_seq(),
-                    language,
-                    source,
-                    response_tx,
-                },
-            ))
+            .send(
+                crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(
+                    crate::server::RunnerProgramRequest {
+                        brain,
+                        request_seq: request.get_request_seq(),
+                        language,
+                        source,
+                        response_tx,
+                    },
+                ),
+            )
             .is_err()
         {
             return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));
@@ -298,6 +297,27 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(audience) => audience,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
+        let control = match request.get_control() {
+            Ok(control) => control,
+            Err(error) => return Promise::err(error),
+        };
+        let (approval_tx, mut approval_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::server::RunnerApprovalRequest>();
+        tokio::task::spawn_local(async move {
+            while let Some(request) = approval_rx.recv().await {
+                let result = async {
+                    let mut call = control.request_approval_request();
+                    encode_brain_turn_event(call.get().init_event(), &request.event)?;
+                    let response = call.send().promise.await?;
+                    let decision = response.get()?.get_decision_json()?;
+                    serde_json::from_slice(decision)
+                        .map_err(|error| capnp::Error::failed(error.to_string()))
+                }
+                .await
+                .map_err(|error| error.to_string());
+                let _ = request.response_tx.send(result);
+            }
+        });
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if self
             .event_tx
@@ -308,6 +328,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                     prompt,
                     context,
                     approval_audience,
+                    approval_tx: Some(approval_tx),
                     response_tx,
                 },
             ))
@@ -356,56 +377,63 @@ fn encode_brain_turn_events(
 ) -> capnp::Result<()> {
     let mut turn_events = result.reborrow().init_turn_events(events.len() as u32);
     for (index, event) in events.iter().enumerate() {
-        let mut encoded = turn_events.reborrow().get(index as u32);
-        match event {
-            crate::server::RunnerTurnEvent::Call {
-                tool_id,
-                name,
-                input,
-            } => {
-                encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::Call);
-                encoded.set_tool_id(tool_id);
-                encoded.set_name(name);
-                let input = serde_json::to_vec(input)
-                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                encoded.set_input_json(&input);
-            }
-            crate::server::RunnerTurnEvent::Result {
-                tool_id,
-                output,
-                is_error,
-            } => {
-                encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::Result);
-                encoded.set_tool_id(tool_id);
-                encoded.set_output(output);
-                encoded.set_is_error(*is_error);
-            }
-            crate::server::RunnerTurnEvent::ApprovalRequested {
-                approval_id,
-                approval_kind,
-                subject,
-                audience,
-                detail,
-            } => {
-                encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::ApprovalRequested);
-                encoded.set_approval_id(approval_id);
-                encoded.set_approval_kind(approval_kind);
-                encoded.set_subject(subject);
-                encode_approval_audience(encoded.reborrow().init_approval_audience(), audience);
-                let detail = serde_json::to_vec(detail)
-                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                encoded.set_detail_json(&detail);
-            }
-            crate::server::RunnerTurnEvent::ApprovalDecided {
-                approval_id,
-                decision,
-            } => {
-                encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
-                encoded.set_approval_id(approval_id);
-                let decision = serde_json::to_vec(decision)
-                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                encoded.set_decision_json(&decision);
-            }
+        encode_brain_turn_event(turn_events.reborrow().get(index as u32), event)?;
+    }
+    Ok(())
+}
+
+fn encode_brain_turn_event(
+    mut encoded: finch_ipc_capnp::brain_turn_event::Builder<'_>,
+    event: &crate::server::RunnerTurnEvent,
+) -> capnp::Result<()> {
+    match event {
+        crate::server::RunnerTurnEvent::Call {
+            tool_id,
+            name,
+            input,
+        } => {
+            encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::Call);
+            encoded.set_tool_id(tool_id);
+            encoded.set_name(name);
+            let input = serde_json::to_vec(input)
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            encoded.set_input_json(&input);
+        }
+        crate::server::RunnerTurnEvent::Result {
+            tool_id,
+            output,
+            is_error,
+        } => {
+            encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::Result);
+            encoded.set_tool_id(tool_id);
+            encoded.set_output(output);
+            encoded.set_is_error(*is_error);
+        }
+        crate::server::RunnerTurnEvent::ApprovalRequested {
+            approval_id,
+            approval_kind,
+            subject,
+            audience,
+            detail,
+        } => {
+            encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::ApprovalRequested);
+            encoded.set_approval_id(approval_id);
+            encoded.set_approval_kind(approval_kind);
+            encoded.set_subject(subject);
+            encode_approval_audience(encoded.reborrow().init_approval_audience(), audience);
+            let detail = serde_json::to_vec(detail)
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            encoded.set_detail_json(&detail);
+        }
+        crate::server::RunnerTurnEvent::ApprovalDecided {
+            approval_id,
+            decision,
+        } => {
+            encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
+            encoded.set_approval_id(approval_id);
+            let decision = serde_json::to_vec(decision)
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            encoded.set_decision_json(&decision);
         }
     }
     Ok(())
