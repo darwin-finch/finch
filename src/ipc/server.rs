@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use capnp::capability::Promise;
 use capnp_rpc::{pry, rpc_twoparty_capnp, twoparty, RpcSystem};
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::ipc::brain_codec::{
@@ -1498,13 +1498,36 @@ mod tests {
 
 /// Bind the Unix socket and accept Cap'n Proto connections in a `LocalSet`.
 ///
-/// This function never returns under normal operation.
-pub async fn start_ipc_server(server: Arc<AgentServer>) -> Result<()> {
+/// This function returns after the daemon cancels its shutdown token.
+pub async fn start_ipc_server(
+    server: Arc<AgentServer>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<()> {
     let path = crate::ipc::transport::sock_path();
 
-    // Remove stale socket file if present (crash recovery).
+    // Remove only a stale socket. Blind unlinking lets a second daemon replace
+    // the pathname while the original listener continues serving through its
+    // open file descriptor.
     if path.exists() {
-        std::fs::remove_file(&path)?;
+        match UnixStream::connect(&path).await {
+            Ok(_) => anyhow::bail!(
+                "Finch IPC socket already has a live listener at {}",
+                path.display()
+            ),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                std::fs::remove_file(&path)?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("could not determine whether {} is stale", path.display())
+                });
+            }
+        }
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1517,22 +1540,28 @@ pub async fn start_ipc_server(server: Arc<AgentServer>) -> Result<()> {
     local
         .run_until(async move {
             loop {
-                match listener.accept().await {
-                    Ok((stream, _addr)) => {
-                        let server = Arc::clone(&server);
-                        tokio::task::spawn_local(async move {
-                            if let Err(e) = handle_connection(stream, server).await {
-                                tracing::warn!("IPC connection error: {}", e);
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!("IPC accept error: {}", e);
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    accepted = listener.accept() => match accepted {
+                        Ok((stream, _addr)) => {
+                            let server = Arc::clone(&server);
+                            tokio::task::spawn_local(async move {
+                                if let Err(e) = handle_connection(stream, server).await {
+                                    tracing::warn!("IPC connection error: {}", e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!("IPC accept error: {}", e);
+                        }
                     }
                 }
             }
         })
         .await;
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
     Ok(())
 }
 

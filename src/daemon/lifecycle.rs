@@ -4,13 +4,29 @@
 // and graceful shutdown coordination.
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use std::fs;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
 /// Manages daemon lifecycle (PID file, shutdown)
 pub struct DaemonLifecycle {
     pid_file: PathBuf,
+}
+
+/// Process-lifetime ownership of the daemon namespace.
+///
+/// The advisory lock closes the check-then-write race in the PID-file-only
+/// protocol. The PID file remains human-readable status metadata; it is not
+/// itself the mutual-exclusion primitive.
+#[derive(Debug)]
+pub struct DaemonInstanceGuard {
+    lock_file: File,
+    pid_file: PathBuf,
+    pid: u32,
+    released: bool,
 }
 
 impl DaemonLifecycle {
@@ -37,6 +53,39 @@ impl DaemonLifecycle {
             .with_context(|| format!("Failed to write PID file: {}", self.pid_file.display()))?;
         info!(pid = pid, path = %self.pid_file.display(), "Daemon PID file written");
         Ok(())
+    }
+
+    /// Acquire exclusive ownership before binding any daemon transport.
+    /// Holding the returned guard is mandatory for the daemon's lifetime.
+    pub fn acquire_instance(&self) -> Result<DaemonInstanceGuard> {
+        let lock_path = self.pid_file.with_extension("lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("Failed to open daemon lock: {}", lock_path.display()))?;
+        lock_file.try_lock_exclusive().map_err(|error| {
+            let owner = self
+                .read_pid()
+                .map(|pid| format!(" (PID: {pid})"))
+                .unwrap_or_default();
+            anyhow::anyhow!("another Finch daemon owns the daemon lock{owner}: {error}")
+        })?;
+
+        // A pre-lock Finch version may still be alive. Honor its PID file
+        // instead of stealing its socket merely because no lock existed yet.
+        if self.is_running() {
+            let pid = self.read_pid()?;
+            anyhow::bail!("Finch daemon is already running (PID: {pid})");
+        }
+        self.write_pid()?;
+        Ok(DaemonInstanceGuard {
+            lock_file,
+            pid_file: self.pid_file.clone(),
+            pid: std::process::id(),
+            released: false,
+        })
     }
 
     /// Remove PID file (called on shutdown)
@@ -190,6 +239,36 @@ impl DaemonLifecycle {
     }
 }
 
+impl DaemonInstanceGuard {
+    fn cleanup_owned_pid(&self) -> Result<()> {
+        let owns_pid_file = fs::read_to_string(&self.pid_file)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            == Some(self.pid);
+        if owns_pid_file {
+            fs::remove_file(&self.pid_file).with_context(|| {
+                format!("Failed to remove PID file: {}", self.pid_file.display())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn release(mut self) -> Result<()> {
+        self.cleanup_owned_pid()?;
+        self.released = true;
+        FileExt::unlock(&self.lock_file).context("Failed to unlock daemon instance")
+    }
+}
+
+impl Drop for DaemonInstanceGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self.cleanup_owned_pid();
+        }
+        let _ = FileExt::unlock(&self.lock_file);
+    }
+}
+
 impl Default for DaemonLifecycle {
     fn default() -> Self {
         Self::new().expect("Failed to initialize DaemonLifecycle")
@@ -248,6 +327,26 @@ mod tests {
         lifecycle.cleanup().unwrap();
         assert!(!pid_file.exists());
         assert!(!lifecycle.is_running());
+    }
+
+    #[test]
+    fn instance_guard_excludes_a_second_daemon_and_cleans_only_its_pid() {
+        let temp_dir = TempDir::new().unwrap();
+        let pid_file = temp_dir.path().join("daemon.pid");
+        let lifecycle = DaemonLifecycle {
+            pid_file: pid_file.clone(),
+        };
+
+        let first = lifecycle.acquire_instance().unwrap();
+        let error = lifecycle.acquire_instance().unwrap_err();
+        assert!(error.to_string().contains("daemon lock"));
+        drop(first);
+        assert!(!pid_file.exists());
+
+        let replacement = lifecycle.acquire_instance().unwrap();
+        fs::write(&pid_file, "999999999").unwrap();
+        drop(replacement);
+        assert_eq!(fs::read_to_string(&pid_file).unwrap(), "999999999");
     }
 
     #[test]

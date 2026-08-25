@@ -1596,14 +1596,10 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     // Initialize daemon lifecycle (PID file management)
     let lifecycle = DaemonLifecycle::new()?;
 
-    // Check if daemon is already running
-    if lifecycle.is_running() {
-        let existing_pid = lifecycle.read_pid()?;
-        anyhow::bail!(finch::errors::daemon_already_running_error(existing_pid));
-    }
-
-    // Write PID file
-    lifecycle.write_pid()?;
+    // The process-lifetime lock is authoritative. A PID file alone has a
+    // check-then-write race and allowed two coordinators to unlink/rebind the
+    // same Unix socket.
+    let daemon_instance = lifecycle.acquire_instance()?;
     tracing::info!(pid = std::process::id(), "Daemon PID file written");
 
     // Load configuration
@@ -1805,7 +1801,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
 
     // Set up graceful shutdown handling
     let server = Arc::new(server);
-    let server_handle = tokio::spawn({
+    let mut server_handle = tokio::spawn({
         let server = Arc::clone(&server);
         async move { server.serve().await }
     });
@@ -1813,15 +1809,17 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     // Start Cap'n Proto IPC server on Unix socket (internal CLI ↔ daemon channel).
     // capnp-rpc uses !Send futures, so we run it on a dedicated single-threaded runtime
     // inside a spawn_blocking thread rather than tokio::spawn (which requires Send).
-    let ipc_handle = tokio::task::spawn_blocking({
+    let ipc_shutdown = tokio_util::sync::CancellationToken::new();
+    let mut ipc_handle = tokio::task::spawn_blocking({
         let server = Arc::clone(&server);
+        let shutdown = ipc_shutdown.clone();
         move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("IPC tokio runtime");
             let local = tokio::task::LocalSet::new();
-            rt.block_on(local.run_until(finch::ipc::start_ipc_server(server)))
+            rt.block_on(local.run_until(finch::ipc::start_ipc_server(server, shutdown)))
         }
     });
 
@@ -1830,7 +1828,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Received SIGINT, shutting down gracefully");
         }
-        result = server_handle => {
+        result = &mut server_handle => {
             match result {
                 Ok(Ok(())) => {
                     tracing::info!("Server exited normally");
@@ -1843,13 +1841,27 @@ async fn run_daemon(bind_address: String) -> Result<()> {
                 }
             }
         }
-        result = ipc_handle => {
+        result = &mut ipc_handle => {
             match result {
                 Ok(Ok(())) => tracing::info!("IPC server exited normally"),
                 Ok(Err(e)) => tracing::error!(error = %e, "IPC server error"),
                 Err(e) => tracing::error!(error = %e, "IPC server task panicked"),
             }
         }
+    }
+
+    // The IPC accept loop runs in a dedicated current-thread runtime. It must
+    // observe cancellation and finish before the PID/instance lock is released;
+    // dropping a spawn_blocking JoinHandle does not stop its thread.
+    ipc_shutdown.cancel();
+    if !ipc_handle.is_finished() {
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), &mut ipc_handle)
+            .await
+            .context("IPC server did not stop within two seconds")??;
+        stopped?;
+    }
+    if !server_handle.is_finished() {
+        server_handle.abort();
     }
 
     // Stop mDNS advertisement if enabled
@@ -1859,8 +1871,9 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         }
     }
 
-    // Cleanup PID file on exit
-    lifecycle.cleanup()?;
+    // Remove only this process's PID metadata, then release exclusive daemon
+    // ownership. Drop performs the same owner-safe cleanup on early returns.
+    daemon_instance.release()?;
     tracing::info!("Daemon shutdown complete");
 
     Ok(())
