@@ -91,8 +91,6 @@ impl EventHandler {
             ReplEvent::StreamingComplete { .. } => {}
             ReplEvent::CancelQuery => {}
             ReplEvent::Shutdown => {}
-            ReplEvent::BrainQuestion { .. } => {}
-            ReplEvent::BrainProposedAction { .. } => {}
             ReplEvent::ShowDialog { .. } => {}
             ReplEvent::PosetComplete { .. } => {}
             ReplEvent::LispResult { .. } => {}

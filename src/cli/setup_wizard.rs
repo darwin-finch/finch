@@ -686,7 +686,6 @@ pub fn apply_and_save(result: &SetupResult) -> Result<()> {
         context_recall_k: new_config.features.context_recall_k,
         enable_summarization: new_config.features.enable_summarization,
         auto_compact_enabled: new_config.features.auto_compact_enabled,
-        brain_enabled: new_config.features.brain_enabled,
     };
     if result.daemon_only_mode {
         new_config.server.mode = "daemon-only".to_string();

@@ -1,178 +1,23 @@
-// In-process context-gathering and durable Brain session handlers for EventLoop.
+// Durable named-Brain handlers for EventLoop.
 //
-// This file is included verbatim into src/cli/repl_event/event_loop.rs by:
-//
-//   include!("brain_handler.rs");
-//
-// Because `include!` pastes the content at the call site, this file shares
-// the event_loop module's namespace: all EventLoop fields, imports from
-// event_loop.rs, and crate-level types are directly in scope.
-//
-// This is NOT a Rust module — it has no `mod` declaration.
-//
-// ── Summary of contents ─────────────────────────────────────────────────────
-//
-// impl EventLoop (in-process brain):
-//   cancel_active_brain     — cancel + optionally discard gathered context
-//   handle_typing_started   — debounce-spawns brain on partial input
-//   handle_brain_question   — shows dialog for in-process brain question
-//   handle_brain_proposed_action — shows Yes/No dialog for brain action
-//
-// impl EventLoop (durable Brain sessions):
-//   handle_brains_list      — /brains: lists authoritative named Brains
-//   handle_brain_archive    — archives an inactive named Brain
-
-// ── In-process brain handlers ─────────────────────────────────────────────────
+// This file is included verbatim into event_loop.rs. There is intentionally
+// no client-local speculative Brain session: background work must enter the
+// canonical service as a correlated BrainRun.
 
 impl EventLoop {
-    /// Cancel the active brain session.
-    ///
-    /// `clear_context` controls whether the pre-gathered context is discarded:
-    /// - `true`  — typing restarted (new partial query); old context is stale, discard it.
-    /// - `false` — user submitted; keep context so `handle_user_input` can inject it.
-    async fn cancel_active_brain(&self, clear_context: bool) {
-        if let Some(session) = self.active_brain.write().await.take() {
-            session.cancel();
-        }
-        if clear_context {
-            *self.brain_context.write().await = None;
-        }
-    }
-
-    /// Handle a `TypingStarted` event: update the word panel.
-    /// No AI calls are made while typing — functions only fire on submit.
+    /// Update the vocabulary panel from partially typed input. This is local
+    /// presentation only and never starts provider or workspace work.
     async fn handle_typing_started(&self, partial: String) {
-        // Extract words from the partial input and show arrows in the panel.
         let mut seen = std::collections::HashSet::new();
-        let words: Vec<String> = partial
-            .split(|c: char| !c.is_alphabetic() && c != '-' && c != '\'')
-            .filter(|w| w.len() >= 3)
-            .map(|w| w.to_lowercase())
-            .filter(|w| seen.insert(w.clone()))
+        let words = partial
+            .split(|character: char| {
+                !character.is_alphabetic() && character != '-' && character != '\''
+            })
+            .filter(|word| word.len() >= 3)
+            .map(str::to_lowercase)
+            .filter(|word| seen.insert(word.clone()))
             .collect();
-        let mut tui = self.tui_renderer.lock().await;
-        tui.set_typing_words(words);
-    }
-
-    /// Handle a `BrainQuestion` event: show a dialog and store the response channel.
-    ///
-    /// If the user is currently busy (active query in flight), defer the question
-    /// until they become idle — the brain waits rather than interrupting.
-    async fn handle_brain_question(
-        &mut self,
-        question: String,
-        options: Vec<String>,
-        response_tx: tokio::sync::oneshot::Sender<String>,
-    ) -> Result<()> {
-        tracing::debug!("[EVENT_LOOP] Brain question: {}", question);
-
-        // If a query is in flight, defer the question — don't interrupt the user.
-        let is_busy = self.active_query_id.read().await.is_some();
-        if is_busy {
-            tracing::debug!("[EVENT_LOOP] User busy — deferring brain question");
-            // Replace any older deferred question (drop it, sending no answer).
-            let _ = self.deferred_brain_question.take();
-            self.deferred_brain_question = Some((question, options, response_tx));
-            return Ok(());
-        }
-
-        self.show_brain_question_dialog(question, options, response_tx)
-            .await
-    }
-
-    /// Actually show the brain question dialog in TUI and store the response channel.
-    async fn show_brain_question_dialog(
-        &mut self,
-        question: String,
-        options: Vec<String>,
-        response_tx: tokio::sync::oneshot::Sender<String>,
-    ) -> Result<()> {
-        use crate::cli::tui::{Dialog, DialogOption};
-
-        // Drop any previous pending brain question (replaced by this new one).
-        let _ = self.pending_brain_question_tx.take();
-        self.pending_brain_question_options.clear();
-
-        let dialog = if options.is_empty() {
-            Dialog::text_input(question, None)
-        } else {
-            let dialog_options: Vec<DialogOption> = options
-                .iter()
-                .map(|s| DialogOption::new(s.as_str()))
-                .collect();
-            Dialog::select(question, dialog_options)
-        };
-
-        // Show the dialog in TUI.
-        let mut tui = self.tui_renderer.lock().await;
-        tui.active_dialog = Some(dialog);
-        if let Err(e) = tui.render() {
-            tracing::error!("[EVENT_LOOP] Failed to render brain question dialog: {}", e);
-        }
-        drop(tui);
-
-        // Store the response channel and options; the render tick will send the answer.
-        self.pending_brain_question_tx = Some(response_tx);
-        self.pending_brain_question_options = options;
-        Ok(())
-    }
-
-    /// Show any deferred brain question if the user is now idle.
-    /// Called when a query completes so the brain can ask its question.
-    pub(super) async fn maybe_show_deferred_brain_question(&mut self) -> Result<()> {
-        if let Some((question, options, response_tx)) = self.deferred_brain_question.take() {
-            tracing::debug!("[EVENT_LOOP] Showing deferred brain question now that user is idle");
-            self.show_brain_question_dialog(question, options, response_tx)
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// Handle a `BrainProposedAction` event: show a Yes/No approval dialog.
-    ///
-    /// The response channel is stored and resolved by the render tick after the
-    /// user makes a selection.  A previously pending action is denied automatically
-    /// (replaced by the new one).
-    async fn handle_brain_proposed_action(
-        &mut self,
-        command: String,
-        reason: String,
-        response_tx: tokio::sync::oneshot::Sender<Option<String>>,
-    ) -> Result<()> {
-        use crate::cli::tui::{Dialog, DialogOption};
-
-        tracing::debug!("[EVENT_LOOP] Brain proposed action: {}", command);
-
-        // Deny any previously pending action (replaced by this one).
-        if let Some(old_tx) = self.pending_brain_action_tx.take() {
-            let _ = old_tx.send(None);
-        }
-        self.pending_brain_action_command = None;
-
-        let prompt = if reason.is_empty() {
-            format!("Brain wants to run:\n  `{}`", command)
-        } else {
-            format!("Brain wants to run:\n  `{}`\n\nReason: {}", command, reason)
-        };
-
-        let dialog = Dialog::select(
-            prompt,
-            vec![
-                DialogOption::new("Yes, run it"),
-                DialogOption::new("No, skip"),
-            ],
-        );
-
-        let mut tui = self.tui_renderer.lock().await;
-        tui.active_dialog = Some(dialog);
-        if let Err(e) = tui.render() {
-            tracing::error!("[EVENT_LOOP] Failed to render brain action dialog: {}", e);
-        }
-        drop(tui);
-
-        self.pending_brain_action_tx = Some(response_tx);
-        self.pending_brain_action_command = Some(command);
-        Ok(())
+        self.tui_renderer.lock().await.set_typing_words(words);
     }
 }
 
@@ -192,13 +37,13 @@ impl EventLoop {
         let snapshot = ipc.brain_snapshot(&self.session_label).await?;
         let initial = ipc
             .brain_acquire_runner(
-            &self.session_label,
-            &self.participant_subject,
-            &snapshot.environment,
-            None,
-            30_000,
-        )
-        .await;
+                &self.session_label,
+                &self.participant_subject,
+                &snapshot.environment,
+                None,
+                30_000,
+            )
+            .await;
         let initial_registration = match (&initial, self.ipc_client.as_ref()) {
             (Ok(lease), Some(ipc)) => match ipc
                 .register_brain_runner(&self.session_label, lease.lease_id, self.event_tx.clone())
@@ -231,14 +76,8 @@ impl EventLoop {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
                 }
                 match ipc
-                    .brain_acquire_runner(
-                    &snapshot.name,
-                    &subject,
-                    &environment,
-                    lease_id,
-                    30_000,
-                )
-                .await
+                    .brain_acquire_runner(&snapshot.name, &subject, &environment, lease_id, 30_000)
+                    .await
                 {
                     Ok(lease) => {
                         lease_id = Some(lease.lease_id);
@@ -357,23 +196,17 @@ impl EventLoop {
         self.home_runner_lease_active = false;
 
         if let Some(client) = self.active_remote_brain.take() {
-            if tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                client.disconnect(),
-            )
-            .await
-            .is_err()
+            if tokio::time::timeout(std::time::Duration::from_secs(2), client.disconnect())
+                .await
+                .is_err()
             {
                 tracing::warn!("remote Brain detach timed out during shutdown");
             }
         }
         if let Some(client) = self.home_brain.take() {
-            if tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                client.disconnect(),
-            )
-            .await
-            .is_err()
+            if tokio::time::timeout(std::time::Duration::from_secs(2), client.disconnect())
+                .await
+                .is_err()
             {
                 tracing::warn!("home Brain detach timed out during shutdown");
             }
@@ -422,9 +255,8 @@ impl EventLoop {
                     .as_ref()
                     .map(|client| client.target.brain.as_str())
                     .unwrap_or(self.session_label.as_str());
-                let mut lines = vec![
-                    "Named Brains (event revision · retained program stack):".to_string(),
-                ];
+                let mut lines =
+                    vec!["Named Brains (event revision · retained program stack):".to_string()];
                 for b in &brains {
                     let current = if b.name == current_name {
                         if self.active_remote_brain.is_some() {

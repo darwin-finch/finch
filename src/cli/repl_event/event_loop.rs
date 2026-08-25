@@ -305,29 +305,6 @@ pub struct EventLoop {
     /// Used by the cross-machine relay poller.
     daemon_base_url: Option<String>,
 
-    /// Provider used by the brain (background context-gathering agent).
-    /// `None` when the brain is disabled (config flag) or no cloud provider is available.
-    brain_provider: Option<Arc<dyn crate::providers::LlmProvider>>,
-
-    /// Pre-gathered context from the active brain session (injected at query time).
-    brain_context: Arc<RwLock<Option<String>>>,
-
-    /// Active brain session (cancelled when user submits or starts a new brain).
-    active_brain: Arc<RwLock<Option<crate::brain::BrainSession>>>,
-
-    /// Pending oneshot sender for a BrainQuestion dialog response.
-    pending_brain_question_tx: Option<tokio::sync::oneshot::Sender<String>>,
-
-    /// Options for the current brain question dialog (to map index → text).
-    pending_brain_question_options: Vec<String>,
-
-    /// Pending oneshot sender for a BrainProposedAction approval dialog.
-    /// Resolved with Some(output) when approved and executed, None when denied.
-    pending_brain_action_tx: Option<tokio::sync::oneshot::Sender<Option<String>>>,
-
-    /// The command string for the pending brain action (shown in the dialog).
-    pending_brain_action_command: Option<String>,
-
     /// Oneshot sender for a dialog shown via `ReplEvent::ShowDialog`.
     /// The render tick delivers `pending_dialog_result` here when the dialog completes.
     pending_dialog_tx: Option<tokio::sync::oneshot::Sender<crate::cli::tui::DialogResult>>,
@@ -342,10 +319,6 @@ pub struct EventLoop {
 
     /// Execution graph for the current (or most recent) query.
     current_graph: Arc<tokio::sync::Mutex<crate::graph::ExecutionGraph>>,
-
-    /// Deferred brain question: held when a BrainQuestion arrives while the user
-    /// is busy (active query in flight).  Shown when the user becomes idle.
-    deferred_brain_question: Option<(String, Vec<String>, tokio::sync::oneshot::Sender<String>)>,
 
     /// Co-Forth shared stack: items pushed by the user (text) or by the AI (Push tool).
     /// Arc<Mutex> so the tool executor can write to it during generation.
@@ -863,7 +836,6 @@ impl EventLoop {
         todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
         enable_summarization: bool,
         auto_compact_enabled: bool,
-        brain_provider: Option<Arc<dyn crate::providers::LlmProvider>>,
         daemon_base_url: Option<String>,
         provider_resolver: crate::runtime::scheduler::ProviderResolver,
         agent_scheduler: Arc<crate::runtime::scheduler::AgentScheduler>,
@@ -1028,14 +1000,6 @@ impl EventLoop {
             todo_list,
             enable_summarization,
             auto_compact_enabled,
-            brain_provider,
-            brain_context: Arc::new(RwLock::new(None)),
-            active_brain: Arc::new(RwLock::new(None)),
-            pending_brain_question_tx: None,
-            pending_brain_question_options: Vec::new(),
-            deferred_brain_question: None,
-            pending_brain_action_tx: None,
-            pending_brain_action_command: None,
             pending_dialog_tx: None,
             pending_poset_run: None,
             tool_call_history: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -1274,32 +1238,15 @@ impl EventLoop {
                     match event {
                         InputEvent::Submitted(input) => {
                             tracing::debug!("Received input: {}", input);
-                            // Drop any pending brain question dialog so its oneshot sender
-                            // doesn't intercept a future tool-approval dialog result.
-                            if self.pending_brain_question_tx.take().is_some() {
-                                let mut tui = self.tui_renderer.lock().await;
-                                tui.active_dialog = None;
-                                let _ = tui.pending_dialog_result.take();
-                            }
-                            self.pending_brain_question_options.clear();
                             // Clear typing words — restore panel to previous mode.
                             {
                                 let mut tui = self.tui_renderer.lock().await;
                                 tui.set_typing_words(vec![]);
                             }
-                            // Cancel the brain session but preserve its context for injection.
-                            self.cancel_active_brain(false).await;
                             self.handle_user_input(input).await?;
                         }
                         InputEvent::TypingStarted(partial) => {
                             tracing::debug!("Typing started: {} chars", partial.len());
-                            // Drop any pending brain question dialog (brain is restarting).
-                            if self.pending_brain_question_tx.take().is_some() {
-                                let mut tui = self.tui_renderer.lock().await;
-                                tui.active_dialog = None;
-                                let _ = tui.pending_dialog_result.take();
-                            }
-                            self.pending_brain_question_options.clear();
                             self.handle_typing_started(partial).await;
                         }
                     }
@@ -1324,8 +1271,6 @@ impl EventLoop {
                         ReplEvent::AgentLifecycle(_) => "AgentLifecycle",
                         ReplEvent::CancelQuery => "CancelQuery",
                         ReplEvent::Shutdown => "Shutdown",
-                        ReplEvent::BrainQuestion { .. } => "BrainQuestion",
-                        ReplEvent::BrainProposedAction { .. } => "BrainProposedAction",
                         ReplEvent::ShowDialog { .. } => "ShowDialog",
                         ReplEvent::PosetComplete { result: Ok(_) } => "PosetComplete(ok)",
                         ReplEvent::PosetComplete { result: Err(_) } => "PosetComplete(err)",
@@ -1401,35 +1346,8 @@ impl EventLoop {
                                     self.render_tui().await.ok();
                                 }
                             }
-                            // Priority 2: Brain question.
-                            else if let Some(brain_tx) = self.pending_brain_question_tx.take() {
-                                let opts = std::mem::take(&mut self.pending_brain_question_options);
-                                let answer = match &dialog_result {
-                                    crate::cli::tui::DialogResult::TextEntered(s) => s.clone(),
-                                    crate::cli::tui::DialogResult::CustomText(s) => s.clone(),
-                                    crate::cli::tui::DialogResult::Selected(idx) => opts
-                                        .get(*idx)
-                                        .cloned()
-                                        .unwrap_or_else(|| format!("option_{}", idx)),
-                                    _ => "[no answer]".to_string(),
-                                };
-                                let _ = brain_tx.send(answer);
-                                tracing::debug!("[EVENT_LOOP] Brain question answered");
-                            } else if let Some(action_tx) = self.pending_brain_action_tx.take() {
-                                // Brain proposed action — "Yes" = index 0, anything else = deny.
-                                let command = self.pending_brain_action_command.take().unwrap_or_default();
-                                let approved = matches!(&dialog_result, crate::cli::tui::DialogResult::Selected(0));
-                                if approved {
-                                    tracing::debug!("[EVENT_LOOP] Brain action approved: {}", command);
-                                    tokio::spawn(async move {
-                                        let output = crate::brain::execute_brain_command(&command).await;
-                                        let _ = action_tx.send(Some(output));
-                                    });
-                                } else {
-                                    tracing::debug!("[EVENT_LOOP] Brain action denied");
-                                    let _ = action_tx.send(None);
-                                }
-                            } else if let Some(pending) =
+                            // Priority 2: addressed named-Brain approval.
+                            else if let Some(pending) =
                                 self.active_remote_brain_approval.take()
                             {
                                 let decision = match &pending.kind {
@@ -2407,29 +2325,10 @@ Rules:\n\
         // Set as active query (for cancellation)
         *self.active_query_id.write().await = Some(query_id);
 
-        // Inject pre-gathered brain context (if any) as a hidden block.
-        // Skip for chat_only (word pushes) — brain context triggers tool use.
-        let enriched = if chat_only {
-            // Drop brain context without consuming it — it stays for the next real query.
-            input.clone()
-        } else {
-            let mut ctx = self.brain_context.write().await;
-            match ctx.take() {
-                Some(brain_ctx) if !brain_ctx.trim().is_empty() => {
-                    tracing::debug!(
-                        "[EVENT_LOOP] Injecting brain context ({} chars)",
-                        brain_ctx.len()
-                    );
-                    format!("{}\n\n---\n[Pre-gathered context:\n{}]", input, brain_ctx)
-                }
-                _ => input.clone(),
-            }
-        };
-
         // Send query to the LLM worker loop (no tools for chat_only word-push responses)
         let _ = self.llm_tx.send(LlmRequest::Query {
             id: query_id,
-            text: enriched,
+            text: input,
             no_tools: chat_only,
         });
 
@@ -3141,9 +3040,6 @@ Rules:\n\
                 if let Some((next, echo, chat_only)) = self.pending_queries.pop_front() {
                     self.execute_query_inner(next, echo, chat_only).await?;
                 }
-                // Now that the user is idle, show any brain question that was deferred.
-                self.maybe_show_deferred_brain_question().await.ok();
-
                 // Record final response + save execution graph
                 if !is_executing_tools {
                     let preview = full_response.chars().take(300).collect::<String>();
@@ -3269,24 +3165,6 @@ Rules:\n\
             ReplEvent::Shutdown => {
                 // Handled in run() method - this should not be reached
                 unreachable!("Shutdown event should be handled in run() method");
-            }
-
-            ReplEvent::BrainQuestion {
-                question,
-                options,
-                response_tx,
-            } => {
-                self.handle_brain_question(question, options, response_tx)
-                    .await?;
-            }
-
-            ReplEvent::BrainProposedAction {
-                command,
-                reason,
-                response_tx,
-            } => {
-                self.handle_brain_proposed_action(command, reason, response_tx)
-                    .await?;
             }
 
             ReplEvent::PosetComplete { result } => {
@@ -4865,9 +4743,8 @@ Rules:\n\
         // ── Plan-approval fast path ───────────────────────────────────────────
         // When the user just approved a PresentPlan, the mode is now Executing.
         // The long planning exploration history confuses the model (it forgets the
-        // task and re-explores instead of implementing).  Reset to a clean context
-        // with just the execution directive, and cancel any active brain session so
-        // its pending AskUserQuestion dialogs don't interfere.
+        // task and re-explores instead of implementing). Reset to a clean context
+        // with just the execution directive.
         if matches!(current_mode, ReplMode::Executing { .. }) {
             let plan_directive = results.iter().find_map(|(_, r)| {
                 if let Ok(content) = r {
@@ -4882,9 +4759,6 @@ Rules:\n\
             });
 
             if let Some(directive) = plan_directive {
-                // Cancel brain — its stale AskUserQuestion would hijack the next dialog.
-                self.cancel_active_brain(true).await;
-
                 // Clear tool-call history so planning-phase reads/globs don't
                 // trigger loop detection when Claude calls them again during execution.
                 self.tool_call_history.write().await.remove(&query_id);
@@ -7378,101 +7252,6 @@ mod tests {
             "index 2 is No/Deny in 3-option dialog, got {:?}",
             result
         );
-    }
-
-    // ── Brain context injection ──────────────────────────────────────────────
-
-    #[test]
-    fn test_brain_context_injection_formats_separator() {
-        // When brain context is present it should be appended after a separator.
-        let input = "How do I implement async in Rust?".to_string();
-        let brain_ctx = "Found src/models/bootstrap.rs — relevant for async patterns.".to_string();
-        let enriched = format!("{}\n\n---\n[Pre-gathered context:\n{}]", input, brain_ctx);
-
-        assert!(enriched.contains("---"), "should contain separator");
-        assert!(enriched.contains("Pre-gathered context:"));
-        assert!(enriched.contains("How do I implement async"));
-        assert!(enriched.contains("bootstrap.rs"));
-    }
-
-    #[test]
-    fn test_brain_context_none_does_not_modify_query() {
-        // When there is no brain context the query should pass through unchanged.
-        let input = "What is a lifetime?".to_string();
-        let brain_ctx: Option<String> = None;
-        let enriched = match brain_ctx {
-            Some(ctx) if !ctx.trim().is_empty() => {
-                format!("{}\n\n---\n[Pre-gathered context:\n{}]", input, ctx)
-            }
-            _ => input.clone(),
-        };
-        assert_eq!(
-            enriched, input,
-            "query should be unchanged when brain has no context"
-        );
-    }
-
-    #[test]
-    fn test_brain_context_empty_not_injected() {
-        // Regression: an empty or whitespace-only brain context must NOT be injected.
-        let input = "What is a lifetime?".to_string();
-        for empty_ctx in ["", "  ", "\n", "\t\n "] {
-            let brain_ctx: Option<String> = Some(empty_ctx.to_string());
-            let enriched = match brain_ctx {
-                Some(ctx) if !ctx.trim().is_empty() => {
-                    format!("{}\n\n---\n[Pre-gathered context:\n{}]", input, ctx)
-                }
-                _ => input.clone(),
-            };
-            assert_eq!(
-                enriched, input,
-                "whitespace-only brain context '{:?}' should not be injected",
-                empty_ctx
-            );
-        }
-    }
-
-    #[test]
-    fn test_pending_brain_question_tx_cleared_on_submit() {
-        // Regression: pending_brain_question_tx must be cleared when the user submits
-        // so a stale sender doesn't intercept the next tool-approval dialog result.
-        // We test the guard logic in isolation (can't drive the full EventLoop here).
-        let (tx, _rx) = tokio::sync::oneshot::channel::<String>();
-        let mut pending: Option<tokio::sync::oneshot::Sender<String>> = Some(tx);
-        let mut options: Vec<String> = vec!["Option A".to_string()];
-
-        // Simulate what the Submitted arm does
-        let was_pending = pending.take().is_some();
-        options.clear();
-
-        assert!(
-            was_pending,
-            "pending_brain_question_tx should have been Some"
-        );
-        assert!(
-            pending.is_none(),
-            "pending_brain_question_tx should be None after take"
-        );
-        assert!(
-            options.is_empty(),
-            "pending_brain_question_options should be cleared"
-        );
-    }
-
-    #[test]
-    fn test_handle_typing_started_skips_commands() {
-        // Inputs starting with '/' are slash-commands and should not trigger the brain.
-        let input = "/help".to_string();
-        let should_skip = input.trim().starts_with('/') || input.trim().len() < 10;
-        assert!(should_skip, "/help should be skipped (command)");
-    }
-
-    #[test]
-    fn test_handle_typing_started_skips_short_input() {
-        // Inputs shorter than 10 chars are not worth speculating on.
-        let input = "short".to_string();
-        let should_skip = input.trim().starts_with('/') || input.trim().len() < 10;
-        assert!(should_skip, "input < 10 chars should be skipped");
     }
 
 }

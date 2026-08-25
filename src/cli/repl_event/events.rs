@@ -5,8 +5,7 @@
 //!
 //! * **Query lifecycle** — `StreamingChunk`, `StreamingComplete`, `ToolResult`,
 //!   `ToolApprovalNeeded`, `CancelQuery`.
-//! * **Brain** — `BrainQuestion`, `BrainProposedAction`.
-//! * **Daemon** — `DaemonBrainQuestion`, `DaemonBrainProposedAction`.
+//! * **Brain** — canonical named-Brain projections and runner requests.
 
 use crate::cli::messages::WorkUnit;
 use crate::cli::output_manager::VmOutputProjection;
@@ -137,26 +136,6 @@ pub enum ReplEvent {
 
     /// Request to shut down the REPL
     Shutdown,
-
-    /// Brain is asking the user a clarifying question while they are typing.
-    ///
-    /// The event loop shows a dialog; the answer is sent back on `response_tx`.
-    BrainQuestion {
-        question: String,
-        /// Optional choices (empty = free-text dialog).
-        options: Vec<String>,
-        response_tx: tokio::sync::oneshot::Sender<String>,
-    },
-
-    /// Brain wants to run a shell command and is asking for approval.
-    ///
-    /// The event loop shows a Yes/No dialog.  If approved, the command is
-    /// executed and `Some(output)` is sent; if denied, `None` is sent.
-    BrainProposedAction {
-        command: String,
-        reason: String,
-        response_tx: tokio::sync::oneshot::Sender<Option<String>>,
-    },
 
     /// Show a dialog and send the result back through `response_tx`.
     ///
@@ -362,27 +341,6 @@ mod tests {
         let _cancel = ReplEvent::CancelQuery;
         let _shutdown = ReplEvent::Shutdown;
         // If the above compile and run, the test passes
-    }
-
-    #[test]
-    fn test_brain_question_variant_via_channel() {
-        // BrainQuestion requires a oneshot channel — verify it is constructible
-        // and pattern-matchable.
-        let (response_tx, _rx) = tokio::sync::oneshot::channel::<String>();
-        let event = ReplEvent::BrainQuestion {
-            question: "Which file should I look at?".to_string(),
-            options: vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
-            response_tx,
-        };
-        match event {
-            ReplEvent::BrainQuestion {
-                question, options, ..
-            } => {
-                assert_eq!(question, "Which file should I look at?");
-                assert_eq!(options.len(), 2);
-            }
-            _ => panic!("Wrong variant"),
-        }
     }
 
     #[test]
