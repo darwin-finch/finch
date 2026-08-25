@@ -261,6 +261,9 @@ pub enum ModelConfig {
         api_key: String,
         model: String,
         enabled: bool,
+        /// Exact configured profile, retaining endpoint/auth/capability fields
+        /// the compact wizard editor does not expose.
+        persisted: Option<ProviderEntry>,
     },
 }
 
@@ -324,6 +327,22 @@ fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
             enabled: *enabled,
             persisted: Some(provider.clone()),
         }),
+        ProviderEntry::Ollama { model, name, .. } => Some(ModelConfig::Remote {
+            provider: "ollama".to_string(),
+            name: name.clone().unwrap_or_else(|| "ollama".to_string()),
+            api_key: String::new(),
+            model: model.clone(),
+            enabled: true,
+            persisted: Some(provider.clone()),
+        }),
+        ProviderEntry::RemoteDaemon { address, name } => Some(ModelConfig::Remote {
+            provider: "finch".to_string(),
+            name: name.clone().unwrap_or_else(|| "remote-daemon".to_string()),
+            api_key: String::new(),
+            model: address.clone(),
+            enabled: true,
+            persisted: Some(provider.clone()),
+        }),
         _ => provider.to_teacher_entry().map(|teacher| ModelConfig::Remote {
             provider: teacher.provider.clone(),
             name: teacher
@@ -333,6 +352,78 @@ fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
             api_key: teacher.api_key,
             model: teacher.model.unwrap_or_default(),
             enabled: true,
+            persisted: Some(provider.clone()),
+        }),
+    }
+}
+
+fn provider_entry_from_remote_model(
+    provider: &str,
+    name: &str,
+    api_key: &str,
+    model: &str,
+    persisted: Option<&ProviderEntry>,
+) -> ProviderEntry {
+    let model = (!model.is_empty()).then(|| model.to_string());
+    let name = Some(name.to_string());
+    match persisted {
+        Some(ProviderEntry::Claude { base_url, .. }) => ProviderEntry::Claude {
+            api_key: api_key.to_string(),
+            model,
+            base_url: base_url.clone(),
+            name,
+        },
+        Some(ProviderEntry::Openai {
+            base_url,
+            reasoning_effort,
+            ..
+        }) => ProviderEntry::Openai {
+            api_key: api_key.to_string(),
+            model,
+            base_url: base_url.clone(),
+            name,
+            reasoning_effort: *reasoning_effort,
+        },
+        Some(ProviderEntry::Grok { .. }) => ProviderEntry::Grok {
+            api_key: api_key.to_string(),
+            model,
+            name,
+        },
+        Some(ProviderEntry::Gemini { .. }) => ProviderEntry::Gemini {
+            api_key: api_key.to_string(),
+            model,
+            name,
+        },
+        Some(ProviderEntry::Mistral { base_url, .. }) => ProviderEntry::Mistral {
+            api_key: api_key.to_string(),
+            model,
+            base_url: base_url.clone(),
+            name,
+        },
+        Some(ProviderEntry::Groq { .. }) => ProviderEntry::Groq {
+            api_key: api_key.to_string(),
+            model,
+            name,
+        },
+        Some(ProviderEntry::Ollama { base_url, .. }) => ProviderEntry::Ollama {
+            model: model.unwrap_or_default(),
+            base_url: base_url.clone(),
+            name,
+        },
+        Some(ProviderEntry::RemoteDaemon { .. }) => ProviderEntry::RemoteDaemon {
+            address: model.unwrap_or_default(),
+            name,
+        },
+        _ if provider.eq_ignore_ascii_case("finch") => ProviderEntry::RemoteDaemon {
+            address: model.unwrap_or_default(),
+            name,
+        },
+        _ => ProviderEntry::from_teacher_entry(&TeacherEntry {
+            provider: provider.to_string(),
+            api_key: api_key.to_string(),
+            model,
+            base_url: None,
+            name,
         }),
     }
 }
@@ -410,6 +501,7 @@ impl WizardState {
                         api_key: teacher.api_key.clone(),
                         model: teacher.model.clone().unwrap_or_default(),
                         enabled: true,
+                        persisted: None,
                     }
                 }));
             }
@@ -426,6 +518,7 @@ impl WizardState {
                 api_key: detected_key,
                 model: String::new(),
                 enabled: true,
+                persisted: None,
             }
         } else {
             configured_models.remove(0)
@@ -1338,6 +1431,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 api_key,
                                 model: resolved_model,
                                 enabled: true,
+                                persisted: None,
                             };
                             if let Some(index) = editing_idx {
                                 if index == 0 {
@@ -1406,6 +1500,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     api_key: String::new(),
                                     model: format!("{}:{}", agent.host, agent.port),
                                     enabled: true,
+                                    persisted: None,
                                 });
                                 *selected_idx = tool_models.len();
                             }
@@ -2097,6 +2192,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
             api_key,
             model,
             enabled,
+            ..
         } = tool_model
         {
             if *enabled {
@@ -2133,14 +2229,24 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
     // Rebuild the unified provider list in the exact order shown. Remote
     // models have already been normalized in `teachers`; local models must be
     // emitted directly because they have no teacher representation.
-    let mut remote_entries = teachers.iter().map(ProviderEntry::from_teacher_entry);
     let providers: Vec<ProviderEntry> = std::iter::once(&primary_model)
         .chain(tool_models.iter())
         .enumerate()
         .filter_map(|(index, model)| match model {
-            ModelConfig::Remote { enabled, .. } if index == 0 || *enabled => {
-                remote_entries.next()
-            }
+            ModelConfig::Remote {
+                provider,
+                name,
+                api_key,
+                model,
+                enabled,
+                persisted,
+            } if index == 0 || *enabled => Some(provider_entry_from_remote_model(
+                provider,
+                name,
+                api_key,
+                model,
+                persisted.as_ref(),
+            )),
             ModelConfig::Remote { .. } => None,
             ModelConfig::Local {
                 family,
@@ -4135,6 +4241,7 @@ mod tests {
                 api_key: "sk-ant-abc123".to_string(),
                 model: String::new(),
                 enabled: true,
+                persisted: None,
             };
         }
         handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
@@ -4524,6 +4631,7 @@ mod tests {
                 api_key: "sk-ant-test".to_string(),
                 model: "claude-sonnet-4-6".to_string(),
                 enabled: true,
+                persisted: None,
             };
         }
         let result = build_setup_result(&state).unwrap();
@@ -4642,6 +4750,34 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn test_wizard_round_trip_preserves_non_teacher_provider_metadata() {
+        use crate::config::{Config, ProviderEntry, ReasoningEffort};
+
+        let providers = vec![
+            ProviderEntry::Openai {
+                api_key: "openai-key".to_string(),
+                model: Some("gpt-test".to_string()),
+                base_url: Some("https://compatible.example/api".to_string()),
+                name: Some("reasoning-profile".to_string()),
+                reasoning_effort: Some(ReasoningEffort::High),
+            },
+            ProviderEntry::Ollama {
+                model: "qwen2.5:7b".to_string(),
+                base_url: "http://model-host:11434".to_string(),
+                name: Some("office-qwen".to_string()),
+            },
+            ProviderEntry::RemoteDaemon {
+                address: "https://finch-host:11435".to_string(),
+                name: Some("build-machine".to_string()),
+            },
+        ];
+        let state = WizardState::new(Some(&Config::with_providers(providers.clone())));
+        let saved = build_setup_result(&state).unwrap();
+
+        assert_eq!(saved.providers, providers);
     }
 
     #[test]
