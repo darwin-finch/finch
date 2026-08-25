@@ -406,7 +406,13 @@ still blocks the corresponding Brain phase until it is unified.
   test, commit, reconnect, and resume—without another coding harness repairing the session. Track
   crashes, lost Brain context, invalid first-pass wire programs, repair attempts, tool loops,
   approval friction, rendering corruption, and manual shell escapes; retain failures as replayable
-  fixtures and require a sustained clean daily workflow rather than a one-off demo.
+  fixtures and require a sustained clean daily workflow rather than a one-off demo. Add an explicit
+  reviewed self-upgrade handoff: build/test a candidate in the proposal workspace, record its binary
+  hash and schema/migration impact, persist Brain/checkpoint plus restart intent, health-check a new
+  daemon process before transferring the socket/runner lease, reconnect frontends by durable Brain
+  identity, and atomically promote or roll back. Frontends may re-exec themselves; daemon replacement
+  requires a small stable supervisor or two-process takeover and must never rely on killing the only
+  process that can recover its state.
 - [ ] Normalize model-facing naming and manifests. `todo_read`/`todo_write`, `enter_plan_mode`,
   `present_plan`, and `ask_user_question` now advertise canonical snake_case names while
   dispatch-only PascalCase aliases preserve compatibility; extend that audited migration to every
