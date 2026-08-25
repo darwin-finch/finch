@@ -255,6 +255,7 @@ pub(crate) enum BrainRemoteCommandKind {
         delivery_policy: BrainScheduleDeliveryPolicy,
     },
     CancelSchedule(ScheduleId),
+    ScheduleInitialization { next_due_ms: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -291,6 +292,10 @@ pub(crate) enum BrainRemoteReply {
         request_id: u64,
         cancelled: bool,
     },
+    InitializationScheduled {
+        request_id: u64,
+        schedule: BrainSchedule,
+    },
     Error {
         request_id: u64,
         code: String,
@@ -309,6 +314,7 @@ impl BrainRemoteReply {
             | Self::RunCancelled { request_id, .. }
             | Self::ScheduleCreated { request_id, .. }
             | Self::ScheduleCancelled { request_id, .. }
+            | Self::InitializationScheduled { request_id, .. }
             | Self::Error { request_id, .. } => *request_id,
         }
     }
@@ -650,6 +656,9 @@ pub(crate) fn encode_brain_remote_envelope(
                 BrainRemoteCommandKind::CancelSchedule(schedule_id) => {
                     builder.set_cancel_schedule(&schedule_id.0.to_string())
                 }
+                BrainRemoteCommandKind::ScheduleInitialization { next_due_ms } => {
+                    builder.set_schedule_initialization(*next_due_ms)
+                }
             }
         }
         BrainRemoteEnvelope::Reply(reply) => {
@@ -685,6 +694,9 @@ pub(crate) fn encode_brain_remote_envelope(
                 }
                 BrainRemoteReply::ScheduleCancelled { cancelled, .. } => {
                     builder.set_schedule_cancelled(*cancelled)
+                }
+                BrainRemoteReply::InitializationScheduled { schedule, .. } => {
+                    encode_schedule(builder.init_initialization_scheduled(), schedule)
                 }
                 BrainRemoteReply::Error { code, message, .. } => {
                     let mut error = builder.init_error();
@@ -768,6 +780,9 @@ pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<Brain
                 CommandWhich::CancelSchedule(schedule_id) => {
                     BrainRemoteCommandKind::CancelSchedule(ScheduleId(parse_uuid(schedule_id?)?))
                 }
+                CommandWhich::ScheduleInitialization(next_due_ms) => {
+                    BrainRemoteCommandKind::ScheduleInitialization { next_due_ms }
+                }
             };
             BrainRemoteEnvelope::Command(BrainRemoteCommand { request_id, kind })
         }
@@ -808,6 +823,12 @@ pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<Brain
                     BrainRemoteReply::ScheduleCancelled {
                         request_id,
                         cancelled,
+                    }
+                }
+                ReplyWhich::InitializationScheduled(schedule) => {
+                    BrainRemoteReply::InitializationScheduled {
+                        request_id,
+                        schedule: decode_schedule(schedule?)?,
                     }
                 }
                 ReplyWhich::Error(error) => {
@@ -2012,6 +2033,10 @@ mod tests {
                 request_id: 8,
                 kind: BrainRemoteCommandKind::CancelSchedule(schedule.schedule_id),
             }),
+            BrainRemoteEnvelope::Command(BrainRemoteCommand {
+                request_id: 9,
+                kind: BrainRemoteCommandKind::ScheduleInitialization { next_due_ms: 900 },
+            }),
             BrainRemoteEnvelope::Reply(BrainRemoteReply::Submitted {
                 request_id: 1,
                 accepted,
@@ -2034,14 +2059,18 @@ mod tests {
             }),
             BrainRemoteEnvelope::Reply(BrainRemoteReply::ScheduleCreated {
                 request_id: 7,
-                schedule,
+                schedule: schedule.clone(),
             }),
             BrainRemoteEnvelope::Reply(BrainRemoteReply::ScheduleCancelled {
                 request_id: 8,
                 cancelled: true,
             }),
-            BrainRemoteEnvelope::Reply(BrainRemoteReply::Error {
+            BrainRemoteEnvelope::Reply(BrainRemoteReply::InitializationScheduled {
                 request_id: 9,
+                schedule,
+            }),
+            BrainRemoteEnvelope::Reply(BrainRemoteReply::Error {
+                request_id: 10,
                 code: "forbidden".into(),
                 message: "scope denied".into(),
             }),

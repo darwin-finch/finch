@@ -819,6 +819,21 @@ impl RemoteBrainClient {
         }
     }
 
+    pub async fn schedule_initialization(
+        &self,
+        next_due_ms: u64,
+    ) -> Result<super::store::BrainSchedule> {
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+
+        match self
+            .send_remote_command(BrainRemoteCommandKind::ScheduleInitialization { next_due_ms })
+            .await?
+        {
+            BrainRemoteReply::InitializationScheduled { schedule, .. } => Ok(schedule),
+            reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
+        }
+    }
+
     pub async fn disconnect(&self) -> Result<()> {
         use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
@@ -1356,6 +1371,29 @@ impl AttachedBrainClient {
                     .await
             }
             AttachedBrainTransport::Remote(client) => client.cancel_schedule(schedule_id).await,
+        }
+    }
+
+    pub async fn schedule_initialization(
+        &self,
+        next_due_ms: u64,
+    ) -> Result<super::store::BrainSchedule> {
+        let attachment = self
+            .attachment
+            .as_ref()
+            .context("client is not attached to a Brain")?;
+        match &self.transport {
+            AttachedBrainTransport::Local(ipc) => {
+                ipc.brain_schedule_initialization(
+                    &self.target.brain,
+                    attachment,
+                    next_due_ms,
+                )
+                .await
+            }
+            AttachedBrainTransport::Remote(client) => {
+                client.schedule_initialization(next_due_ms).await
+            }
         }
     }
 

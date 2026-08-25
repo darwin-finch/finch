@@ -1126,6 +1126,43 @@ impl brain_service::Server for BrainRpcService {
         }
     }
 
+    fn schedule_initialization(
+        &mut self,
+        params: brain_service::ScheduleInitializationParams,
+        mut results: brain_service::ScheduleInitializationResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let attachment_id = match parse_attachment_id(params.get_attachment_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let connection_id = match parse_connection_id(params.get_connection_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        if let Err(error) = self.runners.require_connection_attachment(
+            self.connection_id,
+            &brain,
+            attachment_id,
+            connection_id,
+        ) {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        match self.lifecycle.schedule_initialization(
+            &brain,
+            attachment_id,
+            connection_id,
+            params.get_next_due_ms(),
+        ) {
+            Ok(schedule) => {
+                encode_schedule(results.get().init_schedule(), &schedule);
+                Promise::ok(())
+            }
+            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+        }
+    }
+
     fn claim_runner_identity(
         &mut self,
         params: brain_service::ClaimRunnerIdentityParams,
@@ -2148,6 +2185,103 @@ mod tests {
             )
             .unwrap();
         assert!(runners.has_registration("shared", renewed.lease_id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_initialization_rpc_requires_its_claimed_active_driver() {
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let runners = crate::server::BrainRunnerBroker::default();
+        let lifecycle = crate::server::BrainLifecycleService::new(
+            store,
+            runners.clone(),
+            crate::server::BrainApprovalBroker::default(),
+        );
+        let driver = lifecycle
+            .attach(
+                "shared",
+                "alice",
+                crate::brain::store::AttachmentRole::Driver,
+                None,
+            )
+            .unwrap();
+        let driver_connection = driver.connection_id.unwrap();
+        let _watch = lifecycle
+            .watch("shared", driver.attachment_id, driver_connection)
+            .unwrap();
+        let rpc_connection = uuid::Uuid::new_v4();
+        runners
+            .claim_connection_attachment(
+                rpc_connection,
+                "shared",
+                driver.attachment_id,
+                driver_connection,
+            )
+            .unwrap();
+        let service: crate::ipc::schema::finch_ipc_capnp::brain_service::Client =
+            capnp_rpc::new_client(BrainRpcService {
+                lifecycle: lifecycle.clone(),
+                runners: runners.clone(),
+                connection_id: rpc_connection,
+            });
+
+        let mut request = service.schedule_initialization_request();
+        {
+            let mut params = request.get();
+            params.set_brain("shared");
+            params.set_attachment_id(&driver.attachment_id.0.to_string());
+            params.set_connection_id(&driver_connection.0.to_string());
+            params.set_next_due_ms(1_000);
+        }
+        let reply = request.send().promise.await.unwrap();
+        let schedule = crate::ipc::brain_codec::decode_schedule(
+            reply.get().unwrap().get_schedule().unwrap(),
+        )
+        .unwrap();
+        assert!(schedule.module_identity.is_some());
+
+        let mut forged = service.schedule_initialization_request();
+        {
+            let mut params = forged.get();
+            params.set_brain("shared");
+            params.set_attachment_id(&driver.attachment_id.0.to_string());
+            params.set_connection_id(&uuid::Uuid::new_v4().to_string());
+            params.set_next_due_ms(2_000);
+        }
+        assert!(forged.send().promise.await.is_err());
+
+        let consultant = lifecycle
+            .attach(
+                "shared",
+                "bob",
+                crate::brain::store::AttachmentRole::Consultant,
+                None,
+            )
+            .unwrap();
+        let consultant_connection = consultant.connection_id.unwrap();
+        let _consultant_watch = lifecycle
+            .watch(
+                "shared",
+                consultant.attachment_id,
+                consultant_connection,
+            )
+            .unwrap();
+        runners
+            .claim_connection_attachment(
+                rpc_connection,
+                "shared",
+                consultant.attachment_id,
+                consultant_connection,
+            )
+            .unwrap();
+        let mut denied = service.schedule_initialization_request();
+        {
+            let mut params = denied.get();
+            params.set_brain("shared");
+            params.set_attachment_id(&consultant.attachment_id.0.to_string());
+            params.set_connection_id(&consultant_connection.0.to_string());
+            params.set_next_due_ms(3_000);
+        }
+        assert!(denied.send().promise.await.is_err());
     }
 
     #[test]

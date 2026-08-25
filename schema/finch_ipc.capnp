@@ -1239,6 +1239,7 @@ struct BrainRemoteCommand {
     cancelRun            @6 :Text;
     createSchedule       @7 :BrainScheduleCreateRequest;
     cancelSchedule       @8 :Text;
+    scheduleInitialization @9 :UInt64;
   }
 }
 
@@ -1276,6 +1277,7 @@ struct BrainRemoteReply {
     runCancelled     @7 :BrainRun;
     scheduleCreated  @8 :BrainSchedule;
     scheduleCancelled @9 :Bool;
+    initializationScheduled @10 :BrainSchedule;
   }
 }
 
@@ -1407,6 +1409,13 @@ interface BrainService {
                       attachmentId :Text,
                       connectionId :Text,
                       scheduleId :Text) -> (cancelled :Bool);
+
+  # Schedule only the daemon-persisted reviewed initialization module. The
+  # caller supplies neither program source nor capabilities.
+  scheduleInitialization @17 (brain :Text,
+                              attachmentId :Text,
+                              connectionId :Text,
+                              nextDueMs :UInt64) -> (schedule :BrainSchedule);
 }
 
 # ---------------------------------------------------------------------------
