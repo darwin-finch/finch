@@ -989,6 +989,23 @@ impl RemoteBrainClient {
         }
     }
 
+    pub async fn start_speculative(&self, prompt: String) -> Result<super::store::BrainRun> {
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+
+        match self
+            .send_remote_command(BrainRemoteCommandKind::Submit(
+                BrainEventKind::SpeculativePrompt { text: prompt },
+            ))
+            .await?
+        {
+            BrainRemoteReply::Submitted { run: Some(run), .. } => Ok(run),
+            BrainRemoteReply::Submitted { .. } => {
+                anyhow::bail!("speculative Brain submission did not create a run")
+            }
+            reply => anyhow::bail!("remote Brain returned the wrong reply: {reply:?}"),
+        }
+    }
+
     pub async fn acknowledge(&mut self, seq: u64) -> Result<()> {
         use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
@@ -1639,6 +1656,20 @@ impl AttachedBrainClient {
                 Ok(())
             }
             AttachedBrainTransport::Remote(client) => client.push(kind).await,
+        }
+    }
+
+    pub async fn start_speculative(&self, prompt: String) -> Result<super::store::BrainRun> {
+        let attachment = self
+            .attachment
+            .as_ref()
+            .context("client is not attached to a Brain")?;
+        match &self.transport {
+            AttachedBrainTransport::Local(ipc) => {
+                ipc.brain_start_speculative(&self.target.brain, attachment, prompt)
+                    .await
+            }
+            AttachedBrainTransport::Remote(client) => client.start_speculative(prompt).await,
         }
     }
 
@@ -3665,6 +3696,7 @@ mod tests {
                 .filter_map(|event| match event.kind {
                     BrainEventKind::ClientAttached { .. } => Some("attached"),
                     BrainEventKind::Prompt { .. } => Some("prompt"),
+                    BrainEventKind::SpeculativePrompt { .. } => Some("speculative-prompt"),
                     BrainEventKind::RunStarted { .. } => Some("run-started"),
                     BrainEventKind::ClientDetached { .. } => Some("detached"),
                     _ => None,
@@ -3712,6 +3744,14 @@ mod tests {
                 .brain_acknowledge(&local_brain, &local_attachment, local_outcome.accepted.seq)
                 .await
                 .unwrap();
+            let local_speculative = ipc
+                .brain_start_speculative(
+                    &local_brain,
+                    &local_ack,
+                    "same speculative lifecycle".into(),
+                )
+                .await
+                .unwrap();
             ipc.brain_detach(&local_brain, &local_ack).await.unwrap();
             let local_snapshot = ipc.brain_snapshot(&local_brain).await.unwrap();
 
@@ -3750,6 +3790,10 @@ mod tests {
                 panic!("remote transport returned a non-submission outcome")
             };
             remote.acknowledge(remote_accepted.seq).await.unwrap();
+            let remote_speculative = remote
+                .start_speculative("same speculative lifecycle".into())
+                .await
+                .unwrap();
             remote.disconnect().await.unwrap();
             let remote_snapshot = remote.snapshot().await.unwrap();
 
@@ -3761,6 +3805,9 @@ mod tests {
             assert_eq!(local_run.kind, remote_run.kind);
             assert_eq!(local_run.status, BrainRunStatus::QueuedForEnvironment);
             assert_eq!(local_run.status, remote_run.status);
+            assert_eq!(local_speculative.kind, BrainRunKind::Speculative);
+            assert_eq!(local_speculative.kind, remote_speculative.kind);
+            assert_eq!(local_speculative.status, remote_speculative.status);
             assert_eq!(
                 local_run.request_seq - local_snapshot.events[0].seq,
                 remote_run.request_seq - remote_snapshot.events[0].seq

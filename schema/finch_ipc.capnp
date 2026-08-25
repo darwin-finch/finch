@@ -1197,6 +1197,7 @@ struct BrainEvent {
     scheduleChanged        @26 :BrainSchedule;
     scheduleDue            @27 :BrainScheduleDue;
     taskListReplaced       @28 :BrainTaskList;
+    speculativePrompt      @29 :Text;
   }
 }
 
@@ -1302,6 +1303,7 @@ struct BrainSubmission {
     approvalDecided @3 :BrainApprovalDecided;
     participantMessage @4 :Text;
     taskListReplaced @5 :BrainTaskList;
+    speculativePrompt @6 :Text;
   }
 }
 

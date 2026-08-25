@@ -453,6 +453,7 @@ pub(super) fn encode_brain_submission(
 ) -> anyhow::Result<()> {
     match kind {
         BrainEventKind::Prompt { text } => builder.set_prompt(text),
+        BrainEventKind::SpeculativePrompt { text } => builder.set_speculative_prompt(text),
         BrainEventKind::ParticipantMessage { text } => builder.set_participant_message(text),
         BrainEventKind::TaskListReplaced { tasks } => {
             encode_task_list(builder.init_task_list_replaced(), tasks);
@@ -487,6 +488,9 @@ pub(super) fn decode_brain_submission(
 
     Ok(match reader.which()? {
         Which::Prompt(value) => BrainEventKind::Prompt { text: text(value?)? },
+        Which::SpeculativePrompt(value) => BrainEventKind::SpeculativePrompt {
+            text: text(value?)?,
+        },
         Which::ParticipantMessage(value) => BrainEventKind::ParticipantMessage {
             text: text(value?)?,
         },
@@ -1323,6 +1327,7 @@ pub(super) fn encode_event(
             }
         }
         BrainEventKind::Prompt { text } => builder.set_prompt(text),
+        BrainEventKind::SpeculativePrompt { text } => builder.set_speculative_prompt(text),
         BrainEventKind::ParticipantMessage { text } => builder.set_participant_message(text),
         BrainEventKind::TaskListReplaced { tasks } => {
             encode_task_list(builder.init_task_list_replaced(), tasks);
@@ -1496,6 +1501,9 @@ pub(super) fn decode_event(
             }
         }
         Which::Prompt(value) => BrainEventKind::Prompt {
+            text: text(value?)?,
+        },
+        Which::SpeculativePrompt(value) => BrainEventKind::SpeculativePrompt {
             text: text(value?)?,
         },
         Which::ParticipantMessage(value) => BrainEventKind::ParticipantMessage {
@@ -1740,6 +1748,9 @@ mod tests {
         let submissions = vec![
             BrainEventKind::Prompt {
                 text: "inspect the workspace".into(),
+            },
+            BrainEventKind::SpeculativePrompt {
+                text: "inspect likely context".into(),
             },
             BrainEventKind::ParticipantMessage {
                 text: "hello, collaborators".into(),
@@ -1991,6 +2002,12 @@ mod tests {
                 request_id: 1,
                 kind: BrainRemoteCommandKind::Submit(BrainEventKind::Prompt {
                     text: "inspect it".into(),
+                }),
+            }),
+            BrainRemoteEnvelope::Command(BrainRemoteCommand {
+                request_id: 11,
+                kind: BrainRemoteCommandKind::Submit(BrainEventKind::SpeculativePrompt {
+                    text: "inspect ahead".into(),
                 }),
             }),
             BrainRemoteEnvelope::Command(BrainRemoteCommand {

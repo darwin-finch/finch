@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 12;
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 13;
 const BRAIN_METADATA_VERSION: u32 = 1;
 const BRAIN_INITIALIZATION_VERSION: u32 = 1;
 const DEFAULT_INITIALIZATION_MODULE: &str = "finch.brain.initialization";
@@ -431,6 +431,11 @@ pub enum BrainEventKind {
     Prompt {
         text: String,
     },
+    /// An explicitly requested helper turn. Its transcript is durable and
+    /// inspectable, but is never injected into later interactive context.
+    SpeculativePrompt {
+        text: String,
+    },
     /// A participant-to-participant message. It is durable and enters later
     /// prompt context, but never schedules a provider turn by itself.
     ParticipantMessage {
@@ -810,6 +815,7 @@ impl BrainState {
                 }
             }
             BrainEventKind::Prompt { .. }
+            | BrainEventKind::SpeculativePrompt { .. }
             | BrainEventKind::ParticipantMessage { .. }
             | BrainEventKind::ToolCall { .. }
             | BrainEventKind::ToolResult { .. }
@@ -1925,6 +1931,7 @@ impl BrainStore {
                 matches!(
                     event.kind,
                     BrainEventKind::Prompt { .. }
+                        | BrainEventKind::SpeculativePrompt { .. }
                         | BrainEventKind::ParticipantMessage { .. }
                         | BrainEventKind::TaskListReplaced { .. }
                         | BrainEventKind::ToolCall { .. }

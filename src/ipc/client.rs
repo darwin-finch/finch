@@ -461,6 +461,22 @@ impl IpcClient {
         })
     }
 
+    pub async fn brain_start_speculative(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::store::BrainAttachment,
+        prompt: String,
+    ) -> Result<crate::brain::store::BrainRun> {
+        self.brain_submit(
+            brain,
+            attachment,
+            crate::brain::store::BrainEventKind::SpeculativePrompt { text: prompt },
+        )
+        .await?
+        .run
+        .context("speculative Brain submission did not create a run")
+    }
+
     pub async fn brain_watch(
         &self,
         brain: &str,

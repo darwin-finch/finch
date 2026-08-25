@@ -818,6 +818,7 @@ fn attachment_can_submit(
         AttachmentRole::Driver => matches!(
             kind,
             BrainEventKind::Prompt { .. }
+                | BrainEventKind::SpeculativePrompt { .. }
                 | BrainEventKind::ParticipantMessage { .. }
                 | BrainEventKind::TaskListReplaced { .. }
                 | BrainEventKind::Program { .. }
@@ -871,6 +872,7 @@ pub(crate) async fn submit_named_brain_event_with_authority(
     if !matches!(
         kind,
         BrainEventKind::Prompt { .. }
+            | BrainEventKind::SpeculativePrompt { .. }
             | BrainEventKind::ParticipantMessage { .. }
             | BrainEventKind::TaskListReplaced { .. }
             | BrainEventKind::Program { .. }
@@ -919,7 +921,9 @@ pub(crate) async fn submit_named_brain_event_with_authority(
 
     let run = if matches!(
         kind,
-        BrainEventKind::Program { .. } | BrainEventKind::Prompt { .. }
+        BrainEventKind::Program { .. }
+            | BrainEventKind::Prompt { .. }
+            | BrainEventKind::SpeculativePrompt { .. }
     ) {
         let status = if named_brain_runner_is_ready(store, runners, name)? {
             crate::brain::store::BrainRunStatus::Running
@@ -929,7 +933,11 @@ pub(crate) async fn submit_named_brain_event_with_authority(
         Some(store.start_run(
             name,
             &attachment.subject,
-            crate::brain::store::BrainRunKind::Interactive,
+            if matches!(kind, BrainEventKind::SpeculativePrompt { .. }) {
+                crate::brain::store::BrainRunKind::Speculative
+            } else {
+                crate::brain::store::BrainRunKind::Interactive
+            },
             accepted.seq,
             attachment.attachment_id,
             status,
@@ -965,7 +973,9 @@ pub(crate) async fn submit_named_brain_event_with_authority(
             | BrainEventKind::RunStatusChanged { .. }
             | BrainEventKind::ScheduleChanged { .. }
             | BrainEventKind::ScheduleDue { .. } => None,
-            BrainEventKind::Program { .. } | BrainEventKind::Prompt { .. } => {
+            BrainEventKind::Program { .. }
+            | BrainEventKind::Prompt { .. }
+            | BrainEventKind::SpeculativePrompt { .. } => {
                 unreachable!("executable requests create a BrainRun")
             }
         },
@@ -1070,7 +1080,7 @@ async fn dispatch_named_brain_run(
                 Err(error) => Err(error),
             }
         }
-        BrainEventKind::Prompt { text } => {
+        BrainEventKind::Prompt { text } | BrainEventKind::SpeculativePrompt { text } => {
             match snapshot
                 .attachments
                 .iter()
@@ -1099,6 +1109,13 @@ async fn dispatch_named_brain_run(
             run.run_id.0
         )),
     };
+
+    // Cancellation is authoritative once the initiating driver and exact
+    // runner have acknowledged it. A callback that completes after that point
+    // must not publish a stale result or overwrite the cancelled state.
+    if store.inspect_run(name, run.run_id)?.status == BrainRunStatus::Cancelled {
+        return Ok(None);
+    }
 
     match execution {
         Ok((result, commit_ack)) => {
@@ -1480,6 +1497,11 @@ async fn dispatch_named_brain_program(
             return Err(error);
         }
     };
+    if store.inspect_run(name, run_id)?.status
+        == crate::brain::store::BrainRunStatus::Cancelled
+    {
+        anyhow::bail!("named Brain run cancelled");
+    }
     persist_named_brain_effect_journal(
         store,
         name,
@@ -1562,6 +1584,11 @@ async fn dispatch_named_brain_turn(
             return Err(error);
         }
     };
+    if store.inspect_run(name, run_id)?.status
+        == crate::brain::store::BrainRunStatus::Cancelled
+    {
+        anyhow::bail!("named Brain run cancelled");
+    }
     let commit_ack = outcome.commit_ack.clone();
     persist_named_brain_turn_events(
         store,
@@ -1787,6 +1814,41 @@ fn named_brain_provider_messages_at(
 ) -> Vec<Message> {
     use crate::brain::store::BrainEventKind;
 
+    // Speculative helper transcripts are visible in the canonical log, but
+    // they are not conversation input. Exclude only events correlated to the
+    // helper; unrelated durable events remain context even if they interleave.
+    let speculative_runs = snapshot
+        .runs
+        .iter()
+        .filter(|run| run.kind == crate::brain::store::BrainRunKind::Speculative)
+        .map(|run| {
+            let end = snapshot
+                .events
+                .iter()
+                .find_map(|event| match &event.kind {
+                    BrainEventKind::RunStatusChanged { run_id, status, .. }
+                        if *run_id == run.run_id && status.is_terminal() =>
+                    {
+                        Some(event.seq)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(request_seq);
+            let provider_program_seqs = snapshot
+                .events
+                .iter()
+                .filter(|event| {
+                    run.request_seq < event.seq
+                        && event.seq < end
+                        && event.sender == "provider"
+                        && matches!(event.kind, BrainEventKind::Program { .. })
+                })
+                .map(|event| event.seq)
+                .collect::<std::collections::HashSet<_>>();
+            (run.run_id, run.request_seq, end, provider_program_seqs)
+        })
+        .collect::<Vec<_>>();
+
     // A queued run must see the conversation and task projection that existed
     // when its exact request was accepted. In particular, later queued prompts
     // and task-list replacements must never leak backward after a restart.
@@ -1804,6 +1866,39 @@ fn named_brain_provider_messages_at(
         .iter()
         .rev()
         .filter(|event| event.seq <= request_seq)
+        .filter(|event| {
+            !speculative_runs
+                .iter()
+                .any(|(run_id, start, end, program_seqs)| {
+                    if event.seq == *start {
+                        return true;
+                    }
+                    if event.seq <= *start || event.seq >= *end {
+                        return false;
+                    }
+                    match &event.kind {
+                        BrainEventKind::RunStarted { run } => run.run_id == *run_id,
+                        BrainEventKind::RunStatusChanged {
+                            run_id: changed, ..
+                        } => changed == run_id,
+                        BrainEventKind::ToolCall { request_seq, .. }
+                        | BrainEventKind::ToolResult { request_seq, .. }
+                        | BrainEventKind::ApprovalRequested { request_seq, .. }
+                        | BrainEventKind::ApprovalDecided { request_seq, .. }
+                        | BrainEventKind::EffectRecorded { request_seq, .. } => {
+                            *request_seq == *start
+                        }
+                        BrainEventKind::Program { .. } => {
+                            event.sender == "provider" && program_seqs.contains(&event.seq)
+                        }
+                        BrainEventKind::RuntimeCommitted { request_seq, .. }
+                        | BrainEventKind::Result { request_seq, .. } => {
+                            *request_seq == *start || program_seqs.contains(request_seq)
+                        }
+                        _ => false,
+                    }
+                })
+        })
         .filter(|event| {
             !matches!(
                 event.kind,
@@ -1831,6 +1926,9 @@ fn named_brain_provider_messages_at(
         .into_iter()
         .rev()
         .map(|event| match &event.kind {
+            BrainEventKind::SpeculativePrompt { .. } => {
+                unreachable!("speculative transcripts are filtered above")
+            }
             BrainEventKind::Prompt { text } => {
                 let prompt = format!("[{}]\n{text}", event.sender);
                 Message::user(
@@ -5517,6 +5615,156 @@ mod handler_tests {
             .await,
             Err(BrainSubmissionError::Invalid(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn speculative_prompt_is_sent_once_and_only_its_correlated_transcript_is_hidden_later() {
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let driver = store
+            .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
+            .unwrap();
+        let lease = store
+            .acquire_runner_lease(
+                "shared",
+                "runner@box.local",
+                store.environment().generation,
+                None,
+                60_000,
+            )
+            .unwrap();
+        let runners = crate::server::BrainRunnerBroker::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, tx);
+        let callback_store = store.clone();
+        let runner = tokio::spawn(async move {
+            let crate::server::RunnerRequest::Turn(speculative) = rx.recv().await.unwrap() else {
+                panic!("expected speculative turn")
+            };
+            assert_eq!(speculative.prompt, "spec-only-prompt");
+            assert_eq!(
+                speculative
+                    .context
+                    .iter()
+                    .filter(|message| message.text_content().contains("spec-only-prompt"))
+                    .count(),
+                0,
+                "the prompt field is the helper's only prompt copy"
+            );
+            callback_store
+                .push(
+                    "shared",
+                    "bob@box.local",
+                    BrainEventKind::ParticipantMessage {
+                        text: "keep-this-interleaved-message".into(),
+                    },
+                )
+                .unwrap();
+            let runtime = crate::runtime::ProgramRuntime::new();
+            let source = "(say \"spec-secret-output\")";
+            let execution = runtime
+                .submit_typed_only(crate::runtime::ProgramSubmission {
+                    language: crate::programs::ProgramLanguage::Lisp,
+                    source_id: Some("speculative-context-test".into()),
+                    source: source.into(),
+                    intent: "speculative transcript isolation".into(),
+                    effect: crate::programs::ExecutionEffect::Pure,
+                    declared_capabilities: Vec::new(),
+                    manifest_generation: runtime.manifest_generation(),
+                    expected_revision: Some(runtime.revision()),
+                    budget: None,
+                })
+                .await
+                .unwrap();
+            let checkpoint = runtime
+                .revision_history()
+                .unwrap()
+                .into_iter()
+                .find(|snapshot| snapshot.revision == execution.output_revision)
+                .and_then(|snapshot| snapshot.checkpoint)
+                .unwrap();
+            speculative
+                .response_tx
+                .send(Ok(crate::server::RunnerTurnResult {
+                    source: source.into(),
+                    language: ProgramLanguage::Lisp,
+                    output: "spec-secret-result".into(),
+                    turn_events: vec![
+                        crate::server::RunnerTurnEvent::Call {
+                            tool_id: "spec-tool".into(),
+                            name: "spec-secret-tool".into(),
+                            input: serde_json::json!({"secret": true}),
+                        },
+                        crate::server::RunnerTurnEvent::Result {
+                            tool_id: "spec-tool".into(),
+                            output: "spec-secret-tool-result".into(),
+                            is_error: false,
+                        },
+                    ],
+                    runtime_revision: execution.output_revision,
+                    checkpoint,
+                    effect_journal: Vec::new(),
+                    commit_ack: None,
+                }))
+                .unwrap();
+
+            let crate::server::RunnerRequest::Turn(interactive) = rx.recv().await.unwrap() else {
+                panic!("expected later interactive turn")
+            };
+            let context = interactive
+                .context
+                .iter()
+                .map(|message| message.text_content())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(context.contains("keep-this-interleaved-message"));
+            for hidden in [
+                "spec-only-prompt",
+                "spec-secret-output",
+                "spec-secret-result",
+                "spec-secret-tool",
+                "spec-secret-tool-result",
+            ] {
+                assert!(!context.contains(hidden), "leaked speculative transcript: {hidden}");
+            }
+            interactive
+                .response_tx
+                .send(Err(crate::server::RunnerTurnError {
+                    message: "stop after context assertion".into(),
+                    turn_events: Vec::new(),
+                    effect_journal: Vec::new(),
+                }))
+                .unwrap();
+        });
+
+        let speculative = submit_named_brain_event(
+            &store,
+            &runners,
+            &crate::server::BrainApprovalBroker::default(),
+            "shared",
+            &driver,
+            BrainEventKind::SpeculativePrompt {
+                text: "spec-only-prompt".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            speculative.run.unwrap().kind,
+            crate::brain::store::BrainRunKind::Speculative
+        );
+        submit_named_brain_event(
+            &store,
+            &runners,
+            &crate::server::BrainApprovalBroker::default(),
+            "shared",
+            &driver,
+            BrainEventKind::Prompt {
+                text: "ordinary follow-up".into(),
+            },
+        )
+        .await
+        .unwrap();
+        runner.await.unwrap();
     }
 
     #[tokio::test]

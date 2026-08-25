@@ -2580,6 +2580,13 @@ Rules:\n\
                             self.render_tui().await?;
                         }
                     }
+                    Command::BrainSpeculate(prompt) => {
+                        if let Err(error) = self.handle_brain_speculate(prompt).await {
+                            self.output_manager
+                                .write_info(format!("brain speculate: {error}"));
+                            self.render_tui().await?;
+                        }
+                    }
                     Command::BrainSay(text) => {
                         if let Err(error) = self.handle_brain_say(text).await {
                             self.output_manager.write_info(format!("brain say: {error}"));
@@ -5606,6 +5613,9 @@ Rules:\n\
                 text.clone(),
                 true,
             ),
+            BrainEventKind::SpeculativePrompt { text } => self
+                .output_manager
+                .write_brain_participant(sender.clone(), format!("[speculative] {text}"), false),
             BrainEventKind::ParticipantMessage { text } => self
                 .output_manager
                 .write_brain_participant(sender, text.clone(), false),

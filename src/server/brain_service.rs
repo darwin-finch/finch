@@ -470,6 +470,24 @@ impl BrainLifecycleService {
             .await
     }
 
+    /// Explicitly start one cancellable speculative helper through the same
+    /// authoritative submission and runner path as every other Brain turn.
+    pub async fn start_speculative(
+        &self,
+        brain: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        prompt: String,
+    ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
+        self.submit(
+            brain,
+            attachment_id,
+            connection_id,
+            BrainEventKind::SpeculativePrompt { text: prompt },
+        )
+        .await
+    }
+
     pub(crate) async fn submit_with_authority(
         &self,
         brain: &str,
@@ -749,6 +767,171 @@ mod tests {
         assert_eq!(created.revision, 0);
         assert!(created.events.is_empty());
         assert!(service.create("review").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_speculative_run_is_durable_inspectable_and_cancellable_after_restart() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let make_service = || {
+            BrainLifecycleService::new(
+                BrainStore::with_root("box.local", Some(root.clone())),
+                BrainRunnerBroker::default(),
+                BrainApprovalBroker::default(),
+            )
+        };
+        let service = make_service();
+        let driver = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let connection_id = driver.connection_id.unwrap();
+        let _watch = service
+            .watch("shared", driver.attachment_id, connection_id)
+            .unwrap();
+
+        let outcome = service
+            .start_speculative(
+                "shared",
+                driver.attachment_id,
+                connection_id,
+                "inspect likely context".into(),
+            )
+            .await
+            .unwrap();
+        let run = outcome.run.unwrap();
+        assert_eq!(run.kind, BrainRunKind::Speculative);
+        assert_eq!(run.status, BrainRunStatus::QueuedForEnvironment);
+        assert_eq!(run.request_seq, outcome.accepted.seq);
+        assert!(matches!(
+            outcome.accepted.kind,
+            BrainEventKind::SpeculativePrompt { ref text } if text == "inspect likely context"
+        ));
+        assert_eq!(
+            service.inspect_run("shared", run.run_id).unwrap().run_id,
+            run.run_id
+        );
+        assert!(service
+            .snapshot("shared")
+            .unwrap()
+            .runs
+            .iter()
+            .any(|candidate| candidate.run_id == run.run_id));
+
+        drop(service);
+        let restarted = make_service();
+        let restored = restarted.inspect_run("shared", run.run_id).unwrap();
+        assert_eq!(restored, run);
+        let driver = restarted
+            .attach(
+                "shared",
+                "alice",
+                AttachmentRole::Driver,
+                Some(driver.attachment_id),
+            )
+            .unwrap();
+        let connection_id = driver.connection_id.unwrap();
+        let _watch = restarted
+            .watch("shared", driver.attachment_id, connection_id)
+            .unwrap();
+        let cancelled = restarted
+            .cancel_run("shared", driver.attachment_id, connection_id, run.run_id)
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status, BrainRunStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn running_speculative_cancellation_suppresses_a_late_runner_result() {
+        let service = service();
+        let driver = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let connection_id = driver.connection_id.unwrap();
+        let _watch = service
+            .watch("shared", driver.attachment_id, connection_id)
+            .unwrap();
+        let environment = service.store.environment().clone();
+        let lease = service
+            .acquire_runner("shared", "runner", &environment, None, 60_000)
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        service.runners.register("shared", lease.lease_id, tx);
+        let driver_id = driver.attachment_id;
+
+        let submitting = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .start_speculative(
+                        "shared",
+                        driver_id,
+                        connection_id,
+                        "look ahead".into(),
+                    )
+                    .await
+            })
+        };
+        let crate::server::RunnerRequest::Turn(turn) = rx.recv().await.unwrap() else {
+            panic!("expected speculative turn")
+        };
+        let run_id = turn.run_id;
+        assert_eq!(turn.prompt, "look ahead");
+
+        let cancelling = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .cancel_run("shared", driver_id, connection_id, run_id)
+                    .await
+            })
+        };
+        let crate::server::RunnerRequest::Cancel(cancel) = rx.recv().await.unwrap() else {
+            panic!("expected cancellation request")
+        };
+        assert_eq!(cancel.run_id, run_id);
+        cancel.response_tx.send(Ok(true)).unwrap();
+        assert_eq!(
+            cancelling.await.unwrap().unwrap().status,
+            BrainRunStatus::Cancelled
+        );
+
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let checkpoint = runtime
+            .revision_history()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        turn.response_tx
+            .send(Ok(crate::server::RunnerTurnResult {
+                source: "(say \"late\")".into(),
+                language: ProgramLanguage::Lisp,
+                output: "late".into(),
+                turn_events: Vec::new(),
+                runtime_revision: 0,
+                checkpoint,
+                effect_journal: Vec::new(),
+                commit_ack: None,
+            }))
+            .unwrap();
+        let outcome = submitting.await.unwrap().unwrap();
+        assert!(outcome.result.is_none());
+        let snapshot = service.snapshot("shared").unwrap();
+        assert_eq!(
+            snapshot
+                .runs
+                .iter()
+                .find(|run| run.run_id == run_id)
+                .unwrap()
+                .status,
+            BrainRunStatus::Cancelled
+        );
+        assert!(!snapshot.events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                BrainEventKind::Result { output, .. } if output == "late"
+            )
+        }));
     }
 
     #[tokio::test]

@@ -785,6 +785,19 @@ impl EventLoop {
         self.render_tui().await
     }
 
+    async fn handle_brain_speculate(&mut self, prompt: String) -> Result<()> {
+        let client = self
+            .selected_brain()
+            .cloned()
+            .context("no Brain is attached")?;
+        let run = client.start_speculative(prompt).await?;
+        self.output_manager.write_info(format!(
+            "speculative run {} is {:?}",
+            run.run_id.0, run.status
+        ));
+        self.render_tui().await
+    }
+
     async fn handle_brain_initialize(&mut self) -> Result<()> {
         let client = self
             .selected_brain()

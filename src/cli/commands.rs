@@ -57,6 +57,7 @@ pub enum Command {
     BrainRuns,                     // /brain runs — list runs in the attached Brain
     BrainInitialize,               // /brain initialize — schedule reviewed initialization
     BrainRunCancel(String),        // /brain cancel <run-id-prefix>
+    BrainSpeculate(String),        // /brain speculate <prompt>
     BrainSay(String),              // /say <text> — relay without scheduling an LLM turn
     BrainWho,                      // /who — list connected Brain participants
     BrainWhois(String),            // /whois <subject> — inspect public Brain presence
@@ -345,6 +346,12 @@ impl Command {
                 return Some(Command::BrainRunCancel(run.to_string()));
             }
         }
+        if let Some(rest) = trimmed.strip_prefix("/brain speculate ") {
+            let prompt = rest.trim();
+            if !prompt.is_empty() {
+                return Some(Command::BrainSpeculate(prompt.to_string()));
+            }
+        }
         if let Some(rest) = trimmed.strip_prefix("/brain handoff accept ") {
             let handoff = rest.trim();
             if !handoff.is_empty() {
@@ -607,6 +614,7 @@ pub fn handle_command(
         | Command::BrainRuns
         | Command::BrainInitialize
         | Command::BrainRunCancel(_)
+        | Command::BrainSpeculate(_)
         | Command::BrainSay(_)
         | Command::BrainWho
         | Command::BrainWhois(_)
@@ -788,6 +796,7 @@ pub fn format_help() -> String {
          {cyan}  /brain runs{reset}        List runs in the attached Brain\n\
          {cyan}  /brain initialize{reset}  Schedule reviewed initialization (driver only)\n\
          {cyan}  /brain cancel <run>{reset} Cancel an initiated run by id prefix\n\
+         {cyan}  /brain speculate <prompt>{reset} Start an explicit speculative helper run\n\
          {cyan}  /say <text>{reset}         Relay text without invoking the model\n\
          {cyan}  @finch <prompt>{reset}      Explicitly address the model in shared conversation\n\
          {cyan}  /who{reset}                List connected participants in this Brain\n\
@@ -1225,6 +1234,10 @@ mod tests {
         assert!(matches!(
             Command::parse("/brain cancel 1234abcd"),
             Some(Command::BrainRunCancel(prefix)) if prefix == "1234abcd"
+        ));
+        assert!(matches!(
+            Command::parse("/brain speculate inspect nearby context"),
+            Some(Command::BrainSpeculate(prompt)) if prompt == "inspect nearby context"
         ));
         assert!(matches!(
             Command::parse("/brain archive old-project"),
