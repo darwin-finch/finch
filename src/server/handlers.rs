@@ -254,7 +254,8 @@ struct IssueNamedBrainCredentialResponse {
 
 #[derive(Debug, Deserialize)]
 struct RevokeDelegatedNamedBrainCredentialRequest {
-    credential: String,
+    credential: Option<String>,
+    invitation: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -496,17 +497,52 @@ async fn revoke_delegated_named_brain_credential(
         crate::brain::credential::BrainCredentialScope::BrainControl,
     )?;
     require_unbound_administrative_credential(&delegator)?;
-    let descendant = server
-        .brain_credentials()
-        .verify(&request.credential, unix_epoch_millis())
-        .map_err(|error| brain_auth_error(StatusCode::UNAUTHORIZED, error.to_string()))?;
-    if descendant.credential_id != credential_id
-        || descendant.brain_id != delegator.brain_id
-        || descendant.brain != delegator.brain
-        || descendant.environment_generation != delegator.environment_generation
-        || !descendant
-            .delegation_chain
-            .contains(&delegator.credential_id)
+    let now_ms = unix_epoch_millis();
+    let (descendant_id, brain_id, brain, generation, delegation_chain) = match request {
+        RevokeDelegatedNamedBrainCredentialRequest {
+            credential: Some(credential),
+            invitation: None,
+        } => {
+            let claims = server
+                .brain_credentials()
+                .verify(&credential, now_ms)
+                .map_err(|error| brain_auth_error(StatusCode::UNAUTHORIZED, error.to_string()))?;
+            (
+                claims.credential_id,
+                claims.brain_id,
+                claims.brain,
+                claims.environment_generation,
+                claims.delegation_chain,
+            )
+        }
+        RevokeDelegatedNamedBrainCredentialRequest {
+            credential: None,
+            invitation: Some(invitation),
+        } => {
+            let claims = server
+                .brain_credentials()
+                .verify_invitation_descendant_proof(&invitation, now_ms)
+                .map_err(|error| brain_auth_error(StatusCode::UNAUTHORIZED, error.to_string()))?;
+            (
+                claims.invitation_id,
+                claims.brain_id,
+                claims.brain,
+                claims.environment_generation,
+                claims.delegation_chain,
+            )
+        }
+        _ => {
+            return Err(brain_auth_error(
+                StatusCode::BAD_REQUEST,
+                "supply exactly one credential or invitation descendant proof",
+            ));
+        }
+    };
+    if descendant_id != credential_id
+        || brain_id != delegator.brain_id
+        || brain != delegator.brain
+        || generation != delegator.environment_generation
+        || !delegation_chain.contains(&delegator.credential_id)
     {
         return Err(brain_auth_error(
             StatusCode::FORBIDDEN,
