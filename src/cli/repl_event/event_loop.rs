@@ -197,7 +197,7 @@ pub struct EventLoop {
 
     /// Cancellation controls for typed programs delegated by the Brain daemon.
     pending_named_brain_programs:
-        std::collections::HashMap<crate::brain::shared::RunId, tokio_util::sync::CancellationToken>,
+        std::collections::HashMap<crate::brain::store::RunId, tokio_util::sync::CancellationToken>,
 
     /// Source/output already rendered while this frontend serviced its home
     /// Brain callback. Matching canonical events advance this marker without
@@ -304,7 +304,7 @@ pub struct EventLoop {
     /// Whether this frontend currently holds the daemon-issued lease for its
     /// home Brain. The UI never infers runner status from local process role.
     home_runner_lease_active: bool,
-    home_runner_lease_id: Option<crate::brain::shared::RunnerLeaseId>,
+    home_runner_lease_id: Option<crate::brain::store::RunnerLeaseId>,
     /// Exact Brain currently served by this frontend's ProgramRuntime. This
     /// starts as the home Brain but may change through an addressed handoff.
     runner_brain: Option<String>,
@@ -418,7 +418,7 @@ fn finch_addressed_prompt(input: &str) -> Option<&str> {
 }
 
 fn approval_audience_summary(
-    audience: &crate::brain::shared::BrainApprovalAudience,
+    audience: &crate::brain::store::BrainApprovalAudience,
 ) -> String {
     format!(
         "Brain: {} ({})\nApproval audience: {} ({:?}, attachment {})\nEnvironment generation: {}",
@@ -447,7 +447,7 @@ fn vm_approval_choices(prompt: &crate::vm::ApprovalPrompt) -> Vec<crate::vm::App
 
 fn vm_approval_dialog(
     prompt: &crate::vm::ApprovalPrompt,
-    audience: Option<&crate::brain::shared::BrainApprovalAudience>,
+    audience: Option<&crate::brain::store::BrainApprovalAudience>,
     runtime: &crate::runtime::ProgramRuntime,
 ) -> crate::cli::tui::Dialog {
     use crate::cli::tui::{Dialog, DialogOption};
@@ -520,7 +520,7 @@ struct DeferredVmApproval {
 }
 
 struct PendingNamedBrainTurn {
-    run_id: crate::brain::shared::RunId,
+    run_id: crate::brain::store::RunId,
     response_tx: tokio::sync::oneshot::Sender<
         std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError>,
     >,
@@ -533,7 +533,7 @@ struct PendingNamedBrainTurn {
     /// Keep the correlation record until cancellation reaches a terminal VM
     /// boundary and all execute-once effects have been collected.
     cancellation_requested: bool,
-    approval_audience: crate::brain::shared::BrainApprovalAudience,
+    approval_audience: crate::brain::store::BrainApprovalAudience,
     approval_tx: Option<
         tokio::sync::mpsc::UnboundedSender<crate::server::RunnerApprovalRequest>,
     >,
@@ -544,7 +544,7 @@ struct RemoteBrainApproval {
     client: crate::brain::remote::AttachedBrainClient,
     request_seq: u64,
     approval_id: String,
-    audience: crate::brain::shared::BrainApprovalAudience,
+    audience: crate::brain::store::BrainApprovalAudience,
     kind: RemoteBrainApprovalKind,
 }
 
@@ -580,21 +580,21 @@ enum LocalProjectionMatch {
 }
 
 impl LocalBrainProjection {
-    fn observe(&mut self, event: &crate::brain::shared::BrainEvent) -> LocalProjectionMatch {
+    fn observe(&mut self, event: &crate::brain::store::BrainEvent) -> LocalProjectionMatch {
         match &event.kind {
-            crate::brain::shared::BrainEventKind::ToolCall { tool_id, .. }
-            | crate::brain::shared::BrainEventKind::ToolResult { tool_id, .. }
+            crate::brain::store::BrainEventKind::ToolCall { tool_id, .. }
+            | crate::brain::store::BrainEventKind::ToolResult { tool_id, .. }
                 if self.tool_ids.contains(tool_id) =>
             {
                 LocalProjectionMatch::Suppress
             }
-            crate::brain::shared::BrainEventKind::ApprovalRequested { approval_id, .. }
-            | crate::brain::shared::BrainEventKind::ApprovalDecided { approval_id, .. }
+            crate::brain::store::BrainEventKind::ApprovalRequested { approval_id, .. }
+            | crate::brain::store::BrainEventKind::ApprovalDecided { approval_id, .. }
                 if self.approval_ids.contains(approval_id) =>
             {
                 LocalProjectionMatch::Suppress
             }
-            crate::brain::shared::BrainEventKind::Program { source, .. }
+            crate::brain::store::BrainEventKind::Program { source, .. }
                 if event.sender == "provider"
                     && self.program_seq.is_none()
                     && self.source == *source =>
@@ -602,7 +602,7 @@ impl LocalBrainProjection {
                 self.program_seq = Some(event.seq);
                 LocalProjectionMatch::Suppress
             }
-            crate::brain::shared::BrainEventKind::Result {
+            crate::brain::store::BrainEventKind::Result {
                 request_seq,
                 output,
                 error,
@@ -1506,7 +1506,7 @@ impl EventLoop {
                                 let event_tx = self.event_tx.clone();
                                 tokio::task::spawn_local(async move {
                                     if let Err(error) = client
-                                        .push(crate::brain::shared::BrainEventKind::ApprovalDecided {
+                                        .push(crate::brain::store::BrainEventKind::ApprovalDecided {
                                             request_seq: pending.request_seq,
                                             approval_id: pending.approval_id,
                                             decision,
@@ -2154,8 +2154,8 @@ Rules:\n\
                     }
                     Command::ForthEval(code) => {
                         if self.selected_brain().is_some() {
-                            self.push_remote_brain(crate::brain::shared::BrainEventKind::Program {
-                                language: crate::brain::shared::ProgramLanguage::Forth,
+                            self.push_remote_brain(crate::brain::store::BrainEventKind::Program {
+                                language: crate::brain::store::ProgramLanguage::Forth,
                                 source: code,
                             })
                             .await?;
@@ -2294,8 +2294,8 @@ Rules:\n\
         if input.trim().starts_with(": ") {
             if self.selected_brain().is_some() {
                 return self
-                    .push_remote_brain(crate::brain::shared::BrainEventKind::Program {
-                        language: crate::brain::shared::ProgramLanguage::Forth,
+                    .push_remote_brain(crate::brain::store::BrainEventKind::Program {
+                        language: crate::brain::store::ProgramLanguage::Forth,
                         source: input,
                     })
                     .await;
@@ -2329,8 +2329,8 @@ Rules:\n\
         if input.trim_start().starts_with('(') {
             if self.selected_brain().is_some() {
                 return self
-                    .push_remote_brain(crate::brain::shared::BrainEventKind::Program {
-                        language: crate::brain::shared::ProgramLanguage::Lisp,
+                    .push_remote_brain(crate::brain::store::BrainEventKind::Program {
+                        language: crate::brain::store::ProgramLanguage::Lisp,
                         source: input,
                     })
                     .await;
@@ -2431,7 +2431,7 @@ Rules:\n\
     ) -> Result<()> {
         if self.selected_brain().is_some() {
             return self
-                .push_remote_brain(crate::brain::shared::BrainEventKind::Prompt { text: input })
+                .push_remote_brain(crate::brain::store::BrainEventKind::Prompt { text: input })
                 .await;
         }
 
@@ -3370,10 +3370,10 @@ Rules:\n\
                 let is_current = self.selected_brain_matches(&target);
                 if is_current {
                     let acknowledged_seq = match &message {
-                        crate::brain::shared::BrainWireMessage::Snapshot { brain } => {
+                        crate::brain::store::BrainWireMessage::Snapshot { brain } => {
                             brain.revision
                         }
-                        crate::brain::shared::BrainWireMessage::Event { event } => event.seq,
+                        crate::brain::store::BrainWireMessage::Event { event } => event.seq,
                     };
                     self.render_remote_brain_message(message).await?;
                     if let Some(client) = self.selected_brain_mut() {
@@ -3523,10 +3523,10 @@ Rules:\n\
             .insert(run_id, cancel.clone());
         tokio::spawn(async move {
             let language = match request.language {
-                crate::brain::shared::ProgramLanguage::Forth => {
+                crate::brain::store::ProgramLanguage::Forth => {
                     crate::programs::ProgramLanguage::Forth
                 }
-                crate::brain::shared::ProgramLanguage::Lisp => {
+                crate::brain::store::ProgramLanguage::Lisp => {
                     crate::programs::ProgramLanguage::Lisp
                 }
             };
@@ -3752,10 +3752,10 @@ Rules:\n\
                 .ok_or_else(|| anyhow::anyhow!("named Brain turn produced no wire source"))?;
             let language = match crate::programs::ProgramLanguage::infer_wire_source(&source)? {
                 crate::programs::ProgramLanguage::Forth => {
-                    crate::brain::shared::ProgramLanguage::Forth
+                    crate::brain::store::ProgramLanguage::Forth
                 }
                 crate::programs::ProgramLanguage::Lisp => {
-                    crate::brain::shared::ProgramLanguage::Lisp
+                    crate::brain::store::ProgramLanguage::Lisp
                 }
             };
             let runtime_revision = self.program_runtime.revision();
@@ -3828,7 +3828,7 @@ Rules:\n\
         query_id: Uuid,
         tool_id: String,
         proposal: DeferredProposal,
-        approval_audience: Option<crate::brain::shared::BrainApprovalAudience>,
+        approval_audience: Option<crate::brain::store::BrainApprovalAudience>,
     ) {
         let event_tx = self.event_tx.clone();
         let runtime = Arc::clone(&self.program_runtime);
@@ -4178,7 +4178,7 @@ Rules:\n\
             client
                 .attach_persistent(
                     &self.participant_subject,
-                    crate::brain::shared::AttachmentRole::Driver,
+                    crate::brain::store::AttachmentRole::Driver,
                     &self.session_label,
                 )
                 .await
@@ -4204,8 +4204,8 @@ Rules:\n\
             }
         };
         let snapshot = match incoming.recv().await {
-            Some(crate::brain::shared::BrainWireMessage::Snapshot { brain }) => brain,
-            Some(crate::brain::shared::BrainWireMessage::Event { .. }) => {
+            Some(crate::brain::store::BrainWireMessage::Snapshot { brain }) => brain,
+            Some(crate::brain::store::BrainWireMessage::Event { .. }) => {
                 self.output_manager.write_info(format!(
                     "brain attach {}: event stream did not begin with a snapshot",
                     client.target.display_name()
@@ -4228,7 +4228,7 @@ Rules:\n\
         let runner_online = snapshot.runner_lease.is_some();
         self.active_remote_brain = Some(client);
         self.update_remote_brain_status(runner_online);
-        self.render_remote_brain_message(crate::brain::shared::BrainWireMessage::Snapshot {
+        self.render_remote_brain_message(crate::brain::store::BrainWireMessage::Snapshot {
             brain: snapshot,
         })
         .await?;
@@ -4264,9 +4264,9 @@ Rules:\n\
             );
         }
         let role = match role.to_ascii_lowercase().as_str() {
-            "driver" => crate::brain::shared::AttachmentRole::Driver,
-            "consultant" => crate::brain::shared::AttachmentRole::Consultant,
-            "observer" => crate::brain::shared::AttachmentRole::Observer,
+            "driver" => crate::brain::store::AttachmentRole::Driver,
+            "consultant" => crate::brain::store::AttachmentRole::Consultant,
+            "observer" => crate::brain::store::AttachmentRole::Observer,
             _ => anyhow::bail!("role must be driver, consultant, or observer"),
         };
         let home = self
@@ -4321,7 +4321,7 @@ Rules:\n\
         if let Some(home) = self.home_brain.as_ref() {
             let snapshot = home.snapshot().await?;
             self.render_remote_brain_message(
-                crate::brain::shared::BrainWireMessage::Snapshot {
+                crate::brain::store::BrainWireMessage::Snapshot {
                     brain: snapshot.clone(),
                 },
             )
@@ -4413,7 +4413,7 @@ Rules:\n\
 
     async fn push_remote_brain(
         &mut self,
-        kind: crate::brain::shared::BrainEventKind,
+        kind: crate::brain::store::BrainEventKind,
     ) -> Result<()> {
         let Some(client) = self.selected_brain().cloned() else {
             return Ok(());
@@ -4433,10 +4433,10 @@ Rules:\n\
 
     async fn render_remote_brain_message(
         &mut self,
-        message: crate::brain::shared::BrainWireMessage,
+        message: crate::brain::store::BrainWireMessage,
     ) -> Result<()> {
         match message {
-            crate::brain::shared::BrainWireMessage::Snapshot { brain } => {
+            crate::brain::store::BrainWireMessage::Snapshot { brain } => {
                 self.update_remote_brain_status(brain.runner_lease.is_some());
                 let acknowledged_seq = self
                     .selected_brain()
@@ -4458,12 +4458,12 @@ Rules:\n\
                     self.observe_remote_brain_approval(event);
                 }
             }
-            crate::brain::shared::BrainWireMessage::Event { event } => {
+            crate::brain::store::BrainWireMessage::Event { event } => {
                 match &event.kind {
-                    crate::brain::shared::BrainEventKind::RunnerLeaseAcquired { .. } => {
+                    crate::brain::store::BrainEventKind::RunnerLeaseAcquired { .. } => {
                         self.update_remote_brain_status(true);
                     }
-                    crate::brain::shared::BrainEventKind::RunnerLeaseReleased { .. } => {
+                    crate::brain::store::BrainEventKind::RunnerLeaseReleased { .. } => {
                         self.update_remote_brain_status(false);
                     }
                     _ => {}
@@ -4476,8 +4476,8 @@ Rules:\n\
         self.render_tui().await
     }
 
-    fn observe_remote_brain_approval(&mut self, event: &crate::brain::shared::BrainEvent) {
-        use crate::brain::shared::BrainEventKind;
+    fn observe_remote_brain_approval(&mut self, event: &crate::brain::store::BrainEvent) {
+        use crate::brain::store::BrainEventKind;
 
         match &event.kind {
             BrainEventKind::ApprovalRequested {
@@ -4631,8 +4631,8 @@ Rules:\n\
         );
     }
 
-    fn render_remote_brain_event(&mut self, event: &crate::brain::shared::BrainEvent) {
-        use crate::brain::shared::BrainEventKind;
+    fn render_remote_brain_event(&mut self, event: &crate::brain::store::BrainEvent) {
+        use crate::brain::store::BrainEventKind;
         match &event.kind {
             BrainEventKind::RunnerLeaseAcquired { lease } => self.output_manager.write_info(
                 format!("{} is the active environment runner", lease.subject),
@@ -4671,7 +4671,7 @@ Rules:\n\
                 .write_info(format!("attachment {} disconnected", attachment_id.0)),
             BrainEventKind::RunStarted { run }
                 if run.status
-                    == crate::brain::shared::BrainRunStatus::QueuedForEnvironment =>
+                    == crate::brain::store::BrainRunStatus::QueuedForEnvironment =>
             {
                 let run_id = run.run_id.0.to_string();
                 self.output_manager.write_info(format!(
@@ -4681,7 +4681,7 @@ Rules:\n\
             }
             BrainEventKind::RunStatusChanged {
                 run_id,
-                status: crate::brain::shared::BrainRunStatus::Running,
+                status: crate::brain::store::BrainRunStatus::Running,
                 ..
             } => {
                 let run_id = run_id.0.to_string();
@@ -4690,7 +4690,7 @@ Rules:\n\
             }
             BrainEventKind::RunStatusChanged {
                 run_id,
-                status: crate::brain::shared::BrainRunStatus::Interrupted,
+                status: crate::brain::store::BrainRunStatus::Interrupted,
                 detail,
             } => {
                 let run_id = run_id.0.to_string();
@@ -4870,8 +4870,8 @@ Rules:\n\
                     return;
                 }
                 let language = match language {
-                    crate::brain::shared::ProgramLanguage::Forth => "forth",
-                    crate::brain::shared::ProgramLanguage::Lisp => "lisp",
+                    crate::brain::store::ProgramLanguage::Forth => "forth",
+                    crate::brain::store::ProgramLanguage::Lisp => "lisp",
                 };
                 let unit = self
                     .output_manager
@@ -6664,11 +6664,11 @@ mod tests {
     fn brain_event(
         seq: u64,
         sender: &str,
-        kind: crate::brain::shared::BrainEventKind,
-    ) -> crate::brain::shared::BrainEvent {
-        crate::brain::shared::BrainEvent {
+        kind: crate::brain::store::BrainEventKind,
+    ) -> crate::brain::store::BrainEvent {
+        crate::brain::store::BrainEvent {
             schema_version: 1,
-            brain_id: crate::brain::shared::BrainId(uuid::Uuid::nil()),
+            brain_id: crate::brain::store::BrainId(uuid::Uuid::nil()),
             seq,
             environment_generation: 1,
             sender: sender.into(),
@@ -6689,8 +6689,8 @@ mod tests {
         let program = brain_event(
             12,
             "provider",
-            crate::brain::shared::BrainEventKind::Program {
-                language: crate::brain::shared::ProgramLanguage::Lisp,
+            crate::brain::store::BrainEventKind::Program {
+                language: crate::brain::store::ProgramLanguage::Lisp,
                 source: "(say \"hello\")".into(),
             },
         );
@@ -6703,7 +6703,7 @@ mod tests {
         let result = brain_event(
             14,
             "daemon",
-            crate::brain::shared::BrainEventKind::Result {
+            crate::brain::store::BrainEventKind::Result {
                 request_seq: 12,
                 output: "hello".into(),
                 error: None,
@@ -6727,7 +6727,7 @@ mod tests {
         let result = brain_event(
             14,
             "daemon",
-            crate::brain::shared::BrainEventKind::Result {
+            crate::brain::store::BrainEventKind::Result {
                 request_seq: 12,
                 output: "different".into(),
                 error: None,

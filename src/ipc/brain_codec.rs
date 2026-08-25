@@ -1,4 +1,4 @@
-use crate::brain::shared::{
+use crate::brain::store::{
     AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
     BrainEvent, BrainEventKind, BrainId, BrainProgram, BrainRun, BrainRunKind, BrainRunStatus,
     BrainRunnerHandoff, BrainRunnerLease, BrainSnapshot, BrainWireMessage, ConnectionId,

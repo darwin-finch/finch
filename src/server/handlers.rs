@@ -211,7 +211,7 @@ fn authorize_named_brain(
         .verify(token, unix_epoch_millis())
         .map_err(|error| brain_auth_error(StatusCode::UNAUTHORIZED, error.to_string()))?;
     let snapshot = server
-        .shared_brains()
+        .brain_store()
         .snapshot(name)
         .map_err(|error| AppError(error).into_response())?;
     claims
@@ -233,7 +233,7 @@ const MAX_BRAIN_INVITATION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 #[derive(Debug, Deserialize)]
 struct IssueNamedBrainCredentialRequest {
     subject: String,
-    role: crate::brain::shared::AttachmentRole,
+    role: crate::brain::store::AttachmentRole,
     scopes: Option<std::collections::BTreeSet<crate::brain::credential::BrainCredentialScope>>,
     ttl_ms: Option<u64>,
 }
@@ -246,7 +246,7 @@ struct IssueNamedBrainCredentialResponse {
 
 #[derive(Debug, Deserialize)]
 struct IssueNamedBrainInvitationRequest {
-    role: crate::brain::shared::AttachmentRole,
+    role: crate::brain::store::AttachmentRole,
     scopes: Option<std::collections::BTreeSet<crate::brain::credential::BrainCredentialScope>>,
     ttl_ms: Option<u64>,
 }
@@ -265,7 +265,7 @@ struct RedeemNamedBrainInvitationRequest {
 
 fn claims_match_attachment(
     claims: &crate::brain::credential::BrainCredentialClaims,
-    attachment: &crate::brain::shared::BrainAttachment,
+    attachment: &crate::brain::store::BrainAttachment,
 ) -> Result<(), Response> {
     claims
         .require_participant(&attachment.subject, attachment.role)
@@ -285,14 +285,14 @@ async fn issue_named_brain_credential(
     Path(name): Path<String>,
     Json(request): Json<IssueNamedBrainCredentialRequest>,
 ) -> Result<Json<IssueNamedBrainCredentialResponse>, Response> {
-    if request.role == crate::brain::shared::AttachmentRole::Runner {
+    if request.role == crate::brain::store::AttachmentRole::Runner {
         return Err(brain_auth_error(
             StatusCode::BAD_REQUEST,
             "runner authority cannot be minted as a participant credential",
         ));
     }
     let snapshot = server
-        .shared_brains()
+        .brain_store()
         .snapshot(&name)
         .map_err(|error| AppError(error).into_response())?;
     let now_ms = unix_epoch_millis();
@@ -371,14 +371,14 @@ async fn issue_named_brain_invitation(
     Path(name): Path<String>,
     Json(request): Json<IssueNamedBrainInvitationRequest>,
 ) -> Result<Json<IssueNamedBrainInvitationResponse>, Response> {
-    if request.role == crate::brain::shared::AttachmentRole::Runner {
+    if request.role == crate::brain::store::AttachmentRole::Runner {
         return Err(brain_auth_error(
             StatusCode::BAD_REQUEST,
             "runner authority cannot be delegated through a Brain invitation",
         ));
     }
     let snapshot = server
-        .shared_brains()
+        .brain_store()
         .snapshot(&name)
         .map_err(|error| AppError(error).into_response())?;
     let now_ms = unix_epoch_millis();
@@ -460,7 +460,7 @@ async fn redeem_named_brain_invitation(
         .inspect_invitation(&request.invitation, now_ms)
         .map_err(|error| brain_auth_error(StatusCode::UNAUTHORIZED, error.to_string()))?;
     let snapshot = server
-        .shared_brains()
+        .brain_store()
         .snapshot(&invitation.brain)
         .map_err(|error| AppError(error).into_response())?;
     if invitation.brain_id != snapshot.brain_id
@@ -495,10 +495,10 @@ async fn revoke_named_brain_credential(
 #[derive(Debug, Serialize)]
 struct NamedBrainListEntry {
     name: String,
-    environment: crate::brain::shared::BrainEnvironment,
+    environment: crate::brain::store::BrainEnvironment,
     event_revision: u64,
     retained_programs: usize,
-    runner: Option<crate::brain::shared::BrainRunnerLease>,
+    runner: Option<crate::brain::store::BrainRunnerLease>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -511,7 +511,7 @@ async fn create_named_brain(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<CreateNamedBrainRequest>,
-) -> Result<(StatusCode, Json<crate::brain::shared::BrainSnapshot>), Response> {
+) -> Result<(StatusCode, Json<crate::brain::store::BrainSnapshot>), Response> {
     check_brain_bootstrap_access(&server, addr, &headers).await?;
     let snapshot = crate::server::BrainLifecycleService::from_server(&server)
         .create(&request.name)
@@ -528,12 +528,12 @@ async fn list_named_brains(
     check_brain_bootstrap_access(&server, addr, &headers).await?;
     let mut result = Vec::new();
     for name in server
-        .shared_brains()
+        .brain_store()
         .list()
         .map_err(|error| AppError(error).into_response())?
     {
         let snapshot = server
-            .shared_brains()
+            .brain_store()
             .snapshot(&name)
             .map_err(|error| AppError(error).into_response())?;
         result.push(NamedBrainListEntry {
@@ -551,7 +551,7 @@ async fn get_named_brain(
     State(server): State<Arc<AgentServer>>,
     headers: HeaderMap,
     Path(name): Path<String>,
-) -> Result<Json<crate::brain::shared::BrainSnapshot>, Response> {
+) -> Result<Json<crate::brain::store::BrainSnapshot>, Response> {
     authorize_named_brain(
         &server,
         &headers,
@@ -559,7 +559,7 @@ async fn get_named_brain(
         crate::brain::credential::BrainCredentialScope::BrainRead,
     )?;
     server
-        .shared_brains()
+        .brain_store()
         .snapshot(&name)
         .map(Json)
         .map_err(|error| AppError(error).into_response())
@@ -577,7 +577,7 @@ async fn get_named_brain_capabilities(
         crate::brain::credential::BrainCredentialScope::BrainRead,
     )?;
     let snapshot = server
-        .shared_brains()
+        .brain_store()
         .snapshot(&name)
         .map_err(|error| AppError(error).into_response())?;
     Ok(Json(crate::brain::remote::RemoteBrainCapabilities {
@@ -593,13 +593,13 @@ async fn get_named_brain_capabilities(
 #[derive(Debug, Deserialize)]
 struct AttachNamedBrainRequest {
     subject: String,
-    role: crate::brain::shared::AttachmentRole,
-    attachment_id: Option<crate::brain::shared::AttachmentId>,
+    role: crate::brain::store::AttachmentRole,
+    attachment_id: Option<crate::brain::store::AttachmentId>,
 }
 
 #[derive(Debug, Serialize)]
 struct AttachNamedBrainResponse {
-    attachment: crate::brain::shared::BrainAttachment,
+    attachment: crate::brain::store::BrainAttachment,
     token: String,
     claims: crate::brain::credential::BrainCredentialClaims,
 }
@@ -687,12 +687,12 @@ async fn archive_named_brain(
         crate::brain::credential::BrainCredentialScope::EnvironmentAdmin,
     )?;
     let execution_lock = server
-        .shared_brains()
+        .brain_store()
         .execution_lock(&name)
         .map_err(|error| AppError(error).into_response())?;
     let _turn = execution_lock.lock_owned().await;
     let archived_to = server
-        .shared_brains()
+        .brain_store()
         .archive(&name)
         .map_err(|error| AppError(error).into_response())?;
     Ok(Json(ArchiveNamedBrainResponse {
@@ -702,10 +702,10 @@ async fn archive_named_brain(
 }
 
 fn attachment_can_submit(
-    role: crate::brain::shared::AttachmentRole,
-    kind: &crate::brain::shared::BrainEventKind,
+    role: crate::brain::store::AttachmentRole,
+    kind: &crate::brain::store::BrainEventKind,
 ) -> bool {
-    use crate::brain::shared::{AttachmentRole, BrainEventKind};
+    use crate::brain::store::{AttachmentRole, BrainEventKind};
     match role {
         AttachmentRole::Driver => matches!(
             kind,
@@ -728,14 +728,14 @@ fn attachment_can_submit(
 /// checks, ordering, run creation, queueing, and terminal persistence cannot
 /// diverge by transport.
 pub(crate) async fn submit_named_brain_event(
-    store: &crate::brain::shared::SharedBrainStore,
+    store: &crate::brain::store::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
     approvals: &crate::server::BrainApprovalBroker,
     name: &str,
-    attachment: &crate::brain::shared::BrainAttachment,
-    kind: crate::brain::shared::BrainEventKind,
+    attachment: &crate::brain::store::BrainAttachment,
+    kind: crate::brain::store::BrainEventKind,
 ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
-    use crate::brain::shared::BrainEventKind;
+    use crate::brain::store::BrainEventKind;
 
     if !matches!(
         kind,
@@ -787,14 +787,14 @@ pub(crate) async fn submit_named_brain_event(
         BrainEventKind::Program { .. } | BrainEventKind::Prompt { .. }
     ) {
         let status = if named_brain_runner_is_ready(store, runners, name)? {
-            crate::brain::shared::BrainRunStatus::Running
+            crate::brain::store::BrainRunStatus::Running
         } else {
-            crate::brain::shared::BrainRunStatus::QueuedForEnvironment
+            crate::brain::store::BrainRunStatus::QueuedForEnvironment
         };
         Some(store.start_run(
             name,
             &attachment.subject,
-            crate::brain::shared::BrainRunKind::Interactive,
+            crate::brain::store::BrainRunKind::Interactive,
             accepted.seq,
             attachment.attachment_id,
             status,
@@ -804,7 +804,7 @@ pub(crate) async fn submit_named_brain_event(
     };
 
     let result = match run.as_ref() {
-        Some(run) if run.status == crate::brain::shared::BrainRunStatus::Running => {
+        Some(run) if run.status == crate::brain::store::BrainRunStatus::Running => {
             Some(dispatch_named_brain_run(store, runners, name, run).await)
         }
         Some(_) => None,
@@ -845,7 +845,7 @@ pub(crate) async fn submit_named_brain_event(
 }
 
 fn named_brain_runner_is_ready(
-    store: &crate::brain::shared::SharedBrainStore,
+    store: &crate::brain::store::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
     name: &str,
 ) -> anyhow::Result<bool> {
@@ -853,18 +853,18 @@ fn named_brain_runner_is_ready(
     ensure_named_brain_store_environment(store, &snapshot)?;
     Ok(snapshot.runner_lease.as_ref().is_some_and(|lease| {
         lease.environment_generation == snapshot.environment.generation
-            && lease.expires_ms > crate::brain::shared::unix_millis()
+            && lease.expires_ms > crate::brain::store::unix_millis()
             && runners.has_registration(name, lease.lease_id)
     }))
 }
 
 async fn dispatch_named_brain_run(
-    store: &crate::brain::shared::SharedBrainStore,
+    store: &crate::brain::store::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
     name: &str,
-    run: &crate::brain::shared::BrainRun,
-) -> anyhow::Result<Option<crate::brain::shared::BrainEvent>> {
-    use crate::brain::shared::{BrainEventKind, BrainRunStatus};
+    run: &crate::brain::store::BrainRun,
+) -> anyhow::Result<Option<crate::brain::store::BrainEvent>> {
+    use crate::brain::store::{BrainEventKind, BrainRunStatus};
 
     let snapshot = store.snapshot(name)?;
     let request = match snapshot
@@ -974,12 +974,12 @@ async fn dispatch_named_brain_run(
 /// The exact lease that registered the callback must still be current before
 /// each run begins; work that has not begun remains queued on disconnect.
 pub(crate) async fn resume_queued_named_brain_runs(
-    store: crate::brain::shared::SharedBrainStore,
+    store: crate::brain::store::BrainStore,
     runners: crate::server::BrainRunnerBroker,
     name: String,
-    lease_id: crate::brain::shared::RunnerLeaseId,
+    lease_id: crate::brain::store::RunnerLeaseId,
 ) -> anyhow::Result<usize> {
-    use crate::brain::shared::BrainRunStatus;
+    use crate::brain::store::BrainRunStatus;
 
     let execution_lock = store.execution_lock(&name)?;
     let _turn = execution_lock.lock_owned().await;
@@ -995,7 +995,7 @@ pub(crate) async fn resume_queued_named_brain_runs(
         let lease_is_current = snapshot.runner_lease.as_ref().is_some_and(|lease| {
             lease.lease_id == lease_id
                 && lease.environment_generation == snapshot.environment.generation
-                && lease.expires_ms > crate::brain::shared::unix_millis()
+                && lease.expires_ms > crate::brain::store::unix_millis()
         });
         if !lease_is_current || !runners.has_registration(&name, lease_id) {
             break;
@@ -1009,14 +1009,14 @@ pub(crate) async fn resume_queued_named_brain_runs(
 }
 
 fn commit_named_brain_approval_decision(
-    store: &crate::brain::shared::SharedBrainStore,
+    store: &crate::brain::store::BrainStore,
     approvals: &crate::server::BrainApprovalBroker,
     name: &str,
-    attachment: &crate::brain::shared::BrainAttachment,
+    attachment: &crate::brain::store::BrainAttachment,
     request_seq: u64,
     approval_id: &str,
     decision: serde_json::Value,
-) -> anyhow::Result<crate::brain::shared::BrainEvent> {
+) -> anyhow::Result<crate::brain::store::BrainEvent> {
     let snapshot = store.snapshot(name)?;
     let claimed = approvals.claim(
         snapshot.brain_id,
@@ -1038,7 +1038,7 @@ fn commit_named_brain_approval_decision(
     let accepted = match store.push(
         name,
         &attachment.subject,
-        crate::brain::shared::BrainEventKind::ApprovalDecided {
+        crate::brain::store::BrainEventKind::ApprovalDecided {
             request_seq,
             approval_id: approval_id.to_string(),
             decision: decision.clone(),
@@ -1057,11 +1057,11 @@ fn commit_named_brain_approval_decision(
 }
 
 fn push_named_brain_result(
-    store: &crate::brain::shared::SharedBrainStore,
+    store: &crate::brain::store::BrainStore,
     name: &str,
     request_seq: u64,
     result: anyhow::Result<String>,
-) -> anyhow::Result<crate::brain::shared::BrainEvent> {
+) -> anyhow::Result<crate::brain::store::BrainEvent> {
     let (output, error) = match result {
         Ok(output) => (output, None),
         Err(error) => (String::new(), Some(error.to_string())),
@@ -1069,7 +1069,7 @@ fn push_named_brain_result(
     store.push(
         name,
         "daemon",
-        crate::brain::shared::BrainEventKind::Result {
+        crate::brain::store::BrainEventKind::Result {
             request_seq,
             output,
             error,
@@ -1078,12 +1078,12 @@ fn push_named_brain_result(
 }
 
 async fn dispatch_named_brain_program(
-    store: &crate::brain::shared::SharedBrainStore,
+    store: &crate::brain::store::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
     name: &str,
-    run_id: crate::brain::shared::RunId,
+    run_id: crate::brain::store::RunId,
     request_seq: u64,
-    language: crate::brain::shared::ProgramLanguage,
+    language: crate::brain::store::ProgramLanguage,
     source: &str,
 ) -> anyhow::Result<String> {
     let snapshot = store.snapshot(name)?;
@@ -1093,7 +1093,7 @@ async fn dispatch_named_brain_program(
         .as_ref()
         .filter(|lease| {
             lease.environment_generation == snapshot.environment.generation
-                && lease.expires_ms > crate::brain::shared::unix_millis()
+                && lease.expires_ms > crate::brain::store::unix_millis()
         })
         .map(|lease| lease.lease_id)
         .ok_or_else(|| anyhow::anyhow!("named Brain '{name}' has no live environment runner"))?;
@@ -1139,14 +1139,14 @@ async fn dispatch_named_brain_program(
 }
 
 async fn dispatch_named_brain_turn(
-    store: &crate::brain::shared::SharedBrainStore,
+    store: &crate::brain::store::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
     name: &str,
-    run_id: crate::brain::shared::RunId,
+    run_id: crate::brain::store::RunId,
     request_seq: u64,
     prompt: &str,
-    requester: &crate::brain::shared::BrainAttachment,
-) -> anyhow::Result<crate::brain::shared::BrainEvent> {
+    requester: &crate::brain::store::BrainAttachment,
+) -> anyhow::Result<crate::brain::store::BrainEvent> {
     let snapshot = store.snapshot(name)?;
     ensure_named_brain_store_environment(store, &snapshot)?;
     let lease = snapshot
@@ -1154,12 +1154,12 @@ async fn dispatch_named_brain_turn(
         .as_ref()
         .filter(|lease| {
             lease.environment_generation == snapshot.environment.generation
-                && lease.expires_ms > crate::brain::shared::unix_millis()
+                && lease.expires_ms > crate::brain::store::unix_millis()
         })
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("named Brain '{name}' has no live environment runner"))?;
     let lease_id = lease.lease_id;
-    let approval_audience = crate::brain::shared::BrainApprovalAudience {
+    let approval_audience = crate::brain::store::BrainApprovalAudience {
         brain_id: snapshot.brain_id,
         brain: name.to_string(),
         attachment_id: requester.attachment_id,
@@ -1219,7 +1219,7 @@ async fn dispatch_named_brain_turn(
     let program = store.push(
         name,
         "provider",
-        crate::brain::shared::BrainEventKind::Program {
+        crate::brain::store::BrainEventKind::Program {
             language: outcome.language,
             source: outcome.source,
         },
@@ -1234,7 +1234,7 @@ async fn dispatch_named_brain_turn(
 }
 
 fn persist_named_brain_effect_journal(
-    store: &crate::brain::shared::SharedBrainStore,
+    store: &crate::brain::store::BrainStore,
     name: &str,
     request_seq: u64,
     sender: &str,
@@ -1245,7 +1245,7 @@ fn persist_named_brain_effect_journal(
         .events
         .into_iter()
         .filter_map(|event| match event.kind {
-            crate::brain::shared::BrainEventKind::EffectRecorded {
+            crate::brain::store::BrainEventKind::EffectRecorded {
                 request_seq,
                 execution_id,
                 effect,
@@ -1274,7 +1274,7 @@ fn persist_named_brain_effect_journal(
         store.push(
             name,
             sender,
-            crate::brain::shared::BrainEventKind::EffectRecorded {
+            crate::brain::store::BrainEventKind::EffectRecorded {
                 request_seq,
                 execution_id: record.execution_id,
                 effect: record.entry.effect.clone(),
@@ -1294,11 +1294,11 @@ fn persist_named_brain_effect_journal(
 }
 
 fn persist_named_brain_turn_events(
-    store: &crate::brain::shared::SharedBrainStore,
+    store: &crate::brain::store::BrainStore,
     name: &str,
     request_seq: u64,
     runner_subject: &str,
-    expected_approval_audience: &crate::brain::shared::BrainApprovalAudience,
+    expected_approval_audience: &crate::brain::store::BrainApprovalAudience,
     turn_events: Vec<crate::server::RunnerTurnEvent>,
 ) -> anyhow::Result<()> {
     let mut persisted = store
@@ -1306,22 +1306,22 @@ fn persist_named_brain_turn_events(
         .events
         .into_iter()
         .filter_map(|event| match event.kind {
-            crate::brain::shared::BrainEventKind::ToolCall {
+            crate::brain::store::BrainEventKind::ToolCall {
                 request_seq: event_request,
                 tool_id,
                 ..
             } if event_request == request_seq => Some(format!("call:{tool_id}")),
-            crate::brain::shared::BrainEventKind::ToolResult {
+            crate::brain::store::BrainEventKind::ToolResult {
                 request_seq: event_request,
                 tool_id,
                 ..
             } if event_request == request_seq => Some(format!("result:{tool_id}")),
-            crate::brain::shared::BrainEventKind::ApprovalRequested {
+            crate::brain::store::BrainEventKind::ApprovalRequested {
                 request_seq: event_request,
                 approval_id,
                 ..
             } if event_request == request_seq => Some(format!("approval:{approval_id}")),
-            crate::brain::shared::BrainEventKind::ApprovalDecided {
+            crate::brain::store::BrainEventKind::ApprovalDecided {
                 request_seq: event_request,
                 approval_id,
                 ..
@@ -1342,7 +1342,7 @@ fn persist_named_brain_turn_events(
                 store.push(
                     name,
                     "provider",
-                    crate::brain::shared::BrainEventKind::ToolCall {
+                    crate::brain::store::BrainEventKind::ToolCall {
                         request_seq,
                         tool_id,
                         name: tool_name,
@@ -1361,7 +1361,7 @@ fn persist_named_brain_turn_events(
                 store.push(
                     name,
                     "runner",
-                    crate::brain::shared::BrainEventKind::ToolResult {
+                    crate::brain::store::BrainEventKind::ToolResult {
                         request_seq,
                         tool_id,
                         output,
@@ -1386,7 +1386,7 @@ fn persist_named_brain_turn_events(
                 store.push(
                     name,
                     "runner",
-                    crate::brain::shared::BrainEventKind::ApprovalRequested {
+                    crate::brain::store::BrainEventKind::ApprovalRequested {
                         request_seq,
                         approval_id,
                         approval_kind,
@@ -1406,7 +1406,7 @@ fn persist_named_brain_turn_events(
                 store.push(
                     name,
                     runner_subject,
-                    crate::brain::shared::BrainEventKind::ApprovalDecided {
+                    crate::brain::store::BrainEventKind::ApprovalDecided {
                         request_seq,
                         approval_id,
                         decision,
@@ -1418,8 +1418,8 @@ fn persist_named_brain_turn_events(
     Ok(())
 }
 
-fn named_brain_provider_messages(snapshot: &crate::brain::shared::BrainSnapshot) -> Vec<Message> {
-    use crate::brain::shared::BrainEventKind;
+fn named_brain_provider_messages(snapshot: &crate::brain::store::BrainSnapshot) -> Vec<Message> {
+    use crate::brain::store::BrainEventKind;
 
     let events = snapshot
         .events
@@ -1487,8 +1487,8 @@ fn named_brain_provider_messages(snapshot: &crate::brain::shared::BrainSnapshot)
                 "[{} submitted a Finch {} program as event #{}]\n{}",
                 event.sender,
                 match language {
-                    crate::brain::shared::ProgramLanguage::Forth => "Co-Forth",
-                    crate::brain::shared::ProgramLanguage::Lisp => "Lisp",
+                    crate::brain::store::ProgramLanguage::Forth => "Co-Forth",
+                    crate::brain::store::ProgramLanguage::Lisp => "Lisp",
                 },
                 event.seq,
                 source,
@@ -1562,8 +1562,8 @@ fn named_brain_provider_messages(snapshot: &crate::brain::shared::BrainSnapshot)
 }
 
 fn ensure_named_brain_store_environment(
-    store: &crate::brain::shared::SharedBrainStore,
-    snapshot: &crate::brain::shared::BrainSnapshot,
+    store: &crate::brain::store::BrainStore,
+    snapshot: &crate::brain::store::BrainSnapshot,
 ) -> anyhow::Result<()> {
     let configured = store.environment();
     if &snapshot.environment != configured {
@@ -1598,8 +1598,8 @@ async fn execute_remote_brain_command(
     server: &Arc<AgentServer>,
     headers: &HeaderMap,
     name: &str,
-    attachment_id: crate::brain::shared::AttachmentId,
-    connection_id: crate::brain::shared::ConnectionId,
+    attachment_id: crate::brain::store::AttachmentId,
+    connection_id: crate::brain::store::ConnectionId,
     command: crate::ipc::brain_codec::BrainRemoteCommand,
 ) -> crate::ipc::brain_codec::BrainRemoteReply {
     use crate::brain::credential::BrainCredentialScope;
@@ -1611,7 +1611,7 @@ async fn execute_remote_brain_command(
         BrainRemoteCommandKind::Submit(kind) => {
             let required_scope = if matches!(
                 &kind,
-                crate::brain::shared::BrainEventKind::ApprovalDecided { .. }
+                crate::brain::store::BrainEventKind::ApprovalDecided { .. }
             ) {
                 BrainCredentialScope::BrainApprove
             } else {
@@ -1865,8 +1865,8 @@ async fn watch_named_brain(
         &name,
         crate::brain::credential::BrainCredentialScope::BrainRead,
     )?;
-    let attachment_id = crate::brain::shared::AttachmentId(connection.attachment_id);
-    let connection_id = crate::brain::shared::ConnectionId(connection.connection_id);
+    let attachment_id = crate::brain::store::AttachmentId(connection.attachment_id);
+    let connection_id = crate::brain::store::ConnectionId(connection.connection_id);
     let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
     let attachment = lifecycle
         .pending_attachment(&name, attachment_id, connection_id)
@@ -1910,7 +1910,7 @@ async fn watch_named_brain(
             });
 
             let initial = BrainRemoteEnvelope::Projection(
-                crate::brain::shared::BrainWireMessage::Snapshot { brain: snapshot },
+                crate::brain::store::BrainWireMessage::Snapshot { brain: snapshot },
             );
             if let Ok(encoded) = crate::ipc::brain_codec::encode_brain_remote_envelope(&initial) {
                 if socket
@@ -1992,18 +1992,18 @@ async fn watch_named_brain(
                         Ok(event) => {
                             let closes_attachment = matches!(
                                 &event.kind,
-                                crate::brain::shared::BrainEventKind::ClientDetached {
+                                crate::brain::store::BrainEventKind::ClientDetached {
                                     attachment_id: detached,
                                     connection_id: disconnected,
                                 } if *detached == attachment_id && *disconnected == connection_id
                             );
-                            (crate::brain::shared::BrainWireMessage::Event { event }, closes_attachment)
+                            (crate::brain::store::BrainWireMessage::Event { event }, closes_attachment)
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             let Ok(brain) = lifecycle.snapshot(&name) else {
                                 break;
                             };
-                            (crate::brain::shared::BrainWireMessage::Snapshot { brain }, false)
+                            (crate::brain::store::BrainWireMessage::Snapshot { brain }, false)
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         };
@@ -2893,7 +2893,7 @@ async fn handle_file_put(
 #[cfg(test)]
 mod named_brain_provider_context_tests {
     use super::*;
-    use crate::brain::shared::{
+    use crate::brain::store::{
         AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
         BrainEvent, BrainEventKind, BrainId, BrainSnapshot, ProgramLanguage,
     };
@@ -2917,7 +2917,7 @@ mod named_brain_provider_context_tests {
             role: AttachmentRole::Driver,
             acknowledged_seq: 0,
             connected: true,
-            connection_id: Some(crate::brain::shared::ConnectionId(uuid::Uuid::new_v4())),
+            connection_id: Some(crate::brain::store::ConnectionId(uuid::Uuid::new_v4())),
         }
     }
 
@@ -3187,7 +3187,7 @@ mod named_brain_provider_context_tests {
 
     #[test]
     fn attachment_roles_bound_which_events_the_client_may_submit() {
-        use crate::brain::shared::AttachmentRole;
+        use crate::brain::store::AttachmentRole;
 
         let prompt = BrainEventKind::Prompt {
             text: "hello".into(),
@@ -3229,7 +3229,7 @@ mod named_brain_provider_context_tests {
     #[tokio::test]
     async fn approval_decision_is_durable_before_the_runner_resumes() {
         let temp = tempfile::tempdir().unwrap();
-        let store = crate::brain::shared::SharedBrainStore::with_root(
+        let store = crate::brain::store::BrainStore::with_root(
             "box.local",
             Some(temp.path().into()),
         );
@@ -3292,7 +3292,7 @@ mod named_brain_provider_context_tests {
     #[tokio::test]
     async fn wrong_attachment_cannot_consume_an_approval_decision() {
         let temp = tempfile::tempdir().unwrap();
-        let store = crate::brain::shared::SharedBrainStore::with_root(
+        let store = crate::brain::store::BrainStore::with_root(
             "box.local",
             Some(temp.path().into()),
         );
@@ -3347,7 +3347,7 @@ mod named_brain_provider_context_tests {
     #[test]
     fn final_turn_flush_deduplicates_live_approval_lifecycle() {
         let temp = tempfile::tempdir().unwrap();
-        let store = crate::brain::shared::SharedBrainStore::with_root(
+        let store = crate::brain::store::BrainStore::with_root(
             "box.local",
             Some(temp.path().into()),
         );
@@ -3475,7 +3475,7 @@ mod named_brain_provider_context_tests {
     #[test]
     fn runner_cannot_substitute_the_daemon_selected_approval_audience() {
         let temp = tempfile::tempdir().unwrap();
-        let store = crate::brain::shared::SharedBrainStore::with_root(
+        let store = crate::brain::store::BrainStore::with_root(
             "box.local",
             Some(temp.path().into()),
         );
@@ -3521,7 +3521,7 @@ mod named_brain_provider_context_tests {
 
     #[test]
     fn effect_journal_is_idempotent_and_rejects_conflicting_identity() {
-        let store = crate::brain::shared::SharedBrainStore::with_root("box.local", None);
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
         let record = acknowledged_emit_effect("once");
         persist_named_brain_effect_journal(
             &store,
@@ -3571,7 +3571,7 @@ mod named_brain_provider_context_tests {
     #[tokio::test]
     async fn named_brain_program_runs_on_registered_frontend_and_commits_checkpoint() {
         let temp = tempfile::tempdir().unwrap();
-        let store = crate::brain::shared::SharedBrainStore::with_root(
+        let store = crate::brain::store::BrainStore::with_root(
             "box.local",
             Some(temp.path().into()),
         );
@@ -3626,7 +3626,7 @@ mod named_brain_provider_context_tests {
             &store,
             &runners,
             "shared",
-            crate::brain::shared::RunId(uuid::Uuid::new_v4()),
+            crate::brain::store::RunId(uuid::Uuid::new_v4()),
             41,
             ProgramLanguage::Lisp,
             "(define (double (n : int)) : int (* n 2))",
@@ -3689,7 +3689,7 @@ mod named_brain_provider_context_tests {
 
         drop(restored);
         drop(store);
-        let restarted = crate::brain::shared::SharedBrainStore::with_root(
+        let restarted = crate::brain::store::BrainStore::with_root(
             "box.local",
             Some(temp.path().into()),
         );
@@ -3712,7 +3712,7 @@ mod named_brain_provider_context_tests {
     #[tokio::test]
     async fn named_brain_prompt_runs_the_full_turn_on_the_registered_frontend() {
         let temp = tempfile::tempdir().unwrap();
-        let store = crate::brain::shared::SharedBrainStore::with_root(
+        let store = crate::brain::store::BrainStore::with_root(
             "box.local",
             Some(temp.path().into()),
         );
@@ -3810,7 +3810,7 @@ mod named_brain_provider_context_tests {
             &store,
             &runners,
             "shared",
-            crate::brain::shared::RunId(uuid::Uuid::new_v4()),
+            crate::brain::store::RunId(uuid::Uuid::new_v4()),
             prompt_seq,
             "define triple",
             &requester,
@@ -3897,7 +3897,7 @@ mod named_brain_provider_context_tests {
     #[tokio::test]
     async fn failed_named_brain_turn_persists_partial_approval_lifecycle() {
         let temp = tempfile::tempdir().unwrap();
-        let store = crate::brain::shared::SharedBrainStore::with_root(
+        let store = crate::brain::store::BrainStore::with_root(
             "box.local",
             Some(temp.path().into()),
         );
@@ -3957,7 +3957,7 @@ mod named_brain_provider_context_tests {
             &store,
             &runners,
             "shared",
-            crate::brain::shared::RunId(uuid::Uuid::new_v4()),
+            crate::brain::store::RunId(uuid::Uuid::new_v4()),
             prompt_seq,
             "try an effect",
             &requester,
@@ -3997,7 +3997,7 @@ mod named_brain_provider_context_tests {
         ));
 
         drop(store);
-        let restarted = crate::brain::shared::SharedBrainStore::with_root(
+        let restarted = crate::brain::store::BrainStore::with_root(
             "box.local",
             Some(temp.path().into()),
         );
@@ -4019,7 +4019,7 @@ mod named_brain_provider_context_tests {
 
     #[tokio::test]
     async fn named_brain_program_requires_callback_for_the_live_lease() {
-        let store = crate::brain::shared::SharedBrainStore::with_root("box.local", None);
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
         let generation = store.environment().generation;
         store
             .acquire_runner_lease("shared", "console", generation, None, 60_000)
@@ -4028,7 +4028,7 @@ mod named_brain_provider_context_tests {
             &store,
             &crate::server::BrainRunnerBroker::default(),
             "shared",
-            crate::brain::shared::RunId(uuid::Uuid::new_v4()),
+            crate::brain::store::RunId(uuid::Uuid::new_v4()),
             1,
             ProgramLanguage::Forth,
             "21 2 *",
@@ -4046,7 +4046,7 @@ mod named_brain_provider_context_tests {
 
     #[tokio::test]
     async fn completed_handoff_rejects_the_previous_runner_callback() {
-        let store = crate::brain::shared::SharedBrainStore::with_root("box.local", None);
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
         let generation = store.environment().generation;
         let source = store
             .acquire_runner_lease("shared", "runner-a", generation, None, 60_000)
@@ -4072,7 +4072,7 @@ mod named_brain_provider_context_tests {
             &store,
             &runners,
             "shared",
-            crate::brain::shared::RunId(uuid::Uuid::new_v4()),
+            crate::brain::store::RunId(uuid::Uuid::new_v4()),
             1,
             ProgramLanguage::Forth,
             "21 2 *",
@@ -4086,7 +4086,7 @@ mod named_brain_provider_context_tests {
     #[tokio::test]
     async fn queued_brain_run_resumes_on_runner_registration_and_survives_restart() {
         let temp = tempfile::tempdir().unwrap();
-        let store = crate::brain::shared::SharedBrainStore::with_root(
+        let store = crate::brain::store::BrainStore::with_root(
             "box.local",
             Some(temp.path().into()),
         );
@@ -4114,20 +4114,20 @@ mod named_brain_provider_context_tests {
             .start_run(
                 "shared",
                 &attachment.subject,
-                crate::brain::shared::BrainRunKind::Interactive,
+                crate::brain::store::BrainRunKind::Interactive,
                 request.seq,
                 attachment.attachment_id,
-                crate::brain::shared::BrainRunStatus::QueuedForEnvironment,
+                crate::brain::store::BrainRunStatus::QueuedForEnvironment,
             )
             .unwrap();
         drop(store);
-        let store = crate::brain::shared::SharedBrainStore::with_root(
+        let store = crate::brain::store::BrainStore::with_root(
             "box.local",
             Some(temp.path().into()),
         );
         assert_eq!(
             store.snapshot("shared").unwrap().runs[0].status,
-            crate::brain::shared::BrainRunStatus::QueuedForEnvironment
+            crate::brain::store::BrainRunStatus::QueuedForEnvironment
         );
         let lease = store
             .acquire_runner_lease(
@@ -4193,7 +4193,7 @@ mod named_brain_provider_context_tests {
         assert_eq!(snapshot.runs[0].run_id, run.run_id);
         assert_eq!(
             snapshot.runs[0].status,
-            crate::brain::shared::BrainRunStatus::Completed
+            crate::brain::store::BrainRunStatus::Completed
         );
         assert!(snapshot.events.iter().any(|event| {
             matches!(
@@ -4207,19 +4207,19 @@ mod named_brain_provider_context_tests {
         }));
 
         drop(store);
-        let restarted = crate::brain::shared::SharedBrainStore::with_root(
+        let restarted = crate::brain::store::BrainStore::with_root(
             "box.local",
             Some(temp.path().into()),
         );
         assert_eq!(
             restarted.snapshot("shared").unwrap().runs[0].status,
-            crate::brain::shared::BrainRunStatus::Completed
+            crate::brain::store::BrainRunStatus::Completed
         );
     }
 
     #[tokio::test]
     async fn queued_brain_run_stays_queued_without_the_registered_lease() {
-        let store = crate::brain::shared::SharedBrainStore::with_root("box.local", None);
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
         let attachment = store
             .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
             .unwrap();
@@ -4237,10 +4237,10 @@ mod named_brain_provider_context_tests {
             .start_run(
                 "shared",
                 &attachment.subject,
-                crate::brain::shared::BrainRunKind::Interactive,
+                crate::brain::store::BrainRunKind::Interactive,
                 request.seq,
                 attachment.attachment_id,
-                crate::brain::shared::BrainRunStatus::QueuedForEnvironment,
+                crate::brain::store::BrainRunStatus::QueuedForEnvironment,
             )
             .unwrap();
         let lease = store
@@ -4266,7 +4266,7 @@ mod named_brain_provider_context_tests {
         );
         assert_eq!(
             store.snapshot("shared").unwrap().runs[0].status,
-            crate::brain::shared::BrainRunStatus::QueuedForEnvironment
+            crate::brain::store::BrainRunStatus::QueuedForEnvironment
         );
         assert!(!store
             .snapshot("shared")
@@ -4278,7 +4278,7 @@ mod named_brain_provider_context_tests {
 
     #[tokio::test]
     async fn runner_failure_is_a_durable_failed_run_and_correlated_result() {
-        let store = crate::brain::shared::SharedBrainStore::with_root("box.local", None);
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
         let attachment = store
             .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
             .unwrap();
@@ -4296,10 +4296,10 @@ mod named_brain_provider_context_tests {
             .start_run(
                 "shared",
                 &attachment.subject,
-                crate::brain::shared::BrainRunKind::Interactive,
+                crate::brain::store::BrainRunKind::Interactive,
                 request.seq,
                 attachment.attachment_id,
-                crate::brain::shared::BrainRunStatus::Running,
+                crate::brain::store::BrainRunStatus::Running,
             )
             .unwrap();
         let lease = store
@@ -4343,7 +4343,7 @@ mod named_brain_provider_context_tests {
                 && error.as_deref() == Some("frontend execution failed")
         ));
         let failed = &store.snapshot("shared").unwrap().runs[0];
-        assert_eq!(failed.status, crate::brain::shared::BrainRunStatus::Failed);
+        assert_eq!(failed.status, crate::brain::store::BrainRunStatus::Failed);
         assert_eq!(failed.detail.as_deref(), Some("frontend execution failed"));
         assert!(store
             .snapshot("shared")
@@ -4368,7 +4368,7 @@ mod named_brain_provider_context_tests {
 
     #[tokio::test]
     async fn transport_neutral_submission_enforces_roles_and_creates_one_queued_run() {
-        let store = crate::brain::shared::SharedBrainStore::with_root("box.local", None);
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
         let runners = crate::server::BrainRunnerBroker::default();
         let approvals = crate::server::BrainApprovalBroker::default();
         let driver = store
@@ -4390,7 +4390,7 @@ mod named_brain_provider_context_tests {
         assert_eq!(run.request_seq, outcome.accepted.seq);
         assert_eq!(
             run.status,
-            crate::brain::shared::BrainRunStatus::QueuedForEnvironment
+            crate::brain::store::BrainRunStatus::QueuedForEnvironment
         );
         assert!(outcome.result.is_none());
         assert_eq!(store.snapshot("shared").unwrap().runs.len(), 1);
@@ -4430,7 +4430,7 @@ mod named_brain_provider_context_tests {
 
     #[tokio::test]
     async fn participant_message_is_durable_context_without_creating_a_run() {
-        let store = crate::brain::shared::SharedBrainStore::with_root("box.local", None);
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
         let runners = crate::server::BrainRunnerBroker::default();
         let approvals = crate::server::BrainApprovalBroker::default();
         let consultant = store

@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use super::shared::{AttachmentId, AttachmentRole, BrainId, ConnectionId};
+use super::store::{AttachmentId, AttachmentRole, BrainId, ConnectionId};
 
 const CREDENTIAL_VERSION: u32 = 1;
 const TOKEN_PREFIX: &str = "finch-brain-v1";

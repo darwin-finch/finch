@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use super::shared::{
+use super::store::{
     AttachmentId, AttachmentRole, BrainAttachment, BrainEnvironment, BrainEventKind, BrainId,
     BrainSnapshot, BrainWireMessage,
 };
@@ -154,7 +154,7 @@ impl RemoteBrainTarget {
             .trim()
             .split_once('@')
             .context("brain target must be NAME@MACHINE[:PORT]")?;
-        super::shared::SharedBrainStore::validate_name(brain)?;
+        super::store::BrainStore::validate_name(brain)?;
         let host = host.trim();
         if host.is_empty() || host.contains('/') || host.contains(char::is_whitespace) {
             anyhow::bail!("brain machine must be a hostname or host:port");
@@ -726,10 +726,10 @@ impl RemoteBrainClient {
     pub async fn request_runner_handoff(
         &self,
         target_subject: &str,
-        expected_lease_id: super::shared::RunnerLeaseId,
+        expected_lease_id: super::store::RunnerLeaseId,
         environment_generation: u64,
         ttl_ms: u64,
-    ) -> Result<super::shared::BrainRunnerHandoff> {
+    ) -> Result<super::store::BrainRunnerHandoff> {
         use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         match self
@@ -748,7 +748,7 @@ impl RemoteBrainClient {
 
     pub async fn cancel_runner_handoff(
         &self,
-        handoff_id: super::shared::RunnerHandoffId,
+        handoff_id: super::store::RunnerHandoffId,
     ) -> Result<()> {
         use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
@@ -763,8 +763,8 @@ impl RemoteBrainClient {
 
     pub async fn cancel_run(
         &self,
-        run_id: super::shared::RunId,
-    ) -> Result<super::shared::BrainRun> {
+        run_id: super::store::RunId,
+    ) -> Result<super::store::BrainRun> {
         use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         match self
@@ -1223,8 +1223,8 @@ impl AttachedBrainClient {
 
     pub async fn cancel_run(
         &self,
-        run_id: super::shared::RunId,
-    ) -> Result<super::shared::BrainRun> {
+        run_id: super::store::RunId,
+    ) -> Result<super::store::BrainRun> {
         let attachment = self
             .attachment
             .as_ref()
@@ -1800,7 +1800,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_binary_session_correlates_mutations_while_streaming_events() {
-        use crate::brain::shared::{BrainEvent, ConnectionId};
+        use crate::brain::store::{BrainEvent, ConnectionId};
         use crate::ipc::brain_codec::{
             BrainRemoteCommandKind, BrainRemoteEnvelope, BrainRemoteReply,
         };
@@ -1911,8 +1911,8 @@ mod tests {
             assert_eq!(target_subject, "runner-b@box.local");
             assert_eq!(environment_generation, 1);
             assert_eq!(ttl_ms, 30_000);
-            let handoff = crate::brain::shared::BrainRunnerHandoff {
-                handoff_id: crate::brain::shared::RunnerHandoffId(uuid::Uuid::new_v4()),
+            let handoff = crate::brain::store::BrainRunnerHandoff {
+                handoff_id: crate::brain::store::RunnerHandoffId(uuid::Uuid::new_v4()),
                 from_lease_id: expected_lease_id,
                 requested_by: "alice@laptop.local".into(),
                 target_subject,
@@ -2022,7 +2022,7 @@ mod tests {
         let handoff = client
             .request_runner_handoff(
                 "runner-b@box.local",
-                crate::brain::shared::RunnerLeaseId(uuid::Uuid::new_v4()),
+                crate::brain::store::RunnerLeaseId(uuid::Uuid::new_v4()),
                 1,
                 30_000,
             )
@@ -2146,7 +2146,7 @@ mod tests {
     #[test]
     #[ignore = "requires a running Finch daemon on the default local IPC and HTTP endpoints"]
     fn live_local_and_remote_transports_produce_equivalent_lifecycle() {
-        use crate::brain::shared::{BrainRunKind, BrainRunStatus};
+        use crate::brain::store::{BrainRunKind, BrainRunStatus};
         use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
         fn lifecycle(snapshot: &BrainSnapshot) -> Vec<&'static str> {
@@ -2397,7 +2397,7 @@ mod tests {
             let submission = tokio::task::spawn_local(async move {
                 submitting_client
                     .push(BrainEventKind::Program {
-                        language: crate::brain::shared::ProgramLanguage::Lisp,
+                        language: crate::brain::store::ProgramLanguage::Lisp,
                         source: "(say \"handoff-live\")".into(),
                     })
                     .await

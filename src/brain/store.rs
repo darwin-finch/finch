@@ -594,13 +594,13 @@ impl BrainState {
     }
 }
 
-/// Persistent registry of named shared brains.
+/// Authoritative persistent store of named Brains.
 ///
 /// Each brain is stored as human-browsable JSON Lines under
 /// `~/.finch/brains/<name>/events.jsonl`.  The log is authoritative; the
 /// program stack is rebuilt from it after a daemon restart.
 #[derive(Clone)]
-pub struct SharedBrainStore {
+pub struct BrainStore {
     root: Option<PathBuf>,
     environment: BrainEnvironment,
     brains: Arc<RwLock<HashMap<String, BrainState>>>,
@@ -613,7 +613,7 @@ pub struct SharedBrainStore {
     execution_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
-impl SharedBrainStore {
+impl BrainStore {
     pub fn new(machine: impl Into<String>) -> Self {
         let root = dirs::home_dir().map(|p| p.join(".finch").join("brains"));
         Self::with_root(machine, root)
@@ -2098,7 +2098,7 @@ mod tests {
     #[test]
     fn run_lifecycle_is_event_sourced_and_terminal_state_is_final() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let attachment = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
@@ -2150,7 +2150,7 @@ mod tests {
             .is_err());
 
         drop(store);
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = &restarted.snapshot("shared").unwrap().runs[0];
         assert_eq!(restored.run_id, run.run_id);
         assert_eq!(restored.request_seq, prompt.seq);
@@ -2161,7 +2161,7 @@ mod tests {
     #[test]
     fn run_ancestry_is_validated_and_survives_restart() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let attachment = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
@@ -2221,7 +2221,7 @@ mod tests {
             .is_err());
 
         drop(store);
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         assert_eq!(
             restarted
                 .inspect_run("shared", child.run_id)
@@ -2263,7 +2263,7 @@ mod tests {
     #[test]
     fn restart_interrupts_started_runs_without_replaying_queued_runs() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let attachment = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
@@ -2307,7 +2307,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let snapshot = restarted.snapshot("shared").unwrap();
         assert_eq!(
             snapshot
@@ -2342,7 +2342,7 @@ mod tests {
     #[test]
     fn program_stack_is_rebuilt_from_the_event_log() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("workstation.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("workstation.local", Some(temp.path().into()));
         let first = store
             .push(
                 "finch",
@@ -2363,7 +2363,7 @@ mod tests {
             )
             .unwrap();
 
-        let restarted = SharedBrainStore::with_root("workstation.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("workstation.local", Some(temp.path().into()));
         let snapshot = restarted.snapshot("finch").unwrap();
         assert_eq!(snapshot.revision, 2);
         assert_eq!(snapshot.program_stack.len(), 1);
@@ -2375,7 +2375,7 @@ mod tests {
     #[test]
     fn tool_and_approval_lifecycle_is_rebuilt_from_the_event_log() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("workstation.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("workstation.local", Some(temp.path().into()));
         let brain_id = store.snapshot("finch").unwrap().brain_id;
         let audience = BrainApprovalAudience {
             brain_id,
@@ -2435,7 +2435,7 @@ mod tests {
             )
             .unwrap();
 
-        let restarted = SharedBrainStore::with_root("workstation.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("workstation.local", Some(temp.path().into()));
         let snapshot = restarted.snapshot("finch").unwrap();
         assert!(matches!(
             &snapshot.events[0].kind,
@@ -2492,7 +2492,7 @@ mod tests {
     #[test]
     fn pop_is_an_event_and_survives_restart() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         store
             .push(
                 "brain",
@@ -2506,7 +2506,7 @@ mod tests {
         let popped = store.pop_program("brain", "alice").unwrap().unwrap();
         assert!(matches!(popped.kind, BrainEventKind::ProgramPopped { .. }));
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         assert!(restarted
             .snapshot("brain")
             .unwrap()
@@ -2516,7 +2516,7 @@ mod tests {
 
     #[test]
     fn subscribers_receive_the_authoritative_sequence() {
-        let store = SharedBrainStore::with_root("box.local", None);
+        let store = BrainStore::with_root("box.local", None);
         let mut first = store.subscribe("brain").unwrap();
         let mut second = store.subscribe("brain").unwrap();
         let event = store
@@ -2533,10 +2533,10 @@ mod tests {
     #[test]
     fn empty_named_brain_remains_listed_after_restart() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let original = store.snapshot("quiet-brain").unwrap();
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         assert_eq!(restarted.list().unwrap(), vec!["quiet-brain"]);
         let restored = restarted.snapshot("quiet-brain").unwrap();
         assert_eq!(restored.revision, 0);
@@ -2548,7 +2548,7 @@ mod tests {
     #[test]
     fn unused_brain_is_removed_after_its_last_participant_leaves() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let generation = store.environment().generation;
         let attachment = store
             .attach("provisional", "alice", AttachmentRole::Driver, None)
@@ -2576,7 +2576,7 @@ mod tests {
     #[test]
     fn pending_attachment_prevents_another_participant_from_removing_brain() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let first = store
             .attach("pending", "alice", AttachmentRole::Driver, None)
             .unwrap();
@@ -2617,7 +2617,7 @@ mod tests {
     #[test]
     fn substantive_brain_survives_after_every_participant_leaves() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let attachment = store
             .attach("durable", "alice", AttachmentRole::Driver, None)
             .unwrap();
@@ -2639,7 +2639,7 @@ mod tests {
             .unwrap();
 
         assert!(!store.remove_if_unused("durable").unwrap());
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         assert_eq!(
             restarted.snapshot("durable").unwrap().program_stack.len(),
             0
@@ -2666,7 +2666,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let snapshot = store.snapshot("legacy").unwrap();
         assert_ne!(snapshot.brain_id, BrainId::nil());
         assert_eq!(snapshot.events[0].schema_version, 1);
@@ -2693,7 +2693,7 @@ mod tests {
             .map(|_| {
                 let root = root.clone();
                 std::thread::spawn(move || {
-                    SharedBrainStore::with_root("box.local", Some(root))
+                    BrainStore::with_root("box.local", Some(root))
                         .snapshot("shared")
                         .unwrap()
                         .brain_id
@@ -2711,7 +2711,7 @@ mod tests {
     #[test]
     fn attachment_cursor_is_monotonic_and_survives_restart() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let attachment = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
@@ -2752,7 +2752,7 @@ mod tests {
             )
             .unwrap();
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = restarted
             .snapshot("shared")
             .unwrap()
@@ -2792,7 +2792,7 @@ mod tests {
 
     #[test]
     fn concurrent_attach_cannot_rebind_one_identity() {
-        let store = Arc::new(SharedBrainStore::with_root("box.local", None));
+        let store = Arc::new(BrainStore::with_root("box.local", None));
         let attachment_id = AttachmentId::new();
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let attempts = [AttachmentRole::Driver, AttachmentRole::Observer]
@@ -2835,7 +2835,7 @@ mod tests {
 
     #[test]
     fn stale_connection_cannot_disconnect_a_reattached_client() {
-        let store = SharedBrainStore::with_root("box.local", None);
+        let store = BrainStore::with_root("box.local", None);
         let first = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
@@ -2893,7 +2893,7 @@ mod tests {
 
     #[test]
     fn abandoned_attachment_reservation_expires_without_advancing_cursor_or_log() {
-        let store = SharedBrainStore::with_root("box.local", None);
+        let store = BrainStore::with_root("box.local", None);
         let first = store
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
@@ -2949,7 +2949,7 @@ mod tests {
     #[test]
     fn runner_lease_is_exclusive_renewable_and_event_sourced() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let generation = store.environment().generation;
         let lease = store
             .acquire_runner_lease("shared", "console-a", generation, None, 60_000)
@@ -2978,7 +2978,7 @@ mod tests {
         assert_eq!(renewed.lease_id, lease.lease_id);
         assert!(renewed.expires_ms >= lease.expires_ms);
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         assert_eq!(
             restarted
                 .snapshot("shared")
@@ -3010,7 +3010,7 @@ mod tests {
     #[test]
     fn runner_handoff_is_addressed_durable_and_atomically_replaces_the_lease() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let generation = store.environment().generation;
         let source = store
             .acquire_runner_lease("shared", "runner-a", generation, None, 60_000)
@@ -3029,7 +3029,7 @@ mod tests {
             .acquire_runner_lease("shared", "runner-b", generation, None, 60_000)
             .is_err());
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         assert_eq!(
             restarted
                 .snapshot("shared")
@@ -3073,7 +3073,7 @@ mod tests {
 
     #[test]
     fn releasing_or_cancelling_the_source_invalidates_a_runner_handoff() {
-        let store = SharedBrainStore::with_root("box.local", None);
+        let store = BrainStore::with_root("box.local", None);
         let generation = store.environment().generation;
         let source = store
             .acquire_runner_lease("shared", "runner-a", generation, None, 60_000)
@@ -3120,7 +3120,7 @@ mod tests {
 
     #[test]
     fn runner_handoff_expiry_is_exact_and_durable() {
-        let store = SharedBrainStore::with_root("box.local", None);
+        let store = BrainStore::with_root("box.local", None);
         let generation = store.environment().generation;
         let source = store
             .acquire_runner_lease("shared", "runner-a", generation, None, 60_000)
@@ -3151,7 +3151,7 @@ mod tests {
     fn archive_removes_a_brain_but_preserves_its_log() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("brains");
-        let store = SharedBrainStore::with_root("box.local", Some(root.clone()));
+        let store = BrainStore::with_root("box.local", Some(root.clone()));
         store
             .push("old", "alice", BrainEventKind::Prompt { text: "hi".into() })
             .unwrap();
@@ -3183,7 +3183,7 @@ mod tests {
 
     #[tokio::test]
     async fn attached_clients_share_one_ordered_turn_lane_per_brain() {
-        let store = SharedBrainStore::with_root("box.local", None);
+        let store = BrainStore::with_root("box.local", None);
         let first = store.execution_lock("brain").unwrap();
         let same_brain = store.execution_lock("brain").unwrap();
         let other_brain = store.execution_lock("other").unwrap();
@@ -3207,7 +3207,7 @@ mod tests {
     #[tokio::test]
     async fn named_brain_restores_one_typed_runtime_without_replaying_source() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let runtime = store.program_runtime("brain").unwrap();
         let outcome = runtime
             .submit_typed_only(crate::runtime::ProgramSubmission {
@@ -3256,7 +3256,7 @@ mod tests {
             }
         }
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = restarted.program_runtime("brain").unwrap();
         assert_eq!(restored.revision(), committed_revision);
         let outcome = restored
@@ -3284,7 +3284,7 @@ mod tests {
     #[tokio::test]
     async fn named_brain_reads_legacy_json_checkpoint_without_rewriting_history() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         store.snapshot("brain").unwrap();
         let runtime = crate::runtime::ProgramRuntime::new();
         let outcome = runtime
@@ -3330,7 +3330,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = restarted.program_runtime("brain").unwrap();
         let called = restored
             .submit_typed_only(crate::runtime::ProgramSubmission {
@@ -3358,7 +3358,7 @@ mod tests {
     #[tokio::test]
     async fn named_brain_commits_a_validated_frontend_runner_checkpoint() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         store.snapshot("brain").unwrap();
         let runner = crate::runtime::ProgramRuntime::new();
         let outcome = runner
@@ -3386,7 +3386,7 @@ mod tests {
             .commit_runner_runtime("brain", 1, outcome.output_revision, checkpoint)
             .unwrap();
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = restarted.program_runtime("brain").unwrap();
         let called = restored
             .submit_typed_only(crate::runtime::ProgramSubmission {
@@ -3408,7 +3408,7 @@ mod tests {
     #[tokio::test]
     async fn named_brain_restores_scoped_authority_from_its_separate_policy_record() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let runtime = store.program_runtime("brain").unwrap();
         let session_id = runtime.capability_session_id();
         let grant_id = runtime
@@ -3442,7 +3442,7 @@ mod tests {
 
         let authority_path = temp.path().join("brain/authority.json");
         assert!(authority_path.exists());
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = restarted.program_runtime("brain").unwrap();
         assert_eq!(restored.capability_session_id(), session_id);
         let ledger = restored.capability_ledger().unwrap();
@@ -3458,7 +3458,7 @@ mod tests {
     #[test]
     fn named_brain_persists_grants_and_revocation_without_a_vm_commit() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let runtime = store.program_runtime("brain").unwrap();
         let grant_id = runtime
             .issue_typed_capability(
@@ -3474,12 +3474,12 @@ mod tests {
             )
             .unwrap();
 
-        let after_grant = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let after_grant = BrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = after_grant.program_runtime("brain").unwrap();
         assert_eq!(restored.capability_ledger().unwrap().grants.grants[0].id, grant_id);
 
         runtime.revoke_typed_capability(grant_id).unwrap();
-        let after_revoke = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let after_revoke = BrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = after_revoke.program_runtime("brain").unwrap();
         let ledger = restored.capability_ledger().unwrap();
         assert!(ledger.grants.grants[0].revoked_at_unix_ms.is_some());
@@ -3493,7 +3493,7 @@ mod tests {
     #[test]
     fn named_brain_persists_policy_changes_and_denials_without_a_vm_commit() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let runtime = store.program_runtime("brain").unwrap();
         let requirement = crate::vm::CapabilityRequirement {
             capability: crate::vm::CapabilityKind::ProcessRun,
@@ -3524,7 +3524,7 @@ mod tests {
             vec![grant_id]
         );
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = restarted.program_runtime("brain").unwrap();
         assert_eq!(
             restored.capability_policy().unwrap(),
@@ -3558,7 +3558,7 @@ mod tests {
     #[tokio::test]
     async fn named_brain_persists_denial_without_a_vm_commit() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let runtime = store.program_runtime("brain").unwrap();
         let pending = runtime
             .submit_typed_only(crate::runtime::ProgramSubmission {
@@ -3587,7 +3587,7 @@ mod tests {
             crate::runtime::outcome::ExecutionStatus::Failed
         );
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = restarted.program_runtime("brain").unwrap();
         assert!(matches!(
             restored
@@ -3603,7 +3603,7 @@ mod tests {
     #[tokio::test]
     async fn named_brain_persists_host_authorization_even_when_the_run_rolls_back() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let runtime = store.program_runtime("brain").unwrap();
         let grant_id = runtime
             .issue_typed_capability(
@@ -3638,7 +3638,7 @@ mod tests {
         );
         assert_eq!(runtime.revision(), 0, "failed VM state must roll back");
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let ledger = restarted
             .program_runtime("brain")
             .unwrap()
@@ -3653,7 +3653,7 @@ mod tests {
     #[tokio::test]
     async fn named_brain_checkpoint_without_authority_record_restores_without_grants() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let runtime = store.program_runtime("brain").unwrap();
         runtime
             .grant_typed_capability(crate::vm::CapabilityRequirement {
@@ -3680,7 +3680,7 @@ mod tests {
             .unwrap();
         std::fs::remove_file(temp.path().join("brain/authority.json")).unwrap();
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = restarted.program_runtime("brain").unwrap();
         assert_eq!(restored.revision(), outcome.output_revision);
         assert!(restored
@@ -3694,7 +3694,7 @@ mod tests {
     #[tokio::test]
     async fn named_brain_rejects_a_tampered_authority_record() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let runtime = store.program_runtime("brain").unwrap();
         let outcome = runtime
             .submit_typed_only(crate::runtime::ProgramSubmission {
@@ -3719,7 +3719,7 @@ mod tests {
         authority["authority"]["project_id"] = serde_json::json!("tampered-project");
         std::fs::write(&authority_path, serde_json::to_vec(&authority).unwrap()).unwrap();
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let error = restarted
             .program_runtime("brain")
             .err()
@@ -3731,7 +3731,7 @@ mod tests {
     #[tokio::test]
     async fn out_of_order_checkpoint_events_never_regress_a_brain_runtime() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let runtime = store.program_runtime("brain").unwrap();
         let submit = |source: &str, revision| crate::runtime::ProgramSubmission {
             language: crate::programs::ProgramLanguage::Forth,
@@ -3753,7 +3753,7 @@ mod tests {
             .commit_runtime("brain", 1, first.output_revision, &runtime)
             .unwrap();
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = restarted.program_runtime("brain").unwrap();
         assert_eq!(restored.revision(), second.output_revision);
         let values = restored
@@ -3776,7 +3776,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_restart_revision_reset_keeps_the_latest_request_state() {
         let temp = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let runtime = crate::runtime::ProgramRuntime::new();
         let submit = |source: &str, revision| crate::runtime::ProgramSubmission {
             language: crate::programs::ProgramLanguage::Forth,
@@ -3840,7 +3840,7 @@ mod tests {
             )
             .unwrap();
 
-        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = restarted.program_runtime("brain").unwrap();
         assert_eq!(restored.revision(), 3);
         let called = restored
@@ -3863,8 +3863,8 @@ mod tests {
 
     #[test]
     fn names_cannot_escape_the_storage_root() {
-        assert!(SharedBrainStore::validate_name("../other").is_err());
-        assert!(SharedBrainStore::validate_name("valid-brain_2").is_ok());
+        assert!(BrainStore::validate_name("../other").is_err());
+        assert!(BrainStore::validate_name("valid-brain_2").is_ok());
     }
 
     #[test]
@@ -3872,7 +3872,7 @@ mod tests {
     fn environment_binds_machine_and_workspace_as_one_revision() {
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let store = SharedBrainStore::with_environment(
+        let store = BrainStore::with_environment(
             "gpu-box.local",
             workspace.path(),
             Some(state.path().into()),

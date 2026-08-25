@@ -7,4 +7,4 @@
 pub mod credential;
 pub mod names;
 pub mod remote;
-pub mod shared;
+pub mod store;

@@ -14,7 +14,7 @@ fn normalize_environment_machine(machine: &str) -> String {
 }
 
 fn verify_frontend_environment(
-    expected: &crate::brain::shared::BrainEnvironment,
+    expected: &crate::brain::store::BrainEnvironment,
     actual_machine: &str,
     actual_workspace: &std::path::Path,
 ) -> Result<()> {
@@ -42,14 +42,14 @@ fn verify_frontend_environment(
 }
 
 fn participant_attachment_label(
-    attachment: &crate::brain::shared::BrainAttachment,
+    attachment: &crate::brain::store::BrainAttachment,
 ) -> String {
     let id = attachment.attachment_id.0.to_string();
     format!("{} [{}]", attachment.subject, &id[..8])
 }
 
 fn verify_local_frontend_environment(
-    expected: &crate::brain::shared::BrainEnvironment,
+    expected: &crate::brain::store::BrainEnvironment,
 ) -> Result<()> {
     let machine = hostname::get()
         .ok()
@@ -85,7 +85,7 @@ impl EventLoop {
     /// runner claim from the status bar; retry never reuses an expired ID.
     async fn register_home_brain(
         &self,
-    ) -> Result<Option<std::result::Result<crate::brain::shared::RunnerLeaseId, String>>> {
+    ) -> Result<Option<std::result::Result<crate::brain::store::RunnerLeaseId, String>>> {
         let Some(ipc) = self.ipc_client.as_ref().cloned() else {
             return Ok(None);
         };
@@ -140,8 +140,8 @@ impl EventLoop {
         ipc: crate::ipc::IpcClient,
         brain: String,
         subject: String,
-        environment: crate::brain::shared::BrainEnvironment,
-        mut lease_id: Option<crate::brain::shared::RunnerLeaseId>,
+        environment: crate::brain::store::BrainEnvironment,
+        mut lease_id: Option<crate::brain::store::RunnerLeaseId>,
         initial_had_lease: bool,
     ) {
         let event_tx = self.event_tx.clone();
@@ -243,14 +243,14 @@ impl EventLoop {
         client
             .attach_persistent(
                 &self.participant_subject,
-                crate::brain::shared::AttachmentRole::Driver,
+                crate::brain::store::AttachmentRole::Driver,
                 &self.session_label,
             )
             .await?;
         let mut incoming = client.watch().await?;
         let snapshot = match incoming.recv().await {
-            Some(crate::brain::shared::BrainWireMessage::Snapshot { brain }) => brain,
-            Some(crate::brain::shared::BrainWireMessage::Event { .. }) => {
+            Some(crate::brain::store::BrainWireMessage::Snapshot { brain }) => brain,
+            Some(crate::brain::store::BrainWireMessage::Event { .. }) => {
                 anyhow::bail!("home Brain event stream did not begin with a snapshot")
             }
             None => anyhow::bail!("home Brain event stream closed before its snapshot"),
@@ -258,7 +258,7 @@ impl EventLoop {
         client.target.machine = snapshot.environment.machine.clone();
         let target_name = client.target.display_name();
         self.home_brain = Some(client);
-        self.render_remote_brain_message(crate::brain::shared::BrainWireMessage::Snapshot {
+        self.render_remote_brain_message(crate::brain::store::BrainWireMessage::Snapshot {
             brain: snapshot.clone(),
         })
         .await?;
@@ -339,10 +339,10 @@ impl EventLoop {
         #[derive(serde::Deserialize)]
         struct NamedBrainSummary {
             name: String,
-            environment: crate::brain::shared::BrainEnvironment,
+            environment: crate::brain::store::BrainEnvironment,
             event_revision: u64,
             retained_programs: usize,
-            runner: Option<crate::brain::shared::BrainRunnerLease>,
+            runner: Option<crate::brain::store::BrainRunnerLease>,
         }
 
         let brains = match reqwest::Client::new()
@@ -489,7 +489,7 @@ impl EventLoop {
 
     async fn handle_brain_say(&mut self, text: String) -> Result<()> {
         anyhow::ensure!(self.selected_brain().is_some(), "no Brain is attached");
-        self.push_remote_brain(crate::brain::shared::BrainEventKind::ParticipantMessage { text })
+        self.push_remote_brain(crate::brain::store::BrainEventKind::ParticipantMessage { text })
             .await
     }
 
@@ -615,9 +615,9 @@ impl EventLoop {
     }
 
     fn selected_handoff(
-        snapshot: &crate::brain::shared::BrainSnapshot,
+        snapshot: &crate::brain::store::BrainSnapshot,
         requested: Option<&str>,
-    ) -> Result<crate::brain::shared::BrainRunnerHandoff> {
+    ) -> Result<crate::brain::store::BrainRunnerHandoff> {
         let handoff = snapshot
             .runner_handoff
             .clone()
@@ -636,7 +636,7 @@ impl EventLoop {
         target: crate::brain::remote::RemoteBrainTarget,
     ) -> Result<(
         crate::brain::remote::RemoteBrainClient,
-        tokio::sync::mpsc::UnboundedReceiver<crate::brain::shared::BrainWireMessage>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::brain::store::BrainWireMessage>,
     )> {
         let password = crate::config::load_config()
             .map(|config| config.server.brain_password)
@@ -645,13 +645,13 @@ impl EventLoop {
         client
             .authorize_runner_handoff_control(
                 &self.participant_subject,
-                crate::brain::shared::AttachmentRole::Driver,
+                crate::brain::store::AttachmentRole::Driver,
             )
             .await?;
         client
             .attach(
                 &self.participant_subject,
-                crate::brain::shared::AttachmentRole::Driver,
+                crate::brain::store::AttachmentRole::Driver,
                 None,
             )
             .await?;
@@ -742,7 +742,7 @@ impl EventLoop {
     async fn restore_runner_after_failed_handoff(
         &mut self,
         ipc: &crate::ipc::IpcClient,
-        previous: Option<(String, crate::brain::shared::BrainEnvironment)>,
+        previous: Option<(String, crate::brain::store::BrainEnvironment)>,
     ) -> Result<()> {
         let Some((brain, environment)) = previous else {
             return Ok(());
@@ -775,7 +775,7 @@ impl EventLoop {
     async fn fail_handoff_and_restore_runner(
         &mut self,
         ipc: &crate::ipc::IpcClient,
-        previous: Option<(String, crate::brain::shared::BrainEnvironment)>,
+        previous: Option<(String, crate::brain::store::BrainEnvironment)>,
         error: anyhow::Error,
     ) -> anyhow::Error {
         match self
@@ -925,7 +925,7 @@ mod brain_handler_tests {
     #[test]
     fn frontend_environment_requires_the_exact_machine_and_workspace() {
         let temp = tempfile::tempdir().unwrap();
-        let expected = crate::brain::shared::BrainEnvironment {
+        let expected = crate::brain::store::BrainEnvironment {
             machine: "workstation.local".into(),
             workspace: temp.path().to_path_buf(),
             generation: 1,
@@ -946,12 +946,12 @@ mod brain_handler_tests {
 
     #[test]
     fn participant_label_distinguishes_two_consoles_for_one_subject() {
-        let attachment = crate::brain::shared::BrainAttachment {
-            attachment_id: crate::brain::shared::AttachmentId(
+        let attachment = crate::brain::store::BrainAttachment {
+            attachment_id: crate::brain::store::AttachmentId(
                 uuid::Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap(),
             ),
             subject: "alice@workstation.local".into(),
-            role: crate::brain::shared::AttachmentRole::Driver,
+            role: crate::brain::store::AttachmentRole::Driver,
             acknowledged_seq: 0,
             connected: true,
             connection_id: None,

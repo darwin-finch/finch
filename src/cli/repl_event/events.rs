@@ -176,7 +176,7 @@ pub enum ReplEvent {
     /// Snapshot or live event from the currently attached named brain.
     RemoteBrainMessage {
         target: String,
-        message: crate::brain::shared::BrainWireMessage,
+        message: crate::brain::store::BrainWireMessage,
     },
     RemoteBrainError {
         target: String,
@@ -195,7 +195,7 @@ pub enum ReplEvent {
     RunnerLeaseStatus {
         brain: String,
         epoch: u64,
-        lease_id: Option<crate::brain::shared::RunnerLeaseId>,
+        lease_id: Option<crate::brain::store::RunnerLeaseId>,
         detail: String,
     },
 
@@ -208,7 +208,7 @@ pub enum ReplEvent {
     /// Cancel one exact ProgramRun currently owned by this frontend.
     NamedBrainRunCancelRequested(crate::server::RunnerCancelRequest),
     /// Release frontend-local cancellation state after a delegated program ends.
-    NamedBrainProgramFinished(crate::brain::shared::RunId),
+    NamedBrainProgramFinished(crate::brain::store::RunId),
 
 }
 

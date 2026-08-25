@@ -7,10 +7,10 @@
 use anyhow::{ensure, Result};
 use tokio::sync::broadcast;
 
-use crate::brain::shared::{
+use crate::brain::store::{
     AttachmentId, AttachmentRole, BrainAttachment, BrainEnvironment, BrainEvent, BrainEventKind,
     BrainRun, BrainRunKind, BrainRunStatus, BrainRunnerHandoff, BrainRunnerLease, BrainSnapshot,
-    ConnectionId, RunId, RunnerHandoffId, RunnerLeaseId, SharedBrainStore,
+    ConnectionId, RunId, RunnerHandoffId, RunnerLeaseId, BrainStore,
 };
 
 use super::{handlers, AgentServer, BrainApprovalBroker, BrainRunnerBroker};
@@ -30,7 +30,7 @@ pub enum BrainSubmissionError {
 #[derive(Debug)]
 pub struct BrainSubmissionOutcome {
     pub accepted: BrainEvent,
-    pub run: Option<crate::brain::shared::BrainRun>,
+    pub run: Option<crate::brain::store::BrainRun>,
     pub result: Option<BrainEvent>,
 }
 
@@ -45,7 +45,7 @@ pub struct BrainWatch {
 /// The canonical in-process named-Brain lifecycle boundary.
 #[derive(Clone)]
 pub struct BrainLifecycleService {
-    store: SharedBrainStore,
+    store: BrainStore,
     runners: BrainRunnerBroker,
     approvals: BrainApprovalBroker,
 }
@@ -53,7 +53,7 @@ pub struct BrainLifecycleService {
 impl BrainLifecycleService {
     pub fn from_server(server: &AgentServer) -> Self {
         Self {
-            store: server.shared_brains().clone(),
+            store: server.brain_store().clone(),
             runners: server.brain_runners().clone(),
             approvals: server.brain_approvals().clone(),
         }
@@ -61,7 +61,7 @@ impl BrainLifecycleService {
 
     #[cfg(test)]
     pub(crate) fn new(
-        store: SharedBrainStore,
+        store: BrainStore,
         runners: BrainRunnerBroker,
         approvals: BrainApprovalBroker,
     ) -> Self {
@@ -283,7 +283,7 @@ impl BrainLifecycleService {
             let snapshot = self.snapshot(brain)?;
             let lease = snapshot
                 .runner_lease
-                .filter(|lease| lease.expires_ms > crate::brain::shared::unix_millis())
+                .filter(|lease| lease.expires_ms > crate::brain::store::unix_millis())
                 .ok_or_else(|| anyhow::anyhow!("named Brain '{brain}' has no live runner"))?;
             ensure!(
                 self.runners.cancel_run(brain, lease.lease_id, run_id).await?,
@@ -336,14 +336,14 @@ impl BrainLifecycleService {
         let store = self.store.clone();
         tokio::spawn(async move {
             loop {
-                let delay_ms = expires_ms.saturating_sub(crate::brain::shared::unix_millis());
+                let delay_ms = expires_ms.saturating_sub(crate::brain::store::unix_millis());
                 if delay_ms == 0 {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
             if store
-                .expire_runner_lease(&brain, lease_id, crate::brain::shared::unix_millis())
+                .expire_runner_lease(&brain, lease_id, crate::brain::store::unix_millis())
                 .is_ok_and(|expired| expired)
             {
                 let _ = store.remove_if_unused(&brain);
@@ -395,14 +395,14 @@ impl BrainLifecycleService {
         let store = self.store.clone();
         tokio::spawn(async move {
             loop {
-                let delay_ms = expires_ms.saturating_sub(crate::brain::shared::unix_millis());
+                let delay_ms = expires_ms.saturating_sub(crate::brain::store::unix_millis());
                 if delay_ms == 0 {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
             if store
-                .expire_runner_handoff(&brain, handoff_id, crate::brain::shared::unix_millis())
+                .expire_runner_handoff(&brain, handoff_id, crate::brain::store::unix_millis())
                 .is_ok_and(|expired| expired)
             {
                 let _ = store.remove_if_unused(&brain);
@@ -470,7 +470,7 @@ mod tests {
         // TempDir handle for the duration of a single test.
         let root = temp.keep();
         BrainLifecycleService::new(
-            SharedBrainStore::with_root("box.local", Some(root)),
+            BrainStore::with_root("box.local", Some(root)),
             BrainRunnerBroker::default(),
             BrainApprovalBroker::default(),
         )
@@ -674,7 +674,7 @@ mod tests {
         assert_eq!(outcome.accepted.sender, "alice");
         assert_eq!(
             outcome.run.as_ref().unwrap().status,
-            crate::brain::shared::BrainRunStatus::QueuedForEnvironment
+            crate::brain::store::BrainRunStatus::QueuedForEnvironment
         );
         assert!(outcome.result.is_none());
 

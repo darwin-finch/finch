@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use tokio::sync::oneshot;
 
-use crate::brain::shared::{AttachmentId, BrainApprovalAudience, BrainId};
+use crate::brain::store::{AttachmentId, BrainApprovalAudience, BrainId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ApprovalKey {
@@ -190,7 +190,7 @@ impl Drop for ClaimedApproval {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::brain::shared::AttachmentRole;
+    use crate::brain::store::AttachmentRole;
 
     fn audience(attachment_id: AttachmentId) -> BrainApprovalAudience {
         BrainApprovalAudience {

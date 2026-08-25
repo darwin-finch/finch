@@ -113,7 +113,7 @@ pub struct AgentServer {
         Option<tokio::sync::mpsc::UnboundedReceiver<crate::models::WeightedExample>>,
     >,
     /// Authoritative event logs and program stacks for named shared brains.
-    shared_brains: crate::brain::shared::SharedBrainStore,
+    brain_store: crate::brain::store::BrainStore,
     /// Send-safe bridge to frontend-owned Cap'n Proto runner callbacks.
     brain_runners: BrainRunnerBroker,
     /// Pending approval continuations keyed to their exact Brain attachment.
@@ -197,7 +197,7 @@ impl AgentServer {
             training_coordinator,
             training_tx: Arc::new(training_tx),
             training_rx: std::sync::Mutex::new(Some(training_rx)),
-            shared_brains: crate::brain::shared::SharedBrainStore::new(machine),
+            brain_store: crate::brain::store::BrainStore::new(machine),
             brain_runners: BrainRunnerBroker::default(),
             brain_approvals: BrainApprovalBroker::default(),
             brain_credentials,
@@ -445,8 +445,8 @@ impl AgentServer {
         &self.config
     }
 
-    pub fn shared_brains(&self) -> &crate::brain::shared::SharedBrainStore {
-        &self.shared_brains
+    pub fn brain_store(&self) -> &crate::brain::store::BrainStore {
+        &self.brain_store
     }
 
     pub fn brain_runners(&self) -> &BrainRunnerBroker {

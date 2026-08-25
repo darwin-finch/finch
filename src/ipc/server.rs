@@ -53,7 +53,7 @@ struct BrainTurnControlImpl {
     server: Arc<AgentServer>,
     brain: String,
     request_seq: u64,
-    expected_audience: crate::brain::shared::BrainApprovalAudience,
+    expected_audience: crate::brain::store::BrainApprovalAudience,
 }
 
 impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
@@ -97,23 +97,23 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
             Ok(registration) => registration,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        let run_id = match self.server.shared_brains().snapshot(&self.brain) {
+        let run_id = match self.server.brain_store().snapshot(&self.brain) {
             Ok(snapshot) => snapshot
                 .runs
                 .into_iter()
                 .find(|run| {
                     run.request_seq == self.request_seq
-                        && run.status == crate::brain::shared::BrainRunStatus::Running
+                        && run.status == crate::brain::store::BrainRunStatus::Running
                 })
                 .map(|run| run.run_id),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         if let Some(run_id) = run_id {
-            if let Err(error) = self.server.shared_brains().transition_run(
+            if let Err(error) = self.server.brain_store().transition_run(
                 &self.brain,
                 "daemon",
                 run_id,
-                crate::brain::shared::BrainRunStatus::AwaitingApproval,
+                crate::brain::store::BrainRunStatus::AwaitingApproval,
                 Some(format!("awaiting approval {approval_id}")),
             ) {
                 return Promise::err(capnp::Error::failed(error.to_string()));
@@ -124,10 +124,10 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
                 .get("input")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            if let Err(error) = self.server.shared_brains().push(
+            if let Err(error) = self.server.brain_store().push(
                 &self.brain,
                 "provider",
-                crate::brain::shared::BrainEventKind::ToolCall {
+                crate::brain::store::BrainEventKind::ToolCall {
                     request_seq: self.request_seq,
                     tool_id: approval_id.clone(),
                     name: subject.clone(),
@@ -135,21 +135,21 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
                 },
             ) {
                 if let Some(run_id) = run_id {
-                    let _ = self.server.shared_brains().transition_run(
+                    let _ = self.server.brain_store().transition_run(
                         &self.brain,
                         "daemon",
                         run_id,
-                        crate::brain::shared::BrainRunStatus::Interrupted,
+                        crate::brain::store::BrainRunStatus::Interrupted,
                         Some(error.to_string()),
                     );
                 }
                 return Promise::err(capnp::Error::failed(error.to_string()));
             }
         }
-        if let Err(error) = self.server.shared_brains().push(
+        if let Err(error) = self.server.brain_store().push(
             &self.brain,
             "runner",
-            crate::brain::shared::BrainEventKind::ApprovalRequested {
+            crate::brain::store::BrainEventKind::ApprovalRequested {
                 request_seq: self.request_seq,
                 approval_id,
                 approval_kind,
@@ -159,18 +159,18 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
             },
         ) {
             if let Some(run_id) = run_id {
-                let _ = self.server.shared_brains().transition_run(
+                let _ = self.server.brain_store().transition_run(
                     &self.brain,
                     "daemon",
                     run_id,
-                    crate::brain::shared::BrainRunStatus::Interrupted,
+                    crate::brain::store::BrainRunStatus::Interrupted,
                     Some(error.to_string()),
                 );
             }
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
 
-        let store = self.server.shared_brains().clone();
+        let store = self.server.brain_store().clone();
         let brain = self.brain.clone();
         Promise::from_future(async move {
             let decision = match registration.wait().await {
@@ -181,7 +181,7 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
                                 &brain,
                                 "daemon",
                                 run_id,
-                                crate::brain::shared::BrainRunStatus::Running,
+                                crate::brain::store::BrainRunStatus::Running,
                                 None,
                             )
                             .map_err(|error| capnp::Error::failed(error.to_string()))?;
@@ -194,7 +194,7 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
                             &brain,
                             "daemon",
                             run_id,
-                            crate::brain::shared::BrainRunStatus::Interrupted,
+                            crate::brain::store::BrainRunStatus::Interrupted,
                             Some(error.to_string()),
                         );
                     }
@@ -771,46 +771,46 @@ impl brain_service::Server for BrainRpcService {
 
 fn parse_attachment_id(
     value: capnp::Result<capnp::text::Reader<'_>>,
-) -> Result<crate::brain::shared::AttachmentId, capnp::Error> {
+) -> Result<crate::brain::store::AttachmentId, capnp::Error> {
     let value = value?.to_str()?;
     uuid::Uuid::parse_str(value)
-        .map(crate::brain::shared::AttachmentId)
+        .map(crate::brain::store::AttachmentId)
         .map_err(|error| capnp::Error::failed(error.to_string()))
 }
 
 fn parse_connection_id(
     value: capnp::Result<capnp::text::Reader<'_>>,
-) -> Result<crate::brain::shared::ConnectionId, capnp::Error> {
+) -> Result<crate::brain::store::ConnectionId, capnp::Error> {
     let value = value?.to_str()?;
     uuid::Uuid::parse_str(value)
-        .map(crate::brain::shared::ConnectionId)
+        .map(crate::brain::store::ConnectionId)
         .map_err(|error| capnp::Error::failed(error.to_string()))
 }
 
 fn parse_run_id(
     value: capnp::Result<capnp::text::Reader<'_>>,
-) -> Result<crate::brain::shared::RunId, capnp::Error> {
+) -> Result<crate::brain::store::RunId, capnp::Error> {
     let value = value?.to_str()?;
     uuid::Uuid::parse_str(value)
-        .map(crate::brain::shared::RunId)
+        .map(crate::brain::store::RunId)
         .map_err(|error| capnp::Error::failed(error.to_string()))
 }
 
 fn parse_runner_lease_id(
     value: capnp::Result<capnp::text::Reader<'_>>,
-) -> Result<crate::brain::shared::RunnerLeaseId, capnp::Error> {
+) -> Result<crate::brain::store::RunnerLeaseId, capnp::Error> {
     let value = value?.to_str()?;
     uuid::Uuid::parse_str(value)
-        .map(crate::brain::shared::RunnerLeaseId)
+        .map(crate::brain::store::RunnerLeaseId)
         .map_err(|error| capnp::Error::failed(error.to_string()))
 }
 
 fn parse_runner_handoff_id(
     value: capnp::Result<capnp::text::Reader<'_>>,
-) -> Result<crate::brain::shared::RunnerHandoffId, capnp::Error> {
+) -> Result<crate::brain::store::RunnerHandoffId, capnp::Error> {
     let value = value?.to_str()?;
     uuid::Uuid::parse_str(value)
-        .map(crate::brain::shared::RunnerHandoffId)
+        .map(crate::brain::store::RunnerHandoffId)
         .map_err(|error| capnp::Error::failed(error.to_string()))
 }
 
@@ -1096,7 +1096,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
             Ok(value) => value,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        let lease_id = crate::brain::shared::RunnerLeaseId(lease_uuid);
+        let lease_id = crate::brain::store::RunnerLeaseId(lease_uuid);
         let runner = pry!(params.get_runner());
         if let Err(error) = self.server.brain_runners().require_connection_lease(
             self.connection_id,
@@ -1105,7 +1105,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
         ) {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
-        let snapshot = match self.server.shared_brains().snapshot(&brain) {
+        let snapshot = match self.server.brain_store().snapshot(&brain) {
             Ok(snapshot) => snapshot,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
@@ -1120,7 +1120,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
         }
 
         let (runtime_revision, checkpoint) =
-            match self.server.shared_brains().runner_checkpoint(&brain) {
+            match self.server.brain_store().runner_checkpoint(&brain) {
                 Ok(checkpoint) => checkpoint,
                 Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
             };
@@ -1198,39 +1198,39 @@ impl finch_daemon::Server for FinchDaemonImpl {
 }
 
 fn program_language_to_capnp(
-    language: crate::brain::shared::ProgramLanguage,
+    language: crate::brain::store::ProgramLanguage,
 ) -> finch_ipc_capnp::ProgramLanguage {
     match language {
-        crate::brain::shared::ProgramLanguage::Forth => finch_ipc_capnp::ProgramLanguage::Forth,
-        crate::brain::shared::ProgramLanguage::Lisp => finch_ipc_capnp::ProgramLanguage::Lisp,
+        crate::brain::store::ProgramLanguage::Forth => finch_ipc_capnp::ProgramLanguage::Forth,
+        crate::brain::store::ProgramLanguage::Lisp => finch_ipc_capnp::ProgramLanguage::Lisp,
     }
 }
 
 fn attachment_role_from_capnp(
     role: finch_ipc_capnp::BrainAttachmentRole,
-) -> crate::brain::shared::AttachmentRole {
+) -> crate::brain::store::AttachmentRole {
     match role {
         finch_ipc_capnp::BrainAttachmentRole::Runner => {
-            crate::brain::shared::AttachmentRole::Runner
+            crate::brain::store::AttachmentRole::Runner
         }
         finch_ipc_capnp::BrainAttachmentRole::Driver => {
-            crate::brain::shared::AttachmentRole::Driver
+            crate::brain::store::AttachmentRole::Driver
         }
         finch_ipc_capnp::BrainAttachmentRole::Consultant => {
-            crate::brain::shared::AttachmentRole::Consultant
+            crate::brain::store::AttachmentRole::Consultant
         }
         finch_ipc_capnp::BrainAttachmentRole::Observer => {
-            crate::brain::shared::AttachmentRole::Observer
+            crate::brain::store::AttachmentRole::Observer
         }
     }
 }
 
 fn program_language_from_capnp(
     language: finch_ipc_capnp::ProgramLanguage,
-) -> crate::brain::shared::ProgramLanguage {
+) -> crate::brain::store::ProgramLanguage {
     match language {
-        finch_ipc_capnp::ProgramLanguage::Forth => crate::brain::shared::ProgramLanguage::Forth,
-        finch_ipc_capnp::ProgramLanguage::Lisp => crate::brain::shared::ProgramLanguage::Lisp,
+        finch_ipc_capnp::ProgramLanguage::Forth => crate::brain::store::ProgramLanguage::Forth,
+        finch_ipc_capnp::ProgramLanguage::Lisp => crate::brain::store::ProgramLanguage::Lisp,
     }
 }
 
@@ -1498,17 +1498,17 @@ mod tests {
     use super::{decode_runner_program_result, decode_runner_turn_result, execute_typed_forth_ipc};
     use crate::ipc::brain_codec::encode_approval_audience;
 
-    fn test_approval_audience() -> crate::brain::shared::BrainApprovalAudience {
-        crate::brain::shared::BrainApprovalAudience {
-            brain_id: crate::brain::shared::BrainId(
+    fn test_approval_audience() -> crate::brain::store::BrainApprovalAudience {
+        crate::brain::store::BrainApprovalAudience {
+            brain_id: crate::brain::store::BrainId(
                 uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
             ),
             brain: "shared".into(),
-            attachment_id: crate::brain::shared::AttachmentId(
+            attachment_id: crate::brain::store::AttachmentId(
                 uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
             ),
             subject: "alice@box.local".into(),
-            role: crate::brain::shared::AttachmentRole::Driver,
+            role: crate::brain::store::AttachmentRole::Driver,
             environment_generation: 3,
         }
     }

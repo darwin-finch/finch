@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::brain::shared::{
+use crate::brain::store::{
     AttachmentId, ConnectionId, ProgramLanguage, RunId, RunnerLeaseId,
 };
 
@@ -72,7 +72,7 @@ pub struct RunnerTurnRequest {
     pub request_seq: u64,
     pub prompt: String,
     pub context: Vec<crate::claude::Message>,
-    pub approval_audience: crate::brain::shared::BrainApprovalAudience,
+    pub approval_audience: crate::brain::store::BrainApprovalAudience,
     /// Reverse approval bridge installed by the Cap'n Proto client adapter.
     /// Daemon-side broker requests leave this unset until they cross IPC.
     pub approval_tx: Option<mpsc::UnboundedSender<RunnerApprovalRequest>>,
@@ -130,7 +130,7 @@ pub enum RunnerTurnEvent {
         approval_id: String,
         approval_kind: String,
         subject: String,
-        audience: crate::brain::shared::BrainApprovalAudience,
+        audience: crate::brain::store::BrainApprovalAudience,
         detail: serde_json::Value,
     },
     ApprovalDecided {
@@ -463,7 +463,7 @@ impl BrainRunnerBroker {
         request_seq: u64,
         prompt: String,
         context: Vec<crate::claude::Message>,
-        approval_audience: crate::brain::shared::BrainApprovalAudience,
+        approval_audience: crate::brain::store::BrainApprovalAudience,
     ) -> Result<RunnerTurnResult> {
         let registration = self
             .registrations
@@ -535,13 +535,13 @@ mod tests {
         RunnerLeaseId(uuid::Uuid::new_v4())
     }
 
-    fn test_approval_audience() -> crate::brain::shared::BrainApprovalAudience {
-        crate::brain::shared::BrainApprovalAudience {
-            brain_id: crate::brain::shared::BrainId(uuid::Uuid::new_v4()),
+    fn test_approval_audience() -> crate::brain::store::BrainApprovalAudience {
+        crate::brain::store::BrainApprovalAudience {
+            brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
             brain: "brain".into(),
-            attachment_id: crate::brain::shared::AttachmentId(uuid::Uuid::new_v4()),
+            attachment_id: crate::brain::store::AttachmentId(uuid::Uuid::new_v4()),
             subject: "driver@box.local".into(),
-            role: crate::brain::shared::AttachmentRole::Driver,
+            role: crate::brain::store::AttachmentRole::Driver,
             environment_generation: 1,
         }
     }

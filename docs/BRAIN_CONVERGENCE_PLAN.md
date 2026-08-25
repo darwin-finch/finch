@@ -88,9 +88,9 @@ clients and providers to the existing shared runtime.
 
 ## Existing implementations to converge
 
-### `SharedBrainStore`
+### `BrainStore`
 
-`src/brain/shared.rs` is the strongest current persistence foundation. It owns named Brain event
+`src/brain/store.rs` is the authoritative persistence foundation. It owns named Brain event
 logs, environment binding, revisions, program-stack projection, subscriptions, and JSONL recovery.
 
 ### Removed legacy daemon registry
@@ -445,7 +445,7 @@ Exit: every current state transition has one canonical event representation.
 
 ### B2: Unified authoritative store
 
-- Evolve `SharedBrainStore` into `BrainStore`/`BrainAggregate` storage.
+- Keep `BrainStore` as the sole aggregate storage boundary and make every projection consume it.
 - Add daemon-coordinated run state and final-summary events directly to the aggregate; do not revive
   the removed parallel registry.
 - Persist typed VM checkpoint/delta references alongside committed programs.
