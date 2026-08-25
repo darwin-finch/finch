@@ -816,9 +816,11 @@ still blocks the corresponding Brain phase until it is unified.
   remain readable as migration input, but all new durable blobs use the exact runner-transport
   codec. Tests cover native and frontend-runner restart, legacy recovery, closure/fiber state, and
   rejection of ambiguous trailing data.
-- [ ] Make the daemon own schedule definitions/due-time delivery only. Coalesce missed ticks into one
-  pending event per schedule while the environment-owning frontend is unavailable; require explicit
-  bounded catch-up and idempotency policy before delivering every missed occurrence.
+- [x] Make the daemon own schedule definitions/due-time delivery only. The Brain store durably
+  coalesces missed ticks into one pending run while its runner is unavailable, with explicit bounded
+  catch-up and idempotent terminal correlation. Typed `schedule-*` words cross the run-scoped
+  daemon capability boundary; the obsolete runtime-local SQLite queue and callback executor have
+  been removed, so schedule identity, authority ceilings, delivery, and cancellation have one owner.
 - [x] Split reducible VM state from the execute-once host-effect journal. Runner callbacks now
   carry exact schema-native effect/state records independently of checkpoints on success, failure,
   and cooperative cancellation. The daemon persists each `(execution_id, sequence)` once before
