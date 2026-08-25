@@ -500,6 +500,70 @@ pub(super) async fn refresh_context_strip(
     }
 }
 
+async fn persist_completed_turn_memory(
+    memory_system: &crate::memory::MemorySystem,
+    conversation: &Arc<RwLock<ConversationHistory>>,
+    query: &str,
+    assistant_source: &str,
+    model: &str,
+    session_label: &str,
+    cwd: &str,
+    status_bar: &StatusBar,
+    context_lines: usize,
+    memory_recall_count: usize,
+) {
+    let explicit_query = query
+        .split_once("\n\n[Context:")
+        .map(|(raw, _)| raw)
+        .unwrap_or(query)
+        .trim();
+    let user_text = if explicit_query.is_empty() {
+        conversation
+            .read()
+            .await
+            .get_messages()
+            .into_iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(|message| message.text())
+            .unwrap_or_default()
+    } else {
+        explicit_query.to_string()
+    };
+    if !user_text.is_empty() {
+        let _ = memory_system
+            .insert_conversation(
+                "user",
+                &user_text,
+                Some(model),
+                Some(session_label),
+            )
+            .await;
+    }
+    if !assistant_source.trim().is_empty() {
+        let _ = memory_system
+            .insert_conversation(
+                "assistant",
+                assistant_source,
+                Some(model),
+                Some(session_label),
+            )
+            .await;
+    }
+    status_bar.update_line(
+        crate::cli::status_bar::StatusLineType::MemoryContext,
+        format!("🧠 recalled {memory_recall_count}"),
+    );
+    refresh_context_strip(
+        memory_system,
+        session_label,
+        cwd,
+        status_bar,
+        context_lines,
+    )
+    .await;
+}
+
 /// Dispatch a batch of tool uses for one query turn.
 ///
 /// Called from both the streaming and non-streaming response paths — they used
@@ -1013,10 +1077,11 @@ pub(crate) async fn process_query_with_tools(
                 )
                 .await;
                 let response = wire_execution.response;
+                let source_for_history = wire_execution.source_for_history;
                 conversation
                     .write()
                     .await
-                    .add_assistant_message(wire_execution.source_for_history);
+                    .add_assistant_message(source_for_history.clone());
                 query_states
                     .update_state(
                         query_id,
@@ -1029,6 +1094,21 @@ pub(crate) async fn process_query_with_tools(
                     query_id,
                     full_response: response,
                 });
+                if let Some(ref mem) = memory_system {
+                    persist_completed_turn_memory(
+                        mem,
+                        &conversation,
+                        &query,
+                        &source_for_history,
+                        generator.name(),
+                        &session_label,
+                        &cwd,
+                        &status_bar,
+                        context_lines,
+                        memory_recall_count,
+                    )
+                    .await;
+                }
                 return;
             }
             Ok(None) | Err(_) => {
@@ -1171,39 +1251,22 @@ pub(crate) async fn process_query_with_tools(
             });
             tracing::debug!("Query complete (no tools), non-streaming finished");
 
-            // Store to memory (fire-and-forget)
+            // Store the completed turn and refresh its Brain-local summary.
             if let Some(ref mem) = memory_system {
                 let model_name = response.metadata.model.clone();
-                let query_for_memory = query
-                    .split_once("\n\n[Context:")
-                    .map(|(raw, _)| raw)
-                    .unwrap_or(&query);
-                let _ = mem
-                    .insert_conversation(
-                        "user",
-                        query_for_memory,
-                        Some(&model_name),
-                        Some(&session_label),
-                    )
-                    .await;
-                let _ = mem
-                    .insert_conversation(
-                        "assistant",
-                        &response.text,
-                        Some(&model_name),
-                        Some(&session_label),
-                    )
-                    .await;
-                if let Ok(stats) = mem.stats().await {
-                    status_bar.update_line(
-                        crate::cli::status_bar::StatusLineType::MemoryContext,
-                        format!(
-                            "🧠 recalled {}  ·  {} memories",
-                            memory_recall_count, stats.conversation_count
-                        ),
-                    );
-                }
-                refresh_context_strip(mem, &session_label, &cwd, &status_bar, context_lines).await;
+                persist_completed_turn_memory(
+                    mem,
+                    &conversation,
+                    &query,
+                    &response.text,
+                    &model_name,
+                    &session_label,
+                    &cwd,
+                    &status_bar,
+                    context_lines,
+                    memory_recall_count,
+                )
+                .await;
             }
         }
         Err(e) => {
@@ -1443,6 +1506,50 @@ pub(crate) fn apply_sliding_window(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn completed_streaming_turn_populates_session_context_strip() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let memory = crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let conversation = Arc::new(RwLock::new(ConversationHistory::new()));
+        conversation
+            .write()
+            .await
+            .add_user_message("test the context strip".into());
+        let status = StatusBar::new();
+
+        persist_completed_turn_memory(
+            &memory,
+            &conversation,
+            "",
+            "(say \"test\")",
+            "test-model",
+            "test-brain",
+            "/workspace",
+            &status,
+            4,
+            2,
+        )
+        .await;
+
+        assert_eq!(memory.stats().await.unwrap().conversation_count, 2);
+        let lines = status.get_lines();
+        assert!(lines.iter().any(|line| {
+            line.line_type == crate::cli::status_bar::StatusLineType::MemoryContext
+                && line.content == "🧠 recalled 2"
+        }));
+        assert!(lines.iter().any(|line| {
+            matches!(
+                line.line_type,
+                crate::cli::status_bar::StatusLineType::ContextLine(_)
+            )
+        }));
+    }
 
     struct SingleRepairGenerator {
         calls: AtomicUsize,
