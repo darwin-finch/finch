@@ -7676,6 +7676,35 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn initialization_command_distinguishes_completed_one_shot() {
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let attachment = store
+            .attach(
+                "shared",
+                "alice",
+                crate::brain::store::AttachmentRole::Driver,
+                None,
+            )
+            .unwrap();
+        let connection_id = attachment.connection_id.unwrap();
+        store
+            .activate_connection("shared", attachment.attachment_id, connection_id)
+            .unwrap();
+        let schedule = store
+            .schedule_initialization("shared", attachment.attachment_id, connection_id, 10)
+            .unwrap();
+        assert!(initialization_schedule_message(&schedule, None).contains("scheduled"));
+        let mut completed = schedule;
+        completed.active = false;
+        let message = initialization_schedule_message(
+            &completed,
+            Some(crate::brain::store::BrainRunStatus::Completed),
+        );
+        assert!(message.contains("already completed"));
+        assert!(!message.contains(" scheduled as "));
+    }
+
     fn brain_event(
         seq: u64,
         sender: &str,
