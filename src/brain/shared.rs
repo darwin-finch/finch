@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 4;
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 5;
 const BRAIN_METADATA_VERSION: u32 = 1;
 
 /// Stable identity of one durable Brain. Names are mutable human aliases;
@@ -155,6 +155,18 @@ pub enum BrainEventKind {
     },
     Prompt {
         text: String,
+    },
+    ToolCall {
+        request_seq: u64,
+        tool_id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        request_seq: u64,
+        tool_id: String,
+        output: String,
+        is_error: bool,
     },
     Program {
         language: ProgramLanguage,
@@ -350,7 +362,10 @@ impl BrainState {
                     current.durable_revision = durable_revision;
                 }
             }
-            BrainEventKind::Prompt { .. } | BrainEventKind::Result { .. } => {}
+            BrainEventKind::Prompt { .. }
+            | BrainEventKind::ToolCall { .. }
+            | BrainEventKind::ToolResult { .. }
+            | BrainEventKind::Result { .. } => {}
         }
         self.events.push(event);
     }
@@ -670,6 +685,8 @@ impl SharedBrainStore {
                 matches!(
                     event.kind,
                     BrainEventKind::Prompt { .. }
+                        | BrainEventKind::ToolCall { .. }
+                        | BrainEventKind::ToolResult { .. }
                         | BrainEventKind::Program { .. }
                         | BrainEventKind::ProgramPopped { .. }
                         | BrainEventKind::Result { .. }
@@ -1414,6 +1431,49 @@ mod tests {
         assert_eq!(snapshot.program_stack[0].seq, first.seq);
         assert_eq!(snapshot.environment.machine, "workstation.local");
         assert_eq!(snapshot.events[0].environment_generation, 1);
+    }
+
+    #[test]
+    fn tool_lifecycle_is_rebuilt_from_the_event_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("workstation.local", Some(temp.path().into()));
+        store
+            .push(
+                "finch",
+                "provider",
+                BrainEventKind::ToolCall {
+                    request_seq: 1,
+                    tool_id: "tool-1".into(),
+                    name: "search_word".into(),
+                    input: serde_json::json!({"query": "fib"}),
+                },
+            )
+            .unwrap();
+        store
+            .push(
+                "finch",
+                "runner",
+                BrainEventKind::ToolResult {
+                    request_seq: 1,
+                    tool_id: "tool-1".into(),
+                    output: "found".into(),
+                    is_error: false,
+                },
+            )
+            .unwrap();
+
+        let restarted = SharedBrainStore::with_root("workstation.local", Some(temp.path().into()));
+        let snapshot = restarted.snapshot("finch").unwrap();
+        assert!(matches!(
+            &snapshot.events[0].kind,
+            BrainEventKind::ToolCall { tool_id, input, .. }
+                if tool_id == "tool-1" && input["query"] == "fib"
+        ));
+        assert!(matches!(
+            &snapshot.events[1].kind,
+            BrainEventKind::ToolResult { tool_id, output, is_error: false, .. }
+                if tool_id == "tool-1" && output == "found"
+        ));
     }
 
     #[test]

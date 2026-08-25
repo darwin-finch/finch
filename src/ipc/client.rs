@@ -322,6 +322,36 @@ impl brain_runner::Server for BrainRunnerImpl {
                         }
                     });
                     result.set_output(&response.output);
+                    let mut tool_events = result
+                        .reborrow()
+                        .init_tool_events(response.tool_events.len() as u32);
+                    for (index, event) in response.tool_events.iter().enumerate() {
+                        let mut encoded = tool_events.reborrow().get(index as u32);
+                        match event {
+                            crate::server::RunnerToolEvent::Call {
+                                tool_id,
+                                name,
+                                input,
+                            } => {
+                                encoded.set_kind(finch_ipc_capnp::BrainToolEventKind::Call);
+                                encoded.set_tool_id(tool_id);
+                                encoded.set_name(name);
+                                let input = serde_json::to_vec(input)
+                                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                                encoded.set_input_json(&input);
+                            }
+                            crate::server::RunnerToolEvent::Result {
+                                tool_id,
+                                output,
+                                is_error,
+                            } => {
+                                encoded.set_kind(finch_ipc_capnp::BrainToolEventKind::Result);
+                                encoded.set_tool_id(tool_id);
+                                encoded.set_output(output);
+                                encoded.set_is_error(*is_error);
+                            }
+                        }
+                    }
                     result.set_runtime_revision(response.runtime_revision);
                     let encoded = serde_json::to_vec(&response.checkpoint)
                         .map_err(|error| capnp::Error::failed(error.to_string()))?;

@@ -768,9 +768,12 @@ still blocks the corresponding Brain phase until it is unified.
   daemon turn lane; the leased frontend runs the complete provider/tool/VM callback, while both home
   and remote consoles replay its canonical prompt/program/result events. A live two-console test
   submitted a follow-up from the remote driver, executed it on the home runner, and displayed the
-  same Lisp source/result in both projections. Add canonical tool-start/tool-output/approval events
-  next so remote history includes the complete coding-agent lifecycle rather than only its final
-  program/result; keep workspace execution and provider tools in the frontend runner.
+  same Lisp source/result in both projections. Frontend tool calls and results now cross the
+  runner callback as typed Cap'n Proto lifecycle entries, persist before the final program in the
+  canonical log, reconstruct provider-native tool messages after restart, and replay as grouped
+  tool rows on attached consoles without duplicating the home runner's live view. Add canonical
+  approval request/decision events next so remote history includes the remaining human-control
+  lifecycle; keep workspace execution and provider tools in the frontend runner.
 - [ ] Complete Brain control and approval ownership above that substrate. Put the role and approval
   audience on every permission/proposal view and add scoped participant credentials. ProgramRuns
   now execute on the leased frontend, but approval/control authority still needs explicit audience,

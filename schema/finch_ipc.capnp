@@ -127,6 +127,24 @@ struct BrainTurnResult {
   runtimeRevision @3 :UInt64;
   checkpointJson  @4 :Data; # Transitional typed checkpoint payload; schema becomes native later.
   error           @5 :Text;
+  toolEvents      @6 :List(BrainToolEvent);
+}
+
+enum BrainToolEventKind {
+  call   @0;
+  result @1;
+}
+
+# Ordered provider/runner tool transcript produced while servicing one Brain
+# prompt. Arbitrary tool arguments remain JSON values at the provider API
+# boundary, but the event envelope and lifecycle are typed Cap'n Proto data.
+struct BrainToolEvent {
+  kind      @0 :BrainToolEventKind;
+  toolId    @1 :Text;
+  name      @2 :Text; # Present for call events.
+  inputJson @3 :Data; # Present for call events.
+  output    @4 :Text; # Present for result events.
+  isError   @5 :Bool; # Present for result events.
 }
 
 interface BrainRunner {

@@ -514,6 +514,46 @@ fn decode_runner_turn_result(
         result.get_checkpoint_json().map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
+    let mut tool_events = Vec::new();
+    let encoded_tool_events = result.get_tool_events().map_err(|error| error.to_string())?;
+    for encoded in encoded_tool_events.iter() {
+        let tool_id = encoded
+            .get_tool_id()
+            .ok()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        match encoded.get_kind().map_err(|error| error.to_string())? {
+            finch_ipc_capnp::BrainToolEventKind::Call => {
+                let input = serde_json::from_slice(
+                    encoded.get_input_json().map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
+                tool_events.push(crate::server::RunnerToolEvent::Call {
+                    tool_id,
+                    name: encoded
+                        .get_name()
+                        .ok()
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string(),
+                    input,
+                });
+            }
+            finch_ipc_capnp::BrainToolEventKind::Result => {
+                tool_events.push(crate::server::RunnerToolEvent::Result {
+                    tool_id,
+                    output: encoded
+                        .get_output()
+                        .ok()
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string(),
+                    is_error: encoded.get_is_error(),
+                });
+            }
+        }
+    }
     Ok(crate::server::RunnerTurnResult {
         source: result
             .get_source()
@@ -530,6 +570,7 @@ fn decode_runner_turn_result(
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string(),
+        tool_events,
         runtime_revision: result.get_runtime_revision(),
         checkpoint,
     })
@@ -537,7 +578,62 @@ fn decode_runner_turn_result(
 
 #[cfg(test)]
 mod tests {
-    use super::execute_typed_forth_ipc;
+    use super::{decode_runner_turn_result, execute_typed_forth_ipc};
+
+    #[test]
+    fn runner_turn_result_decodes_ordered_capnp_tool_events() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let checkpoint = runtime
+            .revision_history()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let checkpoint_json = serde_json::to_vec(&checkpoint).unwrap();
+        let mut message = capnp::message::Builder::new_default();
+        {
+            let mut result = message
+                .init_root::<super::finch_ipc_capnp::brain_turn_result::Builder>();
+            result.set_source("(say \"done\")");
+            result.set_language(super::finch_ipc_capnp::ProgramLanguage::Lisp);
+            result.set_output("done");
+            result.set_runtime_revision(1);
+            result.set_checkpoint_json(&checkpoint_json);
+            result.set_error("");
+            let mut events = result.init_tool_events(2);
+            let mut call = events.reborrow().get(0);
+            call.set_kind(super::finch_ipc_capnp::BrainToolEventKind::Call);
+            call.set_tool_id("tool-1");
+            call.set_name("search_word");
+            call.set_input_json(br#"{"query":"fib"}"#);
+            let mut tool_result = events.reborrow().get(1);
+            tool_result.set_kind(super::finch_ipc_capnp::BrainToolEventKind::Result);
+            tool_result.set_tool_id("tool-1");
+            tool_result.set_output("found");
+            tool_result.set_is_error(false);
+        }
+
+        let reader = message
+            .get_root_as_reader::<super::finch_ipc_capnp::brain_turn_result::Reader>()
+            .unwrap();
+        let decoded = decode_runner_turn_result(Ok(reader)).unwrap();
+        assert_eq!(
+            decoded.tool_events,
+            vec![
+                crate::server::RunnerToolEvent::Call {
+                    tool_id: "tool-1".into(),
+                    name: "search_word".into(),
+                    input: serde_json::json!({"query": "fib"}),
+                },
+                crate::server::RunnerToolEvent::Result {
+                    tool_id: "tool-1".into(),
+                    output: "found".into(),
+                    is_error: false,
+                },
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn eval_forth_uses_typed_signatures_and_runtime() {

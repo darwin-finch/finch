@@ -200,6 +200,10 @@ pub struct EventLoop {
     /// drawing a second copy in the runner console.
     local_brain_projections: std::collections::VecDeque<LocalBrainProjection>,
 
+    /// Canonical tool calls replay into one grouped unit per Brain turn.
+    remote_brain_tool_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
+    remote_brain_tool_rows: std::collections::HashMap<String, usize>,
+
     /// Pending tool approval requests (query_id -> (tool_use, response_tx))
     pending_approvals: PendingApprovalsMap,
 
@@ -425,11 +429,46 @@ struct PendingNamedBrainTurn {
     response_tx: tokio::sync::oneshot::Sender<
         std::result::Result<crate::server::RunnerTurnResult, String>,
     >,
+    /// The daemon supplied this canonical prefix. Only later rich content
+    /// belongs to the delegated turn's tool transcript.
+    context_message_count: usize,
+}
+
+fn runner_tool_events_since(
+    messages: &[crate::claude::Message],
+    start: usize,
+) -> Vec<crate::server::RunnerToolEvent> {
+    messages
+        .iter()
+        .skip(start.min(messages.len()))
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            crate::claude::ContentBlock::ToolUse { id, name, input } => {
+                Some(crate::server::RunnerToolEvent::Call {
+                    tool_id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                })
+            }
+            crate::claude::ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => Some(crate::server::RunnerToolEvent::Result {
+                tool_id: tool_use_id.clone(),
+                output: content.clone(),
+                is_error: is_error.unwrap_or(false),
+            }),
+            crate::claude::ContentBlock::Text { .. }
+            | crate::claude::ContentBlock::Image { .. } => None,
+        })
+        .collect()
 }
 
 struct LocalBrainProjection {
     source: String,
     output: String,
+    tool_ids: std::collections::HashSet<String>,
     program_seq: Option<u64>,
 }
 
@@ -443,6 +482,12 @@ enum LocalProjectionMatch {
 impl LocalBrainProjection {
     fn observe(&mut self, event: &crate::brain::shared::BrainEvent) -> LocalProjectionMatch {
         match &event.kind {
+            crate::brain::shared::BrainEventKind::ToolCall { tool_id, .. }
+            | crate::brain::shared::BrainEventKind::ToolResult { tool_id, .. }
+                if self.tool_ids.contains(tool_id) =>
+            {
+                LocalProjectionMatch::Suppress
+            }
             crate::brain::shared::BrainEventKind::Program { source, .. }
                 if event.sender == "provider"
                     && self.program_seq.is_none()
@@ -862,6 +907,8 @@ impl EventLoop {
             pending_queries: std::collections::VecDeque::new(),
             pending_named_brain_turns: std::collections::HashMap::new(),
             local_brain_projections: std::collections::VecDeque::new(),
+            remote_brain_tool_unit: None,
+            remote_brain_tool_rows: std::collections::HashMap::new(),
             pending_approvals: Arc::new(RwLock::new(std::collections::HashMap::new())),
             pending_vm_approval: None,
             ipc_client,
@@ -3240,12 +3287,14 @@ Rules:\n\
             .write()
             .await
             .restore_snapshot(context.clone());
+        let context_message_count = context.len();
         let query_id = self.query_states.create_query(context).await;
         *self.active_query_id.write().await = Some(query_id);
         self.pending_named_brain_turns.insert(
             query_id,
             PendingNamedBrainTurn {
                 response_tx: request.response_tx,
+                context_message_count,
             },
         );
         self.update_compaction_status().await;
@@ -3273,11 +3322,16 @@ Rules:\n\
             return;
         };
         let result = (|| -> anyhow::Result<crate::server::RunnerTurnResult> {
-            let source = self
+            let messages = self
                 .conversation
                 .try_read()
                 .map_err(|_| anyhow::anyhow!("named Brain conversation is busy"))?
-                .get_messages()
+                .get_messages();
+            let tool_events = runner_tool_events_since(
+                &messages,
+                pending.context_message_count,
+            );
+            let source = messages
                 .into_iter()
                 .rev()
                 .find(|message| message.role == "assistant")
@@ -3308,15 +3362,25 @@ Rules:\n\
                 source,
                 language,
                 output,
+                tool_events,
                 runtime_revision,
                 checkpoint,
             })
         })()
         .map_err(|error| error.to_string());
         if let Ok(result) = &result {
+            let tool_ids = result
+                .tool_events
+                .iter()
+                .map(|event| match event {
+                    crate::server::RunnerToolEvent::Call { tool_id, .. }
+                    | crate::server::RunnerToolEvent::Result { tool_id, .. } => tool_id.clone(),
+                })
+                .collect();
             self.local_brain_projections.push_back(LocalBrainProjection {
                 source: result.source.clone(),
                 output: result.output.clone(),
+                tool_ids,
                 program_seq: None,
             });
         }
@@ -3937,7 +4001,75 @@ Rules:\n\
             BrainEventKind::Prompt { text } => self
                 .output_manager
                 .write_user(format!("{}: {text}", event.sender)),
+            BrainEventKind::ToolCall {
+                tool_id,
+                name,
+                input,
+                ..
+            } => {
+                if self.selected_brain_is_home()
+                    && self
+                        .local_brain_projections
+                        .front_mut()
+                        .is_some_and(|projection| {
+                            projection.observe(event) == LocalProjectionMatch::Suppress
+                        })
+                {
+                    return;
+                }
+                let unit = self
+                    .remote_brain_tool_unit
+                    .get_or_insert_with(|| self.output_manager.start_work_unit("Brain tools"));
+                let input = input.to_string();
+                let input = if input.chars().count() > 80 {
+                    format!("{}…", input.chars().take(79).collect::<String>())
+                } else {
+                    input
+                };
+                let row = unit.add_row(format!("{name} {input}"));
+                self.remote_brain_tool_rows.insert(tool_id.clone(), row);
+            }
+            BrainEventKind::ToolResult {
+                tool_id,
+                output,
+                is_error,
+                ..
+            } => {
+                if self.selected_brain_is_home()
+                    && self
+                        .local_brain_projections
+                        .front_mut()
+                        .is_some_and(|projection| {
+                            projection.observe(event) == LocalProjectionMatch::Suppress
+                        })
+                {
+                    return;
+                }
+                let unit = self
+                    .remote_brain_tool_unit
+                    .get_or_insert_with(|| self.output_manager.start_work_unit("Brain tools"));
+                let row = self
+                    .remote_brain_tool_rows
+                    .remove(tool_id)
+                    .unwrap_or_else(|| unit.add_row(tool_id));
+                if *is_error {
+                    unit.fail_row(row, output);
+                } else {
+                    let first = output.lines().next().unwrap_or_default();
+                    let summary = if first.chars().count() > 80 {
+                        format!("{}…", first.chars().take(79).collect::<String>())
+                    } else {
+                        first.to_string()
+                    };
+                    let body = output.lines().skip(1).map(str::to_owned).collect();
+                    unit.complete_row_with_body(row, summary, body);
+                }
+            }
             BrainEventKind::Program { language, source } => {
+                if let Some(unit) = self.remote_brain_tool_unit.take() {
+                    unit.set_complete();
+                }
+                self.remote_brain_tool_rows.clear();
                 if self.selected_brain_is_home()
                     && self
                         .local_brain_projections
@@ -5549,6 +5681,64 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn named_brain_tool_transcript_excludes_context_and_preserves_order() {
+        let messages = vec![
+            crate::claude::Message::with_content(
+                "assistant",
+                vec![crate::claude::ContentBlock::ToolUse {
+                    id: "old".into(),
+                    name: "read".into(),
+                    input: serde_json::json!({"path": "old"}),
+                }],
+            ),
+            crate::claude::Message::with_content(
+                "assistant",
+                vec![
+                    crate::claude::ContentBlock::ToolUse {
+                        id: "one".into(),
+                        name: "search_word".into(),
+                        input: serde_json::json!({"query": "fib"}),
+                    },
+                    crate::claude::ContentBlock::ToolUse {
+                        id: "two".into(),
+                        name: "get_vm_state".into(),
+                        input: serde_json::json!({}),
+                    },
+                ],
+            ),
+            crate::claude::Message::with_content(
+                "user",
+                vec![
+                    crate::claude::ContentBlock::ToolResult {
+                        tool_use_id: "one".into(),
+                        content: "found".into(),
+                        is_error: None,
+                    },
+                    crate::claude::ContentBlock::ToolResult {
+                        tool_use_id: "two".into(),
+                        content: "denied".into(),
+                        is_error: Some(true),
+                    },
+                ],
+            ),
+            crate::claude::Message::assistant("(say \"done\")"),
+        ];
+
+        let events = super::runner_tool_events_since(&messages, 1);
+        assert_eq!(events.len(), 4);
+        assert!(matches!(
+            &events[0],
+            crate::server::RunnerToolEvent::Call { tool_id, name, .. }
+                if tool_id == "one" && name == "search_word"
+        ));
+        assert!(matches!(
+            &events[3],
+            crate::server::RunnerToolEvent::Result { tool_id, is_error: true, .. }
+                if tool_id == "two"
+        ));
+    }
+
     use super::*;
 
     fn brain_event(
@@ -5572,6 +5762,7 @@ mod tests {
         let mut projection = LocalBrainProjection {
             source: "(say \"hello\")".into(),
             output: "hello".into(),
+            tool_ids: std::collections::HashSet::new(),
             program_seq: None,
         };
         let program = brain_event(
@@ -5608,6 +5799,7 @@ mod tests {
         let mut projection = LocalBrainProjection {
             source: "(say \"hello\")".into(),
             output: "hello".into(),
+            tool_ids: std::collections::HashSet::new(),
             program_seq: Some(12),
         };
         let result = brain_event(

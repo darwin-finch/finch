@@ -45,8 +45,23 @@ pub struct RunnerTurnResult {
     pub source: String,
     pub language: ProgramLanguage,
     pub output: String,
+    pub tool_events: Vec<RunnerToolEvent>,
     pub runtime_revision: u64,
     pub checkpoint: crate::vm::TypedRuntimeCheckpoint,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunnerToolEvent {
+    Call {
+        tool_id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    Result {
+        tool_id: String,
+        output: String,
+        is_error: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +294,7 @@ mod tests {
                     source: "(say \"42\")".into(),
                     language: ProgramLanguage::Lisp,
                     output: "42".into(),
+                    tool_events: Vec::new(),
                     runtime_revision: 1,
                     checkpoint,
                 }))

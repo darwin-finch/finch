@@ -538,6 +538,8 @@ async fn push_named_brain_event(
             })
         }
         BrainEventKind::ProgramPopped { .. }
+        | BrainEventKind::ToolCall { .. }
+        | BrainEventKind::ToolResult { .. }
         | BrainEventKind::Result { .. }
         | BrainEventKind::RuntimeCommitted { .. }
         | BrainEventKind::RunnerLeaseAcquired { .. }
@@ -672,6 +674,42 @@ async fn dispatch_named_brain_turn(
             named_brain_provider_messages(&snapshot),
         )
         .await?;
+    for tool_event in outcome.tool_events {
+        match tool_event {
+            crate::server::RunnerToolEvent::Call {
+                tool_id,
+                name: tool_name,
+                input,
+            } => {
+                store.push(
+                    name,
+                    "provider",
+                    crate::brain::shared::BrainEventKind::ToolCall {
+                        request_seq,
+                        tool_id,
+                        name: tool_name,
+                        input,
+                    },
+                )?;
+            }
+            crate::server::RunnerToolEvent::Result {
+                tool_id,
+                output,
+                is_error,
+            } => {
+                store.push(
+                    name,
+                    "runner",
+                    crate::brain::shared::BrainEventKind::ToolResult {
+                        request_seq,
+                        tool_id,
+                        output,
+                        is_error,
+                    },
+                )?;
+            }
+        }
+    }
     let program = store.push(
         name,
         "provider",
@@ -710,13 +748,39 @@ fn named_brain_provider_messages(
         })
         .take(80)
         .collect::<Vec<_>>();
-    events
+    let projected = events
         .into_iter()
         .rev()
         .map(|event| match &event.kind {
             BrainEventKind::Prompt { text } => {
                 Message::user(format!("[{}]\n{text}", event.sender))
             }
+            BrainEventKind::ToolCall {
+                tool_id,
+                name,
+                input,
+                ..
+            } => Message::with_content(
+                "assistant",
+                vec![crate::claude::ContentBlock::ToolUse {
+                    id: tool_id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                }],
+            ),
+            BrainEventKind::ToolResult {
+                tool_id,
+                output,
+                is_error,
+                ..
+            } => Message::with_content(
+                "user",
+                vec![crate::claude::ContentBlock::ToolResult {
+                    tool_use_id: tool_id.clone(),
+                    content: output.clone(),
+                    is_error: is_error.then_some(true),
+                }],
+            ),
             BrainEventKind::Program {
                 language: _,
                 source,
@@ -754,7 +818,41 @@ fn named_brain_provider_messages(
             | BrainEventKind::ClientAttached { .. }
             | BrainEventKind::ClientDetached { .. } => unreachable!("filtered above"),
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    // Parallel provider calls are one assistant message, followed by one user
+    // message containing their results. The event log deliberately stores one
+    // lifecycle item per event; rebuild the provider protocol grouping here
+    // instead of emitting invalid consecutive assistant/user messages.
+    let mut messages: Vec<Message> = Vec::with_capacity(projected.len());
+    for mut message in projected {
+        let block_kind = message.content.first().map(|block| match block {
+            crate::claude::ContentBlock::ToolUse { .. } => 1,
+            crate::claude::ContentBlock::ToolResult { .. } => 2,
+            _ => 0,
+        });
+        let merge = messages.last().is_some_and(|previous| {
+            previous.role == message.role
+                && block_kind.is_some_and(|kind| kind != 0)
+                && previous.content.iter().all(|block| {
+                    matches!(
+                        (block_kind, block),
+                        (Some(1), crate::claude::ContentBlock::ToolUse { .. })
+                            | (Some(2), crate::claude::ContentBlock::ToolResult { .. })
+                    )
+                })
+        });
+        if merge {
+            messages
+                .last_mut()
+                .expect("merge requires a preceding message")
+                .content
+                .append(&mut message.content);
+        } else {
+            messages.push(message);
+        }
+    }
+    messages
 }
 
 fn ensure_named_brain_store_environment(
@@ -2014,6 +2112,107 @@ mod named_brain_provider_context_tests {
     }
 
     #[test]
+    fn brain_history_reconstructs_provider_tool_protocol() {
+        let snapshot = BrainSnapshot {
+            brain_id: BrainId(uuid::Uuid::nil()),
+            name: "shared".into(),
+            environment: BrainEnvironment {
+                machine: "box.local".into(),
+                workspace: "/workspace".into(),
+                generation: 1,
+            },
+            revision: 6,
+            events: vec![
+                event(
+                    1,
+                    "driver",
+                    BrainEventKind::Prompt {
+                        text: "inspect fib".into(),
+                    },
+                ),
+                event(
+                    2,
+                    "provider",
+                    BrainEventKind::ToolCall {
+                        request_seq: 1,
+                        tool_id: "tool-1".into(),
+                        name: "search_word".into(),
+                        input: serde_json::json!({"query": "fib"}),
+                    },
+                ),
+                event(
+                    3,
+                    "provider",
+                    BrainEventKind::ToolCall {
+                        request_seq: 1,
+                        tool_id: "tool-2".into(),
+                        name: "get_vm_state".into(),
+                        input: serde_json::json!({}),
+                    },
+                ),
+                event(
+                    4,
+                    "runner",
+                    BrainEventKind::ToolResult {
+                        request_seq: 1,
+                        tool_id: "tool-1".into(),
+                        output: "found fib".into(),
+                        is_error: false,
+                    },
+                ),
+                event(
+                    5,
+                    "runner",
+                    BrainEventKind::ToolResult {
+                        request_seq: 1,
+                        tool_id: "tool-2".into(),
+                        output: "revision 7".into(),
+                        is_error: false,
+                    },
+                ),
+                event(
+                    6,
+                    "provider",
+                    BrainEventKind::Program {
+                        language: ProgramLanguage::Lisp,
+                        source: "(say \"done\")".into(),
+                    },
+                ),
+            ],
+            program_stack: Vec::new(),
+            attachments: Vec::new(),
+            runner_lease: None,
+        };
+
+        let messages = named_brain_provider_messages(&snapshot);
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(
+            &messages[1].content[..],
+            [
+                crate::claude::ContentBlock::ToolUse { id, name, .. },
+                crate::claude::ContentBlock::ToolUse { id: id2, name: name2, .. }
+            ] if id == "tool-1" && name == "search_word"
+                && id2 == "tool-2" && name2 == "get_vm_state"
+        ));
+        assert!(matches!(
+            &messages[2].content[..],
+            [
+                crate::claude::ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error: None,
+                },
+                crate::claude::ContentBlock::ToolResult {
+                    tool_use_id: tool_use_id2,
+                    content: content2,
+                    is_error: None,
+                }
+            ] if tool_use_id == "tool-1" && content == "found fib"
+                && tool_use_id2 == "tool-2" && content2 == "revision 7"
+        ));
+    }
+
+    #[test]
     fn named_brain_list_fields_expose_their_actual_semantics() {
         let entry = NamedBrainListEntry {
             name: "shared".into(),
@@ -2207,6 +2406,18 @@ mod named_brain_provider_context_tests {
                     source: source.into(),
                     language: ProgramLanguage::Lisp,
                     output: "triple defined".into(),
+                    tool_events: vec![
+                        crate::server::RunnerToolEvent::Call {
+                            tool_id: "tool-1".into(),
+                            name: "search_word".into(),
+                            input: serde_json::json!({"query": "triple"}),
+                        },
+                        crate::server::RunnerToolEvent::Result {
+                            tool_id: "tool-1".into(),
+                            output: "no matches".into(),
+                            is_error: false,
+                        },
+                    ],
                     runtime_revision: outcome.output_revision,
                     checkpoint,
                 }))
@@ -2234,6 +2445,25 @@ mod named_brain_provider_context_tests {
         assert!(error.is_none());
 
         let snapshot = store.snapshot("shared").unwrap();
+        let kinds = snapshot
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                BrainEventKind::ToolCall { tool_id, .. } => Some(("call", tool_id.as_str())),
+                BrainEventKind::ToolResult { tool_id, .. } => {
+                    Some(("result", tool_id.as_str()))
+                }
+                BrainEventKind::Program { .. } if event.sender == "provider" => {
+                    Some(("program", ""))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![("call", "tool-1"), ("result", "tool-1"), ("program", "")],
+            "tool lifecycle must precede the final provider program in the canonical log"
+        );
         assert!(snapshot.events.iter().any(|event| {
             event.seq == request_seq
                 && matches!(
