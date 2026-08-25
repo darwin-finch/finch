@@ -758,8 +758,10 @@ still blocks the corresponding Brain phase until it is unified.
   detach commands. The server binds commands to the authenticated socket attachment, revalidates
   scoped credentials on every command and while idle, and preserves event delivery while a long
   runner request is in flight. A loopback fixture and ignored live-daemon test cover the remote
-  command lifecycle. Still consolidate attach/bootstrap cleanup, add one cross-transport
-  conformance fixture that asserts identical outcomes, and remove duplicated lifecycle HTTP routes.
+  command lifecycle, including detach before an explicit watch. JSON submit, acknowledge, detach,
+  and runner-lease routes have been removed; HTTP now remains only for authenticated
+  discovery/credential/attachment bootstrap and explicit administrative archive. Still add one
+  cross-transport conformance fixture that asserts identical outcomes and converge embedded mode.
 - [ ] Define Brain initialization as a reviewed typed program/module with an explicit capability
   budget and journaled effects. Deterministic VM vocabulary/module loading may occur before a
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work

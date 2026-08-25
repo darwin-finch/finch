@@ -134,8 +134,8 @@ snapshot/event projections plus submit, acknowledge, and detach commands. Comman
 exact socket attachment rather than accepting client-authored attachment IDs, and the daemon
 revalidates the signed credential for each mutation and periodically while the connection is idle.
 
-The named-Brain HTTP compatibility handler no longer executes ProgramRuns inside the daemon. It
-serializes the accepted event, requires the active environment lease's registered callback, and
+The daemon's transport-neutral submission operation never executes ProgramRuns inside the daemon.
+It serializes the accepted event, requires the active environment lease's registered callback, and
 dispatches the source to the frontend-owned typed `ProgramRuntime`. The runner returns its exact
 output/revision/checkpoint; the daemon independently reverifies and content-addresses reducible
 state beside the event log without inheriting frontend authority or replaying effects. A restarted
@@ -161,13 +161,15 @@ against the restored dictionary. A second live provider test rejected a three-ar
 then committed the corrected program; another daemon restart restored the earlier definition and
 continued the runtime revision. Static wire repair never retries host effects, approvals,
 cancellation, or runtime-limit failures.
-The transport-neutral participant-submission operation is now shared by HTTP, local Cap'n Proto,
-and the authenticated remote binary session, and the local RPC exposes the complete first lifecycle
-surface. Remote command correlation is independent of event projection, so long provider/runner
-requests do not stop that socket from receiving canonical events. Run ancestry/budgets/cancellation
-and generalized effect-resume correlation still need the unified service, and compatibility HTTP
-mutation routes remain to be removed. Runtime ownership has moved to the leased environment runner;
-the daemon is now the durable coordinator for interactive prompt/program runs.
+The transport-neutral participant-submission operation is now shared by local Cap'n Proto and the
+authenticated remote binary session; the former JSON HTTP adapter has been removed. The local RPC
+exposes the complete first lifecycle surface. Remote command correlation is independent of event
+projection, so long provider/runner
+requests do not stop that socket from receiving canonical events. JSON submit, acknowledge, detach,
+and runner-lease routes are gone; HTTP remains for authenticated discovery, credential/attachment
+bootstrap, and explicit administrative archive. Run ancestry/budgets/cancellation and generalized
+effect-resume correlation still need the unified service. Runtime ownership has moved to the leased
+environment runner; the daemon is now the durable coordinator for interactive prompt/program runs.
 
 On 2026-08-24 a live attachment test used separate driver and consultant consoles against one
 Brain. The driver defined and invoked a shared Lisp word, the consultant was forbidden from
@@ -424,9 +426,9 @@ capability entirely on its `LocalSet`; a live ignored test verifies snapshot-fir
 submission, cursor acknowledgement, and detach against a restarted daemon. Remote consoles carry
 the same closed submission union and typed outcomes in correlated binary WebSocket envelopes;
 fixture and live-daemon tests cover attach, watch, submit, acknowledge, final detach projection, and
-cleanup. Compatibility JSON mutation handlers still need removal, a shared conformance fixture must
-compare transport outcomes directly, generalized approval/effect resumptions remain incomplete, and
-embedded mode likewise does not yet implement the same contract.
+cleanup, including detach before an explicit watch. A shared conformance fixture must compare
+transport outcomes directly, generalized approval/effect resumptions remain incomplete, and embedded
+mode likewise does not yet implement the same contract.
 
 ### B5: Client projections and shadow-buffer UI
 
