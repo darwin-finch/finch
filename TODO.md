@@ -466,6 +466,9 @@ still blocks the corresponding Brain phase until it is unified.
   by which a model discovers that work exists. Plan mode must read and update this same state,
   enforce its advertised read-only/exploration boundary, survive reconnect/restart, and have
   fixtures proving approval, rejection, requested changes, and exit preserve one coherent plan.
+  Named-Brain turns now receive a bounded authoritative snapshot of in-progress and pending tasks,
+  including the first ordered in-progress item as the current task; active-goal/runtime-handle and
+  plan-mode convergence remain open.
 - [ ] Establish a Finch-on-Finch dogfood gate before calling the interactive harness production
   ready. Complete representative Finch changes entirely from Finch—inspect, plan, edit, review,
   test, commit, reconnect, and resume—without another coding harness repairing the session. Track
