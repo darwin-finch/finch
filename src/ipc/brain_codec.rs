@@ -193,6 +193,15 @@ pub(crate) enum BrainRemoteCommandKind {
     },
     CancelRunnerHandoff(RunnerHandoffId),
     CancelRun(RunId),
+    CreateSchedule {
+        language: ProgramLanguage,
+        source: String,
+        grant_ceiling: crate::vm::EffectSet,
+        next_due_ms: u64,
+        interval_ms: Option<u64>,
+        delivery_policy: BrainScheduleDeliveryPolicy,
+    },
+    CancelSchedule(ScheduleId),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -221,6 +230,14 @@ pub(crate) enum BrainRemoteReply {
         request_id: u64,
         run: BrainRun,
     },
+    ScheduleCreated {
+        request_id: u64,
+        schedule: BrainSchedule,
+    },
+    ScheduleCancelled {
+        request_id: u64,
+        cancelled: bool,
+    },
     Error {
         request_id: u64,
         code: String,
@@ -237,6 +254,8 @@ impl BrainRemoteReply {
             | Self::HandoffRequested { request_id, .. }
             | Self::HandoffCancelled { request_id }
             | Self::RunCancelled { request_id, .. }
+            | Self::ScheduleCreated { request_id, .. }
+            | Self::ScheduleCancelled { request_id, .. }
             | Self::Error { request_id, .. } => *request_id,
         }
     }
@@ -536,6 +555,42 @@ pub(crate) fn encode_brain_remote_envelope(
                 BrainRemoteCommandKind::CancelRun(run_id) => {
                     builder.set_cancel_run(&run_id.0.to_string())
                 }
+                BrainRemoteCommandKind::CreateSchedule {
+                    language,
+                    source,
+                    grant_ceiling,
+                    next_due_ms,
+                    interval_ms,
+                    delivery_policy,
+                } => {
+                    let mut request = builder.init_create_schedule();
+                    request.set_language(language_to_capnp(*language));
+                    request.set_source(source);
+                    crate::ipc::checkpoint_codec::encode_effects(
+                        request
+                            .reborrow()
+                            .init_grant_ceiling(grant_ceiling.0.len() as u32),
+                        grant_ceiling,
+                    );
+                    request.set_next_due_ms(*next_due_ms);
+                    if let Some(interval_ms) = interval_ms {
+                        request.set_has_interval_ms(true);
+                        request.set_interval_ms(*interval_ms);
+                    }
+                    let mut policy = request.reborrow().init_policy();
+                    policy.set_kind(schedule_policy_kind_to_capnp(delivery_policy));
+                    if let BrainScheduleDeliveryPolicy::BoundedCatchUp {
+                        max_catch_up,
+                        expires_after_ms,
+                    } = delivery_policy
+                    {
+                        policy.set_max_catch_up(*max_catch_up);
+                        policy.set_expires_after_ms(*expires_after_ms);
+                    }
+                }
+                BrainRemoteCommandKind::CancelSchedule(schedule_id) => {
+                    builder.set_cancel_schedule(&schedule_id.0.to_string())
+                }
             }
         }
         BrainRemoteEnvelope::Reply(reply) => {
@@ -565,6 +620,12 @@ pub(crate) fn encode_brain_remote_envelope(
                 }
                 BrainRemoteReply::RunCancelled { run, .. } => {
                     encode_run(builder.init_run_cancelled(), run)
+                }
+                BrainRemoteReply::ScheduleCreated { schedule, .. } => {
+                    encode_schedule(builder.init_schedule_created(), schedule)
+                }
+                BrainRemoteReply::ScheduleCancelled { cancelled, .. } => {
+                    builder.set_schedule_cancelled(*cancelled)
                 }
                 BrainRemoteReply::Error { code, message, .. } => {
                     let mut error = builder.init_error();
@@ -618,6 +679,36 @@ pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<Brain
                 CommandWhich::CancelRun(run_id) => {
                     BrainRemoteCommandKind::CancelRun(RunId(parse_uuid(run_id?)?))
                 }
+                CommandWhich::CreateSchedule(request) => {
+                    let request = request?;
+                    let policy = request.get_policy()?;
+                    let delivery_policy = match policy.get_kind()? {
+                        finch_ipc_capnp::BrainSchedulePolicyKind::Coalesce => {
+                            BrainScheduleDeliveryPolicy::Coalesce
+                        }
+                        finch_ipc_capnp::BrainSchedulePolicyKind::BoundedCatchUp => {
+                            BrainScheduleDeliveryPolicy::BoundedCatchUp {
+                                max_catch_up: policy.get_max_catch_up(),
+                                expires_after_ms: policy.get_expires_after_ms(),
+                            }
+                        }
+                    };
+                    BrainRemoteCommandKind::CreateSchedule {
+                        language: language_from_capnp(request.get_language()?),
+                        source: text(request.get_source()?)?,
+                        grant_ceiling: crate::ipc::checkpoint_codec::decode_effects(
+                            request.get_grant_ceiling()?,
+                        )?,
+                        next_due_ms: request.get_next_due_ms(),
+                        interval_ms: request
+                            .get_has_interval_ms()
+                            .then(|| request.get_interval_ms()),
+                        delivery_policy,
+                    }
+                }
+                CommandWhich::CancelSchedule(schedule_id) => {
+                    BrainRemoteCommandKind::CancelSchedule(ScheduleId(parse_uuid(schedule_id?)?))
+                }
             };
             BrainRemoteEnvelope::Command(BrainRemoteCommand { request_id, kind })
         }
@@ -650,6 +741,16 @@ pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<Brain
                     request_id,
                     run: decode_run(run?)?,
                 },
+                ReplyWhich::ScheduleCreated(schedule) => BrainRemoteReply::ScheduleCreated {
+                    request_id,
+                    schedule: decode_schedule(schedule?)?,
+                },
+                ReplyWhich::ScheduleCancelled(cancelled) => {
+                    BrainRemoteReply::ScheduleCancelled {
+                        request_id,
+                        cancelled,
+                    }
+                }
                 ReplyWhich::Error(error) => {
                     let error = error?;
                     BrainRemoteReply::Error {
@@ -1748,6 +1849,18 @@ mod tests {
             updated_ms: 200,
             detail: Some("cancelled by initiating driver".into()),
         };
+        let schedule = BrainSchedule {
+            schedule_id: ScheduleId(uuid::Uuid::new_v4()),
+            initiating_attachment_id: attachment.attachment_id,
+            created_by: attachment.subject.clone(),
+            grant_ceiling: crate::vm::EffectSet::default(),
+            language: ProgramLanguage::Lisp,
+            source: "(say \"later\")".into(),
+            next_due_ms: 500,
+            interval_ms: Some(100),
+            delivery_policy: BrainScheduleDeliveryPolicy::Coalesce,
+            active: true,
+        };
         let envelopes = vec![
             BrainRemoteEnvelope::Command(BrainRemoteCommand {
                 request_id: 1,
@@ -1780,6 +1893,21 @@ mod tests {
                 request_id: 6,
                 kind: BrainRemoteCommandKind::CancelRun(run.run_id),
             }),
+            BrainRemoteEnvelope::Command(BrainRemoteCommand {
+                request_id: 7,
+                kind: BrainRemoteCommandKind::CreateSchedule {
+                    language: schedule.language,
+                    source: schedule.source.clone(),
+                    grant_ceiling: schedule.grant_ceiling.clone(),
+                    next_due_ms: schedule.next_due_ms,
+                    interval_ms: schedule.interval_ms,
+                    delivery_policy: schedule.delivery_policy.clone(),
+                },
+            }),
+            BrainRemoteEnvelope::Command(BrainRemoteCommand {
+                request_id: 8,
+                kind: BrainRemoteCommandKind::CancelSchedule(schedule.schedule_id),
+            }),
             BrainRemoteEnvelope::Reply(BrainRemoteReply::Submitted {
                 request_id: 1,
                 accepted,
@@ -1800,8 +1928,16 @@ mod tests {
                 request_id: 6,
                 run,
             }),
-            BrainRemoteEnvelope::Reply(BrainRemoteReply::Error {
+            BrainRemoteEnvelope::Reply(BrainRemoteReply::ScheduleCreated {
                 request_id: 7,
+                schedule,
+            }),
+            BrainRemoteEnvelope::Reply(BrainRemoteReply::ScheduleCancelled {
+                request_id: 8,
+                cancelled: true,
+            }),
+            BrainRemoteEnvelope::Reply(BrainRemoteReply::Error {
+                request_id: 9,
                 code: "forbidden".into(),
                 message: "scope denied".into(),
             }),

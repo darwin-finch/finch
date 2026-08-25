@@ -1168,7 +1168,19 @@ struct BrainRemoteCommand {
     requestRunnerHandoff @4 :BrainRunnerHandoffRequest;
     cancelRunnerHandoff  @5 :Text;
     cancelRun            @6 :Text;
+    createSchedule       @7 :BrainScheduleCreateRequest;
+    cancelSchedule       @8 :Text;
   }
+}
+
+struct BrainScheduleCreateRequest {
+  language       @0 :ProgramLanguage;
+  source         @1 :Text;
+  grantCeiling   @2 :List(CapabilityRequirement);
+  nextDueMs      @3 :UInt64;
+  hasIntervalMs  @4 :Bool;
+  intervalMs     @5 :UInt64;
+  policy         @6 :BrainScheduleDeliveryPolicy;
 }
 
 struct BrainRunnerHandoffRequest {
@@ -1193,6 +1205,8 @@ struct BrainRemoteReply {
     handoffRequested @5 :BrainRunnerHandoff;
     handoffCancelled @6 :Void;
     runCancelled     @7 :BrainRun;
+    scheduleCreated  @8 :BrainSchedule;
+    scheduleCancelled @9 :Bool;
   }
 }
 

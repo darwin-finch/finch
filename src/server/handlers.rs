@@ -2024,6 +2024,98 @@ async fn execute_remote_brain_command(
                 Err(error) => remote_brain_error(request_id, "conflict", error.to_string()),
             }
         }
+        BrainRemoteCommandKind::CreateSchedule {
+            language,
+            source,
+            grant_ceiling,
+            next_due_ms,
+            interval_ms,
+            delivery_policy,
+        } => {
+            let claims = match authorize_named_brain(
+                server,
+                headers,
+                name,
+                BrainCredentialScope::BrainSubmit,
+            ) {
+                Ok(claims) => claims,
+                Err(_) => {
+                    return remote_brain_error(
+                        request_id,
+                        "forbidden",
+                        "Brain credential no longer authorizes schedule creation",
+                    );
+                }
+            };
+            let attachment = match lifecycle.connection(name, attachment_id, connection_id) {
+                Ok(attachment) => attachment,
+                Err(error) => return remote_brain_error(request_id, "conflict", error.to_string()),
+            };
+            if claims_match_attachment(&claims, &attachment).is_err() {
+                return remote_brain_error(
+                    request_id,
+                    "forbidden",
+                    "Brain credential participant no longer matches this attachment",
+                );
+            }
+            match lifecycle.create_schedule(
+                name,
+                attachment_id,
+                connection_id,
+                language,
+                source,
+                grant_ceiling,
+                next_due_ms,
+                interval_ms,
+                delivery_policy,
+            ) {
+                Ok(schedule) => BrainRemoteReply::ScheduleCreated {
+                    request_id,
+                    schedule,
+                },
+                Err(error) => remote_brain_error(request_id, "conflict", error.to_string()),
+            }
+        }
+        BrainRemoteCommandKind::CancelSchedule(schedule_id) => {
+            let claims = match authorize_named_brain(
+                server,
+                headers,
+                name,
+                BrainCredentialScope::BrainSubmit,
+            ) {
+                Ok(claims) => claims,
+                Err(_) => {
+                    return remote_brain_error(
+                        request_id,
+                        "forbidden",
+                        "Brain credential no longer authorizes schedule cancellation",
+                    );
+                }
+            };
+            let attachment = match lifecycle.connection(name, attachment_id, connection_id) {
+                Ok(attachment) => attachment,
+                Err(error) => return remote_brain_error(request_id, "conflict", error.to_string()),
+            };
+            if claims_match_attachment(&claims, &attachment).is_err() {
+                return remote_brain_error(
+                    request_id,
+                    "forbidden",
+                    "Brain credential participant no longer matches this attachment",
+                );
+            }
+            match lifecycle.cancel_schedule(
+                name,
+                attachment_id,
+                connection_id,
+                schedule_id,
+            ) {
+                Ok(cancelled) => BrainRemoteReply::ScheduleCancelled {
+                    request_id,
+                    cancelled,
+                },
+                Err(error) => remote_brain_error(request_id, "conflict", error.to_string()),
+            }
+        }
     }
 }
 
