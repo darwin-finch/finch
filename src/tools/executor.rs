@@ -57,7 +57,7 @@ pub struct ToolSignature {
     pub context_key: String,
 
     // Structured components for flexible pattern matching
-    /// Command being executed (for bash, save_and_exec)
+    /// Command being executed (for bash)
     pub command: Option<String>,
     /// Arguments passed to the command
     pub args: Option<String>,
@@ -686,25 +686,6 @@ pub fn generate_tool_signature(tool_use: &ToolUse, working_dir: &std::path::Path
                 command: None,
                 args: None,
                 directory: None,
-            }
-        }
-        "save_and_exec" => {
-            let command = tool_use.input["command"].as_str().unwrap_or("");
-
-            // Parse command into base command and args (same as bash)
-            let (base_cmd, args) = if let Some(space_idx) = command.find(' ') {
-                let (cmd, rest) = command.split_at(space_idx);
-                (cmd.to_string(), Some(rest.trim().to_string()))
-            } else {
-                (command.to_string(), None)
-            };
-
-            ToolSignature {
-                tool_name: "save_and_exec".to_string(),
-                context_key: format!("{} in {}", command, working_dir.display()),
-                command: Some(base_cmd),
-                args,
-                directory: Some(working_dir.display().to_string()),
             }
         }
         "train" => {

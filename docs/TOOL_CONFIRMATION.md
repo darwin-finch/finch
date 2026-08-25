@@ -243,7 +243,7 @@ Each tool execution generates a context-specific signature that identifies the o
 | `grep` | `pattern '{pattern}' in {path}` | `pattern 'fn main' in src/` |
 | `glob` | `pattern {pattern}` | `pattern **/*.rs` |
 | `web_fetch` | `fetching {url}` | `fetching https://docs.rs/tokio` |
-| `save_and_exec` | `{command} in {working_dir}` | `cargo build in /Users/foo/project` |
+| `restart_session` | approved binary path + digest | `/project/target/release/finch` after its Brain turn commits |
 
 ## Example Prompts
 
@@ -974,7 +974,7 @@ These improvements are not currently implemented but could be added:
 **Symptom**: Expected pattern match, but still prompted
 
 **Possible causes**:
-1. **Tool name mismatch**: Pattern tool must match exactly (`bash` ≠ `save_and_exec`)
+1. **Tool name mismatch**: Pattern tool must match exactly (`bash` ≠ `restart_session`)
 2. **Wildcard position**: `cargo * in *` matches `cargo test in /dir`, not `cargo in /dir test`
 3. **Case sensitivity**: Patterns are case-sensitive unless using regex with `(?i)`
 4. **Path format**: Absolute vs relative paths must match

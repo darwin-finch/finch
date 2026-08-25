@@ -494,8 +494,9 @@ pub fn legacy_tool_effect(tool_name: &str, input: &Value) -> ExecutionEffect {
             }
         }
         "restart_session" => ExecutionEffect::Destructive,
-        "run" | "save_and_exec" | "spawn_task" | "ansible" | "gui_click" | "gui_type"
-        | "excel_activate" => ExecutionEffect::ExternalWrite,
+        "run" | "spawn_task" | "ansible" | "gui_click" | "gui_type" | "excel_activate" => {
+            ExecutionEffect::ExternalWrite
+        }
         _ => ExecutionEffect::Unclassified,
     }
 }

@@ -29,7 +29,7 @@ use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
     AnsibleTool, AskUserQuestionTool, BashTool, EditTool, EnterPlanModeTool, GlobTool, GrepTool,
-    HashCompareTool, PatchTool, PresentPlanTool, ReadTool, RestartTool, SaveAndExecTool,
+    HashCompareTool, PatchTool, PresentPlanTool, ReadTool, RestartTool,
     WebFetchTool, WriteTool,
 };
 #[cfg(target_os = "macos")]
@@ -318,12 +318,7 @@ impl Repl {
         tool_registry.register_alias("inspect_program", "inspect_word");
 
         // Self-improvement tools
-        let session_state_file = dirs::home_dir()
-            .map(|home| home.join(".finch").join("restart_state.json"))
-            .unwrap_or_else(|| PathBuf::from(".finch/restart_state.json"));
-
         tool_registry.register(Box::new(RestartTool));
-        tool_registry.register(Box::new(SaveAndExecTool::new(session_state_file.clone())));
 
         // Plan mode tools
         tool_registry.register(Box::new(EnterPlanModeTool));
@@ -501,8 +496,6 @@ impl Repl {
                 fallback_registry.register_alias("search_vocabulary", "search_word");
                 fallback_registry.register_alias("inspect_program", "inspect_word");
                 fallback_registry.register(Box::new(RestartTool));
-                fallback_registry
-                    .register(Box::new(SaveAndExecTool::new(session_state_file.clone())));
                 // Plan mode tools
                 fallback_registry.register(Box::new(EnterPlanModeTool));
                 fallback_registry.register(Box::new(PresentPlanTool));
@@ -2274,7 +2267,7 @@ impl Repl {
         signature: &ToolSignature,
     ) -> (Option<String>, Option<String>) {
         match signature.tool_name.as_str() {
-            "bash" | "save_and_exec" => {
+            "bash" => {
                 // Format: "command args in /dir"
                 if let Some(pos) = signature.context_key.rfind(" in ") {
                     let command = signature.context_key[..pos].to_string();
@@ -2381,14 +2374,6 @@ impl Repl {
             "glob" => {
                 if let Some(pattern) = tool_use.input["pattern"].as_str() {
                     self.output_status(format!("  Pattern: {}", pattern));
-                }
-            }
-            "save_and_exec" => {
-                if let Some(command) = tool_use.input["command"].as_str() {
-                    self.output_status(format!("  Command: {}", command));
-                }
-                if let Some(reason) = tool_use.input.get("reason").and_then(|v| v.as_str()) {
-                    self.output_status(format!("  Reason: {}", reason));
                 }
             }
             _ => {
@@ -2641,7 +2626,7 @@ impl Repl {
         let tool_name = Menu::text_input(
             "Tool name:",
             None,
-            Some("bash, read, grep, glob, web_fetch, save_and_exec"),
+            Some("bash, read, grep, glob, web_fetch, restart_session"),
         )?;
 
         if tool_name.is_empty() {
@@ -4092,7 +4077,7 @@ impl Repl {
         self.output_status(format!("{}", "Available tools:".green()));
         self.output_status("  read, glob, grep, web_fetch");
         self.output_status(format!("{}", "Blocked tools:".red()));
-        self.output_status("  bash, save_and_exec");
+        self.output_status("  bash, restart_session");
         self.output_status("");
         self.output_status("Ask me to explore the codebase and generate a plan.");
         self.output_status(format!(
@@ -4104,7 +4089,7 @@ impl Repl {
         self.conversation.write().await.add_user_message(format!(
             "[System: Entered planning mode for task: {}]\n\
              Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
-             Blocked tools: bash, save_and_exec\n\
+             Blocked tools: bash, restart_session\n\
              Please explore the codebase and generate a detailed plan.",
             task
         ));

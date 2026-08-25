@@ -6410,7 +6410,7 @@ Rules:\n\
             .write_info("  read, glob, grep, web_fetch");
         self.output_manager
             .write_info(format!("{}", "Blocked tools:".red()));
-        self.output_manager.write_info("  bash, save_and_exec");
+        self.output_manager.write_info("  bash, restart_session");
         self.output_manager.write_info("");
         self.output_manager
             .write_info("Ask me to explore the codebase and generate a plan.");
@@ -6423,7 +6423,7 @@ Rules:\n\
         self.conversation.write().await.add_user_message(format!(
             "[System: Entered planning mode for task: {}]\n\
              Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
-             Blocked tools: bash, save_and_exec\n\
+             Blocked tools: bash, restart_session\n\
              Please explore the codebase and generate a detailed plan.",
             task
         ));

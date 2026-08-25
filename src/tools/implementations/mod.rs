@@ -23,7 +23,6 @@ pub mod propose;
 
 // Self-improvement tools
 pub mod restart;
-pub mod save_and_exec;
 
 // Plan mode tools
 pub mod enter_plan_mode;
@@ -78,7 +77,6 @@ pub use patch::PatchTool;
 pub use present_plan::PresentPlanTool;
 pub use read::ReadTool;
 pub use restart::RestartTool;
-pub use save_and_exec::SaveAndExecTool;
 pub use web_fetch::WebFetchTool;
 pub use write::WriteTool;
 
