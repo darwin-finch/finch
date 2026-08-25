@@ -236,10 +236,10 @@ impl ColorScheme {
     /// vice versa), so custom schemes need no second theme discriminator.
     pub fn message_band_style(&self, band: MessageBand) -> Style {
         const LIGHT_PARTICIPANTS: [(u8, u8, u8); 8] = [
-            (226, 238, 255),
+            (222, 235, 252),
             (232, 246, 230),
             (255, 239, 219),
-            (243, 231, 255),
+            (239, 229, 252),
             (224, 246, 246),
             (255, 229, 235),
             (241, 240, 218),
@@ -585,8 +585,8 @@ mod tests {
     }
 
     #[test]
-    fn transcript_bands_are_distinct_and_legible_in_light_and_dark_themes() {
-        let bands = [
+    fn every_builtin_transcript_band_is_unique_and_legible() {
+        let semantic_bands = [
             MessageBand::LocalUser,
             MessageBand::Assistant,
             MessageBand::ProgramSource,
@@ -594,17 +594,29 @@ mod tests {
             MessageBand::ProgramOutput,
         ];
 
-        for theme in [ColorTheme::Dark, ColorTheme::Light] {
+        for theme in ColorTheme::all() {
             let scheme = theme.to_scheme();
-            let styles = bands.map(|band| scheme.message_band_style(band));
-            for style in styles {
+            let mut styles = semantic_bands
+                .map(|band| scheme.message_band_style(band))
+                .to_vec();
+            styles.extend(
+                (0..8).map(|index| scheme.message_band_style(MessageBand::Participant(index))),
+            );
+
+            for style in &styles {
                 assert!(
-                    contrast(style) >= 7.0,
+                    contrast(*style) >= 7.0,
                     "{theme:?} band contrast was too low"
                 );
             }
             for (index, style) in styles.iter().enumerate() {
-                assert!(styles[index + 1..].iter().all(|other| style.bg != other.bg));
+                assert!(
+                    styles[index + 1..]
+                        .iter()
+                        .all(|other| style.bg != other.bg),
+                    "{theme:?} reused transcript background {:?}",
+                    style.bg
+                );
             }
         }
     }
