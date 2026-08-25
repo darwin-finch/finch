@@ -4507,18 +4507,14 @@ Rules:\n\
                     .and_then(|client| client.attachment())
                     .map(|attachment| attachment.acknowledged_seq)
                     .unwrap_or(0);
-                self.output_manager.write_info(format!(
-                    "environment: {}:{} (generation {})",
-                    brain.environment.machine,
-                    brain.environment.workspace.display(),
-                    brain.environment.generation,
-                ));
                 for event in brain
                     .events
                     .iter()
                     .filter(|event| event.seq > acknowledged_seq)
                 {
-                    self.render_remote_brain_event(event);
+                    if replay_event_belongs_in_transcript(event) {
+                        self.render_remote_brain_event(event);
+                    }
                     self.observe_remote_brain_approval(event);
                 }
             }
@@ -4689,9 +4685,14 @@ Rules:\n\
                 if runner_online { "online" } else { "offline" }
             )
         };
+        let target = if client.target.secure {
+            client.target.display_name()
+        } else {
+            client.target.brain.clone()
+        };
         self.status_bar.update_line(
             crate::cli::status_bar::StatusLineType::SessionLabel,
-            format!("◆ brain: {} · {role}", client.target.display_name()),
+            format!("◆ {target} · {role}"),
         );
     }
 
@@ -6244,6 +6245,27 @@ Rules:\n\
     }
 }
 
+/// Snapshot replay reconstructs conversation, not transient connection chrome.
+/// Presence and runner ownership are projected into the status line from the
+/// snapshot itself; replaying their historical transitions pollutes scrollback
+/// and can duplicate the first live event delivered after subscription.
+fn replay_event_belongs_in_transcript(event: &crate::brain::store::BrainEvent) -> bool {
+    use crate::brain::store::BrainEventKind;
+
+    !matches!(
+        event.kind,
+        BrainEventKind::RunnerLeaseAcquired { .. }
+            | BrainEventKind::RunnerLeaseReleased { .. }
+            | BrainEventKind::RunnerHandoffRequested { .. }
+            | BrainEventKind::RunnerHandoffCompleted { .. }
+            | BrainEventKind::RunnerHandoffCancelled { .. }
+            | BrainEventKind::ClientAttached { .. }
+            | BrainEventKind::ClientDetached { .. }
+            | BrainEventKind::RunStarted { .. }
+            | BrainEventKind::RunStatusChanged { .. }
+    )
+}
+
 include!("brain_handler.rs");
 
 // handle_present_plan, handle_ask_user_question, is_tool_allowed_in_mode moved to plan_handler.rs
@@ -6739,6 +6761,26 @@ mod tests {
             created_ms: 0,
             kind,
         }
+    }
+
+    #[test]
+    fn snapshot_replay_keeps_conversation_and_hides_presence_churn() {
+        use crate::brain::store::{AttachmentId, AttachmentRole, BrainEventKind, ConnectionId};
+
+        let prompt = brain_event(1, "alice", BrainEventKind::Prompt { text: "hello".into() });
+        let attached = brain_event(
+            2,
+            "daemon",
+            BrainEventKind::ClientAttached {
+                attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+                connection_id: ConnectionId(uuid::Uuid::new_v4()),
+                subject: "alice".into(),
+                role: AttachmentRole::Driver,
+            },
+        );
+
+        assert!(replay_event_belongs_in_transcript(&prompt));
+        assert!(!replay_event_belongs_in_transcript(&attached));
     }
 
     #[test]
