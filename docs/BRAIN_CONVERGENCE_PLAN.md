@@ -113,6 +113,9 @@ authoritative Brain.
 Named-Brain HTTP/WebSocket attachment and local frontend registration currently address the one
 durable namespace. Attachments now have daemon-authoritative identities, roles, connection leases,
 and monotonically acknowledged event cursors that survive reconnect and daemon restart. Each Brain
+frontend also persists only its opaque attachment ID, scoped by durable Brain ID and local console
+slot, so restarting that console resumes the daemon-owned cursor instead of minting a new identity.
+The daemon remains authoritative and rejects concurrent rebinding of the same attachment. Each Brain
 also has an exclusive, expiring runner lease bound to its exact environment generation. The
 ordinary frontend/daemon Cap'n Proto channel now carries a lease-bound runner callback, correlated
 ProgramRun request/result records, and bootstrap revision/checkpoint state. It still lacks the full

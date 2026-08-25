@@ -298,10 +298,10 @@ impl EventLoop {
             .unwrap_or_default();
         let mut client = crate::brain::remote::RemoteBrainClient::new(target, password)?;
         client
-            .attach(
+            .attach_persistent(
                 &self.participant_subject,
                 crate::brain::shared::AttachmentRole::Driver,
-                None,
+                &self.session_label,
             )
             .await?;
         let mut incoming = client.watch().await?;

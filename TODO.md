@@ -783,9 +783,12 @@ still blocks the corresponding Brain phase until it is unified.
   audience on every permission/proposal view and add scoped participant credentials. ProgramRuns
   now execute on the leased frontend, but approval/control authority still needs explicit audience,
   disconnect, cancellation, and handoff semantics rather than relying on the local dialog alone.
-- [ ] Persist a frontend attachment identity across frontend process restarts, not merely reconnects
-  in one process, while keeping the daemon cursor authoritative. Expire or clean up an attachment
-  that REST-attaches but crashes before its WebSocket activates, without advancing its cursor.
+- [x] Persist a frontend attachment identity across frontend process restarts, not merely reconnects
+  in one process, while keeping the daemon cursor authoritative. The client stores only the opaque
+  attachment ID, keyed by durable Brain ID plus console slot/subject/role; the daemon still owns the
+  role, connection generation, and acknowledged cursor and rejects concurrent rebinding.
+- [ ] Expire or clean up an attachment that REST-attaches but crashes before its WebSocket activates,
+  without advancing its cursor or allowing a stale connection to detach a later reconnect.
 - [ ] Add remote brain creation while preserving the invariant that one environment is an
   indivisible machine/workspace authority boundary.
 - [ ] Treat the global brain password as a local/bootstrap credential only. Mint scoped, revocable,

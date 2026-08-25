@@ -1,18 +1,129 @@
 //! Client for attaching a Finch TUI to a named brain on another daemon.
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use futures::StreamExt;
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use super::shared::{
-    AttachmentId, AttachmentRole, BrainAttachment, BrainEventKind, BrainSnapshot,
+    AttachmentId, AttachmentRole, BrainAttachment, BrainEventKind, BrainId, BrainSnapshot,
     BrainWireMessage,
 };
 
 pub const DEFAULT_BRAIN_PORT: u16 = 11435;
+const ATTACHMENT_IDENTITIES_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AttachmentIdentityRecord {
+    brain_id: BrainId,
+    client_slot: String,
+    subject: String,
+    role: AttachmentRole,
+    attachment_id: AttachmentId,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AttachmentIdentityFile {
+    version: u32,
+    entries: Vec<AttachmentIdentityRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct AttachmentIdentityStore {
+    path: PathBuf,
+}
+
+impl AttachmentIdentityStore {
+    fn default_path() -> Result<PathBuf> {
+        dirs::home_dir()
+            .map(|home| home.join(".finch").join("brain-attachments.json"))
+            .context("cannot persist Brain attachment identity without a home directory")
+    }
+
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn load(&self) -> Result<AttachmentIdentityFile> {
+        if !self.path.exists() {
+            return Ok(AttachmentIdentityFile {
+                version: ATTACHMENT_IDENTITIES_VERSION,
+                entries: Vec::new(),
+            });
+        }
+        let bytes =
+            std::fs::read(&self.path).with_context(|| format!("read {}", self.path.display()))?;
+        let file: AttachmentIdentityFile = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse {}", self.path.display()))?;
+        if file.version != ATTACHMENT_IDENTITIES_VERSION {
+            anyhow::bail!(
+                "unsupported Brain attachment identity version {}",
+                file.version
+            );
+        }
+        Ok(file)
+    }
+
+    fn find(
+        &self,
+        brain_id: BrainId,
+        client_slot: &str,
+        subject: &str,
+        role: AttachmentRole,
+    ) -> Result<Option<AttachmentId>> {
+        Ok(self
+            .load()?
+            .entries
+            .into_iter()
+            .find(|entry| {
+                entry.brain_id == brain_id
+                    && entry.client_slot == client_slot
+                    && entry.subject == subject
+                    && entry.role == role
+            })
+            .map(|entry| entry.attachment_id))
+    }
+
+    fn save(&self, record: AttachmentIdentityRecord) -> Result<()> {
+        let parent = self
+            .path
+            .parent()
+            .context("Brain attachment identity path has no parent")?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        let lock_path = parent.join("brain-attachments.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("open {}", lock_path.display()))?;
+        lock.lock_exclusive()
+            .with_context(|| format!("lock {}", lock_path.display()))?;
+
+        let mut identities = self.load()?;
+        identities.entries.retain(|entry| {
+            !(entry.brain_id == record.brain_id
+                && entry.client_slot == record.client_slot
+                && entry.subject == record.subject
+                && entry.role == record.role)
+        });
+        identities.entries.push(record);
+        let encoded = serde_json::to_vec_pretty(&identities)?;
+        let temporary = parent.join(format!(".brain-attachments.{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&temporary, encoded)
+            .with_context(|| format!("write {}", temporary.display()))?;
+        std::fs::rename(&temporary, &self.path)
+            .with_context(|| format!("commit {}", self.path.display()))?;
+        lock.unlock()
+            .with_context(|| format!("unlock {}", lock_path.display()))?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteBrainTarget {
@@ -146,6 +257,36 @@ impl RemoteBrainClient {
             .await
             .context("invalid brain attachment")?;
         self.attachment = Some(attachment.clone());
+        Ok(attachment)
+    }
+
+    /// Reuse this console slot's daemon-owned attachment identity across
+    /// frontend restarts. The local file stores only an opaque ID; the daemon
+    /// remains authoritative for role, cursor, connection state, and whether
+    /// the ID may be rebound.
+    pub async fn attach_persistent(
+        &mut self,
+        subject: &str,
+        role: AttachmentRole,
+        client_slot: &str,
+    ) -> Result<BrainAttachment> {
+        let snapshot = self.snapshot().await?;
+        let store = AttachmentIdentityStore::new(AttachmentIdentityStore::default_path()?);
+        let attachment_id = store.find(snapshot.brain_id, client_slot, subject, role)?;
+        let attachment = self
+            .attach(subject, role, attachment_id)
+            .await
+            .context("persistent Brain attachment rejected")?;
+        if let Err(error) = store.save(AttachmentIdentityRecord {
+            brain_id: snapshot.brain_id,
+            client_slot: client_slot.to_string(),
+            subject: subject.to_string(),
+            role,
+            attachment_id: attachment.attachment_id,
+        }) {
+            let _ = self.disconnect().await;
+            return Err(error.context("persist Brain attachment identity"));
+        }
         Ok(attachment)
     }
 
@@ -323,5 +464,94 @@ mod tests {
         assert!(RemoteBrainTarget::parse("brain-only").is_err());
         assert!(RemoteBrainTarget::parse("../brain@host").is_err());
         assert!(RemoteBrainTarget::parse("brain@host/path").is_err());
+    }
+
+    #[test]
+    fn attachment_identity_survives_restart_and_is_scoped_to_console() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AttachmentIdentityStore::new(temp.path().join("attachments.json"));
+        let brain_id = BrainId(uuid::Uuid::new_v4());
+        let attachment_id = AttachmentId(uuid::Uuid::new_v4());
+        store
+            .save(AttachmentIdentityRecord {
+                brain_id,
+                client_slot: "home-brain".into(),
+                subject: "alice@box.local".into(),
+                role: AttachmentRole::Driver,
+                attachment_id,
+            })
+            .unwrap();
+
+        let restarted = AttachmentIdentityStore::new(temp.path().join("attachments.json"));
+        assert_eq!(
+            restarted
+                .find(
+                    brain_id,
+                    "home-brain",
+                    "alice@box.local",
+                    AttachmentRole::Driver,
+                )
+                .unwrap(),
+            Some(attachment_id)
+        );
+        assert_eq!(
+            restarted
+                .find(
+                    brain_id,
+                    "other-console",
+                    "alice@box.local",
+                    AttachmentRole::Driver,
+                )
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn corrupt_attachment_identity_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("attachments.json");
+        std::fs::write(&path, b"not json").unwrap();
+        let error = AttachmentIdentityStore::new(path).load().unwrap_err();
+        assert!(error.to_string().contains("parse"));
+    }
+
+    #[test]
+    fn attachment_identity_updates_preserve_other_console_slots() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("attachments.json");
+        let brain_id = BrainId(uuid::Uuid::new_v4());
+        let first_id = AttachmentId(uuid::Uuid::new_v4());
+        let second_id = AttachmentId(uuid::Uuid::new_v4());
+        for (client_slot, attachment_id) in [("first", first_id), ("second", second_id)] {
+            AttachmentIdentityStore::new(path.clone())
+                .save(AttachmentIdentityRecord {
+                    brain_id,
+                    client_slot: client_slot.into(),
+                    subject: "alice@box.local".into(),
+                    role: AttachmentRole::Driver,
+                    attachment_id,
+                })
+                .unwrap();
+        }
+
+        let store = AttachmentIdentityStore::new(path);
+        assert_eq!(
+            store
+                .find(brain_id, "first", "alice@box.local", AttachmentRole::Driver,)
+                .unwrap(),
+            Some(first_id)
+        );
+        assert_eq!(
+            store
+                .find(
+                    brain_id,
+                    "second",
+                    "alice@box.local",
+                    AttachmentRole::Driver,
+                )
+                .unwrap(),
+            Some(second_id)
+        );
     }
 }

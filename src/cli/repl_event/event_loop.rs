@@ -3764,20 +3764,11 @@ Rules:\n\
             .map(|config| config.server.brain_password)
             .unwrap_or_default();
         let mut client = crate::brain::remote::RemoteBrainClient::new(target, password)?;
-        let reusable_attachment = self
-            .active_remote_brain
-            .as_ref()
-            .filter(|active| {
-                active.target.brain == client.target.brain
-                    && active.target.address == client.target.address
-            })
-            .and_then(|active| active.attachment())
-            .map(|attachment| attachment.attachment_id);
         if let Err(error) = client
-            .attach(
+            .attach_persistent(
                 &self.participant_subject,
                 crate::brain::shared::AttachmentRole::Driver,
-                reusable_attachment,
+                &self.session_label,
             )
             .await
         {
