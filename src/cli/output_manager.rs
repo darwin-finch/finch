@@ -448,6 +448,12 @@ impl OutputManager {
         self.messages.write().unwrap().clear();
     }
 
+    /// Remove one transient projection after its contents have been adopted
+    /// by a durable grouped work unit.
+    pub fn remove_message(&self, id: crate::cli::messages::MessageId) {
+        self.messages.write().unwrap().retain(|message| message.id() != id);
+    }
+
     /// Get the number of messages in the buffer
     pub fn len(&self) -> usize {
         self.messages.read().unwrap().len()

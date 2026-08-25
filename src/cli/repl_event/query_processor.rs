@@ -254,6 +254,7 @@ struct WireExecution {
     source_for_history: String,
     response: String,
     effect_journal: Vec<crate::server::RunnerEffectRecord>,
+    output_unit: Arc<crate::cli::messages::WorkUnit>,
 }
 
 pub(super) fn runner_effect_records(
@@ -337,6 +338,7 @@ async fn execute_wire_with_single_repair(
                 source_for_history: source,
                 response: outcome.output,
                 effect_journal,
+                output_unit,
             };
         }
         Ok(outcome) => {
@@ -369,6 +371,7 @@ async fn execute_wire_with_single_repair(
             source_for_history: source,
             response: diagnostic,
             effect_journal,
+            output_unit,
         };
     }
     metric.repair_attempted = true;
@@ -391,6 +394,7 @@ async fn execute_wire_with_single_repair(
             source_for_history: source,
             response: diagnostic,
             effect_journal,
+            output_unit,
         };
     };
     if !repair.tool_uses.is_empty() || repair.text.trim().is_empty() {
@@ -401,6 +405,7 @@ async fn execute_wire_with_single_repair(
             source_for_history: source,
             response: diagnostic,
             effect_journal,
+            output_unit,
         };
     }
     output_unit.set_complete();
@@ -449,6 +454,7 @@ async fn execute_wire_with_single_repair(
                 source_for_history: repaired_source,
                 response: outcome.output,
                 effect_journal,
+                output_unit: repair_output_unit,
             }
         }
         Ok(outcome) => {
@@ -468,6 +474,7 @@ async fn execute_wire_with_single_repair(
                 source_for_history: repaired_source,
                 response: detail,
                 effect_journal,
+                output_unit: repair_output_unit,
             }
         }
         Err(error) => {
@@ -482,6 +489,7 @@ async fn execute_wire_with_single_repair(
                 source_for_history: repaired_source,
                 response: detail,
                 effect_journal,
+                output_unit: repair_output_unit,
             }
         }
     }
@@ -969,7 +977,11 @@ pub(crate) async fn process_query_with_tools(
         // The shadow-buffer / insert_before architecture requires the message to
         // exist in output_manager before any blit cycles run — the WorkUnit's
         // time-driven animation will be visible during streaming.
-        let inherited_tool_unit = if query.is_empty() {
+        let named_brain_turn = query_states
+            .get_metadata(query_id)
+            .await
+            .is_some_and(|metadata| metadata.brain_turn_provenance.is_some());
+        let inherited_tool_unit = if query.is_empty() || named_brain_turn {
             query_states.tool_work_unit(query_id).await
         } else {
             None
@@ -1142,7 +1154,7 @@ pub(crate) async fn process_query_with_tools(
                 // then route its `say`/UI events to a distinct output unit.
                 // This keeps agent activity inspectable without making source
                 // and user-visible output compete for the same mutable row.
-                let source_unit = if reusing_tool_unit {
+                let source_unit = if reusing_tool_unit && !named_brain_turn {
                     work_unit.set_complete();
                     query_states.set_tool_work_unit(query_id, None).await;
                     output_manager.start_work_unit(crate::cli::messages::random_spinner_verb())
@@ -1170,6 +1182,18 @@ pub(crate) async fn process_query_with_tools(
                     wire_metrics_logger.as_deref(),
                 )
                 .await;
+                if query_states
+                    .get_metadata(query_id)
+                    .await
+                    .is_some_and(|metadata| metadata.brain_turn_provenance.is_some())
+                {
+                    query_states
+                        .set_brain_output_work_unit(
+                            query_id,
+                            Some(Arc::clone(&wire_execution.output_unit)),
+                        )
+                        .await;
+                }
                 let response = wire_execution.response;
                 let source_for_history = wire_execution.source_for_history;
                 let effect_journal = wire_execution.effect_journal;
@@ -1221,7 +1245,11 @@ pub(crate) async fn process_query_with_tools(
     // Non-streaming path (for Qwen or fallback)
     // Create WorkUnit before the blocking generate call so the animated
     // header is visible during the wait (blit cycle runs every ~100ms).
-    let inherited_tool_unit = if query.is_empty() {
+    let named_brain_turn = query_states
+        .get_metadata(query_id)
+        .await
+        .is_some_and(|metadata| metadata.brain_turn_provenance.is_some());
+    let inherited_tool_unit = if query.is_empty() || named_brain_turn {
         query_states.tool_work_unit(query_id).await
     } else {
         None
@@ -1311,7 +1339,7 @@ pub(crate) async fn process_query_with_tools(
 
             // Non-streaming providers receive the same two-unit projection:
             // source first, then the independently reactive program output.
-            let source_unit = if reusing_tool_unit {
+            let source_unit = if reusing_tool_unit && !named_brain_turn {
                 work_unit.set_complete();
                 query_states.set_tool_work_unit(query_id, None).await;
                 output_manager.start_work_unit(crate::cli::messages::random_spinner_verb())
@@ -1339,6 +1367,18 @@ pub(crate) async fn process_query_with_tools(
                 wire_metrics_logger.as_deref(),
             )
             .await;
+            if query_states
+                .get_metadata(query_id)
+                .await
+                .is_some_and(|metadata| metadata.brain_turn_provenance.is_some())
+            {
+                query_states
+                    .set_brain_output_work_unit(
+                        query_id,
+                        Some(Arc::clone(&wire_execution.output_unit)),
+                    )
+                    .await;
+            }
             let rendered_response = wire_execution.response;
             let effect_journal = wire_execution.effect_journal;
             conversation

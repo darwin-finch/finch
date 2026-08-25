@@ -68,6 +68,10 @@ pub struct QueryMetadata {
     /// Keeping it live across continuation requests prevents each round trip
     /// from becoming a separate anonymous transcript block.
     pub tool_work_unit: Option<Arc<WorkUnit>>,
+    /// Transient live VM output for a named-Brain turn. Once the daemon
+    /// publishes the correlated Result, EventLoop folds this into the run
+    /// group and removes the transient unit without losing live updates.
+    pub brain_output_work_unit: Option<Arc<WorkUnit>>,
 }
 
 /// Manages state for all in-flight queries
@@ -94,6 +98,7 @@ impl QueryStateManager {
             cancellation_token: CancellationToken::new(),
             created_at: std::time::Instant::now(),
             tool_work_unit: None,
+            brain_output_work_unit: None,
         };
 
         self.states.write().await.insert(id, metadata);
@@ -144,6 +149,24 @@ impl QueryStateManager {
             .await
             .get(&query_id)
             .and_then(|metadata| metadata.tool_work_unit.clone())
+    }
+
+    pub async fn set_brain_output_work_unit(
+        &self,
+        query_id: Uuid,
+        unit: Option<Arc<WorkUnit>>,
+    ) {
+        if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
+            metadata.brain_output_work_unit = unit;
+        }
+    }
+
+    pub async fn brain_output_work_unit(&self, query_id: Uuid) -> Option<Arc<WorkUnit>> {
+        self.states
+            .read()
+            .await
+            .get(&query_id)
+            .and_then(|metadata| metadata.brain_output_work_unit.clone())
     }
 
     /// Cancel a query

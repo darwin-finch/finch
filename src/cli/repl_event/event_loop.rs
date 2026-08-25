@@ -845,6 +845,9 @@ struct RemoteBrainRunProjection {
     result_row: Option<usize>,
     tool_rows: std::collections::HashMap<String, usize>,
     approval_rows: std::collections::HashMap<String, usize>,
+    locally_rendered_tool_ids: std::collections::HashSet<String>,
+    locally_rendered_approval_ids: std::collections::HashSet<String>,
+    locally_rendered_program: bool,
 }
 
 fn brain_run_group_label(
@@ -871,7 +874,7 @@ fn ensure_remote_brain_run_projection<'a>(
         // WorkUnit's completed row presentation otherwise uses the generic
         // "Tools" title. Keep the canonical kind/id visible on the group.
         unit.set_response(&label);
-        let status_row = unit.add_row("status");
+        let status_row = unit.add_row(format!("{label} · status"));
         unit.complete_row(status_row, format!("{status:?}").to_lowercase());
         RemoteBrainRunProjection {
             unit,
@@ -881,6 +884,9 @@ fn ensure_remote_brain_run_projection<'a>(
             result_row: None,
             tool_rows: std::collections::HashMap::new(),
             approval_rows: std::collections::HashMap::new(),
+            locally_rendered_tool_ids: std::collections::HashSet::new(),
+            locally_rendered_approval_ids: std::collections::HashSet::new(),
+            locally_rendered_program: false,
         }
     })
 }
@@ -956,6 +962,9 @@ fn project_remote_brain_run_event(
             input,
             ..
         } => {
+            if projection.locally_rendered_tool_ids.contains(tool_id) {
+                return true;
+            }
             projection.tool_rows.entry(tool_id.clone()).or_insert_with(|| {
                 let input = input.to_string();
                 let input = if input.chars().count() > 80 {
@@ -972,6 +981,9 @@ fn project_remote_brain_run_event(
             is_error,
             ..
         } => {
+            if projection.locally_rendered_tool_ids.contains(tool_id) {
+                return true;
+            }
             let row = *projection
                 .tool_rows
                 .entry(tool_id.clone())
@@ -1000,6 +1012,12 @@ fn project_remote_brain_run_event(
             detail,
             ..
         } => {
+            if projection
+                .locally_rendered_approval_ids
+                .contains(approval_id)
+            {
+                return true;
+            }
             if !projection.approval_rows.contains_key(approval_id) {
                 let audience_summary = audience
                     .as_ref()
@@ -1027,6 +1045,12 @@ fn project_remote_brain_run_event(
             decision,
             ..
         } => {
+            if projection
+                .locally_rendered_approval_ids
+                .contains(approval_id)
+            {
+                return true;
+            }
             let row = *projection
                 .approval_rows
                 .entry(approval_id.clone())
@@ -1043,6 +1067,9 @@ fn project_remote_brain_run_event(
             }
         }
         BrainEventKind::Program { language, source } => {
+            if projection.locally_rendered_program {
+                return true;
+            }
             let language = match language {
                 ProgramLanguage::Forth => "Co-Forth",
                 ProgramLanguage::Lisp => "Lisp",
@@ -1081,6 +1108,7 @@ struct LocalBrainProjection {
     tool_ids: std::collections::HashSet<String>,
     approval_ids: std::collections::HashSet<String>,
     program_seq: Option<u64>,
+    transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1146,9 +1174,35 @@ fn project_remote_brain_live_run_event(
         .flatten()
         .map(|projection| projection.observe(event))
         .unwrap_or(LocalProjectionMatch::None);
+    if projection_match != LocalProjectionMatch::None {
+        if let Some(projection) = projections.get_mut(&event.run_id.expect("checked above")) {
+            match &event.kind {
+                crate::brain::store::BrainEventKind::ToolCall { tool_id, .. }
+                | crate::brain::store::BrainEventKind::ToolResult { tool_id, .. } => {
+                    projection.locally_rendered_tool_ids.insert(tool_id.clone());
+                }
+                crate::brain::store::BrainEventKind::ApprovalRequested { approval_id, .. }
+                | crate::brain::store::BrainEventKind::ApprovalDecided { approval_id, .. } => {
+                    projection
+                        .locally_rendered_approval_ids
+                        .insert(approval_id.clone());
+                }
+                crate::brain::store::BrainEventKind::Program { .. } => {
+                    projection.locally_rendered_program = true;
+                }
+                _ => {}
+            }
+        }
+    }
     let projected = project_remote_brain_run_event(output_manager, projections, event);
     if projected && projection_match == LocalProjectionMatch::SuppressAndComplete {
-        local_projections.pop_front();
+        if let Some(local) = local_projections.pop_front() {
+            if let Some(output_unit) = local.transient_output_unit {
+                output_manager.remove_message(crate::cli::messages::Message::id(
+                    output_unit.as_ref(),
+                ));
+            }
+        }
     }
     projected
 }
@@ -4551,6 +4605,17 @@ Rules:\n\
                 },
             )
             .await;
+        let run_unit = self
+            .ensure_remote_brain_run_projection(
+                request.run_id,
+                None,
+                crate::brain::store::BrainRunStatus::Running,
+            )
+            .unit
+            .clone();
+        self.query_states
+            .set_tool_work_unit(query_id, Some(run_unit))
+            .await;
         *self.active_query_id.write().await = Some(query_id);
         self.pending_named_brain_turns.insert(
             query_id,
@@ -4675,6 +4740,11 @@ Rules:\n\
     }
 
     async fn finish_named_brain_turn(&mut self, query_id: Uuid, output: String) {
+        let transient_output_unit = self.query_states.brain_output_work_unit(query_id).await;
+        self.query_states.set_tool_work_unit(query_id, None).await;
+        self.query_states
+            .set_brain_output_work_unit(query_id, None)
+            .await;
         let Some(pending) = self.pending_named_brain_turns.remove(&query_id) else {
             return;
         };
@@ -4803,6 +4873,7 @@ Rules:\n\
                 tool_ids,
                 approval_ids,
                 program_seq: None,
+                transient_output_unit,
             });
         }
         let _ = response_tx.send(result);
@@ -8627,12 +8698,40 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut projections = std::collections::HashMap::new();
+        let local_unit = super::ensure_remote_brain_run_projection(
+            &output,
+            &mut projections,
+            run_id,
+            Some(BrainRunKind::Speculative),
+            BrainRunStatus::Running,
+        )
+        .unit
+        .clone();
+        let tool_row = local_unit.add_row("read_cache {\"key\":\"alpha\"}");
+        local_unit.complete_row_with_body(
+            tool_row,
+            "cache hit",
+            vec!["value=7".to_string()],
+        );
+        let approval_row = local_unit.add_row(
+            "approval (tool) for legacy audience unspecified: write_cache",
+        );
+        local_unit.complete_row(approval_row, "approve_once by daemon");
+        local_unit.set_program_source("lisp");
+        local_unit.set_response("(say \"cache checked\")");
+        local_unit.set_complete();
+        let transient_output_unit = output.start_work_unit("VM program output");
+        transient_output_unit.set_program_output();
+        transient_output_unit.set_response("cache checked");
+        transient_output_unit.set_complete();
+        assert_eq!(output.get_messages().len(), 2);
         let mut local_projections = std::collections::VecDeque::from([LocalBrainProjection {
             source: "(say \"cache checked\")".into(),
             output: "cache checked".into(),
             tool_ids: std::collections::HashSet::from(["tool-1".into()]),
             approval_ids: std::collections::HashSet::from(["approval-1".into()]),
             program_seq: None,
+            transient_output_unit: Some(transient_output_unit),
         }]);
 
         // These are the actual live EventLoop projection inputs for a home
@@ -8663,7 +8762,7 @@ mod tests {
             "cache hit",
             "approval (tool)",
             "approve_once by daemon",
-            "Lisp program",
+            "program (lisp)",
             "(say \"cache checked\")",
             "cache checked",
             "completed",
@@ -8676,7 +8775,7 @@ mod tests {
         assert_eq!(rendered.matches("inspect the cache").count(), 1);
         assert_eq!(rendered.matches("read_cache").count(), 1);
         assert_eq!(rendered.matches("approval (tool)").count(), 1);
-        assert_eq!(rendered.matches("Lisp program").count(), 1);
+        assert_eq!(rendered.matches("program (lisp)").count(), 1);
         assert_eq!(rendered.matches("result").count(), 1);
     }
 
@@ -8688,6 +8787,7 @@ mod tests {
             tool_ids: std::collections::HashSet::new(),
             approval_ids: std::collections::HashSet::new(),
             program_seq: None,
+            transient_output_unit: None,
         };
         let program = brain_event(
             12,
@@ -8726,6 +8826,7 @@ mod tests {
             tool_ids: std::collections::HashSet::new(),
             approval_ids: std::collections::HashSet::new(),
             program_seq: Some(12),
+            transient_output_unit: None,
         };
         let result = brain_event(
             14,
