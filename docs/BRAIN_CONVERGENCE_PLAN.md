@@ -101,12 +101,13 @@ background tasks as a second kind of Brain and silently mixed speculative summar
 Future autonomous work enters the authoritative named Brain as a `BrainRun`; the old protocol is not
 a compatibility boundary.
 
-### `BrainSession`
+### Removed client-local speculative Brain
 
-`src/brain/mod.rs` is still a client-side speculative typing worker. It owns cancellation and writes
-a local `brain_context`, but no longer publishes that context into a global daemon bucket. This must
-become a speculative `BrainRun` and client projection after the shared-VM gate; it is not another
-authoritative Brain.
+The former `BrainSession`, its separate provider loop, hidden `brain_context` prompt injection,
+typing-time question/action channels, and ambient shell-command helper were removed. Typing now
+updates the local vocabulary panel only. If speculative context gathering returns, it must be an
+explicit cancellable `BrainRun` in the named Brain log, using the ordinary addressed approval and
+environment-runner paths rather than recreating a second client-local authority.
 
 ### Transport-specific lifecycle paths
 
@@ -170,6 +171,8 @@ and runner-lease routes are gone; HTTP remains for authenticated discovery, cred
 bootstrap, and explicit administrative archive. Run ancestry/budgets/cancellation and generalized
 effect-resume correlation still need the unified service. Runtime ownership has moved to the leased
 environment runner; the daemon is now the durable coordinator for interactive prompt/program runs.
+The obsolete client-local speculative agent and hidden context-injection path are absent, so they
+can no longer bypass this coordinator or consume a separate provider session while the user types.
 
 On 2026-08-24 a live attachment test used separate driver and consultant consoles against one
 Brain. The driver defined and invoked a shared Lisp word, the consultant was forbidden from

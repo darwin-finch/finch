@@ -808,7 +808,9 @@ still blocks the corresponding Brain phase until it is unified.
   execution and provider tools in the frontend runner. The daemon now also exposes a per-turn
   reverse Cap'n Proto approval capability: it publishes the triggering call and addressed request
   immediately, accepts a decision only from that attachment, persists the decision before resuming
-  the runner, and deduplicates the final lifecycle flush.
+  the runner, and deduplicates the final lifecycle flush. The obsolete client-local `BrainSession`,
+  separate typing-time provider, hidden context injection, and ambient question/action shell path
+  have been deleted; any future speculative helper must be a visible cancellable `BrainRun` here.
 - [ ] Complete Brain control and approval ownership above that substrate. Put the role and approval
   audience on every permission/proposal view. ProgramRuns
   now execute on the leased frontend. Each approval request now carries the daemon-selected
