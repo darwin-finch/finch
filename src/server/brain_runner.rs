@@ -138,6 +138,44 @@ pub struct RunnerTurnResult {
     pub runtime_revision: u64,
     pub checkpoint: crate::vm::TypedRuntimeCheckpoint,
     pub effect_journal: Vec<RunnerEffectRecord>,
+    pub commit_ack: Option<RunnerTurnCommitAck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerTurnCommitNotice {
+    pub status: crate::brain::store::BrainRunStatus,
+    pub detail: String,
+}
+
+/// Send-safe proxy for a frontend-owned post-commit continuation. The Cap'n
+/// Proto adapter keeps the actual capability on its LocalSet and forwards
+/// notices through this channel.
+#[derive(Debug, Clone)]
+pub struct RunnerTurnCommitAck {
+    tx: mpsc::UnboundedSender<RunnerTurnCommitNotice>,
+}
+
+impl RunnerTurnCommitAck {
+    pub fn new(tx: mpsc::UnboundedSender<RunnerTurnCommitNotice>) -> Self {
+        Self { tx }
+    }
+
+    pub fn acknowledge(
+        &self,
+        status: crate::brain::store::BrainRunStatus,
+        detail: impl Into<String>,
+    ) -> Result<(), String> {
+        self.tx
+            .send(RunnerTurnCommitNotice {
+                status,
+                detail: detail.into(),
+            })
+            .map_err(|_| "runner commit acknowledgement receiver disconnected".to_string())
+    }
+
+    pub(crate) fn tx(&self) -> &mpsc::UnboundedSender<RunnerTurnCommitNotice> {
+        &self.tx
+    }
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -872,6 +910,7 @@ mod tests {
                     runtime_revision: 1,
                     checkpoint,
                     effect_journal: Vec::new(),
+                    commit_ack: None,
                 }))
                 .unwrap();
         });

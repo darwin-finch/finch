@@ -894,7 +894,8 @@ async fn dispatch_named_brain_run(
             )
             .await
             {
-                Ok(output) => push_named_brain_result(store, name, request.seq, Ok(output)),
+                Ok(output) => push_named_brain_result(store, name, request.seq, Ok(output))
+                    .map(|event| (event, None::<crate::server::RunnerTurnCommitAck>)),
                 Err(error) => Err(error),
             }
         }
@@ -912,7 +913,8 @@ async fn dispatch_named_brain_run(
             )
             .await
             {
-                Ok(output) => push_named_brain_result(store, name, request.seq, Ok(output)),
+                Ok(output) => push_named_brain_result(store, name, request.seq, Ok(output))
+                    .map(|event| (event, None::<crate::server::RunnerTurnCommitAck>)),
                 Err(error) => Err(error),
             }
         }
@@ -947,7 +949,7 @@ async fn dispatch_named_brain_run(
     };
 
     match execution {
-        Ok(result) => {
+        Ok((result, commit_ack)) => {
             store.transition_run(name, "daemon", run.run_id, BrainRunStatus::Completed, None)?;
             if projects_memory {
                 if let Err(error) =
@@ -959,6 +961,11 @@ async fn dispatch_named_brain_run(
                         %error,
                         "could not project committed Brain turn into memory"
                     );
+                }
+            }
+            if let Some(commit_ack) = commit_ack {
+                if let Err(error) = commit_ack.acknowledge(BrainRunStatus::Completed, "") {
+                    tracing::warn!(brain = name, run_id = %run.run_id.0, %error, "could not acknowledge committed Brain turn");
                 }
             }
             Ok(Some(result))
@@ -996,7 +1003,12 @@ async fn project_committed_named_brain_memory(
     run: &crate::brain::store::BrainRun,
 ) -> anyhow::Result<usize> {
     let snapshot = store.snapshot(name)?;
-    let (prompt, source) = committed_named_brain_memory_pair(&snapshot, run)?;
+    let committed_run = snapshot
+        .runs
+        .iter()
+        .find(|candidate| candidate.run_id == run.run_id)
+        .ok_or_else(|| anyhow::anyhow!("committed Brain run disappeared before projection"))?;
+    let (prompt, source) = committed_named_brain_memory_pair(&snapshot, committed_run)?;
     let lease = snapshot
         .runner_lease
         .as_ref()
@@ -1010,8 +1022,8 @@ async fn project_committed_named_brain_memory(
             name,
             lease.lease_id,
             snapshot.brain_id,
-            run.run_id,
-            run.request_seq,
+            committed_run.run_id,
+            committed_run.request_seq,
             prompt,
             source,
         )
@@ -1340,7 +1352,10 @@ async fn dispatch_named_brain_turn(
     request_seq: u64,
     prompt: &str,
     requester: &crate::brain::store::BrainAttachment,
-) -> anyhow::Result<crate::brain::store::BrainEvent> {
+) -> anyhow::Result<(
+    crate::brain::store::BrainEvent,
+    Option<crate::server::RunnerTurnCommitAck>,
+)> {
     let snapshot = store.snapshot(name)?;
     ensure_named_brain_store_environment(store, &snapshot)?;
     let lease = snapshot
@@ -1395,6 +1410,7 @@ async fn dispatch_named_brain_turn(
             return Err(error);
         }
     };
+    let commit_ack = outcome.commit_ack.clone();
     persist_named_brain_turn_events(
         store,
         name,
@@ -1424,7 +1440,8 @@ async fn dispatch_named_brain_turn(
         outcome.runtime_revision,
         outcome.checkpoint,
     )?;
-    push_named_brain_result(store, name, program.seq, Ok(outcome.output))
+    let result = push_named_brain_result(store, name, program.seq, Ok(outcome.output))?;
+    Ok((result, commit_ack))
 }
 
 fn persist_named_brain_effect_journal(
@@ -3747,6 +3764,7 @@ mod handler_tests {
                     runtime_revision: outcome.output_revision,
                     checkpoint,
                     effect_journal: vec![effect_record],
+                    commit_ack: None,
                 }))
                 .unwrap();
         });
@@ -3766,7 +3784,7 @@ mod handler_tests {
             request_seq,
             output,
             error,
-        } = result.kind
+        } = result.0.kind
         else {
             panic!("expected result event")
         };
@@ -4537,7 +4555,7 @@ mod handler_tests {
         runners.register("shared", lease.lease_id, tx);
         let callback_store = store.clone();
         let expected_brain_id = store.snapshot("shared").unwrap().brain_id;
-        tokio::spawn(async move {
+        let runner = tokio::spawn(async move {
             let crate::server::RunnerRequest::Turn(request) = rx.recv().await.unwrap() else {
                 panic!("expected full turn request")
             };
@@ -4566,6 +4584,7 @@ mod handler_tests {
                 .find(|snapshot| snapshot.revision == outcome.output_revision)
                 .and_then(|snapshot| snapshot.checkpoint)
                 .unwrap();
+            let (commit_tx, mut commit_rx) = tokio::sync::mpsc::unbounded_channel();
             request
                 .response_tx
                 .send(Ok(crate::server::RunnerTurnResult {
@@ -4576,6 +4595,7 @@ mod handler_tests {
                     runtime_revision: outcome.output_revision,
                     checkpoint,
                     effect_journal: Vec::new(),
+                    commit_ack: Some(crate::server::RunnerTurnCommitAck::new(commit_tx)),
                 }))
                 .unwrap();
 
@@ -4609,6 +4629,18 @@ mod handler_tests {
                 )
             }));
             request.response_tx.send(Ok(2)).unwrap();
+            let notice = commit_rx.recv().await.expect("daemon must acknowledge commit");
+            assert_eq!(
+                notice.status,
+                crate::brain::store::BrainRunStatus::Completed
+            );
+            assert_eq!(
+                callback_store
+                    .inspect_run("shared", run_id)
+                    .unwrap()
+                    .status,
+                crate::brain::store::BrainRunStatus::Completed
+            );
         });
 
         let outcome = submit_named_brain_event(
@@ -4631,6 +4663,7 @@ mod handler_tests {
             outcome.result.unwrap().kind,
             BrainEventKind::Result { error: None, .. }
         ));
+        runner.await.unwrap();
     }
 
     #[tokio::test]

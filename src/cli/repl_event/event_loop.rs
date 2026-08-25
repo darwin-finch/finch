@@ -4087,6 +4087,7 @@ Rules:\n\
                 runtime_revision,
                 checkpoint,
                 effect_journal: effect_journal.clone(),
+                commit_ack: None,
             })
         })()
         .map_err(|error| crate::server::RunnerTurnError {

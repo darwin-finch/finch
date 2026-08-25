@@ -1870,6 +1870,28 @@ fn decode_runner_turn_result(
     }
     let checkpoint = decode_checkpoint(result.get_checkpoint().map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())?;
+    let commit_ack = if result.get_has_commit_ack() {
+        let capability = result.get_commit_ack().map_err(|error| error.to_string())?;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<
+            crate::server::RunnerTurnCommitNotice,
+        >();
+        tokio::task::spawn_local(async move {
+            while let Some(notice) = rx.recv().await {
+                let mut call = capability.committed_request();
+                call.get().set_status(crate::ipc::brain_codec::run_status_to_capnp(
+                    notice.status,
+                ));
+                call.get().set_detail(&notice.detail);
+                if let Err(error) = call.send().promise.await {
+                    tracing::warn!(%error, "could not acknowledge committed Brain turn to runner");
+                    break;
+                }
+            }
+        });
+        Some(crate::server::RunnerTurnCommitAck::new(tx))
+    } else {
+        None
+    };
     Ok(crate::server::RunnerTurnResult {
         source: result
             .get_source()
@@ -1890,6 +1912,7 @@ fn decode_runner_turn_result(
         runtime_revision: result.get_runtime_revision(),
         checkpoint,
         effect_journal,
+        commit_ack,
     })
 }
 

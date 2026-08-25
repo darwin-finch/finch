@@ -858,6 +858,16 @@ struct BrainTurnResult {
   error           @5 :Text;
   turnEvents      @6 :List(BrainTurnEvent);
   effectJournal   @7 :List(BrainEffectRecord);
+  hasCommitAck    @8 :Bool;
+  commitAck       @9 :BrainTurnCommitAck;
+}
+
+# Optional reverse capability returned by the runner with a completed turn.
+# The daemon invokes it only after the canonical Brain events, runtime
+# checkpoint, and terminal run transition have committed. Frontends use this
+# boundary for operations such as self-restart that must not race durability.
+interface BrainTurnCommitAck {
+  committed @0 (status :BrainRunStatus, detail :Text) -> ();
 }
 
 struct BrainMemoryProjectionRequest {

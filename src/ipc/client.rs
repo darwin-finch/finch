@@ -664,6 +664,43 @@ struct BrainRunnerImpl {
     event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
 }
 
+struct BrainTurnCommitAckImpl {
+    tx: tokio::sync::mpsc::UnboundedSender<crate::server::RunnerTurnCommitNotice>,
+}
+
+impl finch_ipc_capnp::brain_turn_commit_ack::Server for BrainTurnCommitAckImpl {
+    fn committed(
+        &mut self,
+        params: finch_ipc_capnp::brain_turn_commit_ack::CommittedParams,
+        _results: finch_ipc_capnp::brain_turn_commit_ack::CommittedResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(params) => params,
+            Err(error) => return Promise::err(error),
+        };
+        let status = match params.get_status() {
+            Ok(status) => crate::ipc::brain_codec::run_status_from_capnp(status),
+            Err(error) => return Promise::err(error.into()),
+        };
+        let detail = params
+            .get_detail()
+            .ok()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        if self
+            .tx
+            .send(crate::server::RunnerTurnCommitNotice { status, detail })
+            .is_err()
+        {
+            return Promise::err(capnp::Error::failed(
+                "frontend commit acknowledgement receiver disconnected".into(),
+            ));
+        }
+        Promise::ok(())
+    }
+}
+
 impl brain_runner::Server for BrainRunnerImpl {
     fn run_program(
         &mut self,
@@ -1010,6 +1047,14 @@ impl brain_runner::Server for BrainRunnerImpl {
                     result.set_runtime_revision(response.runtime_revision);
                     encode_checkpoint(result.reborrow().init_checkpoint(), &response.checkpoint)
                         .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                    result.set_has_commit_ack(response.commit_ack.is_some());
+                    if let Some(commit_ack) = response.commit_ack {
+                        let client: finch_ipc_capnp::brain_turn_commit_ack::Client =
+                            capnp_rpc::new_client(BrainTurnCommitAckImpl {
+                                tx: commit_ack.tx().clone(),
+                            });
+                        result.set_commit_ack(client);
+                    }
                     result.set_error("");
                 }
                 Err(error) => result.set_error(&error.message),
