@@ -111,6 +111,38 @@ pub(crate) fn resolve_provider_profile(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BrainAttachmentRoute {
+    LocalIpc { brain: String },
+    RemoteInvitation {
+        target: crate::brain::remote::RemoteBrainTarget,
+        invitation: String,
+    },
+}
+
+fn brain_attachment_route(
+    value: &str,
+    invitation: Option<String>,
+) -> Result<BrainAttachmentRoute> {
+    if value.contains('@') {
+        let invitation = invitation.context(
+            "remote Brain attachments require `/brain join NAME@MACHINE[:PORT] INVITE`; use `/brain attach NAME` for a Brain on this daemon",
+        )?;
+        return Ok(BrainAttachmentRoute::RemoteInvitation {
+            target: crate::brain::remote::RemoteBrainTarget::parse(value)?,
+            invitation,
+        });
+    }
+    anyhow::ensure!(
+        invitation.is_none(),
+        "Brain invitation targets must include NAME@MACHINE[:PORT]"
+    );
+    crate::brain::store::BrainStore::validate_name(value)?;
+    Ok(BrainAttachmentRoute::LocalIpc {
+        brain: value.to_string(),
+    })
+}
+
 /// Continuation data for a poset run that is waiting for user confirmation.
 struct PendingPosetRun {
     generator: Arc<dyn crate::generators::Generator>,
@@ -2505,12 +2537,22 @@ Rules:\n\
                         self.handle_brain_attach(target).await?;
                     }
                     Command::BrainJoin { target, invitation } => {
-                        self.handle_brain_join(target, invitation).await?;
+                        if let Err(error) = self.handle_brain_join(target, invitation).await {
+                            self.output_manager
+                                .write_info(format!("brain join: {error:#}"));
+                            self.render_tui().await?;
+                        }
+                    }
+                    Command::BrainJoinUsage => {
+                        self.output_manager.write_info(
+                            "Usage: /brain join NAME@MACHINE[:PORT] INVITE\nFor another Brain on this daemon, use: /brain attach NAME",
+                        );
+                        self.render_tui().await?;
                     }
                     Command::BrainInvite { role, ttl_minutes } => {
                         if let Err(error) = self.handle_brain_invite(role, ttl_minutes).await {
                             self.output_manager
-                                .write_info(format!("brain invite: {error}"));
+                                .write_info(format!("brain invite: {error:#}"));
                             self.render_tui().await?;
                         }
                     }
@@ -4915,22 +4957,42 @@ Rules:\n\
         value: String,
         invitation: Option<String>,
     ) -> Result<()> {
-        let parsed = if value.contains('@') {
-            crate::brain::remote::RemoteBrainTarget::parse(&value)
-        } else if let Some(base) = self.daemon_base_url.as_deref() {
-            crate::brain::remote::RemoteBrainTarget::local(&value, base)
-        } else {
-            Err(anyhow::anyhow!(
-                "a bare Brain name requires a connected local daemon; use NAME@MACHINE[:PORT]"
-            ))
-        };
-        let target = match parsed {
-            Ok(target) => target,
+        let route = match brain_attachment_route(&value, invitation) {
+            Ok(route) => route,
             Err(error) => {
                 self.output_manager
                     .write_info(format!("brain attach: {error}"));
                 self.render_tui().await?;
                 return Ok(());
+            }
+        };
+        let (target, mut client, invited) = match route {
+            BrainAttachmentRoute::LocalIpc { brain } => {
+                let ipc = self.ipc_client.clone().context(
+                    "local Brain attachment requires the connected daemon IPC socket",
+                )?;
+                let mut target = self
+                    .home_brain
+                    .as_ref()
+                    .map(|home| home.target.clone())
+                    .context("this console has no local Brain environment")?;
+                target.brain = brain;
+                (
+                    target.clone(),
+                    crate::brain::remote::AttachedBrainClient::local(target, ipc),
+                    false,
+                )
+            }
+            BrainAttachmentRoute::RemoteInvitation { target, invitation } => {
+                let remote = crate::brain::remote::RemoteBrainClient::new_with_invitation(
+                    target.clone(),
+                    invitation,
+                )?;
+                (
+                    target,
+                    crate::brain::remote::AttachedBrainClient::remote(remote),
+                    true,
+                )
             }
         };
         if self.home_brain.as_ref().is_some_and(|home| {
@@ -4942,16 +5004,7 @@ Rules:\n\
             ));
             return self.render_tui().await;
         }
-        let remote = if let Some(invitation) = invitation.as_ref() {
-            crate::brain::remote::RemoteBrainClient::new_with_invitation(target, invitation)?
-        } else {
-            let password = crate::config::load_config()
-                .map(|config| config.server.brain_password)
-                .unwrap_or_default();
-            crate::brain::remote::RemoteBrainClient::new(target, password)?
-        };
-        let mut client = crate::brain::remote::AttachedBrainClient::remote(remote);
-        let attachment = if invitation.is_some() {
+        let attachment = if invited {
             client
                 .attach_invited_persistent(&self.participant_subject, &self.session_label)
                 .await
@@ -4967,7 +5020,7 @@ Rules:\n\
         };
         if let Err(error) = attachment {
             self.output_manager.write_info(format!(
-                "brain attach {}: {error}",
+                "brain attach {}: {error:#}",
                 client.target.display_name()
             ));
             self.render_tui().await?;
@@ -5065,9 +5118,17 @@ Rules:\n\
             &home.target.brain,
             daemon_base_url,
         )?;
-        let password = crate::config::load_config()
-            .map(|config| config.server.brain_password)
-            .unwrap_or_default();
+        let config = crate::config::load_config().context("load Brain collaboration settings")?;
+        anyhow::ensure!(
+            config.server.advertise,
+            "remote Brain collaboration is disabled; enable LAN discovery/advertisement before issuing an invitation"
+        );
+        let recipient_target = crate::brain::remote::RemoteBrainTarget::invitation_recipient(
+            &home.target.brain,
+            &home.target.machine,
+            &config.server.brain_bind_address,
+        )?;
+        let password = config.server.brain_password;
         let client = crate::brain::remote::RemoteBrainClient::new(target, password)?;
         let ttl_ms = ttl_minutes
             .map(|minutes| {
@@ -5077,13 +5138,18 @@ Rules:\n\
             })
             .transpose()?;
         let (invitation, claims) = client.issue_invitation(role, ttl_ms).await?;
+        let invitation_client = crate::brain::remote::RemoteBrainClient::new_with_invitation(
+            recipient_target.clone(),
+            invitation.clone(),
+        )?;
+        invitation_client.probe_invitation_endpoint().await?;
         self.output_manager.write_info(format!(
             "Brain invitation for {} ({}, expires at Unix ms {}):\n{}\n\nRecipient command:\n/brain join {} {}",
             claims.brain,
             format!("{:?}", claims.role).to_ascii_lowercase(),
             claims.expires_ms,
             invitation,
-            client.target.display_name(),
+            recipient_target.command_target(),
             invitation,
         ));
         self.render_tui().await
@@ -7569,6 +7635,44 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bare_brain_attach_routes_only_to_local_ipc() {
+        assert_eq!(
+            super::brain_attachment_route("review", None).unwrap(),
+            super::BrainAttachmentRoute::LocalIpc {
+                brain: "review".into()
+            }
+        );
+    }
+
+    #[test]
+    fn remote_brain_attach_requires_the_invitation_join_path() {
+        let error = super::brain_attachment_route("review@workstation.local", None).unwrap_err();
+        assert!(error.to_string().contains("/brain join"));
+
+        let route = super::brain_attachment_route(
+            "review@workstation.local:19436",
+            Some("finch-brain-invite-v1.payload.signature".into()),
+        )
+        .unwrap();
+        assert!(matches!(
+            route,
+            super::BrainAttachmentRoute::RemoteInvitation { target, invitation }
+                if target.address == "workstation.local:19436"
+                    && invitation == "finch-brain-invite-v1.payload.signature"
+        ));
+    }
+
+    #[test]
+    fn invitation_join_rejects_a_bare_local_target() {
+        let error = super::brain_attachment_route(
+            "review",
+            Some("finch-brain-invite-v1.payload.signature".into()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("NAME@MACHINE[:PORT]"));
+    }
+
     #[tokio::test]
     async fn named_brain_schedule_effect_uses_the_run_scoped_control_proxy() {
         let runtime = crate::runtime::ProgramRuntime::new();

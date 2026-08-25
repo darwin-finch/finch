@@ -67,6 +67,7 @@ pub enum Command {
         target: String,
         invitation: String,
     }, // /brain join <name@machine[:port]> <invitation>
+    BrainJoinUsage,                  // incomplete /brain join
     BrainInvite {
         role: String,
         ttl_minutes: Option<u64>,
@@ -154,6 +155,7 @@ impl Command {
                     invitation: invitation.to_string(),
                 });
             }
+            return Some(Command::BrainJoinUsage);
         }
 
         let trimmed = input
@@ -193,6 +195,7 @@ impl Command {
             "/brain initialize" => return Some(Command::BrainInitialize),
             "/who" | "/brain who" => return Some(Command::BrainWho),
             "/brain detach" => return Some(Command::BrainDetach),
+            "/brain join" => return Some(Command::BrainJoinUsage),
             "/brain invite" => {
                 return Some(Command::BrainInvite {
                     role: "driver".into(),
@@ -611,6 +614,7 @@ pub fn handle_command(
         | Command::BrainArchive(_)
         | Command::BrainAttach(_)
         | Command::BrainJoin { .. }
+        | Command::BrainJoinUsage
         | Command::BrainInvite { .. }
         | Command::BrainDetach
         | Command::BrainHandoff(_)
@@ -1169,6 +1173,14 @@ mod tests {
             Some(Command::BrainJoin { target, invitation })
                 if target == "finch@workstation.local"
                     && invitation == "finch-brain-invite-v1.payload.sig_"
+        ));
+        assert!(matches!(
+            Command::parse("/brain join copper-brook-a1752c"),
+            Some(Command::BrainJoinUsage)
+        ));
+        assert!(matches!(
+            Command::parse("/brain join"),
+            Some(Command::BrainJoinUsage)
         ));
         assert!(matches!(
             Command::parse("/brain invite consultant 30"),

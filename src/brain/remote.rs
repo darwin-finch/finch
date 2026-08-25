@@ -182,6 +182,43 @@ impl RemoteBrainTarget {
         format!("{}@{}", self.brain, self.machine)
     }
 
+    /// Build the endpoint printed with an invitation minted through the local
+    /// plaintext daemon. The daemon bind address is intentionally *not* a
+    /// recipient address: it is commonly `0.0.0.0` while the administration
+    /// endpoint is loopback-only. Invitations must name the TLS certificate's
+    /// machine hostname and the configured collaboration-listener port.
+    pub fn invitation_recipient(
+        brain: &str,
+        certificate_hostname: &str,
+        brain_bind_address: &str,
+    ) -> Result<Self> {
+        let bind: std::net::SocketAddr = brain_bind_address
+            .parse()
+            .with_context(|| format!("invalid Brain TLS bind address '{brain_bind_address}'"))?;
+        anyhow::ensure!(bind.port() != 0, "Brain TLS listener has no stable port");
+
+        let hostname = certificate_hostname.trim().trim_end_matches('.');
+        anyhow::ensure!(
+            !hostname.is_empty()
+                && hostname.parse::<std::net::IpAddr>().is_err()
+                && !hostname.contains('/')
+                && !hostname.contains(char::is_whitespace),
+            "Brain TLS certificate has no recipient-reachable hostname"
+        );
+        let hostname = if hostname.contains('.') {
+            hostname.to_string()
+        } else {
+            format!("{hostname}.local")
+        };
+        Self::parse(&format!("{brain}@{hostname}:{}", bind.port()))
+    }
+
+    /// Exact target spelling suitable for `/brain join`. Unlike
+    /// `display_name`, this always preserves a configured non-default port.
+    pub fn command_target(&self) -> String {
+        format!("{}@{}", self.brain, self.address)
+    }
+
     /// Resolve a bare Brain name through the already-connected local daemon.
     pub fn local(brain: &str, daemon_base_url: &str) -> Result<Self> {
         let address = daemon_base_url
@@ -741,7 +778,12 @@ impl RemoteBrainClient {
             })
             .send()
             .await
-            .context("could not reach Brain invitation redemption endpoint")?
+            .with_context(|| {
+                format!(
+                    "could not reach Brain invitation redemption endpoint at {}",
+                    self.target.address
+                )
+            })?
             .error_for_status()
             .context("Brain invitation redemption rejected")?
             .json::<IssuedBrainCredential>()
@@ -762,6 +804,37 @@ impl RemoteBrainClient {
             token: issued.token,
             claims: issued.claims,
         })
+    }
+
+    /// Verify that an invitation's advertised TLS endpoint is reachable and
+    /// presents the exact certificate embedded in the invitation, without
+    /// consuming the single-participant token. The redemption route accepts
+    /// POST only, so a method-mismatch response proves that the intended route
+    /// was reached after DNS, TCP, and TLS validation.
+    pub async fn probe_invitation_endpoint(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.target.secure
+                && matches!(&self.bootstrap, RemoteBrainBootstrap::Invitation { .. }),
+            "invitation endpoint probes require a signed invitation client"
+        );
+        let response = self
+            .http
+            .get(self.target.invitation_redemption_url())
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "could not reach certificate-valid Brain TLS listener at {}",
+                    self.target.address
+                )
+            })?;
+        anyhow::ensure!(
+            response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED,
+            "Brain TLS listener at {} does not expose invitation redemption (HTTP {})",
+            self.target.address,
+            response.status()
+        );
+        Ok(())
     }
 
     pub async fn attach(
@@ -1857,6 +1930,47 @@ mod tests {
     }
 
     #[test]
+    fn invitation_recipient_uses_certificate_hostname_and_tls_listener_port() {
+        let target = RemoteBrainTarget::invitation_recipient(
+            "copper-brook-a1752c",
+            "Shammahs-MacBook-Air.local",
+            "0.0.0.0:11436",
+        )
+        .unwrap();
+
+        assert_eq!(
+            target.command_target(),
+            "copper-brook-a1752c@Shammahs-MacBook-Air.local:11436"
+        );
+        assert_eq!(target.machine, "Shammahs-MacBook-Air.local");
+        assert!(target.secure);
+    }
+
+    #[test]
+    fn invitation_recipient_normalizes_bare_certificate_hostname_for_mdns() {
+        let target =
+            RemoteBrainTarget::invitation_recipient("review", "workstation", "[::]:19436")
+                .unwrap();
+        assert_eq!(target.command_target(), "review@workstation.local:19436");
+    }
+
+    #[test]
+    fn invitation_recipient_never_publishes_bind_or_loopback_ip_as_host() {
+        assert!(RemoteBrainTarget::invitation_recipient(
+            "review",
+            "127.0.0.1",
+            "0.0.0.0:11436"
+        )
+        .is_err());
+        assert!(RemoteBrainTarget::invitation_recipient(
+            "review",
+            "workstation.local",
+            "0.0.0.0:0"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn bare_name_can_resolve_through_the_local_daemon() {
         let target = RemoteBrainTarget::local("review", "http://127.0.0.1:11435").unwrap();
         assert_eq!(target.brain, "review");
@@ -2188,6 +2302,8 @@ mod tests {
             secure: true,
         };
         let client = RemoteBrainClient::new_with_invitation(target, invitation).unwrap();
+
+        client.probe_invitation_endpoint().await.unwrap();
 
         assert_eq!(
             client
