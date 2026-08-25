@@ -17,6 +17,10 @@ use tokio::sync::broadcast;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const BRAIN_EVENT_SCHEMA_VERSION: u32 = 11;
 const BRAIN_METADATA_VERSION: u32 = 1;
+const BRAIN_INITIALIZATION_VERSION: u32 = 1;
+const DEFAULT_INITIALIZATION_MODULE: &str = "finch.brain.initialization";
+const DEFAULT_INITIALIZATION_SOURCE: &str =
+    "(define (finch-brain-initialized) : int 1)";
 
 /// Stable identity of one durable Brain. Names are mutable human aliases;
 /// this ID is what future runs, attachments, cursors, and grants reference.
@@ -197,6 +201,52 @@ struct BrainMetadata {
     version: u32,
     brain_id: BrainId,
     created_ms: u64,
+}
+
+/// Reviewed, immutable program that establishes a Brain's initial typed state.
+/// Loading this record is inert: execution requires an explicit scheduled run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainInitialization {
+    pub version: u32,
+    pub brain_id: BrainId,
+    pub module: String,
+    pub module_revision: u32,
+    pub language: ProgramLanguage,
+    pub source: String,
+    pub source_sha256: String,
+    pub capability_budget: crate::vm::EffectSet,
+}
+
+impl BrainInitialization {
+    fn reviewed_default(brain_id: BrainId) -> Self {
+        Self {
+            version: BRAIN_INITIALIZATION_VERSION,
+            brain_id,
+            module: DEFAULT_INITIALIZATION_MODULE.into(),
+            module_revision: 1,
+            language: ProgramLanguage::Lisp,
+            source: DEFAULT_INITIALIZATION_SOURCE.into(),
+            source_sha256: hex::encode(Sha256::digest(DEFAULT_INITIALIZATION_SOURCE.as_bytes())),
+            capability_budget: crate::vm::EffectSet::pure(),
+        }
+    }
+
+    fn validate(&self, brain_id: BrainId) -> Result<()> {
+        anyhow::ensure!(self.version == BRAIN_INITIALIZATION_VERSION,
+            "unsupported Brain initialization version {}", self.version);
+        anyhow::ensure!(self.brain_id == brain_id,
+            "Brain initialization identity does not match metadata");
+        anyhow::ensure!(!self.module.trim().is_empty() && self.module_revision > 0,
+            "Brain initialization module identity is invalid");
+        anyhow::ensure!(!self.source.trim().is_empty(),
+            "Brain initialization program is empty");
+        let actual = hex::encode(Sha256::digest(self.source.as_bytes()));
+        anyhow::ensure!(self.source_sha256 == actual,
+            "Brain initialization program digest does not match its source");
+        anyhow::ensure!(self == &Self::reviewed_default(brain_id),
+            "Brain initialization contract is not the reviewed built-in module");
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -725,6 +775,7 @@ pub struct BrainStore {
     root: Option<PathBuf>,
     environment: BrainEnvironment,
     brains: Arc<RwLock<HashMap<String, BrainState>>>,
+    initializations: Arc<RwLock<HashMap<String, BrainInitialization>>>,
     runtimes: Arc<RwLock<HashMap<String, Arc<crate::runtime::ProgramRuntime>>>>,
     runtime_checkpoints:
         Arc<RwLock<HashMap<String, crate::vm::TypedRuntimeCheckpoint>>>,
@@ -760,6 +811,7 @@ impl BrainStore {
                 generation: initial_environment_generation(),
             },
             brains: Arc::new(RwLock::new(HashMap::new())),
+            initializations: Arc::new(RwLock::new(HashMap::new())),
             runtimes: Arc::new(RwLock::new(HashMap::new())),
             runtime_checkpoints: Arc::new(RwLock::new(HashMap::new())),
             execution_locks: Arc::new(RwLock::new(HashMap::new())),
@@ -838,6 +890,65 @@ impl BrainStore {
             schedules: sorted_schedules(&state.schedules),
             pending_schedule_dues: sorted_schedule_dues(&state.pending_schedule_dues),
         })
+    }
+
+    /// Return the persisted initialization contract without executing it or
+    /// appending any observable Brain event.
+    pub fn initialization(&self, name: &str) -> Result<BrainInitialization> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        self.initializations
+            .read()
+            .expect("shared Brain initialization lock poisoned")
+            .get(name)
+            .cloned()
+            .context("Brain initialization was removed concurrently")
+    }
+
+    /// Idempotently journal initialization as a one-shot schedule. The
+    /// ordinary scheduler creates the explicit `BrainRun`, and the runner is
+    /// limited to the reviewed contract's capability ceiling.
+    pub fn schedule_initialization(
+        &self,
+        name: &str,
+        sender: &str,
+        initiating_attachment_id: AttachmentId,
+        next_due_ms: u64,
+    ) -> Result<BrainSchedule> {
+        let name = Self::validate_name(name)?;
+        let initialization = self.initialization(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        let attachment = state.attachments.get(&initiating_attachment_id)
+            .context("initialization scheduler attachment does not exist")?;
+        anyhow::ensure!(attachment.subject == sender,
+            "initialization scheduler does not own the initiating attachment");
+        anyhow::ensure!(matches!(attachment.role, AttachmentRole::Runner | AttachmentRole::Driver),
+            "attachment role cannot schedule Brain initialization");
+        if let Some(existing) = state.schedules.values().find(|schedule| {
+            schedule.language == initialization.language
+                && schedule.source == initialization.source
+                && schedule.grant_ceiling == initialization.capability_budget
+                && schedule.interval_ms.is_none()
+        }) {
+            return Ok(existing.clone());
+        }
+        let schedule = BrainSchedule {
+            schedule_id: ScheduleId::new(),
+            initiating_attachment_id,
+            created_by: sender.to_string(),
+            grant_ceiling: initialization.capability_budget,
+            language: initialization.language,
+            source: initialization.source,
+            next_due_ms,
+            interval_ms: None,
+            delivery_policy: BrainScheduleDeliveryPolicy::Coalesce,
+            active: true,
+        };
+        self.push_locked(name, state, sender, BrainEventKind::ScheduleChanged {
+            schedule: schedule.clone(),
+        })?;
+        Ok(schedule)
     }
 
     pub fn create_schedule(
@@ -1756,6 +1867,10 @@ impl BrainStore {
             .write()
             .expect("shared brain runtime lock poisoned")
             .remove(name);
+        self.initializations
+            .write()
+            .expect("shared Brain initialization lock poisoned")
+            .remove(name);
         self.execution_locks
             .write()
             .expect("shared brain execution-lock map poisoned")
@@ -1871,6 +1986,10 @@ impl BrainStore {
         self.runtimes
             .write()
             .expect("shared brain runtime lock poisoned")
+            .remove(name);
+        self.initializations
+            .write()
+            .expect("shared Brain initialization lock poisoned")
             .remove(name);
         self.execution_locks
             .write()
@@ -2216,6 +2335,7 @@ impl BrainStore {
             return Ok(());
         }
         let brain_id = self.load_or_create_metadata(name)?.brain_id;
+        let initialization = self.load_or_create_initialization(name, brain_id)?;
         let events = self.read_events(name)?;
         for event in &events {
             if event.schema_version > BRAIN_EVENT_SCHEMA_VERSION {
@@ -2285,12 +2405,62 @@ impl BrainStore {
             self.append_event(name, &event)?;
             state.apply(event);
         }
+        self.initializations
+            .write()
+            .expect("shared Brain initialization lock poisoned")
+            .entry(name.to_string())
+            .or_insert(initialization);
         self.brains
             .write()
             .expect("shared brain lock poisoned")
             .entry(name.to_string())
             .or_insert(state);
         Ok(())
+    }
+
+    fn load_or_create_initialization(
+        &self,
+        name: &str,
+        brain_id: BrainId,
+    ) -> Result<BrainInitialization> {
+        let Some(root) = &self.root else {
+            return Ok(BrainInitialization::reviewed_default(brain_id));
+        };
+        let directory = root.join(name);
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("create {}", directory.display()))?;
+        let path = directory.join("initialization.json");
+        if path.exists() {
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("read {}", path.display()))?;
+            let initialization: BrainInitialization = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse {}", path.display()))?;
+            initialization.validate(brain_id)?;
+            return Ok(initialization);
+        }
+        let initialization = BrainInitialization::reviewed_default(brain_id);
+        let temporary = directory.join(format!(".initialization.{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&temporary, serde_json::to_vec_pretty(&initialization)?)
+            .with_context(|| format!("write {}", temporary.display()))?;
+        match std::fs::hard_link(&temporary, &path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&temporary);
+                Ok(initialization)
+            }
+            Err(_error) if path.exists() => {
+                let _ = std::fs::remove_file(&temporary);
+                let bytes = std::fs::read(&path)
+                    .with_context(|| format!("read {} after initialization race", path.display()))?;
+                let initialization: BrainInitialization = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse {} after initialization race", path.display()))?;
+                initialization.validate(brain_id)?;
+                Ok(initialization)
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&temporary);
+                Err(error).with_context(|| format!("commit {}", path.display()))
+            }
+        }
     }
 
     fn read_attachment_cursors(
@@ -3215,6 +3385,115 @@ mod tests {
         assert_eq!(restored.brain_id, original.brain_id);
         assert_ne!(restored.brain_id, BrainId::nil());
         assert!(temp.path().join("quiet-brain/metadata.json").exists());
+    }
+
+    #[test]
+    fn initialization_contract_is_persisted_and_inert_across_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let before = store.initialization("quiet-brain").unwrap();
+        let snapshot = store.snapshot("quiet-brain").unwrap();
+        assert_eq!(before.brain_id, snapshot.brain_id);
+        assert_eq!(before.capability_budget, crate::vm::EffectSet::pure());
+        assert_eq!(snapshot.revision, 0);
+        assert!(snapshot.runs.is_empty() && snapshot.schedules.is_empty());
+        assert!(snapshot.events.iter().all(|event| !matches!(
+            event.kind, BrainEventKind::EffectRecorded { .. }
+        )));
+
+        drop(store);
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        assert_eq!(restarted.initialization("quiet-brain").unwrap(), before);
+        assert_eq!(restarted.snapshot("quiet-brain").unwrap().revision, 0);
+        assert!(temp.path().join("quiet-brain/initialization.json").exists());
+    }
+
+    #[test]
+    fn initialization_requires_an_explicit_scheduled_brain_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        store.activate_connection(
+            "shared",
+            attachment.attachment_id,
+            attachment.connection_id.unwrap(),
+        ).unwrap();
+        let contract = store.initialization("shared").unwrap();
+        let schedule = store
+            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .unwrap();
+        assert_eq!(schedule.source, contract.source);
+        assert_eq!(schedule.grant_ceiling, contract.capability_budget);
+        assert!(store.queue_due_schedules("shared", 9).unwrap().is_empty());
+        let runs = store.queue_due_schedules("shared", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].kind, BrainRunKind::Scheduled);
+        assert_eq!(runs[0].status, BrainRunStatus::QueuedForEnvironment);
+
+        drop(store);
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let reattached = restarted.attach(
+            "shared",
+            "alice",
+            AttachmentRole::Driver,
+            Some(attachment.attachment_id),
+        ).unwrap();
+        restarted.activate_connection(
+            "shared",
+            reattached.attachment_id,
+            reattached.connection_id.unwrap(),
+        ).unwrap();
+        let same = restarted
+            .schedule_initialization("shared", "alice", attachment.attachment_id, 20)
+            .unwrap();
+        assert_eq!(same.schedule_id, schedule.schedule_id);
+        let snapshot = restarted.snapshot("shared").unwrap();
+        assert_eq!(snapshot.schedules.len(), 1);
+        assert_eq!(snapshot.runs.len(), 1);
+        assert!(snapshot.events.iter().all(|event| !matches!(
+            event.kind, BrainEventKind::EffectRecorded { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn reviewed_initialization_module_is_typed_and_pure() {
+        let store = BrainStore::with_root("box.local", None);
+        let contract = store.initialization("reviewed").unwrap();
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let outcome = runtime.submit_typed_only(crate::runtime::ProgramSubmission {
+            language: crate::programs::ProgramLanguage::Lisp,
+            source_id: Some(format!("brain-initialization:{}", contract.source_sha256)),
+            source: contract.source,
+            intent: "reviewed Brain initialization module".into(),
+            effect: crate::programs::ExecutionEffect::Pure,
+            declared_capabilities: Vec::new(),
+            manifest_generation: runtime.manifest_generation(),
+            expected_revision: Some(runtime.revision()),
+            budget: None,
+        }).await.unwrap();
+        assert_eq!(outcome.status, crate::runtime::outcome::ExecutionStatus::Completed);
+        assert!(outcome.inferred_capabilities.is_empty());
+        assert!(outcome.vm_side_effects.is_empty());
+    }
+
+    #[test]
+    fn unreviewed_persisted_initialization_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let mut contract = store.initialization("tampered").unwrap();
+        contract.source = "(define (ambient-startup) : int 2)".into();
+        contract.source_sha256 = hex::encode(Sha256::digest(contract.source.as_bytes()));
+        std::fs::write(
+            temp.path().join("tampered/initialization.json"),
+            serde_json::to_vec_pretty(&contract).unwrap(),
+        ).unwrap();
+        drop(store);
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        assert!(restarted.initialization("tampered").unwrap_err()
+            .to_string().contains("not the reviewed built-in module"));
     }
 
     #[test]

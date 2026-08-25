@@ -77,6 +77,35 @@ impl BrainLifecycleService {
         self.store.snapshot(brain)
     }
 
+    pub fn initialization(
+        &self,
+        brain: &str,
+    ) -> Result<crate::brain::store::BrainInitialization> {
+        self.store.initialization(brain)
+    }
+
+    /// Journal the reviewed initialization module as a one-shot schedule.
+    /// Merely creating, listing, or attaching to a Brain never calls this.
+    pub fn schedule_initialization(
+        &self,
+        brain: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        next_due_ms: u64,
+    ) -> Result<BrainSchedule> {
+        let attachment = self.connection(brain, attachment_id, connection_id)?;
+        ensure!(
+            attachment.role == AttachmentRole::Driver,
+            "only a Brain driver can schedule initialization"
+        );
+        self.store.schedule_initialization(
+            brain,
+            &attachment.subject,
+            attachment_id,
+            next_due_ms,
+        )
+    }
+
     pub fn list(&self) -> Result<Vec<String>> {
         self.store.list()
     }
