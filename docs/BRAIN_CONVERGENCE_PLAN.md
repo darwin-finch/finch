@@ -149,7 +149,9 @@ output/revision/checkpoint; the daemon independently reverifies and content-addr
 state beside the event log without inheriting frontend authority or replaying effects. A restarted
 runner receives the durable checkpoint during callback registration before it accepts work.
 Concurrent commits journal their exact runtime revision and recovery never regresses to a
-later-appended older checkpoint.
+later-appended older checkpoint. The content-addressed durable blob uses this same Cap'n Proto
+checkpoint graph; legacy `.json` blobs remain a read-only migration input for hashes already present
+in historical event logs.
 Every accepted prompt or typed program now also creates one canonical, versioned `BrainRun` with a
 stable `RunId`, initiating attachment, request-event cursor, kind, timestamps, detail, and explicit
 `queued_for_environment`, `running`, `awaiting_approval`, `completed`, `failed`, `cancelled`, or
@@ -500,6 +502,9 @@ rather than opaque JSON bytes. Canonical provider context crosses the runner cal
 `List(Message)`, with structured tool inputs preserved. Typed-runtime checkpoints now use a closed
 native Cap'n Proto schema in registration and both runner result paths; exhaustive arm coverage plus
 a live addressed-handoff ProgramRun prove encode/decode, restore, commit, and stale-runner isolation.
+Committed Brain revisions persist those same native messages as content-addressed `.capnp` blobs.
+Restart tests prove native closure/fiber restoration and legacy JSON checkpoint recovery; decoding
+rejects trailing data rather than accepting an ambiguous content-addressed representation.
 A cloneable in-process
 `BrainLifecycleService` now owns attachment
 reservation and expiry, watch activation, acknowledgement, detach cleanup, participant submission,

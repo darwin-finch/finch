@@ -724,7 +724,13 @@ still blocks the corresponding Brain phase until it is unified.
   Brain concepts into one daemon-authoritative event log, VM history, environment, and authority
   boundary; model interactive turns, speculative helpers, schedules, and subagents as `BrainRun`s;
   and make local, embedded, IPC, HTTP/WebSocket, and remote clients projections of one service.
-- [ ] Persist complete VM checkpoints or reversible VM deltas at committed program boundaries.
+- [x] Persist complete VM checkpoints or reversible VM deltas at committed program boundaries.
+  Every committed local or leased-runner revision writes one content-addressed, schema-native
+  Cap'n Proto `TypedRuntimeCheckpoint` beside the Brain event log. Restart restores and reverifies
+  that closed graph rather than replaying source. Existing content-addressed `.json` checkpoints
+  remain readable as migration input, but all new durable blobs use the exact runner-transport
+  codec. Tests cover native and frontend-runner restart, legacy recovery, closure/fiber state, and
+  rejection of ambiguous trailing data.
 - [ ] Make the daemon own schedule definitions/due-time delivery only. Coalesce missed ticks into one
   pending event per schedule while the environment-owning frontend is unavailable; require explicit
   bounded catch-up and idempotency policy before delivering every missed occurrence.
@@ -778,7 +784,9 @@ still blocks the corresponding Brain phase until it is unified.
   and full-turn results now carry a closed, schema-native `TypedRuntimeCheckpoint`: all typed values,
   types, effect selectors, IR instructions, verified modules, continuations, diagnostics, and
   producer fibers round-trip without an opaque JSON envelope. A live addressed-handoff test proves
-  native checkpoint bootstrap/result transport through the replacement frontend callback.
+  native checkpoint bootstrap/result transport through the replacement frontend callback. Durable
+  checkpoint blobs now use that same Cap'n Proto graph and content hash; JSON is read only to
+  migrate already-journaled historical hashes.
 - [ ] Define Brain initialization as a reviewed typed program/module with an explicit capability
   budget and journaled effects. Deterministic VM vocabulary/module loading may occur before a
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work
