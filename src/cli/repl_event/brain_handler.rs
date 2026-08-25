@@ -92,6 +92,34 @@ struct HomeRunnerRegistration {
     registration: std::result::Result<crate::brain::store::RunnerLeaseId, String>,
 }
 
+fn initialization_schedule_message(
+    schedule: &crate::brain::store::BrainSchedule,
+    status: Option<crate::brain::store::BrainRunStatus>,
+) -> String {
+    let schedule_id = schedule.schedule_id.0.to_string();
+    if schedule.active {
+        return format!(
+            "reviewed Brain initialization scheduled as {}",
+            &schedule_id[..8]
+        );
+    }
+    match status {
+        Some(crate::brain::store::BrainRunStatus::Completed) => format!(
+            "reviewed Brain initialization already completed as {}",
+            &schedule_id[..8]
+        ),
+        Some(status) => format!(
+            "reviewed Brain initialization was already dispatched as {} ({})",
+            &schedule_id[..8],
+            format!("{status:?}").to_ascii_lowercase(),
+        ),
+        None => format!(
+            "reviewed Brain initialization was already delivered as {}",
+            &schedule_id[..8]
+        ),
+    }
+}
+
 fn verify_local_frontend_environment(
     expected: &crate::brain::store::BrainEnvironment,
 ) -> Result<()> {
@@ -769,11 +797,25 @@ impl EventLoop {
             .try_into()
             .context("system clock does not fit the Brain scheduler")?;
         let schedule = client.schedule_initialization(next_due_ms).await?;
-        let schedule_id = schedule.schedule_id.0.to_string();
-        self.output_manager.write_info(format!(
-            "reviewed Brain initialization scheduled as {}",
-            &schedule_id[..8]
-        ));
+        let status = if schedule.active {
+            None
+        } else {
+            let snapshot = client.snapshot().await?;
+            snapshot.events.iter().rev().find_map(|event| match &event.kind {
+                crate::brain::store::BrainEventKind::ScheduleDue { due }
+                    if due.schedule_id == schedule.schedule_id =>
+                {
+                    snapshot
+                        .runs
+                        .iter()
+                        .find(|run| run.run_id == due.run.run_id)
+                        .map(|run| run.status)
+                }
+                _ => None,
+            })
+        };
+        self.output_manager
+            .write_info(initialization_schedule_message(&schedule, status));
         self.render_tui().await
     }
 
