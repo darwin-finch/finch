@@ -293,10 +293,16 @@ impl RemoteBrainClient {
             role: AttachmentRole,
             attachment_id: Option<AttachmentId>,
         }
+        #[derive(Deserialize)]
+        struct Attached {
+            attachment: BrainAttachment,
+            token: String,
+            claims: super::credential::BrainCredentialClaims,
+        }
 
         self.ensure_credential(subject, role).await?;
         let token = self.authorized_token().await?;
-        let attachment = self
+        let attached = self
             .http
             .post(self.target.attachments_url())
             .bearer_auth(token)
@@ -310,9 +316,28 @@ impl RemoteBrainClient {
             .context("could not reach brain host")?
             .error_for_status()
             .context("brain attachment rejected")?
-            .json::<BrainAttachment>()
+            .json::<Attached>()
             .await
             .context("invalid brain attachment")?;
+        let connection_id = attached
+            .attachment
+            .connection_id
+            .context("remote Brain attachment omitted its pending connection")?;
+        attached
+            .claims
+            .require_participant(subject, role)
+            .and_then(|()| {
+                attached.claims.require_attachment(
+                    attached.attachment.attachment_id,
+                    connection_id,
+                )
+            })
+            .context("remote Brain returned the wrong attachment credential")?;
+        *self.credential.lock().await = Some(RemoteBrainCredential {
+            token: attached.token,
+            claims: attached.claims,
+        });
+        let attachment = attached.attachment;
         self.attachment = Some(attachment.clone());
         Ok(attachment)
     }
@@ -650,6 +675,8 @@ impl RemoteBrainClient {
             credential.claims.subject == subject
                 && credential.claims.role == role
                 && credential.claims.brain == self.target.brain
+                && credential.claims.attachment_id.is_none()
+                && credential.claims.connection_id.is_none()
                 && credential.claims.expires_ms > now_ms.saturating_add(60_000)
                 && requested_scopes
                     .as_ref()
@@ -736,20 +763,14 @@ impl RemoteBrainClient {
     }
 
     async fn authorized_token(&self) -> Result<String> {
-        let identity = self
-            .credential
-            .lock()
-            .await
+        let credential = self.credential.lock().await;
+        let credential = credential
             .as_ref()
-            .map(|credential| (credential.claims.subject.clone(), credential.claims.role))
             .context("client has not bootstrapped a scoped Brain credential")?;
-        self.ensure_credential(&identity.0, identity.1).await?;
-        self.credential
-            .lock()
-            .await
-            .as_ref()
-            .map(|credential| credential.token.clone())
-            .context("Brain credential refresh did not produce a token")
+        if credential.claims.expires_ms <= unix_epoch_millis() {
+            anyhow::bail!("scoped Brain credential expired; reconnect the attachment");
+        }
+        Ok(credential.token.clone())
     }
 }
 
@@ -1170,7 +1191,7 @@ mod tests {
             address: address.to_string(),
         };
         let mut client = RemoteBrainClient::new(target, "unused").unwrap();
-        client.attachment = Some(attachment);
+        client.attachment = Some(attachment.clone());
         *client.credential.lock().await = Some(RemoteBrainCredential {
             token: "scoped-token".into(),
             claims: crate::brain::credential::BrainCredentialClaims {
@@ -1185,6 +1206,8 @@ mod tests {
                 scopes: super::super::credential::default_participant_scopes(
                     AttachmentRole::Driver,
                 ),
+                attachment_id: Some(attachment.attachment_id),
+                connection_id: attachment.connection_id,
                 delegation_chain: Vec::new(),
                 issued_ms: 0,
                 expires_ms: u64::MAX,
@@ -1297,6 +1320,48 @@ mod tests {
         never_watched.disconnect().await.unwrap();
 
         client.archive("codex-smoke@localhost").await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Finch daemon on the default loopback port"]
+    async fn live_remote_attachment_credential_cannot_claim_a_sibling_connection() {
+        let brain = format!(
+            "remote-auth-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        );
+        let target = RemoteBrainTarget::parse(&format!(
+            "{brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}"
+        ))
+        .unwrap();
+        let subject = "same-subject@localhost";
+        let mut first = RemoteBrainClient::new(target.clone(), "loopback").unwrap();
+        let first_attachment = first
+            .attach(subject, AttachmentRole::Driver, None)
+            .await
+            .unwrap();
+        let mut second = RemoteBrainClient::new(target, "loopback").unwrap();
+        second
+            .attach(subject, AttachmentRole::Driver, None)
+            .await
+            .unwrap();
+
+        let mut forged = second.clone();
+        forged.attachment = Some(first_attachment);
+        assert!(forged.watch().await.is_err());
+
+        let mut first_events = first.watch().await.unwrap();
+        let initial = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            first_events.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(initial, BrainWireMessage::Snapshot { .. }));
+
+        first.disconnect().await.unwrap();
+        second.disconnect().await.unwrap();
+        first.archive(subject).await.unwrap();
     }
 
     #[test]
@@ -1639,6 +1704,8 @@ mod tests {
                 scopes: super::super::credential::default_participant_scopes(
                     AttachmentRole::Driver,
                 ),
+                attachment_id: None,
+                connection_id: None,
                 delegation_chain: Vec::new(),
                 issued_ms: 0,
                 expires_ms: u64::MAX,

@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use super::shared::{AttachmentRole, BrainId};
+use super::shared::{AttachmentId, AttachmentRole, BrainId, ConnectionId};
 
 const CREDENTIAL_VERSION: u32 = 1;
 const TOKEN_PREFIX: &str = "finch-brain-v1";
@@ -102,6 +102,13 @@ pub struct BrainCredentialClaims {
     pub environment_generation: u64,
     pub role: AttachmentRole,
     pub scopes: BTreeSet<BrainCredentialScope>,
+    /// Present only after the daemon narrows a bootstrap participant
+    /// credential to one exact remote attachment connection. These opaque
+    /// identities are correlation data until covered by this signed claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_id: Option<AttachmentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<ConnectionId>,
     /// Oldest-to-newest credential IDs that delegated this credential.
     /// Revoking any ancestor therefore revokes every descendant without a
     /// mutable child index.
@@ -138,6 +145,19 @@ impl BrainCredentialClaims {
     pub fn require_participant(&self, subject: &str, role: AttachmentRole) -> Result<()> {
         if self.subject != subject || self.role != role {
             anyhow::bail!("Brain participant identity does not match the credential");
+        }
+        Ok(())
+    }
+
+    pub fn require_attachment(
+        &self,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+    ) -> Result<()> {
+        if self.attachment_id != Some(attachment_id)
+            || self.connection_id != Some(connection_id)
+        {
+            anyhow::bail!("Brain credential is not bound to this attachment connection");
         }
         Ok(())
     }
@@ -252,6 +272,8 @@ impl BrainCredentialAuthority {
             environment_generation: request.environment_generation,
             role: request.role,
             scopes: request.scopes,
+            attachment_id: None,
+            connection_id: None,
             delegation_chain: request.delegation_chain,
             issued_ms: now_ms,
             expires_ms: now_ms
@@ -259,6 +281,52 @@ impl BrainCredentialAuthority {
                 .context("Brain credential expiry overflow")?,
         };
         self.sign(&claims)
+    }
+
+    /// Narrow an already verified participant credential to one pending
+    /// remote attachment. The derived credential cannot create or operate a
+    /// sibling attachment, cannot outlive its parent, and is invalidated by
+    /// revoking any ancestor in the signed chain.
+    pub fn bind_attachment(
+        &self,
+        parent: &BrainCredentialClaims,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        now_ms: u64,
+    ) -> Result<(String, BrainCredentialClaims)> {
+        if parent.attachment_id.is_some() || parent.connection_id.is_some() {
+            anyhow::bail!("Brain credential is already bound to an attachment");
+        }
+        if !parent.permits(BrainCredentialScope::BrainAttach) {
+            anyhow::bail!("Brain credential cannot bind an attachment without brain:attach");
+        }
+        if now_ms < parent.issued_ms || now_ms >= parent.expires_ms {
+            anyhow::bail!("Brain credential is outside its validity interval");
+        }
+        let mut delegation_chain = parent.delegation_chain.clone();
+        delegation_chain.push(parent.credential_id);
+        if delegation_chain.len() > MAX_DELEGATION_DEPTH {
+            anyhow::bail!("Brain credential delegation chain is too deep");
+        }
+        let mut scopes = parent.scopes.clone();
+        scopes.remove(&BrainCredentialScope::BrainAttach);
+        let claims = BrainCredentialClaims {
+            version: CREDENTIAL_VERSION,
+            credential_id: uuid::Uuid::new_v4(),
+            issuer: parent.issuer.clone(),
+            subject: parent.subject.clone(),
+            brain_id: parent.brain_id,
+            brain: parent.brain.clone(),
+            environment_generation: parent.environment_generation,
+            role: parent.role,
+            scopes,
+            attachment_id: Some(attachment_id),
+            connection_id: Some(connection_id),
+            delegation_chain,
+            issued_ms: now_ms,
+            expires_ms: parent.expires_ms,
+        };
+        Ok((self.sign(&claims)?, claims))
     }
 
     pub fn verify(&self, token: &str, now_ms: u64) -> Result<BrainCredentialClaims> {
@@ -290,6 +358,9 @@ impl BrainCredentialAuthority {
             serde_json::from_slice(&encoded).context("Brain credential claims are invalid")?;
         if claims.version != CREDENTIAL_VERSION {
             anyhow::bail!("unsupported Brain credential version {}", claims.version);
+        }
+        if claims.attachment_id.is_some() != claims.connection_id.is_some() {
+            anyhow::bail!("Brain credential attachment binding is incomplete");
         }
         if now_ms < claims.issued_ms {
             anyhow::bail!("Brain credential is not valid yet");
@@ -452,6 +523,41 @@ mod tests {
         assert!(claims.permits(BrainCredentialScope::BrainRead));
         assert!(claims.permits(BrainCredentialScope::BrainSubmit));
         assert!(!claims.permits(BrainCredentialScope::BrainApprove));
+    }
+
+    #[test]
+    fn attachment_credential_is_narrowed_to_one_connection_and_parent_revocation() {
+        let authority = BrainCredentialAuthority::ephemeral([10; 32]);
+        let now = 1_000;
+        let mut credential_request = request(60_000);
+        credential_request
+            .scopes
+            .insert(BrainCredentialScope::BrainAttach);
+        let parent_token = authority.issue(credential_request, now).unwrap();
+        let parent = authority.verify(&parent_token, now).unwrap();
+        let attachment_id = AttachmentId(uuid::Uuid::new_v4());
+        let connection_id = ConnectionId(uuid::Uuid::new_v4());
+        let (token, bound) = authority
+            .bind_attachment(&parent, attachment_id, connection_id, now + 1)
+            .unwrap();
+
+        assert!(bound
+            .require_attachment(attachment_id, connection_id)
+            .is_ok());
+        assert!(!bound.permits(BrainCredentialScope::BrainAttach));
+        assert!(bound
+            .require_attachment(
+                AttachmentId(uuid::Uuid::new_v4()),
+                connection_id,
+            )
+            .is_err());
+        assert!(authority
+            .bind_attachment(&bound, attachment_id, connection_id, now + 2)
+            .is_err());
+        assert_eq!(authority.verify(&token, now + 2).unwrap(), bound);
+
+        authority.revoke(parent.credential_id).unwrap();
+        assert!(authority.verify(&token, now + 3).is_err());
     }
 
     #[test]

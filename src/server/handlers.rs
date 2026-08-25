@@ -1,5 +1,6 @@
 // HTTP request handlers
 
+use anyhow::Context as _;
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -230,6 +231,12 @@ fn claims_match_attachment(
 ) -> Result<(), Response> {
     claims
         .require_participant(&attachment.subject, attachment.role)
+        .and_then(|()| {
+            let connection_id = attachment
+                .connection_id
+                .context("Brain attachment has no current connection")?;
+            claims.require_attachment(attachment.attachment_id, connection_id)
+        })
         .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))
 }
 
@@ -413,12 +420,19 @@ struct AttachNamedBrainRequest {
     attachment_id: Option<crate::brain::shared::AttachmentId>,
 }
 
+#[derive(Debug, Serialize)]
+struct AttachNamedBrainResponse {
+    attachment: crate::brain::shared::BrainAttachment,
+    token: String,
+    claims: crate::brain::credential::BrainCredentialClaims,
+}
+
 async fn attach_named_brain(
     State(server): State<Arc<AgentServer>>,
     headers: HeaderMap,
     Path(name): Path<String>,
     Json(request): Json<AttachNamedBrainRequest>,
-) -> Result<Json<crate::brain::shared::BrainAttachment>, Response> {
+) -> Result<Json<AttachNamedBrainResponse>, Response> {
     let claims = authorize_named_brain(
         &server,
         &headers,
@@ -428,10 +442,39 @@ async fn attach_named_brain(
     claims
         .require_participant(&request.subject, request.role)
         .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
+    if claims.attachment_id.is_some() || claims.connection_id.is_some() {
+        return Err(brain_auth_error(
+            StatusCode::FORBIDDEN,
+            "an attachment-bound credential cannot create another attachment",
+        ));
+    }
     let attachment = crate::server::BrainLifecycleService::from_server(&server)
         .attach(&name, &request.subject, request.role, request.attachment_id)
         .map_err(brain_state_conflict)?;
-    Ok(Json(attachment))
+    let connection_id = attachment
+        .connection_id
+        .expect("new remote Brain attachment has a pending connection");
+    let (token, bound_claims) = match server.brain_credentials().bind_attachment(
+        &claims,
+        attachment.attachment_id,
+        connection_id,
+        unix_epoch_millis(),
+    ) {
+        Ok(bound) => bound,
+        Err(error) => {
+            let _ = crate::server::BrainLifecycleService::from_server(&server).detach(
+                &name,
+                attachment.attachment_id,
+                connection_id,
+            );
+            return Err(AppError(error).into_response());
+        }
+    };
+    Ok(Json(AttachNamedBrainResponse {
+        attachment,
+        token,
+        claims: bound_claims,
+    }))
 }
 
 fn brain_state_conflict(error: anyhow::Error) -> Response {
