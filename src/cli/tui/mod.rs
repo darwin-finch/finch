@@ -1439,8 +1439,8 @@ impl TuiRenderer {
                         }
                     },
                     Event::Resize(w, h) => {
-                        // Clear the entire screen on resize; cursor goes to (0,0)
-                        // so the next draw_live_area() starts from the correct position.
+                        // Invalidate the live region; the next loop iteration redraws it
+                        // using the terminal's new dimensions without erasing scrollback.
                         let _ = self.handle_resize(w, h);
                     }
                     _ => {}
@@ -1461,9 +1461,9 @@ impl TuiRenderer {
     }
 
     pub fn handle_resize(&mut self, _w: u16, _h: u16) -> Result<()> {
-        // Clear the entire screen on resize to prevent ghosts from old layout
-        execute!(io::stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0))?;
-        self.active_rows = 0;
+        // Terminal emulators reflow scrollback themselves. Clearing the entire screen
+        // here destroys visible history; invalidate only Finch's live region and let
+        // the caller redraw it using the new terminal dimensions.
         self.live_area_dirty = true;
         Ok(())
     }

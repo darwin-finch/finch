@@ -141,6 +141,7 @@ pub fn spawn_input_task(
                 if crossterm::event::poll(Duration::from_millis(5)).unwrap_or(false) {
                     // Track if we need to render after processing first event
                     let mut first_event_modified_input = false;
+                    let mut first_event_needs_render = false;
 
                     // Process first event
                     let first_event_result = match crossterm::event::read() {
@@ -470,7 +471,14 @@ pub fn spawn_input_task(
                             first_event_modified_input = true;
                             Ok(None)
                         }
-                        Ok(_) => Ok(None), // Ignore other events (mouse, resize, etc.)
+                        Ok(Event::Resize(w, h)) => match tui.handle_resize(w, h) {
+                            Ok(()) => {
+                                first_event_needs_render = true;
+                                Ok(None)
+                            }
+                            Err(error) => Err(error),
+                        },
+                        Ok(_) => Ok(None), // Ignore other events (mouse, focus, etc.)
                         Err(e) => Err(anyhow::anyhow!("Failed to read input: {}", e)),
                     };
 
@@ -480,6 +488,7 @@ pub fn spawn_input_task(
                     // process it as a submit — the previous code read() it and then broke,
                     // silently dropping the keystroke and making Enter feel unreliable.
                     let mut had_input = first_event_modified_input;
+                    let mut needs_render = first_event_needs_render;
                     let mut batch_submit: Option<String> = None;
                     while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
                         match crossterm::event::read() {
@@ -511,7 +520,12 @@ pub fn spawn_input_task(
                                     had_input = true;
                                 }
                             }
-                            Ok(_) => {} // Ignore other events (mouse, resize, paste)
+                            Ok(Event::Resize(w, h)) => {
+                                if tui.handle_resize(w, h).is_ok() {
+                                    needs_render = true;
+                                }
+                            }
+                            Ok(_) => {} // Ignore other events (mouse, focus, paste)
                             Err(_) => break,
                         }
                     }
@@ -527,24 +541,20 @@ pub fn spawn_input_task(
                     // Render immediately after input (event-driven, not polled)
                     // Capture typing hint BEFORE releasing lock, only when
                     // text was modified but not submitted (had_input && no submit).
-                    let typing_hint = if had_input {
-                        // Update ghost text suggestion based on new input
+                    if had_input {
                         tui.update_ghost_text();
+                    }
 
-                        // Skip render if an external editor has the terminal.
-                        if !crate::is_editor_active() {
-                            if let Err(e) = tui.render() {
-                                tracing::error!("Async input render failed: {}", e);
-                                tui.needs_full_refresh = true;
-                                tui.last_render_error = Some(e.to_string());
-                            }
+                    if (had_input || needs_render) && !crate::is_editor_active() {
+                        if let Err(e) = tui.render() {
+                            tracing::error!("Async input render failed: {}", e);
+                            tui.needs_full_refresh = true;
+                            tui.last_render_error = Some(e.to_string());
                         }
+                    }
 
-                        // Capture current content for typing hint.
-                        Some(tui.input_textarea.lines().join("\n"))
-                    } else {
-                        None
-                    };
+                    // A resize redraw is not typing and must not notify the Brain.
+                    let typing_hint = had_input.then(|| tui.input_textarea.lines().join("\n"));
 
                     (first_event_result, typing_hint)
                 } else {
