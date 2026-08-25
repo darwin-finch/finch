@@ -291,6 +291,18 @@ fn claims_match_attachment(
         .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))
 }
 
+fn require_unbound_administrative_credential(
+    claims: &crate::brain::credential::BrainCredentialClaims,
+) -> Result<(), Response> {
+    if claims.attachment_id.is_some() || claims.connection_id.is_some() {
+        return Err(brain_auth_error(
+            StatusCode::FORBIDDEN,
+            "attachment-bound credentials cannot administer or delegate Brain authority",
+        ));
+    }
+    Ok(())
+}
+
 async fn issue_named_brain_credential(
     State(server): State<Arc<AgentServer>>,
     restricted: Option<axum::Extension<RestrictedBrainListener>>,
@@ -333,6 +345,7 @@ async fn issue_named_brain_credential(
                 crate::brain::credential::BrainCredentialScope::BrainControl,
             )
             .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
+        require_unbound_administrative_credential(&claims)?;
         Some(claims)
     };
     let ttl_ms = request
@@ -422,6 +435,7 @@ async fn issue_named_brain_invitation(
                 crate::brain::credential::BrainCredentialScope::BrainControl,
             )
             .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
+        require_unbound_administrative_credential(&claims)?;
         Some(claims)
     };
     let ttl_ms = request
@@ -481,6 +495,7 @@ async fn revoke_delegated_named_brain_credential(
         &name,
         crate::brain::credential::BrainCredentialScope::BrainControl,
     )?;
+    require_unbound_administrative_credential(&delegator)?;
     let descendant = server
         .brain_credentials()
         .verify(&request.credential, unix_epoch_millis())
@@ -735,12 +750,13 @@ async fn archive_named_brain(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<ArchiveNamedBrainResponse>, Response> {
-    authorize_named_brain(
+    let claims = authorize_named_brain(
         &server,
         &headers,
         &name,
         crate::brain::credential::BrainCredentialScope::EnvironmentAdmin,
     )?;
+    require_unbound_administrative_credential(&claims)?;
     let execution_lock = server
         .brain_store()
         .execution_lock(&name)
