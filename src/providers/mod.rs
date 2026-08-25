@@ -37,6 +37,7 @@ pub use factory::{
     create_provider_from_teacher, create_providers, create_providers_from_entries,
 };
 pub use fallback_chain::FallbackChain;
+pub use codex_app_server::{CodexAppServerAuth, CodexAppServerProvider};
 pub use teacher_session::{
     ConversationState, OptimizationStats, TeacherContextConfig, TeacherSession,
 };
