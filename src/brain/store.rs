@@ -3819,6 +3819,25 @@ mod tests {
             .to_string()
             .contains("reused with a different command"));
 
+        let changed_revision = store.push_idempotent(
+            "shared",
+            "alice",
+            BrainEventKind::Prompt { text: "once".into() },
+            mutation_receipt(
+                &store, attachment.attachment_id, mutation_id, 99, "sha256:first",
+            ),
+        );
+        assert!(changed_revision.unwrap_err().to_string()
+            .contains("different command or precondition"));
+        let mut changed_environment = mutation_receipt(
+            &store, attachment.attachment_id, mutation_id, 0, "sha256:first",
+        );
+        changed_environment.environment_generation += 1;
+        assert!(store.push_idempotent(
+            "shared", "alice", BrainEventKind::Prompt { text: "once".into() },
+            changed_environment,
+        ).unwrap_err().to_string().contains("different command or precondition"));
+
         let stale = store.push_idempotent(
             "shared",
             "alice",
