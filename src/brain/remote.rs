@@ -278,7 +278,7 @@ pub struct RemoteBrainClient {
     http: Client,
     websocket_connector: Option<tokio_tungstenite::Connector>,
     attachment: Option<BrainAttachment>,
-    session: std::sync::Arc<tokio::sync::Mutex<Option<RemoteBrainSession>>>,
+    connection: std::sync::Arc<tokio::sync::Mutex<Option<RemoteBrainConnection>>>,
 }
 
 #[derive(Clone)]
@@ -303,7 +303,7 @@ struct IssuedBrainCredential {
 }
 
 #[derive(Clone)]
-struct RemoteBrainSession {
+struct RemoteBrainConnection {
     id: uuid::Uuid,
     commands: mpsc::UnboundedSender<RemoteBrainRequest>,
 }
@@ -329,7 +329,7 @@ impl RemoteBrainClient {
                 .build()?,
             websocket_connector: None,
             attachment: None,
-            session: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            connection: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -382,7 +382,7 @@ impl RemoteBrainClient {
             http,
             websocket_connector,
             attachment: None,
-            session: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            connection: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -712,7 +712,7 @@ impl RemoteBrainClient {
         subject: &str,
         role: AttachmentRole,
     ) -> Result<()> {
-        if self.session.lock().await.is_some() {
+        if self.connection.lock().await.is_some() {
             anyhow::bail!(
                 "disconnect the remote Brain event stream before changing control authority"
             );
@@ -779,7 +779,7 @@ impl RemoteBrainClient {
     pub async fn disconnect(&self) -> Result<()> {
         use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
 
-        let temporary_events = if self.session.lock().await.is_none() {
+        let temporary_events = if self.connection.lock().await.is_none() {
             Some(self.watch().await?)
         } else {
             None
@@ -803,7 +803,7 @@ impl RemoteBrainClient {
             .attachment
             .as_ref()
             .context("client is not attached to a Brain")?;
-        if self.session.lock().await.is_some() {
+        if self.connection.lock().await.is_some() {
             anyhow::bail!("remote Brain event stream is already connected");
         }
         let mut request = self.target.ws_url(attachment)?.into_client_request()?;
@@ -821,12 +821,12 @@ impl RemoteBrainClient {
         .context("could not open brain event stream")?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<RemoteBrainRequest>();
-        let session_id = uuid::Uuid::new_v4();
-        *self.session.lock().await = Some(RemoteBrainSession {
-            id: session_id,
+        let connection_id = uuid::Uuid::new_v4();
+        *self.connection.lock().await = Some(RemoteBrainConnection {
+            id: connection_id,
             commands: command_tx,
         });
-        let session = self.session.clone();
+        let connection = self.connection.clone();
         tokio::spawn(async move {
             let mut next_request_id = 1_u64;
             let mut pending = HashMap::<
@@ -911,10 +911,10 @@ impl RemoteBrainClient {
             for (_, response) in pending {
                 let _ = response.send(Err("remote Brain connection closed".into()));
             }
-            let mut active = session.lock().await;
+            let mut active = connection.lock().await;
             if active
                 .as_ref()
-                .is_some_and(|current| current.id == session_id)
+                .is_some_and(|current| current.id == connection_id)
             {
                 *active = None;
             }
@@ -926,14 +926,14 @@ impl RemoteBrainClient {
         &self,
         kind: crate::ipc::brain_codec::BrainRemoteCommandKind,
     ) -> Result<crate::ipc::brain_codec::BrainRemoteReply> {
-        let session = self
-            .session
+        let connection = self
+            .connection
             .lock()
             .await
             .clone()
             .context("remote Brain event stream is not connected")?;
         let (response_tx, response_rx) = oneshot::channel();
-        session
+        connection
             .commands
             .send(RemoteBrainRequest {
                 kind,
