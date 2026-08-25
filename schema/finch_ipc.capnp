@@ -185,6 +185,144 @@ interface BrainTurnControl {
 }
 
 # ---------------------------------------------------------------------------
+# Canonical named-Brain snapshot and event stream
+# ---------------------------------------------------------------------------
+
+struct BrainEnvironment {
+  machine    @0 :Text;
+  workspace  @1 :Text;
+  generation @2 :UInt64;
+}
+
+struct BrainAttachment {
+  attachmentId    @0 :Text;
+  subject         @1 :Text;
+  role            @2 :BrainAttachmentRole;
+  acknowledgedSeq @3 :UInt64;
+  connected       @4 :Bool;
+  hasConnection   @5 :Bool;
+  connectionId    @6 :Text;
+}
+
+struct BrainRunnerLease {
+  leaseId               @0 :Text;
+  subject               @1 :Text;
+  environmentGeneration @2 :UInt64;
+  acquiredMs            @3 :UInt64;
+  expiresMs             @4 :UInt64;
+}
+
+struct BrainProgram {
+  seq      @0 :UInt64;
+  sender   @1 :Text;
+  language @2 :ProgramLanguage;
+  source   @3 :Text;
+}
+
+struct BrainToolCall {
+  requestSeq @0 :UInt64;
+  toolId     @1 :Text;
+  name       @2 :Text;
+  inputJson  @3 :Data;
+}
+
+struct BrainToolResult {
+  requestSeq @0 :UInt64;
+  toolId     @1 :Text;
+  output     @2 :Text;
+  isError    @3 :Bool;
+}
+
+struct BrainApprovalRequested {
+  requestSeq      @0 :UInt64;
+  approvalId      @1 :Text;
+  approvalKind    @2 :Text;
+  subject         @3 :Text;
+  hasAudience     @4 :Bool;
+  audience        @5 :BrainApprovalAudience;
+  detailJson      @6 :Data;
+}
+
+struct BrainApprovalDecided {
+  requestSeq  @0 :UInt64;
+  approvalId  @1 :Text;
+  decisionJson @2 :Data;
+}
+
+struct BrainProgramSubmitted {
+  language @0 :ProgramLanguage;
+  source   @1 :Text;
+}
+
+struct BrainResult {
+  requestSeq @0 :UInt64;
+  output     @1 :Text;
+  hasError   @2 :Bool;
+  error      @3 :Text;
+}
+
+struct BrainRuntimeCommitted {
+  requestSeq       @0 :UInt64;
+  runtimeRevision  @1 :UInt64;
+  checkpointSha256 @2 :Text;
+}
+
+struct BrainClientAttached {
+  attachmentId @0 :Text;
+  connectionId @1 :Text;
+  subject      @2 :Text;
+  role         @3 :BrainAttachmentRole;
+}
+
+struct BrainClientDetached {
+  attachmentId @0 :Text;
+  connectionId @1 :Text;
+}
+
+struct BrainEvent {
+  schemaVersion        @0 :UInt32;
+  brainId              @1 :Text;
+  seq                  @2 :UInt64;
+  environmentGeneration @3 :UInt64;
+  sender               @4 :Text;
+  createdMs            @5 :UInt64;
+  union {
+    runnerLeaseAcquired @6  :BrainRunnerLease;
+    runnerLeaseReleased @7  :Text;
+    clientAttached      @8  :BrainClientAttached;
+    clientDetached      @9  :BrainClientDetached;
+    prompt              @10 :Text;
+    toolCall            @11 :BrainToolCall;
+    toolResult          @12 :BrainToolResult;
+    approvalRequested   @13 :BrainApprovalRequested;
+    approvalDecided     @14 :BrainApprovalDecided;
+    program             @15 :BrainProgramSubmitted;
+    programPopped       @16 :UInt64;
+    result              @17 :BrainResult;
+    runtimeCommitted    @18 :BrainRuntimeCommitted;
+  }
+}
+
+struct BrainSnapshot {
+  brainId         @0 :Text;
+  name            @1 :Text;
+  environment     @2 :BrainEnvironment;
+  revision        @3 :UInt64;
+  events          @4 :List(BrainEvent);
+  programStack    @5 :List(BrainProgram);
+  attachments     @6 :List(BrainAttachment);
+  hasRunnerLease  @7 :Bool;
+  runnerLease     @8 :BrainRunnerLease;
+}
+
+struct BrainWireMessage {
+  union {
+    snapshot @0 :BrainSnapshot;
+    event    @1 :BrainEvent;
+  }
+}
+
+# ---------------------------------------------------------------------------
 # Main daemon interface
 # ---------------------------------------------------------------------------
 
