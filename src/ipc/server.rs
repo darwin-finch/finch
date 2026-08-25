@@ -46,6 +46,37 @@ struct BrainRpcService {
     connection_id: uuid::Uuid,
 }
 
+impl BrainRpcService {
+    fn acquire_connection_runner(
+        &self,
+        brain: &str,
+        subject: &str,
+        environment: &crate::brain::store::BrainEnvironment,
+        lease_id: Option<crate::brain::store::RunnerLeaseId>,
+        ttl_ms: u64,
+    ) -> anyhow::Result<crate::brain::store::BrainRunnerLease> {
+        self.runners
+            .require_connection_identity(self.connection_id, subject)?;
+        let reconnecting_lease = lease_id.is_some();
+        let lease = self
+            .lifecycle
+            .acquire_runner(brain, subject, environment, lease_id, ttl_ms)?;
+        if let Err(error) = self.runners.claim_connection_lease(
+            self.connection_id,
+            brain,
+            lease.lease_id,
+        ) {
+            // Never release a renewed durable lease merely because rebinding
+            // lost a race with another still-live connection.
+            if !reconnecting_lease {
+                let _ = self.lifecycle.release_runner(brain, lease.lease_id);
+            }
+            return Err(error);
+        }
+        Ok(lease)
+    }
+}
+
 /// Reverse per-turn capability used by the leased frontend runner to suspend
 /// on an approval without deciding it locally. The daemon records the request
 /// and resumes it only from the attachment named by `expected_audience`.
@@ -759,22 +790,9 @@ impl brain_service::Server for BrainRpcService {
         } else {
             None
         };
-        if let Err(error) = self
-            .runners
-            .require_connection_identity(self.connection_id, &subject)
-        {
-            return Promise::err(capnp::Error::failed(error.to_string()));
-        }
-        if let Some(lease_id) = lease_id {
-            if let Err(error) = self.runners.require_connection_lease(
-                self.connection_id,
-                &brain,
-                lease_id,
-            ) {
-                return Promise::err(capnp::Error::failed(error.to_string()));
-            }
-        }
-        let lease = match self.lifecycle.acquire_runner(
+        // A reconnect has a new IPC connection ID. The durable subject and
+        // lease are validated before the new connection binds the lease.
+        let lease = match self.acquire_connection_runner(
             &brain,
             &subject,
             &environment,
@@ -784,14 +802,6 @@ impl brain_service::Server for BrainRpcService {
             Ok(lease) => lease,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        if let Err(error) = self.runners.claim_connection_lease(
-            self.connection_id,
-            &brain,
-            lease.lease_id,
-        ) {
-            let _ = self.lifecycle.release_runner(&brain, lease.lease_id);
-            return Promise::err(capnp::Error::failed(error.to_string()));
-        }
         encode_runner_lease(results.get().init_lease(), &lease);
         Promise::ok(())
     }
@@ -1994,7 +2004,7 @@ fn decode_runner_turn_event(
 mod tests {
     use super::{
         decode_runner_program_result, decode_runner_turn_result, execute_typed_forth_ipc,
-        BrainRunnerControlImpl,
+        BrainRpcService, BrainRunnerControlImpl,
     };
     use crate::ipc::brain_codec::encode_approval_audience;
 
@@ -2078,6 +2088,66 @@ mod tests {
         assert_ne!(replacement.lease_id, first.lease_id);
         let error = control.validate_lease().unwrap_err();
         assert!(error.to_string().contains("active lease"));
+    }
+
+    #[tokio::test]
+    async fn disconnected_ipc_connection_rebinds_its_durable_runner_lease() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let store = crate::brain::store::BrainStore::with_root("box.local", Some(root));
+        let runners = crate::server::BrainRunnerBroker::default();
+        let lifecycle = crate::server::BrainLifecycleService::new(
+            store.clone(),
+            runners.clone(),
+            crate::server::BrainApprovalBroker::default(),
+        );
+        lifecycle.create("shared").await.unwrap();
+        let environment = store.environment().clone();
+        let subject = "runner@box.local/frontend-stable";
+
+        let first_connection = uuid::Uuid::new_v4();
+        runners
+            .claim_connection_identity(first_connection, subject)
+            .unwrap();
+        let first = BrainRpcService {
+            lifecycle: lifecycle.clone(),
+            runners: runners.clone(),
+            connection_id: first_connection,
+        };
+        let lease = first
+            .acquire_connection_runner("shared", subject, &environment, None, 60_000)
+            .unwrap();
+        runners.disconnect_connection(first_connection);
+
+        let replacement_connection = uuid::Uuid::new_v4();
+        runners
+            .claim_connection_identity(replacement_connection, subject)
+            .unwrap();
+        let replacement = BrainRpcService {
+            lifecycle,
+            runners: runners.clone(),
+            connection_id: replacement_connection,
+        };
+        let renewed = replacement
+            .acquire_connection_runner(
+                "shared",
+                subject,
+                &environment,
+                Some(lease.lease_id),
+                60_000,
+            )
+            .unwrap();
+        assert_eq!(renewed.lease_id, lease.lease_id);
+
+        let (callback_tx, _callback_rx) = tokio::sync::mpsc::unbounded_channel();
+        runners
+            .register_for_connection(
+                replacement_connection,
+                "shared",
+                renewed.lease_id,
+                callback_tx,
+            )
+            .unwrap();
+        assert!(runners.has_registration("shared", renewed.lease_id));
     }
 
     #[test]
@@ -2353,8 +2423,13 @@ async fn handle_connection(stream: tokio::net::UnixStream, server: Arc<AgentServ
     let result = RpcSystem::new(Box::new(network), Some(daemon_client.client))
         .await
         .map_err(anyhow::Error::from);
-    server
+    let attachments = server
         .brain_runners()
         .disconnect_connection(connection_id);
+    for (brain, attachment_id, attachment_connection_id) in attachments {
+        let _ = server
+            .brain_store()
+            .detach(&brain, attachment_id, attachment_connection_id);
+    }
     result
 }

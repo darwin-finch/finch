@@ -317,6 +317,12 @@ pub struct EventLoop {
     /// periodic, so identical transport failures must not spam scrollback.
     last_home_runner_error: Option<String>,
 
+    /// Generation of the authoritative home event watch.
+    home_watch_epoch: u64,
+
+    /// Last event-watch failure shown, tracked separately from runner health.
+    last_home_watch_error: Option<String>,
+
     /// Base URL of the local daemon (e.g. "http://127.0.0.1:8000").
     /// Used by the cross-machine relay poller.
     daemon_base_url: Option<String>,
@@ -1305,6 +1311,8 @@ impl EventLoop {
             runner_brain: None,
             runner_renewal_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_home_runner_error: None,
+            home_watch_epoch: 0,
+            last_home_watch_error: None,
             daemon_base_url,
             llm_tx,
             llm_rx: Some(llm_rx),
@@ -1389,10 +1397,13 @@ impl EventLoop {
         }
         if self.daemon_base_url.is_some() {
             if let Err(error) = self.attach_home_brain().await {
+                let detail = error.to_string();
+                self.last_home_watch_error = Some(detail.clone());
                 self.output_manager.write_info(format!(
-                    "{}: home Brain event stream unavailable: {}",
-                    self.session_label, error
+                    "{}: home event watch unavailable: {}; reconnecting independently of the runner callback",
+                    self.session_label, detail
                 ));
+                self.schedule_home_brain_reconnect(self.home_watch_epoch, 0);
             }
         }
         // ─────────────────────────────────────────────────────────────────────
@@ -1579,6 +1590,9 @@ impl EventLoop {
                         ReplEvent::RemoteBrainMessage { .. } => "RemoteBrainMessage",
                         ReplEvent::RemoteBrainError { .. } => "RemoteBrainError",
                         ReplEvent::RemoteBrainDisconnected { .. } => "RemoteBrainDisconnected",
+                        ReplEvent::HomeBrainMessage { .. } => "HomeBrainMessage",
+                        ReplEvent::HomeBrainWatchFailed { .. } => "HomeBrainWatchFailed",
+                        ReplEvent::ReconnectHomeBrain { .. } => "ReconnectHomeBrain",
                         ReplEvent::RunnerLeaseStatus { .. } => "RunnerLeaseStatus",
                         ReplEvent::NamedBrainProgramRequested(_) => "NamedBrainProgramRequested",
                         ReplEvent::NamedBrainTurnRequested(_) => "NamedBrainTurnRequested",
@@ -3658,6 +3672,84 @@ Rules:\n\
                         "{target}: Brain event connection closed; detach or reattach to reconnect"
                     ));
                     self.render_tui().await?;
+                }
+            }
+            ReplEvent::HomeBrainMessage { epoch, message } => {
+                if epoch != self.home_watch_epoch {
+                    return Ok(());
+                }
+                let acknowledged_seq = match &message {
+                    crate::brain::store::BrainWireMessage::Snapshot { brain } => brain.revision,
+                    crate::brain::store::BrainWireMessage::Event { event } => event.seq,
+                };
+                if self.active_remote_brain.is_none() {
+                    self.render_remote_brain_message(message).await?;
+                }
+                if let Some(client) = self.home_brain.as_mut() {
+                    if let Err(error) = client.acknowledge(acknowledged_seq).await {
+                        let detail = format!("home cursor acknowledgement failed: {error}");
+                        if self.last_home_watch_error.as_deref() != Some(&detail) {
+                            self.output_manager.write_info(detail.clone());
+                        }
+                        self.last_home_watch_error = Some(detail);
+                    }
+                }
+            }
+            ReplEvent::HomeBrainWatchFailed { epoch, error } => {
+                if epoch != self.home_watch_epoch {
+                    return Ok(());
+                }
+                self.home_brain = None;
+                let detail = error.unwrap_or_else(|| "connection closed".into());
+                if self.last_home_watch_error.as_deref() != Some(&detail) {
+                    self.output_manager.write_info(format!(
+                        "{}: home event watch unavailable: {}; reconnecting (runner callback is {})",
+                        self.session_label,
+                        detail,
+                        if self.home_runner_lease_active { "still registered" } else { "offline" },
+                    ));
+                }
+                self.last_home_watch_error = Some(detail);
+                if self.active_remote_brain.is_none() {
+                    self.status_bar.update_line(
+                        crate::cli::status_bar::StatusLineType::SessionLabel,
+                        format!(
+                            "◆ {} · {} · event watch reconnecting",
+                            self.session_label,
+                            if self.home_runner_lease_active { "runner" } else { "runner offline" },
+                        ),
+                    );
+                    self.render_tui().await?;
+                }
+                self.schedule_home_brain_reconnect(epoch, 0);
+            }
+            ReplEvent::ReconnectHomeBrain { epoch, attempt } => {
+                if epoch != self.home_watch_epoch || self.home_brain.is_some() {
+                    return Ok(());
+                }
+                match self.reconnect_home_brain().await {
+                    Ok(()) => {
+                        self.output_manager.write_info(format!(
+                            "{}: home event watch reconnected; runner callback {}",
+                            self.session_label,
+                            if self.home_runner_lease_active { "registered" } else { "still retrying" },
+                        ));
+                        self.render_tui().await?;
+                    }
+                    Err(error) => {
+                        let detail = error.to_string();
+                        if self.last_home_watch_error.as_deref() != Some(&detail) {
+                            self.output_manager.write_info(format!(
+                                "{}: home reconnect attempt failed: {}",
+                                self.session_label, detail
+                            ));
+                        }
+                        self.last_home_watch_error = Some(detail);
+                        self.schedule_home_brain_reconnect(
+                            self.home_watch_epoch,
+                            attempt.saturating_add(1),
+                        );
+                    }
                 }
             }
             ReplEvent::RunnerLeaseStatus {

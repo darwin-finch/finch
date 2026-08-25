@@ -188,6 +188,22 @@ pub enum ReplEvent {
     RemoteBrainDisconnected {
         target: String,
     },
+    /// Snapshot or event from the durable home attachment. The epoch keeps a
+    /// superseded receiver from invalidating its replacement.
+    HomeBrainMessage {
+        epoch: u64,
+        message: crate::brain::store::BrainWireMessage,
+    },
+    /// The home event watch ended independently of runner callback health.
+    HomeBrainWatchFailed {
+        epoch: u64,
+        error: Option<String>,
+    },
+    /// Retry local IPC, durable attachment, and runner callback binding.
+    ReconnectHomeBrain {
+        epoch: u64,
+        attempt: u32,
+    },
     /// The expiring lease served by this frontend was renewed, lost, or
     /// reacquired. A renewed lease is not considered active until the event
     /// loop has also registered its Cap'n Proto runner callback. `epoch`

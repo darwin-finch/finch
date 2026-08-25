@@ -50,7 +50,18 @@ pub struct BrainSubmissionResult {
 pub struct IpcClient {
     client: finch_daemon::Client,
     // Keeps the RPC system alive for the lifetime of this client.
-    _rpc_handle: std::rc::Rc<tokio::task::JoinHandle<()>>,
+    _rpc_handle: std::rc::Rc<RpcTask>,
+}
+
+struct RpcTask(tokio::task::JoinHandle<()>);
+
+impl Drop for RpcTask {
+    fn drop(&mut self) {
+        // Dropping JoinHandle detaches rather than cancels. Abort when the
+        // final IpcClient clone disappears so the daemon observes connection
+        // loss and releases connection-scoped identities/callbacks promptly.
+        self.0.abort();
+    }
 }
 
 impl IpcClient {
@@ -78,7 +89,7 @@ impl IpcClient {
 
         let client = Self {
             client,
-            _rpc_handle: std::rc::Rc::new(handle),
+            _rpc_handle: std::rc::Rc::new(RpcTask(handle)),
         };
         client.verify_protocol_compatibility().await?;
         Ok(client)
@@ -1625,6 +1636,141 @@ mod tests {
             let version = client.ping().await.expect("ping failed");
             assert!(!version.is_empty(), "version string should be non-empty");
             println!("IPC ping OK — daemon version: {}", version);
+        }));
+    }
+
+    /// A newly spawned daemon from the current binary must establish both its
+    /// event watch and reverse runner callback without a manual restart.
+    #[test]
+    #[ignore]
+    fn test_fresh_daemon_brain_bootstrap_reaches_live_runner() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(async {
+            let client = IpcClient::connect()
+                .await
+                .expect("IPC connect — start the rebuilt Finch daemon first");
+            let brain = format!("bootstrap-smoke-{}", uuid::Uuid::new_v4().simple());
+            let snapshot = client.brain_snapshot(&brain).await.unwrap();
+            let subject = format!("smoke@localhost/frontend-{}", uuid::Uuid::new_v4());
+            client.brain_claim_runner_identity(&subject).await.unwrap();
+            let lease = client
+                .brain_acquire_runner(
+                    &brain,
+                    &subject,
+                    &snapshot.environment,
+                    None,
+                    30_000,
+                )
+                .await
+                .unwrap();
+            let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let _bootstrap = client
+                .register_brain_runner(&brain, lease.lease_id, event_tx)
+                .await
+                .expect("fresh daemon must accept the current runner callback schema");
+
+            let attachment = client
+                .brain_attach(
+                    &brain,
+                    "smoke@localhost",
+                    crate::brain::store::AttachmentRole::Driver,
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut events = client.brain_watch(&brain, &attachment).await.unwrap();
+            let initial = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .expect("fresh daemon event watch timed out")
+                .expect("fresh daemon event watch closed")
+                .expect("fresh daemon event watch failed");
+            let crate::brain::store::BrainWireMessage::Snapshot { brain: watched } = initial else {
+                panic!("fresh daemon watch did not start with a snapshot");
+            };
+            assert_eq!(watched.brain_id, snapshot.brain_id);
+            assert_eq!(
+                watched.runner_lease.as_ref().map(|runner| runner.lease_id),
+                Some(lease.lease_id)
+            );
+
+            let attachment = client
+                .brain_acknowledge(&brain, &attachment, watched.revision)
+                .await
+                .unwrap();
+            let attachment_id = attachment.attachment_id;
+            drop(events);
+            drop(_bootstrap);
+            drop(client);
+
+            let replacement = IpcClient::connect().await.unwrap();
+            replacement
+                .brain_claim_runner_identity(&subject)
+                .await
+                .expect("replacement IPC connection did not reclaim runner identity");
+            let renewed = replacement
+                .brain_acquire_runner(
+                    &brain,
+                    &subject,
+                    &snapshot.environment,
+                    Some(lease.lease_id),
+                    30_000,
+                )
+                .await
+                .expect("replacement IPC connection did not renew durable runner lease");
+            let (replacement_tx, _replacement_rx) = tokio::sync::mpsc::unbounded_channel();
+            let _replacement_bootstrap = replacement
+                .register_brain_runner(&brain, renewed.lease_id, replacement_tx)
+                .await
+                .expect("replacement IPC connection did not restore runner callback");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            let attachment = loop {
+                match replacement
+                    .brain_attach(
+                        &brain,
+                        "smoke@localhost",
+                        crate::brain::store::AttachmentRole::Driver,
+                        Some(attachment_id),
+                    )
+                    .await
+                {
+                    Ok(attachment) => break attachment,
+                    Err(error)
+                        if error
+                            .to_string()
+                            .contains("already has a live or pending connection")
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    Err(error) => panic!(
+                        "replacement IPC connection did not restore durable attachment: {error}"
+                    ),
+                }
+            };
+            let mut events = replacement.brain_watch(&brain, &attachment).await.unwrap();
+            let resumed = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .expect("replacement event watch timed out")
+                .expect("replacement event watch closed")
+                .expect("replacement event watch failed");
+            let crate::brain::store::BrainWireMessage::Snapshot { brain: resumed } = resumed else {
+                panic!("replacement watch did not start with a snapshot");
+            };
+            assert_eq!(resumed.brain_id, snapshot.brain_id);
+            assert!(
+                attachment.acknowledged_seq >= watched.revision,
+                "durable attachment cursor moved backward"
+            );
+
+            replacement.brain_detach(&brain, &attachment).await.unwrap();
+            replacement
+                .brain_release_runner(&brain, renewed.lease_id)
+                .await
+                .unwrap();
         }));
     }
 

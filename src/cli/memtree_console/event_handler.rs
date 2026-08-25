@@ -98,6 +98,9 @@ impl EventHandler {
             ReplEvent::RemoteBrainMessage { .. } => {}
             ReplEvent::RemoteBrainError { .. }
             | ReplEvent::RemoteBrainDisconnected { .. }
+            | ReplEvent::HomeBrainMessage { .. }
+            | ReplEvent::HomeBrainWatchFailed { .. }
+            | ReplEvent::ReconnectHomeBrain { .. }
             | ReplEvent::RunnerLeaseStatus { .. }
             | ReplEvent::NamedBrainProgramRequested(_)
             | ReplEvent::NamedBrainTurnRequested(_)
