@@ -756,7 +756,9 @@ still blocks the corresponding Brain phase until it is unified.
   `runner`, `driver`, `consultant`, or `observer`; remote attachment creation cannot mint runners;
   roles constrain submission; and the status/list projections report the authoritative role and
   live runner. The exclusive runner lease expires, renews without event-log heartbeat spam, is
-  bound to an exact environment generation, and emits a durable release on expiry.
+  bound to an exact environment generation, and emits a durable release on expiry or graceful
+  frontend shutdown. `/quit` follows the ordinary cleanup path, detaches both home/selected
+  participants, and removes an otherwise-unused provisional Brain.
 - [x] Dispatch named-Brain ProgramRuns to the leased environment frontend instead of executing
   them in the daemon. The frontend registers a lease-bound Cap'n Proto callback, re-registers it on
   every renewal, hydrates newer durable reducible VM state without importing daemon authority, and

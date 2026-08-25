@@ -295,6 +295,7 @@ pub struct EventLoop {
     /// Whether this frontend currently holds the daemon-issued lease for its
     /// home Brain. The UI never infers runner status from local process role.
     home_runner_lease_active: bool,
+    home_runner_lease_id: Option<crate::brain::shared::RunnerLeaseId>,
 
     /// Last runner-registration failure shown to the user. Lease renewal is
     /// periodic, so identical transport failures must not spam scrollback.
@@ -955,6 +956,7 @@ impl EventLoop {
             active_remote_brain: None,
             home_brain: None,
             home_runner_lease_active: false,
+            home_runner_lease_id: None,
             last_home_runner_error: None,
             daemon_base_url,
             llm_tx,
@@ -995,7 +997,11 @@ impl EventLoop {
                 None
             }
         };
-        self.home_runner_lease_active = matches!(home_runner_state, Some(Ok(())));
+        self.home_runner_lease_id = home_runner_state
+            .as_ref()
+            .and_then(|state| state.as_ref().ok())
+            .copied();
+        self.home_runner_lease_active = self.home_runner_lease_id.is_some();
         let home_runner_error = home_runner_state
             .as_ref()
             .and_then(|state| state.as_ref().err())
@@ -1004,7 +1010,7 @@ impl EventLoop {
         self.status_bar.update_line(
             crate::cli::status_bar::StatusLineType::SessionLabel,
             match &home_runner_state {
-                Some(Ok(())) => format!("◆ brain: {} · runner", self.session_label),
+                Some(Ok(_)) => format!("◆ brain: {} · runner", self.session_label),
                 Some(Err(_)) => {
                     format!("◆ brain: {} · home · no runner lease", self.session_label)
                 }
@@ -1501,6 +1507,10 @@ impl EventLoop {
             }
         }
 
+        // Release durable Brain presence before the TUI shuts down. `/quit`
+        // reaches this path rather than bypassing cleanup with process::exit.
+        self.release_home_brain_presence().await;
+
         // Save persistent state before the TUI shuts down and the terminal goes read-only.
         {
             let mut executor = self.tool_coordinator.tool_executor().lock().await;
@@ -1542,16 +1552,10 @@ impl EventLoop {
             if let Some(command) = Command::parse(&input) {
                 match command {
                     Command::Quit => {
-                        // Restore terminal before exiting — disable raw mode, show cursor.
-                        // Use try_lock to avoid deadlock if the TUI lock is held elsewhere.
-                        if let Ok(mut tui) = self.tui_renderer.try_lock() {
-                            let _ = tui.shutdown();
-                        } else {
-                            // Lock is held; `process::exit` skips Drop, so restore
-                            // bracketed paste and keyboard enhancement flags too.
-                            crate::cli::tui::emergency_restore_terminal();
-                        }
-                        std::process::exit(0);
+                        self.event_tx
+                            .send(ReplEvent::Shutdown)
+                            .context("Failed to send shutdown event")?;
+                        return Ok(());
                     }
                     Command::Help => {
                         let help_text = format_help();
@@ -3139,6 +3143,7 @@ Rules:\n\
                 };
                 let active = registration.is_ok();
                 self.home_runner_lease_active = active;
+                self.home_runner_lease_id = if active { lease_id } else { None };
                 let registration_error = registration.err();
                 if self.active_remote_brain.is_none() {
                     if self.home_brain.is_some() {

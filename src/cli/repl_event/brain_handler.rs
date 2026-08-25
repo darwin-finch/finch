@@ -183,7 +183,9 @@ impl EventLoop {
     /// Register the frontend's home namespace and maintain its expiring
     /// environment-runner lease. A failed renewal immediately removes the
     /// runner claim from the status bar; retry never reuses an expired ID.
-    async fn register_home_brain(&self) -> Result<Option<std::result::Result<(), String>>> {
+    async fn register_home_brain(
+        &self,
+    ) -> Result<Option<std::result::Result<crate::brain::shared::RunnerLeaseId, String>>> {
         let Some(base) = self.daemon_base_url.as_deref() else {
             return Ok(None);
         };
@@ -219,7 +221,7 @@ impl EventLoop {
                         bootstrap.runtime_revision,
                     )
                     .await
-                    .map(|_| ())
+                    .map(|_| lease.lease_id)
                     .map_err(|error| error.to_string()),
                 Err(error) => Err(error.to_string()),
             },
@@ -339,6 +341,56 @@ impl EventLoop {
             });
         });
         Ok(())
+    }
+
+    /// Best-effort graceful teardown for the durable presence this frontend
+    /// established at startup. The daemon still expires crashed runners, but
+    /// an ordinary `/quit` must make callback availability exact immediately.
+    async fn release_home_brain_presence(&mut self) {
+        if let (Some(base), Some(lease_id)) = (
+            self.daemon_base_url.as_deref(),
+            self.home_runner_lease_id.take(),
+        ) {
+            let request = reqwest::Client::new()
+                .delete(format!(
+                    "{base}/v1/brains/named/{}/runner-lease/{}",
+                    self.session_label, lease_id.0
+                ))
+                .send();
+            match tokio::time::timeout(std::time::Duration::from_secs(2), request).await {
+                Ok(Ok(response)) if response.status().is_success() => {}
+                Ok(Ok(response)) => tracing::warn!(
+                    "home Brain runner release returned {}",
+                    response.status()
+                ),
+                Ok(Err(error)) => tracing::warn!("home Brain runner release failed: {error}"),
+                Err(_) => tracing::warn!("home Brain runner release timed out"),
+            }
+        }
+        self.home_runner_lease_active = false;
+
+        if let Some(client) = self.active_remote_brain.take() {
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.disconnect(),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("remote Brain detach timed out during shutdown");
+            }
+        }
+        if let Some(client) = self.home_brain.take() {
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.disconnect(),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("home Brain detach timed out during shutdown");
+            }
+        }
     }
 
     /// Handle `/brains` — list the daemon's authoritative named Brains.
