@@ -1099,8 +1099,12 @@ still blocks the corresponding Brain phase until it is unified.
   triggers projection only after the canonical Program, checkpoint, Result, and completed-run state
   are durable, using a typed callback to the exact leased frontend so there is still only one
   MemTree writer. Runner registration replays completed prompt runs from the Brain log; deterministic
-  Brain/run/role identities make reconnect/restart recovery idempotent. Still add stable
-  recall-source inspection.
+  Brain/run/role identities make reconnect/restart recovery idempotent. Semantic search now returns
+  a stable memory ID plus source metadata, and `inspect_memory` resolves that ID to the complete
+  canonical turn. The source mapping and tree update commit together; an injected persistence
+  failure regression proves the in-memory tree is restored before retry. Historical unattributed
+  leaves remain honestly addressable as `node:<id>` without invented provenance. This item remains
+  open for the always-applied policy channel and full provider-path independence.
 - [ ] Make OpenAI tool-call behavior respect control ownership: a participant client must not
   accidentally execute workspace tools on its own machine.
 
