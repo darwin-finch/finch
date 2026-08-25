@@ -11,7 +11,6 @@ pub mod outcome;
 pub mod scheduler;
 
 use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramValue};
-use crate::scheduling::{ScheduledTask, TaskQueue, TaskScheduler, TaskStatus};
 use crate::vm::{
     ApprovalChoice, ApprovalPrompt, AuthorizationContext, AuthorizationDecision,
     CapabilityAvailability, CapabilityKind, CapabilityLedger, CapabilityPolicy, CapabilityRequest,
@@ -179,45 +178,6 @@ pub struct ProgramSubmission {
     pub budget: Option<ExecutionBudget>,
 }
 
-/// Versioned authority snapshot persisted with a typed scheduled callback.
-///
-/// A schedule is an instruction to run a known program later, not a blank
-/// cheque against whatever approvals happen to exist when the clock fires.
-/// The snapshot is deliberately a ceiling: the callback can use only grants
-/// that existed at schedule creation.  It is separate from a future durable
-/// approval/revocation record, which will additionally be able to narrow or
-/// invalidate this ceiling before delivery.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ScheduledVmContext {
-    version: u8,
-    grants: EffectSet,
-}
-
-const SCHEDULED_VM_CONTEXT_VERSION: u8 = 1;
-
-fn scheduled_vm_context(grants: EffectSet) -> Result<String> {
-    serde_json::to_string(&ScheduledVmContext {
-        version: SCHEDULED_VM_CONTEXT_VERSION,
-        grants,
-    })
-    .map_err(Into::into)
-}
-
-fn scheduled_vm_grants(context: &str) -> Result<EffectSet> {
-    let context: ScheduledVmContext = serde_json::from_str(context).map_err(|error| {
-        anyhow::anyhow!(
-            "scheduled callback has no valid Finch authority snapshot; reschedule it: {error}"
-        )
-    })?;
-    if context.version != SCHEDULED_VM_CONTEXT_VERSION {
-        bail!(
-            "scheduled callback has unsupported Finch authority snapshot version {}; reschedule it",
-            context.version
-        );
-    }
-    Ok(context.grants)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmStackCell {
     pub index_from_bottom: usize,
@@ -378,7 +338,6 @@ pub struct ProgramRuntime {
     capability_ledger: Arc<Mutex<CapabilityLedger>>,
     capability_policy: Arc<RwLock<CapabilityPolicy>>,
     authority_sink: Arc<RwLock<Option<ProgramRuntimeAuthoritySink>>>,
-    schedule_queue: RwLock<Option<Arc<TaskQueue>>>,
     agent_scheduler: RwLock<Weak<scheduler::AgentScheduler>>,
     /// Daemon-owned typed continuations keyed by the execution id visible in
     /// the UI. Approval and resumption use this exact verified program state.
@@ -645,7 +604,6 @@ impl ProgramRuntime {
             capability_ledger: Arc::new(Mutex::new(CapabilityLedger::default())),
             capability_policy: Arc::new(RwLock::new(default_capability_policy())),
             authority_sink: Arc::new(RwLock::new(None)),
-            schedule_queue: RwLock::new(None),
             agent_scheduler: RwLock::new(Weak::new()),
             pending_typed: Mutex::new(HashMap::new()),
             revision_history: Mutex::new(vec![VmRevisionSnapshot {
@@ -722,15 +680,12 @@ impl ProgramRuntime {
                     reason: "memory binding lock poisoned".into(),
                 },
             },
+            // Scheduling is owned by the daemon/Brain host. A bare runtime
+            // has no second local queue; portable and named-Brain adapters
+            // explicitly defer these effects to their owning host.
             CapabilityKind::ScheduleCreate
             | CapabilityKind::ScheduleRead
-            | CapabilityKind::ScheduleManage => match self.schedule_queue.read() {
-                Ok(queue) if queue.is_some() => CapabilityAvailability::Available,
-                Ok(_) => CapabilityAvailability::Disabled,
-                Err(_) => CapabilityAvailability::Degraded {
-                    reason: "schedule queue binding lock poisoned".into(),
-                },
-            },
+            | CapabilityKind::ScheduleManage => CapabilityAvailability::Disabled,
             CapabilityKind::NetworkConnect
             | CapabilityKind::ProcessRun
             | CapabilityKind::ProgramInvoke => CapabilityAvailability::Available,
@@ -875,92 +830,6 @@ impl ProgramRuntime {
     /// second memory database or an ambient memory authority.
     pub fn attach_memory(&self, memory: Arc<crate::memory::MemorySystem>) {
         *self.memory.write().expect("memory binding lock poisoned") = Some(memory);
-    }
-
-    pub fn attach_schedule_queue(&self, queue: Arc<TaskQueue>) {
-        *self
-            .schedule_queue
-            .write()
-            .expect("schedule queue lock poisoned") = Some(queue);
-    }
-
-    /// Construct the durable scheduler with this runtime's typed callback
-    /// executor. Keeping construction here prevents callers from accidentally
-    /// falling back to an unbound scheduler that cannot execute callbacks.
-    pub fn task_scheduler(self: &Arc<Self>) -> Option<TaskScheduler> {
-        let queue = self
-            .schedule_queue
-            .read()
-            .expect("schedule queue lock poisoned")
-            .clone()?;
-        Some(TaskScheduler::with_executor(
-            queue,
-            Arc::clone(self).scheduled_executor(),
-        ))
-    }
-
-    /// Build the executor used by the durable scheduler. Each callback gets a
-    /// fresh submission context and never inherits an approval decision from
-    /// the scheduling call.
-    pub fn scheduled_executor(
-        self: Arc<Self>,
-    ) -> Arc<
-        dyn Fn(ScheduledTask) -> futures::future::BoxFuture<'static, Result<String>> + Send + Sync,
-    > {
-        Arc::new(move |task| {
-            let runtime = Arc::clone(&self);
-            Box::pin(async move {
-                let grant_ceiling = scheduled_vm_grants(&task.context)?;
-                let language = ProgramLanguage::infer_source(&task.task);
-                let mut outcome = runtime
-                    .submit_typed_only_with_grant_ceiling(ProgramSubmission {
-                        language,
-                        source_id: Some(format!("scheduled-callback.{}", language.as_str())),
-                        source: task.task,
-                        intent: "scheduled callback".into(),
-                        effect: ExecutionEffect::VmRead,
-                        declared_capabilities: Vec::new(),
-                        manifest_generation: runtime.manifest_generation(),
-                        expected_revision: None,
-                        budget: None,
-                    }, grant_ceiling)
-                    .await?;
-                // A unit-valued yield is a local scheduling boundary, so a
-                // callback can cooperatively slice CPU work without becoming
-                // a permanently parked task. Any other suspension needs the
-                // future daemon approval/I/O/message lifecycle; do not leave
-                // an invisible continuation behind while TaskScheduler
-                // retries the source text.
-                while outcome.status == ExecutionStatus::Suspended
-                    && matches!(
-                        runtime.pending_typed_execution(outcome.execution_id)?,
-                        Some(PendingTypedExecutionInfo {
-                            reason: PendingTypedReason::Yielded,
-                            yielded_value: Some(ProgramValue::Nil),
-                            ..
-                        })
-                    )
-                {
-                    tokio::task::yield_now().await;
-                    outcome = runtime.resume_typed_execution(outcome.execution_id).await?;
-                }
-                if !matches!(outcome.status, ExecutionStatus::Completed) {
-                    let pending = runtime
-                        .cancel_typed_execution_with_outcome(outcome.execution_id)?;
-                    let diagnostic = pending
-                        .as_ref()
-                        .and_then(|cancelled| cancelled.diagnostics.first())
-                        .cloned()
-                        .or_else(|| outcome.diagnostics.first().cloned())
-                        .unwrap_or_else(|| format!("scheduled callback ended as {:?}", outcome.status));
-                    anyhow::bail!(
-                        "scheduled callback did not complete: {:?}: {diagnostic}",
-                        outcome.status
-                    );
-                }
-                Ok(outcome.output)
-            })
-        })
     }
 
     /// Grant a typed capability after an approval decision. A saved typed
@@ -3082,11 +2951,6 @@ impl ProgramRuntime {
         let network = Arc::clone(&self.network);
         let output_handles = Arc::clone(&self.output_handles);
         let streams = Arc::clone(&self.streams);
-        let schedule_queue = self
-            .schedule_queue
-            .read()
-            .expect("schedule queue lock poisoned")
-            .clone();
         let scheduler = self
             .agent_scheduler
             .read()
@@ -3134,7 +2998,6 @@ impl ProgramRuntime {
                         authorization,
                         grants,
                         typed_effect_sink,
-                        schedule_queue,
                         deferred_host_effects,
                     );
                     let execution = runtime.execute_with_handler(
@@ -3187,11 +3050,6 @@ impl ProgramRuntime {
         let streams = Arc::clone(&self.streams);
         let typed_effect_sink = pending.effect_sink.clone();
         let deferred_host_effects = pending.deferred_host_effects;
-        let schedule_queue = self
-            .schedule_queue
-            .read()
-            .expect("schedule queue lock poisoned")
-            .clone();
         let scheduler = self
             .agent_scheduler
             .read()
@@ -3235,7 +3093,6 @@ impl ProgramRuntime {
                         authorization,
                         grants,
                         typed_effect_sink,
-                        schedule_queue,
                         deferred_host_effects,
                     );
                     let execution = match external_effect_result {
@@ -3274,7 +3131,6 @@ struct TypedHostHandler {
     authorization: HostAuthorizationAudit,
     network_grants: EffectSet,
     typed_effect_sink: Option<TypedEffectSink>,
-    schedule_queue: Option<Arc<TaskQueue>>,
     deferred_host_effects: DeferredHostEffects,
 }
 
@@ -3304,7 +3160,6 @@ impl TypedHostHandler {
         authorization: HostAuthorizationAudit,
         network_grants: EffectSet,
         typed_effect_sink: Option<TypedEffectSink>,
-        schedule_queue: Option<Arc<TaskQueue>>,
         deferred_host_effects: DeferredHostEffects,
     ) -> Self {
         Self {
@@ -3325,7 +3180,6 @@ impl TypedHostHandler {
             authorization,
             network_grants,
             typed_effect_sink,
-            schedule_queue,
             deferred_host_effects,
         }
     }
@@ -4764,92 +4618,6 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 response.truncate(size);
                 return Ok(vec![TypedValue::Bytes(response)]);
-            }
-            crate::vm::CapabilityKind::ScheduleRead
-            | crate::vm::CapabilityKind::ScheduleManage => {
-                let [TypedValue::Resource { kind, handle, .. }] = arguments.as_slice() else {
-                    return Err(host_binding_error(
-                        origin,
-                        "schedule operation requires one schedule resource",
-                    ));
-                };
-                if kind != "schedule" {
-                    return Err(host_binding_error(origin, "resource is not a schedule"));
-                }
-                let task_id = handle.parse::<i64>().map_err(|_| {
-                    host_binding_error(origin, "schedule resource has an invalid host handle")
-                })?;
-                let Some(queue) = self.schedule_queue.clone() else {
-                    return Err(host_binding_error(origin, "schedule queue is unavailable"));
-                };
-                if requirement.capability == crate::vm::CapabilityKind::ScheduleRead {
-                    let task = block_on_host(async move { queue.get_task(task_id).await })
-                        .map_err(|error| host_binding_error(origin, error.to_string()))?;
-                    let value = task.map(|task| {
-                        serde_json::json!({
-                            "id": task.id,
-                            "scheduled_time": task.scheduled_time,
-                            "task": task.task,
-                            "recurring": task.recurring,
-                            "status": task.status,
-                            "created_at": task.created_at,
-                            "last_run": task.last_run,
-                            "retries": task.retries,
-                        })
-                    });
-                    return Ok(vec![TypedValue::Option {
-                        inner_type: Type::Json,
-                        value: value.map(|value| Box::new(TypedValue::Json(value))),
-                    }]);
-                }
-                let cancelled = block_on_host(async move { queue.cancel(task_id).await })
-                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
-                return Ok(vec![TypedValue::Bool(cancelled)]);
-            }
-            crate::vm::CapabilityKind::ScheduleCreate => {
-                let [TypedValue::String(callback), TypedValue::Int(timestamp)] =
-                    arguments.as_slice()
-                else {
-                    return Err(host_binding_error(
-                        origin,
-                        "schedule-create requires a callback and Unix timestamp",
-                    ));
-                };
-                let Some(queue) = self.schedule_queue.clone() else {
-                    return Err(host_binding_error(origin, "schedule queue is unavailable"));
-                };
-                let callback = callback.clone();
-                // Snapshot the run's effective grants at the moment it
-                // schedules work. This is a capability ceiling, not an
-                // approval token; the future executor must not consult later
-                // global grants as a way to expand the callback's authority.
-                let context = scheduled_vm_context(self.network_grants.clone())
-                    .map_err(|error| host_binding_error(origin, error.to_string()))?;
-                let timestamp = *timestamp;
-                let scheduled_time = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
-                    .ok_or_else(|| host_binding_error(origin, "invalid schedule timestamp"))?;
-                let id = block_on_host(async move {
-                    queue
-                        .enqueue(ScheduledTask {
-                            id: None,
-                            scheduled_time,
-                            task: callback.clone(),
-                            context,
-                            recurring: None,
-                            status: TaskStatus::Pending,
-                            created_at: chrono::Utc::now(),
-                            last_run: None,
-                            retries: 0,
-                        })
-                        .await
-                        .map(|id| id.to_string())
-                })
-                .map_err(|error| host_binding_error(origin, error.to_string()))?;
-                return Ok(vec![TypedValue::Resource {
-                    kind: "schedule".into(),
-                    handle: id,
-                    generation: 0,
-                }]);
             }
             _ => {
                 return Err(host_binding_error(
@@ -9451,225 +9219,6 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
     }
 
     #[tokio::test]
-    async fn typed_schedule_create_persists_callback() {
-        let database = tempfile::NamedTempFile::new().unwrap();
-        let queue = Arc::new(TaskQueue::new(database.path().to_path_buf()).unwrap());
-        let runtime = ProgramRuntime::new();
-        runtime.attach_schedule_queue(Arc::clone(&queue));
-        runtime
-            .grant_typed_capability(crate::vm::CapabilityRequirement {
-                capability: crate::vm::CapabilityKind::ScheduleCreate,
-                selector: crate::vm::ResourceSelector::Schedule { policy: None },
-            })
-            .unwrap();
-        let timestamp = chrono::Utc::now().timestamp();
-        let outcome = runtime
-            .submit(submission(
-                ProgramLanguage::Lisp,
-                &format!("(schedule-create \"check\" {timestamp})"),
-                ExecutionEffect::VmWrite,
-            ))
-            .await
-            .unwrap();
-        assert!(matches!(
-            outcome.values.first(),
-            Some(ProgramValue::Resource { kind, .. }) if kind == "schedule"
-        ));
-        let tasks = queue.get_ready_tasks().await.unwrap();
-        assert_eq!(tasks.len(), 1);
-        let grants = scheduled_vm_grants(&tasks[0].context).unwrap();
-        assert!(grants.grants(&EffectSet::from_requirement(
-            crate::vm::CapabilityRequirement {
-                capability: crate::vm::CapabilityKind::ScheduleCreate,
-                selector: crate::vm::ResourceSelector::Schedule { policy: None },
-            },
-        )));
-        assert!(grants.grants(&EffectSet::from_requirement(
-            crate::vm::CapabilityRequirement {
-                capability: crate::vm::CapabilityKind::SessionEmit,
-                selector: crate::vm::ResourceSelector::None,
-            },
-        )));
-    }
-
-    #[tokio::test]
-    async fn typed_schedule_handle_can_be_inspected_and_cancelled() {
-        let database = tempfile::NamedTempFile::new().unwrap();
-        let queue = Arc::new(TaskQueue::new(database.path().to_path_buf()).unwrap());
-        let runtime = ProgramRuntime::new();
-        runtime.attach_schedule_queue(Arc::clone(&queue));
-        for capability in [
-            crate::vm::CapabilityKind::ScheduleCreate,
-            crate::vm::CapabilityKind::ScheduleRead,
-            crate::vm::CapabilityKind::ScheduleManage,
-        ] {
-            runtime
-                .grant_typed_capability(crate::vm::CapabilityRequirement {
-                    capability,
-                    selector: crate::vm::ResourceSelector::Schedule { policy: None },
-                })
-                .unwrap();
-        }
-        let timestamp = chrono::Utc::now().timestamp();
-        let outcome = runtime
-            .submit(submission(
-                ProgramLanguage::Forth,
-                &format!(
-                    "s\" inspect-me\" {timestamp} schedule-create dup schedule-get swap schedule-cancel"
-                ),
-                ExecutionEffect::VmWrite,
-            ))
-            .await
-            .unwrap();
-        assert!(matches!(
-            outcome.values.as_slice(),
-            [ProgramValue::Option(Some(task)), ProgramValue::Bool(true)]
-                if matches!(task.as_ref(), ProgramValue::Json(value)
-                    if value["task"] == "inspect-me" && value["status"] == "Pending")
-        ));
-        let stored = queue.get_task(1).await.unwrap().unwrap();
-        assert_eq!(stored.status, TaskStatus::Cancelled);
-    }
-
-    #[tokio::test]
-    async fn durable_scheduler_reenters_typed_runtime_for_callbacks() {
-        let database = tempfile::NamedTempFile::new().unwrap();
-        let queue = Arc::new(TaskQueue::new(database.path().to_path_buf()).unwrap());
-        queue
-            .enqueue(ScheduledTask {
-                id: None,
-                scheduled_time: chrono::Utc::now(),
-                task: "s\"scheduled callback\" say".into(),
-                context: scheduled_vm_context(TypedRuntime::new().grants().clone()).unwrap(),
-                recurring: None,
-                status: TaskStatus::Pending,
-                created_at: chrono::Utc::now(),
-                last_run: None,
-                retries: 0,
-            })
-            .await
-            .unwrap();
-        let runtime = Arc::new(ProgramRuntime::new());
-        runtime.attach_schedule_queue(Arc::clone(&queue));
-        let scheduler = runtime.task_scheduler().expect("scheduler is attached");
-        scheduler.run_once().await.unwrap();
-        assert!(queue.get_ready_tasks().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn durable_scheduler_reenters_cooperative_yielded_callbacks() {
-        let database = tempfile::NamedTempFile::new().unwrap();
-        let queue = Arc::new(TaskQueue::new(database.path().to_path_buf()).unwrap());
-        queue
-            .enqueue(ScheduledTask {
-                id: None,
-                scheduled_time: chrono::Utc::now(),
-                task: "unit yield 42".into(),
-                context: scheduled_vm_context(TypedRuntime::new().grants().clone()).unwrap(),
-                recurring: None,
-                status: TaskStatus::Pending,
-                created_at: chrono::Utc::now(),
-                last_run: None,
-                retries: 0,
-            })
-            .await
-            .unwrap();
-        let runtime = Arc::new(ProgramRuntime::new());
-        runtime.attach_schedule_queue(Arc::clone(&queue));
-
-        runtime
-            .task_scheduler()
-            .expect("scheduler is attached")
-            .run_once()
-            .await
-            .unwrap();
-        assert!(queue.get_ready_tasks().await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn scheduled_callback_cannot_gain_grants_after_creation() {
-        let database = tempfile::NamedTempFile::new().unwrap();
-        let queue = Arc::new(TaskQueue::new(database.path().to_path_buf()).unwrap());
-        let runtime = Arc::new(ProgramRuntime::new());
-        runtime.attach_schedule_queue(Arc::clone(&queue));
-        runtime
-            .grant_typed_capability(crate::vm::CapabilityRequirement {
-                capability: crate::vm::CapabilityKind::ScheduleCreate,
-                selector: crate::vm::ResourceSelector::Schedule { policy: None },
-            })
-            .unwrap();
-
-        let scheduled = runtime
-            .submit(submission(
-                ProgramLanguage::Lisp,
-                &format!(
-                    "(schedule-create \"(file-read (path \\\"later.txt\\\"))\" {})",
-                    chrono::Utc::now().timestamp()
-                ),
-                ExecutionEffect::VmWrite,
-            ))
-            .await
-            .unwrap();
-        assert!(matches!(scheduled.status, ExecutionStatus::Completed));
-
-        // This grant did not exist when the callback was made durable. A
-        // fresh scheduled run must remain inside its persisted ceiling.
-        runtime
-            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
-                crate::vm::FileOperation::Read,
-                crate::vm::FileSelector::parse("./**").unwrap(),
-            ))
-            .unwrap();
-        let scheduler = runtime.task_scheduler().expect("scheduler is attached");
-        scheduler.run_once().await.unwrap();
-
-        let ready = queue.get_ready_tasks().await.unwrap();
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].retries, 1);
-        assert_eq!(ready[0].status, TaskStatus::Pending);
-    }
-
-    #[tokio::test]
-    async fn scheduled_commit_does_not_erase_later_global_grants() {
-        let database = tempfile::NamedTempFile::new().unwrap();
-        let queue = Arc::new(TaskQueue::new(database.path().to_path_buf()).unwrap());
-        let runtime = Arc::new(ProgramRuntime::new());
-        runtime.attach_schedule_queue(Arc::clone(&queue));
-        runtime
-            .grant_typed_capability(crate::vm::CapabilityRequirement {
-                capability: crate::vm::CapabilityKind::ScheduleCreate,
-                selector: crate::vm::ResourceSelector::Schedule { policy: None },
-            })
-            .unwrap();
-        runtime
-            .submit(submission(
-                ProgramLanguage::Lisp,
-                &format!(
-                    "(schedule-create \"42\" {})",
-                    chrono::Utc::now().timestamp()
-                ),
-                ExecutionEffect::VmWrite,
-            ))
-            .await
-            .unwrap();
-
-        let later_grant = crate::vm::CapabilityRequirement::file(
-            crate::vm::FileOperation::Read,
-            crate::vm::FileSelector::parse("./**").unwrap(),
-        );
-        runtime.grant_typed_capability(later_grant.clone()).unwrap();
-        runtime
-            .task_scheduler()
-            .expect("scheduler is attached")
-            .run_once()
-            .await
-            .unwrap();
-
-        let state = runtime.inspect().await.unwrap();
-        assert!(state.granted_capabilities.contains(&later_grant));
-    }
-
-    #[tokio::test]
     async fn inspection_reports_ordered_stack_and_vocabulary() {
         let runtime = ProgramRuntime::new();
         runtime
@@ -10116,6 +9665,14 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
                 selector: crate::vm::ResourceSelector::None,
             }),
             crate::vm::CapabilityAvailability::Unsupported
+        );
+        assert_eq!(
+            runtime.capability_availability(&crate::vm::CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::ScheduleCreate,
+                selector: crate::vm::ResourceSelector::Schedule { policy: None },
+            }),
+            crate::vm::CapabilityAvailability::Disabled,
+            "a bare runtime must not expose a second local schedule store"
         );
     }
 

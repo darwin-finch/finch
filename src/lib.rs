@@ -102,7 +102,6 @@ pub mod ssh;       // SSH client (russh) — sessions referenced from Lisp
 pub mod registry; // Migration-only legacy Co-Forth peer registry
 pub mod router;
 pub mod runtime; // Provider-neutral Forth/Lisp execution and capabilities
-pub mod scheduling; // Autonomous task scheduling (Phase 5)
 pub mod server; // HTTP daemon mode (Phase 1)
 pub mod service; // Service discovery (Phase 3)
 pub mod tools; // Tool execution system

@@ -84,7 +84,6 @@ where
             || target.starts_with("finch::generators")
             || target.starts_with("finch::models")
             || target.starts_with("finch::local")
-            || target.starts_with("finch::scheduling")
             || target.starts_with("finch::server");
         if is_internal && *level <= Level::INFO {
             return; // Suppress internal INFO/DEBUG from TUI; ERRORs still shown
