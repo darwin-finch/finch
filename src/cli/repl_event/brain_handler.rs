@@ -202,7 +202,7 @@ impl EventLoop {
         let initial = request_home_runner_lease(
             &http,
             &endpoint,
-            &self.session_label,
+            &self.participant_subject,
             &snapshot.environment,
             None,
         )
@@ -229,7 +229,7 @@ impl EventLoop {
         let initial_had_lease = initial.is_ok();
         let mut lease_id = initial.ok().map(|lease| lease.lease_id);
         let event_tx = self.event_tx.clone();
-        let subject = self.session_label.clone();
+        let subject = self.participant_subject.clone();
         let environment = snapshot.environment;
         tokio::spawn(async move {
             let mut had_lease = initial_had_lease;

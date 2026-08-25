@@ -236,6 +236,10 @@ pub struct EventLoop {
     /// Human-readable label for this session (e.g. "swift-falcon")
     session_label: String,
 
+    /// Human participant identity shown on attachments and runner leases.
+    /// This is deliberately separate from the Brain's name and opaque lease IDs.
+    participant_subject: String,
+
     /// Stable UUID for this session — assigned at startup, printed on exit.
     session_uuid: Uuid,
 
@@ -357,6 +361,32 @@ pub enum ViewMode {
     List,
     /// Tree-structured conversation view
     Tree,
+}
+
+fn local_participant_subject() -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "user".into());
+    let machine = hostname::get()
+        .ok()
+        .and_then(|value| value.into_string().ok())
+        .unwrap_or_else(|| "machine".into());
+    participant_subject_from(&user, &machine)
+}
+
+fn participant_subject_from(user: &str, machine: &str) -> String {
+    let user = user.trim();
+    let machine = machine.trim();
+    let value = format!(
+        "{}@{}",
+        if user.is_empty() { "user" } else { user },
+        if machine.is_empty() { "machine" } else { machine }
+    );
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(128)
+        .collect()
 }
 
 /// Application-owned data extracted from one verified, suspended
@@ -786,6 +816,7 @@ impl EventLoop {
                 .map(Arc::new),
             memory_system,
             session_label,
+            participant_subject: local_participant_subject(),
             session_uuid: Uuid::new_v4(),
             cwd: String::new(), // populated at the start of run()
             context_lines,
@@ -3406,7 +3437,7 @@ Rules:\n\
             .map(|attachment| attachment.attachment_id);
         if let Err(error) = client
             .attach(
-                &self.session_label,
+                &self.participant_subject,
                 crate::brain::shared::AttachmentRole::Driver,
                 reusable_attachment,
             )
@@ -5242,6 +5273,22 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn participant_subject_is_not_the_brain_name() {
+        assert_eq!(
+            participant_subject_from("shammah", "workstation.local"),
+            "shammah@workstation.local"
+        );
+    }
+
+    #[test]
+    fn participant_subject_is_printable_and_bounded() {
+        let subject = participant_subject_from(&format!("user\n{}", "x".repeat(200)), "");
+        assert!(!subject.chars().any(char::is_control));
+        assert!(subject.chars().count() <= 128);
+        assert!(subject.ends_with('x'));
+    }
     use crate::cli::repl_event::query_processor::apply_sliding_window;
     // format_elapsed and format_token_count moved to tool_display; import for status-bar tests.
     use crate::cli::repl_event::tool_display::{format_elapsed, format_token_count};
