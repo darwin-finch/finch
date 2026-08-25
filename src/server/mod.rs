@@ -352,11 +352,7 @@ impl AgentServer {
         if let Some(brain_bind_address) = &app_state.config.brain_bind_address {
             crate::node::tls::install_server_crypto_provider();
             let brain_addr: SocketAddr = brain_bind_address.parse()?;
-            let hostname = hostname_or_default();
-            let tls_identity = crate::node::tls::NodeTlsIdentity::from_signing_identity(
-                app_state.brain_credentials.invitation_signer(),
-                &hostname,
-            )?;
+            let tls_identity = app_state.brain_credentials.invitation_tls_identity();
             let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
                 vec![tls_identity.certificate_der().to_vec()],
                 tls_identity.private_key_der().to_vec(),

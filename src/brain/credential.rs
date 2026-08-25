@@ -291,8 +291,8 @@ impl BrainCredentialAuthority {
         self.invitation_signer.public_key_bytes()
     }
 
-    pub(crate) fn invitation_signer(&self) -> &crate::node::identity::NodeSigningIdentity {
-        &self.invitation_signer
+    pub(crate) fn invitation_tls_identity(&self) -> &crate::node::tls::NodeTlsIdentity {
+        &self.invitation_tls
     }
 
     /// Load the daemon credential authority from a private state directory.
