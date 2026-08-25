@@ -853,6 +853,7 @@ pub(crate) async fn process_query_with_tools(
     context_lines: usize,
     max_verbatim: usize,
     recall_k: usize,
+    streaming_enabled: bool,
     enable_summarization: bool,
     auto_compact_enabled: bool,
     summary_gen: Arc<dyn Generator>,
@@ -955,8 +956,9 @@ pub(crate) async fn process_query_with_tools(
     };
     let caps = generator.capabilities();
 
-    // Try streaming first if supported
-    if caps.supports_streaming {
+    // Streaming is both a provider capability and a user preference. The
+    // setup wizard persists the latter in features.streaming_enabled.
+    if should_stream_responses(streaming_enabled, caps.supports_streaming) {
         tracing::debug!("Generator supports streaming, attempting to stream");
 
         // Create a WorkUnit for this generation turn BEFORE streaming begins.
@@ -1386,6 +1388,10 @@ pub(crate) async fn process_query_with_tools(
     }
 }
 
+fn should_stream_responses(streaming_enabled: bool, provider_supports_streaming: bool) -> bool {
+    streaming_enabled && provider_supports_streaming
+}
+
 fn inject_vm_manifest(
     messages: &mut Vec<crate::claude::Message>,
     manifest: &crate::programs::VmManifest,
@@ -1614,6 +1620,14 @@ pub(crate) fn apply_sliding_window(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn streaming_requires_both_user_opt_in_and_provider_support() {
+        assert!(should_stream_responses(true, true));
+        assert!(!should_stream_responses(false, true));
+        assert!(!should_stream_responses(true, false));
+        assert!(!should_stream_responses(false, false));
+    }
 
     #[tokio::test]
     async fn completed_streaming_turn_populates_session_context_strip() {

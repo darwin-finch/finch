@@ -68,6 +68,7 @@ pub struct LlmLoop {
     context_lines: usize,
     max_verbatim_messages: usize,
     context_recall_k: usize,
+    streaming_enabled: bool,
     enable_summarization: bool,
     auto_compact_enabled: bool,
     wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
@@ -106,6 +107,7 @@ impl LlmLoop {
         context_lines: usize,
         max_verbatim_messages: usize,
         context_recall_k: usize,
+        streaming_enabled: bool,
         enable_summarization: bool,
         auto_compact_enabled: bool,
         wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
@@ -136,6 +138,7 @@ impl LlmLoop {
             context_lines,
             max_verbatim_messages,
             context_recall_k,
+            streaming_enabled,
             enable_summarization,
             auto_compact_enabled,
             wire_metrics_logger,
@@ -197,6 +200,7 @@ impl LlmLoop {
         let context_lines = self.context_lines;
         let max_verbatim = self.max_verbatim_messages;
         let recall_k = self.context_recall_k;
+        let streaming_enabled = self.streaming_enabled;
         let enable_summarization = self.enable_summarization;
         let auto_compact_enabled = self.auto_compact_enabled;
         let wire_metrics_logger = self.wire_metrics_logger.clone();
@@ -231,6 +235,7 @@ impl LlmLoop {
                 context_lines,
                 max_verbatim,
                 recall_k,
+                streaming_enabled,
                 enable_summarization,
                 auto_compact_enabled,
                 summary_gen,

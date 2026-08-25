@@ -1532,6 +1532,7 @@ impl EventLoop {
                 self.context_lines,
                 self.max_verbatim_messages,
                 self.context_recall_k,
+                self.streaming_enabled,
                 self.enable_summarization,
                 self.auto_compact_enabled,
                 self.metrics_logger.clone(),
