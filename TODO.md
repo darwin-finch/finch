@@ -396,7 +396,17 @@ still blocks the corresponding Brain phase until it is unified.
   task-list projection owned by the Brain/runtime. Keep their useful visible-plan UX and stable tool
   surface, but make task creation, status changes, hierarchy, progress, cancellation, and durable
   recovery ordinary typed task events—not a second session-local JSON source of truth beside VM
-  `task<T>` handles.
+  `task<T>` handles. Project the active goal, current plan step, and concise unfinished-task summary
+  into every provider turn automatically; `todo_read` is an inspection operation, not the mechanism
+  by which a model discovers that work exists. Plan mode must read and update this same state,
+  enforce its advertised read-only/exploration boundary, survive reconnect/restart, and have
+  fixtures proving approval, rejection, requested changes, and exit preserve one coherent plan.
+- [ ] Establish a Finch-on-Finch dogfood gate before calling the interactive harness production
+  ready. Complete representative Finch changes entirely from Finch—inspect, plan, edit, review,
+  test, commit, reconnect, and resume—without another coding harness repairing the session. Track
+  crashes, lost Brain context, invalid first-pass wire programs, repair attempts, tool loops,
+  approval friction, rendering corruption, and manual shell escapes; retain failures as replayable
+  fixtures and require a sustained clean daily workflow rather than a one-off demo.
 - [ ] Normalize model-facing naming and manifests. `todo_read`/`todo_write`, `enter_plan_mode`,
   `present_plan`, and `ask_user_question` now advertise canonical snake_case names while
   dispatch-only PascalCase aliases preserve compatibility; extend that audited migration to every
