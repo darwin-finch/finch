@@ -261,6 +261,13 @@ still blocks the corresponding Brain phase until it is unified.
   discovery where the provider actually exposes it, a cache with source and refresh time, manual
   model IDs for providers without discovery, and a tested static fallback. Keep capability and
   context metadata keyed by provider plus model rather than inferring it from a display name.
+- [ ] Refresh Finch's local-model catalogue and runtime compatibility matrix. Inventory newly
+  released open-weight families (including current Meta/Facebook releases), distinguish upstream
+  weights from actually usable ONNX/Core ML/Metal exports, and record tokenizer, quantization,
+  context, memory, tool-use, structured-output, and Finch-wire conformance per model/runtime/hardware
+  combination. Discover installed compatible models without silently claiming support for a family
+  whose weights cannot run through Finch, keep manual model paths available, and add opt-in local
+  smoke tests plus a dated static fallback catalogue.
 - [ ] **P0 — make OpenAI-compatible onboarding endpoint-correct before adding Ox Alpha or Z.AI.**
   Introduce a reusable compatible-API connection profile whose configured base URL is actually
   honored and whose chat path is explicit instead of always appending `/v1/chat/completions`.
