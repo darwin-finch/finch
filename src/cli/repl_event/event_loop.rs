@@ -285,12 +285,12 @@ pub struct EventLoop {
 
     /// Explicit destination for prompts and VM programs while attached.
     /// This is singular by design: host effects are never broadcast.
-    active_remote_brain: Option<crate::brain::remote::RemoteBrainClient>,
+    active_remote_brain: Option<crate::brain::remote::AttachedBrainClient>,
 
     /// Durable attachment to this console's home Brain. Ordinary input uses
     /// this attachment whenever no foreign Brain is selected, so the runner
     /// console and remote drivers project the same canonical event log.
-    home_brain: Option<crate::brain::remote::RemoteBrainClient>,
+    home_brain: Option<crate::brain::remote::AttachedBrainClient>,
 
     /// Whether this frontend currently holds the daemon-issued lease for its
     /// home Brain. The UI never infers runner status from local process role.
@@ -526,7 +526,7 @@ struct PendingNamedBrainTurn {
 
 #[derive(Clone)]
 struct RemoteBrainApproval {
-    client: crate::brain::remote::RemoteBrainClient,
+    client: crate::brain::remote::AttachedBrainClient,
     request_seq: u64,
     approval_id: String,
     audience: crate::brain::shared::BrainApprovalAudience,
@@ -1507,7 +1507,7 @@ impl EventLoop {
                                 let client = pending.client;
                                 let target = client.target.display_name();
                                 let event_tx = self.event_tx.clone();
-                                tokio::spawn(async move {
+                                tokio::task::spawn_local(async move {
                                     if let Err(error) = client
                                         .push(crate::brain::shared::BrainEventKind::ApprovalDecided {
                                             request_seq: pending.request_seq,
@@ -3992,7 +3992,8 @@ Rules:\n\
         let password = crate::config::load_config()
             .map(|config| config.server.brain_password)
             .unwrap_or_default();
-        let mut client = crate::brain::remote::RemoteBrainClient::new(target, password)?;
+        let remote = crate::brain::remote::RemoteBrainClient::new(target, password)?;
+        let mut client = crate::brain::remote::AttachedBrainClient::remote(remote);
         if let Err(error) = client
             .attach_persistent(
                 &self.participant_subject,
@@ -4051,7 +4052,7 @@ Rules:\n\
         .await?;
 
         let event_tx = self.event_tx.clone();
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             while let Some(message) = incoming.recv().await {
                 if event_tx
                     .send(ReplEvent::RemoteBrainMessage {
@@ -4155,13 +4156,13 @@ Rules:\n\
         self.render_tui().await
     }
 
-    fn selected_brain(&self) -> Option<&crate::brain::remote::RemoteBrainClient> {
+    fn selected_brain(&self) -> Option<&crate::brain::remote::AttachedBrainClient> {
         self.active_remote_brain
             .as_ref()
             .or(self.home_brain.as_ref())
     }
 
-    fn selected_brain_mut(&mut self) -> Option<&mut crate::brain::remote::RemoteBrainClient> {
+    fn selected_brain_mut(&mut self) -> Option<&mut crate::brain::remote::AttachedBrainClient> {
         self.active_remote_brain
             .as_mut()
             .or(self.home_brain.as_mut())
@@ -4185,7 +4186,7 @@ Rules:\n\
         };
         let target = client.target.display_name();
         let event_tx = self.event_tx.clone();
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             if let Err(error) = client.push(kind).await {
                 let _ = event_tx.send(ReplEvent::RemoteBrainError {
                     target,

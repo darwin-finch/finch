@@ -42,10 +42,11 @@ pub struct BrainSubmissionResult {
 ///
 /// Must be created inside a `tokio::task::LocalSet` (or equivalent) because
 /// `capnp-rpc` uses `spawn_local` internally.
+#[derive(Clone)]
 pub struct IpcClient {
     client: finch_daemon::Client,
     // Keeps the RPC system alive for the lifetime of this client.
-    _rpc_handle: tokio::task::JoinHandle<()>,
+    _rpc_handle: std::rc::Rc<tokio::task::JoinHandle<()>>,
 }
 
 impl IpcClient {
@@ -73,7 +74,7 @@ impl IpcClient {
 
         Ok(Self {
             client,
-            _rpc_handle: handle,
+            _rpc_handle: std::rc::Rc::new(handle),
         })
     }
 

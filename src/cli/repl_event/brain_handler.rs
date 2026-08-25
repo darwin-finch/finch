@@ -186,27 +186,17 @@ impl EventLoop {
     async fn register_home_brain(
         &self,
     ) -> Result<Option<std::result::Result<crate::brain::shared::RunnerLeaseId, String>>> {
-        let Some(base) = self.daemon_base_url.as_deref() else {
+        let Some(ipc) = self.ipc_client.as_ref().cloned() else {
             return Ok(None);
         };
-        let http = reqwest::Client::new();
-        let snapshot = http
-            .get(format!("{base}/v1/brains/named/{}", self.session_label))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<crate::brain::shared::BrainSnapshot>()
-            .await?;
-        let endpoint = format!(
-            "{base}/v1/brains/named/{}/runner-lease",
-            self.session_label
-        );
-        let initial = request_home_runner_lease(
-            &http,
-            &endpoint,
+        let snapshot = ipc.brain_snapshot(&self.session_label).await?;
+        let initial = ipc
+            .brain_acquire_runner(
+            &self.session_label,
             &self.participant_subject,
             &snapshot.environment,
             None,
+            30_000,
         )
         .await;
         let initial_registration = match (&initial, self.ipc_client.as_ref()) {
@@ -233,19 +223,20 @@ impl EventLoop {
         let event_tx = self.event_tx.clone();
         let subject = self.participant_subject.clone();
         let environment = snapshot.environment;
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             let mut had_lease = initial_had_lease;
             loop {
                 tokio::select! {
                     _ = event_tx.closed() => break,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
                 }
-                match request_home_runner_lease(
-                    &http,
-                    &endpoint,
+                match ipc
+                    .brain_acquire_runner(
+                    &snapshot.name,
                     &subject,
                     &environment,
                     lease_id,
+                    30_000,
                 )
                 .await
                 {
@@ -293,10 +284,12 @@ impl EventLoop {
             .as_deref()
             .context("local daemon is unavailable")?;
         let target = crate::brain::remote::RemoteBrainTarget::local(&self.session_label, base)?;
-        let password = crate::config::load_config()
-            .map(|config| config.server.brain_password)
-            .unwrap_or_default();
-        let mut client = crate::brain::remote::RemoteBrainClient::new(target, password)?;
+        let ipc = self
+            .ipc_client
+            .as_ref()
+            .context("Cap'n Proto daemon connection unavailable")?
+            .clone();
+        let mut client = crate::brain::remote::AttachedBrainClient::local(target, ipc);
         client
             .attach_persistent(
                 &self.participant_subject,
@@ -324,7 +317,7 @@ impl EventLoop {
         }
 
         let event_tx = self.event_tx.clone();
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             while let Some(message) = incoming.recv().await {
                 if event_tx
                     .send(ReplEvent::RemoteBrainMessage {
@@ -347,22 +340,16 @@ impl EventLoop {
     /// established at startup. The daemon still expires crashed runners, but
     /// an ordinary `/quit` must make callback availability exact immediately.
     async fn release_home_brain_presence(&mut self) {
-        if let (Some(base), Some(lease_id)) = (
-            self.daemon_base_url.as_deref(),
-            self.home_runner_lease_id.take(),
-        ) {
-            let request = reqwest::Client::new()
-                .delete(format!(
-                    "{base}/v1/brains/named/{}/runner-lease/{}",
-                    self.session_label, lease_id.0
-                ))
-                .send();
-            match tokio::time::timeout(std::time::Duration::from_secs(2), request).await {
-                Ok(Ok(response)) if response.status().is_success() => {}
-                Ok(Ok(response)) => tracing::warn!(
-                    "home Brain runner release returned {}",
-                    response.status()
-                ),
+        if let (Some(ipc), Some(lease_id)) =
+            (self.ipc_client.as_ref(), self.home_runner_lease_id.take())
+        {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                ipc.brain_release_runner(&self.session_label, lease_id),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
                 Ok(Err(error)) => tracing::warn!("home Brain runner release failed: {error}"),
                 Err(_) => tracing::warn!("home Brain runner release timed out"),
             }
@@ -510,29 +497,4 @@ impl EventLoop {
         }
         self.render_tui().await
     }
-}
-
-async fn request_home_runner_lease(
-    http: &reqwest::Client,
-    endpoint: &str,
-    subject: &str,
-    environment: &crate::brain::shared::BrainEnvironment,
-    lease_id: Option<crate::brain::shared::RunnerLeaseId>,
-) -> Result<crate::brain::shared::BrainRunnerLease> {
-    let response = http
-        .post(endpoint)
-        .json(&serde_json::json!({
-            "subject": subject,
-            "environment": environment,
-            "lease_id": lease_id,
-            "ttl_ms": 30_000,
-        }))
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        anyhow::bail!(response.text().await.unwrap_or_else(|_| {
-            "runner lease request failed".into()
-        }));
-    }
-    Ok(response.json().await?)
 }

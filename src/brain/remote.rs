@@ -516,6 +516,163 @@ impl RemoteBrainClient {
     }
 }
 
+#[derive(Clone)]
+enum AttachedBrainTransport {
+    Local(crate::ipc::IpcClient),
+    Remote(RemoteBrainClient),
+}
+
+/// One client projection over the canonical Brain service. Local consoles use
+/// Cap'n Proto on the daemon Unix socket; remote consoles retain scoped
+/// credential bootstrap and the binary WebSocket adapter until remote
+/// mutations move to the same Cap'n Proto request schema.
+#[derive(Clone)]
+pub struct AttachedBrainClient {
+    pub target: RemoteBrainTarget,
+    transport: AttachedBrainTransport,
+    attachment: Option<BrainAttachment>,
+}
+
+impl AttachedBrainClient {
+    pub fn local(target: RemoteBrainTarget, ipc: crate::ipc::IpcClient) -> Self {
+        Self {
+            target,
+            transport: AttachedBrainTransport::Local(ipc),
+            attachment: None,
+        }
+    }
+
+    pub fn remote(client: RemoteBrainClient) -> Self {
+        Self {
+            target: client.target.clone(),
+            transport: AttachedBrainTransport::Remote(client),
+            attachment: None,
+        }
+    }
+
+    pub fn attachment(&self) -> Option<&BrainAttachment> {
+        self.attachment.as_ref()
+    }
+
+    pub async fn attach_persistent(
+        &mut self,
+        subject: &str,
+        role: AttachmentRole,
+        client_slot: &str,
+    ) -> Result<BrainAttachment> {
+        let attachment = match &mut self.transport {
+            AttachedBrainTransport::Remote(client) => {
+                client.attach_persistent(subject, role, client_slot).await?
+            }
+            AttachedBrainTransport::Local(ipc) => {
+                let snapshot = ipc.brain_snapshot(&self.target.brain).await?;
+                let store = AttachmentIdentityStore::new(AttachmentIdentityStore::default_path()?);
+                let attachment_id =
+                    store.find(snapshot.brain_id, client_slot, subject, role)?;
+                let attachment = ipc
+                    .brain_attach(&self.target.brain, subject, role, attachment_id)
+                    .await?;
+                if let Err(error) = store.save(AttachmentIdentityRecord {
+                    brain_id: snapshot.brain_id,
+                    client_slot: client_slot.to_string(),
+                    subject: subject.to_string(),
+                    role,
+                    attachment_id: attachment.attachment_id,
+                }) {
+                    let _ = ipc.brain_detach(&self.target.brain, &attachment).await;
+                    return Err(error.context("persist Brain attachment identity"));
+                }
+                attachment
+            }
+        };
+        self.attachment = Some(attachment.clone());
+        Ok(attachment)
+    }
+
+    pub async fn snapshot(&self) -> Result<BrainSnapshot> {
+        match &self.transport {
+            AttachedBrainTransport::Local(ipc) => ipc.brain_snapshot(&self.target.brain).await,
+            AttachedBrainTransport::Remote(client) => client.snapshot().await,
+        }
+    }
+
+    pub async fn push(&self, kind: BrainEventKind) -> Result<()> {
+        let attachment = self
+            .attachment
+            .as_ref()
+            .context("client is not attached to a Brain")?;
+        match &self.transport {
+            AttachedBrainTransport::Local(ipc) => {
+                ipc.brain_submit(&self.target.brain, attachment, kind).await?;
+                Ok(())
+            }
+            AttachedBrainTransport::Remote(client) => client.push(kind).await,
+        }
+    }
+
+    pub async fn acknowledge(&mut self, seq: u64) -> Result<()> {
+        let attachment = self
+            .attachment
+            .as_ref()
+            .context("client is not attached to a Brain")?;
+        let updated = match &mut self.transport {
+            AttachedBrainTransport::Local(ipc) => {
+                ipc.brain_acknowledge(&self.target.brain, attachment, seq)
+                    .await?
+            }
+            AttachedBrainTransport::Remote(client) => {
+                client.acknowledge(seq).await?;
+                client
+                    .attachment()
+                    .cloned()
+                    .context("remote Brain acknowledgement lost its attachment")?
+            }
+        };
+        self.attachment = Some(updated);
+        Ok(())
+    }
+
+    pub async fn disconnect(&self) -> Result<()> {
+        let attachment = self
+            .attachment
+            .as_ref()
+            .context("client is not attached to a Brain")?;
+        match &self.transport {
+            AttachedBrainTransport::Local(ipc) => {
+                ipc.brain_detach(&self.target.brain, attachment).await
+            }
+            AttachedBrainTransport::Remote(client) => client.disconnect().await,
+        }
+    }
+
+    pub async fn watch(&self) -> Result<mpsc::UnboundedReceiver<BrainWireMessage>> {
+        let attachment = self
+            .attachment
+            .as_ref()
+            .context("client is not attached to a Brain")?;
+        match &self.transport {
+            AttachedBrainTransport::Remote(client) => client.watch().await,
+            AttachedBrainTransport::Local(ipc) => {
+                let mut source = ipc.brain_watch(&self.target.brain, attachment).await?;
+                let (tx, rx) = mpsc::unbounded_channel();
+                tokio::task::spawn_local(async move {
+                    while let Some(message) = source.recv().await {
+                        match message {
+                            Ok(message) => {
+                                if tx.send(message).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+                Ok(rx)
+            }
+        }
+    }
+}
+
 fn unix_epoch_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
