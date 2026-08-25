@@ -248,6 +248,11 @@ pub struct EventLoop {
 
     /// Canonical tool calls replay into one grouped unit per Brain turn.
     remote_brain_tool_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
+    /// Canonical run-correlated lifecycle rows. Program and result events for
+    /// one RunId update this same selectable work unit instead of rendering as
+    /// unrelated flat messages.
+    remote_brain_run_units:
+        std::collections::HashMap<crate::brain::store::RunId, RemoteBrainRunProjection>,
     remote_brain_tool_rows: std::collections::HashMap<String, usize>,
     remote_brain_approval_rows: std::collections::HashMap<String, usize>,
     queued_remote_brain_approvals: std::collections::VecDeque<RemoteBrainApproval>,
@@ -832,6 +837,20 @@ struct PendingVmApproval {
     approval_id: String,
 }
 
+struct RemoteBrainRunProjection {
+    unit: Arc<crate::cli::messages::WorkUnit>,
+    status_row: usize,
+    program_row: Option<usize>,
+}
+
+fn brain_run_group_label(
+    run_id: crate::brain::store::RunId,
+    kind: Option<crate::brain::store::BrainRunKind>,
+) -> String {
+    kind.map(|kind| format!("{kind:?} run {}", run_id.0))
+        .unwrap_or_else(|| format!("Brain run {}", run_id.0))
+}
+
 struct LocalBrainProjection {
     source: String,
     output: String,
@@ -1313,6 +1332,7 @@ impl EventLoop {
             local_brain_projections: std::collections::VecDeque::new(),
             brain_projection_revisions: std::collections::HashMap::new(),
             remote_brain_tool_unit: None,
+            remote_brain_run_units: std::collections::HashMap::new(),
             remote_brain_tool_rows: std::collections::HashMap::new(),
             remote_brain_approval_rows: std::collections::HashMap::new(),
             queued_remote_brain_approvals: std::collections::VecDeque::new(),
@@ -5300,6 +5320,13 @@ Rules:\n\
                     .selected_brain()
                     .is_some_and(|client| !client.target.secure)
                     .then_some(brain.environment.machine.as_str());
+                for group in projected_brain_run_groups(&brain.events) {
+                    self.ensure_remote_brain_run_projection(
+                        group.run_id,
+                        Some(group.kind),
+                        group.status,
+                    );
+                }
                 self.todo_list
                     .write()
                     .await
@@ -5530,6 +5557,31 @@ Rules:\n\
         );
     }
 
+    fn ensure_remote_brain_run_projection(
+        &mut self,
+        run_id: crate::brain::store::RunId,
+        kind: Option<crate::brain::store::BrainRunKind>,
+        status: crate::brain::store::BrainRunStatus,
+    ) -> &mut RemoteBrainRunProjection {
+        if !self.remote_brain_run_units.contains_key(&run_id) {
+            let label = brain_run_group_label(run_id, kind);
+            let unit = self.output_manager.start_work_unit(label);
+            let status_row = unit.add_row("status");
+            unit.complete_row(status_row, format!("{status:?}").to_lowercase());
+            self.remote_brain_run_units.insert(
+                run_id,
+                RemoteBrainRunProjection {
+                    unit,
+                    status_row,
+                    program_row: None,
+                },
+            );
+        }
+        self.remote_brain_run_units
+            .get_mut(&run_id)
+            .expect("run projection inserted above")
+    }
+
     async fn render_remote_brain_event(&mut self, event: &crate::brain::store::BrainEvent) {
         use crate::brain::store::BrainEventKind;
         let local_machine = self
@@ -5561,61 +5613,65 @@ Rules:\n\
             BrainEventKind::RunnerHandoffCompleted { lease, .. } => self
                 .output_manager
                 .write_info(format!("runner handoff completed to {}", lease.subject)),
-            BrainEventKind::RunnerHandoffCancelled { .. } => self
-                .output_manager
-                .write_info("runner handoff cancelled"),
-            BrainEventKind::ClientAttached {
-                subject, role, ..
-            } => self.output_manager.write_info(format!(
-                "{subject} attached as {}",
-                format!("{role:?}").to_lowercase()
-            )),
+            BrainEventKind::RunnerHandoffCancelled { .. } => {
+                self.output_manager.write_info("runner handoff cancelled")
+            }
+            BrainEventKind::ClientAttached { subject, role, .. } => {
+                self.output_manager.write_info(format!(
+                    "{subject} attached as {}",
+                    format!("{role:?}").to_lowercase()
+                ))
+            }
             BrainEventKind::ClientDetached { attachment_id, .. } => self
                 .output_manager
                 .write_info(format!("attachment {} disconnected", attachment_id.0)),
-            BrainEventKind::RunStarted { run }
-                if run.status
-                    == crate::brain::store::BrainRunStatus::QueuedForEnvironment =>
-            {
-                let run_id = run.run_id.0.to_string();
-                self.output_manager.write_info(format!(
-                    "{:?} run {} queued for the environment runner",
-                    run.kind, &run_id[..8]
-                ));
+            BrainEventKind::RunStarted { run } => {
+                self.ensure_remote_brain_run_projection(run.run_id, Some(run.kind), run.status);
             }
             BrainEventKind::RunStatusChanged {
                 run_id,
-                status: crate::brain::store::BrainRunStatus::Running,
-                ..
-            } => {
-                let run_id = run_id.0.to_string();
-                self.output_manager
-                    .write_info(format!("run {} resumed on the environment runner", &run_id[..8]));
-            }
-            BrainEventKind::RunStatusChanged {
-                run_id,
-                status: crate::brain::store::BrainRunStatus::Interrupted,
+                status,
                 detail,
             } => {
-                let run_id = run_id.0.to_string();
-                self.output_manager.write_info(format!(
-                    "run {} interrupted{}",
-                    &run_id[..8],
-                    detail
-                        .as_deref()
-                        .map(|detail| format!(": {detail}"))
-                        .unwrap_or_default()
-                ));
+                let projection = self.ensure_remote_brain_run_projection(*run_id, None, *status);
+                let summary = detail
+                    .as_deref()
+                    .map(|detail| format!("{}: {detail}", format!("{status:?}").to_lowercase()))
+                    .unwrap_or_else(|| format!("{status:?}").to_lowercase());
+                if *status == crate::brain::store::BrainRunStatus::Failed {
+                    projection.unit.fail_row(projection.status_row, summary);
+                } else {
+                    projection.unit.complete_row(projection.status_row, summary);
+                }
+                if status.is_terminal() {
+                    projection.unit.set_complete();
+                }
             }
-            BrainEventKind::RunStarted { .. } | BrainEventKind::RunStatusChanged { .. } => {}
-            BrainEventKind::Prompt { text } => self.output_manager.write_brain_participant(
-                sender.clone(),
-                text.clone(),
-                true,
-            ),
-            BrainEventKind::SpeculativePrompt { text } => self
-                .output_manager
-                .write_brain_participant(sender.clone(), format!("[speculative] {text}"), false),
+            BrainEventKind::Prompt { text } => {
+                self.output_manager
+                    .write_brain_participant(sender.clone(), text.clone(), true)
+            }
+            BrainEventKind::SpeculativePrompt { text } => {
+                if let Some(run_id) = event.run_id {
+                    let projection = self.ensure_remote_brain_run_projection(
+                        run_id,
+                        Some(crate::brain::store::BrainRunKind::Speculative),
+                        crate::brain::store::BrainRunStatus::QueuedForEnvironment,
+                    );
+                    let row = projection.unit.add_row("prompt");
+                    projection.unit.complete_row_with_body(
+                        row,
+                        "accepted",
+                        text.lines().map(str::to_owned).collect(),
+                    );
+                } else {
+                    self.output_manager.write_brain_participant(
+                        sender.clone(),
+                        format!("[legacy speculative] {text}"),
+                        false,
+                    );
+                }
+            }
             BrainEventKind::ParticipantMessage { text } => self
                 .output_manager
                 .write_brain_participant(sender, text.clone(), false),
@@ -5769,14 +5825,35 @@ Rules:\n\
                 }
                 self.remote_brain_tool_rows.clear();
                 self.remote_brain_approval_rows.clear();
-                if self.selected_brain_is_home()
+                let locally_projected = self.selected_brain_is_home()
                     && self
                         .local_brain_projections
                         .front_mut()
                         .is_some_and(|projection| {
                             projection.observe(event) == LocalProjectionMatch::Suppress
-                        })
-                {
+                        });
+                if let Some(run_id) = event.run_id {
+                    let projection = self.ensure_remote_brain_run_projection(
+                        run_id,
+                        None,
+                        crate::brain::store::BrainRunStatus::Running,
+                    );
+                    let language = match language {
+                        crate::brain::store::ProgramLanguage::Forth => "Co-Forth",
+                        crate::brain::store::ProgramLanguage::Lisp => "Lisp",
+                    };
+                    let row = projection
+                        .program_row
+                        .unwrap_or_else(|| projection.unit.add_row(format!("{language} program")));
+                    projection.program_row = Some(row);
+                    projection.unit.complete_row_with_body(
+                        row,
+                        format!("event #{}", event.seq),
+                        source.lines().map(str::to_owned).collect(),
+                    );
+                    return;
+                }
+                if locally_projected {
                     return;
                 }
                 let language = match language {
@@ -5804,6 +5881,27 @@ Rules:\n\
                     .flatten()
                     .map(|projection| projection.observe(event))
                     .unwrap_or(LocalProjectionMatch::None);
+                if let Some(run_id) = event.run_id {
+                    let projection = self.ensure_remote_brain_run_projection(
+                        run_id,
+                        None,
+                        crate::brain::store::BrainRunStatus::Running,
+                    );
+                    let row = projection.unit.add_row("result");
+                    if let Some(error) = error {
+                        projection.unit.fail_row(row, error);
+                    } else {
+                        projection.unit.complete_row_with_body(
+                            row,
+                            "completed",
+                            output.lines().map(str::to_owned).collect(),
+                        );
+                    }
+                    if projection_match == LocalProjectionMatch::SuppressAndComplete {
+                        self.local_brain_projections.pop_front();
+                    }
+                    return;
+                }
                 if projection_match == LocalProjectionMatch::SuppressAndComplete {
                     self.local_brain_projections.pop_front();
                     return;
@@ -7184,6 +7282,49 @@ fn projected_brain_context_lines(
     lines
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrainRunGroupProjection {
+    run_id: crate::brain::store::RunId,
+    kind: crate::brain::store::BrainRunKind,
+    status: crate::brain::store::BrainRunStatus,
+    event_seqs: Vec<u64>,
+}
+
+/// Snapshot form of the same RunId grouping used by the live shadow buffer.
+/// A snapshot replay and its live tail therefore select one run hierarchy,
+/// rather than drawing Program/Result events as unrelated rows.
+fn projected_brain_run_groups(
+    events: &[crate::brain::store::BrainEvent],
+) -> Vec<BrainRunGroupProjection> {
+    let mut groups = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            crate::brain::store::BrainEventKind::RunStarted { run } => {
+                Some(BrainRunGroupProjection {
+                    run_id: run.run_id,
+                    kind: run.kind,
+                    status: run.status,
+                    event_seqs: Vec::new(),
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for event in events {
+        let Some(run_id) = event.run_id else {
+            continue;
+        };
+        let Some(group) = groups.iter_mut().find(|group| group.run_id == run_id) else {
+            continue;
+        };
+        group.event_seqs.push(event.seq);
+        if let crate::brain::store::BrainEventKind::RunStatusChanged { status, .. } = event.kind {
+            group.status = status;
+        }
+    }
+    groups
+}
+
 /// Advance the visible projection's canonical cursor. Watch snapshots include
 /// every event through their revision, while the live receiver may already
 /// have buffered some of those same events. Sequence numbers are authoritative
@@ -8061,6 +8202,75 @@ mod tests {
         assert_eq!(
             projected_brain_context_lines(&[request, started, result, ordinary], 4, None),
             vec!["bob: visible collaboration"]
+        );
+    }
+
+    #[test]
+    fn snapshot_groups_speculative_lifecycle_program_and_result_by_exact_run_id() {
+        use crate::brain::store::{
+            AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, ProgramLanguage,
+            RunId,
+        };
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let run = BrainRun {
+            run_id,
+            kind: BrainRunKind::Speculative,
+            parent_run_id: None,
+            request_seq: 1,
+            initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            initiated_by: "alice".into(),
+            status: BrainRunStatus::QueuedForEnvironment,
+            started_ms: 1,
+            updated_ms: 1,
+            detail: None,
+        };
+        let kinds = vec![
+            BrainEventKind::SpeculativePrompt {
+                text: "probe".into(),
+            },
+            BrainEventKind::RunStarted { run },
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status: BrainRunStatus::Running,
+                detail: None,
+            },
+            BrainEventKind::Program {
+                language: ProgramLanguage::Lisp,
+                source: "(say \"probe\")".into(),
+            },
+            BrainEventKind::Result {
+                request_seq: 4,
+                output: "probe".into(),
+                error: None,
+            },
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status: BrainRunStatus::Completed,
+                detail: None,
+            },
+        ];
+        let events = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                let mut event = brain_event(index as u64 + 1, "daemon", kind);
+                event.run_id = Some(run_id);
+                event
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            projected_brain_run_groups(&events),
+            vec![BrainRunGroupProjection {
+                run_id,
+                kind: BrainRunKind::Speculative,
+                status: BrainRunStatus::Completed,
+                event_seqs: vec![1, 2, 3, 4, 5, 6],
+            }]
+        );
+        assert_eq!(
+            brain_run_group_label(run_id, Some(BrainRunKind::Speculative)),
+            format!("Speculative run {}", run_id.0)
         );
     }
 
