@@ -856,7 +856,8 @@ still blocks the corresponding Brain phase until it is unified.
   exact connection;
   sibling replay fails even for the same subject, ancestor revocation reaches the child, and a
   pending authenticated reservation prevents another detach from deleting the provisional Brain.
-  Still finish the remaining explicit invitation/delegation and handoff semantics.
+  Signed invitation bootstrap and addressed handoff now exist; finish the remaining
+  scope-specific hostile/replay cases before closing this ownership milestone.
 - [x] Persist a frontend attachment identity across frontend process restarts, not merely reconnects
   in one process, while keeping the daemon cursor authoritative. The client stores only the opaque
   attachment ID, keyed by durable Brain ID plus console slot/subject/role; the daemon still owns the
@@ -880,6 +881,14 @@ still blocks the corresponding Brain phase until it is unified.
   random signing secret and revocation ledger survive restart; the password is accepted only by
   authenticated discovery/bootstrap/administration routes, and the client refreshes its scoped
   credential without reverting ordinary operations to the password.
+- [x] Replace password sharing with signed Brain invitations for collaboration bootstrap. The owner
+  issues a short-lived single-participant token fixing Brain ID, environment generation, role,
+  scopes, delegation ancestry, and expiry; runner authority is forbidden. `/brain join` redeems it
+  into the existing scoped credential and attachment path. Redemption persists a subject binding
+  before responding, returns the exact same credential to same-subject retries after response loss
+  or daemon restart, rejects a different subject, and inherits ancestor revocation. This completes
+  invitation bootstrap, not B6: remote HTTP/WebSocket traffic still needs cryptographic node
+  identity and an encrypted authenticated channel.
 - [ ] Enforce least privilege independently for event visibility, prompt/program submission,
   approval, control-lease ownership, workspace effects, environment changes, credential minting,
   and distributed inference. mDNS advertisement and discovery now use an authority-free metadata

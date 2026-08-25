@@ -141,6 +141,15 @@ bootstrap; the resulting WebSocket is a correlated bidirectional Cap'n Proto ses
 snapshot/event projections plus submit, acknowledge, and detach commands. Commands inherit the
 exact socket attachment rather than accepting client-authored attachment IDs, and the daemon
 revalidates the signed credential for each mutation and periodically while the connection is idle.
+An owner can now issue a role- and Brain-scoped invitation without disclosing the bootstrap
+password. Invitations are short-lived, signed under a domain-separated credential key, fix the
+Brain ID, environment generation, role, scope ceiling, delegation ancestry, and expiry, and cannot
+mint runner authority. Redemption binds one participant subject and produces the ordinary scoped
+credential used by attachment bootstrap. The binding is persisted before response, is idempotently
+recoverable by that same subject after response loss or daemon restart, rejects every different
+subject, and inherits ancestor revocation. `/brain invite` and `/brain join` expose this exchange;
+the remaining remote-security gap is channel encryption and cryptographic peer identity, not a
+second invitation authentication path.
 
 The daemon's transport-neutral submission operation never executes ProgramRuns inside the daemon.
 It serializes the accepted event, requires the active environment lease's registered callback, and
@@ -541,7 +550,9 @@ Exit: local, daemon, and remote attachment render the same event history.
 
 - Keep the completed removal of advertised peer tokens covered by an authority-free allowlist test,
   and replace the remaining plaintext remote Brain authentication.
-- Add cryptographic node identity, encrypted authenticated channels, invitations/ACLs, and revocation.
+- Keep the completed signed, expiring, retry-safe, single-participant invitation/ACL and descendant
+  revocation path covered while adding cryptographic node identity and encrypted authenticated
+  channels.
 - Advertise only stable discovery metadata; retrieve live capabilities after authentication.
 
 Exit: hostile-LAN, replay, confused-deputy, and cross-Brain authorization tests pass.
