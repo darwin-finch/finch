@@ -400,7 +400,10 @@ impl ProviderEntry {
                 base_url: None,
                 name: name.clone(),
             }),
-            Self::Ollama { .. } | Self::RemoteDaemon { .. } | Self::Local { .. } => None,
+            Self::ChatgptSubscription { .. }
+            | Self::Ollama { .. }
+            | Self::RemoteDaemon { .. }
+            | Self::Local { .. } => None,
         }
     }
 
