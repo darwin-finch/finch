@@ -3576,6 +3576,7 @@ mod handler_tests {
             sender: sender.into(),
             created_ms: 0,
             run_id: None,
+            mutation: None,
             kind,
         }
     }

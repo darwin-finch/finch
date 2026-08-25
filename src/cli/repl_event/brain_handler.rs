@@ -1466,6 +1466,7 @@ mod brain_handler_tests {
             sender: "test".into(),
             created_ms: 10,
             run_id: None,
+            mutation: None,
             kind,
         }
     }

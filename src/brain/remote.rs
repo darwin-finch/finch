@@ -1223,6 +1223,7 @@ impl RemoteBrainClient {
                         next_request_id = next_request_id.checked_add(1).unwrap_or(1);
                         let envelope = BrainRemoteEnvelope::Command(BrainRemoteCommand {
                             request_id,
+                            mutation: None,
                             kind: request.kind,
                         });
                         let encoded = match crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope) {
@@ -3167,6 +3168,7 @@ mod tests {
             sender: "bob@desktop.local".into(),
             created_ms: 10,
             run_id: None,
+            mutation: None,
             kind: BrainEventKind::Prompt {
                 text: "hello from another console".into(),
             },

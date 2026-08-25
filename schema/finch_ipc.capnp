@@ -1201,6 +1201,16 @@ struct BrainEvent {
     taskListReplaced       @28 :BrainTaskList;
     speculativePrompt      @29 :Text;
   }
+  hasMutation @29 :Bool;
+  mutation    @30 :BrainMutationReceipt;
+}
+
+struct BrainMutationReceipt {
+  mutationId           @0 :Text;
+  attachmentId         @1 :Text;
+  expectedRevision     @2 :UInt64;
+  environmentGeneration @3 :UInt64;
+  commandSha256        @4 :Text;
 }
 
 struct BrainSnapshot {
@@ -1244,6 +1254,16 @@ struct BrainRemoteCommand {
     cancelSchedule       @8 :Text;
     scheduleInitialization @9 :UInt64;
   }
+  # Absent only for connection-lifecycle operations (acknowledge/detach).
+  hasMutation @10 :Bool;
+  mutation    @11 :BrainRemoteMutation;
+}
+
+struct BrainRemoteMutation {
+  brainId               @0 :Text;
+  expectedRevision      @1 :UInt64;
+  environmentGeneration @2 :UInt64;
+  idempotencyKey        @3 :Text;
 }
 
 struct BrainScheduleCreateRequest {

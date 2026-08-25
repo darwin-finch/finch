@@ -49,6 +49,24 @@ impl AttachmentId {
     }
 }
 
+/// Durable identity and preconditions for one authorized Brain mutation.
+/// The receipt lives on the first canonical event produced by the mutation,
+/// making acceptance and deduplication one append-only commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainMutationReceipt {
+    pub mutation_id: uuid::Uuid,
+    pub attachment_id: AttachmentId,
+    pub expected_revision: u64,
+    pub environment_generation: u64,
+    pub command_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrainMutationAppend {
+    pub event: BrainEvent,
+    pub replayed: bool,
+}
+
 /// Identity of one live transport connection for a durable attachment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -530,6 +548,8 @@ pub struct BrainEvent {
         skip_serializing_if = "Option::is_none"
     )]
     pub run_id: Option<RunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation: Option<BrainMutationReceipt>,
     #[serde(flatten)]
     pub kind: BrainEventKind,
 }
@@ -2272,6 +2292,53 @@ impl BrainStore {
         self.push_locked(name, state, sender, kind)
     }
 
+    /// Append a mutation's first canonical event exactly once. Replays are
+    /// resolved before revision validation because a successful retry is
+    /// necessarily stale relative to its own original append.
+    pub fn push_idempotent(
+        &self,
+        name: &str,
+        sender: &str,
+        kind: BrainEventKind,
+        receipt: BrainMutationReceipt,
+    ) -> Result<BrainMutationAppend> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        if let Some(existing) = state.events.iter().find(|event| {
+            event.mutation.as_ref().is_some_and(|recorded| {
+                recorded.attachment_id == receipt.attachment_id
+                    && recorded.mutation_id == receipt.mutation_id
+            })
+        }) {
+            let recorded = existing.mutation.as_ref().expect("matched mutation receipt");
+            anyhow::ensure!(
+                recorded == &receipt,
+                "Brain mutation idempotency key was reused with a different command"
+            );
+            return Ok(BrainMutationAppend {
+                event: existing.clone(),
+                replayed: true,
+            });
+        }
+        anyhow::ensure!(
+            receipt.environment_generation == self.environment.generation,
+            "Brain mutation environment generation is stale"
+        );
+        let revision = state.events.last().map(|event| event.seq).unwrap_or(0);
+        anyhow::ensure!(
+            receipt.expected_revision == revision,
+            "Brain mutation expected revision {} but current revision is {revision}",
+            receipt.expected_revision
+        );
+        let event = self.push_locked_with_mutation(name, state, sender, kind, Some(receipt))?;
+        Ok(BrainMutationAppend {
+            event,
+            replayed: false,
+        })
+    }
+
     fn push_locked(
         &self,
         name: &str,
@@ -2279,16 +2346,31 @@ impl BrainStore {
         sender: &str,
         kind: BrainEventKind,
     ) -> Result<BrainEvent> {
-        self.push_locked_for_run(name, state, sender, None, kind)
+        self.push_locked_with_context(name, state, sender, None, kind, None)
     }
 
     fn push_locked_for_run(
+        &self, name: &str, state: &mut BrainState, sender: &str,
+        run_id: Option<RunId>, kind: BrainEventKind,
+    ) -> Result<BrainEvent> {
+        self.push_locked_with_context(name, state, sender, run_id, kind, None)
+    }
+
+    fn push_locked_with_mutation(
+        &self, name: &str, state: &mut BrainState, sender: &str,
+        kind: BrainEventKind, mutation: Option<BrainMutationReceipt>,
+    ) -> Result<BrainEvent> {
+        self.push_locked_with_context(name, state, sender, None, kind, mutation)
+    }
+
+    fn push_locked_with_context(
         &self,
         name: &str,
         state: &mut BrainState,
         sender: &str,
         run_id: Option<RunId>,
         kind: BrainEventKind,
+        mutation: Option<BrainMutationReceipt>,
     ) -> Result<BrainEvent> {
         if let BrainEventKind::ScheduleChanged { schedule } = &kind {
             if schedule.module_identity.is_some() {
@@ -2324,6 +2406,7 @@ impl BrainStore {
             sender: sender.trim().to_string(),
             created_ms: unix_millis(),
             run_id,
+            mutation,
             kind,
         };
         self.append_event(name, &event)?;
@@ -2769,6 +2852,7 @@ impl BrainStore {
                 sender: "daemon".into(),
                 created_ms: unix_millis(),
                 run_id: Some(run_id),
+                mutation: None,
                 kind: BrainEventKind::RunStatusChanged {
                     run_id,
                     status: BrainRunStatus::Interrupted,
@@ -3225,6 +3309,120 @@ const fn legacy_schedule_language() -> ProgramLanguage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mutation_receipt(
+        store: &BrainStore,
+        attachment_id: AttachmentId,
+        mutation_id: uuid::Uuid,
+        expected_revision: u64,
+        fingerprint: &str,
+    ) -> BrainMutationReceipt {
+        BrainMutationReceipt {
+            mutation_id,
+            attachment_id,
+            expected_revision,
+            environment_generation: store.environment().generation,
+            command_sha256: fingerprint.into(),
+        }
+    }
+
+    #[test]
+    fn mutation_receipt_replays_from_the_canonical_log_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let mutation_id = uuid::Uuid::new_v4();
+        let receipt = mutation_receipt(
+            &store,
+            attachment.attachment_id,
+            mutation_id,
+            0,
+            "sha256:first",
+        );
+        let first = store
+            .push_idempotent(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt { text: "once".into() },
+                receipt.clone(),
+            )
+            .unwrap();
+        assert!(!first.replayed);
+        drop(store);
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let replayed = restarted
+            .push_idempotent(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt { text: "once".into() },
+                receipt,
+            )
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.event.seq, first.event.seq);
+        assert_eq!(restarted.snapshot("shared").unwrap().revision, 1);
+    }
+
+    #[test]
+    fn mutation_receipt_rejects_stale_revision_and_fingerprint_reuse() {
+        let store = BrainStore::with_root("box.local", None);
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let mutation_id = uuid::Uuid::new_v4();
+        store
+            .push_idempotent(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt { text: "once".into() },
+                mutation_receipt(
+                    &store,
+                    attachment.attachment_id,
+                    mutation_id,
+                    0,
+                    "sha256:first",
+                ),
+            )
+            .unwrap();
+
+        let conflict = store.push_idempotent(
+            "shared",
+            "alice",
+            BrainEventKind::Prompt { text: "forged".into() },
+            mutation_receipt(
+                &store,
+                attachment.attachment_id,
+                mutation_id,
+                0,
+                "sha256:different",
+            ),
+        );
+        assert!(conflict
+            .unwrap_err()
+            .to_string()
+            .contains("reused with a different command"));
+
+        let stale = store.push_idempotent(
+            "shared",
+            "alice",
+            BrainEventKind::Prompt { text: "stale".into() },
+            mutation_receipt(
+                &store,
+                attachment.attachment_id,
+                uuid::Uuid::new_v4(),
+                0,
+                "sha256:stale",
+            ),
+        );
+        assert!(stale
+            .unwrap_err()
+            .to_string()
+            .contains("expected revision 0 but current revision is 1"));
+        assert_eq!(store.snapshot("shared").unwrap().revision, 1);
+    }
 
     #[test]
     fn schedule_due_is_one_durable_coalesced_run_until_terminal() {
@@ -4637,6 +4835,7 @@ mod tests {
         assert_ne!(snapshot.brain_id, BrainId::nil());
         assert_eq!(snapshot.events[0].schema_version, 1);
         assert_eq!(snapshot.events[0].brain_id, snapshot.brain_id);
+        assert!(snapshot.events[0].mutation.is_none());
 
         let appended = store
             .push(

@@ -230,7 +230,16 @@ pub(super) fn decode_messages(
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BrainRemoteCommand {
     pub request_id: u64,
+    pub mutation: Option<BrainRemoteMutation>,
     pub kind: BrainRemoteCommandKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BrainRemoteMutation {
+    pub brain_id: BrainId,
+    pub expected_revision: u64,
+    pub environment_generation: u64,
+    pub idempotency_key: uuid::Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -600,6 +609,14 @@ pub(crate) fn encode_brain_remote_envelope(
         BrainRemoteEnvelope::Command(command) => {
             let mut builder = root.reborrow().init_command();
             builder.set_request_id(command.request_id);
+            if let Some(mutation) = &command.mutation {
+                builder.set_has_mutation(true);
+                let mut encoded = builder.reborrow().init_mutation();
+                encoded.set_brain_id(&mutation.brain_id.0.to_string());
+                encoded.set_expected_revision(mutation.expected_revision);
+                encoded.set_environment_generation(mutation.environment_generation);
+                encoded.set_idempotency_key(&mutation.idempotency_key.to_string());
+            }
             match &command.kind {
                 BrainRemoteCommandKind::Submit(kind) => {
                     encode_brain_submission(builder.init_submit(), kind)?
@@ -729,6 +746,19 @@ pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<Brain
         EnvelopeWhich::Command(command) => {
             let command = command?;
             let request_id = command.get_request_id();
+            let mutation = command
+                .get_has_mutation()
+                .then(|| command.get_mutation())
+                .transpose()?
+                .map(|mutation| {
+                    Ok::<_, anyhow::Error>(BrainRemoteMutation {
+                        brain_id: parse_brain_id(mutation.get_brain_id()?)?,
+                        expected_revision: mutation.get_expected_revision(),
+                        environment_generation: mutation.get_environment_generation(),
+                        idempotency_key: parse_uuid(mutation.get_idempotency_key()?)?,
+                    })
+                })
+                .transpose()?;
             let kind = match command.which()? {
                 CommandWhich::Submit(submission) => {
                     BrainRemoteCommandKind::Submit(decode_brain_submission(submission?)?)
@@ -788,7 +818,11 @@ pub(crate) fn decode_brain_remote_envelope(bytes: &[u8]) -> anyhow::Result<Brain
                     BrainRemoteCommandKind::ScheduleInitialization { next_due_ms }
                 }
             };
-            BrainRemoteEnvelope::Command(BrainRemoteCommand { request_id, kind })
+            BrainRemoteEnvelope::Command(BrainRemoteCommand {
+                request_id,
+                mutation,
+                kind,
+            })
         }
         EnvelopeWhich::Reply(reply) => {
             let reply = reply?;
@@ -1278,6 +1312,15 @@ pub(super) fn encode_event(
         builder.set_has_run_id(true);
         builder.set_run_id(&run_id.0.to_string());
     }
+    if let Some(receipt) = &event.mutation {
+        builder.set_has_mutation(true);
+        let mut mutation = builder.reborrow().init_mutation();
+        mutation.set_mutation_id(&receipt.mutation_id.to_string());
+        mutation.set_attachment_id(&receipt.attachment_id.0.to_string());
+        mutation.set_expected_revision(receipt.expected_revision);
+        mutation.set_environment_generation(receipt.environment_generation);
+        mutation.set_command_sha256(&receipt.command_sha256);
+    }
     match &event.kind {
         BrainEventKind::RunnerLeaseAcquired { lease } => {
             encode_runner_lease(builder.init_runner_lease_acquired(), lease);
@@ -1621,6 +1664,20 @@ pub(super) fn decode_event(
             .map(parse_uuid)
             .transpose()?
             .map(RunId),
+        mutation: reader
+            .get_has_mutation()
+            .then(|| reader.get_mutation())
+            .transpose()?
+            .map(|mutation| -> anyhow::Result<_> {
+                Ok(crate::brain::store::BrainMutationReceipt {
+                    mutation_id: parse_uuid(mutation.get_mutation_id()?)?,
+                    attachment_id: AttachmentId(parse_uuid(mutation.get_attachment_id()?)?),
+                    expected_revision: mutation.get_expected_revision(),
+                    environment_generation: mutation.get_environment_generation(),
+                    command_sha256: text(mutation.get_command_sha256()?)?,
+                })
+            })
+             .transpose()?,
         kind,
     })
 }
@@ -1650,6 +1707,7 @@ mod tests {
             sender: "alice@laptop.local".into(),
             created_ms: 123_000 + seq,
             run_id: None,
+            mutation: None,
             kind,
         }
     }
@@ -1969,13 +2027,20 @@ mod tests {
             connected: true,
             connection_id: Some(ConnectionId(uuid::Uuid::new_v4())),
         };
-        let accepted = event(
+        let mut accepted = event(
             brain_id,
             5,
             BrainEventKind::Prompt {
                 text: "inspect it".into(),
             },
         );
+        accepted.mutation = Some(crate::brain::store::BrainMutationReceipt {
+            mutation_id: uuid::Uuid::new_v4(),
+            attachment_id: attachment.attachment_id,
+            expected_revision: 4,
+            environment_generation: 7,
+            command_sha256: "submitted-command-digest".into(),
+        });
         let handoff = BrainRunnerHandoff {
             handoff_id: RunnerHandoffId(uuid::Uuid::new_v4()),
             from_lease_id: RunnerLeaseId(uuid::Uuid::new_v4()),
@@ -2014,29 +2079,40 @@ mod tests {
             }),
             active: true,
         };
+        let remote_mutation = BrainRemoteMutation {
+            brain_id,
+            expected_revision: 4,
+            environment_generation: 7,
+            idempotency_key: uuid::Uuid::new_v4(),
+        };
         let envelopes = vec![
             BrainRemoteEnvelope::Command(BrainRemoteCommand {
                 request_id: 1,
+                mutation: Some(remote_mutation.clone()),
                 kind: BrainRemoteCommandKind::Submit(BrainEventKind::Prompt {
                     text: "inspect it".into(),
                 }),
             }),
             BrainRemoteEnvelope::Command(BrainRemoteCommand {
                 request_id: 11,
+                mutation: None,
                 kind: BrainRemoteCommandKind::Submit(BrainEventKind::SpeculativePrompt {
                     text: "inspect ahead".into(),
                 }),
             }),
             BrainRemoteEnvelope::Command(BrainRemoteCommand {
                 request_id: 2,
+                mutation: None,
                 kind: BrainRemoteCommandKind::Acknowledge(5),
             }),
             BrainRemoteEnvelope::Command(BrainRemoteCommand {
                 request_id: 3,
+                mutation: None,
                 kind: BrainRemoteCommandKind::Detach,
             }),
             BrainRemoteEnvelope::Command(BrainRemoteCommand {
                 request_id: 4,
+                mutation: Some(remote_mutation.clone()),
                 kind: BrainRemoteCommandKind::RequestRunnerHandoff {
                     target_subject: handoff.target_subject.clone(),
                     expected_lease_id: handoff.from_lease_id,
@@ -2046,14 +2122,17 @@ mod tests {
             }),
             BrainRemoteEnvelope::Command(BrainRemoteCommand {
                 request_id: 5,
+                mutation: Some(remote_mutation.clone()),
                 kind: BrainRemoteCommandKind::CancelRunnerHandoff(handoff.handoff_id),
             }),
             BrainRemoteEnvelope::Command(BrainRemoteCommand {
                 request_id: 6,
+                mutation: Some(remote_mutation.clone()),
                 kind: BrainRemoteCommandKind::CancelRun(run.run_id),
             }),
             BrainRemoteEnvelope::Command(BrainRemoteCommand {
                 request_id: 7,
+                mutation: Some(remote_mutation.clone()),
                 kind: BrainRemoteCommandKind::CreateSchedule {
                     language: schedule.language,
                     source: schedule.source.clone(),
@@ -2065,10 +2144,12 @@ mod tests {
             }),
             BrainRemoteEnvelope::Command(BrainRemoteCommand {
                 request_id: 8,
+                mutation: Some(remote_mutation.clone()),
                 kind: BrainRemoteCommandKind::CancelSchedule(schedule.schedule_id),
             }),
             BrainRemoteEnvelope::Command(BrainRemoteCommand {
                 request_id: 9,
+                mutation: Some(remote_mutation),
                 kind: BrainRemoteCommandKind::ScheduleInitialization { next_due_ms: 900 },
             }),
             BrainRemoteEnvelope::Reply(BrainRemoteReply::Submitted {
