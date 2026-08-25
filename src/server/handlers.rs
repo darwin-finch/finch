@@ -73,6 +73,18 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
                 .post(push_named_brain_event)
                 .delete(archive_named_brain),
         )
+        .route(
+            "/v1/brains/named/:name/attachments",
+            post(attach_named_brain),
+        )
+        .route(
+            "/v1/brains/named/:name/attachments/:attachment_id/ack",
+            post(acknowledge_named_brain),
+        )
+        .route(
+            "/v1/brains/named/:name/attachments/:attachment_id/connections/:connection_id",
+            axum::routing::delete(detach_named_brain),
+        )
         .route("/v1/brains/named/:name/ws", get(watch_named_brain))
         .route(
             "/v1/brains/password",
@@ -191,6 +203,86 @@ async fn get_named_brain(
         .map_err(|error| AppError(error).into_response())
 }
 
+#[derive(Debug, Deserialize)]
+struct AttachNamedBrainRequest {
+    subject: String,
+    role: crate::brain::shared::AttachmentRole,
+    attachment_id: Option<crate::brain::shared::AttachmentId>,
+}
+
+async fn attach_named_brain(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(request): Json<AttachNamedBrainRequest>,
+) -> Result<Json<crate::brain::shared::BrainAttachment>, Response> {
+    check_brain_access(&server, addr, &headers).await?;
+    if request.role == crate::brain::shared::AttachmentRole::Runner {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "runner authority requires a runner lease, not a client attachment"
+            })),
+        )
+            .into_response());
+    }
+    server
+        .shared_brains()
+        .attach(
+            &name,
+            &request.subject,
+            request.role,
+            request.attachment_id,
+        )
+        .map(Json)
+        .map_err(|error| AppError(error).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct AcknowledgeNamedBrainRequest {
+    connection_id: crate::brain::shared::ConnectionId,
+    seq: u64,
+}
+
+async fn acknowledge_named_brain(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((name, attachment_id)): Path<(String, uuid::Uuid)>,
+    Json(request): Json<AcknowledgeNamedBrainRequest>,
+) -> Result<Json<crate::brain::shared::BrainAttachment>, Response> {
+    check_brain_access(&server, addr, &headers).await?;
+    server
+        .shared_brains()
+        .acknowledge(
+            &name,
+            crate::brain::shared::AttachmentId(attachment_id),
+            request.connection_id,
+            request.seq,
+        )
+        .map(Json)
+        .map_err(|error| AppError(error).into_response())
+}
+
+async fn detach_named_brain(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((name, attachment_id, connection_id)): Path<(String, uuid::Uuid, uuid::Uuid)>,
+) -> Result<StatusCode, Response> {
+    check_brain_access(&server, addr, &headers).await?;
+    server
+        .shared_brains()
+        .detach(
+            &name,
+            crate::brain::shared::AttachmentId(attachment_id),
+            crate::brain::shared::ConnectionId(connection_id),
+        )
+        .map_err(|error| AppError(error).into_response())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Debug, Serialize)]
 struct ArchiveNamedBrainResponse {
     name: String,
@@ -221,7 +313,8 @@ async fn archive_named_brain(
 
 #[derive(Debug, Deserialize)]
 struct PushNamedBrainEvent {
-    sender: String,
+    attachment_id: crate::brain::shared::AttachmentId,
+    connection_id: crate::brain::shared::ConnectionId,
     #[serde(flatten)]
     kind: crate::brain::shared::BrainEventKind,
 }
@@ -231,6 +324,23 @@ struct PushNamedBrainResponse {
     accepted: crate::brain::shared::BrainEvent,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<crate::brain::shared::BrainEvent>,
+}
+
+fn attachment_can_submit(
+    role: crate::brain::shared::AttachmentRole,
+    kind: &crate::brain::shared::BrainEventKind,
+) -> bool {
+    use crate::brain::shared::{AttachmentRole, BrainEventKind};
+    match role {
+        AttachmentRole::Driver => matches!(
+            kind,
+            BrainEventKind::Prompt { .. }
+                | BrainEventKind::Program { .. }
+                | BrainEventKind::ProgramPopped { .. }
+        ),
+        AttachmentRole::Consultant => matches!(kind, BrainEventKind::Prompt { .. }),
+        AttachmentRole::Observer | AttachmentRole::Runner => false,
+    }
 }
 
 async fn push_named_brain_event(
@@ -243,6 +353,10 @@ async fn push_named_brain_event(
     use crate::brain::shared::BrainEventKind;
 
     check_brain_access(&server, addr, &headers).await?;
+    let attachment = server
+        .shared_brains()
+        .require_connection(&name, request.attachment_id, request.connection_id)
+        .map_err(|error| AppError(error).into_response())?;
     if !matches!(
         request.kind,
         BrainEventKind::Prompt { .. }
@@ -257,6 +371,15 @@ async fn push_named_brain_event(
         )
             .into_response());
     }
+    if !attachment_can_submit(attachment.role, &request.kind) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "attachment role cannot submit this Brain event"
+            })),
+        )
+            .into_response());
+    }
     // A Brain is one ordered conversation and one authoritative VM revision.
     // Hold its lane from input acceptance through the corresponding result so
     // two attached consoles cannot race commits or interleave turn events.
@@ -267,7 +390,7 @@ async fn push_named_brain_event(
     let _turn = execution_lock.lock_owned().await;
     let accepted = server
         .shared_brains()
-        .push(&name, &request.sender, request.kind.clone())
+        .push(&name, &attachment.subject, request.kind.clone())
         .map_err(|error| AppError(error).into_response())?;
 
     let result = match request.kind {
@@ -640,9 +763,16 @@ async fn watch_named_brain(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    Query(connection): Query<WatchNamedBrainQuery>,
     ws: axum::extract::WebSocketUpgrade,
 ) -> Result<Response, Response> {
     check_brain_access(&server, addr, &headers).await?;
+    let attachment_id = crate::brain::shared::AttachmentId(connection.attachment_id);
+    let connection_id = crate::brain::shared::ConnectionId(connection.connection_id);
+    server
+        .shared_brains()
+        .require_connection(&name, attachment_id, connection_id)
+        .map_err(|error| AppError(error).into_response())?;
     // Subscribe before taking the snapshot. Events appended after the
     // snapshot revision then wait in this receiver and are sent immediately
     // afterward, so an attaching console cannot miss the gap between two
@@ -662,20 +792,39 @@ async fn watch_named_brain(
             let initial = crate::brain::shared::BrainWireMessage::Snapshot { brain: snapshot };
             if let Ok(json) = serde_json::to_string(&initial) {
                 if socket.send(WsMessage::Text(json.into())).await.is_err() {
+                    let _ = store.detach(&name, attachment_id, connection_id);
                     return;
                 }
             }
             loop {
-                let wire = match events.recv().await {
-                    Ok(event) => crate::brain::shared::BrainWireMessage::Event { event },
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let Ok(brain) = store.snapshot(&name) else {
-                            break;
-                        };
-                        crate::brain::shared::BrainWireMessage::Snapshot { brain }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                let wire = tokio::select! {
+                    incoming = socket.recv() => match incoming {
+                        Some(Ok(WsMessage::Ping(payload))) => {
+                            if socket.send(WsMessage::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                        Some(Ok(_)) => continue,
+                    },
+                    event = events.recv() => match event {
+                        Ok(event) => crate::brain::shared::BrainWireMessage::Event { event },
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let Ok(brain) = store.snapshot(&name) else {
+                                break;
+                            };
+                            crate::brain::shared::BrainWireMessage::Snapshot { brain }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
                 };
+                if store
+                    .require_connection(&name, attachment_id, connection_id)
+                    .is_err()
+                {
+                    break;
+                }
                 let Ok(json) = serde_json::to_string(&wire) else {
                     continue;
                 };
@@ -683,8 +832,15 @@ async fn watch_named_brain(
                     break;
                 }
             }
+            let _ = store.detach(&name, attachment_id, connection_id);
         })
         .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct WatchNamedBrainQuery {
+    attachment_id: uuid::Uuid,
+    connection_id: uuid::Uuid,
 }
 
 async fn show_brain_password(
@@ -1852,5 +2008,25 @@ mod named_brain_provider_context_tests {
         assert_eq!(value["retained_programs"], 7);
         assert!(value.get("revision").is_none());
         assert!(value.get("programs").is_none());
+    }
+
+    #[test]
+    fn attachment_roles_bound_which_events_the_client_may_submit() {
+        use crate::brain::shared::AttachmentRole;
+
+        let prompt = BrainEventKind::Prompt { text: "hello".into() };
+        let program = BrainEventKind::Program {
+            language: ProgramLanguage::Lisp,
+            source: "(say \"hello\")".into(),
+        };
+        assert!(attachment_can_submit(AttachmentRole::Driver, &prompt));
+        assert!(attachment_can_submit(AttachmentRole::Driver, &program));
+        assert!(attachment_can_submit(AttachmentRole::Consultant, &prompt));
+        assert!(!attachment_can_submit(
+            AttachmentRole::Consultant,
+            &program
+        ));
+        assert!(!attachment_can_submit(AttachmentRole::Observer, &prompt));
+        assert!(!attachment_can_submit(AttachmentRole::Runner, &program));
     }
 }

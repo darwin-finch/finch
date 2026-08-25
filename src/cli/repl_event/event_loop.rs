@@ -2883,7 +2883,20 @@ Rules:\n\
                     .as_ref()
                     .is_some_and(|client| client.target.display_name() == target);
                 if is_current {
+                    let acknowledged_seq = match &message {
+                        crate::brain::shared::BrainWireMessage::Snapshot { brain } => {
+                            brain.revision
+                        }
+                        crate::brain::shared::BrainWireMessage::Event { event } => event.seq,
+                    };
                     self.render_remote_brain_message(message).await?;
+                    if let Some(client) = self.active_remote_brain.as_mut() {
+                        if let Err(error) = client.acknowledge(acknowledged_seq).await {
+                            self.output_manager
+                                .write_info(format!("{target}: could not save cursor: {error}"));
+                            self.render_tui().await?;
+                        }
+                    }
                 }
             }
             ReplEvent::RemoteBrainError { target, error } => {
@@ -2898,10 +2911,10 @@ Rules:\n\
                 if is_current {
                     self.status_bar.update_line(
                         crate::cli::status_bar::StatusLineType::SessionLabel,
-                        format!("◆ brain: {target} · driver · runner offline"),
+                        format!("◆ brain: {target} · driver · disconnected"),
                     );
                     self.output_manager.write_info(format!(
-                        "{target}: runner connection closed; detach or reattach to reconnect"
+                        "{target}: Brain event connection closed; detach or reattach to reconnect"
                     ));
                     self.render_tui().await?;
                 }
@@ -3231,9 +3244,34 @@ Rules:\n\
             .map(|config| config.server.brain_password)
             .unwrap_or_default();
         let mut client = crate::brain::remote::RemoteBrainClient::new(target, password)?;
+        let reusable_attachment = self
+            .active_remote_brain
+            .as_ref()
+            .filter(|active| {
+                active.target.brain == client.target.brain
+                    && active.target.address == client.target.address
+            })
+            .and_then(|active| active.attachment())
+            .map(|attachment| attachment.attachment_id);
+        if let Err(error) = client
+            .attach(
+                &self.session_label,
+                crate::brain::shared::AttachmentRole::Driver,
+                reusable_attachment,
+            )
+            .await
+        {
+            self.output_manager.write_info(format!(
+                "brain attach {}: {error}",
+                client.target.display_name()
+            ));
+            self.render_tui().await?;
+            return Ok(());
+        }
         let mut incoming = match client.watch().await {
             Ok(incoming) => incoming,
             Err(error) => {
+                let _ = client.disconnect().await;
                 self.output_manager.write_info(format!(
                     "brain attach {}: {error}",
                     client.target.display_name()
@@ -3267,7 +3305,7 @@ Rules:\n\
         self.active_remote_brain = Some(client);
         self.status_bar.update_line(
             crate::cli::status_bar::StatusLineType::SessionLabel,
-            format!("◆ brain: {target_name} · driver · runner online"),
+            format!("◆ brain: {target_name} · driver"),
         );
         self.render_remote_brain_message(crate::brain::shared::BrainWireMessage::Snapshot {
             brain: snapshot,
@@ -3296,6 +3334,12 @@ Rules:\n\
 
     async fn handle_brain_detach(&mut self) -> Result<()> {
         if let Some(client) = self.active_remote_brain.take() {
+            if let Err(error) = client.disconnect().await {
+                self.output_manager.write_info(format!(
+                    "{}: could not close attachment cleanly: {error}",
+                    client.target.display_name()
+                ));
+            }
             self.output_manager
                 .write_info(format!("detached from {}", client.target.display_name()));
         }
@@ -3362,10 +3406,9 @@ Rules:\n\
             return Ok(());
         };
         let target = client.target.display_name();
-        let sender = self.session_label.clone();
         let event_tx = self.event_tx.clone();
         tokio::spawn(async move {
-            if let Err(error) = client.push(&sender, kind).await {
+            if let Err(error) = client.push(kind).await {
                 let _ = event_tx.send(ReplEvent::RemoteBrainError {
                     target,
                     error: error.to_string(),
@@ -3381,14 +3424,23 @@ Rules:\n\
     ) -> Result<()> {
         match message {
             crate::brain::shared::BrainWireMessage::Snapshot { brain } => {
-                self.output_manager.clear();
+                let acknowledged_seq = self
+                    .active_remote_brain
+                    .as_ref()
+                    .and_then(|client| client.attachment())
+                    .map(|attachment| attachment.acknowledged_seq)
+                    .unwrap_or(0);
                 self.output_manager.write_info(format!(
                     "environment: {}:{} (generation {})",
                     brain.environment.machine,
                     brain.environment.workspace.display(),
                     brain.environment.generation,
                 ));
-                for event in &brain.events {
+                for event in brain
+                    .events
+                    .iter()
+                    .filter(|event| event.seq > acknowledged_seq)
+                {
                     self.render_remote_brain_event(event);
                 }
             }
@@ -3408,7 +3460,7 @@ Rules:\n\
                 "{subject} attached as {}",
                 format!("{role:?}").to_lowercase()
             )),
-            BrainEventKind::ClientDetached { attachment_id } => self
+            BrainEventKind::ClientDetached { attachment_id, .. } => self
                 .output_manager
                 .write_info(format!("attachment {} disconnected", attachment_id.0)),
             BrainEventKind::Prompt { text } => self

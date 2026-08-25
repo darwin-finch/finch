@@ -7,7 +7,10 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use super::shared::{BrainEventKind, BrainSnapshot, BrainWireMessage};
+use super::shared::{
+    AttachmentId, AttachmentRole, BrainAttachment, BrainEventKind, BrainSnapshot,
+    BrainWireMessage,
+};
 
 pub const DEFAULT_BRAIN_PORT: u16 = 11435;
 
@@ -68,8 +71,18 @@ impl RemoteBrainTarget {
         format!("http://{}/v1/brains/named/{}", self.address, self.brain)
     }
 
-    fn ws_url(&self) -> String {
-        format!("ws://{}/v1/brains/named/{}/ws", self.address, self.brain)
+    fn attachments_url(&self) -> String {
+        format!("{}/attachments", self.http_url())
+    }
+
+    fn ws_url(&self, attachment: &BrainAttachment) -> Result<String> {
+        let connection_id = attachment
+            .connection_id
+            .context("Brain attachment has no live connection")?;
+        Ok(format!(
+            "ws://{}/v1/brains/named/{}/ws?attachment_id={}&connection_id={}",
+            self.address, self.brain, attachment.attachment_id.0, connection_id.0
+        ))
     }
 }
 
@@ -83,6 +96,7 @@ pub struct RemoteBrainClient {
     pub target: RemoteBrainTarget,
     password: String,
     http: Client,
+    attachment: Option<BrainAttachment>,
 }
 
 impl RemoteBrainClient {
@@ -93,7 +107,46 @@ impl RemoteBrainClient {
             http: Client::builder()
                 .timeout(std::time::Duration::from_secs(180))
                 .build()?,
+            attachment: None,
         })
+    }
+
+    pub fn attachment(&self) -> Option<&BrainAttachment> {
+        self.attachment.as_ref()
+    }
+
+    pub async fn attach(
+        &mut self,
+        subject: &str,
+        role: AttachmentRole,
+        attachment_id: Option<AttachmentId>,
+    ) -> Result<BrainAttachment> {
+        #[derive(Serialize)]
+        struct Attach<'a> {
+            subject: &'a str,
+            role: AttachmentRole,
+            attachment_id: Option<AttachmentId>,
+        }
+
+        let attachment = self
+            .http
+            .post(self.target.attachments_url())
+            .bearer_auth(&self.password)
+            .json(&Attach {
+                subject,
+                role,
+                attachment_id,
+            })
+            .send()
+            .await
+            .context("could not reach brain host")?
+            .error_for_status()
+            .context("brain attachment rejected")?
+            .json::<BrainAttachment>()
+            .await
+            .context("invalid brain attachment")?;
+        self.attachment = Some(attachment.clone());
+        Ok(attachment)
     }
 
     pub async fn snapshot(&self) -> Result<BrainSnapshot> {
@@ -110,18 +163,31 @@ impl RemoteBrainClient {
             .context("invalid brain snapshot")
     }
 
-    pub async fn push(&self, sender: &str, kind: BrainEventKind) -> Result<()> {
+    pub async fn push(&self, kind: BrainEventKind) -> Result<()> {
         #[derive(Serialize)]
-        struct Push<'a> {
-            sender: &'a str,
+        struct Push {
+            attachment_id: AttachmentId,
+            connection_id: super::shared::ConnectionId,
             #[serde(flatten)]
             kind: BrainEventKind,
         }
 
+        let attachment = self
+            .attachment
+            .as_ref()
+            .context("client is not attached to a Brain")?;
+        let connection_id = attachment
+            .connection_id
+            .context("Brain attachment has no live connection")?;
+
         self.http
             .post(self.target.http_url())
             .bearer_auth(&self.password)
-            .json(&Push { sender, kind })
+            .json(&Push {
+                attachment_id: attachment.attachment_id,
+                connection_id,
+                kind,
+            })
             .send()
             .await
             .context("could not reach brain host")?
@@ -130,24 +196,94 @@ impl RemoteBrainClient {
         Ok(())
     }
 
+    pub async fn acknowledge(&mut self, seq: u64) -> Result<()> {
+        let attachment = self
+            .attachment
+            .as_ref()
+            .context("client is not attached to a Brain")?;
+        let connection_id = attachment
+            .connection_id
+            .context("Brain attachment has no live connection")?;
+        let updated = self
+            .http
+            .post(format!(
+                "{}/{}/ack",
+                self.target.attachments_url(),
+                attachment.attachment_id.0
+            ))
+            .bearer_auth(&self.password)
+            .json(&serde_json::json!({
+                "connection_id": connection_id,
+                "seq": seq
+            }))
+            .send()
+            .await
+            .context("could not reach brain host")?
+            .error_for_status()
+            .context("brain acknowledgement rejected")?
+            .json::<BrainAttachment>()
+            .await
+            .context("invalid brain acknowledgement")?;
+        self.attachment = Some(updated);
+        Ok(())
+    }
+
+    pub async fn disconnect(&self) -> Result<()> {
+        let attachment = self
+            .attachment
+            .as_ref()
+            .context("client is not attached to a Brain")?;
+        let connection_id = attachment
+            .connection_id
+            .context("Brain attachment has no live connection")?;
+        self.http
+            .delete(format!(
+                "{}/{}/connections/{}",
+                self.target.attachments_url(),
+                attachment.attachment_id.0,
+                connection_id.0
+            ))
+            .bearer_auth(&self.password)
+            .send()
+            .await
+            .context("could not reach brain host")?
+            .error_for_status()
+            .context("brain detach rejected")?;
+        Ok(())
+    }
+
     /// Connect to the brain's snapshot/live-event stream.
     pub async fn watch(&self) -> Result<mpsc::UnboundedReceiver<BrainWireMessage>> {
-        let mut request = self.target.ws_url().into_client_request()?;
+        let attachment = self
+            .attachment
+            .as_ref()
+            .context("client is not attached to a Brain")?;
+        let mut request = self.target.ws_url(attachment)?.into_client_request()?;
         request.headers_mut().insert(
             tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
             format!("Bearer {}", self.password).parse()?,
         );
-        let (socket, _) = tokio_tungstenite::connect_async(request)
+        let (mut socket, _) = tokio_tungstenite::connect_async(request)
             .await
             .context("could not open brain event stream")?;
-        let (_, mut incoming) = socket.split();
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            while let Some(Ok(message)) = incoming.next().await {
-                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
-                    if let Ok(message) = serde_json::from_str::<BrainWireMessage>(&text) {
-                        if tx.send(message).is_err() {
+            loop {
+                tokio::select! {
+                    _ = tx.closed() => {
+                        let _ = socket.close(None).await;
+                        break;
+                    }
+                    incoming = socket.next() => {
+                        let Some(Ok(message)) = incoming else {
                             break;
+                        };
+                        if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                            if let Ok(message) = serde_json::from_str::<BrainWireMessage>(&text) {
+                                if tx.send(message).is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }

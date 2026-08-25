@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 2;
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 3;
 const BRAIN_METADATA_VERSION: u32 = 1;
 
 /// Stable identity of one durable Brain. Names are mutable human aliases;
@@ -45,6 +45,23 @@ impl AttachmentId {
     }
 }
 
+/// Identity of one live transport connection for a durable attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ConnectionId(pub uuid::Uuid);
+
+impl ConnectionId {
+    fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+impl Default for ConnectionId {
+    fn default() -> Self {
+        Self(uuid::Uuid::nil())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentRole {
@@ -61,6 +78,7 @@ pub struct BrainAttachment {
     pub role: AttachmentRole,
     pub acknowledged_seq: u64,
     pub connected: bool,
+    pub connection_id: Option<ConnectionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,11 +118,15 @@ pub struct BrainEnvironment {
 pub enum BrainEventKind {
     ClientAttached {
         attachment_id: AttachmentId,
+        #[serde(default)]
+        connection_id: ConnectionId,
         subject: String,
         role: AttachmentRole,
     },
     ClientDetached {
         attachment_id: AttachmentId,
+        #[serde(default)]
+        connection_id: ConnectionId,
     },
     Prompt {
         text: String,
@@ -218,6 +240,7 @@ impl BrainState {
         match &event.kind {
             BrainEventKind::ClientAttached {
                 attachment_id,
+                connection_id,
                 subject,
                 role,
             } => {
@@ -234,12 +257,19 @@ impl BrainState {
                         role: *role,
                         acknowledged_seq,
                         connected: true,
+                        connection_id: Some(*connection_id),
                     },
                 );
             }
-            BrainEventKind::ClientDetached { attachment_id } => {
+            BrainEventKind::ClientDetached {
+                attachment_id,
+                connection_id,
+            } => {
                 if let Some(attachment) = self.attachments.get_mut(attachment_id) {
-                    attachment.connected = false;
+                    if attachment.connection_id == Some(*connection_id) {
+                        attachment.connected = false;
+                        attachment.connection_id = None;
+                    }
                 }
             }
             BrainEventKind::Program { language, source } => {
@@ -412,6 +442,7 @@ impl SharedBrainStore {
             anyhow::bail!("attachment subject must be 1-128 printable characters");
         }
         let attachment_id = attachment_id.unwrap_or_else(AttachmentId::new);
+        let connection_id = ConnectionId::new();
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains.get_mut(name).expect("brain loaded above");
@@ -426,6 +457,7 @@ impl SharedBrainStore {
             subject,
             BrainEventKind::ClientAttached {
                 attachment_id,
+                connection_id,
                 subject: subject.to_string(),
                 role,
             },
@@ -437,23 +469,53 @@ impl SharedBrainStore {
             .context("attached client missing from Brain projection")
     }
 
-    pub fn detach(&self, name: &str, attachment_id: AttachmentId) -> Result<()> {
+    pub fn detach(
+        &self,
+        name: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+    ) -> Result<()> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
-        let subject = {
-            let brains = self.brains.read().expect("shared brain lock poisoned");
-            brains
-                .get(name)
-                .and_then(|state| state.attachments.get(&attachment_id))
-                .map(|attachment| attachment.subject.clone())
-                .context("unknown Brain attachment")?
-        };
-        self.push(
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).expect("brain loaded above");
+        let attachment = state
+            .attachments
+            .get(&attachment_id)
+            .context("unknown Brain attachment")?;
+        if attachment.connection_id != Some(connection_id) {
+            anyhow::bail!("Brain attachment connection is no longer current");
+        }
+        let subject = attachment.subject.clone();
+        self.push_locked(
             name,
+            state,
             &subject,
-            BrainEventKind::ClientDetached { attachment_id },
+            BrainEventKind::ClientDetached {
+                attachment_id,
+                connection_id,
+            },
         )?;
         Ok(())
+    }
+
+    pub fn require_connection(
+        &self,
+        name: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+    ) -> Result<BrainAttachment> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brains = self.brains.read().expect("shared brain lock poisoned");
+        let attachment = brains
+            .get(name)
+            .and_then(|state| state.attachments.get(&attachment_id))
+            .context("unknown Brain attachment")?;
+        if !attachment.connected || attachment.connection_id != Some(connection_id) {
+            anyhow::bail!("Brain attachment connection is no longer current");
+        }
+        Ok(attachment.clone())
     }
 
     /// Persist a projection cursor without appending another numbered Brain
@@ -463,6 +525,7 @@ impl SharedBrainStore {
         &self,
         name: &str,
         attachment_id: AttachmentId,
+        connection_id: ConnectionId,
         seq: u64,
     ) -> Result<BrainAttachment> {
         let name = Self::validate_name(name)?;
@@ -476,8 +539,11 @@ impl SharedBrainStore {
         let previous = state
             .attachments
             .get(&attachment_id)
-            .context("unknown Brain attachment")?
-            .acknowledged_seq;
+            .context("unknown Brain attachment")?;
+        if !previous.connected || previous.connection_id != Some(connection_id) {
+            anyhow::bail!("Brain attachment connection is no longer current");
+        }
+        let previous = previous.acknowledged_seq;
         if seq < previous {
             anyhow::bail!("attachment cursor cannot move backward from {previous} to {seq}");
         }
@@ -806,6 +872,7 @@ impl SharedBrainStore {
             // A process restart disconnects every transport projection;
             // reconnect appends a fresh ClientAttached event.
             attachment.connected = false;
+            attachment.connection_id = None;
         }
         for (attachment_id, acknowledged_seq) in cursors {
             if let Some(attachment) = state.attachments.get_mut(&attachment_id) {
@@ -1165,17 +1232,34 @@ mod tests {
             .attach("shared", "alice", AttachmentRole::Driver, None)
             .unwrap();
         let head = store.snapshot("shared").unwrap().revision;
+        let connection_id = attachment.connection_id.unwrap();
         let acknowledged = store
-            .acknowledge("shared", attachment.attachment_id, head)
+            .acknowledge("shared", attachment.attachment_id, connection_id, head)
             .unwrap();
         assert_eq!(acknowledged.acknowledged_seq, head);
         assert!(store
-            .acknowledge("shared", attachment.attachment_id, head + 1)
+            .acknowledge(
+                "shared",
+                attachment.attachment_id,
+                connection_id,
+                head + 1,
+            )
             .is_err());
         assert!(store
-            .acknowledge("shared", attachment.attachment_id, head - 1)
+            .acknowledge(
+                "shared",
+                attachment.attachment_id,
+                connection_id,
+                head - 1,
+            )
             .is_err());
-        store.detach("shared", attachment.attachment_id).unwrap();
+        store
+            .detach(
+                "shared",
+                attachment.attachment_id,
+                attachment.connection_id.unwrap(),
+            )
+            .unwrap();
 
         let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
         let restored = restarted
@@ -1240,6 +1324,47 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn stale_connection_cannot_disconnect_a_reattached_client() {
+        let store = SharedBrainStore::with_root("box.local", None);
+        let first = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let second = store
+            .attach(
+                "shared",
+                "alice",
+                AttachmentRole::Driver,
+                Some(first.attachment_id),
+            )
+            .unwrap();
+
+        assert_ne!(first.connection_id, second.connection_id);
+        assert!(store
+            .detach(
+                "shared",
+                first.attachment_id,
+                first.connection_id.unwrap(),
+            )
+            .is_err());
+        let head = store.snapshot("shared").unwrap().revision;
+        assert!(store
+            .acknowledge(
+                "shared",
+                first.attachment_id,
+                first.connection_id.unwrap(),
+                head,
+            )
+            .is_err());
+        assert!(store
+            .require_connection(
+                "shared",
+                second.attachment_id,
+                second.connection_id.unwrap(),
+            )
+            .is_ok());
     }
 
     #[test]
