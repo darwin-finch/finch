@@ -994,6 +994,10 @@ mod tests {
 
     struct EchoGenerator;
 
+    struct BlockingGenerator {
+        started: Arc<Notify>,
+    }
+
     #[async_trait]
     impl Generator for EchoGenerator {
         async fn generate(
@@ -1038,6 +1042,41 @@ mod tests {
 
         fn name(&self) -> &str {
             "echo"
+        }
+    }
+
+    #[async_trait]
+    impl Generator for BlockingGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<GeneratorResponse> {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> Result<Option<tokio::sync::mpsc::Receiver<Result<crate::generators::StreamChunk>>>>
+        {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &GeneratorCapabilities {
+            static CAPABILITIES: GeneratorCapabilities = GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(10),
+            };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "blocking"
         }
     }
 
@@ -1167,6 +1206,102 @@ mod tests {
         assert_eq!(result.status, AgentTaskStatus::Completed);
         assert_eq!(
             finished_rx.await.unwrap(),
+            crate::brain::store::RunId(identity.task_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn named_brain_child_cancellation_publishes_cancelled_terminal_state() {
+        let started = Arc::new(Notify::new());
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(BlockingGenerator {
+                started: Arc::clone(&started),
+            })),
+            Arc::new(ProgramRuntime::new()),
+        );
+        let parent_run_id = crate::brain::store::RunId(Uuid::new_v4());
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        scheduler.bind_brain_control(control_tx).await;
+        scheduler
+            .set_active_brain_parent(Some(AgentBrainContext {
+                run_id: parent_run_id,
+                request_seq: 9,
+            }))
+            .await;
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let AgentBrainControlRequest::Start {
+                task_id,
+                detail,
+                response_tx,
+                ..
+            } = control_rx.recv().await.unwrap()
+            else {
+                panic!("expected child start")
+            };
+            let run_id = crate::brain::store::RunId(task_id);
+            response_tx
+                .send(Ok(crate::brain::store::BrainRun {
+                    run_id,
+                    kind: crate::brain::store::BrainRunKind::Subagent,
+                    parent_run_id: Some(parent_run_id),
+                    request_seq: 9,
+                    initiating_attachment_id: crate::brain::store::AttachmentId(Uuid::new_v4()),
+                    initiated_by: "alice".into(),
+                    status: crate::brain::store::BrainRunStatus::Running,
+                    started_ms: 1,
+                    updated_ms: 1,
+                    detail: Some(detail),
+                }))
+                .unwrap();
+            let AgentBrainControlRequest::Finish {
+                status,
+                response_tx,
+                ..
+            } = control_rx.recv().await.unwrap()
+            else {
+                panic!("expected child finish")
+            };
+            assert_eq!(status, crate::brain::store::BrainRunStatus::Cancelled);
+            response_tx
+                .send(Ok(crate::brain::store::BrainRun {
+                    run_id,
+                    kind: crate::brain::store::BrainRunKind::Subagent,
+                    parent_run_id: Some(parent_run_id),
+                    request_seq: 9,
+                    initiating_attachment_id: crate::brain::store::AttachmentId(Uuid::new_v4()),
+                    initiated_by: "alice".into(),
+                    status,
+                    started_ms: 1,
+                    updated_ms: 2,
+                    detail: Some("cancelled".into()),
+                }))
+                .unwrap();
+            let _ = cancelled_tx.send(run_id);
+        });
+
+        let identity = scheduler
+            .spawn(
+                AgentTaskSpec {
+                    task: "wait".into(),
+                    role: AgentRole::Explore,
+                    background: None,
+                    provider: None,
+                    model: None,
+                    context: Vec::new(),
+                    capability_grant_ids: None,
+                    budget: AgentBudget::default(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        started.notified().await;
+        scheduler.cancel(identity.task_id).await.unwrap();
+        let result = scheduler.wait(identity.task_id).await.unwrap();
+        assert_eq!(result.status, AgentTaskStatus::Cancelled);
+        assert_eq!(
+            cancelled_rx.await.unwrap(),
             crate::brain::store::RunId(identity.task_id)
         );
     }

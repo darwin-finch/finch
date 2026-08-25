@@ -1966,7 +1966,10 @@ fn decode_runner_turn_event(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_runner_program_result, decode_runner_turn_result, execute_typed_forth_ipc};
+    use super::{
+        decode_runner_program_result, decode_runner_turn_result, execute_typed_forth_ipc,
+        BrainRunnerControlImpl,
+    };
     use crate::ipc::brain_codec::encode_approval_audience;
 
     fn test_approval_audience() -> crate::brain::store::BrainApprovalAudience {
@@ -2004,6 +2007,51 @@ mod tests {
                 state: crate::vm::EffectJournalState::Acknowledged { values: Vec::new() },
             },
         }
+    }
+
+    #[tokio::test]
+    async fn runner_lifecycle_capability_rejects_a_replaced_lease() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let store = crate::brain::store::BrainStore::with_root("box.local", Some(root));
+        let runners = crate::server::BrainRunnerBroker::default();
+        let lifecycle = crate::server::BrainLifecycleService::new(
+            store.clone(),
+            runners.clone(),
+            crate::server::BrainApprovalBroker::default(),
+        );
+        lifecycle.create("shared").await.unwrap();
+        let _driver = lifecycle
+            .attach(
+                "shared",
+                "alice",
+                crate::brain::store::AttachmentRole::Driver,
+                None,
+            )
+            .unwrap();
+        let environment = store.environment().clone();
+        let first = lifecycle
+            .acquire_runner("shared", "runner-one", &environment, None, 60_000)
+            .unwrap();
+        let connection_id = uuid::Uuid::new_v4();
+        runners
+            .claim_connection_lease(connection_id, "shared", first.lease_id)
+            .unwrap();
+        let control = BrainRunnerControlImpl {
+            lifecycle: lifecycle.clone(),
+            runners: runners.clone(),
+            connection_id,
+            brain: "shared".into(),
+            lease_id: first.lease_id,
+        };
+        control.validate_lease().unwrap();
+
+        lifecycle.release_runner("shared", first.lease_id).unwrap();
+        let replacement = lifecycle
+            .acquire_runner("shared", "runner-two", &environment, None, 60_000)
+            .unwrap();
+        assert_ne!(replacement.lease_id, first.lease_id);
+        let error = control.validate_lease().unwrap_err();
+        assert!(error.to_string().contains("active lease"));
     }
 
     #[test]
