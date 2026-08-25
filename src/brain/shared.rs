@@ -1288,11 +1288,15 @@ impl SharedBrainStore {
                         | BrainEventKind::RuntimeCommitted { .. }
                 )
             });
-            let has_connected_attachment = state
+            // A pending reservation already represents a live participant.
+            // Removing the Brain while another transport is between `attach`
+            // and `watch` invalidates that participant's signed connection and
+            // lets an unrelated detach race erase the shared session.
+            let has_live_attachment = state
                 .attachments
                 .values()
-                .any(|attachment| attachment.connected);
-            if has_substantive_history || has_connected_attachment || state.runner_lease.is_some() {
+                .any(|attachment| attachment.connection_id.is_some());
+            if has_substantive_history || has_live_attachment || state.runner_lease.is_some() {
                 return Ok(false);
             }
 
@@ -2542,6 +2546,47 @@ mod tests {
         assert!(store.remove_if_unused("provisional").unwrap());
         assert!(!temp.path().join("provisional").exists());
         assert!(!store.list().unwrap().contains(&"provisional".to_string()));
+    }
+
+    #[test]
+    fn pending_attachment_prevents_another_participant_from_removing_brain() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let first = store
+            .attach("pending", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let second = store
+            .attach("pending", "bob", AttachmentRole::Driver, None)
+            .unwrap();
+
+        store
+            .detach(
+                "pending",
+                first.attachment_id,
+                first.connection_id.unwrap(),
+            )
+            .unwrap();
+        assert!(!store.remove_if_unused("pending").unwrap());
+        assert_eq!(
+            store
+                .snapshot("pending")
+                .unwrap()
+                .attachments
+                .into_iter()
+                .find(|attachment| attachment.attachment_id == second.attachment_id)
+                .unwrap()
+                .connection_id,
+            second.connection_id
+        );
+
+        store
+            .detach(
+                "pending",
+                second.attachment_id,
+                second.connection_id.unwrap(),
+            )
+            .unwrap();
+        assert!(store.remove_if_unused("pending").unwrap());
     }
 
     #[test]
