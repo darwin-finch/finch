@@ -62,7 +62,7 @@ pub enum Command {
     BrainWhois(String),            // /whois <subject> — inspect public Brain presence
     BrainCreate(String),           // /brain create <name> (local daemon administration)
     BrainArchive(String),          // /brain archive <name>
-    BrainAttach(String),           // /brain attach <name@machine[:port]>
+    BrainAttach(String),           // /brain attach <name> (local IPC only)
     BrainJoin {
         target: String,
         invitation: String,
@@ -793,9 +793,9 @@ pub fn format_help() -> String {
          {cyan}  /who{reset}                List connected participants in this Brain\n\
          {cyan}  /whois <subject>{reset}    Show public presence for one participant\n\
          {cyan}  /brain create <name>{reset}  Create an empty Brain on this machine\n\
-         {cyan}  /brain attach <name>[@machine]{reset} Attach locally or to a remote Brain\n\
+         {cyan}  /brain attach <name>{reset}  Attach to another Brain on this daemon\n\
          {cyan}  /brain invite [role] [minutes]{reset} Create a short-lived single-use invitation\n\
-         {cyan}  /brain join <name@machine> <invite>{reset} Redeem an invitation and attach\n\
+         {cyan}  /brain join <name@machine[:port]> <invite>{reset} Redeem a remote invitation\n\
          {cyan}  /brain detach{reset}      Return to this console's home Brain\n\
          {cyan}  /brain handoff <subject>{reset} Request an addressed runner transfer\n\
          {cyan}  /brain handoff identity{reset} Show this exact frontend's runner identity\n\
@@ -1251,6 +1251,9 @@ mod tests {
             Some(Command::BrainHandoffCancel(None))
         ));
         assert!(format_help().contains("/brain list"));
+        assert!(format_help().contains("/brain attach <name>"));
+        assert!(format_help().contains("/brain join <name@machine[:port]> <invite>"));
+        assert!(!format_help().contains("/brain attach <name>[@machine]"));
         assert!(!format_help().contains("Spawn a background research brain"));
     }
 

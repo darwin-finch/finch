@@ -74,8 +74,8 @@ Execution-plan prototype: /push <text>  /pop  /run  /program  /stack  /stack cle
   /chain W1 W2  /forget W1  /dup W1  /swap W1 W2
 
 Brains: /brain list  /brain runs  /brain cancel <run>  /brain create <name>
-  /brain attach <name>[@machine]  /brain invite [role] [minutes]
-  /brain join <name@machine> <invite>  /brain detach  /brain archive <name>
+  /brain attach <name>  /brain invite [role] [minutes]
+  /brain join <name@machine[:port]> <invite>  /brain detach  /brain archive <name>
   /brain handoff <subject>  /brain handoff identity  /brain handoff accept [id]
   /brain handoff cancel [id]  /brain password [new]  /brains
 Collaboration: /say <text>  /who  /whois <subject>  @finch <prompt>
