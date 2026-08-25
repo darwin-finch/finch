@@ -200,6 +200,11 @@ pub enum ReplEvent {
         epoch: u64,
         attempt: u32,
     },
+    /// Retry the lease-bound runner callback independently of the event watch.
+    ReconnectHomeRunner {
+        epoch: u64,
+        attempt: u32,
+    },
     /// The expiring lease served by this frontend was renewed, lost, or
     /// reacquired. A renewed lease is not considered active until the event
     /// loop has also registered its Cap'n Proto runner callback. `epoch`

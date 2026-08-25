@@ -1411,6 +1411,10 @@ impl EventLoop {
                 "{}: runner unavailable: {}",
                 self.session_label, error
             ));
+            let epoch = self
+                .runner_renewal_epoch
+                .load(std::sync::atomic::Ordering::SeqCst);
+            self.schedule_home_runner_reconnect(epoch, 0);
         }
         if self.daemon_base_url.is_some() {
             if let Err(error) = self.attach_home_brain().await {
@@ -1612,6 +1616,7 @@ impl EventLoop {
                         ReplEvent::HomeBrainMessage { .. } => "HomeBrainMessage",
                         ReplEvent::HomeBrainWatchFailed { .. } => "HomeBrainWatchFailed",
                         ReplEvent::ReconnectHomeBrain { .. } => "ReconnectHomeBrain",
+                        ReplEvent::ReconnectHomeRunner { .. } => "ReconnectHomeRunner",
                         ReplEvent::RunnerLeaseStatus { .. } => "RunnerLeaseStatus",
                         ReplEvent::NamedBrainProgramRequested(_) => "NamedBrainProgramRequested",
                         ReplEvent::NamedBrainTurnRequested(_) => "NamedBrainTurnRequested",
@@ -3824,6 +3829,42 @@ Rules:\n\
                     }
                 }
             }
+            ReplEvent::ReconnectHomeRunner { epoch, attempt } => {
+                if epoch
+                    != self
+                        .runner_renewal_epoch
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    || self.home_runner_lease_active
+                {
+                    return Ok(());
+                }
+                match self.restore_home_runner().await {
+                    Ok(()) => {
+                        self.output_manager.write_info(format!(
+                            "{}: runner callback reconnected",
+                            self.session_label
+                        ));
+                        if self.active_remote_brain.is_none() {
+                            self.update_remote_brain_status(true);
+                            self.render_tui().await?;
+                        }
+                    }
+                    Err(error) => {
+                        let detail = error.to_string();
+                        if self.last_home_runner_error.as_deref() != Some(&detail) {
+                            self.output_manager.write_info(format!(
+                                "{}: runner reconnect attempt failed: {}",
+                                self.session_label, detail
+                            ));
+                        }
+                        self.last_home_runner_error = Some(detail);
+                        self.schedule_home_runner_reconnect(
+                            epoch,
+                            attempt.saturating_add(1),
+                        );
+                    }
+                }
+            }
             ReplEvent::RunnerLeaseStatus {
                 brain,
                 epoch,
@@ -3869,9 +3910,20 @@ Rules:\n\
                     self.agent_scheduler.clear_brain_control().await;
                 }
                 self.home_runner_lease_active = active;
-                self.home_runner_lease_id = if active { lease_id } else { None };
+                // Registration loss does not erase the durable lease identity;
+                // it is precisely what a replacement connection must reclaim.
                 self.runner_brain = active.then_some(brain.clone());
                 let registration_error = registration.err();
+                let handed_off = !active && detail.contains("handed off");
+                self.home_runner_lease_id = lease_id_after_registration(
+                    self.home_runner_lease_id,
+                    lease_id,
+                    active,
+                    handed_off,
+                );
+                if !active && !handed_off {
+                    self.schedule_home_runner_reconnect(epoch, 0);
+                }
                 if self.active_remote_brain.is_none() {
                     if self.home_brain.is_some() {
                         self.update_remote_brain_status(active);

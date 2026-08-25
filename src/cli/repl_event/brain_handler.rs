@@ -48,6 +48,33 @@ fn participant_attachment_label(
     format!("{} [{}]", attachment.subject, &id[..8])
 }
 
+fn reconnect_runner_lease_id(
+    retained: Option<crate::brain::store::RunnerLeaseId>,
+    observed: Option<&crate::brain::store::BrainRunnerLease>,
+    subject: &str,
+) -> Option<crate::brain::store::RunnerLeaseId> {
+    retained.or_else(|| {
+        observed
+            .filter(|lease| lease.subject == subject)
+            .map(|lease| lease.lease_id)
+    })
+}
+
+fn lease_id_after_registration(
+    retained: Option<crate::brain::store::RunnerLeaseId>,
+    registered: Option<crate::brain::store::RunnerLeaseId>,
+    active: bool,
+    handed_off: bool,
+) -> Option<crate::brain::store::RunnerLeaseId> {
+    if handed_off {
+        None
+    } else if active {
+        registered
+    } else {
+        retained
+    }
+}
+
 fn verify_local_frontend_environment(
     expected: &crate::brain::store::BrainEnvironment,
 ) -> Result<()> {
@@ -319,38 +346,116 @@ impl EventLoop {
         });
     }
 
-    /// Restore both connection-scoped capabilities from durable identities.
-    async fn reconnect_home_brain(&mut self) -> Result<()> {
-        // A watch can end while the IPC connection and runner callback remain
-        // healthy. Repair that path first without disturbing runner authority.
-        if self.ipc_client.is_some() {
-            self.home_brain = None;
-            if self.attach_home_brain().await.is_ok() {
-                self.last_home_watch_error = None;
-                self.update_remote_brain_status(self.home_runner_lease_active);
-                return Ok(());
+    fn schedule_home_runner_reconnect(&self, epoch: u64, attempt: u32) {
+        let event_tx = self.event_tx.clone();
+        let delay_ms = match attempt {
+            0 => 100,
+            1 => 250,
+            2 => 500,
+            3 => 1_000,
+            4 => 2_000,
+            _ => 5_000,
+        };
+        tokio::task::spawn_local(async move {
+            tokio::select! {
+                _ = event_tx.closed() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {
+                    let _ = event_tx.send(ReplEvent::ReconnectHomeRunner { epoch, attempt });
+                }
             }
+        });
+    }
+
+    /// Restore only the durable event attachment. Runner callback health is
+    /// supervised separately, even when both capabilities lost one socket.
+    async fn reconnect_home_brain(&mut self) -> Result<()> {
+        self.home_brain = None;
+        if self.attach_home_brain().await.is_ok() {
+            self.last_home_watch_error = None;
+            self.update_remote_brain_status(self.home_runner_lease_active);
+            return Ok(());
         }
 
+        // Do not replace a healthy connection merely because attachment
+        // restoration failed (for example while its old binding drains).
+        if let Some(ipc) = self.ipc_client.as_ref() {
+            ipc.ping().await.context("check local daemon IPC")?;
+            anyhow::bail!("home Brain attachment is not ready to reconnect");
+        }
         let ipc = crate::ipc::IpcClient::connect()
             .await
             .context("reconnect local daemon IPC")?;
         self.ipc_client = Some(ipc);
-        let runner_state = self
-            .register_home_brain()
-            .await?
-            .context("local daemon disappeared during home Brain reconnect")?;
-        self.home_runner_lease_id = runner_state.as_ref().ok().copied();
-        self.home_runner_lease_active = self.home_runner_lease_id.is_some();
-        self.runner_brain = self
-            .home_runner_lease_active
-            .then(|| self.session_label.clone());
-        self.last_home_runner_error = runner_state.err();
-
-        self.home_brain = None;
+        // A replacement socket cannot retain the old reverse callback. Keep
+        // its durable lease ID, but let the runner supervisor rebind it.
+        self.home_runner_lease_active = false;
+        self.runner_brain = None;
+        self.agent_scheduler.clear_brain_control().await;
         self.attach_home_brain().await?;
         self.last_home_watch_error = None;
         self.update_remote_brain_status(self.home_runner_lease_active);
+        let runner_epoch = self
+            .runner_renewal_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        self.schedule_home_runner_reconnect(runner_epoch, 0);
+        Ok(())
+    }
+
+    async fn restore_home_runner(&mut self) -> Result<()> {
+        let mut ipc = self
+            .ipc_client
+            .as_ref()
+            .context("Cap'n Proto daemon connection unavailable")?
+            .clone();
+        if ipc.ping().await.is_err() {
+            ipc = crate::ipc::IpcClient::connect()
+                .await
+                .context("reconnect local daemon IPC for runner")?;
+            self.ipc_client = Some(ipc.clone());
+        }
+        ipc.brain_claim_runner_identity(&self.runner_subject)
+            .await
+            .context("reclaim this frontend's runner identity")?;
+        let snapshot = ipc.brain_snapshot(&self.session_label).await?;
+        verify_local_frontend_environment(&snapshot.environment)?;
+        let durable_lease_id = reconnect_runner_lease_id(
+            self.home_runner_lease_id,
+            snapshot.runner_lease.as_ref(),
+            &self.runner_subject,
+        );
+        let lease = ipc
+            .brain_acquire_runner(
+                &self.session_label,
+                &self.runner_subject,
+                &snapshot.environment,
+                durable_lease_id,
+                30_000,
+            )
+            .await?;
+        let bootstrap = ipc
+            .register_brain_runner(&self.session_label, lease.lease_id, self.event_tx.clone())
+            .await?;
+        self.agent_scheduler
+            .bind_brain_control(bootstrap.subagent_control)
+            .await;
+        self.program_runtime
+            .hydrate_reducible_state_if_newer(
+                bootstrap.checkpoint,
+                bootstrap.runtime_revision,
+            )
+            .await?;
+        self.home_runner_lease_id = Some(lease.lease_id);
+        self.home_runner_lease_active = true;
+        self.runner_brain = Some(self.session_label.clone());
+        self.last_home_runner_error = None;
+        self.start_runner_lease_renewal(
+            ipc,
+            snapshot.name,
+            self.runner_subject.clone(),
+            snapshot.environment,
+            Some(lease.lease_id),
+            true,
+        );
         Ok(())
     }
 
@@ -1045,6 +1150,39 @@ mod brain_handler_tests {
         assert_eq!(
             participant_attachment_label(&attachment),
             "alice@workstation.local [12345678]"
+        );
+    }
+
+    #[test]
+    fn runner_reconnect_recovers_lease_hidden_by_failed_initial_registration() {
+        let observed_id = crate::brain::store::RunnerLeaseId(uuid::Uuid::new_v4());
+        let observed = crate::brain::store::BrainRunnerLease {
+            lease_id: observed_id,
+            subject: "runner/frontend-stable".into(),
+            environment_generation: 1,
+            acquired_ms: 10,
+            expires_ms: 20,
+        };
+        assert_eq!(
+            reconnect_runner_lease_id(None, Some(&observed), "runner/frontend-stable"),
+            Some(observed_id)
+        );
+        assert_eq!(
+            reconnect_runner_lease_id(None, Some(&observed), "another/frontend"),
+            None
+        );
+    }
+
+    #[test]
+    fn callback_loss_retains_lease_identity_until_an_explicit_handoff() {
+        let lease_id = crate::brain::store::RunnerLeaseId(uuid::Uuid::new_v4());
+        assert_eq!(
+            lease_id_after_registration(Some(lease_id), None, false, false),
+            Some(lease_id)
+        );
+        assert_eq!(
+            lease_id_after_registration(Some(lease_id), None, false, true),
+            None
         );
     }
 }
