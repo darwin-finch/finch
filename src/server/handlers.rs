@@ -186,6 +186,38 @@ fn authorize_named_brain(
     Ok(claims)
 }
 
+pub(crate) fn authorize_pending_remote_attachment(
+    lifecycle: &crate::server::BrainLifecycleService,
+    credentials: &crate::brain::credential::BrainCredentialAuthority,
+    headers: &HeaderMap,
+    name: &str,
+    attachment_id: crate::brain::store::AttachmentId,
+    connection_id: crate::brain::store::ConnectionId,
+) -> Result<crate::brain::credential::BrainCredentialClaims, Response> {
+    let token = bearer_token(headers).ok_or_else(|| {
+        brain_auth_error(StatusCode::UNAUTHORIZED, "scoped Brain credential required")
+    })?;
+    let claims = credentials
+        .verify(token, unix_epoch_millis())
+        .map_err(|error| brain_auth_error(StatusCode::UNAUTHORIZED, error.to_string()))?;
+    let snapshot = lifecycle
+        .snapshot(name)
+        .map_err(|error| AppError(error).into_response())?;
+    claims
+        .require_audience(
+            snapshot.brain_id,
+            name,
+            snapshot.environment.generation,
+            crate::brain::credential::BrainCredentialScope::BrainRead,
+        )
+        .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
+    let attachment = lifecycle
+        .pending_attachment(name, attachment_id, connection_id)
+        .map_err(brain_state_conflict)?;
+    claims_match_attachment(&claims, &attachment)?;
+    Ok(claims)
+}
+
 const DEFAULT_BRAIN_CREDENTIAL_TTL_MS: u64 = 8 * 60 * 60 * 1_000;
 const MAX_BRAIN_CREDENTIAL_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_BRAIN_INVITATION_TTL_MS: u64 = 15 * 60 * 1_000;
@@ -2071,7 +2103,7 @@ fn remote_brain_error(
     }
 }
 
-fn execute_authorized_remote_initialization(
+pub(crate) fn execute_authorized_remote_initialization(
     lifecycle: &crate::server::BrainLifecycleService,
     claims: &crate::brain::credential::BrainCredentialClaims,
     name: &str,
@@ -2504,19 +2536,17 @@ async fn watch_named_brain(
     Query(connection): Query<WatchNamedBrainQuery>,
     ws: axum::extract::WebSocketUpgrade,
 ) -> Result<Response, Response> {
-    let claims = authorize_named_brain(
-        &server,
-        &headers,
-        &name,
-        crate::brain::credential::BrainCredentialScope::BrainRead,
-    )?;
     let attachment_id = crate::brain::store::AttachmentId(connection.attachment_id);
     let connection_id = crate::brain::store::ConnectionId(connection.connection_id);
     let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
-    let attachment = lifecycle
-        .pending_attachment(&name, attachment_id, connection_id)
-        .map_err(brain_state_conflict)?;
-    claims_match_attachment(&claims, &attachment)?;
+    authorize_pending_remote_attachment(
+        &lifecycle,
+        server.brain_credentials(),
+        &headers,
+        &name,
+        attachment_id,
+        connection_id,
+    )?;
     let watch = lifecycle
         .watch(&name, attachment_id, connection_id)
         .map_err(|error| AppError(error).into_response())?;
@@ -3239,128 +3269,6 @@ mod handler_tests {
         assert!(driver_maximum.contains(&BrainCredentialScope::EnvironmentAdmin));
         assert!(!driver_maximum.contains(&BrainCredentialScope::EnvironmentExecute));
         assert!(!driver_maximum.contains(&BrainCredentialScope::ComputeSubmit));
-    }
-
-    #[tokio::test]
-    async fn remote_initialization_authority_is_bound_to_the_exact_active_driver() {
-        let store = crate::brain::store::BrainStore::with_root("box.local", None);
-        let lifecycle = crate::server::BrainLifecycleService::new(
-            store,
-            crate::server::BrainRunnerBroker::default(),
-            crate::server::BrainApprovalBroker::default(),
-        );
-        let driver = lifecycle
-            .attach("shared", "alice", AttachmentRole::Driver, None)
-            .unwrap();
-        let driver_connection = driver.connection_id.unwrap();
-        let _watch = lifecycle
-            .watch("shared", driver.attachment_id, driver_connection)
-            .unwrap();
-        let snapshot = lifecycle.snapshot("shared").unwrap();
-        let claims = |attachment: &BrainAttachment| crate::brain::credential::BrainCredentialClaims {
-            version: 1,
-            credential_id: uuid::Uuid::new_v4(),
-            issuer: "box.local".into(),
-            subject: attachment.subject.clone(),
-            brain_id: snapshot.brain_id,
-            brain: "shared".into(),
-            environment_generation: snapshot.environment.generation,
-            role: attachment.role,
-            scopes: crate::brain::credential::default_participant_scopes(attachment.role),
-            attachment_id: Some(attachment.attachment_id),
-            connection_id: attachment.connection_id,
-            delegation_chain: Vec::new(),
-            issued_ms: 1,
-            expires_ms: u64::MAX,
-        };
-
-        let decode_command = |request_id, next_due_ms| {
-            let envelope = crate::ipc::brain_codec::BrainRemoteEnvelope::Command(
-                crate::ipc::brain_codec::BrainRemoteCommand {
-                    request_id,
-                    kind: crate::ipc::brain_codec::BrainRemoteCommandKind::ScheduleInitialization {
-                        next_due_ms,
-                    },
-                },
-            );
-            let encoded = crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope).unwrap();
-            let crate::ipc::brain_codec::BrainRemoteEnvelope::Command(command) =
-                crate::ipc::brain_codec::decode_brain_remote_envelope(&encoded).unwrap()
-            else {
-                panic!("initialization command decoded as the wrong envelope")
-            };
-            command
-        };
-        let execute = |claims: &crate::brain::credential::BrainCredentialClaims,
-                       attachment: &BrainAttachment,
-                       command: crate::ipc::brain_codec::BrainRemoteCommand| {
-            let crate::ipc::brain_codec::BrainRemoteCommandKind::ScheduleInitialization {
-                next_due_ms,
-            } = command.kind
-            else {
-                panic!("decoded the wrong remote command")
-            };
-            execute_authorized_remote_initialization(
-                &lifecycle,
-                claims,
-                "shared",
-                attachment.attachment_id,
-                attachment.connection_id.unwrap(),
-                command.request_id,
-                next_due_ms,
-            )
-        };
-
-        let driver_claims = claims(&driver);
-        assert!(matches!(
-            execute(&driver_claims, &driver, decode_command(41, 1_000)),
-            crate::ipc::brain_codec::BrainRemoteReply::InitializationScheduled {
-                request_id: 41,
-                ..
-            }
-        ));
-
-        let sibling = lifecycle
-            .attach("shared", "mallory", AttachmentRole::Driver, None)
-            .unwrap();
-        let sibling_connection = sibling.connection_id.unwrap();
-        let _sibling_watch = lifecycle
-            .watch("shared", sibling.attachment_id, sibling_connection)
-            .unwrap();
-        let sibling_claims = claims(&sibling);
-        assert!(matches!(
-            execute(&sibling_claims, &driver, decode_command(42, 2_000)),
-            crate::ipc::brain_codec::BrainRemoteReply::Error {
-                request_id: 42,
-                ref code,
-                ..
-            } if code == "forbidden"
-        ));
-
-        let consultant = lifecycle
-            .attach("shared", "bob", AttachmentRole::Consultant, None)
-            .unwrap();
-        let consultant_connection = consultant.connection_id.unwrap();
-        let _consultant_watch = lifecycle
-            .watch(
-                "shared",
-                consultant.attachment_id,
-                consultant_connection,
-            )
-            .unwrap();
-        let consultant_claims = claims(&consultant);
-        assert!(consultant_claims.permits(
-            crate::brain::credential::BrainCredentialScope::BrainSubmit
-        ));
-        claims_match_attachment(&consultant_claims, &consultant).unwrap();
-        assert!(matches!(
-            execute(&consultant_claims, &consultant, decode_command(43, 3_000)),
-            crate::ipc::brain_codec::BrainRemoteReply::Error {
-                request_id: 43,
-                ref code,
-                ref message,
-            } if code == "conflict" && message.contains("only a Brain driver")
-        ));
     }
 
     fn event(seq: u64, sender: &str, kind: BrainEventKind) -> BrainEvent {

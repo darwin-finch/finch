@@ -65,6 +65,14 @@ impl Drop for RpcTask {
 }
 
 impl IpcClient {
+    #[cfg(test)]
+    pub(crate) fn from_test_client(client: finch_daemon::Client) -> Self {
+        Self {
+            client,
+            _rpc_handle: std::rc::Rc::new(RpcTask(tokio::task::spawn_local(async {}))),
+        }
+    }
+
     /// Connect to the daemon's Unix socket.
     pub async fn connect() -> Result<Self> {
         Self::connect_path(sock_path()).await
