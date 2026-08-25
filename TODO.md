@@ -764,11 +764,13 @@ still blocks the corresponding Brain phase until it is unified.
   checkpoint; missing and stale callbacks fail closed. Request-boundary, replacement-callback,
   authority-separation, pending-continuation, and daemon-restart tests cover the path.
 - [ ] Route the ordinary home-console conversation and its complete coding-agent/tool loop through
-  the same named-Brain event log. Today local prompts, tool calls, and assistant turns still live in
-  `ConversationHistory`/MemTree while only explicit remote submissions are durable Brain events;
-  consequently attaching to an older Brain cannot replay local scrollback that was never logged.
-  Add canonical user/program/tool/result events and project both home and remote consoles from them
-  without moving workspace execution or provider tools into the daemon.
+  the same named-Brain event log. Ordinary home prompts now use a durable driver attachment and the
+  daemon turn lane; the leased frontend runs the complete provider/tool/VM callback, while both home
+  and remote consoles replay its canonical prompt/program/result events. A live two-console test
+  submitted a follow-up from the remote driver, executed it on the home runner, and displayed the
+  same Lisp source/result in both projections. Add canonical tool-start/tool-output/approval events
+  next so remote history includes the complete coding-agent lifecycle rather than only its final
+  program/result; keep workspace execution and provider tools in the frontend runner.
 - [ ] Complete Brain control and approval ownership above that substrate. Put the role and approval
   audience on every permission/proposal view and add scoped participant credentials. ProgramRuns
   now execute on the leased frontend, but approval/control authority still needs explicit audience,

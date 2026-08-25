@@ -282,6 +282,65 @@ impl EventLoop {
         Ok(Some(initial_registration))
     }
 
+    /// Attach the home console as a driver to the same durable Brain whose
+    /// environment-runner lease it owns. Runner authority and conversation
+    /// participation remain distinct, but both now observe one event stream.
+    async fn attach_home_brain(&mut self) -> Result<()> {
+        let base = self
+            .daemon_base_url
+            .as_deref()
+            .context("local daemon is unavailable")?;
+        let target = crate::brain::remote::RemoteBrainTarget::local(&self.session_label, base)?;
+        let password = crate::config::load_config()
+            .map(|config| config.server.brain_password)
+            .unwrap_or_default();
+        let mut client = crate::brain::remote::RemoteBrainClient::new(target, password)?;
+        client
+            .attach(
+                &self.participant_subject,
+                crate::brain::shared::AttachmentRole::Driver,
+                None,
+            )
+            .await?;
+        let mut incoming = client.watch().await?;
+        let snapshot = match incoming.recv().await {
+            Some(crate::brain::shared::BrainWireMessage::Snapshot { brain }) => brain,
+            Some(crate::brain::shared::BrainWireMessage::Event { .. }) => {
+                anyhow::bail!("home Brain event stream did not begin with a snapshot")
+            }
+            None => anyhow::bail!("home Brain event stream closed before its snapshot"),
+        };
+        client.target.machine = snapshot.environment.machine.clone();
+        let target_name = client.target.display_name();
+        self.home_brain = Some(client);
+        self.render_remote_brain_message(crate::brain::shared::BrainWireMessage::Snapshot {
+            brain: snapshot.clone(),
+        })
+        .await?;
+        if let Some(client) = self.home_brain.as_mut() {
+            client.acknowledge(snapshot.revision).await?;
+        }
+
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            while let Some(message) = incoming.recv().await {
+                if event_tx
+                    .send(ReplEvent::RemoteBrainMessage {
+                        target: target_name.clone(),
+                        message,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = event_tx.send(ReplEvent::RemoteBrainDisconnected {
+                target: target_name,
+            });
+        });
+        Ok(())
+    }
+
     /// Handle `/brains` — list the daemon's authoritative named Brains.
     /// Legacy background workers are runs/tasks, not another Brain namespace.
     async fn handle_brains_list(&mut self) -> Result<()> {

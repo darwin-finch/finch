@@ -195,6 +195,11 @@ pub struct EventLoop {
     /// so tool continuations use the exact same pipeline as local turns.
     pending_named_brain_turns: std::collections::HashMap<Uuid, PendingNamedBrainTurn>,
 
+    /// Source/output already rendered while this frontend serviced its home
+    /// Brain callback. Matching canonical events advance this marker without
+    /// drawing a second copy in the runner console.
+    local_brain_projections: std::collections::VecDeque<LocalBrainProjection>,
+
     /// Pending tool approval requests (query_id -> (tool_use, response_tx))
     pending_approvals: PendingApprovalsMap,
 
@@ -277,6 +282,11 @@ pub struct EventLoop {
     /// Explicit destination for prompts and VM programs while attached.
     /// This is singular by design: host effects are never broadcast.
     active_remote_brain: Option<crate::brain::remote::RemoteBrainClient>,
+
+    /// Durable attachment to this console's home Brain. Ordinary input uses
+    /// this attachment whenever no foreign Brain is selected, so the runner
+    /// console and remote drivers project the same canonical event log.
+    home_brain: Option<crate::brain::remote::RemoteBrainClient>,
 
     /// Whether this frontend currently holds the daemon-issued lease for its
     /// home Brain. The UI never infers runner status from local process role.
@@ -415,6 +425,45 @@ struct PendingNamedBrainTurn {
     response_tx: tokio::sync::oneshot::Sender<
         std::result::Result<crate::server::RunnerTurnResult, String>,
     >,
+}
+
+struct LocalBrainProjection {
+    source: String,
+    output: String,
+    program_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalProjectionMatch {
+    None,
+    Suppress,
+    SuppressAndComplete,
+}
+
+impl LocalBrainProjection {
+    fn observe(&mut self, event: &crate::brain::shared::BrainEvent) -> LocalProjectionMatch {
+        match &event.kind {
+            crate::brain::shared::BrainEventKind::Program { source, .. }
+                if event.sender == "provider"
+                    && self.program_seq.is_none()
+                    && self.source == *source =>
+            {
+                self.program_seq = Some(event.seq);
+                LocalProjectionMatch::Suppress
+            }
+            crate::brain::shared::BrainEventKind::Result {
+                request_seq,
+                output,
+                error,
+            } if self.program_seq == Some(*request_seq)
+                && error.is_none()
+                && self.output == *output =>
+            {
+                LocalProjectionMatch::SuppressAndComplete
+            }
+            _ => LocalProjectionMatch::None,
+        }
+    }
 }
 
 fn deferred_vm_approval_from_tool_result(
@@ -812,6 +861,7 @@ impl EventLoop {
             active_query_id: Arc::new(RwLock::new(None)),
             pending_queries: std::collections::VecDeque::new(),
             pending_named_brain_turns: std::collections::HashMap::new(),
+            local_brain_projections: std::collections::VecDeque::new(),
             pending_approvals: Arc::new(RwLock::new(std::collections::HashMap::new())),
             pending_vm_approval: None,
             ipc_client,
@@ -856,6 +906,7 @@ impl EventLoop {
             diff_store: DiffStore::new(),
             peer_session_rx,
             active_remote_brain: None,
+            home_brain: None,
             home_runner_lease_active: false,
             last_home_runner_error: None,
             daemon_base_url,
@@ -928,6 +979,14 @@ impl EventLoop {
                 "{}: runner unavailable: {}",
                 self.session_label, error
             ));
+        }
+        if self.daemon_base_url.is_some() {
+            if let Err(error) = self.attach_home_brain().await {
+                self.output_manager.write_info(format!(
+                    "{}: home Brain event stream unavailable: {}",
+                    self.session_label, error
+                ));
+            }
         }
         // ─────────────────────────────────────────────────────────────────────
 
@@ -1834,7 +1893,7 @@ Rules:\n\
                         self.execute_query(query).await?;
                     }
                     Command::ForthEval(code) => {
-                        if self.active_remote_brain.is_some() {
+                        if self.selected_brain().is_some() {
                             self.push_remote_brain(crate::brain::shared::BrainEventKind::Program {
                                 language: crate::brain::shared::ProgramLanguage::Forth,
                                 source: code,
@@ -1892,7 +1951,7 @@ Rules:\n\
         // Forth word definition: `: word ... ;`
         // Route directly to the Forth VM — do not push as a vocabulary word.
         if input.trim().starts_with(": ") {
-            if self.active_remote_brain.is_some() {
+            if self.selected_brain().is_some() {
                 return self
                     .push_remote_brain(crate::brain::shared::BrainEventKind::Program {
                         language: crate::brain::shared::ProgramLanguage::Forth,
@@ -1918,14 +1977,16 @@ Rules:\n\
         {
             let query = query.trim().to_string();
             if !query.is_empty() {
-                self.output_manager.write_user(input.clone());
+                if self.selected_brain().is_none() {
+                    self.output_manager.write_user(input.clone());
+                }
                 return self.execute_query(query).await;
             }
         }
 
         // ── Lisp: input starting with `(` is a Lisp expression ───────────────
         if input.trim_start().starts_with('(') {
-            if self.active_remote_brain.is_some() {
+            if self.selected_brain().is_some() {
                 return self
                     .push_remote_brain(crate::brain::shared::BrainEventKind::Program {
                         language: crate::brain::shared::ProgramLanguage::Lisp,
@@ -2027,7 +2088,7 @@ Rules:\n\
         echo: bool,
         chat_only: bool,
     ) -> Result<()> {
-        if self.active_remote_brain.is_some() {
+        if self.selected_brain().is_some() {
             return self
                 .push_remote_brain(crate::brain::shared::BrainEventKind::Prompt { text: input })
                 .await;
@@ -2965,10 +3026,7 @@ Rules:\n\
             }
 
             ReplEvent::RemoteBrainMessage { target, message } => {
-                let is_current = self
-                    .active_remote_brain
-                    .as_ref()
-                    .is_some_and(|client| client.target.display_name() == target);
+                let is_current = self.selected_brain_matches(&target);
                 if is_current {
                     let acknowledged_seq = match &message {
                         crate::brain::shared::BrainWireMessage::Snapshot { brain } => {
@@ -2977,7 +3035,7 @@ Rules:\n\
                         crate::brain::shared::BrainWireMessage::Event { event } => event.seq,
                     };
                     self.render_remote_brain_message(message).await?;
-                    if let Some(client) = self.active_remote_brain.as_mut() {
+                    if let Some(client) = self.selected_brain_mut() {
                         if let Err(error) = client.acknowledge(acknowledged_seq).await {
                             self.output_manager
                                 .write_info(format!("{target}: could not save cursor: {error}"));
@@ -2991,14 +3049,16 @@ Rules:\n\
                 self.render_tui().await?;
             }
             ReplEvent::RemoteBrainDisconnected { target } => {
-                let is_current = self
-                    .active_remote_brain
-                    .as_ref()
-                    .is_some_and(|client| client.target.display_name() == target);
+                let is_current = self.selected_brain_matches(&target);
                 if is_current {
+                    let role = if self.selected_brain_is_home() {
+                        "home"
+                    } else {
+                        "driver"
+                    };
                     self.status_bar.update_line(
                         crate::cli::status_bar::StatusLineType::SessionLabel,
-                        format!("◆ brain: {target} · driver · disconnected"),
+                        format!("◆ brain: {target} · {role} · disconnected"),
                     );
                     self.output_manager.write_info(format!(
                         "{target}: Brain event connection closed; detach or reattach to reconnect"
@@ -3034,14 +3094,18 @@ Rules:\n\
                 self.home_runner_lease_active = active;
                 let registration_error = registration.err();
                 if self.active_remote_brain.is_none() {
-                    self.status_bar.update_line(
-                        crate::cli::status_bar::StatusLineType::SessionLabel,
-                        if active {
-                            format!("◆ brain: {} · runner", self.session_label)
-                        } else {
-                            format!("◆ brain: {} · home · no runner lease", self.session_label)
-                        },
-                    );
+                    if self.home_brain.is_some() {
+                        self.update_remote_brain_status(active);
+                    } else {
+                        self.status_bar.update_line(
+                            crate::cli::status_bar::StatusLineType::SessionLabel,
+                            if active {
+                                format!("◆ brain: {} · runner", self.session_label)
+                            } else {
+                                format!("◆ brain: {} · home · no runner lease", self.session_label)
+                            },
+                        );
+                    }
                     if let Some(error) = registration_error {
                         let changed = self.last_home_runner_error.as_deref() != Some(&error);
                         self.last_home_runner_error = Some(error.clone());
@@ -3249,6 +3313,13 @@ Rules:\n\
             })
         })()
         .map_err(|error| error.to_string());
+        if let Ok(result) = &result {
+            self.local_brain_projections.push_back(LocalBrainProjection {
+                source: result.source.clone(),
+                output: result.output.clone(),
+                program_seq: None,
+            });
+        }
         let _ = pending.response_tx.send(result);
     }
 
@@ -3558,6 +3629,15 @@ Rules:\n\
                 return Ok(());
             }
         };
+        if self.home_brain.as_ref().is_some_and(|home| {
+            home.target.brain == target.brain && home.target.address == target.address
+        }) {
+            self.output_manager.write_info(format!(
+                "{} is already this console's home Brain",
+                target.display_name()
+            ));
+            return self.render_tui().await;
+        }
         let password = crate::config::load_config()
             .map(|config| config.server.brain_password)
             .unwrap_or_default();
@@ -3659,14 +3739,27 @@ Rules:\n\
             self.output_manager
                 .write_info(format!("detached from {}", client.target.display_name()));
         }
-        self.status_bar.update_line(
-            crate::cli::status_bar::StatusLineType::SessionLabel,
-            if self.home_runner_lease_active {
-                format!("◆ brain: {} · runner", self.session_label)
-            } else {
-                format!("◆ brain: {} · home · no runner lease", self.session_label)
-            },
-        );
+        if let Some(home) = self.home_brain.as_ref() {
+            let snapshot = home.snapshot().await?;
+            self.render_remote_brain_message(
+                crate::brain::shared::BrainWireMessage::Snapshot {
+                    brain: snapshot.clone(),
+                },
+            )
+            .await?;
+            if let Some(home) = self.home_brain.as_mut() {
+                home.acknowledge(snapshot.revision).await?;
+            }
+        } else {
+            self.status_bar.update_line(
+                crate::cli::status_bar::StatusLineType::SessionLabel,
+                if self.home_runner_lease_active {
+                    format!("◆ brain: {} · runner", self.session_label)
+                } else {
+                    format!("◆ brain: {} · home · no runner lease", self.session_label)
+                },
+            );
+        }
         self.render_tui().await
     }
 
@@ -3718,11 +3811,32 @@ Rules:\n\
         self.render_tui().await
     }
 
+    fn selected_brain(&self) -> Option<&crate::brain::remote::RemoteBrainClient> {
+        self.active_remote_brain
+            .as_ref()
+            .or(self.home_brain.as_ref())
+    }
+
+    fn selected_brain_mut(&mut self) -> Option<&mut crate::brain::remote::RemoteBrainClient> {
+        self.active_remote_brain
+            .as_mut()
+            .or(self.home_brain.as_mut())
+    }
+
+    fn selected_brain_is_home(&self) -> bool {
+        self.active_remote_brain.is_none() && self.home_brain.is_some()
+    }
+
+    fn selected_brain_matches(&self, target: &str) -> bool {
+        self.selected_brain()
+            .is_some_and(|client| client.target.display_name() == target)
+    }
+
     async fn push_remote_brain(
         &mut self,
         kind: crate::brain::shared::BrainEventKind,
     ) -> Result<()> {
-        let Some(client) = self.active_remote_brain.clone() else {
+        let Some(client) = self.selected_brain().cloned() else {
             return Ok(());
         };
         let target = client.target.display_name();
@@ -3746,8 +3860,7 @@ Rules:\n\
             crate::brain::shared::BrainWireMessage::Snapshot { brain } => {
                 self.update_remote_brain_status(brain.runner_lease.is_some());
                 let acknowledged_seq = self
-                    .active_remote_brain
-                    .as_ref()
+                    .selected_brain()
                     .and_then(|client| client.attachment())
                     .map(|attachment| attachment.acknowledged_seq)
                     .unwrap_or(0);
@@ -3782,24 +3895,28 @@ Rules:\n\
     }
 
     fn update_remote_brain_status(&self, runner_online: bool) {
-        let Some(client) = self.active_remote_brain.as_ref() else {
+        let Some(client) = self.selected_brain() else {
             return;
         };
         let role = client
             .attachment()
             .map(|attachment| format!("{:?}", attachment.role).to_lowercase())
             .unwrap_or_else(|| "detached".into());
+        let role = if self.selected_brain_is_home() && self.home_runner_lease_active {
+            format!("runner · {role}")
+        } else {
+            format!(
+                "{role} · runner {}",
+                if runner_online { "online" } else { "offline" }
+            )
+        };
         self.status_bar.update_line(
             crate::cli::status_bar::StatusLineType::SessionLabel,
-            format!(
-                "◆ brain: {} · {role} · runner {}",
-                client.target.display_name(),
-                if runner_online { "online" } else { "offline" }
-            ),
+            format!("◆ brain: {} · {role}", client.target.display_name()),
         );
     }
 
-    fn render_remote_brain_event(&self, event: &crate::brain::shared::BrainEvent) {
+    fn render_remote_brain_event(&mut self, event: &crate::brain::shared::BrainEvent) {
         use crate::brain::shared::BrainEventKind;
         match &event.kind {
             BrainEventKind::RunnerLeaseAcquired { lease } => self.output_manager.write_info(
@@ -3821,6 +3938,16 @@ Rules:\n\
                 .output_manager
                 .write_user(format!("{}: {text}", event.sender)),
             BrainEventKind::Program { language, source } => {
+                if self.selected_brain_is_home()
+                    && self
+                        .local_brain_projections
+                        .front_mut()
+                        .is_some_and(|projection| {
+                            projection.observe(event) == LocalProjectionMatch::Suppress
+                        })
+                {
+                    return;
+                }
                 let language = match language {
                     crate::brain::shared::ProgramLanguage::Forth => "forth",
                     crate::brain::shared::ProgramLanguage::Lisp => "lisp",
@@ -3835,7 +3962,21 @@ Rules:\n\
             BrainEventKind::ProgramPopped { program_seq } => self
                 .output_manager
                 .write_info(format!("{} popped program #{program_seq}", event.sender)),
-            BrainEventKind::Result { output, error, .. } => {
+            BrainEventKind::Result {
+                request_seq: _,
+                output,
+                error,
+            } => {
+                let projection_match = self
+                    .selected_brain_is_home()
+                    .then(|| self.local_brain_projections.front_mut())
+                    .flatten()
+                    .map(|projection| projection.observe(event))
+                    .unwrap_or(LocalProjectionMatch::None);
+                if projection_match == LocalProjectionMatch::SuppressAndComplete {
+                    self.local_brain_projections.pop_front();
+                    return;
+                }
                 if let Some(error) = error {
                     self.output_manager.write_info(format!("error: {error}"));
                 } else if !output.is_empty() {
@@ -5409,6 +5550,77 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn brain_event(
+        seq: u64,
+        sender: &str,
+        kind: crate::brain::shared::BrainEventKind,
+    ) -> crate::brain::shared::BrainEvent {
+        crate::brain::shared::BrainEvent {
+            schema_version: 1,
+            brain_id: crate::brain::shared::BrainId(uuid::Uuid::nil()),
+            seq,
+            environment_generation: 1,
+            sender: sender.into(),
+            created_ms: 0,
+            kind,
+        }
+    }
+
+    #[test]
+    fn local_runner_projection_suppresses_matching_canonical_program_and_result() {
+        let mut projection = LocalBrainProjection {
+            source: "(say \"hello\")".into(),
+            output: "hello".into(),
+            program_seq: None,
+        };
+        let program = brain_event(
+            12,
+            "provider",
+            crate::brain::shared::BrainEventKind::Program {
+                language: crate::brain::shared::ProgramLanguage::Lisp,
+                source: "(say \"hello\")".into(),
+            },
+        );
+        assert_eq!(
+            projection.observe(&program),
+            LocalProjectionMatch::Suppress
+        );
+        assert_eq!(projection.program_seq, Some(12));
+
+        let result = brain_event(
+            14,
+            "daemon",
+            crate::brain::shared::BrainEventKind::Result {
+                request_seq: 12,
+                output: "hello".into(),
+                error: None,
+            },
+        );
+        assert_eq!(
+            projection.observe(&result),
+            LocalProjectionMatch::SuppressAndComplete
+        );
+    }
+
+    #[test]
+    fn local_runner_projection_does_not_hide_different_canonical_output() {
+        let mut projection = LocalBrainProjection {
+            source: "(say \"hello\")".into(),
+            output: "hello".into(),
+            program_seq: Some(12),
+        };
+        let result = brain_event(
+            14,
+            "daemon",
+            crate::brain::shared::BrainEventKind::Result {
+                request_seq: 12,
+                output: "different".into(),
+                error: None,
+            },
+        );
+        assert_eq!(projection.observe(&result), LocalProjectionMatch::None);
+    }
 
     #[test]
     fn participant_subject_is_not_the_brain_name() {
