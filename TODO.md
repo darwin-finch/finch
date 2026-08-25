@@ -197,6 +197,18 @@ still blocks the corresponding Brain phase until it is unified.
   unit cannot pretend those commits or effects rolled back. Incomplete Lisp forms and incomplete
   Co-Forth definitions/control regions remain visible source only and never execute. Preserve an
   explicit single-language mode for self-contained scripts, conformance fixtures, and diagnostics.
+- [ ] Explore the original IRC-like token stream as a separate protocol/language frontend, not as
+  Co-Forth reader sugar or an assumed-compatible ProgramSubmission mode. It is a pushdown
+  transducer: every token is handled by the current parser-frame stack and may mutate that stack,
+  schedule an action/effect, or retain a continuation whose meaning depends on following tokens.
+  Thus postfix Co-Forth `"Hello" say` materializes a value before selecting an effect, while stream
+  syntax such as `SAY #channel "Hello"` lets `SAY` install a frame first and potentially consume the
+  payload incrementally for that destination. Define programmable typed token/frame handlers,
+  nesting, bounded lookahead, recovery, and per-transition verification/capability/commit semantics;
+  a never-ending stream cannot rely on whole-program verification. It may share typed values,
+  vocabulary metadata, host effects, and some IR operations with Lisp/Co-Forth without sharing
+  their parsing semantics. An LLM may inspect, explain, or explicitly propose unknown meanings,
+  but must not become the trusted parser for already-defined transitions.
 - [x] Add one bounded provider-wire repair turn for reader/type/capability diagnostics. Preserve the
   rejected source and its diagnostic as journaled program/output WorkUnits, send the structured
   error plus exact source back to the same provider, and render any replacement as a new program
@@ -805,7 +817,11 @@ still blocks the corresponding Brain phase until it is unified.
   model are complete. The eventual channel should be a threaded/multi-participant projection of a
   Brain: people and models share one durable conversation, while programs run only on the remote
   environment-owning runner. Adding/removing VM definitions and borrowing CPU require explicit,
-  attenuated participant grants. Until then, quarantine the aspirational IRC/room/peer/gas command
+  attenuated participant grants. Distinguish a canonical `ParticipantMessage` (relay/store only,
+  never schedules an LLM turn) from a `Prompt` explicitly addressed to Finch; an eventual `/say`
+  and `@finch` spelling can expose that boundary. Add `/who` as the current authenticated
+  participant/role projection and `/whois <subject>` for public identity, role, and presence
+  metadata, never credentials. Until then, quarantine the aspirational IRC/room/peer/gas command
   surfaces (`/join`, `/part`, `/say`, `/room`, `/connect`, and related commands) rather than
   presenting them as a second collaboration protocol.
 
