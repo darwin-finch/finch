@@ -24,6 +24,14 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
 - [ ] Allow saving the accumulated settings from every wizard screen instead of only the final
   screen. Make Escape unwind the current editor/dialog/screen first; cancelling the entire wizard
   must be a distinct action and must confirm before discarding unsaved changes.
+- [ ] Keep ordinary Brain/REPL startup read-only with respect to global configuration. The weekly
+  noncommercial notice currently advances `license.notice_suppress_until` by rewriting
+  `~/.finch/config.toml` during `EventLoop::run`, which also leaks a misleading
+  `[config::settings] Configuration saved` line into first-start output. Store notice-delivery
+  bookkeeping in a separate runtime-state file (or an explicit acknowledgement event), write it
+  atomically only when needed, and keep persistence diagnostics out of conversation/startup rows.
+  Add a startup test proving Brain creation/attachment alone leaves the config bytes and mtime
+  unchanged.
 - [ ] Dogfood Finch with the ChatGPT Sol profile after the wizard fixes land; verify provider
   selection, prompt override, settings reload, and visible memory status lines.
 
