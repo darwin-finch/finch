@@ -18,6 +18,13 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+#[derive(Debug, Clone)]
+pub struct RunnerReconnectTarget {
+    pub brain: String,
+    pub environment: crate::brain::store::BrainEnvironment,
+    pub lease_id: Option<crate::brain::store::RunnerLeaseId>,
+}
+
 /// Result of a tool execution confirmation prompt
 #[derive(Debug, Clone)]
 pub enum ConfirmationResult {
@@ -204,6 +211,7 @@ pub enum ReplEvent {
     ReconnectHomeRunner {
         epoch: u64,
         attempt: u32,
+        target: RunnerReconnectTarget,
     },
     /// The expiring lease served by this frontend was renewed, lost, or
     /// reacquired. A renewed lease is not considered active until the event
@@ -211,6 +219,7 @@ pub enum ReplEvent {
     /// prevents a stopped home-renewal task from overwriting a later handoff.
     RunnerLeaseStatus {
         brain: String,
+        environment: crate::brain::store::BrainEnvironment,
         epoch: u64,
         lease_id: Option<crate::brain::store::RunnerLeaseId>,
         detail: String,

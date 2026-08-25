@@ -87,6 +87,11 @@ fn lease_id_after_registration(
     }
 }
 
+struct HomeRunnerRegistration {
+    target: RunnerReconnectTarget,
+    registration: std::result::Result<crate::brain::store::RunnerLeaseId, String>,
+}
+
 fn verify_local_frontend_environment(
     expected: &crate::brain::store::BrainEnvironment,
 ) -> Result<()> {
@@ -124,7 +129,7 @@ impl EventLoop {
     /// runner claim from the status bar; retry never reuses an expired ID.
     async fn register_home_brain(
         &self,
-    ) -> Result<Option<std::result::Result<crate::brain::store::RunnerLeaseId, String>>> {
+    ) -> Result<Option<HomeRunnerRegistration>> {
         let Some(ipc) = self.ipc_client.as_ref().cloned() else {
             return Ok(None);
         };
@@ -147,15 +152,28 @@ impl EventLoop {
                 .register_brain_runner(&self.session_label, lease.lease_id, self.event_tx.clone())
                 .await
             {
-                Ok(bootstrap) => self
+                Ok(bootstrap) => match self
                     .program_runtime
                     .hydrate_reducible_state_if_newer(
                         bootstrap.checkpoint,
                         bootstrap.runtime_revision,
                     )
                     .await
-                    .map(|_| lease.lease_id)
-                    .map_err(|error| error.to_string()),
+                {
+                    Ok(_) => {
+                        self.agent_scheduler
+                            .bind_brain_control(bootstrap.subagent_control)
+                            .await;
+                        Ok(lease.lease_id)
+                    }
+                    Err(error) => {
+                        let _ = ipc
+                            .brain_release_runner(&self.session_label, lease.lease_id)
+                            .await;
+                        self.agent_scheduler.clear_brain_control().await;
+                        Err(error.to_string())
+                    }
+                },
                 Err(error) => Err(error.to_string()),
             },
             (Ok(_), None) => Err("Cap'n Proto daemon connection unavailable".into()),
@@ -165,13 +183,20 @@ impl EventLoop {
         let lease_id = initial.ok().map(|lease| lease.lease_id);
         self.start_runner_lease_renewal(
             ipc,
-            snapshot.name,
+            snapshot.name.clone(),
             self.runner_subject.clone(),
-            snapshot.environment,
+            snapshot.environment.clone(),
             lease_id,
             initial_had_lease,
         );
-        Ok(Some(initial_registration))
+        Ok(Some(HomeRunnerRegistration {
+            target: RunnerReconnectTarget {
+                brain: snapshot.name,
+                environment: snapshot.environment,
+                lease_id,
+            },
+            registration: initial_registration,
+        }))
     }
 
     fn start_runner_lease_renewal(
@@ -212,6 +237,7 @@ impl EventLoop {
                         // runner is reachable.
                         let _ = event_tx.send(ReplEvent::RunnerLeaseStatus {
                             brain: brain.clone(),
+                            environment: environment.clone(),
                             epoch,
                             lease_id: Some(lease.lease_id),
                             detail: if had_lease {
@@ -240,6 +266,7 @@ impl EventLoop {
                         if had_lease {
                             let _ = event_tx.send(ReplEvent::RunnerLeaseStatus {
                                 brain: brain.clone(),
+                                environment: environment.clone(),
                                 epoch,
                                 lease_id: None,
                                 detail: if handed_off {
@@ -358,7 +385,12 @@ impl EventLoop {
         });
     }
 
-    fn schedule_home_runner_reconnect(&self, epoch: u64, attempt: u32) {
+    fn schedule_home_runner_reconnect(
+        &self,
+        epoch: u64,
+        attempt: u32,
+        target: RunnerReconnectTarget,
+    ) {
         let event_tx = self.event_tx.clone();
         let delay_ms = match attempt {
             0 => 100,
@@ -372,7 +404,7 @@ impl EventLoop {
             tokio::select! {
                 _ = event_tx.closed() => {}
                 _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {
-                    let _ = event_tx.send(ReplEvent::ReconnectHomeRunner { epoch, attempt });
+                    let _ = event_tx.send(ReplEvent::ReconnectHomeRunner { epoch, attempt, target });
                 }
             }
         });
@@ -406,14 +438,32 @@ impl EventLoop {
         self.attach_home_brain().await?;
         self.last_home_watch_error = None;
         self.update_remote_brain_status(self.home_runner_lease_active);
-        let runner_epoch = self
-            .runner_renewal_epoch
-            .load(std::sync::atomic::Ordering::SeqCst);
-        self.schedule_home_runner_reconnect(runner_epoch, 0);
+        if self.runner_reconnect_target.is_none() {
+            let snapshot = self
+                .home_brain
+                .as_ref()
+                .context("home Brain attachment disappeared after reconnect")?
+                .snapshot()
+                .await?;
+            self.runner_reconnect_target = Some(RunnerReconnectTarget {
+                brain: snapshot.name,
+                environment: snapshot.environment,
+                lease_id: snapshot
+                    .runner_lease
+                    .filter(|lease| lease.subject == self.runner_subject)
+                    .map(|lease| lease.lease_id),
+            });
+        }
+        if let Some(target) = self.runner_reconnect_target.clone() {
+            let runner_epoch = self
+                .runner_renewal_epoch
+                .load(std::sync::atomic::Ordering::SeqCst);
+            self.schedule_home_runner_reconnect(runner_epoch, 0, target);
+        }
         Ok(())
     }
 
-    async fn restore_home_runner(&mut self) -> Result<()> {
+    async fn restore_home_runner(&mut self, target: RunnerReconnectTarget) -> Result<()> {
         let mut ipc = self
             .ipc_client
             .as_ref()
@@ -428,41 +478,74 @@ impl EventLoop {
         ipc.brain_claim_runner_identity(&self.runner_subject)
             .await
             .context("reclaim this frontend's runner identity")?;
-        let snapshot = ipc.brain_snapshot(&self.session_label).await?;
+        let snapshot = ipc.brain_snapshot(&target.brain).await?;
         verify_local_frontend_environment(&snapshot.environment)?;
+        anyhow::ensure!(
+            snapshot.environment == target.environment,
+            "runner reconnect environment changed for {}",
+            target.brain
+        );
         let durable_lease_id = reconnect_runner_lease_id(
-            self.home_runner_lease_id,
+            target.lease_id,
             &snapshot,
             &self.runner_subject,
         )?;
         let lease = ipc
             .brain_acquire_runner(
-                &self.session_label,
+                &target.brain,
                 &self.runner_subject,
                 &snapshot.environment,
                 durable_lease_id,
                 30_000,
             )
             .await?;
-        let bootstrap = ipc
-            .register_brain_runner(&self.session_label, lease.lease_id, self.event_tx.clone())
-            .await?;
-        self.agent_scheduler
-            .bind_brain_control(bootstrap.subagent_control)
-            .await;
-        self.program_runtime
+        let bootstrap = match ipc
+            .register_brain_runner(&target.brain, lease.lease_id, self.event_tx.clone())
+            .await
+        {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                let _ = ipc
+                    .brain_release_runner(&target.brain, lease.lease_id)
+                    .await;
+                return Err(error.context(format!(
+                    "register restored runner callback for {}",
+                    target.brain
+                )));
+            }
+        };
+        if let Err(error) = self
+            .program_runtime
             .hydrate_reducible_state_if_newer(
                 bootstrap.checkpoint,
                 bootstrap.runtime_revision,
             )
-            .await?;
+            .await
+        {
+            let _ = ipc
+                .brain_release_runner(&target.brain, lease.lease_id)
+                .await;
+            self.agent_scheduler.clear_brain_control().await;
+            return Err(error.context(format!(
+                "hydrate restored runner checkpoint for {}",
+                target.brain
+            )));
+        }
+        self.agent_scheduler
+            .bind_brain_control(bootstrap.subagent_control)
+            .await;
         self.home_runner_lease_id = Some(lease.lease_id);
         self.home_runner_lease_active = true;
-        self.runner_brain = Some(self.session_label.clone());
+        self.runner_brain = Some(target.brain.clone());
+        self.runner_reconnect_target = Some(RunnerReconnectTarget {
+            brain: target.brain.clone(),
+            environment: target.environment.clone(),
+            lease_id: Some(lease.lease_id),
+        });
         self.last_home_runner_error = None;
         self.start_runner_lease_renewal(
             ipc,
-            snapshot.name,
+            target.brain,
             self.runner_subject.clone(),
             snapshot.environment,
             Some(lease.lease_id),
@@ -494,6 +577,7 @@ impl EventLoop {
             }
         }
         self.home_runner_lease_active = false;
+        self.runner_reconnect_target = None;
 
         if let Some(client) = self.active_remote_brain.take() {
             if tokio::time::timeout(std::time::Duration::from_secs(2), client.disconnect())
@@ -964,6 +1048,11 @@ impl EventLoop {
         self.runner_brain = Some(brain.clone());
         self.home_runner_lease_id = Some(lease.lease_id);
         self.home_runner_lease_active = true;
+        self.runner_reconnect_target = Some(RunnerReconnectTarget {
+            brain: brain.clone(),
+            environment: environment.clone(),
+            lease_id: Some(lease.lease_id),
+        });
         self.start_runner_lease_renewal(
             ipc.clone(),
             brain,
@@ -1053,6 +1142,7 @@ impl EventLoop {
         self.runner_brain = None;
         self.home_runner_lease_id = None;
         self.home_runner_lease_active = false;
+        self.runner_reconnect_target = None;
 
         let lease = match ipc
             .brain_accept_runner_handoff(
@@ -1103,6 +1193,11 @@ impl EventLoop {
         self.runner_brain = Some(snapshot.name.clone());
         self.home_runner_lease_id = Some(lease.lease_id);
         self.home_runner_lease_active = true;
+        self.runner_reconnect_target = Some(RunnerReconnectTarget {
+            brain: snapshot.name.clone(),
+            environment: snapshot.environment.clone(),
+            lease_id: Some(lease.lease_id),
+        });
         self.start_runner_lease_renewal(
             ipc,
             snapshot.name.clone(),
