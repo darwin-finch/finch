@@ -264,6 +264,28 @@ impl BrainInitialization {
             source_sha256: self.source_sha256.clone(),
         }
     }
+
+    fn validate_schedule(&self, schedule: &BrainSchedule) -> Result<()> {
+        let identity = schedule
+            .module_identity
+            .as_ref()
+            .context("reviewed Brain-module schedule is missing its module identity")?;
+        anyhow::ensure!(identity == &self.module_identity(),
+            "Brain-module schedule identity does not match the reviewed initialization module");
+        anyhow::ensure!(schedule.language == self.language,
+            "Brain initialization schedule language does not match the reviewed module");
+        let actual = hex::encode(Sha256::digest(schedule.source.as_bytes()));
+        anyhow::ensure!(identity.source_sha256 == actual,
+            "Brain initialization schedule digest does not match its source");
+        anyhow::ensure!(schedule.source == self.source,
+            "Brain initialization schedule source is not the reviewed module");
+        anyhow::ensure!(schedule.grant_ceiling == self.capability_budget,
+            "Brain initialization schedule capability budget is not the reviewed ceiling");
+        anyhow::ensure!(schedule.interval_ms.is_none()
+                && schedule.delivery_policy == BrainScheduleDeliveryPolicy::Coalesce,
+            "Brain initialization schedule must be a coalesced one-shot");
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -931,8 +953,9 @@ impl BrainStore {
     ///
     /// An active or delivered-but-nonterminal attempt is returned unchanged.
     /// A successfully completed attempt remains idempotently complete. A
-    /// schedule cancelled before delivery, or an attempt whose run failed or
-    /// was cancelled, is retried with a new schedule ID. The ordinary
+    /// schedule cancelled before delivery, or an attempt whose run failed,
+    /// was cancelled, or was interrupted, is retried with a new schedule ID.
+    /// The ordinary
     /// scheduler creates the explicit `BrainRun`, and the runner is limited to
     /// the reviewed contract's capability ceiling.
     pub fn schedule_initialization(
@@ -967,6 +990,7 @@ impl BrainStore {
             let existing = state.schedules.get(&schedule_id)
                 .expect("module schedule event was projected")
                 .clone();
+            initialization.validate_schedule(&existing)?;
             if existing.active {
                 return Ok(existing);
             }
@@ -979,7 +1003,12 @@ impl BrainStore {
                 _ => None,
             });
             if run_status.is_some_and(|status| {
-                !matches!(status, BrainRunStatus::Failed | BrainRunStatus::Cancelled)
+                !matches!(
+                    status,
+                    BrainRunStatus::Failed
+                        | BrainRunStatus::Cancelled
+                        | BrainRunStatus::Interrupted
+                )
             }) {
                 return Ok(existing);
             }
@@ -988,15 +1017,16 @@ impl BrainStore {
             schedule_id: ScheduleId::new(),
             initiating_attachment_id,
             created_by: sender.to_string(),
-            grant_ceiling: initialization.capability_budget,
+            grant_ceiling: initialization.capability_budget.clone(),
             language: initialization.language,
-            source: initialization.source,
+            source: initialization.source.clone(),
             next_due_ms,
             interval_ms: None,
             delivery_policy: BrainScheduleDeliveryPolicy::Coalesce,
             module_identity: Some(module_identity),
             active: true,
         };
+        initialization.validate_schedule(&schedule)?;
         self.push_locked(name, state, sender, BrainEventKind::ScheduleChanged {
             schedule: schedule.clone(),
         })?;
@@ -1884,6 +1914,10 @@ impl BrainStore {
                         | BrainEventKind::ProgramPopped { .. }
                         | BrainEventKind::Result { .. }
                         | BrainEventKind::RuntimeCommitted { .. }
+                        | BrainEventKind::RunStarted { .. }
+                        | BrainEventKind::RunStatusChanged { .. }
+                        | BrainEventKind::ScheduleChanged { .. }
+                        | BrainEventKind::ScheduleDue { .. }
                 )
             });
             // A pending reservation already represents a live participant.
@@ -2066,6 +2100,18 @@ impl BrainStore {
         sender: &str,
         kind: BrainEventKind,
     ) -> Result<BrainEvent> {
+        if let BrainEventKind::ScheduleChanged { schedule } = &kind {
+            if schedule.module_identity.is_some() {
+                let initialization = self
+                    .initializations
+                    .read()
+                    .expect("shared Brain initialization lock poisoned")
+                    .get(name)
+                    .cloned()
+                    .context("reviewed Brain initialization contract is not loaded")?;
+                initialization.validate_schedule(schedule)?;
+            }
+        }
         let event = BrainEvent {
             schema_version: BRAIN_EVENT_SCHEMA_VERSION,
             brain_id: state.brain_id,
@@ -2402,6 +2448,16 @@ impl BrainStore {
                     "Brain '{name}' event #{} belongs to a different Brain identity",
                     event.seq
                 );
+            }
+            if let BrainEventKind::ScheduleChanged { schedule } = &event.kind {
+                if schedule.module_identity.is_some() {
+                    initialization.validate_schedule(schedule).with_context(|| {
+                        format!(
+                            "Brain '{name}' event #{} contains an invalid reviewed-module schedule",
+                            event.seq
+                        )
+                    })?;
+                }
             }
         }
         // Preserve an empty named Brain across daemon restarts, even before
@@ -3614,6 +3670,132 @@ mod tests {
             .unwrap();
         assert_ne!(second_retry.schedule_id, retry.schedule_id);
         assert!(second_retry.active);
+    }
+
+    #[test]
+    fn interrupted_initialization_attempt_is_retried_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let first = store
+            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .unwrap();
+        let run = store.queue_due_schedules("shared", 10).unwrap().remove(0);
+        store
+            .transition_run(
+                "shared",
+                "daemon:runner",
+                run.run_id,
+                BrainRunStatus::Running,
+                None,
+            )
+            .unwrap();
+        drop(store);
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let reattached = restarted
+            .attach(
+                "shared",
+                "alice",
+                AttachmentRole::Driver,
+                Some(attachment.attachment_id),
+            )
+            .unwrap();
+        restarted.activate_connection(
+            "shared",
+            reattached.attachment_id,
+            reattached.connection_id.unwrap(),
+        ).unwrap();
+        assert_eq!(
+            restarted.inspect_run("shared", run.run_id).unwrap().status,
+            BrainRunStatus::Interrupted
+        );
+        let retry = restarted
+            .schedule_initialization("shared", "alice", attachment.attachment_id, 20)
+            .unwrap();
+        assert_ne!(retry.schedule_id, first.schedule_id);
+        assert!(retry.active);
+    }
+
+    #[test]
+    fn scheduled_initialization_prevents_provisional_brain_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        store.activate_connection(
+            "shared",
+            attachment.attachment_id,
+            attachment.connection_id.unwrap(),
+        ).unwrap();
+        store
+            .schedule_initialization("shared", "alice", attachment.attachment_id, 10_000)
+            .unwrap();
+        store
+            .detach(
+                "shared",
+                attachment.attachment_id,
+                attachment.connection_id.unwrap(),
+            )
+            .unwrap();
+
+        assert!(!store.remove_if_unused("shared").unwrap());
+        assert_eq!(store.snapshot("shared").unwrap().schedules.len(), 1);
+        assert!(temp.path().join("shared/initialization.json").exists());
+    }
+
+    #[test]
+    fn tagged_initialization_schedule_must_match_reviewed_payload() {
+        let store = BrainStore::with_root("box.local", None);
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let mut schedule = store
+            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .unwrap();
+        schedule.source = "(define (unreviewed-startup) : int 2)".into();
+
+        let error = store
+            .push(
+                "shared",
+                "daemon",
+                BrainEventKind::ScheduleChanged { schedule },
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("schedule digest does not match its source"));
+    }
+
+    #[test]
+    fn invalid_tagged_initialization_schedule_is_rejected_during_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        store
+            .schedule_initialization("shared", "alice", attachment.attachment_id, 10)
+            .unwrap();
+        drop(store);
+
+        let path = temp.path().join("shared/events.jsonl");
+        let encoded = std::fs::read_to_string(&path).unwrap();
+        let tampered = encoded.replace(
+            DEFAULT_INITIALIZATION_SOURCE,
+            "(define (unreviewed-startup) : int 2)",
+        );
+        assert_ne!(tampered, encoded);
+        std::fs::write(&path, tampered).unwrap();
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let error = restarted.snapshot("shared").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid reviewed-module schedule"));
     }
 
     #[test]

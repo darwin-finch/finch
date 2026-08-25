@@ -964,7 +964,11 @@ still blocks the corresponding Brain phase until it is unified.
   budget and journaled effects. Deterministic VM vocabulary/module loading may occur before a
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work
   must be separately scheduled/approved BrainRuns. Do not revive the legacy mutable
-  `boot = true` Co-Forth registry as an ambient startup hook.
+  `boot = true` Co-Forth registry as an ambient startup hook. The persisted, inert reviewed-module
+  contract and its restart-safe one-shot scheduling substrate exist, but the authenticated
+  driver-facing Cap'n Proto/remote command and CLI affordance remain intentionally unexposed until
+  they can reuse the transport-neutral lifecycle authorization path without minting a second
+  scheduling or authority mechanism.
 - [x] Add the first per-Brain runner lease and participant-role substrate. Attachments persist as
   `runner`, `driver`, `consultant`, or `observer`; remote attachment creation cannot mint runners;
   roles constrain submission; and the status/list projections report the authoritative role and
