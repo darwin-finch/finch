@@ -161,9 +161,7 @@ impl BrainCredentialClaims {
         attachment_id: AttachmentId,
         connection_id: ConnectionId,
     ) -> Result<()> {
-        if self.attachment_id != Some(attachment_id)
-            || self.connection_id != Some(connection_id)
-        {
+        if self.attachment_id != Some(attachment_id) || self.connection_id != Some(connection_id) {
             anyhow::bail!("Brain credential is not bound to this attachment connection");
         }
         Ok(())
@@ -270,14 +268,14 @@ struct ConsumedInvitations {
 
 impl ConsumedInvitations {
     fn is_consumed(&self, invitation_id: uuid::Uuid) -> bool {
-        self.legacy_burned.contains(&invitation_id)
-            || self.redemptions.contains_key(&invitation_id)
+        self.legacy_burned.contains(&invitation_id) || self.redemptions.contains_key(&invitation_id)
     }
 }
 
 #[derive(Clone)]
 pub struct BrainCredentialAuthority {
     signing_key: Arc<[u8; 32]>,
+    invitation_signer: Arc<crate::node::identity::NodeSigningIdentity>,
     revoked: Arc<Mutex<BTreeSet<uuid::Uuid>>>,
     revocations_path: Option<Arc<PathBuf>>,
     consumed_invitations: Arc<Mutex<ConsumedInvitations>>,
@@ -292,12 +290,15 @@ impl BrainCredentialAuthority {
             .with_context(|| format!("create {}", state_directory.display()))?;
         let key_path = state_directory.join(SIGNING_KEY_FILE);
         let signing_key = load_or_create_signing_key(&key_path)?;
+        let invitation_signer =
+            crate::node::identity::NodeSigningIdentity::load_or_create(state_directory)?;
         let revocations_path = state_directory.join(REVOCATIONS_FILE);
         let revoked = load_revocations(&revocations_path)?;
         let consumed_invitations_path = state_directory.join(CONSUMED_INVITATIONS_FILE);
         let consumed_invitations = load_consumed_invitations(&consumed_invitations_path)?;
         Ok(Self {
             signing_key: Arc::new(signing_key),
+            invitation_signer: Arc::new(invitation_signer),
             revoked: Arc::new(Mutex::new(revoked)),
             revocations_path: Some(Arc::new(revocations_path)),
             consumed_invitations: Arc::new(Mutex::new(consumed_invitations)),
@@ -306,9 +307,12 @@ impl BrainCredentialAuthority {
     }
 
     #[cfg(test)]
-    fn ephemeral(signing_key: [u8; 32]) -> Self {
+    pub(crate) fn ephemeral(signing_key: [u8; 32]) -> Self {
         Self {
             signing_key: Arc::new(signing_key),
+            invitation_signer: Arc::new(crate::node::identity::NodeSigningIdentity::from_secret(
+                signing_key,
+            )),
             revoked: Arc::new(Mutex::new(BTreeSet::new())),
             revocations_path: None,
             consumed_invitations: Arc::new(Mutex::new(ConsumedInvitations::default())),
@@ -378,7 +382,12 @@ impl BrainCredentialAuthority {
             anyhow::bail!("Brain invitation scopes are invalid for its participant role");
         }
         if request.delegation_chain.len() > MAX_DELEGATION_DEPTH
-            || request.delegation_chain.iter().copied().collect::<BTreeSet<_>>().len()
+            || request
+                .delegation_chain
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
                 != request.delegation_chain.len()
         {
             anyhow::bail!("Brain invitation delegation chain is invalid");
@@ -403,11 +412,7 @@ impl BrainCredentialAuthority {
 
     /// Verify an invitation without consuming it. This is suitable for UI
     /// preview only; authority is created exclusively by `redeem_invitation`.
-    pub fn inspect_invitation(
-        &self,
-        token: &str,
-        now_ms: u64,
-    ) -> Result<BrainInvitationClaims> {
+    pub fn inspect_invitation(&self, token: &str, now_ms: u64) -> Result<BrainInvitationClaims> {
         let claims = self.decode_invitation(token, now_ms)?;
         if self
             .consumed_invitations
@@ -596,53 +601,21 @@ impl BrainCredentialAuthority {
     fn sign_invitation(&self, claims: &BrainInvitationClaims) -> Result<String> {
         let encoded = serde_json::to_vec(claims).context("serialize Brain invitation")?;
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encoded);
-        let signature = self.invitation_signature(&payload);
-        Ok(format!("{INVITATION_PREFIX}.{payload}.{signature}"))
+        let public_key = self.invitation_signer.public_key_bytes();
+        let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public_key);
+        let signature = self
+            .invitation_signer
+            .sign(invitation_signature_message(&payload).as_slice());
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature);
+        Ok(format!(
+            "{INVITATION_PREFIX}.{public_key}.{payload}.{signature}"
+        ))
     }
 
     fn decode_invitation(&self, token: &str, now_ms: u64) -> Result<BrainInvitationClaims> {
-        let mut parts = token.split('.');
-        let prefix = parts.next().unwrap_or_default();
-        let payload = parts.next().context("Brain invitation payload is missing")?;
-        let signature = parts
-            .next()
-            .context("Brain invitation signature is missing")?;
-        if prefix != INVITATION_PREFIX || parts.next().is_some() {
-            anyhow::bail!("Brain invitation envelope is invalid");
-        }
-        let supplied = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(signature)
-            .context("Brain invitation signature is invalid")?;
-        let mut mac = HmacSha256::new_from_slice(self.signing_key.as_slice())
-            .expect("HMAC accepts a 32-byte key");
-        mac.update(INVITATION_PREFIX.as_bytes());
-        mac.update(&[0]);
-        mac.update(payload.as_bytes());
-        mac.verify_slice(&supplied)
-            .map_err(|_| anyhow::anyhow!("Brain invitation signature does not match"))?;
-
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(payload)
-            .context("Brain invitation payload is invalid")?;
-        let claims: BrainInvitationClaims =
-            serde_json::from_slice(&encoded).context("Brain invitation claims are invalid")?;
-        if claims.version != CREDENTIAL_VERSION {
-            anyhow::bail!("unsupported Brain invitation version {}", claims.version);
-        }
-        if now_ms < claims.issued_ms {
-            anyhow::bail!("Brain invitation is not valid yet");
-        }
-        if now_ms >= claims.expires_ms {
-            anyhow::bail!("Brain invitation has expired");
-        }
-        if claims.role == AttachmentRole::Runner
-            || claims.scopes.is_empty()
-            || !claims
-                .scopes
-                .is_subset(&permitted_participant_scopes(claims.role))
-            || !claims.scopes.contains(&BrainCredentialScope::BrainAttach)
-        {
-            anyhow::bail!("Brain invitation claims have invalid participant authority");
+        let (claims, public_key) = verify_portable_invitation(token, now_ms)?;
+        if public_key != self.invitation_signer.public_key_bytes() {
+            anyhow::bail!("Brain invitation was issued by a different node identity");
         }
         let revoked = self
             .revoked
@@ -657,15 +630,88 @@ impl BrainCredentialAuthority {
         }
         Ok(claims)
     }
+}
 
-    fn invitation_signature(&self, payload: &str) -> String {
-        let mut mac = HmacSha256::new_from_slice(self.signing_key.as_slice())
-            .expect("HMAC accepts a 32-byte key");
-        mac.update(INVITATION_PREFIX.as_bytes());
-        mac.update(&[0]);
-        mac.update(payload.as_bytes());
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+/// Verify the self-contained Ed25519 envelope before contacting its issuer.
+/// This proves that all invitation claims came from the returned node key; a
+/// transport still has to pin its authenticated channel to that same key.
+pub fn verify_portable_invitation(
+    token: &str,
+    now_ms: u64,
+) -> Result<(BrainInvitationClaims, [u8; 32])> {
+    let mut parts = token.split('.');
+    let prefix = parts.next().unwrap_or_default();
+    let public_key = parts
+        .next()
+        .context("Brain invitation node key is missing")?;
+    let payload = parts
+        .next()
+        .context("Brain invitation payload is missing")?;
+    let signature = parts
+        .next()
+        .context("Brain invitation signature is missing")?;
+    if prefix != INVITATION_PREFIX || parts.next().is_some() {
+        anyhow::bail!("Brain invitation envelope is invalid");
     }
+    let public_key: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(public_key)
+        .context("Brain invitation node key is invalid")?
+        .try_into()
+        .map_err(|key: Vec<u8>| {
+            anyhow::anyhow!(
+                "Brain invitation node key has {} bytes, expected 32",
+                key.len()
+            )
+        })?;
+    let supplied: [u8; 64] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(signature)
+        .context("Brain invitation signature is invalid")?
+        .try_into()
+        .map_err(|signature: Vec<u8>| {
+            anyhow::anyhow!(
+                "Brain invitation signature has {} bytes, expected 64",
+                signature.len()
+            )
+        })?;
+    crate::node::identity::NodeSigningIdentity::verify(
+        public_key,
+        invitation_signature_message(payload).as_slice(),
+        supplied,
+    )
+    .context("Brain invitation signature does not match")?;
+
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .context("Brain invitation payload is invalid")?;
+    let claims: BrainInvitationClaims =
+        serde_json::from_slice(&encoded).context("Brain invitation claims are invalid")?;
+    if claims.version != CREDENTIAL_VERSION {
+        anyhow::bail!("unsupported Brain invitation version {}", claims.version);
+    }
+    if now_ms < claims.issued_ms {
+        anyhow::bail!("Brain invitation is not valid yet");
+    }
+    if now_ms >= claims.expires_ms {
+        anyhow::bail!("Brain invitation has expired");
+    }
+    if claims.role == AttachmentRole::Runner
+        || claims.scopes.is_empty()
+        || !claims
+            .scopes
+            .is_subset(&permitted_participant_scopes(claims.role))
+        || !claims.scopes.contains(&BrainCredentialScope::BrainAttach)
+    {
+        anyhow::bail!("Brain invitation claims have invalid participant authority");
+    }
+    Ok((claims, public_key))
+}
+
+fn invitation_signature_message(payload: &str) -> Vec<u8> {
+    let mut message = Vec::with_capacity(INVITATION_PREFIX.len() + 1 + payload.len());
+    message.extend_from_slice(INVITATION_PREFIX.as_bytes());
+    message.push(0);
+    message.extend_from_slice(payload.as_bytes());
+    message
 }
 
 fn load_or_create_signing_key(path: &Path) -> Result<[u8; 32]> {
@@ -792,10 +838,7 @@ fn load_consumed_invitations(path: &Path) -> Result<ConsumedInvitations> {
     }
 }
 
-fn persist_consumed_invitations(
-    path: &Path,
-    consumed: &ConsumedInvitations,
-) -> Result<()> {
+fn persist_consumed_invitations(path: &Path, consumed: &ConsumedInvitations) -> Result<()> {
     let file = ConsumedInvitationFile {
         version: CREDENTIAL_VERSION,
         invitation_ids: consumed.legacy_burned.clone(),
@@ -890,10 +933,7 @@ mod tests {
         assert!(!bound.permits(BrainCredentialScope::BrainAttach));
         assert!(bound.permits(BrainCredentialScope::BrainDetach));
         assert!(bound
-            .require_attachment(
-                AttachmentId(uuid::Uuid::new_v4()),
-                connection_id,
-            )
+            .require_attachment(AttachmentId(uuid::Uuid::new_v4()), connection_id,)
             .is_err());
         assert!(authority
             .bind_attachment(&bound, attachment_id, connection_id, now + 2)
@@ -980,8 +1020,12 @@ mod tests {
     fn attenuation_cannot_add_authority_or_outlive_its_parent() {
         let authority = BrainCredentialAuthority::ephemeral([9; 32]);
         let mut parent_request = request(5_000);
-        parent_request.scopes.insert(BrainCredentialScope::BrainControl);
-        parent_request.scopes.insert(BrainCredentialScope::BrainApprove);
+        parent_request
+            .scopes
+            .insert(BrainCredentialScope::BrainControl);
+        parent_request
+            .scopes
+            .insert(BrainCredentialScope::BrainApprove);
         let parent_token = authority.issue(parent_request, 10_000).unwrap();
         let parent = authority.verify(&parent_token, 10_100).unwrap();
 
@@ -1076,6 +1120,13 @@ mod tests {
         let (invitation, invitation_claims) = authority
             .issue_invitation(invitation_request(1_000), 10_000)
             .unwrap();
+        let (portable_claims, issuer_key) =
+            verify_portable_invitation(&invitation, 10_100).unwrap();
+        assert_eq!(portable_claims, invitation_claims);
+        assert_eq!(
+            issuer_key,
+            crate::node::identity::NodeSigningIdentity::from_secret([11; 32]).public_key_bytes()
+        );
         assert_eq!(
             authority.inspect_invitation(&invitation, 10_100).unwrap(),
             invitation_claims
@@ -1171,6 +1222,15 @@ mod tests {
         runner.role = AttachmentRole::Runner;
         runner.scopes = [BrainCredentialScope::BrainAttach].into_iter().collect();
         assert!(authority.issue_invitation(runner, 10_000).is_err());
+
+        let foreign = BrainCredentialAuthority::ephemeral([99; 32]);
+        let (foreign_invitation, _) = foreign
+            .issue_invitation(invitation_request(1_000), 10_000)
+            .unwrap();
+        assert!(authority
+            .inspect_invitation(&foreign_invitation, 10_100)
+            .is_err());
+        assert!(verify_portable_invitation(&foreign_invitation, 10_100).is_ok());
     }
 
     #[test]
