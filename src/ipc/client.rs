@@ -1158,6 +1158,17 @@ mod tests {
             );
             assert!(outcome.result.is_none());
             assert!(outcome.accepted.seq > initial.revision);
+            let run = outcome.run.unwrap();
+            let inspected = client.brain_inspect_run(brain, run.run_id).await.unwrap();
+            assert_eq!(inspected.run_id, run.run_id);
+            let cancelled = client
+                .brain_cancel_run(brain, &attachment, run.run_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                cancelled.status,
+                crate::brain::shared::BrainRunStatus::Cancelled
+            );
             let acknowledged = client
                 .brain_acknowledge(brain, &attachment, outcome.accepted.seq)
                 .await
