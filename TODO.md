@@ -662,6 +662,23 @@ still blocks the corresponding Brain phase until it is unified.
 
 ## TUI and tool presentation
 
+- [ ] Make retained `WorkUnit` rows interactively expandable without replacing native terminal
+  scrollback. Extend the generic structured-message/render trait with stable row ownership and
+  optional actions (`expand source`, `collapse source`, `open tool transcript`, later approval
+  actions); have the shadow buffer retain visible cell/row hit regions keyed by WorkUnit ID; enable
+  mouse reporting only while Finch owns the live viewport and route clicks through that map. Keep
+  keyboard equivalents and stable short IDs for terminals without mouse support. Completed VM
+  source should be sealed before execution, then retain its execution ID, output handle/chunks, and
+  terminal result in the same correlated `ProgramWorkUnit`; only the terminal result completes the
+  WorkUnit. After success its collapsed rendering shows user-visible output plus a compact `program
+  (lisp|forth)` handle, while expansion reveals exact source and execution detail. Diagnostics and
+  failed source remain expanded; do not build a full-screen virtual scrollback merely to make
+  historical rows clickable.
+- [ ] Simplify Brain/session chrome and separate transport lifecycle from conversation. Keep local
+  Brain names free of redundant hostnames and `brain:` labels, reserve `name@host` for actual remote
+  environments, project presence/runner state compactly in chrome or `/who`, and never replay
+  attachment/lease churn as transcript messages. Give user turns, VM source, executed output, tools,
+  and lifecycle diagnostics distinct structured presentation instead of mixing them as peer prose.
 - [ ] Add theme-aware author/channel backgrounds so user input, model-authored VM source, tool
   activity, and VM/user-visible output are distinguishable without relying on low-contrast cyan
   foreground text alone. Keep output backgrounds subtle, preserve WCAG-like foreground contrast in
