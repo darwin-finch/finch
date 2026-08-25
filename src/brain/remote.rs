@@ -1482,6 +1482,77 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn invitation_rejects_a_substituted_https_certificate() {
+        use axum::{routing::post, Json, Router};
+
+        let invited_secret = [51; 32];
+        let authority =
+            super::super::credential::BrainCredentialAuthority::ephemeral(invited_secret);
+        let brain_id = BrainId(uuid::Uuid::new_v4());
+        let (invitation, _) = authority
+            .issue_invitation(
+                super::super::credential::BrainInvitationRequest {
+                    issuer: "real.local".into(),
+                    brain_id,
+                    brain: "shared".into(),
+                    environment_generation: 1,
+                    role: AttachmentRole::Observer,
+                    scopes: super::super::credential::default_participant_scopes(
+                        AttachmentRole::Observer,
+                    ),
+                    delegation_chain: Vec::new(),
+                    ttl_ms: 60_000,
+                },
+                unix_epoch_millis(),
+            )
+            .unwrap();
+
+        let attacker = crate::node::identity::NodeSigningIdentity::from_secret([52; 32]);
+        let attacker_tls =
+            crate::node::tls::NodeTlsIdentity::from_signing_identity(&attacker, "localhost")
+                .unwrap();
+        crate::node::tls::install_server_crypto_provider();
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
+            vec![attacker_tls.certificate_der().to_vec()],
+            attacker_tls.private_key_der().to_vec(),
+        )
+        .await
+        .unwrap();
+        let app = Router::new().route(
+            "/v1/brains/invitations/redeem",
+            post(|| async { Json(serde_json::json!({ "unexpected": true })) }),
+        );
+        let handle = axum_server::Handle::new();
+        let server = tokio::spawn(
+            axum_server::bind_rustls(
+                "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
+                tls_config,
+            )
+            .handle(handle.clone())
+            .serve(app.into_make_service()),
+        );
+        let address = handle.listening().await.unwrap();
+        let target = RemoteBrainTarget {
+            brain: "shared".into(),
+            machine: "localhost".into(),
+            address: format!("localhost:{}", address.port()),
+            secure: true,
+        };
+        let client = RemoteBrainClient::new_with_invitation(target, invitation).unwrap();
+
+        let error = client
+            .redeem_invitation("alice@laptop.local")
+            .await
+            .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("certificate") || detail.contains("UnknownIssuer"),
+            "unexpected TLS error: {detail}"
+        );
+        server.abort();
+    }
+
     #[test]
     #[ignore = "requires a running Finch daemon on the default loopback port"]
     fn live_remote_creation_is_explicit_and_environment_owned() {
