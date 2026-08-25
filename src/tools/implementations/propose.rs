@@ -675,6 +675,18 @@ mod tests {
                         if matches!(outcome, Outcome::LaunchError) {
                             anyhow::bail!("fake editor launch failed");
                         }
+                        if matches!(outcome, Outcome::Signal) {
+                            // A real full-screen child can die before its
+                            // terminal cleanup handler runs. Emit only the
+                            // child's enter sequence, then terminate the shell
+                            // itself so ExitStatus carries an actual signal.
+                            let output = std::process::Command::new("/bin/sh")
+                                .args(["-c", r#"printf '\033[?1049h'; kill -TERM $$"#])
+                                .output()?;
+                            assert_eq!(output.status.signal(), Some(libc::SIGTERM));
+                            child.output.lock().unwrap().extend(output.stdout);
+                            return Ok(output.status);
+                        }
                         {
                             let mut output = child.output.lock().unwrap();
                             execute!(&mut *output, terminal::EnterAlternateScreen)?;
@@ -690,12 +702,7 @@ mod tests {
                                 Ok(exit_status(0))
                             }
                             Outcome::Nonzero => Ok(exit_status(7)),
-                            Outcome::Signal => {
-                                let status = std::process::ExitStatus::from_raw(libc::SIGTERM);
-                                assert_eq!(status.signal(), Some(libc::SIGTERM));
-                                Ok(status)
-                            }
-                            Outcome::LaunchError => unreachable!(),
+                            Outcome::Signal | Outcome::LaunchError => unreachable!(),
                         }
                     })
                 })
@@ -717,13 +724,15 @@ mod tests {
 
             let output = String::from_utf8(control.output.lock().unwrap().clone()).unwrap();
             let child_started = !matches!(outcome, Outcome::LaunchError);
+            let child_left_screen =
+                !matches!(outcome, Outcome::LaunchError | Outcome::Signal);
             assert_eq!(
                 output.matches("\x1b[?1049h").count(),
                 1 + usize::from(child_started)
             );
             assert_eq!(
                 output.matches("\x1b[?1049l").count(),
-                1 + usize::from(child_started)
+                1 + usize::from(child_left_screen)
             );
             assert!(output.rfind("\x1b[?1049l").unwrap() > output.rfind("\x1b[?1049h").unwrap());
         }
