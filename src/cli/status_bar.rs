@@ -207,11 +207,26 @@ impl StatusBar {
         self.lines.read().unwrap().is_empty()
     }
 
+    /// Get one status line without exposing the internal map or its lock.
+    pub fn get_line(&self, line_type: &StatusLineType) -> Option<String> {
+        self.lines.read().unwrap().get(line_type).cloned()
+    }
+
     /// Get status content as a string (for change detection)
     pub fn get_status(&self) -> String {
         let lines = self.get_lines();
         lines
             .iter()
+            .map(|line| line.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Get rendered status content while projecting one line somewhere else.
+    pub fn get_status_without(&self, excluded: &StatusLineType) -> String {
+        self.get_lines()
+            .iter()
+            .filter(|line| &line.line_type != excluded)
             .map(|line| line.content.as_str())
             .collect::<Vec<_>>()
             .join("\n")
@@ -417,6 +432,22 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].line_type, StatusLineType::SessionLabel);
         assert_eq!(lines[1].line_type, StatusLineType::MemoryContext);
+    }
+
+    #[test]
+    fn session_label_can_be_projected_out_of_the_status_body() {
+        let status = StatusBar::new();
+        status.update_line(StatusLineType::SessionLabel, "◆ brain: quiet-hill · runner");
+        status.update_line(StatusLineType::MemoryContext, "🧠 recalled 2");
+
+        assert_eq!(
+            status.get_line(&StatusLineType::SessionLabel).as_deref(),
+            Some("◆ brain: quiet-hill · runner")
+        );
+        assert_eq!(
+            status.get_status_without(&StatusLineType::SessionLabel),
+            "🧠 recalled 2"
+        );
     }
 
     #[test]

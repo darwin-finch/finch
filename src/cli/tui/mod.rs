@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tui_textarea::TextArea;
 
-use super::{OutputManager, StatusBar};
+use super::{OutputManager, StatusBar, StatusLineType};
 use crate::cli::messages::{MessageId, MessageRef, MessageStatus};
 // Sub-modules
 mod async_input;
@@ -947,10 +947,15 @@ impl TuiRenderer {
         let prefix = "── ";
         let prefix_vis = 3_usize;
         let cwd_part = format!(" {} ", cwd_label);
-        let right_part = if self.session_label.is_empty() {
+        let session_label = self
+            .status_bar
+            .get_line(&StatusLineType::SessionLabel)
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| self.session_label.clone());
+        let right_part = if session_label.is_empty() {
             " ──".to_string()
         } else {
-            format!(" {} ──", self.session_label)
+            format!(" {} ──", session_label)
         };
         let left_vis = prefix_vis + cwd_part.chars().count();
         let right_vis = right_part.chars().count();
@@ -1048,7 +1053,11 @@ impl TuiRenderer {
             // the status bar has several active entries (e.g. operation + compaction
             // + plan-mode indicator).  Each must be printed with \r\n so that raw
             // mode does not leave the cursor at the wrong column.
-            let raw_status = self.status_bar.get_status();
+            // Session identity is projected into the upper separator. Keeping it
+            // here as well wastes a row and makes the Brain appear twice.
+            let raw_status = self
+                .status_bar
+                .get_status_without(&StatusLineType::SessionLabel);
             let current_input = self.input_textarea.lines().join("\n");
             let effective_status = compute_effective_status(
                 self.ghost_text.as_deref(),
