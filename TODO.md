@@ -15,7 +15,12 @@ This is the short, discoverable work queue. Detailed rationale and protocol sket
   merely cosmetic response style.
 - [ ] Use one setup-result-to-config mapping for first-run setup, `finch setup`, and `/setup`; cover
   GUI automation, daemon-only mode, network advertisement, LAN discovery, persona, and memory
-  status-line count with round-trip tests.
+  status-line count with round-trip tests. The mapping now round-trips the displayed values and the
+  active event loop honors disabled response streaming, but persistence is not completion: make
+  `server.mode = "daemon-only"` actually select a daemon-only startup path, consume
+  `client.auto_discover` through the correct Brain transport rather than treating advertised TLS as
+  an HTTP daemon, make configured debug logging control the interactive output layer and document
+  its real destination, and add behavioral tests for each runtime path.
 - [ ] Allow saving the accumulated settings from every wizard screen instead of only the final
   screen. Make Escape unwind the current editor/dialog/screen first; cancelling the entire wizard
   must be a distinct action and must confirm before discarding unsaved changes.
