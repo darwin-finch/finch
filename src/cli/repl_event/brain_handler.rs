@@ -435,15 +435,16 @@ impl EventLoop {
     }
 
     async fn handle_brain_create(&mut self, target: String) -> Result<()> {
-        let target = if target.contains('@') {
-            crate::brain::remote::RemoteBrainTarget::parse(&target)?
-        } else {
-            let base = self
-                .daemon_base_url
-                .as_deref()
-                .context("local daemon is unavailable")?;
-            crate::brain::remote::RemoteBrainTarget::local(&target, base)?
-        };
+        anyhow::ensure!(
+            !target.contains('@'),
+            "remote Brain creation is administrative and loopback-only; run `/brain create {}` on the environment machine, then issue an invitation",
+            target.split('@').next().unwrap_or("NAME")
+        );
+        let base = self
+            .daemon_base_url
+            .as_deref()
+            .context("local daemon is unavailable")?;
+        let target = crate::brain::remote::RemoteBrainTarget::local(&target, base)?;
         let password = crate::config::load_config()
             .map(|config| config.server.brain_password)
             .unwrap_or_default();

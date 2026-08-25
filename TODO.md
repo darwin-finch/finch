@@ -894,12 +894,17 @@ still blocks the corresponding Brain phase until it is unified.
   attachment now creates a 15-second pending reservation; only the exact WebSocket activation emits
   `ClientAttached`, concurrent identity reuse fails closed, and expiry clears only the matching
   pending connection without moving its durable acknowledgement cursor or Brain revision.
-- [x] Add explicit remote Brain creation while preserving the invariant that one environment is an
-  indivisible machine/workspace authority boundary. `/brain create <name>[@machine]` calls an
-  authenticated bootstrap/admin endpoint whose request contains only the alias; the owning daemon
-  supplies its fixed canonical machine, workspace, and generation and rejects alias reuse. The same
-  operation lives on `BrainLifecycleService`, and hermetic plus live-daemon tests cover environment
-  ownership, conflict behavior, and scoped archive cleanup.
+- [x] Add explicit local Brain creation while preserving the invariant that one environment is an
+  indivisible machine/workspace authority boundary. `/brain create <name>` calls a loopback-only
+  bootstrap/admin endpoint whose request contains only the alias; the owning daemon supplies its
+  fixed canonical machine, workspace, and generation and rejects alias reuse. The same operation
+  lives on `BrainLifecycleService`, and hermetic plus live-daemon tests cover environment ownership,
+  conflict behavior, and scoped archive cleanup.
+- [ ] If remote Brain administration is needed, design an explicit node-administrator credential
+  and audited create operation distinct from participant invitations. Do not reuse the daemon
+  bootstrap password or let an invitation for an existing Brain mint a new environment namespace;
+  until then create the Brain from a local/SSH console on its environment machine and invite remote
+  participants afterward.
 - [x] Treat the global brain password as a local/bootstrap credential only. Mint scoped, revocable,
   expiring participant credentials containing subject, audience, brain, environment generation,
   and permitted roles. Initial scopes: `brain:read`, `brain:attach`, `brain:detach`, `brain:submit`,

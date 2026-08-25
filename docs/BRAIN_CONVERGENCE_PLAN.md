@@ -536,7 +536,10 @@ explicit one-purpose `environment:admin` credential instead of relying on localh
 Remote creation is now an explicit bootstrap/admin operation rather than merely an attachment side
 effect: its request carries only a validated alias, while the owning daemon fixes the Brain's
 machine, canonical workspace, and environment generation. Alias reuse fails closed, and
-`/brain create <name>[@machine]` exposes the same lifecycle-service operation.
+`/brain create <name>` exposes the same lifecycle-service operation through the environment
+machine's loopback-only administrative endpoint. Remote participants join an existing Brain with a
+signed invitation; creating a new remote environment namespace requires a future, distinct
+node-administrator credential rather than password bootstrap or participant authority.
 The rebuilt-daemon remote lifecycle smoke test and local/remote conformance fixture both pass with
 that stricter boundary, including explicit archive cleanup.
 

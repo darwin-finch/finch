@@ -59,7 +59,7 @@ pub enum Command {
     BrainSay(String),              // /say <text> — relay without scheduling an LLM turn
     BrainWho,                      // /who — list connected Brain participants
     BrainWhois(String),            // /whois <subject> — inspect public Brain presence
-    BrainCreate(String),           // /brain create <name>[@machine]
+    BrainCreate(String),           // /brain create <name> (local daemon administration)
     BrainArchive(String),          // /brain archive <name>
     BrainAttach(String),           // /brain attach <name@machine[:port]>
     BrainJoin {
@@ -779,7 +779,7 @@ pub fn format_help() -> String {
          {cyan}  @finch <prompt>{reset}      Explicitly address the model in shared conversation\n\
          {cyan}  /who{reset}                List connected participants in this Brain\n\
          {cyan}  /whois <subject>{reset}    Show public presence for one participant\n\
-         {cyan}  /brain create <name>[@machine]{reset} Create an empty Brain in that environment\n\
+         {cyan}  /brain create <name>{reset}  Create an empty Brain on this machine\n\
          {cyan}  /brain attach <name>[@machine]{reset} Attach locally or to a remote Brain\n\
          {cyan}  /brain invite [role] [minutes]{reset} Create a short-lived single-use invitation\n\
          {cyan}  /brain join <name@machine> <invite>{reset} Redeem an invitation and attach\n\
