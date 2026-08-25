@@ -645,6 +645,11 @@ still blocks the corresponding Brain phase until it is unified.
 
 ## TUI and tool presentation
 
+- [ ] Add theme-aware author/channel backgrounds so user input, model-authored VM source, tool
+  activity, and VM/user-visible output are distinguishable without relying on low-contrast cyan
+  foreground text alone. Keep output backgrounds subtle, preserve WCAG-like foreground contrast in
+  light and dark themes, emit plain text when copied, and make the styling part of structured
+  `OutputManager` rows so redraw, resize, scrollback, and concurrent WorkUnits remain stable.
 - [ ] Batch model-authored edits into one explicit multi-file changeset/proposal and request one
   approval before applying it to the real workspace. Keep the familiar model-facing edit/write
   tools, but make them target a per-run proposal overlay by default: later reads, searches, and test
