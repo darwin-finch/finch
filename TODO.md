@@ -674,7 +674,15 @@ still blocks the corresponding Brain phase until it is unified.
 - [ ] Batch model-authored edits into one explicit multi-file changeset/proposal and request one
   approval before applying it to the real workspace. Keep the familiar model-facing edit/write
   tools, but make them target a per-run proposal overlay by default: later reads, searches, and test
-  processes in that run see the overlay, while the user's workspace remains unchanged. Multiple
+  processes in that run see the overlay, while the user's workspace remains unchanged. Treat this
+  as a real materialized proposal workspace rather than only an in-memory interception layer:
+  model-authored shell commands, editors, build scripts, and arbitrary subprocesses must receive the
+  proposal tree as their working tree and must not receive the real workspace as a writable root.
+  Back the platform-neutral snapshot interface with APFS `clonefile`/reflinks on macOS, OverlayFS or
+  reflinks on Linux, ReFS block cloning where available on Windows, and a correct copy fallback.
+  Isolate Git metadata/index state, seed the snapshot from the exact visible dirty and untracked
+  workspace state, and enforce capability/OS-sandbox boundaries against absolute-path and `..`
+  escapes. Multiple
   edit calls are internal proposal events: update one live summary WorkUnit instead of committing a
   stream of intermediate per-file diffs to scrollback, then present the aggregate multi-file diff at
   the review boundary. User comments and requested changes resume the proposal's agent/run against
