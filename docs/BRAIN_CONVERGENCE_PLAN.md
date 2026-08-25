@@ -467,6 +467,12 @@ additionally confined to the Cap'n Proto
 connection that claimed them. Public snapshot knowledge of a lease ID cannot register, renew, or
 release its callback; disconnect removes the callback authority immediately while the durable lease
 expires normally. VM host effects already resume against an exact `(execution_id, sequence)` pair;
+Local participant attachments are bound to the Cap'n Proto connection that created their pending
+connection identity. Snapshot-visible attachment and connection IDs are therefore correlation
+values, not bearer authority: a second local client cannot watch, submit, acknowledge, cancel, or
+detach through them, and transport disconnect drops that in-memory authority. A live
+two-connection regression exercises the hostile replay path while the owning connection remains
+usable.
 Brain approval continuations are now keyed by exact
 `(brain_id, request_seq, approval_id)` identity so a stale sequence cannot consume a live request.
 Tool inputs and approval detail/decision values use the recursive schema-native `JsonValue` union

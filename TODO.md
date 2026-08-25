@@ -888,7 +888,11 @@ still blocks the corresponding Brain phase until it is unified.
   runner identities are now first-claim bound to one Cap'n Proto connection; acquisition, renewal,
   handoff acceptance, release, and callback registration require that connection's lease authority,
   and disconnect atomically removes its callback. A live two-connection test proves a client that
-  merely learns the public lease ID cannot claim, renew, register, or release it.
+  merely learns the public lease ID cannot claim, renew, register, or release it. Local participant
+  attachments now use the same connection-bound rule: watch, submit, acknowledge, run cancellation,
+  and detach require the Cap'n Proto connection that created the attachment connection identity.
+  A second live two-connection test proves snapshot-visible attachment IDs cannot be replayed while
+  the owner continues to submit and acknowledge normally.
 - [ ] Revisit shared channels only after the Brain event log, runner lease, and participant-role
   model are complete. The eventual channel should be a threaded/multi-participant projection of a
   Brain: people and models share one durable conversation, while programs run only on the remote
