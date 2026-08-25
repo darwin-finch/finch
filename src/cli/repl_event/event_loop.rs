@@ -3882,6 +3882,7 @@ Rules:\n\
                             .is_some_and(|detail| detail.contains("handed off"))
                         {
                             self.home_runner_lease_id = None;
+                            self.runner_reconnect_target = None;
                         } else {
                             self.schedule_home_runner_reconnect(
                                 epoch,
