@@ -752,13 +752,30 @@ impl EventLoop {
             .brain_acquire_runner(&brain, &self.runner_subject, &environment, None, 30_000)
             .await
             .with_context(|| format!("restore runner lease for {brain}"))?;
-        if let Err(error) = ipc
+        let bootstrap = match ipc
             .register_brain_runner(&brain, lease.lease_id, self.event_tx.clone())
             .await
         {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                let _ = ipc.brain_release_runner(&brain, lease.lease_id).await;
+                return Err(error.context(format!("restore runner callback for {brain}")));
+            }
+        };
+        if let Err(error) = self
+            .program_runtime
+            .hydrate_reducible_state_if_newer(
+                bootstrap.checkpoint,
+                bootstrap.runtime_revision,
+            )
+            .await
+        {
             let _ = ipc.brain_release_runner(&brain, lease.lease_id).await;
-            return Err(error.context(format!("restore runner callback for {brain}")));
+            return Err(error.context(format!("restore runtime checkpoint for {brain}")));
         }
+        self.agent_scheduler
+            .bind_brain_control(bootstrap.subagent_control)
+            .await;
         self.runner_brain = Some(brain.clone());
         self.home_runner_lease_id = Some(lease.lease_id);
         self.home_runner_lease_active = true;

@@ -4063,6 +4063,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frontend_replacement_reacquires_the_same_durable_brain() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let generation = store.environment().generation;
+        let lease = store
+            .acquire_runner_lease("dogfood", "frontend-a", generation, None, 60_000)
+            .unwrap();
+        let prompt = store
+            .push(
+                "dogfood",
+                "developer",
+                BrainEventKind::Prompt {
+                    text: "continue the self-upgrade goal".into(),
+                },
+            )
+            .unwrap();
+        let runner = crate::runtime::ProgramRuntime::new();
+        let outcome = runner
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Lisp,
+                source_id: Some("dogfood:define".into()),
+                source: "(define (next-step (n : int)) (+ n 1))".into(),
+                intent: "retain work across frontend replacement".into(),
+                effect: crate::programs::ExecutionEffect::VmWrite,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runner.manifest_generation(),
+                expected_revision: Some(runner.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        let checkpoint = runner
+            .revision_history()
+            .unwrap()
+            .into_iter()
+            .find(|revision| revision.revision == outcome.output_revision)
+            .and_then(|revision| revision.checkpoint)
+            .unwrap();
+        store
+            .commit_runner_runtime(
+                "dogfood",
+                prompt.seq,
+                outcome.output_revision,
+                checkpoint,
+            )
+            .unwrap();
+        store
+            .release_runner_lease("dogfood", lease.lease_id)
+            .unwrap();
+        drop(store);
+
+        // Model both halves of the production handoff: a daemon opens the
+        // durable store again, then the replacement frontend acquires a fresh
+        // lease for the same Brain identity.
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let replacement = restarted
+            .acquire_runner_lease("dogfood", "frontend-a", generation, None, 60_000)
+            .unwrap();
+        let snapshot = restarted.snapshot("dogfood").unwrap();
+        assert_eq!(snapshot.runner_lease.unwrap().lease_id, replacement.lease_id);
+        assert!(snapshot.events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                BrainEventKind::Prompt { text }
+                    if text == "continue the self-upgrade goal"
+            )
+        }));
+
+        let restored = restarted.program_runtime("dogfood").unwrap();
+        let called = restored
+            .submit_typed_only(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Forth,
+                source_id: Some("dogfood:resume".into()),
+                source: "41 next-step".into(),
+                intent: "resume after frontend replacement".into(),
+                effect: crate::programs::ExecutionEffect::Pure,
+                declared_capabilities: Vec::new(),
+                manifest_generation: restored.manifest_generation(),
+                expected_revision: Some(restored.revision()),
+                budget: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(called.values, vec![crate::programs::ProgramValue::Int(42)]);
+    }
+
+    #[tokio::test]
     async fn named_brain_restores_scoped_authority_from_its_separate_policy_record() {
         let temp = tempfile::tempdir().unwrap();
         let store = BrainStore::with_root("box.local", Some(temp.path().into()));

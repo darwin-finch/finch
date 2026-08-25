@@ -1455,6 +1455,27 @@ impl TuiRenderer {
         self.last_terminal_size = None;
         Ok(())
     }
+
+    /// Reacquire every terminal mode after an attempted process replacement
+    /// called [`emergency_restore_terminal`] but `exec`/spawn failed.  This is
+    /// deliberately stronger than [`Self::resume`]: emergency restoration
+    /// also pops keyboard enhancements and disables bracketed paste.
+    pub(crate) fn resume_after_emergency_restore(&mut self) -> anyhow::Result<()> {
+        enable_raw_mode()?;
+        let _ = execute!(
+            io::stdout(),
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+            ),
+            cursor::Show,
+        );
+        self.output_manager.disable_stdout();
+        self.active_rows = 0;
+        self.last_terminal_size = None;
+        self.live_area_dirty = true;
+        Ok(())
+    }
 }
 
 impl Drop for TuiRenderer {
