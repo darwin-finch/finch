@@ -901,6 +901,16 @@ interface BrainRunner {
   projectMemory @3 (request :BrainMemoryProjectionRequest) -> (inserted :UInt32, error :Text);
 }
 
+# Long-lived reverse capability bound to the exact registered runner lease.
+# Child agents may outlive the parent RPC that spawned them, so their durable
+# lifecycle cannot be carried by BrainTurnControl or BrainProgramControl.
+interface BrainRunnerControl {
+  startSubagent @0 (parentRunId :Text, taskId :Text, detail :Text) ->
+                   (run :BrainRun);
+  finishSubagent @1 (runId :Text, status :BrainRunStatus, detail :Text) ->
+                    (run :BrainRun);
+}
+
 # Per-program reverse capability for durable host state owned by a Brain run.
 # The daemon binds creator identity and authority to the run before handing this
 # capability to the frontend runner.
@@ -1411,7 +1421,8 @@ interface FinchDaemon {
   # The durable reducible VM state is returned so a restarted frontend can
   # hydrate before accepting work. Host authority is deliberately absent.
   registerBrainRunner @4 (brain :Text, leaseId :Text, runner :BrainRunner)
-      -> (runtimeRevision :UInt64, checkpoint :TypedRuntimeCheckpoint);
+      -> (runtimeRevision :UInt64, checkpoint :TypedRuntimeCheckpoint,
+          control :BrainRunnerControl);
 
   # Return the canonical named-Brain lifecycle capability. Keeping this as a
   # capability allows later protocol evolution without adding every Brain

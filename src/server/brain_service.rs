@@ -119,6 +119,54 @@ impl BrainLifecycleService {
         self.store.inspect_run(brain, run_id)
     }
 
+    /// Register a frontend-owned child agent as a canonical run beneath the
+    /// active parent. The task UUID is the RunId, so a lost response can be
+    /// retried without creating a second child.
+    pub fn start_subagent_for_run(
+        &self,
+        brain: &str,
+        parent_run_id: RunId,
+        task_id: uuid::Uuid,
+        detail: Option<String>,
+    ) -> Result<BrainRun> {
+        let parent = self.store.inspect_run(brain, parent_run_id)?;
+        let run = self.store.start_run_with_parent_id(
+            brain,
+            &parent.initiated_by,
+            RunId(task_id),
+            BrainRunKind::Subagent,
+            parent.request_seq,
+            parent.initiating_attachment_id,
+            BrainRunStatus::Running,
+            Some(parent_run_id),
+            detail,
+        )?;
+        Ok(run)
+    }
+
+    pub fn transition_subagent_run(
+        &self,
+        brain: &str,
+        run_id: RunId,
+        status: BrainRunStatus,
+        detail: Option<String>,
+    ) -> Result<BrainRun> {
+        let run = self.store.inspect_run(brain, run_id)?;
+        ensure!(run.kind == BrainRunKind::Subagent, "run is not a subagent");
+        ensure!(
+            matches!(
+                status,
+                BrainRunStatus::Completed | BrainRunStatus::Failed | BrainRunStatus::Cancelled
+            ),
+            "runner may only publish a terminal subagent status"
+        );
+        if run.status == status {
+            return Ok(run);
+        }
+        self.store
+            .transition_run(brain, "runner", run_id, status, detail)
+    }
+
     pub fn inspect_schedule(
         &self,
         brain: &str,
@@ -777,6 +825,120 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cancelled.status, BrainRunStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn subagent_runs_are_idempotent_and_survive_store_restart() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let make_service = || {
+            BrainLifecycleService::new(
+                BrainStore::with_root("box.local", Some(root.clone())),
+                BrainRunnerBroker::default(),
+                BrainApprovalBroker::default(),
+            )
+        };
+        let service = make_service();
+        let driver = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let request = service
+            .store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "delegate this".into(),
+                },
+            )
+            .unwrap();
+        let parent = service
+            .start_run_with_parent(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                request.seq,
+                driver.attachment_id,
+                BrainRunStatus::Running,
+                None,
+            )
+            .unwrap();
+        let task_id = uuid::Uuid::new_v4();
+        let child = service
+            .start_subagent_for_run(
+                "shared",
+                parent.run_id,
+                task_id,
+                Some("inspect scheduler".into()),
+            )
+            .unwrap();
+        let retry = service
+            .start_subagent_for_run(
+                "shared",
+                parent.run_id,
+                task_id,
+                Some("ignored retry detail".into()),
+            )
+            .unwrap();
+        assert_eq!(retry, child);
+        assert_eq!(child.run_id, RunId(task_id));
+        assert_eq!(child.parent_run_id, Some(parent.run_id));
+
+        let completed = service
+            .transition_subagent_run(
+                "shared",
+                child.run_id,
+                BrainRunStatus::Completed,
+                Some("done".into()),
+            )
+            .unwrap();
+        assert_eq!(completed.status, BrainRunStatus::Completed);
+        service
+            .store
+            .transition_run(
+                "shared",
+                "runner",
+                parent.run_id,
+                BrainRunStatus::Completed,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            service
+                .start_subagent_for_run(
+                    "shared",
+                    parent.run_id,
+                    task_id,
+                    Some("retry after parent completion".into()),
+                )
+                .unwrap(),
+            completed
+        );
+        assert_eq!(
+            service
+                .transition_subagent_run(
+                    "shared",
+                    child.run_id,
+                    BrainRunStatus::Completed,
+                    Some("duplicate terminal publication".into()),
+                )
+                .unwrap(),
+            completed
+        );
+
+        drop(service);
+        let restarted = make_service();
+        assert_eq!(
+            restarted.inspect_run("shared", child.run_id).unwrap(),
+            completed
+        );
+        assert!(restarted
+            .transition_subagent_run(
+                "shared",
+                child.run_id,
+                BrainRunStatus::Failed,
+                Some("conflicting terminal status".into()),
+            )
+            .is_err());
     }
 
     #[tokio::test]

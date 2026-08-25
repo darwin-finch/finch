@@ -320,7 +320,7 @@ fn run_kind_from_capnp(kind: finch_ipc_capnp::BrainRunKind) -> BrainRunKind {
     }
 }
 
-fn run_status_to_capnp(status: BrainRunStatus) -> finch_ipc_capnp::BrainRunStatus {
+pub(crate) fn run_status_to_capnp(status: BrainRunStatus) -> finch_ipc_capnp::BrainRunStatus {
     match status {
         BrainRunStatus::QueuedForEnvironment => {
             finch_ipc_capnp::BrainRunStatus::QueuedForEnvironment
@@ -334,7 +334,7 @@ fn run_status_to_capnp(status: BrainRunStatus) -> finch_ipc_capnp::BrainRunStatu
     }
 }
 
-fn run_status_from_capnp(status: finch_ipc_capnp::BrainRunStatus) -> BrainRunStatus {
+pub(crate) fn run_status_from_capnp(status: finch_ipc_capnp::BrainRunStatus) -> BrainRunStatus {
     match status {
         finch_ipc_capnp::BrainRunStatus::QueuedForEnvironment => {
             BrainRunStatus::QueuedForEnvironment

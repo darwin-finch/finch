@@ -67,6 +67,125 @@ struct BrainProgramControlImpl {
     maximum_grant_ceiling: Option<crate::vm::EffectSet>,
 }
 
+/// Reverse lifecycle capability scoped to one exact runner registration.
+/// Every call rechecks both the IPC connection binding and the daemon's live
+/// lease, so a stale frontend cannot publish child state after handoff.
+struct BrainRunnerControlImpl {
+    lifecycle: crate::server::BrainLifecycleService,
+    runners: crate::server::BrainRunnerBroker,
+    connection_id: uuid::Uuid,
+    brain: String,
+    lease_id: crate::brain::store::RunnerLeaseId,
+}
+
+impl BrainRunnerControlImpl {
+    fn validate_lease(&self) -> anyhow::Result<()> {
+        self.runners.require_connection_lease(
+            self.connection_id,
+            &self.brain,
+            self.lease_id,
+        )?;
+        let snapshot = self.lifecycle.snapshot(&self.brain)?;
+        anyhow::ensure!(
+            snapshot
+                .runner_lease
+                .as_ref()
+                .is_some_and(|lease| lease.lease_id == self.lease_id),
+            "runner lifecycle capability no longer matches the active lease"
+        );
+        Ok(())
+    }
+}
+
+impl finch_ipc_capnp::brain_runner_control::Server for BrainRunnerControlImpl {
+    fn start_subagent(
+        &mut self,
+        params: finch_ipc_capnp::brain_runner_control::StartSubagentParams,
+        mut results: finch_ipc_capnp::brain_runner_control::StartSubagentResults,
+    ) -> Promise<(), capnp::Error> {
+        if let Err(error) = self.validate_lease() {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        let params = match params.get() {
+            Ok(params) => params,
+            Err(error) => return Promise::err(error),
+        };
+        let parse_uuid = |value: capnp::text::Reader<'_>| {
+            value
+                .to_str()
+                .map_err(anyhow::Error::from)
+                .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::from))
+        };
+        let parent_run_id = match params.get_parent_run_id().map_err(anyhow::Error::from).and_then(parse_uuid) {
+            Ok(value) => crate::brain::store::RunId(value),
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let task_id = match params.get_task_id().map_err(anyhow::Error::from).and_then(parse_uuid) {
+            Ok(value) => value,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let detail = params
+            .get_detail()
+            .ok()
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        match self
+            .lifecycle
+            .start_subagent_for_run(&self.brain, parent_run_id, task_id, detail)
+        {
+            Ok(run) => {
+                encode_run(results.get().init_run(), &run);
+                Promise::ok(())
+            }
+            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+        }
+    }
+
+    fn finish_subagent(
+        &mut self,
+        params: finch_ipc_capnp::brain_runner_control::FinishSubagentParams,
+        mut results: finch_ipc_capnp::brain_runner_control::FinishSubagentResults,
+    ) -> Promise<(), capnp::Error> {
+        if let Err(error) = self.validate_lease() {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        let params = match params.get() {
+            Ok(params) => params,
+            Err(error) => return Promise::err(error),
+        };
+        let run_id = match params
+            .get_run_id()
+            .map_err(anyhow::Error::from)
+            .and_then(|value| value.to_str().map_err(anyhow::Error::from))
+            .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::from))
+        {
+            Ok(value) => crate::brain::store::RunId(value),
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let status = match params.get_status() {
+            Ok(status) => crate::ipc::brain_codec::run_status_from_capnp(status),
+            Err(error) => return Promise::err(error.into()),
+        };
+        let detail = params
+            .get_detail()
+            .ok()
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        match self
+            .lifecycle
+            .transition_subagent_run(&self.brain, run_id, status, detail)
+        {
+            Ok(run) => {
+                encode_run(results.get().init_run(), &run);
+                Promise::ok(())
+            }
+            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+        }
+    }
+}
+
 impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl {
     fn create_schedule(
         &mut self,
@@ -1394,19 +1513,20 @@ impl finch_daemon::Server for FinchDaemonImpl {
         };
         let queued_lifecycle = crate::server::BrainLifecycleService::from_server(&server);
         let queued_brain = brain.clone();
+        let registered_brain = brain.clone();
         tokio::task::spawn_local(async move {
             while let Some(request) = rx.recv().await {
                 let runner = runner.clone();
                 let server = Arc::clone(&server);
                 let broker = broker.clone();
-                let brain = brain.clone();
+                let brain = registered_brain.clone();
                 tokio::task::spawn_local(async move {
                     if forward_runner_request(runner, server, request).await {
                         broker.unregister(&brain, registration_id);
                     }
                 });
             }
-            broker.unregister(&brain, registration_id);
+            broker.unregister(&registered_brain, registration_id);
         });
         // Return the registration bootstrap first. The frontend then marks
         // this lease active before the queued callback reaches its event loop.
@@ -1434,6 +1554,16 @@ impl finch_daemon::Server for FinchDaemonImpl {
         if let Err(error) = encode_checkpoint(response.reborrow().init_checkpoint(), &checkpoint) {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
+        let control: finch_ipc_capnp::brain_runner_control::Client = capnp_rpc::new_client(
+            BrainRunnerControlImpl {
+                lifecycle: crate::server::BrainLifecycleService::from_server(&self.server),
+                runners: self.server.brain_runners().clone(),
+                connection_id: self.connection_id,
+                brain: brain.clone(),
+                lease_id,
+            },
+        );
+        response.set_control(control);
         Promise::ok(())
     }
 

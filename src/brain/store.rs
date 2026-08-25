@@ -1114,6 +1114,36 @@ impl BrainStore {
         status: BrainRunStatus,
         parent_run_id: Option<RunId>,
     ) -> Result<BrainRun> {
+        self.start_run_with_parent_id(
+            name,
+            sender,
+            RunId::new(),
+            kind,
+            request_seq,
+            initiating_attachment_id,
+            status,
+            parent_run_id,
+            None,
+        )
+    }
+
+    /// Start a run whose identity was allocated by the authoritative caller.
+    /// This is used for child tasks whose task UUID is also their durable
+    /// BrainRun UUID. An exact retry returns the existing run; conflicting
+    /// identity reuse fails closed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_run_with_parent_id(
+        &self,
+        name: &str,
+        sender: &str,
+        run_id: RunId,
+        kind: BrainRunKind,
+        request_seq: u64,
+        initiating_attachment_id: AttachmentId,
+        status: BrainRunStatus,
+        parent_run_id: Option<RunId>,
+        detail: Option<String>,
+    ) -> Result<BrainRun> {
         let name = Self::validate_name(name)?;
         let sender = validate_participant_subject("run initiator", sender)?;
         self.ensure_loaded(name)?;
@@ -1121,6 +1151,18 @@ impl BrainStore {
         let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         if !state.events.iter().any(|event| event.seq == request_seq) {
             anyhow::bail!("Brain run request event {request_seq} does not exist");
+        }
+        if let Some(existing) = state.runs.get(&run_id) {
+            anyhow::ensure!(
+                existing.kind == kind
+                    && existing.parent_run_id == parent_run_id
+                    && existing.request_seq == request_seq
+                    && existing.initiating_attachment_id == initiating_attachment_id
+                    && existing.initiated_by == sender,
+                "Brain run identity {} was reused with conflicting ancestry or principal",
+                run_id.0
+            );
+            return Ok(existing.clone());
         }
         if let Some(parent_run_id) = parent_run_id {
             let parent = state
@@ -1133,7 +1175,7 @@ impl BrainStore {
         }
         let now = unix_millis();
         let run = BrainRun {
-            run_id: RunId::new(),
+            run_id,
             kind,
             parent_run_id,
             request_seq,
@@ -1142,7 +1184,7 @@ impl BrainStore {
             status,
             started_ms: now,
             updated_ms: now,
-            detail: None,
+            detail,
         };
         self.push_locked(
             name,
