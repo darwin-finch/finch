@@ -1222,6 +1222,33 @@ mod tests {
             };
             assert_eq!(initial.brain_id, snapshot.brain_id);
 
+            let relay = client
+                .brain_submit(
+                    brain,
+                    &attachment,
+                    crate::brain::shared::BrainEventKind::ParticipantMessage {
+                        text: "human-only collaboration message".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(relay.run.is_none());
+            assert!(relay.result.is_none());
+            let relayed = tokio::time::timeout(std::time::Duration::from_secs(2), incoming.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                relayed,
+                crate::brain::shared::BrainWireMessage::Event {
+                    event: crate::brain::shared::BrainEvent {
+                        kind: crate::brain::shared::BrainEventKind::ParticipantMessage { ref text },
+                        ..
+                    }
+                } if text == "human-only collaboration message"
+            ));
+
             let outcome = client
                 .brain_submit(
                     brain,
@@ -1237,7 +1264,7 @@ mod tests {
                 Some(crate::brain::shared::BrainRunStatus::QueuedForEnvironment)
             );
             assert!(outcome.result.is_none());
-            assert!(outcome.accepted.seq > initial.revision);
+            assert!(outcome.accepted.seq > relay.accepted.seq);
             let run = outcome.run.unwrap();
             let inspected = client.brain_inspect_run(brain, run.run_id).await.unwrap();
             assert_eq!(inspected.run_id, run.run_id);
