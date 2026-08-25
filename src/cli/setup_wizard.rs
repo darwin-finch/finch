@@ -102,6 +102,15 @@ struct CatalogRefresh {
     result: Arc<Mutex<CatalogRefreshResult>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelSelectionProvenance {
+    Blank,
+    DefaultGenerated,
+    Cycled,
+    Manual,
+    Persisted,
+}
+
 /// Try to detect an existing Anthropic API key from the environment or Claude Code config.
 fn detect_anthropic_api_key() -> Option<String> {
     // 1. Check the standard environment variable first
@@ -300,6 +309,7 @@ enum SectionState {
         model_input: String,      // model name input buffer
         adding_provider: Option<AddProviderStep>,
         catalog_models: Vec<String>,
+        catalog_model_provenance: ModelSelectionProvenance,
         catalog_source: CatalogSource,
         catalog_refresh: Option<CatalogRefresh>,
         catalog_generation: u64,
@@ -659,6 +669,7 @@ impl WizardState {
                 model_input: String::new(),
                 adding_provider: None,
                 catalog_models: Vec::new(),
+                catalog_model_provenance: ModelSelectionProvenance::Blank,
                 catalog_source: CatalogSource::StaticFallback,
                 catalog_refresh: None,
                 catalog_generation: 0,
@@ -1004,6 +1015,7 @@ fn advance_catalog_refresh_if_done(state: &mut WizardState) {
         tool_models,
         adding_provider,
         catalog_models,
+        catalog_model_provenance,
         catalog_source,
         catalog_refresh,
         catalog_generation,
@@ -1066,13 +1078,16 @@ fn advance_catalog_refresh_if_done(state: &mut WizardState) {
         return;
     }
 
-    let previous_fallback = known_models_for(provider_id);
     if let Some(AddProviderStep::ConfigureRemote { model, .. }) = adding_provider.as_mut() {
         if catalog.source == CatalogSource::Discovered
-            && (model.trim().is_empty() || previous_fallback.contains(model))
+            && matches!(
+                catalog_model_provenance,
+                ModelSelectionProvenance::Blank | ModelSelectionProvenance::DefaultGenerated
+            )
         {
             if let Some(discovered) = catalog.models.first() {
                 *model = discovered.clone();
+                *catalog_model_provenance = ModelSelectionProvenance::DefaultGenerated;
             }
         }
     }
@@ -1302,6 +1317,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
         model_input,
         adding_provider,
         catalog_models,
+        catalog_model_provenance,
         catalog_source,
         catalog_refresh,
         catalog_generation,
@@ -1480,6 +1496,11 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     // Reset model to default for new provider
                                     let default = CLOUD_PROVIDERS[new_idx].2;
                                     *model = default.to_string();
+                                    *catalog_model_provenance = if default.is_empty() {
+                                        ModelSelectionProvenance::Blank
+                                    } else {
+                                        ModelSelectionProvenance::DefaultGenerated
+                                    };
                                     *catalog_models = known_models_for(CLOUD_PROVIDERS[new_idx].0);
                                     *catalog_source = CatalogSource::StaticFallback;
                                     *catalog_refreshed_at = None;
@@ -1496,6 +1517,8 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                         let new_pos =
                                             (pos + catalog_models.len() - 1) % catalog_models.len();
                                         *model = catalog_models[new_pos].clone();
+                                        *catalog_model_provenance =
+                                            ModelSelectionProvenance::Cycled;
                                     }
                                 }
                                 _ => {}
@@ -1564,6 +1587,11 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     // Reset model to default for new provider
                                     let default = CLOUD_PROVIDERS[new_idx].2;
                                     *model = default.to_string();
+                                    *catalog_model_provenance = if default.is_empty() {
+                                        ModelSelectionProvenance::Blank
+                                    } else {
+                                        ModelSelectionProvenance::DefaultGenerated
+                                    };
                                     *catalog_models = known_models_for(CLOUD_PROVIDERS[new_idx].0);
                                     *catalog_source = CatalogSource::StaticFallback;
                                     *catalog_refreshed_at = None;
@@ -1579,6 +1607,8 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                             .unwrap_or(0);
                                         *model = catalog_models[(pos + 1) % catalog_models.len()]
                                             .clone();
+                                        *catalog_model_provenance =
+                                            ModelSelectionProvenance::Cycled;
                                     }
                                 }
                                 _ => {}
@@ -1684,6 +1714,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             }
                             2 => {
                                 model.push(c);
+                                *catalog_model_provenance = ModelSelectionProvenance::Manual;
                             }
                             3 => {
                                 api_key.push(c);
@@ -1711,6 +1742,11 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             }
                             2 => {
                                 model.pop();
+                                *catalog_model_provenance = if model.is_empty() {
+                                    ModelSelectionProvenance::Blank
+                                } else {
+                                    ModelSelectionProvenance::Manual
+                                };
                             }
                             3 => {
                                 api_key.pop();
@@ -1734,6 +1770,11 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             if selected < n_cloud {
                                 // Open single-screen remote dialog pre-selected to this provider
                                 let default_model = CLOUD_PROVIDERS[selected].2.to_string();
+                                *catalog_model_provenance = if default_model.is_empty() {
+                                    ModelSelectionProvenance::Blank
+                                } else {
+                                    ModelSelectionProvenance::DefaultGenerated
+                                };
                                 *catalog_models = known_models_for(CLOUD_PROVIDERS[selected].0);
                                 *catalog_source = CatalogSource::StaticFallback;
                                 *catalog_refreshed_at = None;
@@ -2049,6 +2090,11 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             .position(|(id, ..)| *id == provider)
                             .unwrap_or(0);
                         *catalog_models = known_models_for(CLOUD_PROVIDERS[provider_idx].0);
+                        *catalog_model_provenance = if model.trim().is_empty() {
+                            ModelSelectionProvenance::Blank
+                        } else {
+                            ModelSelectionProvenance::Persisted
+                        };
                         *catalog_source = CatalogSource::StaticFallback;
                         *catalog_refreshed_at = None;
                         *catalog_error = None;
@@ -4670,15 +4716,36 @@ mod tests {
         if let Some(SectionState::Models {
             adding_provider,
             catalog_models,
+            catalog_model_provenance,
             ..
         }) = state.sections.get_mut(&WizardSection::Models)
         {
-            if let AddProviderStep::ConfigureRemote { provider_idx, .. } = &step {
+            if let AddProviderStep::ConfigureRemote {
+                provider_idx,
+                model,
+                ..
+            } = &step
+            {
                 *catalog_models = known_models_for(CLOUD_PROVIDERS[*provider_idx].0);
+                *catalog_model_provenance = if model.is_empty() {
+                    ModelSelectionProvenance::Blank
+                } else {
+                    ModelSelectionProvenance::Manual
+                };
             }
             *adding_provider = Some(step);
         }
         state
+    }
+
+    fn set_catalog_model_provenance(state: &mut WizardState, provenance: ModelSelectionProvenance) {
+        if let Some(SectionState::Models {
+            catalog_model_provenance,
+            ..
+        }) = state.sections.get_mut(&WizardSection::Models)
+        {
+            *catalog_model_provenance = provenance;
+        }
     }
 
     fn get_step(state: &WizardState) -> Option<&AddProviderStep> {
@@ -4709,6 +4776,27 @@ mod tests {
                 selection_identity: model_catalog::profile_cache_identity(profile),
                 result: Arc::new(Mutex::new(Some((catalog, None)))),
             });
+        }
+    }
+
+    fn discovered_catalog(profile: &ModelCatalogProfile, models: &[&str]) -> ModelCatalog {
+        ModelCatalog {
+            provider: profile.provider.clone(),
+            profile_id: profile.profile_id.clone(),
+            models_url: profile.endpoints.models_url.clone(),
+            models: models.iter().map(|model| (*model).to_string()).collect(),
+            source: CatalogSource::Discovered,
+            refreshed_at: Utc::now(),
+        }
+    }
+
+    fn catalog_model_provenance(state: &WizardState) -> ModelSelectionProvenance {
+        match state.sections.get(&WizardSection::Models) {
+            Some(SectionState::Models {
+                catalog_model_provenance,
+                ..
+            }) => *catalog_model_provenance,
+            _ => panic!("expected models section"),
         }
     }
 
@@ -4882,6 +4970,7 @@ mod tests {
             focused_field: 0,
             editing_idx: None,
         });
+        set_catalog_model_provenance(&mut state, ModelSelectionProvenance::DefaultGenerated);
         let claude = model_catalog_profile("claude", "claude-work", "claude-key", None).unwrap();
         install_completed_catalog_refresh(
             &mut state,
@@ -4917,6 +5006,17 @@ mod tests {
             get_step(&state),
             Some(AddProviderStep::ConfigureRemote { provider_idx, model, .. })
                 if *provider_idx == openai_idx && model.is_empty()
+        ));
+        assert_eq!(
+            catalog_model_provenance(&state),
+            ModelSelectionProvenance::DefaultGenerated
+        );
+        assert!(matches!(
+            state.sections.get(&WizardSection::Models),
+            Some(SectionState::Models {
+                catalog_source: CatalogSource::StaticFallback,
+                ..
+            })
         ));
     }
 
@@ -5025,7 +5125,149 @@ mod tests {
     }
 
     #[test]
-    fn completed_discovery_replaces_only_blank_or_fallback_model() {
+    fn persisted_fallback_id_is_not_replaced_by_refresh() {
+        let persisted = ProviderEntry::Openai {
+            api_key: "openai-key".to_string(),
+            model: Some("gpt-4o".to_string()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("openai-work".to_string()),
+            reasoning_effort: None,
+        };
+        let mut state = WizardState::new(Some(&crate::config::Config::with_providers(vec![
+            persisted.clone(),
+        ])));
+        handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            catalog_model_provenance(&state),
+            ModelSelectionProvenance::Persisted
+        );
+        let profile =
+            model_catalog_profile("openai", "openai-work", "openai-key", Some(&persisted)).unwrap();
+        install_completed_catalog_refresh(
+            &mut state,
+            &profile,
+            discovered_catalog(&profile, &["aaa-new-default", "gpt-4o"]),
+        );
+        advance_catalog_refresh_if_done(&mut state);
+        assert!(matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote { model, .. }) if model == "gpt-4o"
+        ));
+    }
+
+    #[test]
+    fn manually_typed_fallback_id_is_not_replaced_by_refresh() {
+        let openai_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, ..)| *id == "openai")
+            .unwrap();
+        let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+            provider_idx: openai_idx,
+            name: "openai-work".to_string(),
+            model: String::new(),
+            api_key: "openai-key".to_string(),
+            focused_field: 2,
+            editing_idx: None,
+        });
+        for character in "gpt-4o".chars() {
+            handle_models_input(&mut state, key(KeyCode::Char(character))).unwrap();
+        }
+        assert_eq!(
+            catalog_model_provenance(&state),
+            ModelSelectionProvenance::Manual
+        );
+        let profile = model_catalog_profile("openai", "openai-work", "openai-key", None).unwrap();
+        install_completed_catalog_refresh(
+            &mut state,
+            &profile,
+            discovered_catalog(&profile, &["aaa-new-default", "gpt-4o"]),
+        );
+        advance_catalog_refresh_if_done(&mut state);
+        assert!(matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote { model, .. }) if model == "gpt-4o"
+        ));
+    }
+
+    #[test]
+    fn discovered_default_may_update_on_later_refresh() {
+        let openai_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, ..)| *id == "openai")
+            .unwrap();
+        let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+            provider_idx: openai_idx,
+            name: "openai-work".to_string(),
+            model: String::new(),
+            api_key: "openai-key".to_string(),
+            focused_field: 2,
+            editing_idx: None,
+        });
+        let profile = model_catalog_profile("openai", "openai-work", "openai-key", None).unwrap();
+        install_completed_catalog_refresh(
+            &mut state,
+            &profile,
+            discovered_catalog(&profile, &["gpt-4o"]),
+        );
+        advance_catalog_refresh_if_done(&mut state);
+        assert_eq!(
+            catalog_model_provenance(&state),
+            ModelSelectionProvenance::DefaultGenerated
+        );
+
+        install_completed_catalog_refresh(
+            &mut state,
+            &profile,
+            discovered_catalog(&profile, &["aaa-new-default", "gpt-4o"]),
+        );
+        advance_catalog_refresh_if_done(&mut state);
+        assert!(matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote { model, .. }) if model == "aaa-new-default"
+        ));
+    }
+
+    #[test]
+    fn cycled_selection_is_not_replaced_by_refresh() {
+        let openai_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, ..)| *id == "openai")
+            .unwrap();
+        let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+            provider_idx: openai_idx,
+            name: "openai-work".to_string(),
+            model: String::new(),
+            api_key: "openai-key".to_string(),
+            focused_field: 2,
+            editing_idx: None,
+        });
+        if let Some(SectionState::Models { catalog_models, .. }) =
+            state.sections.get_mut(&WizardSection::Models)
+        {
+            *catalog_models = vec!["other-model".to_string(), "gpt-4o".to_string()];
+        }
+        handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
+        assert_eq!(
+            catalog_model_provenance(&state),
+            ModelSelectionProvenance::Cycled
+        );
+        let profile = model_catalog_profile("openai", "openai-work", "openai-key", None).unwrap();
+        install_completed_catalog_refresh(
+            &mut state,
+            &profile,
+            discovered_catalog(&profile, &["aaa-new-default", "gpt-4o"]),
+        );
+        advance_catalog_refresh_if_done(&mut state);
+        assert!(matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote { model, .. }) if model == "gpt-4o"
+        ));
+    }
+
+    #[test]
+    fn completed_discovery_replaces_default_generated_but_not_manual_model() {
         let claude_idx = CLOUD_PROVIDERS
             .iter()
             .position(|(id, ..)| *id == "claude")
@@ -5039,6 +5281,7 @@ mod tests {
             focused_field: 2,
             editing_idx: None,
         });
+        set_catalog_model_provenance(&mut state, ModelSelectionProvenance::DefaultGenerated);
         let profile = model_catalog_profile("claude", "claude", "test-key", None).unwrap();
         install_completed_catalog_refresh(
             &mut state,
@@ -5071,6 +5314,7 @@ mod tests {
         {
             *model = "manually-entered-model".to_string();
         }
+        set_catalog_model_provenance(&mut state, ModelSelectionProvenance::Manual);
         install_completed_catalog_refresh(
             &mut state,
             &profile,
@@ -5370,6 +5614,10 @@ mod tests {
             // model should reset to default for new provider
             let expected_model = CLOUD_PROVIDERS[initial_idx + 1].2;
             assert_eq!(model.as_str(), expected_model);
+            assert_eq!(
+                catalog_model_provenance(&state),
+                ModelSelectionProvenance::Blank
+            );
         } else {
             panic!("expected ConfigureRemote");
         }
@@ -5388,6 +5636,10 @@ mod tests {
             assert_eq!(*provider_idx, CLOUD_PROVIDERS.len() - 1);
             let expected_model = CLOUD_PROVIDERS[CLOUD_PROVIDERS.len() - 1].2;
             assert_eq!(model.as_str(), expected_model);
+            assert_eq!(
+                catalog_model_provenance(&state),
+                ModelSelectionProvenance::DefaultGenerated
+            );
         } else {
             panic!("expected ConfigureRemote");
         }
