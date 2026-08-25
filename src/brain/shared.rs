@@ -1454,6 +1454,38 @@ impl SharedBrainStore {
                 );
             }
         }
+        // Queued work has not executed and may be safely offered to the next
+        // valid runner lease. A run that was already executing or suspended
+        // for approval has unknown external progress after daemon restart and
+        // must never be replayed implicitly.
+        let orphaned_runs = state
+            .runs
+            .values()
+            .filter(|run| {
+                matches!(
+                    run.status,
+                    BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
+                )
+            })
+            .map(|run| run.run_id)
+            .collect::<Vec<_>>();
+        for run_id in orphaned_runs {
+            let event = BrainEvent {
+                schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+                brain_id: state.brain_id,
+                seq: state.events.last().map(|event| event.seq + 1).unwrap_or(1),
+                environment_generation: self.environment.generation,
+                sender: "daemon".into(),
+                created_ms: unix_millis(),
+                kind: BrainEventKind::RunStatusChanged {
+                    run_id,
+                    status: BrainRunStatus::Interrupted,
+                    detail: Some("daemon restarted before the run reached a terminal state".into()),
+                },
+            };
+            self.append_event(name, &event)?;
+            state.apply(event);
+        }
         self.brains
             .write()
             .expect("shared brain lock poisoned")
@@ -1742,6 +1774,85 @@ mod tests {
         assert_eq!(restored.request_seq, prompt.seq);
         assert_eq!(restored.status, BrainRunStatus::Completed);
         assert!(restored.updated_ms >= restored.started_ms);
+    }
+
+    #[test]
+    fn restart_interrupts_started_runs_without_replaying_queued_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let running_request = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "started".into(),
+                },
+            )
+            .unwrap();
+        let running = store
+            .start_run(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                running_request.seq,
+                attachment.attachment_id,
+                BrainRunStatus::Running,
+            )
+            .unwrap();
+        let queued_request = store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "queued".into(),
+                },
+            )
+            .unwrap();
+        let queued = store
+            .start_run(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                queued_request.seq,
+                attachment.attachment_id,
+                BrainRunStatus::QueuedForEnvironment,
+            )
+            .unwrap();
+        drop(store);
+
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let snapshot = restarted.snapshot("shared").unwrap();
+        assert_eq!(
+            snapshot
+                .runs
+                .iter()
+                .find(|candidate| candidate.run_id == running.run_id)
+                .unwrap()
+                .status,
+            BrainRunStatus::Interrupted
+        );
+        assert_eq!(
+            snapshot
+                .runs
+                .iter()
+                .find(|candidate| candidate.run_id == queued.run_id)
+                .unwrap()
+                .status,
+            BrainRunStatus::QueuedForEnvironment
+        );
+        assert!(snapshot.events.iter().any(|event| {
+            matches!(
+                event.kind,
+                BrainEventKind::RunStatusChanged {
+                    run_id,
+                    status: BrainRunStatus::Interrupted,
+                    ..
+                } if run_id == running.run_id
+            )
+        }));
     }
 
     #[test]

@@ -4412,6 +4412,40 @@ Rules:\n\
             BrainEventKind::ClientDetached { attachment_id, .. } => self
                 .output_manager
                 .write_info(format!("attachment {} disconnected", attachment_id.0)),
+            BrainEventKind::RunStarted { run }
+                if run.status
+                    == crate::brain::shared::BrainRunStatus::QueuedForEnvironment =>
+            {
+                let run_id = run.run_id.0.to_string();
+                self.output_manager.write_info(format!(
+                    "run {} queued for the environment runner",
+                    &run_id[..8]
+                ));
+            }
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status: crate::brain::shared::BrainRunStatus::Running,
+                ..
+            } => {
+                let run_id = run_id.0.to_string();
+                self.output_manager
+                    .write_info(format!("run {} resumed on the environment runner", &run_id[..8]));
+            }
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status: crate::brain::shared::BrainRunStatus::Interrupted,
+                detail,
+            } => {
+                let run_id = run_id.0.to_string();
+                self.output_manager.write_info(format!(
+                    "run {} interrupted{}",
+                    &run_id[..8],
+                    detail
+                        .as_deref()
+                        .map(|detail| format!(": {detail}"))
+                        .unwrap_or_default()
+                ));
+            }
             BrainEventKind::RunStarted { .. } | BrainEventKind::RunStatusChanged { .. } => {}
             BrainEventKind::Prompt { text } => self
                 .output_manager
