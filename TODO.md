@@ -1244,6 +1244,18 @@ still blocks the corresponding Brain phase until it is unified.
 
 ## Client and model integration
 
+- [ ] Add optional, resource-bounded Language Server Protocol integration as structured editing
+  assistance, not as Finch's authoritative build/test oracle. Compiler, test, lint, and verifier
+  commands remain the final truth; an LSP adapter may add low-latency overlay diagnostics with exact
+  spans/codes, definition/reference/symbol queries, and previewable rename or workspace edits. Expose
+  these through typed VM capabilities and the per-run changeset/overlay so models never apply an
+  arbitrary server `WorkspaceEdit` directly. Pin or report server identity/version, never silently
+  auto-download executables by default, sandbox server processes, bound memory/time/output, detect
+  stale document versions, recover crashed/out-of-sync servers, and let projects disable LSP entirely.
+  Measure task success and latency against the simpler command-only loop before enabling it by default.
+  Separately provide a Finch Co-Lisp/Co-Forth language server once the Syntax/AST/module interfaces are
+  stable, reusing the compiler's real diagnostics and symbol graph rather than implementing semantics
+  twice. Reference: https://opencode.ai/docs/lsp/
 - [ ] Review and reproduce the useful local-first properties of Perplexity/NVIDIA Portable Computer,
   without copying its subscription or hardware assumptions. The 2026-08-25 announcement claims that
   models, files, tools, and workflows run on-device, local work incurs no token charge, and each
