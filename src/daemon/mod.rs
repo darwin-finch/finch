@@ -9,4 +9,7 @@ pub mod upgrade;
 
 pub use lifecycle::DaemonLifecycle;
 pub use spawn::{ensure_daemon_running, spawn_daemon};
-pub use upgrade::{DaemonUpgradePlan, VerifiedDaemonUpgrade};
+pub use upgrade::{
+    DaemonUpgradePlan, DaemonUpgradeRecord, ProductionDaemonEndpoints, SupervisorLaunch,
+    SupervisorPhase, VerifiedDaemonUpgrade,
+};

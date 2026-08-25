@@ -85,6 +85,12 @@ struct Args {
 
 #[derive(Parser, Debug)]
 enum Command {
+    /// Internal crash-recoverable daemon upgrade supervisor.
+    #[command(name = "__daemon-supervisor", hide = true)]
+    DaemonSupervisor {
+        #[arg(long)]
+        record: PathBuf,
+    },
     /// Run interactive setup wizard
     Setup,
     /// Run HTTP daemon server
@@ -729,6 +735,9 @@ async fn main() -> Result<()> {
 
     // Dispatch based on command
     match args.command {
+        Some(Command::DaemonSupervisor { record }) => {
+            return finch::daemon::upgrade::run_supervisor(&record).await;
+        }
         Some(Command::Setup) => {
             return run_setup().await;
         }
