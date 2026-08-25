@@ -462,6 +462,24 @@ impl TurnSession {
                         }
                     }
                 }
+                Some("item/completed") if text.is_empty() => {
+                    if event.pointer("/params/item/type").and_then(Value::as_str)
+                        == Some("agentMessage")
+                    {
+                        if let Some(final_text) =
+                            event.pointer("/params/item/text").and_then(Value::as_str)
+                        {
+                            text = final_text.to_string();
+                            if tx
+                                .send(Ok(StreamChunk::TextDelta(text.clone())))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
                 Some("item/tool/call") => {
                     let Some(params) = event.get("params") else {
                         let _ = tx
