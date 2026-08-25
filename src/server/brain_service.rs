@@ -737,6 +737,8 @@ impl BrainLifecycleService {
         }
         ensure!(!run.status.is_terminal() || run.status == BrainRunStatus::Interrupted,
             "Brain run has already finished");
+        let needs_runner_reconciliation = reserved.as_ref()
+            .is_some_and(|reserved| reserved.needs_runner_cancel);
         if let Some(mutation_id) = mutation_id {
             self.store.mark_run_cancellation_dispatching(
                 brain, &attachment.subject, run_id, mutation_id,
@@ -745,7 +747,7 @@ impl BrainLifecycleService {
         if matches!(
             run.status,
             BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
-        ) {
+        ) || needs_runner_reconciliation {
             self.store.reserve_run_cancellation(brain, run_id).await?;
             let snapshot = self.snapshot(brain)?;
             let lease = match snapshot
