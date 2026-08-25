@@ -452,6 +452,99 @@ impl EventLoop {
         self.render_tui().await
     }
 
+    async fn handle_brain_say(&mut self, text: String) -> Result<()> {
+        anyhow::ensure!(self.selected_brain().is_some(), "no Brain is attached");
+        self.push_remote_brain(crate::brain::shared::BrainEventKind::ParticipantMessage { text })
+            .await
+    }
+
+    async fn handle_brain_who(&mut self) -> Result<()> {
+        let client = self
+            .selected_brain()
+            .cloned()
+            .context("no Brain is attached")?;
+        let snapshot = client.snapshot().await?;
+        let mut attachments = snapshot
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.connected)
+            .collect::<Vec<_>>();
+        attachments.sort_by(|left, right| {
+            left.subject
+                .cmp(&right.subject)
+                .then_with(|| format!("{:?}", left.role).cmp(&format!("{:?}", right.role)))
+        });
+        let mut lines = vec![format!("Participants in {}:", client.target.display_name())];
+        if attachments.is_empty() {
+            lines.push("  (none connected)".into());
+        } else {
+            for attachment in attachments {
+                let you = client
+                    .attachment()
+                    .is_some_and(|current| current.attachment_id == attachment.attachment_id)
+                    .then_some(" · you")
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "  {}  {} · acknowledged event {}{}",
+                    attachment.subject,
+                    format!("{:?}", attachment.role).to_ascii_lowercase(),
+                    attachment.acknowledged_seq,
+                    you,
+                ));
+            }
+        }
+        if let Some(lease) = snapshot.runner_lease {
+            lines.push(format!("  {}  environment runner", lease.subject));
+        }
+        self.output_manager.write_info(lines.join("\n"));
+        self.render_tui().await
+    }
+
+    async fn handle_brain_whois(&mut self, subject: String) -> Result<()> {
+        let client = self
+            .selected_brain()
+            .cloned()
+            .context("no Brain is attached")?;
+        let snapshot = client.snapshot().await?;
+        let mut attachments = snapshot
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.subject.eq_ignore_ascii_case(&subject))
+            .collect::<Vec<_>>();
+        attachments.sort_by_key(|attachment| !attachment.connected);
+        let runner = snapshot
+            .runner_lease
+            .as_ref()
+            .filter(|lease| lease.subject.eq_ignore_ascii_case(&subject));
+        anyhow::ensure!(
+            !attachments.is_empty() || runner.is_some(),
+            "no participant named '{subject}'"
+        );
+        let canonical_subject = attachments
+            .first()
+            .map(|attachment| attachment.subject.as_str())
+            .or_else(|| runner.map(|lease| lease.subject.as_str()))
+            .unwrap_or(subject.as_str());
+        let mut lines = vec![format!("{canonical_subject} in {}:", client.target.display_name())];
+        for attachment in attachments {
+            lines.push(format!(
+                "  {} · {} · acknowledged event {}",
+                format!("{:?}", attachment.role).to_ascii_lowercase(),
+                if attachment.connected {
+                    "connected"
+                } else {
+                    "disconnected"
+                },
+                attachment.acknowledged_seq,
+            ));
+        }
+        if runner.is_some() {
+            lines.push("  owns the active environment-runner lease".into());
+        }
+        self.output_manager.write_info(lines.join("\n"));
+        self.render_tui().await
+    }
+
     async fn handle_brain_archive(&mut self, name: String) -> Result<()> {
         let active_name = self
             .active_remote_brain

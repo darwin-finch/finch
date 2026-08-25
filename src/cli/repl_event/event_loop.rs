@@ -2139,6 +2139,25 @@ Rules:\n\
                             self.render_tui().await?;
                         }
                     }
+                    Command::BrainSay(text) => {
+                        if let Err(error) = self.handle_brain_say(text).await {
+                            self.output_manager.write_info(format!("brain say: {error}"));
+                            self.render_tui().await?;
+                        }
+                    }
+                    Command::BrainWho => {
+                        if let Err(error) = self.handle_brain_who().await {
+                            self.output_manager.write_info(format!("brain who: {error}"));
+                            self.render_tui().await?;
+                        }
+                    }
+                    Command::BrainWhois(subject) => {
+                        if let Err(error) = self.handle_brain_whois(subject).await {
+                            self.output_manager
+                                .write_info(format!("brain whois: {error}"));
+                            self.render_tui().await?;
+                        }
+                    }
                     Command::BrainDetach => {
                         self.handle_brain_detach().await?;
                     }

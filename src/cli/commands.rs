@@ -56,6 +56,9 @@ pub enum Command {
     Brains,                        // /brains — list named, detachable sessions
     BrainRuns,                     // /brain runs — list runs in the attached Brain
     BrainRunCancel(String),        // /brain cancel <run-id-prefix>
+    BrainSay(String),              // /say <text> — relay without scheduling an LLM turn
+    BrainWho,                      // /who — list connected Brain participants
+    BrainWhois(String),            // /whois <subject> — inspect public Brain presence
     BrainArchive(String),          // /brain archive <name>
     BrainAttach(String),           // /brain attach <name@machine[:port]>
     BrainDetach,                   // /brain detach
@@ -111,6 +114,21 @@ impl Command {
                 return Some(Command::ModelSwitch(profile_name.to_string()));
             }
         }
+        if let Some(rest) = raw
+            .strip_prefix("/say ")
+            .or_else(|| raw.strip_prefix("/brain say "))
+        {
+            let text = rest.trim();
+            if !text.is_empty() {
+                return Some(Command::BrainSay(text.to_string()));
+            }
+        }
+        if let Some(rest) = raw.strip_prefix("/whois ") {
+            let subject = rest.trim();
+            if !subject.is_empty() {
+                return Some(Command::BrainWhois(subject.to_string()));
+            }
+        }
 
         let trimmed = input
             .trim()
@@ -146,6 +164,7 @@ impl Command {
                 return Some(Command::Brains);
             }
             "/brain runs" | "/brain run list" => return Some(Command::BrainRuns),
+            "/who" | "/brain who" => return Some(Command::BrainWho),
             "/brain detach" => return Some(Command::BrainDetach),
             "/brain handoff accept" => return Some(Command::BrainHandoffAccept(None)),
             "/brain handoff cancel" => return Some(Command::BrainHandoffCancel(None)),
@@ -527,6 +546,9 @@ pub fn handle_command(
         Command::Brains
         | Command::BrainRuns
         | Command::BrainRunCancel(_)
+        | Command::BrainSay(_)
+        | Command::BrainWho
+        | Command::BrainWhois(_)
         | Command::BrainArchive(_)
         | Command::BrainAttach(_)
         | Command::BrainDetach
@@ -700,6 +722,9 @@ pub fn format_help() -> String {
          {cyan}  /brain list{reset}        List named Brain sessions ({gray}/brains{reset} also works)\n\
          {cyan}  /brain runs{reset}        List runs in the attached Brain\n\
          {cyan}  /brain cancel <run>{reset} Cancel an initiated run by id prefix\n\
+         {cyan}  /say <text>{reset}         Relay text without invoking the model\n\
+         {cyan}  /who{reset}                List connected participants in this Brain\n\
+         {cyan}  /whois <subject>{reset}    Show public presence for one participant\n\
          {cyan}  /brain attach <name>[@machine]{reset} Attach locally or to a remote Brain\n\
          {cyan}  /brain detach{reset}      Return to this console's home Brain\n\
          {cyan}  /brain handoff <subject>{reset} Request an addressed runner transfer\n\
@@ -1018,6 +1043,19 @@ mod tests {
         ));
         assert!(matches!(Command::parse("/brain ls"), Some(Command::Brains)));
         assert!(matches!(Command::parse("/brain runs"), Some(Command::BrainRuns)));
+        assert!(matches!(Command::parse("/who"), Some(Command::BrainWho)));
+        assert!(matches!(
+            Command::parse("/whois alice@workstation.local"),
+            Some(Command::BrainWhois(subject)) if subject == "alice@workstation.local"
+        ));
+        assert!(matches!(
+            Command::parse("/say hello, collaborators!"),
+            Some(Command::BrainSay(text)) if text == "hello, collaborators!"
+        ));
+        assert!(matches!(
+            Command::parse("/brain say punctuation survives?!"),
+            Some(Command::BrainSay(text)) if text == "punctuation survives?!"
+        ));
         assert!(matches!(
             Command::parse("/brain cancel 1234abcd"),
             Some(Command::BrainRunCancel(prefix)) if prefix == "1234abcd"
