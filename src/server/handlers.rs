@@ -2536,6 +2536,30 @@ async fn execute_remote_brain_command(
         if mutation.brain_id != snapshot.brain_id {
             return remote_brain_error(request_id, "conflict", "Brain mutation identity is stale");
         }
+        let journals_created_identity = match &command.kind {
+            BrainRemoteCommandKind::Submit(kind) => !matches!(
+                kind,
+                crate::brain::store::BrainEventKind::ApprovalDecided { .. }
+            ),
+            BrainRemoteCommandKind::RequestRunnerHandoff { .. }
+            | BrainRemoteCommandKind::CreateSchedule { .. } => true,
+            _ => false,
+        };
+        // Target-addressed cancellations and initialization scheduling are
+        // already effect-idempotent and return fresh state; they do not cache
+        // connection-bound replies. They still honor optimistic concurrency
+        // on their first execution. Creation/submission retries validate their
+        // original revision atomically in the canonical receipt append.
+        if !journals_created_identity && mutation.expected_revision != snapshot.revision {
+            return remote_brain_error(
+                request_id,
+                "stale_revision",
+                format!(
+                    "Brain mutation expected revision {} but current revision is {}",
+                    mutation.expected_revision, snapshot.revision
+                ),
+            );
+        }
         let command_sha256 = match crate::ipc::brain_codec::brain_remote_command_fingerprint(
             &command.kind,
         ) {

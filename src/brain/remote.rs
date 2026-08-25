@@ -3464,6 +3464,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_mutation_retry_preserves_idempotency_key_across_reconnect() {
+        use crate::brain::store::{BrainEvent, ConnectionId};
+        use crate::ipc::brain_codec::{BrainRemoteEnvelope, BrainRemoteReply};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let brain_id = BrainId(uuid::Uuid::new_v4());
+        let attachment = BrainAttachment {
+            attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            subject: "alice@laptop.local".into(),
+            role: AttachmentRole::Driver,
+            acknowledged_seq: 0,
+            connected: true,
+            connection_id: Some(ConnectionId(uuid::Uuid::new_v4())),
+        };
+        let projected = BrainEvent {
+            schema_version: 13,
+            brain_id,
+            seq: 1,
+            environment_generation: 1,
+            sender: "daemon".into(),
+            created_ms: 10,
+            mutation: None,
+            kind: BrainEventKind::ParticipantMessage {
+                text: "ready".into(),
+            },
+        };
+        let fixture_event = projected.clone();
+        let fixture = tokio::spawn(async move {
+            let mut original_key = None;
+            for attempt in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let projection = BrainRemoteEnvelope::Projection(BrainWireMessage::Event {
+                    event: fixture_event.clone(),
+                });
+                socket
+                    .send(Message::Binary(
+                        crate::ipc::brain_codec::encode_brain_remote_envelope(&projection)
+                            .unwrap()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let bytes = socket.next().await.unwrap().unwrap().into_data();
+                let BrainRemoteEnvelope::Command(command) =
+                    crate::ipc::brain_codec::decode_brain_remote_envelope(&bytes).unwrap()
+                else {
+                    panic!("expected retried mutation")
+                };
+                let key = command
+                    .mutation
+                    .as_ref()
+                    .expect("prompt submission has mutation metadata")
+                    .idempotency_key;
+                if let Some(original) = original_key {
+                    assert_eq!(key, original);
+                } else {
+                    original_key = Some(key);
+                }
+                if attempt == 0 {
+                    socket.close(None).await.unwrap();
+                    continue;
+                }
+                let reply = BrainRemoteEnvelope::Reply(BrainRemoteReply::Submitted {
+                    request_id: command.request_id,
+                    accepted: fixture_event.clone(),
+                    run: None,
+                    result: None,
+                });
+                socket
+                    .send(Message::Binary(
+                        crate::ipc::brain_codec::encode_brain_remote_envelope(&reply)
+                            .unwrap()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let target = RemoteBrainTarget {
+            brain: "shared".into(),
+            machine: "fixture".into(),
+            address: address.to_string(),
+            secure: false,
+        };
+        let mut client = RemoteBrainClient::new(target, "unused").unwrap();
+        client.attachment = Some(attachment.clone());
+        *client.credential.lock().await = Some(RemoteBrainCredential {
+            token: "scoped-token".into(),
+            claims: crate::brain::credential::BrainCredentialClaims {
+                version: 1,
+                credential_id: uuid::Uuid::new_v4(),
+                issuer: "fixture".into(),
+                subject: attachment.subject.clone(),
+                brain_id,
+                brain: "shared".into(),
+                environment_generation: 1,
+                role: attachment.role,
+                scopes: super::super::credential::default_participant_scopes(attachment.role),
+                attachment_id: Some(attachment.attachment_id),
+                connection_id: attachment.connection_id,
+                delegation_chain: Vec::new(),
+                issued_ms: 0,
+                expires_ms: u64::MAX,
+            },
+        });
+
+        let mut first_events = client.watch().await.unwrap();
+        assert_eq!(first_events.recv().await, Some(BrainWireMessage::Event { event: projected.clone() }));
+        assert!(client
+            .push(BrainEventKind::Prompt { text: "once".into() })
+            .await
+            .is_err());
+        while client.connection.lock().await.is_some() {
+            tokio::task::yield_now().await;
+        }
+        drop(first_events);
+        let mut second_events = client.watch().await.unwrap();
+        assert!(second_events.recv().await.is_some());
+        client
+            .push(BrainEventKind::Prompt { text: "once".into() })
+            .await
+            .unwrap();
+        fixture.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn remote_initialization_client_uses_narrowed_websocket_authority() {
         use axum::{
             extract::{Path, Query, State, WebSocketUpgrade},
