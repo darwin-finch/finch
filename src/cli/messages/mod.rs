@@ -78,6 +78,18 @@ pub trait Message: Send + Sync {
     ) -> Option<ratatui::style::Style> {
         None // Default: no background
     }
+
+    /// Get the background style for one logical line of a formatted message.
+    /// Most messages use one semantic band throughout; mixed messages can
+    /// override this without embedding presentation codes in copied text.
+    fn background_style_for_line(
+        &self,
+        colors: &crate::config::ColorScheme,
+        _line_index: usize,
+        _line_count: usize,
+    ) -> Option<ratatui::style::Style> {
+        self.background_style(colors)
+    }
 }
 
 /// Type alias for a shared message reference

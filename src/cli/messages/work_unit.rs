@@ -551,8 +551,53 @@ impl Message for WorkUnit {
         let band = match &inner.presentation {
             WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
             WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
-            WorkUnitPresentation::Assistant if !inner.rows.is_empty() => MessageBand::Tool,
             WorkUnitPresentation::Assistant => MessageBand::Assistant,
+        };
+        Some(colors.message_band_style(band))
+    }
+
+    fn background_style_for_line(
+        &self,
+        colors: &ColorScheme,
+        line_index: usize,
+        line_count: usize,
+    ) -> Option<ratatui::style::Style> {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        if inner.rows.is_empty() {
+            let band = match &inner.presentation {
+                WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
+                WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
+                WorkUnitPresentation::Assistant => MessageBand::Assistant,
+            };
+            return Some(colors.message_band_style(band));
+        }
+
+        if inner.status == MessageStatus::InProgress {
+            let band = match &inner.presentation {
+                WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
+                WorkUnitPresentation::ProgramOutput { .. }
+                    if program_output_has_visible_state(&inner) =>
+                {
+                    MessageBand::ProgramOutput
+                }
+                _ => MessageBand::Tool,
+            };
+            return Some(colors.message_band_style(band));
+        }
+
+        let tool_line_count = inner
+            .rows
+            .iter()
+            .map(|row| format_row_collapsed(row).lines().count())
+            .sum::<usize>();
+        let band = if line_index >= line_count.saturating_sub(tool_line_count) {
+            MessageBand::Tool
+        } else {
+            match &inner.presentation {
+                WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
+                WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
+                WorkUnitPresentation::Assistant => MessageBand::Assistant,
+            }
         };
         Some(colors.message_band_style(band))
     }
@@ -853,10 +898,36 @@ mod tests {
             assistant.background_style(&colors),
             source.background_style(&colors),
             output.background_style(&colors),
-            tools.background_style(&colors),
+            tools.background_style_for_line(&colors, 0, 2),
         ];
         for (index, style) in styles.iter().enumerate() {
             assert!(styles[index + 1..].iter().all(|other| style != other));
+        }
+    }
+
+    #[test]
+    fn completed_response_and_collapsed_tools_keep_separate_bands() {
+        let colors = crate::config::ColorTheme::Dark.to_scheme();
+        let unit = WorkUnit::new("mixed");
+        unit.set_response("assistant prose");
+        let row = unit.add_row("bash(test)");
+        unit.complete_row_with_body(row, "ok", vec!["tool output".into()]);
+        unit.set_complete();
+
+        let rendered = unit.format(&colors);
+        let line_count = rendered.lines().count();
+        let assistant = colors.message_band_style(MessageBand::Assistant);
+        let tool = colors.message_band_style(MessageBand::Tool);
+
+        assert_eq!(
+            unit.background_style_for_line(&colors, 0, line_count),
+            Some(assistant)
+        );
+        for line_index in 1..line_count {
+            assert_eq!(
+                unit.background_style_for_line(&colors, line_index, line_count),
+                Some(tool)
+            );
         }
     }
 

@@ -106,7 +106,10 @@ impl ShadowBuffer {
         let (visible_chars, _ansi_positions) = extract_visible_chars(line);
 
         if visible_chars.is_empty() {
-            return 1; // Empty line still occupies one row
+            for column in 0..self.width {
+                self.set(column, y, Cell::empty_with_style(style));
+            }
+            return 1; // Empty line still occupies one fully styled row
         }
 
         let term_width = self.width.max(1);
@@ -184,8 +187,11 @@ impl ShadowBuffer {
         let mut all_lines: Vec<(String, Style)> = Vec::new(); // (line_text, style)
         for msg in messages {
             let formatted = msg.format(colors);
-            let style = msg.background_style(colors).unwrap_or_default();
-            for line in formatted.lines() {
+            let lines: Vec<_> = formatted.lines().collect();
+            for (line_index, line) in lines.iter().enumerate() {
+                let style = msg
+                    .background_style_for_line(colors, line_index, lines.len())
+                    .unwrap_or_default();
                 all_lines.push((line.to_string(), style));
             }
         }
@@ -645,6 +651,38 @@ mod tests {
 
         for column in 0..buf.width {
             assert_eq!(buf.get(column, 1).unwrap().style, expected);
+        }
+    }
+
+    #[test]
+    fn message_band_paints_interior_blank_rows() {
+        let colors = ColorTheme::Dark.to_scheme();
+        let expected = colors.message_band_style(MessageBand::LocalUser);
+        let messages: Vec<MessageRef> = vec![Arc::new(UserQueryMessage::new("top\n\nbottom"))];
+        let mut buf = ShadowBuffer::new(12, 3);
+
+        buf.render_messages(&messages, &colors);
+
+        assert_eq!(buf.get(0, 0).unwrap().ch, ' ');
+        for column in 0..buf.width {
+            assert_eq!(buf.get(column, 1).unwrap().style, expected);
+        }
+        assert_eq!(buf.get(0, 2).unwrap().ch, 'b');
+    }
+
+    #[test]
+    fn message_band_paints_every_wrapped_physical_row() {
+        let colors = ColorTheme::Dark.to_scheme();
+        let expected = colors.message_band_style(MessageBand::LocalUser);
+        let messages: Vec<MessageRef> = vec![Arc::new(UserQueryMessage::new("abcdefghij"))];
+        let mut buf = ShadowBuffer::new(6, 3);
+
+        buf.render_messages(&messages, &colors);
+
+        for row in 0..buf.height {
+            for column in 0..buf.width {
+                assert_eq!(buf.get(column, row).unwrap().style, expected);
+            }
         }
     }
 
