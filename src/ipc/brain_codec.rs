@@ -7,6 +7,7 @@ use crate::brain::store::{
 };
 use crate::brain::tasks::{BrainTask, BrainTaskPriority, BrainTaskStatus};
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_approval_audience};
+use sha2::Digest;
 
 const MAX_JSON_VALUE_DEPTH: usize = 64;
 
@@ -327,6 +328,19 @@ impl BrainRemoteReply {
             | Self::Error { request_id, .. } => *request_id,
         }
     }
+}
+
+pub(crate) fn brain_remote_command_fingerprint(
+    kind: &BrainRemoteCommandKind,
+) -> anyhow::Result<String> {
+    let canonical = BrainRemoteEnvelope::Command(BrainRemoteCommand {
+        request_id: 0,
+        mutation: None,
+        kind: kind.clone(),
+    });
+    Ok(hex::encode(sha2::Sha256::digest(
+        encode_brain_remote_envelope(&canonical)?,
+    )))
 }
 
 #[derive(Debug, Clone, PartialEq)]

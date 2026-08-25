@@ -300,12 +300,40 @@ impl BrainLifecycleService {
         interval_ms: Option<u64>,
         delivery_policy: BrainScheduleDeliveryPolicy,
     ) -> Result<BrainSchedule> {
+        self.create_schedule_with_receipt(
+            brain,
+            attachment_id,
+            connection_id,
+            language,
+            source,
+            grant_ceiling,
+            next_due_ms,
+            interval_ms,
+            delivery_policy,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_schedule_with_receipt(
+        &self,
+        brain: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        language: ProgramLanguage,
+        source: String,
+        grant_ceiling: crate::vm::EffectSet,
+        next_due_ms: u64,
+        interval_ms: Option<u64>,
+        delivery_policy: BrainScheduleDeliveryPolicy,
+        mutation: Option<crate::brain::store::BrainMutationReceipt>,
+    ) -> Result<BrainSchedule> {
         let attachment = self.connection(brain, attachment_id, connection_id)?;
         ensure!(
             attachment.role == AttachmentRole::Driver,
             "only a Brain driver can create a schedule"
         );
-        self.store.create_schedule(
+        self.store.create_schedule_with_receipt(
             brain,
             &attachment.subject,
             attachment_id,
@@ -315,6 +343,7 @@ impl BrainLifecycleService {
             next_due_ms,
             interval_ms,
             delivery_policy,
+            mutation,
         )
     }
 
@@ -547,11 +576,45 @@ impl BrainLifecycleService {
                 .start_speculative(brain, attachment_id, connection_id, text)
                 .await;
         }
+        self.submit_with_authority_and_receipt(
+            brain,
+            attachment_id,
+            connection_id,
+            kind,
+            can_approve,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn submit_with_authority_and_receipt(
+        &self,
+        brain: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        kind: BrainEventKind,
+        can_approve: bool,
+         mutation: Option<crate::brain::store::BrainMutationReceipt>,
+     ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
+        if let BrainEventKind::SpeculativePrompt { text } = kind {
+            return self
+                .start_speculative(brain, attachment_id, connection_id, text)
+                .await;
+        }
         let attachment = self
             .connection(brain, attachment_id, connection_id)
             .map_err(BrainSubmissionError::State)?;
-        self.submit_for_attachment(brain, &attachment, kind, can_approve)
-            .await
+        handlers::submit_named_brain_event_with_authority_and_receipt(
+            &self.store,
+            &self.runners,
+            &self.approvals,
+            brain,
+            &attachment,
+            kind,
+            can_approve,
+            mutation,
+        )
+        .await
     }
 
     async fn submit_for_attachment(
@@ -707,17 +770,40 @@ impl BrainLifecycleService {
         environment: &BrainEnvironment,
         ttl_ms: u64,
     ) -> Result<BrainRunnerHandoff> {
+        self.request_runner_handoff_with_receipt(
+            brain,
+            requested_by,
+            target_subject,
+            expected_lease_id,
+            environment,
+            ttl_ms,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_runner_handoff_with_receipt(
+        &self,
+        brain: &str,
+        requested_by: &str,
+        target_subject: &str,
+        expected_lease_id: RunnerLeaseId,
+        environment: &BrainEnvironment,
+        ttl_ms: u64,
+        mutation: Option<crate::brain::store::BrainMutationReceipt>,
+    ) -> Result<BrainRunnerHandoff> {
         ensure!(
             environment == self.store.environment(),
             "runner handoff environment does not match the daemon Brain environment"
         );
-        let handoff = self.store.request_runner_handoff(
+        let handoff = self.store.request_runner_handoff_with_receipt(
             brain,
             requested_by,
             target_subject,
             expected_lease_id,
             environment.generation,
             ttl_ms,
+            mutation,
         )?;
         self.expire_runner_handoff(
             brain.to_owned(),

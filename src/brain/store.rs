@@ -1171,9 +1171,36 @@ impl BrainStore {
         interval_ms: Option<u64>,
         delivery_policy: BrainScheduleDeliveryPolicy,
     ) -> Result<BrainSchedule> {
+        self.create_schedule_with_receipt(
+            name,
+            created_by,
+            initiating_attachment_id,
+            language,
+            source.into(),
+            grant_ceiling,
+            next_due_ms,
+            interval_ms,
+            delivery_policy,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_schedule_with_receipt(
+        &self,
+        name: &str,
+        created_by: &str,
+        initiating_attachment_id: AttachmentId,
+        language: ProgramLanguage,
+        source: String,
+        grant_ceiling: crate::vm::EffectSet,
+        next_due_ms: u64,
+        interval_ms: Option<u64>,
+        delivery_policy: BrainScheduleDeliveryPolicy,
+        mutation: Option<BrainMutationReceipt>,
+    ) -> Result<BrainSchedule> {
         let name = Self::validate_name(name)?;
         let created_by = validate_participant_subject("schedule creator", created_by)?;
-        let source = source.into();
         if source.trim().is_empty() {
             anyhow::bail!("scheduled program source cannot be empty");
         }
@@ -1217,15 +1244,28 @@ impl BrainStore {
             module_identity: None,
             active: true,
         };
-        self.push_locked(
-            name,
-            state,
-            created_by,
-            BrainEventKind::ScheduleChanged {
-                schedule: schedule.clone(),
-            },
-        )?;
-        Ok(schedule)
+        let kind = BrainEventKind::ScheduleChanged {
+            schedule: schedule.clone(),
+        };
+        match mutation {
+            Some(receipt) => {
+                let appended = self.push_idempotent_locked(
+                    name,
+                    state,
+                    created_by,
+                    kind,
+                    receipt,
+                )?;
+                match appended.event.kind {
+                    BrainEventKind::ScheduleChanged { schedule } => Ok(schedule),
+                    _ => anyhow::bail!("Brain mutation receipt does not identify a schedule"),
+                }
+            }
+            None => {
+                self.push_locked(name, state, created_by, kind)?;
+                Ok(schedule)
+            }
+        }
     }
 
     /// Atomically advance due schedules and append the exact queued ProgramRun
@@ -1737,6 +1777,28 @@ impl BrainStore {
         environment_generation: u64,
         ttl_ms: u64,
     ) -> Result<BrainRunnerHandoff> {
+        self.request_runner_handoff_with_receipt(
+            name,
+            requested_by,
+            target_subject,
+            expected_lease_id,
+            environment_generation,
+            ttl_ms,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_runner_handoff_with_receipt(
+        &self,
+        name: &str,
+        requested_by: &str,
+        target_subject: &str,
+        expected_lease_id: RunnerLeaseId,
+        environment_generation: u64,
+        ttl_ms: u64,
+        mutation: Option<BrainMutationReceipt>,
+    ) -> Result<BrainRunnerHandoff> {
         let name = Self::validate_name(name)?;
         let requested_by = validate_participant_subject("handoff requester", requested_by)?;
         let target_subject = validate_participant_subject("handoff target", target_subject)?;
@@ -1750,6 +1812,24 @@ impl BrainStore {
         let now = unix_millis();
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        if let Some(receipt) = mutation.as_ref() {
+            if let Some(existing) = state.events.iter().find(|event| {
+                event.mutation.as_ref().is_some_and(|recorded| {
+                    recorded.attachment_id == receipt.attachment_id
+                        && recorded.mutation_id == receipt.mutation_id
+                })
+            }) {
+                let recorded = existing.mutation.as_ref().expect("matched mutation receipt");
+                anyhow::ensure!(
+                    recorded.command_sha256 == receipt.command_sha256,
+                    "Brain mutation idempotency key was reused with a different command"
+                );
+                return match &existing.kind {
+                    BrainEventKind::RunnerHandoffRequested { handoff } => Ok(handoff.clone()),
+                    _ => anyhow::bail!("Brain mutation receipt does not identify a handoff"),
+                };
+            }
+        }
         let current = state
             .runner_lease
             .as_ref()
@@ -1784,15 +1864,28 @@ impl BrainStore {
             requested_ms: now,
             expires_ms,
         };
-        self.push_locked(
-            name,
-            state,
-            requested_by,
-            BrainEventKind::RunnerHandoffRequested {
-                handoff: handoff.clone(),
-            },
-        )?;
-        Ok(handoff)
+        let kind = BrainEventKind::RunnerHandoffRequested {
+            handoff: handoff.clone(),
+        };
+        match mutation {
+            Some(receipt) => {
+                let appended = self.push_idempotent_locked(
+                    name,
+                    state,
+                    requested_by,
+                    kind,
+                    receipt,
+                )?;
+                match appended.event.kind {
+                    BrainEventKind::RunnerHandoffRequested { handoff } => Ok(handoff),
+                    _ => anyhow::bail!("Brain mutation receipt does not identify a handoff"),
+                }
+            }
+            None => {
+                self.push_locked(name, state, requested_by, kind)?;
+                Ok(handoff)
+            }
+        }
     }
 
     pub fn accept_runner_handoff(
@@ -2306,6 +2399,17 @@ impl BrainStore {
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        self.push_idempotent_locked(name, state, sender, kind, receipt)
+    }
+
+    fn push_idempotent_locked(
+        &self,
+        name: &str,
+        state: &mut BrainState,
+        sender: &str,
+        kind: BrainEventKind,
+        receipt: BrainMutationReceipt,
+    ) -> Result<BrainMutationAppend> {
         if let Some(existing) = state.events.iter().find(|event| {
             event.mutation.as_ref().is_some_and(|recorded| {
                 recorded.attachment_id == receipt.attachment_id
@@ -2314,7 +2418,7 @@ impl BrainStore {
         }) {
             let recorded = existing.mutation.as_ref().expect("matched mutation receipt");
             anyhow::ensure!(
-                recorded == &receipt,
+                recorded.command_sha256 == receipt.command_sha256,
                 "Brain mutation idempotency key was reused with a different command"
             );
             return Ok(BrainMutationAppend {
@@ -3422,6 +3526,63 @@ mod tests {
             .to_string()
             .contains("expected revision 0 but current revision is 1"));
         assert_eq!(store.snapshot("shared").unwrap().revision, 1);
+    }
+
+    #[test]
+    fn schedule_creation_replays_the_original_identity_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let receipt = mutation_receipt(
+            &store,
+            attachment.attachment_id,
+            uuid::Uuid::new_v4(),
+            0,
+            "sha256:schedule",
+        );
+        let created = store
+            .create_schedule_with_receipt(
+                "shared",
+                "alice",
+                attachment.attachment_id,
+                ProgramLanguage::Lisp,
+                "(say \"once\")".into(),
+                crate::vm::EffectSet::pure(),
+                1_000,
+                None,
+                BrainScheduleDeliveryPolicy::Coalesce,
+                Some(receipt.clone()),
+            )
+            .unwrap();
+        drop(store);
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        restarted
+            .attach(
+                "shared",
+                "alice",
+                AttachmentRole::Driver,
+                Some(attachment.attachment_id),
+            )
+            .unwrap();
+        let replayed = restarted
+            .create_schedule_with_receipt(
+                "shared",
+                "alice",
+                attachment.attachment_id,
+                ProgramLanguage::Lisp,
+                "(say \"once\")".into(),
+                crate::vm::EffectSet::pure(),
+                1_000,
+                None,
+                BrainScheduleDeliveryPolicy::Coalesce,
+                Some(receipt),
+            )
+            .unwrap();
+        assert_eq!(replayed.schedule_id, created.schedule_id);
+        assert_eq!(restarted.snapshot("shared").unwrap().schedules.len(), 1);
     }
 
     #[test]

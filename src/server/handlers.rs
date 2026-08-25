@@ -867,6 +867,29 @@ pub(crate) async fn submit_named_brain_event_with_authority(
     kind: crate::brain::store::BrainEventKind,
     can_approve: bool,
 ) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
+    submit_named_brain_event_with_authority_and_receipt(
+        store,
+        runners,
+        approvals,
+        name,
+        attachment,
+        kind,
+        can_approve,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
+    store: &crate::brain::store::BrainStore,
+    runners: &crate::server::BrainRunnerBroker,
+    approvals: &crate::server::BrainApprovalBroker,
+    name: &str,
+    attachment: &crate::brain::store::BrainAttachment,
+    kind: crate::brain::store::BrainEventKind,
+    can_approve: bool,
+    mutation: Option<crate::brain::store::BrainMutationReceipt>,
+) -> Result<BrainSubmissionOutcome, BrainSubmissionError> {
     use crate::brain::store::BrainEventKind;
 
     if matches!(kind, BrainEventKind::SpeculativePrompt { .. }) {
@@ -923,7 +946,37 @@ pub(crate) async fn submit_named_brain_event_with_authority(
     // two attached consoles cannot race commits or interleave turn events.
     let execution_lock = store.execution_lock(name)?;
     let _turn = execution_lock.lock_owned().await;
-    let accepted = store.push(name, &attachment.subject, kind.clone())?;
+    let accepted = match mutation {
+        Some(receipt) => {
+            let appended = store.push_idempotent(
+                name,
+                &attachment.subject,
+                kind.clone(),
+                receipt,
+            )?;
+            if appended.replayed {
+                let snapshot = store.snapshot(name)?;
+                let run = snapshot
+                    .runs
+                    .into_iter()
+                    .find(|run| run.request_seq == appended.event.seq);
+                let result = snapshot.events.into_iter().find(|event| {
+                    matches!(
+                        event.kind,
+                        BrainEventKind::Result { request_seq, .. }
+                            if request_seq == appended.event.seq
+                    )
+                });
+                return Ok(BrainSubmissionOutcome {
+                    accepted: appended.event,
+                    run,
+                    result,
+                });
+            }
+            appended.event
+        }
+        None => store.push(name, &attachment.subject, kind.clone())?,
+    };
 
     let run = if matches!(
         kind,
@@ -2456,6 +2509,47 @@ async fn execute_remote_brain_command(
 
     let request_id = command.request_id;
     let lifecycle = crate::server::BrainLifecycleService::from_server(server);
+    let mutation_receipt = if matches!(
+        &command.kind,
+        BrainRemoteCommandKind::Acknowledge(_) | BrainRemoteCommandKind::Detach
+    ) {
+        if command.mutation.is_some() {
+            return remote_brain_error(
+                request_id,
+                "invalid",
+                "connection-lifecycle commands do not accept durable mutation metadata",
+            );
+        }
+        None
+    } else {
+        let Some(mutation) = command.mutation.as_ref() else {
+            return remote_brain_error(
+                request_id,
+                "invalid",
+                "durable Brain mutations require idempotency metadata",
+            );
+        };
+        let snapshot = match lifecycle.snapshot(name) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return remote_brain_error(request_id, "conflict", error.to_string()),
+        };
+        if mutation.brain_id != snapshot.brain_id {
+            return remote_brain_error(request_id, "conflict", "Brain mutation identity is stale");
+        }
+        let command_sha256 = match crate::ipc::brain_codec::brain_remote_command_fingerprint(
+            &command.kind,
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => return remote_brain_error(request_id, "invalid", error.to_string()),
+        };
+        Some(crate::brain::store::BrainMutationReceipt {
+            mutation_id: mutation.idempotency_key,
+            attachment_id,
+            expected_revision: mutation.expected_revision,
+            environment_generation: mutation.environment_generation,
+            command_sha256,
+        })
+    };
     match command.kind {
         BrainRemoteCommandKind::Submit(kind) => {
             let required_scope = if matches!(
@@ -2488,12 +2582,13 @@ async fn execute_remote_brain_command(
                 );
             }
             match lifecycle
-                .submit_with_authority(
+                .submit_with_authority_and_receipt(
                     name,
                     attachment_id,
                     connection_id,
                     kind,
                     claims.permits(BrainCredentialScope::BrainApprove),
+                    mutation_receipt,
                 )
                 .await
             {
@@ -2622,13 +2717,14 @@ async fn execute_remote_brain_command(
                 }
                 Err(error) => return remote_brain_error(request_id, "conflict", error.to_string()),
             };
-            match lifecycle.request_runner_handoff(
+            match lifecycle.request_runner_handoff_with_receipt(
                 name,
                 &claims.subject,
                 &target_subject,
                 expected_lease_id,
                 &environment,
                 ttl_ms,
+                mutation_receipt,
             ) {
                 Ok(handoff) => BrainRemoteReply::HandoffRequested {
                     request_id,
@@ -2738,7 +2834,7 @@ async fn execute_remote_brain_command(
                     "Brain credential participant no longer matches this attachment",
                 );
             }
-            match lifecycle.create_schedule(
+            match lifecycle.create_schedule_with_receipt(
                 name,
                 attachment_id,
                 connection_id,
@@ -2748,6 +2844,7 @@ async fn execute_remote_brain_command(
                 next_due_ms,
                 interval_ms,
                 delivery_policy,
+                mutation_receipt,
             ) {
                 Ok(schedule) => BrainRemoteReply::ScheduleCreated {
                     request_id,
