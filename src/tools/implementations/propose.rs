@@ -565,6 +565,18 @@ mod tests {
     }
 
     #[test]
+    fn empty_or_comment_only_proposal_is_rejected() {
+        assert_eq!(parse_proposal_decision(""), ProposalDecision::Cancel);
+        assert_eq!(parse_proposal_decision("  \n\t\n"), ProposalDecision::Cancel);
+        assert_eq!(
+            parse_proposal_decision(
+                "# Finch proposal: delete the source to reject\n# finch: action=execute\n"
+            ),
+            ProposalDecision::Cancel
+        );
+    }
+
+    #[test]
     fn last_proposal_directive_is_the_users_final_decision() {
         assert_eq!(
             parse_proposal_decision(
@@ -609,6 +621,16 @@ mod tests {
             ProposalDecision::Execute {
                 source: "print('ok')".into()
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_noninteractive_artifact_is_rejected() {
+        assert_eq!(
+            propose_artifact_with_decision("bash", "example", "")
+                .await
+                .unwrap(),
+            ProposalDecision::Cancel
         );
     }
 }
