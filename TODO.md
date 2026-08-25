@@ -850,8 +850,10 @@ still blocks the corresponding Brain phase until it is unified.
   consultant credentials no longer approve, default observer credentials are read/attach only,
   elevated participant scopes must be requested explicitly within a role-specific ceiling, and
   ordinary HTTP/WebSocket operations require scoped credentials even over loopback. Keep all future
-  discovery records credential-free. Still define the actual runner-control handoff operation and
-  attenuated delegation chain.
+  discovery records credential-free. A `brain:control` credential may now mint a bounded descendant
+  whose scopes are a subset of both the delegator and target role, whose expiry cannot exceed its
+  parent, and whose signed ancestry makes ancestor revocation invalidate the whole descendant chain.
+  Still define the actual runner-control handoff operation and its environment-authority proof.
 - [ ] Revisit shared channels only after the Brain event log, runner lease, and participant-role
   model are complete. The eventual channel should be a threaded/multi-participant projection of a
   Brain: people and models share one durable conversation, while programs run only on the remote

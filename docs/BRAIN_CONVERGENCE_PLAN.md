@@ -244,7 +244,9 @@ handles. `brain:attach` independently permits a participant to create and close
 its own projection; it does not imply approval or runner control. Default
 consultants do not receive `brain:approve`, default observers receive only read
 and attach authority, and elevated scopes require an explicit bootstrap grant
-within the role's ceiling. A compact status form should make the live condition obvious, for
+within the role's ceiling. A `brain:control` holder can delegate only a subset of
+its live authority and remaining lifetime; bounded signed ancestry makes
+revoking any ancestor revoke every descendant. A compact status form should make the live condition obvious, for
 example `brain: compiler-work · driver · runner online` or
 `brain: compiler-work · consultant · read-only`.
 
