@@ -1038,6 +1038,52 @@ impl BrainStore {
         Ok(queued)
     }
 
+    pub fn inspect_schedule(
+        &self,
+        name: &str,
+        schedule_id: ScheduleId,
+    ) -> Result<Option<BrainSchedule>> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        Ok(self
+            .brains
+            .read()
+            .expect("shared brain lock poisoned")
+            .get(name)
+            .and_then(|state| state.schedules.get(&schedule_id))
+            .cloned())
+    }
+
+    pub fn cancel_schedule(
+        &self,
+        name: &str,
+        cancelled_by: &str,
+        schedule_id: ScheduleId,
+    ) -> Result<bool> {
+        let name = Self::validate_name(name)?;
+        let cancelled_by = validate_participant_subject("schedule canceller", cancelled_by)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        let Some(mut schedule) = state.schedules.get(&schedule_id).cloned() else {
+            return Ok(false);
+        };
+        if !schedule.active {
+            return Ok(false);
+        }
+        if schedule.created_by != cancelled_by {
+            anyhow::bail!("only the schedule creator may cancel this schedule");
+        }
+        schedule.active = false;
+        self.push_locked(
+            name,
+            state,
+            cancelled_by,
+            BrainEventKind::ScheduleChanged { schedule },
+        )?;
+        Ok(true)
+    }
+
     pub fn start_run(
         &self,
         name: &str,
@@ -2613,6 +2659,55 @@ mod tests {
             store.snapshot("shared").unwrap().pending_schedule_dues.len(),
             2
         );
+    }
+
+    #[test]
+    fn schedule_inspection_and_cancellation_are_durable_and_creator_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let schedule = store
+            .create_schedule(
+                "shared",
+                "alice",
+                attachment.attachment_id,
+                ProgramLanguage::Lisp,
+                "(say \"later\")",
+                crate::vm::EffectSet::pure(),
+                10_000,
+                None,
+                BrainScheduleDeliveryPolicy::Coalesce,
+            )
+            .unwrap();
+        assert_eq!(
+            store.inspect_schedule("shared", schedule.schedule_id).unwrap(),
+            Some(schedule.clone())
+        );
+        assert!(store
+            .cancel_schedule("shared", "bob", schedule.schedule_id)
+            .unwrap_err()
+            .to_string()
+            .contains("only the schedule creator"));
+        assert!(store
+            .cancel_schedule("shared", "alice", schedule.schedule_id)
+            .unwrap());
+        assert!(!store
+            .cancel_schedule("shared", "alice", schedule.schedule_id)
+            .unwrap());
+        assert!(store
+            .queue_due_schedules("shared", 20_000)
+            .unwrap()
+            .is_empty());
+
+        drop(store);
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        assert!(!restarted
+            .inspect_schedule("shared", schedule.schedule_id)
+            .unwrap()
+            .unwrap()
+            .active);
     }
 
     #[test]
