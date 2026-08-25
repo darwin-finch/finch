@@ -1213,7 +1213,14 @@ struct BrainMutationOutcome {
     scheduleCancellationNoop @2 :Text;
     handoffCancellationNoop @3 :Text;
     runCancellationNoop    @4 :Text;
+    runCancellationDispatching @5 :BrainRunCancellationProgress;
+    runCancellationReconciled @6 :BrainRunCancellationProgress;
   }
+}
+
+struct BrainRunCancellationProgress {
+  runId      @0 :Text;
+  mutationId @1 :Text;
 }
 
 struct BrainMutationReceipt {

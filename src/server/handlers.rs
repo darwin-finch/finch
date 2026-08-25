@@ -2798,19 +2798,11 @@ async fn execute_remote_brain_command(
                     "Brain credential participant no longer matches this attachment",
                 );
             }
-            let environment = match lifecycle.snapshot(name) {
-                Ok(snapshot) if snapshot.environment.generation == environment_generation => {
-                    snapshot.environment
-                }
-                Ok(_) => {
-                    return remote_brain_error(
-                        request_id,
-                        "conflict",
-                        "runner handoff environment generation is no longer current",
-                    )
-                }
+            let mut environment = match lifecycle.snapshot(name) {
+                Ok(snapshot) => snapshot.environment,
                 Err(error) => return remote_brain_error(request_id, "conflict", error.to_string()),
             };
+            environment.generation = environment_generation;
             match lifecycle.request_runner_handoff_with_receipt(
                 name,
                 &claims.subject,

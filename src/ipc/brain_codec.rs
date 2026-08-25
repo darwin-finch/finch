@@ -1345,6 +1345,20 @@ pub(super) fn encode_event(
                     recorded.set_run_already_cancelled(&run_id.0.to_string()),
                 crate::brain::store::BrainMutationOutcome::RunCancellationNoop { run_id } =>
                     recorded.set_run_cancellation_noop(&run_id.0.to_string()),
+                crate::brain::store::BrainMutationOutcome::RunCancellationDispatching {
+                    run_id, mutation_id,
+                } => {
+                    let mut progress = recorded.init_run_cancellation_dispatching();
+                    progress.set_run_id(&run_id.0.to_string());
+                    progress.set_mutation_id(&mutation_id.to_string());
+                }
+                crate::brain::store::BrainMutationOutcome::RunCancellationReconciled {
+                    run_id, mutation_id,
+                } => {
+                    let mut progress = recorded.init_run_cancellation_reconciled();
+                    progress.set_run_id(&run_id.0.to_string());
+                    progress.set_mutation_id(&mutation_id.to_string());
+                }
                 crate::brain::store::BrainMutationOutcome::ScheduleCancellationNoop { schedule_id } =>
                     recorded.set_schedule_cancellation_noop(&schedule_id.0.to_string()),
                 crate::brain::store::BrainMutationOutcome::HandoffCancellationNoop { handoff_id } =>
@@ -1538,6 +1552,20 @@ pub(super) fn decode_event(
                 Outcome::RunCancellationNoop(value) => BrainMutationOutcome::RunCancellationNoop {
                     run_id: RunId(parse_uuid(value?)?),
                 },
+                Outcome::RunCancellationDispatching(progress) => {
+                    let progress = progress?;
+                    BrainMutationOutcome::RunCancellationDispatching {
+                        run_id: RunId(parse_uuid(progress.get_run_id()?)?),
+                        mutation_id: parse_uuid(progress.get_mutation_id()?)?,
+                    }
+                }
+                Outcome::RunCancellationReconciled(progress) => {
+                    let progress = progress?;
+                    BrainMutationOutcome::RunCancellationReconciled {
+                        run_id: RunId(parse_uuid(progress.get_run_id()?)?),
+                        mutation_id: parse_uuid(progress.get_mutation_id()?)?,
+                    }
+                }
                 Outcome::ScheduleCancellationNoop(value) => BrainMutationOutcome::ScheduleCancellationNoop {
                     schedule_id: crate::brain::store::ScheduleId(parse_uuid(value?)?),
                 },

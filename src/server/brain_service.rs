@@ -71,6 +71,23 @@ impl BrainLifecycleService {
     }
 
     #[cfg(test)]
+    pub(crate) fn register_test_approval(
+        &self,
+        request_seq: u64,
+        approval_id: &str,
+        audience: crate::brain::store::BrainApprovalAudience,
+    ) -> anyhow::Result<crate::server::brain_approval::ApprovalRegistration> {
+        self.approvals.register(request_seq, approval_id, audience)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_test_event(
+        &self, brain: &str, sender: &str, kind: BrainEventKind,
+    ) -> anyhow::Result<crate::brain::store::BrainEvent> {
+        self.store.push(brain, sender, kind)
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         store: BrainStore,
         runners: BrainRunnerBroker,
@@ -700,6 +717,7 @@ impl BrainLifecycleService {
             attachment.role == AttachmentRole::Driver,
             "only a Brain driver can cancel a run"
         );
+        let mutation_id = receipt.as_ref().map(|receipt| receipt.mutation_id);
         let reserved = match receipt {
             Some(receipt) => Some(self.store.reserve_run_cancellation(
                 brain, &attachment.subject, attachment_id, run_id, receipt,
@@ -714,12 +732,16 @@ impl BrainLifecycleService {
             run.initiating_attachment_id == attachment_id,
             "a Brain run can only be cancelled by its initiating attachment"
         );
-        if run.status == BrainRunStatus::Cancelled
-            || reserved.as_ref().is_some_and(|reserved| !reserved.needs_runner_cancel)
-        {
+        if run.status == BrainRunStatus::Cancelled {
             return Ok(run);
         }
-        ensure!(!run.status.is_terminal(), "Brain run has already finished");
+        ensure!(!run.status.is_terminal() || run.status == BrainRunStatus::Interrupted,
+            "Brain run has already finished");
+        if let Some(mutation_id) = mutation_id {
+            self.store.mark_run_cancellation_dispatching(
+                brain, &attachment.subject, run_id, mutation_id,
+            )?;
+        }
         if matches!(
             run.status,
             BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
@@ -736,17 +758,18 @@ impl BrainLifecycleService {
                     anyhow::bail!("named Brain '{brain}' has no live runner");
                 }
             };
-            match self.runners.cancel_run(brain, lease.lease_id, run_id).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    self.store.clear_run_cancellation(brain, run_id).await?;
-                    anyhow::bail!("the environment runner is not executing this Brain run");
-                }
-                Err(error) => {
-                    self.store.clear_run_cancellation(brain, run_id).await?;
-                    return Err(error);
-                }
+            // Cancellation at the runner is idempotent by RunId: `false`
+            // means the run is already absent there, which reconciles the
+            // durable cancellation intent just as safely as `true`.
+            if let Err(error) = self.runners.cancel_run(brain, lease.lease_id, run_id).await {
+                self.store.clear_run_cancellation(brain, run_id).await?;
+                return Err(error);
             }
+        }
+        if let Some(mutation_id) = mutation_id {
+            self.store.mark_run_cancellation_reconciled(
+                brain, &attachment.subject, run_id, mutation_id,
+             )?;
         }
         let publication = self.store.acquire_run_publication(brain, run_id).await?;
         let transition = match reserved {
@@ -858,10 +881,6 @@ impl BrainLifecycleService {
         ttl_ms: u64,
         mutation: Option<crate::brain::store::BrainMutationReceipt>,
     ) -> Result<BrainRunnerHandoff> {
-        ensure!(
-            environment == self.store.environment(),
-            "runner handoff environment does not match the daemon Brain environment"
-        );
         let handoff = self.store.request_runner_handoff_with_receipt(
             brain,
             requested_by,
