@@ -180,7 +180,9 @@ impl EventLoop {
 
 impl EventLoop {
     /// Register the frontend's home Brain in the daemon's durable named store.
-    /// The frontend remains the environment-owning runner.
+    /// This registers the frontend's home namespace. It does not manufacture
+    /// a runner lease; execution ownership is advertised only after the
+    /// daemon grants one through the Brain service.
     async fn register_home_brain(&self) -> Result<bool> {
         let Some(base) = self.daemon_base_url.as_deref() else {
             return Ok(false);
@@ -242,7 +244,7 @@ impl EventLoop {
                         if self.active_remote_brain.is_some() {
                             " · current driver"
                         } else {
-                            " · current runner"
+                            " · current home"
                         }
                     } else {
                         ""

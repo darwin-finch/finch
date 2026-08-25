@@ -847,9 +847,9 @@ impl EventLoop {
         self.status_bar.update_line(
             crate::cli::status_bar::StatusLineType::SessionLabel,
             if home_brain_registered {
-                format!("◆ brain: {} · runner", self.session_label)
+                format!("◆ brain: {} · home · local", self.session_label)
             } else {
-                format!("◆ brain: {} · runner · daemon offline", self.session_label)
+                format!("◆ brain: {} · home · daemon offline", self.session_label)
             },
         );
 
@@ -3345,7 +3345,7 @@ Rules:\n\
         }
         self.status_bar.update_line(
             crate::cli::status_bar::StatusLineType::SessionLabel,
-            format!("◆ brain: {} · runner", self.session_label),
+            format!("◆ brain: {} · home · local", self.session_label),
         );
         self.render_tui().await
     }
