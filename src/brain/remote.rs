@@ -195,6 +195,14 @@ impl RemoteBrainTarget {
         format!("{}/credentials", self.http_url())
     }
 
+    fn invitations_url(&self) -> String {
+        format!("{}/invitations", self.http_url())
+    }
+
+    fn invitation_redemption_url(&self) -> String {
+        format!("http://{}/v1/brains/invitations/redeem", self.address)
+    }
+
     fn ws_url(&self, attachment: &BrainAttachment) -> Result<String> {
         let connection_id = attachment
             .connection_id
@@ -214,7 +222,7 @@ fn has_explicit_port(host: &str) -> bool {
 #[derive(Clone)]
 pub struct RemoteBrainClient {
     pub target: RemoteBrainTarget,
-    bootstrap_password: String,
+    bootstrap: RemoteBrainBootstrap,
     credential: std::sync::Arc<tokio::sync::Mutex<Option<RemoteBrainCredential>>>,
     http: Client,
     attachment: Option<BrainAttachment>,
@@ -222,7 +230,19 @@ pub struct RemoteBrainClient {
 }
 
 #[derive(Clone)]
+enum RemoteBrainBootstrap {
+    Password(String),
+    Invitation(String),
+}
+
+#[derive(Clone)]
 struct RemoteBrainCredential {
+    token: String,
+    claims: super::credential::BrainCredentialClaims,
+}
+
+#[derive(Deserialize)]
+struct IssuedBrainCredential {
     token: String,
     claims: super::credential::BrainCredentialClaims,
 }
@@ -243,7 +263,23 @@ impl RemoteBrainClient {
     pub fn new(target: RemoteBrainTarget, password: impl Into<String>) -> Result<Self> {
         Ok(Self {
             target,
-            bootstrap_password: password.into(),
+            bootstrap: RemoteBrainBootstrap::Password(password.into()),
+            credential: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            http: Client::builder()
+                .timeout(std::time::Duration::from_secs(180))
+                .build()?,
+            attachment: None,
+            session: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        })
+    }
+
+    pub fn new_with_invitation(
+        target: RemoteBrainTarget,
+        invitation: impl Into<String>,
+    ) -> Result<Self> {
+        Ok(Self {
+            target,
+            bootstrap: RemoteBrainBootstrap::Invitation(invitation.into()),
             credential: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             http: Client::builder()
                 .timeout(std::time::Duration::from_secs(180))
@@ -267,7 +303,7 @@ impl RemoteBrainClient {
 
         self.http
             .post(self.target.collection_url())
-            .bearer_auth(&self.bootstrap_password)
+            .bearer_auth(self.bootstrap_password()?)
             .json(&Create {
                 name: &self.target.brain,
             })
@@ -279,6 +315,117 @@ impl RemoteBrainClient {
             .json()
             .await
             .context("invalid created Brain snapshot")
+    }
+
+    /// Create a short-lived, single-participant invitation without exposing
+    /// the daemon bootstrap password to the recipient.
+    pub async fn issue_invitation(
+        &self,
+        role: AttachmentRole,
+        ttl_ms: Option<u64>,
+    ) -> Result<(String, super::credential::BrainInvitationClaims)> {
+        #[derive(Serialize)]
+        struct Issue {
+            role: AttachmentRole,
+            ttl_ms: Option<u64>,
+        }
+        #[derive(Deserialize)]
+        struct Issued {
+            invitation: String,
+            claims: super::credential::BrainInvitationClaims,
+        }
+
+        let issued = self
+            .http
+            .post(self.target.invitations_url())
+            .bearer_auth(self.bootstrap_password()?)
+            .json(&Issue { role, ttl_ms })
+            .send()
+            .await
+            .context("could not reach Brain invitation issuer")?
+            .error_for_status()
+            .context("Brain invitation request rejected")?
+            .json::<Issued>()
+            .await
+            .context("invalid Brain invitation response")?;
+        if issued.claims.brain != self.target.brain || issued.claims.role != role {
+            anyhow::bail!("Brain invitation issuer returned the wrong participant audience");
+        }
+        Ok((issued.invitation, issued.claims))
+    }
+
+    /// Redeem this client's invitation and attach using the role and scopes
+    /// fixed by its issuer. The invitation is exchanged for the same ordinary
+    /// scoped credential used by password-bootstrapped clients.
+    pub async fn attach_invited_persistent(
+        &mut self,
+        subject: &str,
+        client_slot: &str,
+    ) -> Result<(AttachmentRole, BrainAttachment)> {
+        let role = self.redeem_invitation(subject).await?;
+        let attachment = self.attach_persistent(subject, role, client_slot).await?;
+        Ok((role, attachment))
+    }
+
+    async fn redeem_invitation(&self, subject: &str) -> Result<AttachmentRole> {
+        let mut credential = self.credential.lock().await;
+        if let Some(existing) = credential.as_ref() {
+            if existing.claims.subject == subject
+                && existing.claims.brain == self.target.brain
+                && existing.claims.expires_ms > unix_epoch_millis()
+            {
+                return Ok(existing.claims.role);
+            }
+        }
+        let issued = self.request_invitation_credential(subject).await?;
+        let role = issued.claims.role;
+        *credential = Some(issued);
+        Ok(role)
+    }
+
+    async fn request_invitation_credential(
+        &self,
+        subject: &str,
+    ) -> Result<RemoteBrainCredential> {
+        #[derive(Serialize)]
+        struct Redeem<'a> {
+            invitation: &'a str,
+            subject: &'a str,
+        }
+
+        let RemoteBrainBootstrap::Invitation(invitation) = &self.bootstrap else {
+            anyhow::bail!("this Brain client was not created with an invitation");
+        };
+        let issued = self
+            .http
+            .post(self.target.invitation_redemption_url())
+            .json(&Redeem {
+                invitation,
+                subject,
+            })
+            .send()
+            .await
+            .context("could not reach Brain invitation redemption endpoint")?
+            .error_for_status()
+            .context("Brain invitation redemption rejected")?
+            .json::<IssuedBrainCredential>()
+            .await
+            .context("invalid Brain invitation redemption response")?;
+        if issued.claims.subject != subject
+            || issued.claims.brain != self.target.brain
+            || issued.claims.role == AttachmentRole::Runner
+            || !issued
+                .claims
+                .permits(super::credential::BrainCredentialScope::BrainAttach)
+            || issued.claims.attachment_id.is_some()
+            || issued.claims.connection_id.is_some()
+        {
+            anyhow::bail!("Brain invitation returned the wrong participant audience");
+        }
+        Ok(RemoteBrainCredential {
+            token: issued.token,
+            claims: issued.claims,
+        })
     }
 
     pub async fn attach(
@@ -671,13 +818,17 @@ impl RemoteBrainClient {
     ) -> Result<()> {
         let now_ms = unix_epoch_millis();
         let mut credential = self.credential.lock().await;
+        let minimum_expiry = match &self.bootstrap {
+            RemoteBrainBootstrap::Password(_) => now_ms.saturating_add(60_000),
+            RemoteBrainBootstrap::Invitation(_) => now_ms,
+        };
         if credential.as_ref().is_some_and(|credential| {
             credential.claims.subject == subject
                 && credential.claims.role == role
                 && credential.claims.brain == self.target.brain
                 && credential.claims.attachment_id.is_none()
                 && credential.claims.connection_id.is_none()
-                && credential.claims.expires_ms > now_ms.saturating_add(60_000)
+                && credential.claims.expires_ms > minimum_expiry
                 && requested_scopes
                     .as_ref()
                     .is_none_or(|required| required.is_subset(&credential.claims.scopes))
@@ -693,29 +844,34 @@ impl RemoteBrainClient {
                 std::collections::BTreeSet<super::credential::BrainCredentialScope>,
             >,
         }
-        #[derive(Deserialize)]
-        struct Issued {
-            token: String,
-            claims: super::credential::BrainCredentialClaims,
-        }
-
-        let issued = self
-            .http
-            .post(self.target.credentials_url())
-            .bearer_auth(&self.bootstrap_password)
-            .json(&Issue {
-                subject,
-                role,
-                scopes: requested_scopes.clone(),
-            })
-            .send()
-            .await
-            .context("could not reach Brain credential issuer")?
-            .error_for_status()
-            .context("Brain credential request rejected")?
-            .json::<Issued>()
-            .await
-            .context("invalid Brain credential response")?;
+        let issued = match &self.bootstrap {
+            RemoteBrainBootstrap::Password(password) => {
+                let issued = self
+                    .http
+                    .post(self.target.credentials_url())
+                    .bearer_auth(password)
+                    .json(&Issue {
+                        subject,
+                        role,
+                        scopes: requested_scopes.clone(),
+                    })
+                    .send()
+                    .await
+                    .context("could not reach Brain credential issuer")?
+                    .error_for_status()
+                    .context("Brain credential request rejected")?
+                    .json::<IssuedBrainCredential>()
+                    .await
+                    .context("invalid Brain credential response")?;
+                RemoteBrainCredential {
+                    token: issued.token,
+                    claims: issued.claims,
+                }
+            }
+            RemoteBrainBootstrap::Invitation(_) => anyhow::bail!(
+                "redeem the Brain invitation before requesting attachment authority"
+            ),
+        };
         if issued.claims.subject != subject
             || issued.claims.role != role
             || issued.claims.brain != self.target.brain
@@ -725,10 +881,7 @@ impl RemoteBrainClient {
         {
             anyhow::bail!("Brain credential issuer returned the wrong participant audience");
         }
-        *credential = Some(RemoteBrainCredential {
-            token: issued.token,
-            claims: issued.claims,
-        });
+        *credential = Some(issued);
         Ok(())
     }
 
@@ -771,6 +924,15 @@ impl RemoteBrainClient {
             anyhow::bail!("scoped Brain credential expired; reconnect the attachment");
         }
         Ok(credential.token.clone())
+    }
+
+    fn bootstrap_password(&self) -> Result<&str> {
+        match &self.bootstrap {
+            RemoteBrainBootstrap::Password(password) => Ok(password),
+            RemoteBrainBootstrap::Invitation(_) => {
+                anyhow::bail!("this operation requires the Brain owner's bootstrap credential")
+            }
+        }
     }
 }
 
@@ -845,6 +1007,21 @@ impl AttachedBrainClient {
         };
         self.attachment = Some(attachment.clone());
         Ok(attachment)
+    }
+
+    pub async fn attach_invited_persistent(
+        &mut self,
+        subject: &str,
+        client_slot: &str,
+    ) -> Result<(AttachmentRole, BrainAttachment)> {
+        let AttachedBrainTransport::Remote(client) = &mut self.transport else {
+            anyhow::bail!("Brain invitations are redeemed through the remote transport");
+        };
+        let (role, attachment) = client
+            .attach_invited_persistent(subject, client_slot)
+            .await?;
+        self.attachment = Some(attachment.clone());
+        Ok((role, attachment))
     }
 
     pub async fn snapshot(&self) -> Result<BrainSnapshot> {
@@ -984,6 +1161,121 @@ mod tests {
         assert!(RemoteBrainTarget::parse("brain@host/path").is_err());
     }
 
+    #[tokio::test]
+    async fn invitation_client_issues_and_redeems_through_the_scoped_endpoints() {
+        use axum::{
+            extract::State,
+            http::HeaderMap,
+            routing::post,
+            Json, Router,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        #[derive(Clone)]
+        struct Fixture {
+            brain_id: BrainId,
+            issues: Arc<AtomicUsize>,
+            redemptions: Arc<AtomicUsize>,
+        }
+
+        let fixture = Fixture {
+            brain_id: BrainId(uuid::Uuid::new_v4()),
+            issues: Arc::new(AtomicUsize::new(0)),
+            redemptions: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route(
+                "/v1/brains/named/shared/invitations",
+                post(
+                    |State(fixture): State<Fixture>, headers: HeaderMap| async move {
+                        assert_eq!(
+                            headers
+                                .get(axum::http::header::AUTHORIZATION)
+                                .unwrap(),
+                            "Bearer owner-secret"
+                        );
+                        fixture.issues.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "invitation": "finch-brain-invite-v1.payload.signature",
+                            "claims": {
+                                "version": 1,
+                                "invitation_id": uuid::Uuid::new_v4(),
+                                "issuer": "fixture.local",
+                                "brain_id": fixture.brain_id,
+                                "brain": "shared",
+                                "environment_generation": 1,
+                                "role": "consultant",
+                                "scopes": ["brain:read", "brain:attach", "brain:detach", "brain:submit"],
+                                "delegation_chain": [],
+                                "issued_ms": 1,
+                                "expires_ms": u64::MAX
+                            }
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/v1/brains/invitations/redeem",
+                post(
+                    |State(fixture): State<Fixture>, Json(body): Json<serde_json::Value>| async move {
+                        assert_eq!(body["invitation"], "shared-invitation");
+                        assert_eq!(body["subject"], "alice@laptop.local");
+                        fixture.redemptions.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "token": "ordinary-scoped-credential",
+                            "claims": {
+                                "version": 1,
+                                "credential_id": uuid::Uuid::new_v4(),
+                                "issuer": "fixture.local",
+                                "subject": "alice@laptop.local",
+                                "brain_id": fixture.brain_id,
+                                "brain": "shared",
+                                "environment_generation": 1,
+                                "role": "consultant",
+                                "scopes": ["brain:read", "brain:attach", "brain:detach", "brain:submit"],
+                                "delegation_chain": [],
+                                "issued_ms": 1,
+                                "expires_ms": u64::MAX
+                            }
+                        }))
+                    },
+                ),
+            )
+            .with_state(fixture.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let target = RemoteBrainTarget {
+            brain: "shared".into(),
+            machine: "fixture.local".into(),
+            address: address.to_string(),
+        };
+
+        let owner = RemoteBrainClient::new(target.clone(), "owner-secret").unwrap();
+        let (invitation, claims) = owner
+            .issue_invitation(AttachmentRole::Consultant, Some(30_000))
+            .await
+            .unwrap();
+        assert_eq!(invitation, "finch-brain-invite-v1.payload.signature");
+        assert_eq!(claims.role, AttachmentRole::Consultant);
+
+        let guest = RemoteBrainClient::new_with_invitation(target, "shared-invitation").unwrap();
+        assert_eq!(
+            guest.redeem_invitation("alice@laptop.local").await.unwrap(),
+            AttachmentRole::Consultant
+        );
+        assert_eq!(
+            guest.redeem_invitation("alice@laptop.local").await.unwrap(),
+            AttachmentRole::Consultant
+        );
+        assert_eq!(fixture.issues.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.redemptions.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
     #[test]
     #[ignore = "requires a running Finch daemon on the default loopback port"]
     fn live_remote_creation_is_explicit_and_environment_owned() {
@@ -1005,6 +1297,43 @@ mod tests {
             assert!(client.create().await.is_err());
             client.archive("codex-create@localhost").await.unwrap();
         });
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Finch daemon on the default loopback port"]
+    async fn live_invitation_issues_redeems_attaches_and_cannot_be_replayed() {
+        let brain = format!("codex-invite-live-{}", uuid::Uuid::new_v4());
+        let target = RemoteBrainTarget::parse(&format!(
+            "{brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}"
+        ))
+        .unwrap();
+        let owner = RemoteBrainClient::new(target.clone(), "loopback").unwrap();
+        owner.create().await.unwrap();
+        let (invitation, _) = owner
+            .issue_invitation(AttachmentRole::Observer, Some(60_000))
+            .await
+            .unwrap();
+
+        let mut guest =
+            RemoteBrainClient::new_with_invitation(target.clone(), invitation.clone()).unwrap();
+        let (role, _) = guest
+            .attach_invited_persistent("invited-observer@localhost", "invite-live")
+            .await
+            .unwrap();
+        assert_eq!(role, AttachmentRole::Observer);
+        let mut events = guest.watch().await.unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            BrainWireMessage::Snapshot { .. }
+        ));
+
+        let replay = RemoteBrainClient::new_with_invitation(target, invitation).unwrap();
+        assert!(replay
+            .redeem_invitation("different-subject@localhost")
+            .await
+            .is_err());
+        guest.disconnect().await.unwrap();
+        owner.archive("invite-owner@localhost").await.unwrap();
     }
 
     #[tokio::test]

@@ -62,6 +62,14 @@ pub enum Command {
     BrainCreate(String),           // /brain create <name>[@machine]
     BrainArchive(String),          // /brain archive <name>
     BrainAttach(String),           // /brain attach <name@machine[:port]>
+    BrainJoin {
+        target: String,
+        invitation: String,
+    }, // /brain join <name@machine[:port]> <invitation>
+    BrainInvite {
+        role: String,
+        ttl_minutes: Option<u64>,
+    }, // /brain invite [role] [minutes]
     BrainDetach,                   // /brain detach
     BrainHandoff(String),          // /brain handoff <target-subject>
     BrainHandoffIdentity,          // /brain handoff identity
@@ -130,6 +138,17 @@ impl Command {
                 return Some(Command::BrainWhois(subject.to_string()));
             }
         }
+        if let Some(rest) = raw.strip_prefix("/brain join ") {
+            let mut parts = rest.split_whitespace();
+            if let (Some(target), Some(invitation), None) =
+                (parts.next(), parts.next(), parts.next())
+            {
+                return Some(Command::BrainJoin {
+                    target: target.to_string(),
+                    invitation: invitation.to_string(),
+                });
+            }
+        }
 
         let trimmed = input
             .trim()
@@ -167,6 +186,12 @@ impl Command {
             "/brain runs" | "/brain run list" => return Some(Command::BrainRuns),
             "/who" | "/brain who" => return Some(Command::BrainWho),
             "/brain detach" => return Some(Command::BrainDetach),
+            "/brain invite" => {
+                return Some(Command::BrainInvite {
+                    role: "driver".into(),
+                    ttl_minutes: None,
+                });
+            }
             "/brain handoff accept" => return Some(Command::BrainHandoffAccept(None)),
             "/brain handoff cancel" => return Some(Command::BrainHandoffCancel(None)),
             "/brain handoff identity" => return Some(Command::BrainHandoffIdentity),
@@ -278,6 +303,24 @@ impl Command {
             let target = rest.trim();
             if !target.is_empty() {
                 return Some(Command::BrainAttach(target.to_string()));
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("/brain invite ") {
+            let mut parts = rest.split_whitespace();
+            if let Some(role) = parts.next() {
+                let ttl_minutes = match parts.next() {
+                    Some(value) => match value.parse::<u64>() {
+                        Ok(value) => Some(value),
+                        Err(_) => return None,
+                    },
+                    None => None,
+                };
+                if parts.next().is_none() {
+                    return Some(Command::BrainInvite {
+                        role: role.to_string(),
+                        ttl_minutes,
+                    });
+                }
             }
         }
         if let Some(rest) = trimmed.strip_prefix("/brain create ") {
@@ -559,6 +602,8 @@ pub fn handle_command(
         | Command::BrainCreate(_)
         | Command::BrainArchive(_)
         | Command::BrainAttach(_)
+        | Command::BrainJoin { .. }
+        | Command::BrainInvite { .. }
         | Command::BrainDetach
         | Command::BrainHandoff(_)
         | Command::BrainHandoffIdentity
@@ -736,6 +781,8 @@ pub fn format_help() -> String {
          {cyan}  /whois <subject>{reset}    Show public presence for one participant\n\
          {cyan}  /brain create <name>[@machine]{reset} Create an empty Brain in that environment\n\
          {cyan}  /brain attach <name>[@machine]{reset} Attach locally or to a remote Brain\n\
+         {cyan}  /brain invite [role] [minutes]{reset} Create a short-lived single-use invitation\n\
+         {cyan}  /brain join <name@machine> <invite>{reset} Redeem an invitation and attach\n\
          {cyan}  /brain detach{reset}      Return to this console's home Brain\n\
          {cyan}  /brain handoff <subject>{reset} Request an addressed runner transfer\n\
          {cyan}  /brain handoff identity{reset} Show this exact frontend's runner identity\n\
@@ -1042,6 +1089,21 @@ mod tests {
         assert!(matches!(
             Command::parse("/brain attach finch@workstation.local"),
             Some(Command::BrainAttach(target)) if target == "finch@workstation.local"
+        ));
+        assert!(matches!(
+            Command::parse("/brain join finch@workstation.local finch-brain-invite-v1.payload.sig_"),
+            Some(Command::BrainJoin { target, invitation })
+                if target == "finch@workstation.local"
+                    && invitation == "finch-brain-invite-v1.payload.sig_"
+        ));
+        assert!(matches!(
+            Command::parse("/brain invite consultant 30"),
+            Some(Command::BrainInvite { role, ttl_minutes: Some(30) })
+                if role == "consultant"
+        ));
+        assert!(matches!(
+            Command::parse("/brain invite"),
+            Some(Command::BrainInvite { role, ttl_minutes: None }) if role == "driver"
         ));
         assert!(matches!(
             Command::parse("/brain detach"),

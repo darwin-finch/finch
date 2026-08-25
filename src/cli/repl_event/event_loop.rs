@@ -2171,6 +2171,16 @@ Rules:\n\
                     Command::BrainAttach(target) => {
                         self.handle_brain_attach(target).await?;
                     }
+                    Command::BrainJoin { target, invitation } => {
+                        self.handle_brain_join(target, invitation).await?;
+                    }
+                    Command::BrainInvite { role, ttl_minutes } => {
+                        if let Err(error) = self.handle_brain_invite(role, ttl_minutes).await {
+                            self.output_manager
+                                .write_info(format!("brain invite: {error}"));
+                            self.render_tui().await?;
+                        }
+                    }
                     Command::BrainCreate(target) => {
                         if let Err(error) = self.handle_brain_create(target).await {
                             self.output_manager
@@ -4111,6 +4121,19 @@ Rules:\n\
     /// Attach this TUI to one daemon-owned brain. All prompts and explicit
     /// Forth/Lisp programs are routed to that host until `/brain detach`.
     async fn handle_brain_attach(&mut self, value: String) -> Result<()> {
+        self.handle_brain_attach_with_invitation(value, None).await
+    }
+
+    async fn handle_brain_join(&mut self, value: String, invitation: String) -> Result<()> {
+        self.handle_brain_attach_with_invitation(value, Some(invitation))
+            .await
+    }
+
+    async fn handle_brain_attach_with_invitation(
+        &mut self,
+        value: String,
+        invitation: Option<String>,
+    ) -> Result<()> {
         let parsed = if value.contains('@') {
             crate::brain::remote::RemoteBrainTarget::parse(&value)
         } else if let Some(base) = self.daemon_base_url.as_deref() {
@@ -4138,19 +4161,30 @@ Rules:\n\
             ));
             return self.render_tui().await;
         }
-        let password = crate::config::load_config()
-            .map(|config| config.server.brain_password)
-            .unwrap_or_default();
-        let remote = crate::brain::remote::RemoteBrainClient::new(target, password)?;
+        let remote = if let Some(invitation) = invitation.as_ref() {
+            crate::brain::remote::RemoteBrainClient::new_with_invitation(target, invitation)?
+        } else {
+            let password = crate::config::load_config()
+                .map(|config| config.server.brain_password)
+                .unwrap_or_default();
+            crate::brain::remote::RemoteBrainClient::new(target, password)?
+        };
         let mut client = crate::brain::remote::AttachedBrainClient::remote(remote);
-        if let Err(error) = client
-            .attach_persistent(
-                &self.participant_subject,
-                crate::brain::shared::AttachmentRole::Driver,
-                &self.session_label,
-            )
-            .await
-        {
+        let attachment = if invitation.is_some() {
+            client
+                .attach_invited_persistent(&self.participant_subject, &self.session_label)
+                .await
+                .map(|(_, attachment)| attachment)
+        } else {
+            client
+                .attach_persistent(
+                    &self.participant_subject,
+                    crate::brain::shared::AttachmentRole::Driver,
+                    &self.session_label,
+                )
+                .await
+        };
+        if let Err(error) = attachment {
             self.output_manager.write_info(format!(
                 "brain attach {}: {error}",
                 client.target.display_name()
@@ -4218,6 +4252,58 @@ Rules:\n\
             });
         });
         Ok(())
+    }
+
+    async fn handle_brain_invite(
+        &mut self,
+        role: String,
+        ttl_minutes: Option<u64>,
+    ) -> Result<()> {
+        if self.active_remote_brain.is_some() {
+            anyhow::bail!(
+                "issue invitations from the Brain owner's home console, not through a guest attachment"
+            );
+        }
+        let role = match role.to_ascii_lowercase().as_str() {
+            "driver" => crate::brain::shared::AttachmentRole::Driver,
+            "consultant" => crate::brain::shared::AttachmentRole::Consultant,
+            "observer" => crate::brain::shared::AttachmentRole::Observer,
+            _ => anyhow::bail!("role must be driver, consultant, or observer"),
+        };
+        let home = self
+            .home_brain
+            .as_ref()
+            .context("this console has no home Brain")?;
+        let daemon_base_url = self
+            .daemon_base_url
+            .as_deref()
+            .context("this console is not connected to its local daemon")?;
+        let target = crate::brain::remote::RemoteBrainTarget::local(
+            &home.target.brain,
+            daemon_base_url,
+        )?;
+        let password = crate::config::load_config()
+            .map(|config| config.server.brain_password)
+            .unwrap_or_default();
+        let client = crate::brain::remote::RemoteBrainClient::new(target, password)?;
+        let ttl_ms = ttl_minutes
+            .map(|minutes| {
+                minutes
+                    .checked_mul(60_000)
+                    .context("invitation lifetime is too large")
+            })
+            .transpose()?;
+        let (invitation, claims) = client.issue_invitation(role, ttl_ms).await?;
+        self.output_manager.write_info(format!(
+            "Brain invitation for {} ({}, expires at Unix ms {}):\n{}\n\nRecipient command:\n/brain join {} {}",
+            claims.brain,
+            format!("{:?}", claims.role).to_ascii_lowercase(),
+            claims.expires_ms,
+            invitation,
+            client.target.display_name(),
+            invitation,
+        ));
+        self.render_tui().await
     }
 
     async fn handle_brain_detach(&mut self) -> Result<()> {
