@@ -497,8 +497,7 @@ fn attachment_can_submit(
         ),
         AttachmentRole::Consultant => matches!(
             kind,
-            BrainEventKind::Prompt { .. }
-                | BrainEventKind::ParticipantMessage { .. }
+            BrainEventKind::ParticipantMessage { .. }
                 | BrainEventKind::ApprovalDecided { .. }
         ),
         AttachmentRole::Observer | AttachmentRole::Runner => false,
@@ -3118,7 +3117,7 @@ mod named_brain_provider_context_tests {
         ));
         assert!(attachment_can_submit(AttachmentRole::Driver, &program));
         assert!(attachment_can_submit(AttachmentRole::Driver, &decision));
-        assert!(attachment_can_submit(AttachmentRole::Consultant, &prompt));
+        assert!(!attachment_can_submit(AttachmentRole::Consultant, &prompt));
         assert!(attachment_can_submit(
             AttachmentRole::Consultant,
             &participant_message
@@ -4225,6 +4224,25 @@ mod named_brain_provider_context_tests {
         assert!(messages[0]
             .text_content()
             .contains("the failing test is scheduler_cancel"));
+
+        let revision = snapshot.revision;
+        assert!(matches!(
+            submit_named_brain_event(
+                &store,
+                &runners,
+                &approvals,
+                "shared",
+                &consultant,
+                BrainEventKind::Prompt {
+                    text: "execute this instead".into(),
+                },
+            )
+            .await,
+            Err(BrainSubmissionError::Forbidden(_))
+        ));
+        let rejected = store.snapshot("shared").unwrap();
+        assert_eq!(rejected.revision, revision);
+        assert!(rejected.runs.is_empty());
 
         let observer = store
             .attach("shared", "eve@box.local", AttachmentRole::Observer, None)
