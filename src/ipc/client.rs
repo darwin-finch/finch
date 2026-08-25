@@ -17,6 +17,7 @@ use crate::ipc::brain_codec::{
     decode_run, decode_runner_handoff, decode_runner_lease, decode_snapshot, encode_approval_audience,
     encode_brain_submission, encode_environment,
 };
+use crate::ipc::checkpoint_codec::{decode_checkpoint, encode_checkpoint};
 use crate::ipc::schema::finch_ipc_capnp::{
     self, brain_runner, brain_service, brain_wire_receiver, finch_daemon, stream_receiver,
 };
@@ -482,7 +483,7 @@ impl IpcClient {
         let response = reply.get()?;
         Ok(BrainRunnerBootstrap {
             runtime_revision: response.get_runtime_revision(),
-            checkpoint: serde_json::from_slice(response.get_checkpoint_json()?)
+            checkpoint: decode_checkpoint(response.get_checkpoint()?)
                 .context("daemon returned an invalid named-Brain checkpoint")?,
         })
     }
@@ -570,9 +571,8 @@ impl brain_runner::Server for BrainRunnerImpl {
                 Ok(response) => {
                     result.set_output(&response.output);
                     result.set_runtime_revision(response.runtime_revision);
-                    let encoded = serde_json::to_vec(&response.checkpoint)
+                    encode_checkpoint(result.reborrow().init_checkpoint(), &response.checkpoint)
                         .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                    result.set_checkpoint_json(&encoded);
                     result.set_error("");
                 }
                 Err(error) => result.set_error(&error),
@@ -689,9 +689,8 @@ impl brain_runner::Server for BrainRunnerImpl {
                     });
                     result.set_output(&response.output);
                     result.set_runtime_revision(response.runtime_revision);
-                    let encoded = serde_json::to_vec(&response.checkpoint)
+                    encode_checkpoint(result.reborrow().init_checkpoint(), &response.checkpoint)
                         .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                    result.set_checkpoint_json(&encoded);
                     result.set_error("");
                 }
                 Err(error) => result.set_error(&error.message),

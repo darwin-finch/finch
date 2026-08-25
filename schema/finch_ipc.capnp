@@ -756,7 +756,7 @@ struct BrainProgramRequest {
 struct BrainProgramResult {
   output          @0 :Text;
   runtimeRevision @1 :UInt64;
-  checkpointJson  @2 :Data; # Transitional typed checkpoint payload; schema becomes native later.
+  checkpoint      @2 :TypedRuntimeCheckpoint;
   error           @3 :Text;
 }
 
@@ -791,7 +791,7 @@ struct BrainTurnResult {
   language        @1 :ProgramLanguage;
   output          @2 :Text;
   runtimeRevision @3 :UInt64;
-  checkpointJson  @4 :Data; # Transitional typed checkpoint payload; schema becomes native later.
+  checkpoint      @4 :TypedRuntimeCheckpoint;
   error           @5 :Text;
   turnEvents      @6 :List(BrainTurnEvent);
 }
@@ -1237,7 +1237,7 @@ interface FinchDaemon {
   # The durable reducible VM state is returned so a restarted frontend can
   # hydrate before accepting work. Host authority is deliberately absent.
   registerBrainRunner @4 (brain :Text, leaseId :Text, runner :BrainRunner)
-      -> (runtimeRevision :UInt64, checkpointJson :Data);
+      -> (runtimeRevision :UInt64, checkpoint :TypedRuntimeCheckpoint);
 
   # Return the canonical named-Brain lifecycle capability. Keeping this as a
   # capability allows later protocol evolution without adding every Brain

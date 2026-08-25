@@ -16,6 +16,7 @@ use crate::ipc::brain_codec::{
     encode_attachment, encode_brain_submission_outcome, encode_event, encode_runner_handoff,
     encode_run, encode_runner_lease, encode_snapshot,
 };
+use crate::ipc::checkpoint_codec::{decode_checkpoint, encode_checkpoint};
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_service, finch_daemon};
 use crate::server::AgentServer;
 
@@ -1123,11 +1124,6 @@ impl finch_daemon::Server for FinchDaemonImpl {
                 Ok(checkpoint) => checkpoint,
                 Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
             };
-        let checkpoint_json = match serde_json::to_vec(&checkpoint) {
-            Ok(encoded) => encoded,
-            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
-        };
-
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let broker = self.server.brain_runners().clone();
         let server = Arc::clone(&self.server);
@@ -1169,7 +1165,9 @@ impl finch_daemon::Server for FinchDaemonImpl {
         });
         let mut response = results.get();
         response.set_runtime_revision(runtime_revision);
-        response.set_checkpoint_json(&checkpoint_json);
+        if let Err(error) = encode_checkpoint(response.reborrow().init_checkpoint(), &checkpoint) {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         Promise::ok(())
     }
 
@@ -1348,12 +1346,8 @@ fn decode_runner_program_result(
     if !error.is_empty() {
         return Err(error.to_string());
     }
-    let checkpoint = serde_json::from_slice(
-        result
-            .get_checkpoint_json()
-            .map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+    let checkpoint = decode_checkpoint(result.get_checkpoint().map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
     Ok(crate::server::RunnerProgramResult {
         output: result
             .get_output()
@@ -1388,12 +1382,8 @@ fn decode_runner_turn_result(
             turn_events,
         });
     }
-    let checkpoint = serde_json::from_slice(
-        result
-            .get_checkpoint_json()
-            .map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+    let checkpoint = decode_checkpoint(result.get_checkpoint().map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
     Ok(crate::server::RunnerTurnResult {
         source: result
             .get_source()
@@ -1500,7 +1490,6 @@ mod tests {
             .unwrap()
             .checkpoint
             .unwrap();
-        let checkpoint_json = serde_json::to_vec(&checkpoint).unwrap();
         let mut message = capnp::message::Builder::new_default();
         {
             let mut result =
@@ -1509,7 +1498,7 @@ mod tests {
             result.set_language(super::finch_ipc_capnp::ProgramLanguage::Lisp);
             result.set_output("done");
             result.set_runtime_revision(1);
-            result.set_checkpoint_json(&checkpoint_json);
+            super::encode_checkpoint(result.reborrow().init_checkpoint(), &checkpoint).unwrap();
             result.set_error("");
             let mut events = result.init_turn_events(4);
             let mut call = events.reborrow().get(0);
