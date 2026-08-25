@@ -855,7 +855,7 @@ still blocks the corresponding Brain phase until it is unified.
   in its own status namespace, while semantic recall remains independently replaceable. Unit coverage
   includes zero-recall isolation, source/error filtering, truncation, and stale-line removal; a live
   smoke check preserved the projected context across both frontend and daemon restart.
-- [ ] Add theme-aware author/channel backgrounds so user input, model-authored VM source, tool
+- [x] Add theme-aware author/channel backgrounds so user input, model-authored VM source, tool
   activity, and VM/user-visible output are distinguishable without relying on low-contrast cyan
   foreground text alone. Use subtle full-width turn bands like other modern coding harnesses rather
   than coloring only glyphs; define theme-aware hover/selection/expanded states for interactive
@@ -863,15 +863,17 @@ still blocks the corresponding Brain phase until it is unified.
   copied, and make the styling part of structured `OutputManager` rows so redraw, resize,
   scrollback, and concurrent WorkUnits remain stable. In a shared Brain, assign stable
   distinguishable participant background accents from participant identity and label the author;
-  do not make every human console look like the same local user.
-- [ ] Give `$VISUAL`/`$EDITOR` a correct terminal-protocol handoff. Leave Finch raw/live rendering,
+  do not make every human console look like the same local user. Completed in
+  [GitHub #48](https://github.com/darwin-finch/finch/issues/48).
+- [x] Give `$VISUAL`/`$EDITOR` a correct terminal-protocol handoff. Leave Finch raw/live rendering,
   enter a clean alternate screen for Vim and similar full-screen editors, restore terminal modes on
   every exit path, discard the editor screen instead of retaining its `~` rows in scrollback, then
   invalidate and redraw Finch's live region exactly once. Reproduce the observed iTerm path where
   Finch enters an alternate screen and Vim enters/leaves its own non-stacking alternate screen:
   the proposal buffer and `~` rows currently leak into primary scrollback, followed by duplicated
   clipped live rows. Test editor success, rejection, nonzero exit, and signal/error restoration
-  against a fake full-screen editor that emits the relevant terminal sequences.
+  against a fake full-screen editor that emits the relevant terminal sequences. Completed in
+  [GitHub #47](https://github.com/darwin-finch/finch/issues/47).
 - [ ] Preserve visible turn ownership while input queues behind an active provider/repair/tool
   turn. A later user prompt must remain a distinct queued WorkUnit and cannot appear inside the
   earlier repair's source or tool block; program source, diagnostics, bounded repair, tool activity,
