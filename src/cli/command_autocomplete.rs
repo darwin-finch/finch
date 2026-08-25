@@ -29,6 +29,7 @@ pub enum CommandCategory {
     Patterns,
     Feedback,
     Memory,
+    Brain,
 }
 
 impl fmt::Display for CommandCategory {
@@ -41,6 +42,7 @@ impl fmt::Display for CommandCategory {
             CommandCategory::Patterns => write!(f, "🔒 Tool Patterns"),
             CommandCategory::Feedback => write!(f, "🎓 Feedback"),
             CommandCategory::Memory => write!(f, "💾 Memory"),
+            CommandCategory::Brain => write!(f, "🧠 Brain"),
         }
     }
 }
@@ -306,6 +308,116 @@ impl CommandRegistry {
                     description: "Mark response as good example (1x weight)",
                     category: CommandCategory::Feedback,
                 },
+
+                // Durable Brain collaboration
+                CommandSpec {
+                    name: "/say",
+                    params: Some("<text>"),
+                    description: "Relay text without invoking the model",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/who",
+                    params: None,
+                    description: "List connected participants in this Brain",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/whois",
+                    params: Some("<subject>"),
+                    description: "Show public presence for one participant",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain list",
+                    params: None,
+                    description: "List named Brain sessions",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brains",
+                    params: None,
+                    description: "List named Brain sessions",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain runs",
+                    params: None,
+                    description: "List runs in the attached Brain",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain cancel",
+                    params: Some("<run>"),
+                    description: "Cancel an initiated run by ID prefix",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain create",
+                    params: Some("<name>"),
+                    description: "Create an empty Brain on this machine",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain attach",
+                    params: Some("<name>[@machine]"),
+                    description: "Attach to a local or remote Brain",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain invite",
+                    params: Some("[role] [minutes]"),
+                    description: "Create a short-lived single-use invitation",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain join",
+                    params: Some("<name@machine> <invite>"),
+                    description: "Redeem an invitation and attach",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain detach",
+                    params: None,
+                    description: "Return to this console's home Brain",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain handoff",
+                    params: Some("<subject>"),
+                    description: "Request an addressed runner transfer",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain handoff identity",
+                    params: None,
+                    description: "Show this frontend's runner identity",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain handoff accept",
+                    params: Some("[id]"),
+                    description: "Accept a runner transfer addressed to this frontend",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain handoff cancel",
+                    params: Some("[id]"),
+                    description: "Cancel a pending runner transfer",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain archive",
+                    params: Some("<name>"),
+                    description: "Archive an inactive Brain",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
+                    name: "/brain password",
+                    params: Some("[new]"),
+                    description: "Show or rotate the local Brain credential",
+                    category: CommandCategory::Brain,
+                },
             ],
         }
     }
@@ -407,15 +519,65 @@ mod tests {
     }
 
     #[test]
-    fn removed_peer_and_channel_commands_are_not_suggested() {
+    fn legacy_peer_and_channel_commands_are_not_suggested() {
         let registry = CommandRegistry::new();
-        for removed in ["/discover", "/join", "/part", "/say", "/connect", "/room"] {
+        for removed in [
+            "/discover",
+            "/machines",
+            "/peers",
+            "/nodes",
+            "/join",
+            "/part",
+            "/connect",
+            "/disconnect",
+            "/room",
+            "/rooms",
+            "/self-peer",
+            "/balance",
+            "/settle",
+            "/join-registry",
+            "/registry",
+            "/gas-send",
+        ] {
             assert!(
                 registry
                     .all_commands()
                     .iter()
                     .all(|command| command.name != removed),
                 "removed command {removed} remains in autocomplete"
+            );
+        }
+    }
+
+    #[test]
+    fn authoritative_brain_collaboration_commands_are_suggested() {
+        let registry = CommandRegistry::new();
+        for supported in [
+            "/say",
+            "/who",
+            "/whois",
+            "/brain list",
+            "/brains",
+            "/brain runs",
+            "/brain cancel",
+            "/brain create",
+            "/brain attach",
+            "/brain invite",
+            "/brain join",
+            "/brain detach",
+            "/brain handoff",
+            "/brain handoff identity",
+            "/brain handoff accept",
+            "/brain handoff cancel",
+            "/brain archive",
+            "/brain password",
+        ] {
+            assert!(
+                registry
+                    .all_commands()
+                    .iter()
+                    .any(|command| command.name == supported),
+                "supported command {supported} is missing from autocomplete"
             );
         }
     }

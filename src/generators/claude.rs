@@ -73,8 +73,12 @@ Typed Co-Forth: /forth <expr>
 Execution-plan prototype: /push <text>  /pop  /run  /program  /stack  /stack clear
   /chain W1 W2  /forget W1  /dup W1  /swap W1 W2
 
-Brains: /brain list  /brain attach <name>[@machine]  /brain detach
-  /brain archive <name>  /brain password [new]  /brains
+Brains: /brain list  /brain runs  /brain cancel <run>  /brain create <name>
+  /brain attach <name>[@machine]  /brain invite [role] [minutes]
+  /brain join <name@machine> <invite>  /brain detach  /brain archive <name>
+  /brain handoff <subject>  /brain handoff identity  /brain handoff accept [id]
+  /brain handoff cancel [id]  /brain password [new]  /brains
+Collaboration: /say <text>  /who  /whois <subject>  @finch <prompt>
 
 Other: /plan [task]  /graph  /setup  /license  /license activate <key>  /accept  /reject
   /ask <query>  /self-fix
@@ -251,5 +255,31 @@ mod tests {
     fn command_capsule_does_not_advertise_ctrl_d_as_exit() {
         assert!(COMMAND_REFERENCE.contains("Ctrl+D forward-delete"));
         assert!(!COMMAND_REFERENCE.contains("Ctrl+D quit"));
+    }
+
+    #[test]
+    fn command_reference_exposes_only_brain_collaboration() {
+        for removed in [
+            "/join #",
+            "/part #",
+            "/room ",
+            "/connect ",
+            "/disconnect ",
+            "/discover",
+            "/machines",
+            "/peers",
+            "/nodes",
+            "/self-peer",
+            "/balance",
+            "/settle ",
+            "/join-registry ",
+            "/registry ",
+            "/gas-send",
+        ] {
+            assert!(!COMMAND_REFERENCE.contains(removed));
+        }
+        for supported in ["/say <text>", "@finch <prompt>", "/who", "/whois <subject>"] {
+            assert!(COMMAND_REFERENCE.contains(supported));
+        }
     }
 }

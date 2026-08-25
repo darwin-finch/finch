@@ -1134,11 +1134,10 @@ still blocks the corresponding Brain phase until it is unified.
   short durable attachment ID so two consoles owned by the same subject remain distinguishable.
   `@finch <prompt>` now explicitly schedules a model turn without persisting the addressee marker,
   while `/say` remains relay-only; projected prompts and relays use distinct markers and stable
-  participant-derived backgrounds. Still add threads/channels and the corresponding collaboration
-  authorization tests. Until then,
-  quarantine the remaining aspirational IRC/room/peer/gas command surfaces (`/join`, `/part`,
-  `/room`, `/connect`, and related commands) rather than presenting them as a second collaboration
-  protocol.
+  participant-derived backgrounds. The aspirational IRC/room/peer/gas slash-command surfaces are
+  quarantined: they are absent from help and autocomplete, parse only to help, and have no reachable
+  REPL handler. IRC-shaped `/say #channel message` is not reinterpreted as a Brain relay. Still add
+  threads/channels and the corresponding collaboration authorization tests.
 
 ## Client and model integration
 
