@@ -836,8 +836,9 @@ still blocks the corresponding Brain phase until it is unified.
   indivisible machine/workspace authority boundary.
 - [x] Treat the global brain password as a local/bootstrap credential only. Mint scoped, revocable,
   expiring participant credentials containing subject, audience, brain, environment generation,
-  and permitted roles. Initial scopes: `brain:read`, `brain:submit`, `brain:approve`,
-  `brain:control`, `environment:execute`, `environment:admin`, and `compute:submit`. A daemon-owned
+  and permitted roles. Initial scopes: `brain:read`, `brain:attach`, `brain:submit`,
+  `brain:approve`, `brain:control`, `environment:execute`, `environment:admin`, and
+  `compute:submit`. A daemon-owned
   random signing secret and revocation ledger survive restart; the password is accepted only by
   authenticated discovery/bootstrap/administration routes, and the client refreshes its scoped
   credential without reverting ordinary operations to the password.
@@ -845,7 +846,12 @@ still blocks the corresponding Brain phase until it is unified.
   approval, control-lease ownership, workspace effects, environment changes, credential minting,
   and distributed inference. mDNS advertisement and discovery now use an authority-free metadata
   allowlist; the reusable legacy peer token is neither broadcast nor copied into discovered peer
-  state. Keep all future discovery records credential-free.
+  state. Self attachment/detachment now uses `brain:attach` rather than `brain:control`; default
+  consultant credentials no longer approve, default observer credentials are read/attach only,
+  elevated participant scopes must be requested explicitly within a role-specific ceiling, and
+  ordinary HTTP/WebSocket operations require scoped credentials even over loopback. Keep all future
+  discovery records credential-free. Still define the actual runner-control handoff operation and
+  attenuated delegation chain.
 - [ ] Revisit shared channels only after the Brain event log, runner lease, and participant-role
   model are complete. The eventual channel should be a threaded/multi-participant projection of a
   Brain: people and models share one durable conversation, while programs run only on the remote

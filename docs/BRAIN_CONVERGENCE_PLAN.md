@@ -240,7 +240,11 @@ merely become context.
 Approval and control are separate scoped permissions, not substitute roles:
 an authorized driver may decide an approval, while a `brain:control` holder may
 request a runner-lease handoff. Neither action silently transfers workspace
-handles. A compact status form should make the live condition obvious, for
+handles. `brain:attach` independently permits a participant to create and close
+its own projection; it does not imply approval or runner control. Default
+consultants do not receive `brain:approve`, default observers receive only read
+and attach authority, and elevated scopes require an explicit bootstrap grant
+within the role's ceiling. A compact status form should make the live condition obvious, for
 example `brain: compiler-work · driver · runner online` or
 `brain: compiler-work · consultant · read-only`.
 
@@ -440,6 +444,9 @@ RPC and remote WebSocket code are encoding/authentication adapters over it. Herm
 exercise attachment, watch, queueing, projection, and cleanup, while the ignored live conformance
 fixture drives local RPC and remote binary clients through the same
 attach/watch/prompt/queued-run/acknowledge/detach script and compares normalized events and outcomes.
+Ordinary HTTP and WebSocket lifecycle operations now require scoped credentials on loopback as well
+as remote addresses. Attachment lifecycle has its own `brain:attach` scope, and archival obtains an
+explicit one-purpose `environment:admin` credential instead of relying on localhost trust.
 
 ### B5: Client projections and shadow-buffer UI
 
