@@ -12,9 +12,16 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::claude::{ContentBlock, Message};
 use crate::generators::StreamChunk;
-use crate::ipc::schema::finch_ipc_capnp::{self, finch_daemon, stream_receiver};
+use crate::ipc::schema::finch_ipc_capnp::{
+    self, brain_runner, finch_daemon, stream_receiver,
+};
 use crate::ipc::transport::sock_path;
 use crate::tools::types::{ToolDefinition, ToolUse};
+
+pub struct BrainRunnerBootstrap {
+    pub runtime_revision: u64,
+    pub checkpoint: crate::vm::TypedRuntimeCheckpoint,
+}
 
 // ---------------------------------------------------------------------------
 // Public client struct
@@ -139,6 +146,104 @@ impl IpcClient {
         let req = self.client.ping_request();
         let reply = req.send().promise.await?;
         Ok(reply.get()?.get_version()?.to_str()?.to_string())
+    }
+
+    /// Register this frontend as the callback for its current named-Brain
+    /// runner lease. The callback stays on this connection's LocalSet.
+    pub async fn register_brain_runner(
+        &self,
+        brain: &str,
+        lease_id: crate::brain::shared::RunnerLeaseId,
+        event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
+    ) -> Result<BrainRunnerBootstrap> {
+        let runner: brain_runner::Client =
+            capnp_rpc::new_client(BrainRunnerImpl { event_tx });
+        let mut request = self.client.register_brain_runner_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_lease_id(&lease_id.0.to_string());
+            params.set_runner(runner);
+        }
+        let reply = request.send().promise.await?;
+        let response = reply.get()?;
+        Ok(BrainRunnerBootstrap {
+            runtime_revision: response.get_runtime_revision(),
+            checkpoint: serde_json::from_slice(response.get_checkpoint_json()?)
+                .context("daemon returned an invalid named-Brain checkpoint")?,
+        })
+    }
+}
+
+struct BrainRunnerImpl {
+    event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
+}
+
+impl brain_runner::Server for BrainRunnerImpl {
+    fn run_program(
+        &mut self,
+        params: brain_runner::RunProgramParams,
+        mut results: brain_runner::RunProgramResults,
+    ) -> Promise<(), capnp::Error> {
+        let request = match params.get().and_then(|params| params.get_request()) {
+            Ok(request) => request,
+            Err(error) => return Promise::err(error),
+        };
+        let brain = request
+            .get_brain()
+            .ok()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let source = request
+            .get_source()
+            .ok()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let language = match request.get_language() {
+            Ok(finch_ipc_capnp::ProgramLanguage::Forth) => {
+                crate::brain::shared::ProgramLanguage::Forth
+            }
+            Ok(finch_ipc_capnp::ProgramLanguage::Lisp) => {
+                crate::brain::shared::ProgramLanguage::Lisp
+            }
+            Err(error) => return Promise::err(error.into()),
+        };
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if self
+            .event_tx
+            .send(crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(
+                crate::server::RunnerProgramRequest {
+                    brain,
+                    request_seq: request.get_request_seq(),
+                    language,
+                    source,
+                    response_tx,
+                },
+            ))
+            .is_err()
+        {
+            return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));
+        }
+        Promise::from_future(async move {
+            let response = response_rx
+                .await
+                .map_err(|_| capnp::Error::failed("frontend dropped runner response".into()))?;
+            let mut result = results.get().init_result();
+            match response {
+                Ok(response) => {
+                    result.set_output(&response.output);
+                    result.set_runtime_revision(response.runtime_revision);
+                    let encoded = serde_json::to_vec(&response.checkpoint)
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                    result.set_checkpoint_json(&encoded);
+                    result.set_error("");
+                }
+                Err(error) => result.set_error(&error),
+            }
+            Ok(())
+        })
     }
 }
 

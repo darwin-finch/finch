@@ -207,13 +207,31 @@ impl EventLoop {
             None,
         )
         .await;
-        let initially_active = initial.is_ok();
+        let callback_registered = match (&initial, self.ipc_client.as_ref()) {
+            (Ok(lease), Some(ipc)) => match ipc
+                .register_brain_runner(&self.session_label, lease.lease_id, self.event_tx.clone())
+                .await
+            {
+                Ok(bootstrap) => self
+                    .program_runtime
+                    .hydrate_reducible_state_if_newer(
+                        bootstrap.checkpoint,
+                        bootstrap.runtime_revision,
+                    )
+                    .await
+                    .is_ok(),
+                Err(_) => false,
+            },
+            _ => false,
+        };
+        let initially_active = initial.is_ok() && callback_registered;
+        let initial_had_lease = initial.is_ok();
         let mut lease_id = initial.ok().map(|lease| lease.lease_id);
         let event_tx = self.event_tx.clone();
         let subject = self.session_label.clone();
         let environment = snapshot.environment;
         tokio::spawn(async move {
-            let mut was_active = initially_active;
+            let mut had_lease = initial_had_lease;
             loop {
                 tokio::select! {
                     _ = event_tx.closed() => break,
@@ -230,25 +248,32 @@ impl EventLoop {
                 {
                     Ok(lease) => {
                         lease_id = Some(lease.lease_id);
-                        if !was_active {
-                            let _ = event_tx.send(ReplEvent::HomeRunnerLeaseStatus {
-                                active: true,
-                                detail: "lease reacquired".into(),
-                            });
-                        }
-                        was_active = true;
+                        // Re-register on every renewal. Replacing the broker
+                        // sender closes the previous callback bridge, so this
+                        // also repairs a dropped Cap'n Proto callback without
+                        // pretending that lease ownership alone means the
+                        // runner is reachable.
+                        let _ = event_tx.send(ReplEvent::HomeRunnerLeaseStatus {
+                            lease_id: Some(lease.lease_id),
+                            detail: if had_lease {
+                                "lease renewed".into()
+                            } else {
+                                "lease reacquired".into()
+                            },
+                        });
+                        had_lease = true;
                     }
                     Err(error) => {
                         // A retry with an expired/stale lease must acquire a
                         // fresh identity; it may never revive the old lease.
                         lease_id = None;
-                        if was_active {
+                        if had_lease {
                             let _ = event_tx.send(ReplEvent::HomeRunnerLeaseStatus {
-                                active: false,
+                                lease_id: None,
                                 detail: error.to_string(),
                             });
                         }
-                        was_active = false;
+                        had_lease = false;
                     }
                 }
             }

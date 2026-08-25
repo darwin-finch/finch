@@ -203,4 +203,16 @@ mod tests {
         broker.unregister("brain", first);
         assert!(broker.has_registration("brain", lease_id));
     }
+
+    #[tokio::test]
+    async fn replacing_a_registration_closes_the_old_callback_bridge() {
+        let broker = BrainRunnerBroker::default();
+        let lease_id = lease();
+        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        broker.register("brain", lease_id, first_tx);
+        let (second_tx, _second_rx) = mpsc::unbounded_channel();
+        broker.register("brain", lease_id, second_tx);
+
+        assert!(first_rx.recv().await.is_none());
+    }
 }

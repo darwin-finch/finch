@@ -187,11 +187,16 @@ pub enum ReplEvent {
         target: String,
     },
     /// The expiring lease for this console's home Brain was renewed, lost, or
-    /// reacquired. Only a live lease permits the UI to advertise `runner`.
+    /// reacquired. A renewed lease is not considered active until the event
+    /// loop has also registered its Cap'n Proto runner callback.
     HomeRunnerLeaseStatus {
-        active: bool,
+        lease_id: Option<crate::brain::shared::RunnerLeaseId>,
         detail: String,
     },
+
+    /// A daemon request routed through the callback registered for this
+    /// frontend's current named-Brain runner lease.
+    NamedBrainProgramRequested(crate::server::RunnerProgramRequest),
 
 }
 

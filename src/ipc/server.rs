@@ -333,6 +333,114 @@ impl finch_daemon::Server for FinchDaemonImpl {
         })
     }
 
+    fn register_brain_runner(
+        &mut self,
+        params: finch_daemon::RegisterBrainRunnerParams,
+        mut results: finch_daemon::RegisterBrainRunnerResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let lease_text = pry!(params.get_lease_id())
+            .to_str()
+            .unwrap_or("")
+            .to_string();
+        let lease_uuid = match uuid::Uuid::parse_str(&lease_text) {
+            Ok(value) => value,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let lease_id = crate::brain::shared::RunnerLeaseId(lease_uuid);
+        let runner = pry!(params.get_runner());
+        let snapshot = match self.server.shared_brains().snapshot(&brain) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        if !snapshot
+            .runner_lease
+            .as_ref()
+            .is_some_and(|lease| lease.lease_id == lease_id)
+        {
+            return Promise::err(capnp::Error::failed(
+                "runner callback does not match the active lease".into(),
+            ));
+        }
+
+        let (runtime_revision, checkpoint) =
+            match self.server.shared_brains().runner_checkpoint(&brain) {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+            };
+        let checkpoint_json = match serde_json::to_vec(&checkpoint) {
+            Ok(encoded) => encoded,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let broker = self.server.brain_runners().clone();
+        let registration_id = broker.register(brain.clone(), lease_id, tx);
+        tokio::task::spawn_local(async move {
+            while let Some(request) = rx.recv().await {
+                let mut call = runner.run_program_request();
+                {
+                    let mut payload = call.get().init_request();
+                    payload.set_brain(&request.brain);
+                    payload.set_request_seq(request.request_seq);
+                    payload.set_language(match request.language {
+                        crate::brain::shared::ProgramLanguage::Forth => {
+                            finch_ipc_capnp::ProgramLanguage::Forth
+                        }
+                        crate::brain::shared::ProgramLanguage::Lisp => {
+                            finch_ipc_capnp::ProgramLanguage::Lisp
+                        }
+                    });
+                    payload.set_source(&request.source);
+                }
+                let (result, disconnected) = match call.send().promise.await {
+                    Ok(reply) => (
+                        reply
+                            .get()
+                            .and_then(|reply| reply.get_result())
+                            .map_err(|error| error.to_string())
+                            .and_then(|result| {
+                            let error = result
+                                .get_error()
+                                .ok()
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or("");
+                            if !error.is_empty() {
+                                return Err(error.to_string());
+                            }
+                            let checkpoint = serde_json::from_slice(
+                                result.get_checkpoint_json().map_err(|e| e.to_string())?,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            Ok(crate::server::RunnerProgramResult {
+                                output: result
+                                    .get_output()
+                                    .ok()
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                runtime_revision: result.get_runtime_revision(),
+                                checkpoint,
+                            })
+                            }),
+                        false,
+                    ),
+                    Err(error) => (Err(error.to_string()), true),
+                };
+                let _ = request.response_tx.send(result);
+                if disconnected {
+                    break;
+                }
+            }
+            broker.unregister(&brain, registration_id);
+        });
+        let mut response = results.get();
+        response.set_runtime_revision(runtime_revision);
+        response.set_checkpoint_json(&checkpoint_json);
+        Promise::ok(())
+    }
+
     // ---- health ----------------------------------------------------------
 
     fn ping(

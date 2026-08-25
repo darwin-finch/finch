@@ -1069,6 +1069,7 @@ impl EventLoop {
                         ReplEvent::RemoteBrainError { .. } => "RemoteBrainError",
                         ReplEvent::RemoteBrainDisconnected { .. } => "RemoteBrainDisconnected",
                         ReplEvent::HomeRunnerLeaseStatus { .. } => "HomeRunnerLeaseStatus",
+                        ReplEvent::NamedBrainProgramRequested(_) => "NamedBrainProgramRequested",
                     };
                     tracing::debug!("[EVENT_LOOP] Received event: {}", event_name);
                     tracing::debug!("Received event: {:?}", event);
@@ -2928,7 +2929,31 @@ Rules:\n\
                     self.render_tui().await?;
                 }
             }
-            ReplEvent::HomeRunnerLeaseStatus { active, detail } => {
+            ReplEvent::HomeRunnerLeaseStatus { lease_id, detail } => {
+                let registration = match (lease_id, self.ipc_client.as_ref()) {
+                    (Some(lease_id), Some(ipc)) => match ipc
+                        .register_brain_runner(
+                            &self.session_label,
+                            lease_id,
+                            self.event_tx.clone(),
+                        )
+                        .await
+                    {
+                        Ok(bootstrap) => self
+                            .program_runtime
+                            .hydrate_reducible_state_if_newer(
+                                bootstrap.checkpoint,
+                                bootstrap.runtime_revision,
+                            )
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| error.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    },
+                    (Some(_), None) => Err("Cap'n Proto daemon connection unavailable".into()),
+                    (None, _) => Err(detail.clone()),
+                };
+                let active = registration.is_ok();
                 self.home_runner_lease_active = active;
                 if self.active_remote_brain.is_none() {
                     self.status_bar.update_line(
@@ -2941,12 +2966,16 @@ Rules:\n\
                     );
                     if !active {
                         self.output_manager.write_info(format!(
-                            "{}: runner lease unavailable: {detail}",
-                            self.session_label
+                            "{}: runner unavailable: {}",
+                            self.session_label,
+                            registration.err().unwrap_or(detail)
                         ));
                     }
                     self.render_tui().await?;
                 }
+            }
+            ReplEvent::NamedBrainProgramRequested(request) => {
+                self.dispatch_named_brain_program(request);
             }
             ReplEvent::ShowDialog {
                 dialog: _,
@@ -2961,6 +2990,77 @@ Rules:\n\
         }
 
         Ok(())
+    }
+
+    fn dispatch_named_brain_program(&self, request: crate::server::RunnerProgramRequest) {
+        if request.brain != self.session_label || !self.home_runner_lease_active {
+            let _ = request.response_tx.send(Err(format!(
+                "frontend does not hold the runner lease for named Brain '{}'",
+                request.brain
+            )));
+            return;
+        }
+        let runtime = Arc::clone(&self.program_runtime);
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let language = match request.language {
+                crate::brain::shared::ProgramLanguage::Forth => {
+                    crate::programs::ProgramLanguage::Forth
+                }
+                crate::brain::shared::ProgramLanguage::Lisp => {
+                    crate::programs::ProgramLanguage::Lisp
+                }
+            };
+            let submission = crate::runtime::ProgramSubmission {
+                language,
+                source_id: Some(format!(
+                    "brain:{}:event:{}",
+                    request.brain, request.request_seq
+                )),
+                source: request.source,
+                intent: format!("named Brain program event {}", request.request_seq),
+                effect: crate::programs::ExecutionEffect::Unclassified,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: Some(runtime.revision()),
+                budget: None,
+            };
+            let result = async {
+                let outcome = runtime.submit_typed_only(submission).await?;
+                let outcome = super::query_processor::resume_interactive_boundaries(
+                    runtime.as_ref(),
+                    event_tx,
+                    outcome,
+                )
+                .await?;
+                if outcome.status != crate::runtime::outcome::ExecutionStatus::Completed {
+                    anyhow::bail!(
+                        "named Brain ProgramRun ended as {:?}: {}",
+                        outcome.status,
+                        outcome.diagnostics.join("; ")
+                    );
+                }
+                let checkpoint = runtime
+                    .revision_history()?
+                    .into_iter()
+                    .find(|snapshot| snapshot.revision == outcome.output_revision)
+                    .and_then(|snapshot| snapshot.checkpoint)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "named Brain revision {} is not checkpointable",
+                            outcome.output_revision
+                        )
+                    })?;
+                Ok(crate::server::RunnerProgramResult {
+                    output: outcome.output,
+                    runtime_revision: outcome.output_revision,
+                    checkpoint,
+                })
+            }
+            .await
+            .map_err(|error: anyhow::Error| error.to_string());
+            let _ = request.response_tx.send(result);
+        });
     }
 
     /// The editor runs outside the VM; once it finishes, resume precisely the

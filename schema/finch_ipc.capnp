@@ -91,6 +91,33 @@ interface StreamReceiver {
 }
 
 # ---------------------------------------------------------------------------
+# Named-Brain environment runner callback
+# ---------------------------------------------------------------------------
+
+enum ProgramLanguage {
+  forth @0;
+  lisp  @1;
+}
+
+struct BrainProgramRequest {
+  brain      @0 :Text;
+  requestSeq @1 :UInt64;
+  language   @2 :ProgramLanguage;
+  source     @3 :Text;
+}
+
+struct BrainProgramResult {
+  output          @0 :Text;
+  runtimeRevision @1 :UInt64;
+  checkpointJson  @2 :Data; # Transitional typed checkpoint payload; schema becomes native later.
+  error           @3 :Text;
+}
+
+interface BrainRunner {
+  runProgram @0 (request :BrainProgramRequest) -> (result :BrainProgramResult);
+}
+
+# ---------------------------------------------------------------------------
 # Main daemon interface
 # ---------------------------------------------------------------------------
 
@@ -137,4 +164,10 @@ interface FinchDaemon {
   # output: anything printed by . cr etc.
   # error: non-empty if evaluation failed.
   evalForth @3 (program :Text) -> (stack :List(Int64), output :Text, error :Text);
+
+  # Register the callback belonging to the frontend's current runner lease.
+  # The durable reducible VM state is returned so a restarted frontend can
+  # hydrate before accepting work. Host authority is deliberately absent.
+  registerBrainRunner @4 (brain :Text, leaseId :Text, runner :BrainRunner)
+      -> (runtimeRevision :UInt64, checkpointJson :Data);
 }
