@@ -169,14 +169,10 @@ fn brain_auth_error(status: StatusCode, message: impl Into<String>) -> Response 
 
 fn authorize_named_brain(
     server: &AgentServer,
-    addr: SocketAddr,
     headers: &HeaderMap,
     name: &str,
     scope: crate::brain::credential::BrainCredentialScope,
-) -> Result<Option<crate::brain::credential::BrainCredentialClaims>, Response> {
-    if addr.ip().is_loopback() {
-        return Ok(None);
-    }
+) -> Result<crate::brain::credential::BrainCredentialClaims, Response> {
     let token = bearer_token(headers).ok_or_else(|| {
         brain_auth_error(StatusCode::UNAUTHORIZED, "scoped Brain credential required")
     })?;
@@ -196,7 +192,7 @@ fn authorize_named_brain(
             scope,
         )
         .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
-    Ok(Some(claims))
+    Ok(claims)
 }
 
 const DEFAULT_BRAIN_CREDENTIAL_TTL_MS: u64 = 8 * 60 * 60 * 1_000;
@@ -206,6 +202,9 @@ const MAX_BRAIN_CREDENTIAL_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 struct IssueNamedBrainCredentialRequest {
     subject: String,
     role: crate::brain::shared::AttachmentRole,
+    scopes: Option<
+        std::collections::BTreeSet<crate::brain::credential::BrainCredentialScope>,
+    >,
     ttl_ms: Option<u64>,
 }
 
@@ -215,48 +214,13 @@ struct IssueNamedBrainCredentialResponse {
     claims: crate::brain::credential::BrainCredentialClaims,
 }
 
-fn participant_scopes(
-    role: crate::brain::shared::AttachmentRole,
-) -> std::collections::BTreeSet<crate::brain::credential::BrainCredentialScope> {
-    use crate::brain::credential::BrainCredentialScope;
-    use crate::brain::shared::AttachmentRole;
-    match role {
-        AttachmentRole::Driver => [
-            BrainCredentialScope::BrainRead,
-            BrainCredentialScope::BrainSubmit,
-            BrainCredentialScope::BrainApprove,
-            BrainCredentialScope::BrainControl,
-        ]
-        .into_iter()
-        .collect(),
-        AttachmentRole::Consultant => [
-            BrainCredentialScope::BrainRead,
-            BrainCredentialScope::BrainSubmit,
-            BrainCredentialScope::BrainApprove,
-            BrainCredentialScope::BrainControl,
-        ]
-        .into_iter()
-        .collect(),
-        AttachmentRole::Observer => [
-            BrainCredentialScope::BrainRead,
-            BrainCredentialScope::BrainControl,
-        ]
-        .into_iter()
-        .collect(),
-        AttachmentRole::Runner => std::collections::BTreeSet::new(),
-    }
-}
-
 fn claims_match_attachment(
-    claims: Option<&crate::brain::credential::BrainCredentialClaims>,
+    claims: &crate::brain::credential::BrainCredentialClaims,
     attachment: &crate::brain::shared::BrainAttachment,
 ) -> Result<(), Response> {
-    if let Some(claims) = claims {
-        claims
-            .require_participant(&attachment.subject, attachment.role)
-            .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
-    }
-    Ok(())
+    claims
+        .require_participant(&attachment.subject, attachment.role)
+        .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))
 }
 
 async fn issue_named_brain_credential(
@@ -281,6 +245,16 @@ async fn issue_named_brain_credential(
         .ttl_ms
         .unwrap_or(DEFAULT_BRAIN_CREDENTIAL_TTL_MS)
         .min(MAX_BRAIN_CREDENTIAL_TTL_MS);
+    let scopes = request
+        .scopes
+        .unwrap_or_else(|| crate::brain::credential::default_participant_scopes(request.role));
+    let permitted = crate::brain::credential::permitted_participant_scopes(request.role);
+    if !scopes.is_subset(&permitted) {
+        return Err(brain_auth_error(
+            StatusCode::FORBIDDEN,
+            "requested Brain credential scopes exceed this participant role",
+        ));
+    }
     let token = server
         .brain_credentials()
         .issue(
@@ -291,7 +265,7 @@ async fn issue_named_brain_credential(
                 brain: name,
                 environment_generation: snapshot.environment.generation,
                 role: request.role,
-                scopes: participant_scopes(request.role),
+                scopes,
                 ttl_ms,
             },
             unix_epoch_millis(),
@@ -356,13 +330,11 @@ async fn list_named_brains(
 
 async fn get_named_brain(
     State(server): State<Arc<AgentServer>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<crate::brain::shared::BrainSnapshot>, Response> {
     authorize_named_brain(
         &server,
-        addr,
         &headers,
         &name,
         crate::brain::credential::BrainCredentialScope::BrainRead,
@@ -383,23 +355,19 @@ struct AttachNamedBrainRequest {
 
 async fn attach_named_brain(
     State(server): State<Arc<AgentServer>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(name): Path<String>,
     Json(request): Json<AttachNamedBrainRequest>,
 ) -> Result<Json<crate::brain::shared::BrainAttachment>, Response> {
     let claims = authorize_named_brain(
         &server,
-        addr,
         &headers,
         &name,
-        crate::brain::credential::BrainCredentialScope::BrainControl,
+        crate::brain::credential::BrainCredentialScope::BrainAttach,
     )?;
-    if let Some(claims) = claims {
-        claims
-            .require_participant(&request.subject, request.role)
-            .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
-    }
+    claims
+        .require_participant(&request.subject, request.role)
+        .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
     let attachment = crate::server::BrainLifecycleService::from_server(&server)
         .attach(&name, &request.subject, request.role, request.attachment_id)
         .map_err(brain_state_conflict)?;
@@ -429,13 +397,11 @@ struct ArchiveNamedBrainResponse {
 
 async fn archive_named_brain(
     State(server): State<Arc<AgentServer>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<ArchiveNamedBrainResponse>, Response> {
     authorize_named_brain(
         &server,
-        addr,
         &headers,
         &name,
         crate::brain::credential::BrainCredentialScope::EnvironmentAdmin,
@@ -1227,7 +1193,6 @@ fn remote_brain_error(
 
 async fn execute_remote_brain_command(
     server: &Arc<AgentServer>,
-    addr: SocketAddr,
     headers: &HeaderMap,
     name: &str,
     attachment_id: crate::brain::shared::AttachmentId,
@@ -1249,7 +1214,7 @@ async fn execute_remote_brain_command(
             } else {
                 BrainCredentialScope::BrainSubmit
             };
-            let claims = match authorize_named_brain(server, addr, headers, name, required_scope) {
+            let claims = match authorize_named_brain(server, headers, name, required_scope) {
                 Ok(claims) => claims,
                 Err(_) => {
                     return remote_brain_error(
@@ -1265,7 +1230,7 @@ async fn execute_remote_brain_command(
                     return remote_brain_error(request_id, "conflict", error.to_string())
                 }
             };
-            if claims_match_attachment(claims.as_ref(), &attachment).is_err() {
+            if claims_match_attachment(&claims, &attachment).is_err() {
                 return remote_brain_error(
                     request_id,
                     "forbidden",
@@ -1295,7 +1260,6 @@ async fn execute_remote_brain_command(
         BrainRemoteCommandKind::Acknowledge(seq) => {
             let claims = match authorize_named_brain(
                 server,
-                addr,
                 headers,
                 name,
                 BrainCredentialScope::BrainRead,
@@ -1315,7 +1279,7 @@ async fn execute_remote_brain_command(
                     return remote_brain_error(request_id, "conflict", error.to_string())
                 }
             };
-            if claims_match_attachment(claims.as_ref(), &attachment).is_err() {
+            if claims_match_attachment(&claims, &attachment).is_err() {
                 return remote_brain_error(
                     request_id,
                     "forbidden",
@@ -1333,10 +1297,9 @@ async fn execute_remote_brain_command(
         BrainRemoteCommandKind::Detach => {
             let claims = match authorize_named_brain(
                 server,
-                addr,
                 headers,
                 name,
-                BrainCredentialScope::BrainControl,
+                BrainCredentialScope::BrainAttach,
             ) {
                 Ok(claims) => claims,
                 Err(_) => {
@@ -1353,7 +1316,7 @@ async fn execute_remote_brain_command(
                     return remote_brain_error(request_id, "conflict", error.to_string())
                 }
             };
-            if claims_match_attachment(claims.as_ref(), &attachment).is_err() {
+            if claims_match_attachment(&claims, &attachment).is_err() {
                 return remote_brain_error(
                     request_id,
                     "forbidden",
@@ -1370,7 +1333,6 @@ async fn execute_remote_brain_command(
 
 async fn watch_named_brain(
     State(server): State<Arc<AgentServer>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(name): Path<String>,
     Query(connection): Query<WatchNamedBrainQuery>,
@@ -1378,7 +1340,6 @@ async fn watch_named_brain(
 ) -> Result<Response, Response> {
     let claims = authorize_named_brain(
         &server,
-        addr,
         &headers,
         &name,
         crate::brain::credential::BrainCredentialScope::BrainRead,
@@ -1389,7 +1350,7 @@ async fn watch_named_brain(
     let attachment = lifecycle
         .pending_attachment(&name, attachment_id, connection_id)
         .map_err(brain_state_conflict)?;
-    claims_match_attachment(claims.as_ref(), &attachment)?;
+    claims_match_attachment(&claims, &attachment)?;
     let watch = lifecycle
         .watch(&name, attachment_id, connection_id)
         .map_err(|error| AppError(error).into_response())?;
@@ -1413,7 +1374,6 @@ async fn watch_named_brain(
                 while let Some(command) = command_rx.recv().await {
                     let reply = execute_remote_brain_command(
                         &command_server,
-                        addr,
                         &worker_headers,
                         &worker_name,
                         attachment_id,
@@ -1543,7 +1503,6 @@ async fn watch_named_brain(
                     _ = authority_tick.tick() => {
                         if authorize_named_brain(
                             &server,
-                            addr,
                             &headers,
                             &name,
                             crate::brain::credential::BrainCredentialScope::BrainRead,
@@ -2663,20 +2622,40 @@ mod named_brain_provider_context_tests {
     fn participant_credentials_are_least_privilege_by_role() {
         use crate::brain::credential::BrainCredentialScope;
 
-        let driver = participant_scopes(AttachmentRole::Driver);
+        let driver = crate::brain::credential::default_participant_scopes(AttachmentRole::Driver);
         assert!(driver.contains(&BrainCredentialScope::BrainRead));
+        assert!(driver.contains(&BrainCredentialScope::BrainAttach));
         assert!(driver.contains(&BrainCredentialScope::BrainSubmit));
         assert!(driver.contains(&BrainCredentialScope::BrainApprove));
-        assert!(driver.contains(&BrainCredentialScope::BrainControl));
+        assert!(!driver.contains(&BrainCredentialScope::BrainControl));
         assert!(!driver.contains(&BrainCredentialScope::EnvironmentExecute));
         assert!(!driver.contains(&BrainCredentialScope::EnvironmentAdmin));
         assert!(!driver.contains(&BrainCredentialScope::ComputeSubmit));
 
-        let observer = participant_scopes(AttachmentRole::Observer);
+        let consultant =
+            crate::brain::credential::default_participant_scopes(AttachmentRole::Consultant);
+        assert!(consultant.contains(&BrainCredentialScope::BrainRead));
+        assert!(consultant.contains(&BrainCredentialScope::BrainAttach));
+        assert!(consultant.contains(&BrainCredentialScope::BrainSubmit));
+        assert!(!consultant.contains(&BrainCredentialScope::BrainApprove));
+        assert!(!consultant.contains(&BrainCredentialScope::BrainControl));
+        assert!(crate::brain::credential::permitted_participant_scopes(AttachmentRole::Consultant)
+            .contains(&BrainCredentialScope::BrainApprove));
+
+        let observer =
+            crate::brain::credential::default_participant_scopes(AttachmentRole::Observer);
         assert!(observer.contains(&BrainCredentialScope::BrainRead));
-        assert!(observer.contains(&BrainCredentialScope::BrainControl));
+        assert!(observer.contains(&BrainCredentialScope::BrainAttach));
+        assert!(!observer.contains(&BrainCredentialScope::BrainControl));
         assert!(!observer.contains(&BrainCredentialScope::BrainSubmit));
         assert!(!observer.contains(&BrainCredentialScope::BrainApprove));
+
+        let driver_maximum =
+            crate::brain::credential::permitted_participant_scopes(AttachmentRole::Driver);
+        assert!(driver_maximum.contains(&BrainCredentialScope::BrainControl));
+        assert!(driver_maximum.contains(&BrainCredentialScope::EnvironmentAdmin));
+        assert!(!driver_maximum.contains(&BrainCredentialScope::EnvironmentExecute));
+        assert!(!driver_maximum.contains(&BrainCredentialScope::ComputeSubmit));
     }
 
     fn event(seq: u64, sender: &str, kind: BrainEventKind) -> BrainEvent {

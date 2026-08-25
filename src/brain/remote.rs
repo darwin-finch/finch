@@ -527,6 +527,22 @@ impl RemoteBrainClient {
     }
 
     async fn ensure_credential(&self, subject: &str, role: AttachmentRole) -> Result<()> {
+        self.ensure_credential_with_scopes(
+            subject,
+            role,
+            Some(super::credential::default_participant_scopes(role)),
+        )
+        .await
+    }
+
+    async fn ensure_credential_with_scopes(
+        &self,
+        subject: &str,
+        role: AttachmentRole,
+        requested_scopes: Option<
+            std::collections::BTreeSet<super::credential::BrainCredentialScope>,
+        >,
+    ) -> Result<()> {
         let now_ms = unix_epoch_millis();
         let mut credential = self.credential.lock().await;
         if credential.as_ref().is_some_and(|credential| {
@@ -534,6 +550,9 @@ impl RemoteBrainClient {
                 && credential.claims.role == role
                 && credential.claims.brain == self.target.brain
                 && credential.claims.expires_ms > now_ms.saturating_add(60_000)
+                && requested_scopes
+                    .as_ref()
+                    .is_none_or(|required| required.is_subset(&credential.claims.scopes))
         }) {
             return Ok(());
         }
@@ -542,6 +561,9 @@ impl RemoteBrainClient {
         struct Issue<'a> {
             subject: &'a str,
             role: AttachmentRole,
+            scopes: Option<
+                std::collections::BTreeSet<super::credential::BrainCredentialScope>,
+            >,
         }
         #[derive(Deserialize)]
         struct Issued {
@@ -553,7 +575,11 @@ impl RemoteBrainClient {
             .http
             .post(self.target.credentials_url())
             .bearer_auth(&self.bootstrap_password)
-            .json(&Issue { subject, role })
+            .json(&Issue {
+                subject,
+                role,
+                scopes: requested_scopes.clone(),
+            })
             .send()
             .await
             .context("could not reach Brain credential issuer")?
@@ -565,6 +591,9 @@ impl RemoteBrainClient {
         if issued.claims.subject != subject
             || issued.claims.role != role
             || issued.claims.brain != self.target.brain
+            || requested_scopes
+                .as_ref()
+                .is_some_and(|required| !required.is_subset(&issued.claims.scopes))
         {
             anyhow::bail!("Brain credential issuer returned the wrong participant audience");
         }
@@ -573,6 +602,36 @@ impl RemoteBrainClient {
             claims: issued.claims,
         });
         Ok(())
+    }
+
+    /// Archive an inactive Brain with an explicitly elevated administrative
+    /// credential. Ordinary driver credentials never receive this scope.
+    pub async fn archive(&self, subject: &str) -> Result<Option<String>> {
+        let scopes = [super::credential::BrainCredentialScope::EnvironmentAdmin]
+            .into_iter()
+            .collect();
+        self.ensure_credential_with_scopes(subject, AttachmentRole::Driver, Some(scopes))
+            .await?;
+        let token = self
+            .credential
+            .lock()
+            .await
+            .as_ref()
+            .map(|credential| credential.token.clone())
+            .context("administrative Brain credential was not retained")?;
+        let body = self
+            .http
+            .delete(self.target.http_url())
+            .bearer_auth(token)
+            .send()
+            .await
+            .context("could not reach Brain archive endpoint")?
+            .error_for_status()
+            .context("Brain archive rejected")?
+            .json::<serde_json::Value>()
+            .await
+            .context("invalid Brain archive response")?;
+        Ok(body["archived_to"].as_str().map(str::to_owned))
     }
 
     async fn authorized_token(&self) -> Result<String> {
@@ -923,7 +982,9 @@ mod tests {
                 brain: "shared".into(),
                 environment_generation: 1,
                 role: AttachmentRole::Driver,
-                scopes: std::collections::BTreeSet::new(),
+                scopes: super::super::credential::default_participant_scopes(
+                    AttachmentRole::Driver,
+                ),
                 issued_ms: 0,
                 expires_ms: u64::MAX,
             },
@@ -949,17 +1010,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a running Finch daemon on the default loopback port"]
     async fn live_remote_binary_session_attaches_submits_acknowledges_and_detaches() {
-        let brain = "codex-remote-binary-smoke-20260824";
+        let brain = format!("codex-remote-binary-smoke-{}", uuid::Uuid::new_v4());
         let target = RemoteBrainTarget::parse(&format!(
             "{brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}"
         ))
         .unwrap();
         let mut client = RemoteBrainClient::new(target, "loopback").unwrap();
-        let _ = client
-            .http
-            .delete(client.target.http_url())
-            .send()
-            .await;
 
         client
             .attach("codex-smoke@localhost", AttachmentRole::Driver, None)
@@ -1026,14 +1082,7 @@ mod tests {
             .unwrap();
         never_watched.disconnect().await.unwrap();
 
-        client
-            .http
-            .delete(client.target.http_url())
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap();
+        client.archive("codex-smoke@localhost").await.unwrap();
     }
 
     #[test]
@@ -1062,22 +1111,14 @@ mod tests {
             .unwrap();
         let local_set = tokio::task::LocalSet::new();
         runtime.block_on(local_set.run_until(async {
-            let local_brain = "codex-conformance-local-20260825";
-            let remote_brain = "codex-conformance-remote-20260825";
-            let http = reqwest::Client::new();
-            for brain in [local_brain, remote_brain] {
-                let _ = http
-                    .delete(format!(
-                        "http://127.0.0.1:{DEFAULT_BRAIN_PORT}/v1/brains/named/{brain}"
-                    ))
-                    .send()
-                    .await;
-            }
+            let suffix = uuid::Uuid::new_v4();
+            let local_brain = format!("codex-conformance-local-{suffix}");
+            let remote_brain = format!("codex-conformance-remote-{suffix}");
 
             let ipc = crate::ipc::IpcClient::connect().await.unwrap();
             let local_attachment = ipc
                 .brain_attach(
-                    local_brain,
+                    &local_brain,
                     "conformance@localhost",
                     AttachmentRole::Driver,
                     None,
@@ -1085,14 +1126,14 @@ mod tests {
                 .await
                 .unwrap();
             let mut local_events = ipc
-                .brain_watch(local_brain, &local_attachment)
+                .brain_watch(&local_brain, &local_attachment)
                 .await
                 .unwrap();
             let local_initial = local_events.recv().await.unwrap().unwrap();
             assert!(matches!(local_initial, BrainWireMessage::Snapshot { .. }));
             let local_outcome = ipc
                 .brain_submit(
-                    local_brain,
+                    &local_brain,
                     &local_attachment,
                     BrainEventKind::Prompt {
                         text: "same lifecycle".into(),
@@ -1101,11 +1142,11 @@ mod tests {
                 .await
                 .unwrap();
             let local_ack = ipc
-                .brain_acknowledge(local_brain, &local_attachment, local_outcome.accepted.seq)
+                .brain_acknowledge(&local_brain, &local_attachment, local_outcome.accepted.seq)
                 .await
                 .unwrap();
-            ipc.brain_detach(local_brain, &local_ack).await.unwrap();
-            let local_snapshot = ipc.brain_snapshot(local_brain).await.unwrap();
+            ipc.brain_detach(&local_brain, &local_ack).await.unwrap();
+            let local_snapshot = ipc.brain_snapshot(&local_brain).await.unwrap();
 
             let target = RemoteBrainTarget::parse(&format!(
                 "{remote_brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}"
@@ -1160,15 +1201,16 @@ mod tests {
 
             drop(local_events);
             drop(remote_events);
-            for brain in [local_brain, remote_brain] {
-                http.delete(format!(
-                    "http://127.0.0.1:{DEFAULT_BRAIN_PORT}/v1/brains/named/{brain}"
+            for brain in [&local_brain, &remote_brain] {
+                let target = RemoteBrainTarget::parse(&format!(
+                    "{brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}"
                 ))
-                .send()
-                .await
-                .unwrap()
-                .error_for_status()
                 .unwrap();
+                RemoteBrainClient::new(target, "loopback")
+                    .unwrap()
+                    .archive("conformance@localhost")
+                    .await
+                    .unwrap();
             }
         }));
     }
@@ -1191,9 +1233,9 @@ mod tests {
                 brain: "shared".into(),
                 environment_generation: 1,
                 role: AttachmentRole::Driver,
-                scopes: [crate::brain::credential::BrainCredentialScope::BrainRead]
-                    .into_iter()
-                    .collect(),
+                scopes: super::super::credential::default_participant_scopes(
+                    AttachmentRole::Driver,
+                ),
                 issued_ms: 0,
                 expires_ms: u64::MAX,
             },

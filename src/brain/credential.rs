@@ -27,6 +27,8 @@ type HmacSha256 = Hmac<Sha256>;
 pub enum BrainCredentialScope {
     #[serde(rename = "brain:read")]
     BrainRead,
+    #[serde(rename = "brain:attach")]
+    BrainAttach,
     #[serde(rename = "brain:submit")]
     BrainSubmit,
     #[serde(rename = "brain:approve")]
@@ -39,6 +41,53 @@ pub enum BrainCredentialScope {
     EnvironmentAdmin,
     #[serde(rename = "compute:submit")]
     ComputeSubmit,
+}
+
+/// Baseline authority granted when the bootstrap administrator selects only a
+/// participant role. Connection lifecycle is independent from runner control,
+/// and consultant approval is opt-in rather than implied by the role.
+pub fn default_participant_scopes(role: AttachmentRole) -> BTreeSet<BrainCredentialScope> {
+    match role {
+        AttachmentRole::Driver => [
+            BrainCredentialScope::BrainRead,
+            BrainCredentialScope::BrainAttach,
+            BrainCredentialScope::BrainSubmit,
+            BrainCredentialScope::BrainApprove,
+        ]
+        .into_iter()
+        .collect(),
+        AttachmentRole::Consultant => [
+            BrainCredentialScope::BrainRead,
+            BrainCredentialScope::BrainAttach,
+            BrainCredentialScope::BrainSubmit,
+        ]
+        .into_iter()
+        .collect(),
+        AttachmentRole::Observer => [
+            BrainCredentialScope::BrainRead,
+            BrainCredentialScope::BrainAttach,
+        ]
+        .into_iter()
+        .collect(),
+        AttachmentRole::Runner => BTreeSet::new(),
+    }
+}
+
+/// Maximum scopes this participant credential endpoint may mint for a role.
+/// Environment execution and distributed compute remain separate authorities.
+pub fn permitted_participant_scopes(role: AttachmentRole) -> BTreeSet<BrainCredentialScope> {
+    let mut scopes = default_participant_scopes(role);
+    match role {
+        AttachmentRole::Driver => {
+            scopes.insert(BrainCredentialScope::BrainControl);
+            scopes.insert(BrainCredentialScope::EnvironmentAdmin);
+        }
+        AttachmentRole::Consultant => {
+            scopes.insert(BrainCredentialScope::BrainApprove);
+        }
+        AttachmentRole::Observer | AttachmentRole::Runner => {}
+    }
+    scopes
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
