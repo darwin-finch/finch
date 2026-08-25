@@ -44,7 +44,14 @@ pub struct RunnerProgramRequest {
     pub request_seq: u64,
     pub language: ProgramLanguage,
     pub source: String,
+    pub interaction: RunnerProgramInteraction,
     pub response_tx: oneshot::Sender<Result<RunnerProgramResult, RunnerProgramError>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerProgramInteraction {
+    Interactive,
+    Noninteractive,
 }
 
 #[derive(Debug, Clone)]
@@ -438,6 +445,7 @@ impl BrainRunnerBroker {
         request_seq: u64,
         language: ProgramLanguage,
         source: String,
+        interaction: RunnerProgramInteraction,
     ) -> Result<RunnerProgramResult> {
         let registration = self
             .registrations
@@ -458,6 +466,7 @@ impl BrainRunnerBroker {
                 request_seq,
                 language,
                 source,
+                interaction,
                 response_tx,
             }))
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
@@ -682,6 +691,10 @@ mod tests {
             assert_eq!(request.request_seq, 7);
             assert_eq!(request.run_id, run_id);
             assert_eq!(request.source, "21 2 *");
+            assert_eq!(
+                request.interaction,
+                RunnerProgramInteraction::Interactive
+            );
             let runtime = crate::runtime::ProgramRuntime::new();
             let checkpoint = runtime
                 .revision_history()
@@ -709,6 +722,7 @@ mod tests {
                 7,
                 ProgramLanguage::Forth,
                 "21 2 *".into(),
+                RunnerProgramInteraction::Interactive,
             )
             .await
             .unwrap();
@@ -731,6 +745,7 @@ mod tests {
                 1,
                 ProgramLanguage::Lisp,
                 "(+ 1 1)".into(),
+                RunnerProgramInteraction::Interactive,
             )
             .await
             .unwrap_err();

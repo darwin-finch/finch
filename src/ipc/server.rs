@@ -1259,6 +1259,14 @@ async fn forward_runner_request(
                 payload.set_request_seq(request.request_seq);
                 payload.set_language(program_language_to_capnp(request.language));
                 payload.set_source(&request.source);
+                payload.set_interaction(match request.interaction {
+                    crate::server::RunnerProgramInteraction::Interactive => {
+                        finch_ipc_capnp::BrainProgramInteraction::Interactive
+                    }
+                    crate::server::RunnerProgramInteraction::Noninteractive => {
+                        finch_ipc_capnp::BrainProgramInteraction::Noninteractive
+                    }
+                });
             }
             let (result, disconnected) = match call.send().promise.await {
                 Ok(reply) => (

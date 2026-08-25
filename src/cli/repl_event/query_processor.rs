@@ -134,6 +134,28 @@ pub(super) async fn resume_interactive_boundaries(
     }
 }
 
+/// Advance cooperative scheduling points without ever asking a human for new
+/// authority. Scheduled and other unattended ProgramRuns fail closed at the
+/// first approval boundary; the denial remains in the effect journal.
+pub(super) async fn resume_noninteractive_boundaries(
+    runtime: &crate::runtime::ProgramRuntime,
+    mut outcome: crate::runtime::outcome::ExecutionOutcome,
+) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
+    loop {
+        outcome = resume_interactive_yields(runtime, outcome).await?;
+        let Some(prompt) = outcome.approval_prompts.first().cloned() else {
+            return Ok(outcome);
+        };
+        outcome = runtime
+            .resolve_typed_approval(
+                &prompt,
+                crate::vm::ApprovalChoice::Deny,
+                "noninteractive-run-policy",
+            )
+            .await?;
+    }
+}
+
 /// Cooperative `yield` is a scheduling boundary, not a request for the model
 /// or user to intervene.  The interactive wire runner therefore gives other
 /// Tokio work a chance to run and then resumes the exact saved execution.
@@ -1999,6 +2021,39 @@ mod tests {
         let ledger = runtime.capability_ledger().unwrap();
         assert_eq!(ledger.grants.grants.len(), 1);
         assert!(ledger.grants.grants[0].consumed_at_unix_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn noninteractive_program_denies_new_authority_without_opening_ui() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let submission = direct_wire_submission(
+            &runtime,
+            "(file-read (path \"Cargo.toml\"))".to_string(),
+        )
+        .unwrap();
+        let suspended = runtime.submit_typed_only(submission).await.unwrap();
+        assert_eq!(
+            suspended.status,
+            crate::runtime::outcome::ExecutionStatus::AuthorizationRequired
+        );
+        assert_eq!(suspended.approval_prompts.len(), 1);
+
+        let denied = resume_noninteractive_boundaries(&runtime, suspended)
+            .await
+            .unwrap();
+        assert_eq!(
+            denied.status,
+            crate::runtime::outcome::ExecutionStatus::Failed
+        );
+        assert!(runtime
+            .pending_typed_execution(denied.execution_id)
+            .unwrap()
+            .is_none());
+        assert!(runtime.capability_ledger().unwrap().grants.grants.is_empty());
+        assert!(denied.effect_journal.iter().any(|entry| matches!(
+            entry.state,
+            crate::vm::EffectJournalState::Denied { .. }
+        )));
     }
 
     #[test]

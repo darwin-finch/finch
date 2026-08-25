@@ -3556,11 +3556,25 @@ Rules:\n\
                     .await
                     .map_err(|error| crate::server::RunnerProgramError::from(error.to_string()))?;
                 let execution_id = outcome.execution_id;
-                let mut resumed = Box::pin(super::query_processor::resume_interactive_boundaries(
-                    runtime.as_ref(),
-                    event_tx.clone(),
-                    outcome,
-                ));
+                let mut resumed = Box::pin(async {
+                    match request.interaction {
+                        crate::server::RunnerProgramInteraction::Interactive => {
+                            super::query_processor::resume_interactive_boundaries(
+                                runtime.as_ref(),
+                                event_tx.clone(),
+                                outcome,
+                            )
+                            .await
+                        }
+                        crate::server::RunnerProgramInteraction::Noninteractive => {
+                            super::query_processor::resume_noninteractive_boundaries(
+                                runtime.as_ref(),
+                                outcome,
+                            )
+                            .await
+                        }
+                    }
+                });
                 let outcome = tokio::select! {
                     biased;
                     result = &mut resumed => result.map_err(|error| {

@@ -802,6 +802,12 @@ struct BrainProgramRequest {
   language   @2 :ProgramLanguage;
   source     @3 :Text;
   runId      @4 :Text;
+  interaction @5 :BrainProgramInteraction;
+}
+
+enum BrainProgramInteraction {
+  interactive    @0;
+  noninteractive @1;
 }
 
 struct BrainProgramResult {

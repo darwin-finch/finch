@@ -554,6 +554,15 @@ impl brain_runner::Server for BrainRunnerImpl {
                         request_seq: request.get_request_seq(),
                         language,
                         source,
+                        interaction: match request.get_interaction() {
+                            Ok(finch_ipc_capnp::BrainProgramInteraction::Interactive) => {
+                                crate::server::RunnerProgramInteraction::Interactive
+                            }
+                            Ok(finch_ipc_capnp::BrainProgramInteraction::Noninteractive) => {
+                                crate::server::RunnerProgramInteraction::Noninteractive
+                            }
+                            Err(error) => return Promise::err(error.into()),
+                        },
                         response_tx,
                     },
                 ),

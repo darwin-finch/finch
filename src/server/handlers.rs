@@ -866,6 +866,7 @@ async fn dispatch_named_brain_run(
                 request.seq,
                 language,
                 &source,
+                crate::server::RunnerProgramInteraction::Interactive,
             )
             .await
             {
@@ -882,6 +883,7 @@ async fn dispatch_named_brain_run(
                 request.seq,
                 due.language,
                 &due.source,
+                crate::server::RunnerProgramInteraction::Noninteractive,
             )
             .await
             {
@@ -1248,6 +1250,7 @@ async fn dispatch_named_brain_program(
     request_seq: u64,
     language: crate::brain::store::ProgramLanguage,
     source: &str,
+    interaction: crate::server::RunnerProgramInteraction,
 ) -> anyhow::Result<String> {
     let snapshot = store.snapshot(name)?;
     ensure_named_brain_store_environment(store, &snapshot)?;
@@ -1268,6 +1271,7 @@ async fn dispatch_named_brain_program(
             request_seq,
             language,
             source.to_string(),
+            interaction,
         )
         .await
     {
@@ -3410,6 +3414,7 @@ mod handler_tests {
             41,
             ProgramLanguage::Lisp,
             "(define (double (n : int)) : int (* n 2))",
+            crate::server::RunnerProgramInteraction::Interactive,
         )
         .await
         .unwrap();
@@ -3812,6 +3817,7 @@ mod handler_tests {
             1,
             ProgramLanguage::Forth,
             "21 2 *",
+            crate::server::RunnerProgramInteraction::Interactive,
         )
         .await
         .unwrap_err();
@@ -3856,6 +3862,7 @@ mod handler_tests {
             1,
             ProgramLanguage::Forth,
             "21 2 *",
+            crate::server::RunnerProgramInteraction::Interactive,
         )
         .await
         .unwrap_err();
@@ -4118,6 +4125,10 @@ mod handler_tests {
             };
             assert_eq!(request.source, "(say \"scheduled\")");
             assert_eq!(request.language, ProgramLanguage::Lisp);
+            assert_eq!(
+                request.interaction,
+                crate::server::RunnerProgramInteraction::Noninteractive
+            );
             let runtime = crate::runtime::ProgramRuntime::new();
             let outcome = runtime
                 .submit_typed_only(crate::runtime::ProgramSubmission {

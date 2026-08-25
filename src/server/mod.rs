@@ -14,7 +14,8 @@ mod training_worker;
 pub use brain_approval::BrainApprovalBroker;
 pub use brain_runner::{
     BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerEffectRecord,
-    RunnerMemoryProjectionRequest, RunnerProgramError, RunnerProgramRequest, RunnerProgramResult,
+    RunnerMemoryProjectionRequest, RunnerProgramError, RunnerProgramInteraction,
+    RunnerProgramRequest, RunnerProgramResult,
     RunnerRegistrationId, RunnerRequest, RunnerTurnError, RunnerTurnEvent, RunnerTurnRequest,
     RunnerTurnResult,
 };
