@@ -567,9 +567,17 @@ pub struct TuiRenderer {
     // redraw.
     active_rows: usize,
 
-    // Dimensions used for the bytes currently on screen. Resize handling must
-    // remeasure that old rendering at the new width before erasing it.
-    last_terminal_size: Option<(u16, u16)>,
+    // Latest dimensions reported by a resize event. They are consumed by the
+    // next absolute viewport rebuild, so repeated resize events coalesce to the
+    // newest frame instead of replaying intermediate relative repairs.
+    pending_viewport_size: Option<(u16, u16)>,
+
+    // A terminal resize lets the emulator reflow bytes that Finch previously
+    // drew, so the old live-area origin is no longer recoverable with MoveUp.
+    // The next render clears and rebuilds the complete visible viewport using
+    // absolute coordinates. ClearType::All deliberately preserves native
+    // scrollback outside that viewport.
+    viewport_invalidated: bool,
 
     // Row index (0-based from top of live area) where the cursor is parked
     // after draw_live_area().  erase_live_area() uses this to correctly reach
@@ -708,7 +716,8 @@ impl TuiRenderer {
             history_draft: None,
 
             active_rows: 0,
-            last_terminal_size: None,
+            pending_viewport_size: None,
+            viewport_invalidated: false,
             cursor_row_from_top: 0,
             printed_ids: HashSet::new(),
 
@@ -1221,7 +1230,6 @@ impl TuiRenderer {
 
         self.active_rows = rows;
         self.cursor_row_from_top = cursor_row_from_top;
-        self.last_terminal_size = Some((term_width as u16, term_h as u16));
         Ok(())
     }
 
@@ -1273,6 +1281,86 @@ fn uncommitted_suffix(
         .collect()
 }
 
+/// Select the newest transcript rows that fit in a visible viewport slice.
+/// Unlike `live_viewport_lines`, this has no synthetic clipping row: a full
+/// viewport rebuild is a projection of retained transcript, not new scrollback.
+fn viewport_tail_lines(lines: &[String], terminal_width: usize, row_budget: usize) -> Vec<String> {
+    if row_budget == 0 {
+        return Vec::new();
+    }
+    let width = terminal_width.max(1);
+    let mut remaining = row_budget;
+    let mut selected = Vec::new();
+    for line in lines.iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let rows = shadow_buffer::physical_rows(line, width);
+        if rows <= remaining {
+            selected.push(line.clone());
+            remaining -= rows;
+        } else {
+            let fragment = visible_tail(line, remaining.saturating_mul(width));
+            if !fragment.is_empty() {
+                selected.push(fragment);
+            }
+            break;
+        }
+    }
+    selected.reverse();
+    selected
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ViewportRedrawPlan {
+    transcript_top: usize,
+    live_top: usize,
+}
+
+/// Lay out the two parts of Finch's visible shadow frame. The retained
+/// transcript is bottom-aligned in the space above the live area, while the
+/// live area is always anchored to the bottom of the current viewport.
+fn viewport_redraw_plan(
+    terminal_height: usize,
+    live_rows: usize,
+    transcript_rows: usize,
+) -> ViewportRedrawPlan {
+    let live_rows = live_rows.min(terminal_height);
+    let live_top = terminal_height.saturating_sub(live_rows);
+    let transcript_rows = transcript_rows.min(live_top);
+    ViewportRedrawPlan {
+        transcript_top: live_top.saturating_sub(transcript_rows),
+        live_top,
+    }
+}
+
+/// Start an absolute full-viewport paint and leave the synchronized update
+/// open for `draw_live_area` to finish. Keeping this byte emission separate
+/// makes the resize invariant testable without a real terminal emulator.
+fn begin_full_viewport_paint(
+    stdout: &mut impl Write,
+    plan: ViewportRedrawPlan,
+    transcript: &[String],
+) -> Result<()> {
+    execute!(
+        stdout,
+        BeginSynchronizedUpdate,
+        cursor::MoveTo(0, 0),
+        Clear(ClearType::All),
+        cursor::MoveTo(0, plan.transcript_top as u16)
+    )?;
+    for line in transcript {
+        execute!(
+            stdout,
+            Clear(ClearType::CurrentLine),
+            Print(line.trim_end_matches('\r')),
+            Print("\r\n")
+        )?;
+    }
+    execute!(stdout, cursor::MoveTo(0, plan.live_top as u16))?;
+    Ok(())
+}
+
 // ─── flush_output_safe / render ───────────────────────────────────────────────
 
 impl TuiRenderer {
@@ -1298,6 +1386,15 @@ impl TuiRenderer {
                 }
                 MessageStatus::InProgress => unreachable!("committable prefix excludes live messages"),
             }
+        }
+
+        // A resize invalidates terminal coordinates for both the live region
+        // and the visible part of committed transcript. Rebuild that viewport
+        // once, including messages that became committable in this tick.
+        if self.viewport_invalidated {
+            self.redraw_full_viewport()?;
+            self.live_area_dirty = false;
+            return Ok(());
         }
 
         if !to_commit.is_empty() {
@@ -1330,6 +1427,10 @@ impl TuiRenderer {
 
     /// Redraw the live area.  Called by the event loop and by async_input.
     pub fn render(&mut self) -> Result<()> {
+        if self.viewport_invalidated {
+            self.redraw_full_viewport()?;
+            return self.draw_poset_overlay();
+        }
         self.erase_live_area()?;
         self.draw_live_area()?;
         self.draw_poset_overlay()
@@ -1452,7 +1553,8 @@ impl TuiRenderer {
         enable_raw_mode()?;
         // Force a full redraw so the REPL live area reappears.
         self.active_rows = 0;
-        self.last_terminal_size = None;
+        self.pending_viewport_size = None;
+        self.viewport_invalidated = true;
         Ok(())
     }
 
@@ -1472,7 +1574,8 @@ impl TuiRenderer {
         );
         self.output_manager.disable_stdout();
         self.active_rows = 0;
-        self.last_terminal_size = None;
+        self.pending_viewport_size = None;
+        self.viewport_invalidated = true;
         self.live_area_dirty = true;
         Ok(())
     }
@@ -1564,29 +1667,25 @@ impl TuiRenderer {
     }
 
     pub fn handle_resize(&mut self, w: u16, h: u16) -> Result<()> {
-        // Terminal emulators reflow scrollback themselves. Clearing the entire screen
-        // here destroys visible history. Re-measure the already drawn live region at
-        // its new width before the caller erases it; using the old physical-row count
-        // leaves one separator behind for every resize event.
-        if let Some((rows, cursor_row_from_top)) = self.reflowed_live_geometry(w, h) {
-            self.active_rows = rows;
-            self.cursor_row_from_top = cursor_row_from_top;
-        }
+        // Reflow can move previously owned rows above viewport row zero, where
+        // relative MoveUp/Clear operations can never reach them. Do not touch
+        // the reflowed bytes here. The next render replaces the complete visible
+        // screen from retained structured state using absolute coordinates.
+        self.pending_viewport_size = Some((w, h));
+        self.viewport_invalidated = true;
         self.live_area_dirty = true;
         Ok(())
     }
 
-    fn reflowed_live_geometry(&self, width: u16, height: u16) -> Option<(usize, usize)> {
+    fn live_geometry(&self, width: u16, height: u16) -> Option<(usize, usize)> {
         if self.active_dialog.is_some() {
             // Dialog geometry is computed by its renderer. Keep the last known
             // dimensions rather than guessing and risking transcript erasure.
             return None;
         }
         let term_width = usize::from(width).max(1);
-        let (draw_width, draw_height) = self
-            .last_terminal_size
-            .map(|(width, height)| (usize::from(width).max(1), usize::from(height)))
-            .unwrap_or((term_width, usize::from(height)));
+        let draw_width = term_width;
+        let draw_height = usize::from(height);
         let input_lines = self.input_textarea.lines().to_vec();
         let raw_status = self
             .status_bar
@@ -1684,10 +1783,48 @@ impl TuiRenderer {
         let cursor_phys_above = input_phys_rows[..cursor_row.min(input_phys_rows.len())]
             .iter()
             .sum::<usize>();
-        Some((
-            rows,
-            rows_before_input + cursor_phys_above + cursor_sub_row,
-        ))
+        Some((rows, rows_before_input + cursor_phys_above + cursor_sub_row))
+    }
+
+    /// Clear and reconstruct Finch's complete visible viewport after terminal
+    /// reflow. `ClearType::All` clears only the visible screen; terminal-native
+    /// scrollback that has already left the viewport remains untouched.
+    fn redraw_full_viewport(&mut self) -> Result<()> {
+        let (width, height) = self
+            .pending_viewport_size
+            .take()
+            .unwrap_or_else(|| crossterm::terminal::size().unwrap_or((80, 24)));
+        let term_width = usize::from(width).max(1);
+        let term_height = usize::from(height);
+        let live_rows = self
+            .live_geometry(width, height)
+            .map(|(rows, _)| rows)
+            .unwrap_or(self.active_rows)
+            .min(term_height);
+        let transcript_budget = term_height.saturating_sub(live_rows);
+
+        let mut transcript = Vec::new();
+        for message in self.output_manager.get_messages() {
+            if self.printed_ids.contains(&message.id()) {
+                transcript.extend(message.format(&self.colors).split('\n').map(str::to_owned));
+                transcript.push(String::new());
+            }
+        }
+        let transcript = viewport_tail_lines(&transcript, term_width, transcript_budget);
+        let transcript_rows = transcript
+            .iter()
+            .map(|line| shadow_buffer::physical_rows(line, term_width))
+            .sum();
+        let plan = viewport_redraw_plan(term_height, live_rows, transcript_rows);
+
+        let mut stdout = io::stdout();
+        begin_full_viewport_paint(&mut stdout, plan, &transcript)?;
+
+        self.active_rows = 0;
+        self.cursor_row_from_top = 0;
+        self.viewport_invalidated = false;
+        // draw_live_area closes the synchronized update begun above.
+        self.draw_live_area()
     }
 }
 
@@ -2672,6 +2809,79 @@ mod tests {
     fn live_viewport_does_not_modify_content_that_already_fits() {
         let lines = vec!["one".to_string(), "two".to_string()];
         assert_eq!(live_viewport_lines(&lines, 80, 10), (lines, 0));
+    }
+
+    #[test]
+    fn viewport_tail_reflows_at_the_current_width_without_a_synthetic_row() {
+        let lines = vec![
+            "old".to_string(),
+            "123456789012345".to_string(),
+            "new".to_string(),
+        ];
+
+        let selected = viewport_tail_lines(&lines, 5, 3);
+
+        assert_eq!(selected, vec!["… 89012345", "new"]);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|line| shadow_buffer::physical_rows(line, 5))
+                .sum::<usize>(),
+            3
+        );
+    }
+
+    #[test]
+    fn repeated_shrink_and_grow_reanchors_the_live_frame_to_viewport_bottom() {
+        let large = viewport_redraw_plan(40, 6, 20);
+        let small = viewport_redraw_plan(12, 6, 20);
+        let large_again = viewport_redraw_plan(40, 6, 20);
+
+        assert_eq!(
+            large,
+            ViewportRedrawPlan {
+                transcript_top: 14,
+                live_top: 34,
+            }
+        );
+        assert_eq!(
+            small,
+            ViewportRedrawPlan {
+                transcript_top: 0,
+                live_top: 6,
+            }
+        );
+        assert_eq!(large_again, large);
+        assert_eq!(small.live_top + 6, 12);
+        assert_eq!(large_again.live_top + 6, 40);
+    }
+
+    #[test]
+    fn full_viewport_paint_uses_absolute_rows_and_preserves_native_scrollback() {
+        let plan = viewport_redraw_plan(12, 6, 2);
+        let mut bytes = Vec::new();
+
+        begin_full_viewport_paint(&mut bytes, plan, &["old".into(), "new".into()])
+            .expect("paint commands");
+
+        let commands = String::from_utf8(bytes).expect("ANSI commands are UTF-8");
+        assert!(commands.contains("\x1b[2J"), "clear visible viewport: {commands:?}");
+        assert!(!commands.contains("\x1b[3J"), "must not purge scrollback: {commands:?}");
+        assert!(commands.contains("\x1b[5;1H"), "transcript row is absolute: {commands:?}");
+        assert!(commands.contains("\x1b[7;1H"), "live row is absolute: {commands:?}");
+        assert!(!commands.contains("\x1b[1A"), "must not repair with MoveUp: {commands:?}");
+    }
+
+    #[test]
+    fn oversized_live_frame_stays_within_the_visible_viewport() {
+        let plan = viewport_redraw_plan(5, 12, 8);
+        assert_eq!(
+            plan,
+            ViewportRedrawPlan {
+                transcript_top: 0,
+                live_top: 0,
+            }
+        );
     }
 
     #[test]

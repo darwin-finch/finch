@@ -757,7 +757,7 @@ still blocks the corresponding Brain phase until it is unified.
   turn. A later user prompt must remain a distinct queued WorkUnit and cannot appear inside the
   earlier repair's source or tool block; program source, diagnostics, bounded repair, tool activity,
   and VM output must stay grouped under one correlated Brain turn until its terminal event.
-- [ ] Replace relative live-region resize repair with a full-viewport shadow-frame rebuild. The
+- [x] Replace relative live-region resize repair with a full-viewport shadow-frame rebuild. The
   controlled shadow buffer must always cover the whole visible terminal: on resize, invalidate its
   dimensions, reflow retained structured transcript/WorkUnit rows at the new width, clear the
   visible screen, and repaint the complete viewport using absolute coordinates. Rows that have
