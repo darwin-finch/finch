@@ -16,6 +16,15 @@ JIT/AOT, and future coroutine policy no longer prevent testing and converging Br
 runtime. Any change that would create a second execution, authority, checkpoint, or event lifecycle
 still blocks the corresponding Brain phase until it is unified.
 
+- [ ] Sequence the next language push after Finch can dogfood a durable self-upgrade loop: a Brain
+  goal edits Finch through reviewable changes, verifies and commits them, rebuilds the frontend and
+  daemon, restarts without losing the Brain log/checkpoint/goal, and resumes against the new binary.
+  Once that loop is reliable, use Finch itself to converge Co-Lisp/Co-Forth capability and attribute
+  syntax, bounded CTFE, first-class syntax/type/signature reflection, templates and parameter packs,
+  structural concepts with cached evidence, and fast directional inference. Concepts are
+  composition-oriented structural protocols—not classes, inheritance, nominal opt-in, or repeated
+  speculative compilation—and both source languages must expose the same shared-IR semantics.
+
 - [ ] Make "statically safe, scripting-language feel" a conformance requirement for both source
   languages. Infer literal, local, parameter, return, stack-row, effect, yield, and generic
   instantiation types wherever the program determines them; private definitions should normally
