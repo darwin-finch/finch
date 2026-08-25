@@ -475,6 +475,15 @@ impl brain_runner::Server for BrainRunnerImpl {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string();
+        let run_id = match request
+            .get_run_id()
+            .map_err(anyhow::Error::new)
+            .and_then(|value| value.to_str().map_err(anyhow::Error::new))
+            .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::new))
+        {
+            Ok(run_id) => crate::brain::shared::RunId(run_id),
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
         let language = match request.get_language() {
             Ok(finch_ipc_capnp::ProgramLanguage::Forth) => {
                 crate::brain::shared::ProgramLanguage::Forth
@@ -491,6 +500,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                 crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(
                     crate::server::RunnerProgramRequest {
                         brain,
+                        run_id,
                         request_seq: request.get_request_seq(),
                         language,
                         source,
@@ -543,6 +553,15 @@ impl brain_runner::Server for BrainRunnerImpl {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string();
+        let run_id = match request
+            .get_run_id()
+            .map_err(anyhow::Error::new)
+            .and_then(|value| value.to_str().map_err(anyhow::Error::new))
+            .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::new))
+        {
+            Ok(run_id) => crate::brain::shared::RunId(run_id),
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
         let context = match request
             .get_context_json()
             .map_err(anyhow::Error::new)
@@ -586,6 +605,7 @@ impl brain_runner::Server for BrainRunnerImpl {
             .send(crate::cli::repl_event::ReplEvent::NamedBrainTurnRequested(
                 crate::server::RunnerTurnRequest {
                     brain,
+                    run_id,
                     request_seq: request.get_request_seq(),
                     prompt,
                     context,

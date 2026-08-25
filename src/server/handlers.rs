@@ -655,6 +655,7 @@ async fn dispatch_named_brain_run(
                 store,
                 runners,
                 name,
+                run.run_id,
                 request.seq,
                 language,
                 &source,
@@ -676,6 +677,7 @@ async fn dispatch_named_brain_run(
                         store,
                         runners,
                         name,
+                        run.run_id,
                         request.seq,
                         &text,
                         requester,
@@ -836,6 +838,7 @@ async fn dispatch_named_brain_program(
     store: &crate::brain::shared::SharedBrainStore,
     runners: &crate::server::BrainRunnerBroker,
     name: &str,
+    run_id: crate::brain::shared::RunId,
     request_seq: u64,
     language: crate::brain::shared::ProgramLanguage,
     source: &str,
@@ -852,7 +855,14 @@ async fn dispatch_named_brain_program(
         .map(|lease| lease.lease_id)
         .ok_or_else(|| anyhow::anyhow!("named Brain '{name}' has no live environment runner"))?;
     let outcome = runners
-        .dispatch_program(name, lease_id, request_seq, language, source.to_string())
+        .dispatch_program(
+            name,
+            lease_id,
+            run_id,
+            request_seq,
+            language,
+            source.to_string(),
+        )
         .await?;
     store.commit_runner_runtime(
         name,
@@ -867,6 +877,7 @@ async fn dispatch_named_brain_turn(
     store: &crate::brain::shared::SharedBrainStore,
     runners: &crate::server::BrainRunnerBroker,
     name: &str,
+    run_id: crate::brain::shared::RunId,
     request_seq: u64,
     prompt: &str,
     requester: &crate::brain::shared::BrainAttachment,
@@ -895,6 +906,7 @@ async fn dispatch_named_brain_turn(
         .dispatch_turn(
             name,
             lease_id,
+            run_id,
             request_seq,
             prompt.to_string(),
             named_brain_provider_messages(&snapshot),
@@ -3369,6 +3381,7 @@ mod named_brain_provider_context_tests {
             &store,
             &runners,
             "shared",
+            crate::brain::shared::RunId(uuid::Uuid::new_v4()),
             41,
             ProgramLanguage::Lisp,
             "(define (double (n : int)) : int (* n 2))",
@@ -3510,6 +3523,7 @@ mod named_brain_provider_context_tests {
             &store,
             &runners,
             "shared",
+            crate::brain::shared::RunId(uuid::Uuid::new_v4()),
             prompt_seq,
             "define triple",
             &requester,
@@ -3648,6 +3662,7 @@ mod named_brain_provider_context_tests {
             &store,
             &runners,
             "shared",
+            crate::brain::shared::RunId(uuid::Uuid::new_v4()),
             prompt_seq,
             "try an effect",
             &requester,
@@ -3686,6 +3701,7 @@ mod named_brain_provider_context_tests {
             &store,
             &crate::server::BrainRunnerBroker::default(),
             "shared",
+            crate::brain::shared::RunId(uuid::Uuid::new_v4()),
             1,
             ProgramLanguage::Forth,
             "21 2 *",
@@ -3735,6 +3751,7 @@ mod named_brain_provider_context_tests {
             &store,
             &runners,
             "shared",
+            crate::brain::shared::RunId(uuid::Uuid::new_v4()),
             1,
             ProgramLanguage::Forth,
             "21 2 *",

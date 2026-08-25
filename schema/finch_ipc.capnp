@@ -104,6 +104,7 @@ struct BrainProgramRequest {
   requestSeq @1 :UInt64;
   language   @2 :ProgramLanguage;
   source     @3 :Text;
+  runId      @4 :Text;
 }
 
 struct BrainProgramResult {
@@ -120,6 +121,7 @@ struct BrainTurnRequest {
   contextJson @3 :Data; # Transitional canonical Message list; schema becomes native later.
   approvalAudience @4 :BrainApprovalAudience;
   control          @5 :BrainTurnControl;
+  runId            @6 :Text;
 }
 
 enum BrainAttachmentRole {

@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::brain::shared::{ProgramLanguage, RunnerLeaseId};
+use crate::brain::shared::{ProgramLanguage, RunId, RunnerLeaseId};
 
 #[derive(Debug)]
 pub enum RunnerRequest {
@@ -18,6 +18,7 @@ pub enum RunnerRequest {
 #[derive(Debug)]
 pub struct RunnerProgramRequest {
     pub brain: String,
+    pub run_id: RunId,
     pub request_seq: u64,
     pub language: ProgramLanguage,
     pub source: String,
@@ -34,6 +35,7 @@ pub struct RunnerProgramResult {
 #[derive(Debug)]
 pub struct RunnerTurnRequest {
     pub brain: String,
+    pub run_id: RunId,
     pub request_seq: u64,
     pub prompt: String,
     pub context: Vec<crate::claude::Message>,
@@ -158,6 +160,7 @@ impl BrainRunnerBroker {
         &self,
         brain: &str,
         lease_id: RunnerLeaseId,
+        run_id: RunId,
         request_seq: u64,
         language: ProgramLanguage,
         source: String,
@@ -177,6 +180,7 @@ impl BrainRunnerBroker {
             .tx
             .send(RunnerRequest::Program(RunnerProgramRequest {
                 brain: brain.to_string(),
+                run_id,
                 request_seq,
                 language,
                 source,
@@ -193,6 +197,7 @@ impl BrainRunnerBroker {
         &self,
         brain: &str,
         lease_id: RunnerLeaseId,
+        run_id: RunId,
         request_seq: u64,
         prompt: String,
         context: Vec<crate::claude::Message>,
@@ -213,6 +218,7 @@ impl BrainRunnerBroker {
             .tx
             .send(RunnerRequest::Turn(RunnerTurnRequest {
                 brain: brain.to_string(),
+                run_id,
                 request_seq,
                 prompt,
                 context,
@@ -251,6 +257,7 @@ mod tests {
     async fn dispatch_is_correlated_to_the_registered_lease() {
         let broker = BrainRunnerBroker::default();
         let lease_id = lease();
+        let run_id = RunId(uuid::Uuid::new_v4());
         let (tx, mut rx) = mpsc::unbounded_channel();
         broker.register("brain", lease_id, tx);
         tokio::spawn(async move {
@@ -258,6 +265,7 @@ mod tests {
                 panic!("expected program request")
             };
             assert_eq!(request.request_seq, 7);
+            assert_eq!(request.run_id, run_id);
             assert_eq!(request.source, "21 2 *");
             let runtime = crate::runtime::ProgramRuntime::new();
             let checkpoint = runtime
@@ -281,6 +289,7 @@ mod tests {
             .dispatch_program(
                 "brain",
                 lease_id,
+                run_id,
                 7,
                 ProgramLanguage::Forth,
                 "21 2 *".into(),
@@ -299,7 +308,14 @@ mod tests {
         broker.register("brain", current, tx);
 
         let error = broker
-            .dispatch_program("brain", stale, 1, ProgramLanguage::Lisp, "(+ 1 1)".into())
+            .dispatch_program(
+                "brain",
+                stale,
+                RunId(uuid::Uuid::new_v4()),
+                1,
+                ProgramLanguage::Lisp,
+                "(+ 1 1)".into(),
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("stale lease"));
@@ -309,6 +325,7 @@ mod tests {
     async fn full_turn_dispatch_carries_canonical_context() {
         let broker = BrainRunnerBroker::default();
         let lease_id = lease();
+        let run_id = RunId(uuid::Uuid::new_v4());
         let (tx, mut rx) = mpsc::unbounded_channel();
         broker.register("brain", lease_id, tx);
         tokio::spawn(async move {
@@ -316,6 +333,7 @@ mod tests {
                 panic!("expected full turn request")
             };
             assert_eq!(request.prompt, "double it");
+            assert_eq!(request.run_id, run_id);
             assert_eq!(request.context.len(), 1);
             assert_eq!(request.context[0].text(), "21");
             assert_eq!(request.approval_audience.brain, "brain");
@@ -344,6 +362,7 @@ mod tests {
             .dispatch_turn(
                 "brain",
                 lease_id,
+                run_id,
                 8,
                 "double it".into(),
                 vec![crate::claude::Message::user("21")],

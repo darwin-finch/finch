@@ -968,6 +968,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
                         {
                             let mut payload = call.get().init_request();
                             payload.set_brain(&request.brain);
+                            payload.set_run_id(&request.run_id.0.to_string());
                             payload.set_request_seq(request.request_seq);
                             payload.set_language(program_language_to_capnp(request.language));
                             payload.set_source(&request.source);
@@ -993,6 +994,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
                                 {
                                     let mut payload = call.get().init_request();
                                     payload.set_brain(&request.brain);
+                                    payload.set_run_id(&request.run_id.0.to_string());
                                     payload.set_request_seq(request.request_seq);
                                     payload.set_prompt(&request.prompt);
                                     payload.set_context_json(&context_json);
