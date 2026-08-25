@@ -561,7 +561,7 @@ pub(super) fn decode_runner_lease(
     })
 }
 
-fn encode_runner_handoff(
+pub(super) fn encode_runner_handoff(
     mut builder: finch_ipc_capnp::brain_runner_handoff::Builder<'_>,
     handoff: &BrainRunnerHandoff,
 ) {
@@ -574,7 +574,7 @@ fn encode_runner_handoff(
     builder.set_expires_ms(handoff.expires_ms);
 }
 
-fn decode_runner_handoff(
+pub(super) fn decode_runner_handoff(
     reader: finch_ipc_capnp::brain_runner_handoff::Reader<'_>,
 ) -> anyhow::Result<BrainRunnerHandoff> {
     Ok(BrainRunnerHandoff {

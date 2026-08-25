@@ -9,7 +9,8 @@ use tokio::sync::broadcast;
 
 use crate::brain::shared::{
     AttachmentId, AttachmentRole, BrainAttachment, BrainEnvironment, BrainEvent, BrainEventKind,
-    BrainRunnerLease, BrainSnapshot, ConnectionId, RunnerLeaseId, SharedBrainStore,
+    BrainRunnerHandoff, BrainRunnerLease, BrainSnapshot, ConnectionId, RunnerHandoffId,
+    RunnerLeaseId, SharedBrainStore,
 };
 
 use super::{handlers, AgentServer, BrainApprovalBroker, BrainRunnerBroker};
@@ -264,6 +265,94 @@ impl BrainLifecycleService {
         Ok(())
     }
 
+    pub fn request_runner_handoff(
+        &self,
+        brain: &str,
+        requested_by: &str,
+        target_subject: &str,
+        expected_lease_id: RunnerLeaseId,
+        environment: &BrainEnvironment,
+        ttl_ms: u64,
+    ) -> Result<BrainRunnerHandoff> {
+        ensure!(
+            environment == self.store.environment(),
+            "runner handoff environment does not match the daemon Brain environment"
+        );
+        let handoff = self.store.request_runner_handoff(
+            brain,
+            requested_by,
+            target_subject,
+            expected_lease_id,
+            environment.generation,
+            ttl_ms,
+        )?;
+        self.expire_runner_handoff(
+            brain.to_owned(),
+            handoff.handoff_id,
+            handoff.expires_ms,
+        );
+        Ok(handoff)
+    }
+
+    fn expire_runner_handoff(
+        &self,
+        brain: String,
+        handoff_id: RunnerHandoffId,
+        expires_ms: u64,
+    ) {
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            loop {
+                let delay_ms = expires_ms.saturating_sub(crate::brain::shared::unix_millis());
+                if delay_ms == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            if store
+                .expire_runner_handoff(&brain, handoff_id, crate::brain::shared::unix_millis())
+                .is_ok_and(|expired| expired)
+            {
+                let _ = store.remove_if_unused(&brain);
+            }
+        });
+    }
+
+    pub fn accept_runner_handoff(
+        &self,
+        brain: &str,
+        target_subject: &str,
+        handoff_id: RunnerHandoffId,
+        environment: &BrainEnvironment,
+        ttl_ms: u64,
+    ) -> Result<BrainRunnerLease> {
+        ensure!(
+            environment == self.store.environment(),
+            "runner handoff environment does not match the daemon Brain environment"
+        );
+        let lease = self.store.accept_runner_handoff(
+            brain,
+            target_subject,
+            handoff_id,
+            environment.generation,
+            ttl_ms,
+        )?;
+        self.expire_runner_lease(brain.to_owned(), lease.lease_id, lease.expires_ms);
+        Ok(lease)
+    }
+
+    pub fn cancel_runner_handoff(
+        &self,
+        brain: &str,
+        handoff_id: RunnerHandoffId,
+        sender: &str,
+    ) -> Result<()> {
+        self.store
+            .cancel_runner_handoff(brain, handoff_id, sender)?;
+        self.store.remove_if_unused(brain)?;
+        Ok(())
+    }
+
     pub async fn resume_queued_runs(
         &self,
         brain: String,
@@ -339,6 +428,48 @@ mod tests {
             .attach("shared", "runner", AttachmentRole::Runner, None)
             .unwrap_err();
         assert!(error.to_string().contains("runner lease"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_service_transfers_runner_authority_only_to_the_addressed_frontend() {
+        let service = service();
+        let environment = service.store.environment().clone();
+        let source = service
+            .acquire_runner("shared", "runner-a", &environment, None, 60_000)
+            .unwrap();
+        let handoff = service
+            .request_runner_handoff(
+                "shared",
+                "controller",
+                "runner-b",
+                source.lease_id,
+                &environment,
+                30_000,
+            )
+            .unwrap();
+        assert!(service
+            .accept_runner_handoff(
+                "shared",
+                "runner-c",
+                handoff.handoff_id,
+                &environment,
+                60_000,
+            )
+            .is_err());
+        let replacement = service
+            .accept_runner_handoff(
+                "shared",
+                "runner-b",
+                handoff.handoff_id,
+                &environment,
+                60_000,
+            )
+            .unwrap();
+        assert_ne!(replacement.lease_id, source.lease_id);
+        assert_eq!(
+            service.snapshot("shared").unwrap().runner_lease,
+            Some(replacement)
+        );
     }
 
     #[tokio::test]

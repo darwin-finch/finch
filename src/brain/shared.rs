@@ -977,6 +977,31 @@ impl SharedBrainStore {
         Ok(())
     }
 
+    pub fn expire_runner_handoff(
+        &self,
+        name: &str,
+        handoff_id: RunnerHandoffId,
+        now_ms: u64,
+    ) -> Result<bool> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).expect("brain loaded above");
+        let Some(current) = state.runner_handoff.as_ref() else {
+            return Ok(false);
+        };
+        if current.handoff_id != handoff_id || current.expires_ms > now_ms {
+            return Ok(false);
+        }
+        self.push_locked(
+            name,
+            state,
+            "daemon",
+            BrainEventKind::RunnerHandoffCancelled { handoff_id },
+        )?;
+        Ok(true)
+    }
+
     pub fn expire_runner_lease(
         &self,
         name: &str,
@@ -2827,6 +2852,35 @@ mod tests {
                 60_000,
             )
             .is_err());
+    }
+
+    #[test]
+    fn runner_handoff_expiry_is_exact_and_durable() {
+        let store = SharedBrainStore::with_root("box.local", None);
+        let generation = store.environment().generation;
+        let source = store
+            .acquire_runner_lease("shared", "runner-a", generation, None, 60_000)
+            .unwrap();
+        let handoff = store
+            .request_runner_handoff(
+                "shared",
+                "controller",
+                "runner-b",
+                source.lease_id,
+                generation,
+                30_000,
+            )
+            .unwrap();
+        assert!(!store
+            .expire_runner_handoff("shared", handoff.handoff_id, handoff.expires_ms - 1)
+            .unwrap());
+        assert!(store
+            .expire_runner_handoff("shared", handoff.handoff_id, handoff.expires_ms)
+            .unwrap());
+        assert!(store.snapshot("shared").unwrap().runner_handoff.is_none());
+        assert!(!store
+            .expire_runner_handoff("shared", handoff.handoff_id, handoff.expires_ms)
+            .unwrap());
     }
 
     #[test]

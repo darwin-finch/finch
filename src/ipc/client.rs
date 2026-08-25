@@ -14,7 +14,7 @@ use crate::claude::{ContentBlock, Message};
 use crate::generators::StreamChunk;
 use crate::ipc::brain_codec::{
     decode_approval_audience, decode_attachment, decode_brain_wire_reader, decode_event,
-    decode_run, decode_runner_lease, decode_snapshot, encode_approval_audience,
+    decode_run, decode_runner_handoff, decode_runner_lease, decode_snapshot, encode_approval_audience,
     encode_brain_submission, encode_environment,
 };
 use crate::ipc::schema::finch_ipc_capnp::{
@@ -331,6 +331,70 @@ impl IpcClient {
             let mut params = request.get();
             params.set_brain(brain);
             params.set_lease_id(&lease_id.0.to_string());
+        }
+        request.send().promise.await?;
+        Ok(())
+    }
+
+    pub async fn brain_request_runner_handoff(
+        &self,
+        brain: &str,
+        requested_by: &str,
+        target_subject: &str,
+        expected_lease_id: crate::brain::shared::RunnerLeaseId,
+        environment: &crate::brain::shared::BrainEnvironment,
+        ttl_ms: u64,
+    ) -> Result<crate::brain::shared::BrainRunnerHandoff> {
+        let service = self.brain_service().await?;
+        let mut request = service.request_runner_handoff_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_requested_by(requested_by);
+            params.set_target_subject(target_subject);
+            params.set_expected_lease_id(&expected_lease_id.0.to_string());
+            encode_environment(params.reborrow().init_environment(), environment);
+            params.set_ttl_ms(ttl_ms);
+        }
+        let reply = request.send().promise.await?;
+        decode_runner_handoff(reply.get()?.get_handoff()?)
+    }
+
+    pub async fn brain_accept_runner_handoff(
+        &self,
+        brain: &str,
+        target_subject: &str,
+        handoff_id: crate::brain::shared::RunnerHandoffId,
+        environment: &crate::brain::shared::BrainEnvironment,
+        ttl_ms: u64,
+    ) -> Result<crate::brain::shared::BrainRunnerLease> {
+        let service = self.brain_service().await?;
+        let mut request = service.accept_runner_handoff_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_target_subject(target_subject);
+            params.set_handoff_id(&handoff_id.0.to_string());
+            encode_environment(params.reborrow().init_environment(), environment);
+            params.set_ttl_ms(ttl_ms);
+        }
+        let reply = request.send().promise.await?;
+        decode_runner_lease(reply.get()?.get_lease()?)
+    }
+
+    pub async fn brain_cancel_runner_handoff(
+        &self,
+        brain: &str,
+        handoff_id: crate::brain::shared::RunnerHandoffId,
+        sender: &str,
+    ) -> Result<()> {
+        let service = self.brain_service().await?;
+        let mut request = service.cancel_runner_handoff_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_handoff_id(&handoff_id.0.to_string());
+            params.set_sender(sender);
         }
         request.send().promise.await?;
         Ok(())

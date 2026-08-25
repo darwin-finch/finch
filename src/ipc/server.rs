@@ -13,8 +13,8 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::ipc::brain_codec::{
     decode_approval_audience, decode_brain_submission, decode_environment, encode_approval_audience,
-    encode_attachment, encode_brain_submission_outcome, encode_event, encode_runner_lease,
-    encode_snapshot,
+    encode_attachment, encode_brain_submission_outcome, encode_event, encode_runner_handoff,
+    encode_runner_lease, encode_snapshot,
 };
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_service, finch_daemon};
 use crate::server::AgentServer;
@@ -471,6 +471,106 @@ impl brain_service::Server for BrainRpcService {
         }
         Promise::ok(())
     }
+
+    fn request_runner_handoff(
+        &mut self,
+        params: brain_service::RequestRunnerHandoffParams,
+        mut results: brain_service::RequestRunnerHandoffResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let requested_by = pry!(params.get_requested_by())
+            .to_str()
+            .unwrap_or("")
+            .to_string();
+        let target_subject = pry!(params.get_target_subject())
+            .to_str()
+            .unwrap_or("")
+            .to_string();
+        let expected_lease_id = match parse_runner_lease_id(params.get_expected_lease_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let environment = match params
+            .get_environment()
+            .map_err(anyhow::Error::from)
+            .and_then(decode_environment)
+        {
+            Ok(environment) => environment,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let handoff = match self.lifecycle.request_runner_handoff(
+            &brain,
+            &requested_by,
+            &target_subject,
+            expected_lease_id,
+            &environment,
+            params.get_ttl_ms(),
+        ) {
+            Ok(handoff) => handoff,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        encode_runner_handoff(results.get().init_handoff(), &handoff);
+        Promise::ok(())
+    }
+
+    fn accept_runner_handoff(
+        &mut self,
+        params: brain_service::AcceptRunnerHandoffParams,
+        mut results: brain_service::AcceptRunnerHandoffResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let target_subject = pry!(params.get_target_subject())
+            .to_str()
+            .unwrap_or("")
+            .to_string();
+        let handoff_id = match parse_runner_handoff_id(params.get_handoff_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let environment = match params
+            .get_environment()
+            .map_err(anyhow::Error::from)
+            .and_then(decode_environment)
+        {
+            Ok(environment) => environment,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let lease = match self.lifecycle.accept_runner_handoff(
+            &brain,
+            &target_subject,
+            handoff_id,
+            &environment,
+            params.get_ttl_ms(),
+        ) {
+            Ok(lease) => lease,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        encode_runner_lease(results.get().init_lease(), &lease);
+        Promise::ok(())
+    }
+
+    fn cancel_runner_handoff(
+        &mut self,
+        params: brain_service::CancelRunnerHandoffParams,
+        _results: brain_service::CancelRunnerHandoffResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = pry!(params.get());
+        let brain = pry!(params.get_brain()).to_str().unwrap_or("").to_string();
+        let handoff_id = match parse_runner_handoff_id(params.get_handoff_id()) {
+            Ok(id) => id,
+            Err(error) => return Promise::err(error),
+        };
+        let sender = pry!(params.get_sender()).to_str().unwrap_or("").to_string();
+        if let Err(error) = self
+            .lifecycle
+            .cancel_runner_handoff(&brain, handoff_id, &sender)
+        {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        Promise::ok(())
+    }
 }
 
 fn parse_attachment_id(
@@ -497,6 +597,15 @@ fn parse_runner_lease_id(
     let value = value?.to_str()?;
     uuid::Uuid::parse_str(value)
         .map(crate::brain::shared::RunnerLeaseId)
+        .map_err(|error| capnp::Error::failed(error.to_string()))
+}
+
+fn parse_runner_handoff_id(
+    value: capnp::Result<capnp::text::Reader<'_>>,
+) -> Result<crate::brain::shared::RunnerHandoffId, capnp::Error> {
+    let value = value?.to_str()?;
+    uuid::Uuid::parse_str(value)
+        .map(crate::brain::shared::RunnerHandoffId)
         .map_err(|error| capnp::Error::failed(error.to_string()))
 }
 

@@ -490,6 +490,23 @@ interface BrainService {
                     ttlMs :UInt64) -> (lease :BrainRunnerLease);
 
   releaseRunner @7 (brain :Text, leaseId :Text) -> ();
+
+  requestRunnerHandoff @8 (brain :Text,
+                           requestedBy :Text,
+                           targetSubject :Text,
+                           expectedLeaseId :Text,
+                           environment :BrainEnvironment,
+                           ttlMs :UInt64) -> (handoff :BrainRunnerHandoff);
+
+  acceptRunnerHandoff @9 (brain :Text,
+                          targetSubject :Text,
+                          handoffId :Text,
+                          environment :BrainEnvironment,
+                          ttlMs :UInt64) -> (lease :BrainRunnerLease);
+
+  cancelRunnerHandoff @10 (brain :Text,
+                           handoffId :Text,
+                           sender :Text) -> ();
 }
 
 # ---------------------------------------------------------------------------
