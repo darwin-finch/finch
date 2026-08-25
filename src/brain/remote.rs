@@ -242,6 +242,10 @@ impl RemoteBrainTarget {
         format!("{}/invitations", self.http_url())
     }
 
+    fn delegated_credential_url(&self, credential_id: uuid::Uuid) -> String {
+        format!("{}/credentials/{credential_id}", self.http_url())
+    }
+
     fn invitation_redemption_url(&self) -> String {
         format!(
             "{}://{}/v1/brains/invitations/redeem",
@@ -268,6 +272,32 @@ impl RemoteBrainTarget {
 fn has_explicit_port(host: &str) -> bool {
     host.rsplit_once(':')
         .is_some_and(|(_, port)| port.parse::<u16>().is_ok())
+}
+
+fn target_address_is_loopback(address: &str) -> bool {
+    if let Ok(socket) = address.parse::<std::net::SocketAddr>() {
+        return socket.ip().is_loopback();
+    }
+    address
+        .rsplit_once(':')
+        .map(|(host, port)| port.parse::<u16>().is_ok() && host.eq_ignore_ascii_case("localhost"))
+        .unwrap_or_else(|| address.eq_ignore_ascii_case("localhost"))
+}
+
+fn issued_interval_is_valid(
+    issued_ms: u64,
+    expires_ms: u64,
+    requested_ttl_ms: Option<u64>,
+    request_started_ms: u64,
+    response_received_ms: u64,
+) -> bool {
+    const MAX_ISSUED_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+    let maximum_ttl = requested_ttl_ms.unwrap_or(MAX_ISSUED_TTL_MS);
+    issued_ms >= request_started_ms
+        && issued_ms <= response_received_ms
+        && expires_ms > request_started_ms
+        && expires_ms > issued_ms
+        && expires_ms.saturating_sub(issued_ms) <= maximum_ttl
 }
 
 #[derive(Clone)]
@@ -319,6 +349,10 @@ impl RemoteBrainClient {
         anyhow::ensure!(
             !target.secure,
             "remote Brain password bootstrap is disabled; join with a signed invitation"
+        );
+        anyhow::ensure!(
+            target_address_is_loopback(&target.address),
+            "Brain password bootstrap is restricted to a loopback address"
         );
         Ok(Self {
             target,
@@ -455,6 +489,10 @@ impl RemoteBrainClient {
             claims: super::credential::BrainInvitationClaims,
         }
 
+        let requested_scopes = scopes
+            .clone()
+            .unwrap_or_else(|| super::credential::default_participant_scopes(role));
+        let request_started_ms = unix_epoch_millis();
         let (authorization, delegator) = self.delegation_authorization().await?;
         let issued = self
             .http
@@ -473,11 +511,17 @@ impl RemoteBrainClient {
             .json::<Issued>()
             .await
             .context("invalid Brain invitation response")?;
+        let response_received_ms = unix_epoch_millis();
         if issued.claims.brain != self.target.brain
             || issued.claims.role != role
-            || scopes
-                .as_ref()
-                .is_some_and(|required| required != &issued.claims.scopes)
+            || issued.claims.scopes != requested_scopes
+            || !issued_interval_is_valid(
+                issued.claims.issued_ms,
+                issued.claims.expires_ms,
+                ttl_ms,
+                request_started_ms,
+                response_received_ms,
+            )
         {
             anyhow::bail!("Brain invitation issuer returned the wrong participant audience");
         }
@@ -516,6 +560,7 @@ impl RemoteBrainClient {
             ttl_ms: Option<u64>,
         }
 
+        let request_started_ms = unix_epoch_millis();
         let (authorization, delegator) = self.delegation_authorization().await?;
         let issued = self
             .http
@@ -535,12 +580,23 @@ impl RemoteBrainClient {
             .json::<IssuedBrainCredential>()
             .await
             .context("invalid Brain credential response")?;
+        let response_received_ms = unix_epoch_millis();
+        let envelope_claims =
+            super::credential::decode_unverified_credential_claims(&issued.token)?;
         if issued.claims.subject != subject
             || issued.claims.role != role
             || issued.claims.brain != self.target.brain
             || issued.claims.scopes != scopes
             || issued.claims.attachment_id.is_some()
             || issued.claims.connection_id.is_some()
+            || issued.claims != envelope_claims
+            || !issued_interval_is_valid(
+                issued.claims.issued_ms,
+                issued.claims.expires_ms,
+                ttl_ms,
+                request_started_ms,
+                response_received_ms,
+            )
         {
             anyhow::bail!("Brain credential issuer returned the wrong participant audience");
         }
@@ -555,6 +611,39 @@ impl RemoteBrainClient {
             anyhow::bail!("Brain credential issuer returned invalid delegation ancestry");
         }
         Ok((issued.token, issued.claims))
+    }
+
+    /// Revoke a credential descended from this client's unbound controlling
+    /// credential. The server validates the signed target token and refuses
+    /// sibling, ancestor, self, and cross-audience revocation.
+    pub async fn revoke_delegated_credential(&self, credential: &str) -> Result<()> {
+        #[derive(Serialize)]
+        struct Revoke<'a> {
+            credential: &'a str,
+        }
+
+        let target = super::credential::decode_unverified_credential_claims(credential)?;
+        let (authorization, delegator) = self.delegation_authorization().await?;
+        let delegator = delegator.context(
+            "delegated revocation requires a scoped controlling credential",
+        )?;
+        anyhow::ensure!(
+            target.brain_id == delegator.brain_id
+                && target.brain == delegator.brain
+                && target.environment_generation == delegator.environment_generation
+                && target.delegation_chain.contains(&delegator.credential_id),
+            "a controlling credential may revoke only its own descendants"
+        );
+        self.http
+            .delete(self.target.delegated_credential_url(target.credential_id))
+            .bearer_auth(authorization)
+            .json(&Revoke { credential })
+            .send()
+            .await
+            .context("could not reach Brain credential revocation endpoint")?
+            .error_for_status()
+            .context("Brain credential revocation rejected")?;
+        Ok(())
     }
 
     /// Redeem this client's invitation and attach using the role and scopes
@@ -1231,7 +1320,13 @@ impl RemoteBrainClient {
         Option<super::credential::BrainCredentialClaims>,
     )> {
         match &self.bootstrap {
-            RemoteBrainBootstrap::Password(password) => Ok((password.clone(), None)),
+            RemoteBrainBootstrap::Password(password) => {
+                anyhow::ensure!(
+                    !self.target.secure && target_address_is_loopback(&self.target.address),
+                    "Brain password bootstrap is restricted to a loopback address"
+                );
+                Ok((password.clone(), None))
+            }
             RemoteBrainBootstrap::Invitation { .. } => {
                 let credential = self.credential.lock().await;
                 let credential = credential
@@ -1649,6 +1744,31 @@ fn unix_epoch_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issued_intervals_respect_request_time_and_requested_ttl() {
+        assert!(issued_interval_is_valid(
+            1_000,
+            2_000,
+            Some(1_000),
+            900,
+            1_100
+        ));
+        for invalid in [
+            (1_000, 2_001, 900, 1_100),
+            (1_200, 2_000, 900, 1_100),
+            (1_000, 1_000, 900, 1_100),
+            (1_000, 2_000, 2_000, 2_100),
+        ] {
+            assert!(!issued_interval_is_valid(
+                invalid.0,
+                invalid.1,
+                Some(1_000),
+                invalid.2,
+                invalid.3,
+            ));
+        }
+    }
 
     #[test]
     fn target_defaults_to_daemon_port_and_keeps_mdns_name() {
@@ -2089,6 +2209,17 @@ mod tests {
             BrainInvitationRequest,
         };
 
+        assert!(RemoteBrainClient::new(
+            RemoteBrainTarget {
+                brain: "shared".into(),
+                machine: "remote.example".into(),
+                address: "192.0.2.1:11436".into(),
+                secure: false,
+            },
+            "must-not-be-sent",
+        )
+        .is_err());
+
         let temp = tempfile::tempdir().unwrap();
         let authority = super::super::credential::BrainCredentialAuthority::ephemeral([82; 32]);
         let state = Arc::new(
@@ -2167,7 +2298,7 @@ mod tests {
         let read = [BrainCredentialScope::BrainRead]
             .into_iter()
             .collect::<BTreeSet<_>>();
-        let (_, child) = controller
+        let (child_token, child) = controller
             .issue_credential(
                 "reader",
                 AttachmentRole::Observer,
@@ -2177,6 +2308,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(child.delegation_chain, vec![parent.credential_id]);
+        controller
+            .revoke_delegated_credential(&child_token)
+            .await
+            .unwrap();
+        assert!(authority.verify(&child_token, unix_epoch_millis()).is_err());
         let (_, invitation) = controller
             .issue_invitation_with_scopes(
                 AttachmentRole::Observer,
@@ -2186,6 +2322,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(invitation.delegation_chain, vec![parent.credential_id]);
+        let (_, default_invitation) = controller
+            .issue_invitation(AttachmentRole::Observer, Some(10_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            default_invitation.scopes,
+            default_participant_scopes(AttachmentRole::Observer)
+        );
+        assert!(default_invitation.expires_ms - default_invitation.issued_ms <= 10_000);
+
+        let control = [BrainCredentialScope::BrainControl]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let (sibling_token, sibling_claims) = controller
+            .issue_credential(
+                "sibling-controller",
+                AttachmentRole::Driver,
+                control.clone(),
+                Some(20_000),
+            )
+            .await
+            .unwrap();
+        let (other_token, other_claims) = controller
+            .issue_credential(
+                "other-controller",
+                AttachmentRole::Driver,
+                control,
+                Some(20_000),
+            )
+            .await
+            .unwrap();
+        let sibling = RemoteBrainClient::new_with_invitation(
+            target.clone(),
+            controller_invitation.clone(),
+        )
+        .unwrap();
+        *sibling.credential.lock().await = Some(RemoteBrainCredential {
+            token: sibling_token.clone(),
+            claims: sibling_claims.clone(),
+        });
+        assert_eq!(
+            sibling
+                .http
+                .delete(sibling.target.delegated_credential_url(other_claims.credential_id))
+                .bearer_auth(&sibling_token)
+                .json(&serde_json::json!({"credential": other_token}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        let parent_token = controller
+            .credential
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .token
+            .clone();
+        assert_eq!(
+            sibling
+                .http
+                .delete(sibling.target.delegated_credential_url(parent.credential_id))
+                .bearer_auth(sibling_token)
+                .json(&serde_json::json!({"credential": parent_token}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
 
         let escalation = [BrainCredentialScope::EnvironmentAdmin]
             .into_iter()

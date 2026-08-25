@@ -61,6 +61,10 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
             post(issue_named_brain_credential),
         )
         .route(
+            "/v1/brains/named/:name/credentials/:credential_id",
+            axum::routing::delete(revoke_delegated_named_brain_credential),
+        )
+        .route(
             "/v1/brains/named/:name/invitations",
             post(issue_named_brain_invitation),
         )
@@ -105,6 +109,10 @@ pub fn create_remote_brain_router(server: Arc<AgentServer>) -> Router {
         .route(
             "/v1/brains/named/:name/credentials",
             post(issue_named_brain_credential),
+        )
+        .route(
+            "/v1/brains/named/:name/credentials/:credential_id",
+            axum::routing::delete(revoke_delegated_named_brain_credential),
         )
         .route(
             "/v1/brains/named/:name/invitations",
@@ -242,6 +250,11 @@ struct IssueNamedBrainCredentialRequest {
 struct IssueNamedBrainCredentialResponse {
     token: String,
     claims: crate::brain::credential::BrainCredentialClaims,
+}
+
+#[derive(Debug, Deserialize)]
+struct RevokeDelegatedNamedBrainCredentialRequest {
+    credential: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -454,6 +467,42 @@ async fn issue_named_brain_invitation(
         invitation,
         claims,
     }))
+}
+
+async fn revoke_delegated_named_brain_credential(
+    State(server): State<Arc<AgentServer>>,
+    headers: HeaderMap,
+    Path((name, credential_id)): Path<(String, uuid::Uuid)>,
+    Json(request): Json<RevokeDelegatedNamedBrainCredentialRequest>,
+) -> Result<StatusCode, Response> {
+    let delegator = authorize_named_brain(
+        &server,
+        &headers,
+        &name,
+        crate::brain::credential::BrainCredentialScope::BrainControl,
+    )?;
+    let descendant = server
+        .brain_credentials()
+        .verify(&request.credential, unix_epoch_millis())
+        .map_err(|error| brain_auth_error(StatusCode::UNAUTHORIZED, error.to_string()))?;
+    if descendant.credential_id != credential_id
+        || descendant.brain_id != delegator.brain_id
+        || descendant.brain != delegator.brain
+        || descendant.environment_generation != delegator.environment_generation
+        || !descendant
+            .delegation_chain
+            .contains(&delegator.credential_id)
+    {
+        return Err(brain_auth_error(
+            StatusCode::FORBIDDEN,
+            "a controlling credential may revoke only its own descendants",
+        ));
+    }
+    server
+        .brain_credentials()
+        .revoke(credential_id)
+        .map_err(|error| AppError(error).into_response())?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn redeem_named_brain_invitation(
