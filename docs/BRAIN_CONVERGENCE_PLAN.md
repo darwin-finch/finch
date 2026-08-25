@@ -459,6 +459,11 @@ Exit: one store reconstructs Brain and run projections after restart.
 
 - Replace client `BrainSession` ownership with `BrainRun` records plus a daemon-side coordinator and
   environment-runner supervisor.
+- The ordinary child-agent scheduler now enters this supervisor: child task UUIDs are canonical
+  `RunId`s, nested tasks retain ancestry, and a long-lived reverse capability bound to the active
+  runner lease publishes start and terminal state after the spawning RPC has returned. Durable
+  start/finish retries are idempotent and restart reconstructs the same run tree. This completes
+  the subagent slice of B3, not the whole phase.
 - Model speculative typing as a cancellable run in the currently attached Brain.
 - Route questions, plans, approvals, model selection, subagents, and scheduled callbacks by IDs.
 

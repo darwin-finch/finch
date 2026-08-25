@@ -927,6 +927,15 @@ still blocks the corresponding Brain phase until it is unified.
   the runner, and deduplicates the final lifecycle flush. The obsolete client-local `BrainSession`,
   separate typing-time provider, hidden context injection, and ambient question/action shell path
   have been deleted; any future speculative helper must be a visible cancellable `BrainRun` here.
+- [x] Project child-agent scheduler work into the canonical Brain run tree. A runner registration
+  now returns a long-lived, lease-scoped reverse lifecycle capability; spawning beneath an active
+  named-Brain run creates exactly one durable `subagent` run whose `RunId` is the child task UUID,
+  and nested children inherit that run as their parent. Completion, failure, and cancellation
+  publish terminal state through the same capability even after the parent runner RPC returns.
+  Exact start/finish retries are idempotent, conflicting identity reuse fails closed, stale runner
+  leases cannot publish, and child ancestry/outcome reconstructs from the event log after restart.
+  B3 remains open for speculative helpers and any other background activity that still lacks the
+  same canonical lifecycle.
 - [x] Complete Brain control and approval ownership above that substrate. Put the role and approval
   audience on every permission/proposal view. ProgramRuns
   now execute on the leased frontend. Each approval request now carries the daemon-selected
