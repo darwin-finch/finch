@@ -1148,6 +1148,129 @@ fn failed_local_brain_projection(
     }
 }
 
+fn register_named_brain_turn_projection(
+    projections: &mut std::collections::VecDeque<LocalBrainProjection>,
+    run_id: crate::brain::store::RunId,
+    result: &std::result::Result<
+        crate::server::RunnerTurnResult,
+        crate::server::RunnerTurnError,
+    >,
+    transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
+) {
+    match result {
+        Ok(result) => {
+            let tool_ids = result
+                .turn_events
+                .iter()
+                .filter_map(|event| match event {
+                    crate::server::RunnerTurnEvent::Call { tool_id, .. }
+                    | crate::server::RunnerTurnEvent::Result { tool_id, .. } => {
+                        Some(tool_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let approval_ids = result
+                .turn_events
+                .iter()
+                .filter_map(|event| match event {
+                    crate::server::RunnerTurnEvent::ApprovalRequested { approval_id, .. }
+                    | crate::server::RunnerTurnEvent::ApprovalDecided { approval_id, .. } => {
+                        Some(approval_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            projections.push_back(LocalBrainProjection {
+                run_id,
+                source: result.source.clone(),
+                output: result.output.clone(),
+                tool_ids,
+                approval_ids,
+                program_seq: None,
+                transient_output_unit,
+                failed: false,
+            });
+        }
+        Err(error) => projections.push_back(failed_local_brain_projection(
+            run_id,
+            &error.turn_events,
+            transient_output_unit,
+        )),
+    }
+}
+
+fn named_brain_wire_source(
+    messages: Vec<crate::claude::Message>,
+) -> anyhow::Result<(String, crate::brain::store::ProgramLanguage)> {
+    let source = messages
+        .into_iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .map(|message| message.text())
+        .filter(|source| !source.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("named Brain turn produced no wire source"))?;
+    let language = match crate::programs::ProgramLanguage::infer_wire_source(&source)? {
+        crate::programs::ProgramLanguage::Forth => {
+            crate::brain::store::ProgramLanguage::Forth
+        }
+        crate::programs::ProgramLanguage::Lisp => {
+            crate::brain::store::ProgramLanguage::Lisp
+        }
+    };
+    Ok((source, language))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_named_brain_turn(
+    projections: &mut std::collections::VecDeque<LocalBrainProjection>,
+    run_id: crate::brain::store::RunId,
+    messages: anyhow::Result<Vec<crate::claude::Message>>,
+    program_runtime: &crate::runtime::ProgramRuntime,
+    output: String,
+    turn_events: Vec<crate::server::RunnerTurnEvent>,
+    effect_journal: Vec<crate::server::RunnerEffectRecord>,
+    commit_ack: Option<crate::server::RunnerTurnCommitAck>,
+    transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
+) -> std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError> {
+    let result = (|| -> anyhow::Result<crate::server::RunnerTurnResult> {
+        let (source, language) = named_brain_wire_source(messages?)?;
+        let runtime_revision = program_runtime.revision();
+        let checkpoint = program_runtime
+            .revision_history()?
+            .into_iter()
+            .find(|snapshot| snapshot.revision == runtime_revision)
+            .and_then(|snapshot| snapshot.checkpoint)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "named Brain revision {runtime_revision} is not checkpointable"
+                )
+            })?;
+        Ok(crate::server::RunnerTurnResult {
+            source,
+            language,
+            output,
+            turn_events: turn_events.clone(),
+            runtime_revision,
+            checkpoint,
+            effect_journal: effect_journal.clone(),
+            commit_ack,
+        })
+    })()
+    .map_err(|error| crate::server::RunnerTurnError {
+        message: error.to_string(),
+        turn_events,
+        effect_journal,
+    });
+    register_named_brain_turn_projection(
+        projections,
+        run_id,
+        &result,
+        transient_output_unit,
+    );
+    result
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalProjectionMatch {
     None,
@@ -4847,91 +4970,22 @@ Rules:\n\
             });
             crate::server::RunnerTurnCommitAck::new(commit_tx)
         });
-        let result = (|| -> anyhow::Result<crate::server::RunnerTurnResult> {
-            let messages = self
-                .conversation
-                .try_read()
-                .map_err(|_| anyhow::anyhow!("named Brain conversation is busy"))?
-                .get_messages();
-            let source = messages
-                .into_iter()
-                .rev()
-                .find(|message| message.role == "assistant")
-                .map(|message| message.text())
-                .filter(|source| !source.trim().is_empty())
-                .ok_or_else(|| anyhow::anyhow!("named Brain turn produced no wire source"))?;
-            let language = match crate::programs::ProgramLanguage::infer_wire_source(&source)? {
-                crate::programs::ProgramLanguage::Forth => {
-                    crate::brain::store::ProgramLanguage::Forth
-                }
-                crate::programs::ProgramLanguage::Lisp => {
-                    crate::brain::store::ProgramLanguage::Lisp
-                }
-            };
-            let runtime_revision = self.program_runtime.revision();
-            let checkpoint = self
-                .program_runtime
-                .revision_history()?
-                .into_iter()
-                .find(|snapshot| snapshot.revision == runtime_revision)
-                .and_then(|snapshot| snapshot.checkpoint)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "named Brain revision {runtime_revision} is not checkpointable"
-                    )
-                })?;
-            Ok(crate::server::RunnerTurnResult {
-                source,
-                language,
-                output,
-                turn_events: turn_events.clone(),
-                runtime_revision,
-                checkpoint,
-                effect_journal: effect_journal.clone(),
-                commit_ack,
-            })
-        })()
-        .map_err(|error| crate::server::RunnerTurnError {
-            message: error.to_string(),
+        let messages = self
+            .conversation
+            .try_read()
+            .map(|conversation| conversation.get_messages())
+            .map_err(|_| anyhow::anyhow!("named Brain conversation is busy"));
+        let result = assemble_named_brain_turn(
+            &mut self.local_brain_projections,
+            run_id,
+            messages,
+            self.program_runtime.as_ref(),
+            output,
             turn_events,
             effect_journal,
-        });
-        if let Ok(result) = &result {
-            let tool_ids = result
-                .turn_events
-                .iter()
-                .filter_map(|event| match event {
-                    crate::server::RunnerTurnEvent::Call { tool_id, .. }
-                    | crate::server::RunnerTurnEvent::Result { tool_id, .. } => {
-                        Some(tool_id.clone())
-                    }
-                    crate::server::RunnerTurnEvent::ApprovalRequested { .. }
-                    | crate::server::RunnerTurnEvent::ApprovalDecided { .. } => None,
-                })
-                .collect();
-            let approval_ids = result
-                .turn_events
-                .iter()
-                .filter_map(|event| match event {
-                    crate::server::RunnerTurnEvent::ApprovalRequested { approval_id, .. }
-                    | crate::server::RunnerTurnEvent::ApprovalDecided { approval_id, .. } => {
-                        Some(approval_id.clone())
-                    }
-                    crate::server::RunnerTurnEvent::Call { .. }
-                    | crate::server::RunnerTurnEvent::Result { .. } => None,
-                })
-                .collect();
-            self.local_brain_projections.push_back(LocalBrainProjection {
-                run_id,
-                source: result.source.clone(),
-                output: result.output.clone(),
-                tool_ids,
-                approval_ids,
-                program_seq: None,
-                transient_output_unit,
-                failed: false,
-            });
-        }
+            commit_ack,
+            transient_output_unit,
+        );
         let _ = response_tx.send(result);
     }
 
@@ -8843,7 +8897,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_home_tool_rounds_reconcile_durable_error_without_duplicates() {
+    fn missing_final_wire_after_home_tool_rounds_reconciles_durable_error() {
         use crate::brain::store::{
             AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
         };
@@ -8883,7 +8937,7 @@ mod tests {
         local_unit.complete_row(approval_row, "approve_once by daemon");
         let transient_output_unit = output.start_work_unit("VM program output");
         transient_output_unit.set_program_output();
-        transient_output_unit.set_response("provider disconnected");
+        transient_output_unit.set_response("named Brain turn produced no wire source");
         transient_output_unit.set_failed();
         assert_eq!(output.get_messages().len(), 2);
 
@@ -8929,7 +8983,7 @@ mod tests {
             BrainEventKind::Result {
                 request_seq: 1,
                 output: String::new(),
-                error: Some("provider disconnected".into()),
+                error: Some("named Brain turn produced no wire source".into()),
             },
             BrainEventKind::RunStatusChanged {
                 run_id,
@@ -8972,15 +9026,24 @@ mod tests {
                 decision: serde_json::json!({"choice": "approve_once"}),
             },
         ];
-        let failed_projection = super::failed_local_brain_projection(
+        let mut local_projections = std::collections::VecDeque::new();
+        let assembly_result = super::assemble_named_brain_turn(
+            &mut local_projections,
             run_id,
-            &failed_turn_events,
+            Ok(Vec::new()),
+            &crate::runtime::ProgramRuntime::new(),
+            String::new(),
+            failed_turn_events,
+            Vec::new(),
+            None,
             Some(transient_output_unit),
         );
-        assert_eq!(failed_projection.tool_ids.len(), 2);
-        assert_eq!(failed_projection.approval_ids.len(), 1);
-        let mut local_projections =
-            std::collections::VecDeque::from([failed_projection]);
+        assert_eq!(
+            assembly_result.unwrap_err().message,
+            "named Brain turn produced no wire source"
+        );
+        assert_eq!(local_projections[0].tool_ids.len(), 2);
+        assert_eq!(local_projections[0].approval_ids.len(), 1);
 
         for event in &events {
             assert!(super::project_remote_brain_live_run_event(
@@ -9003,7 +9066,12 @@ mod tests {
         let messages = output.get_messages();
         assert_eq!(messages.len(), 1);
         let rendered = messages[0].format(&crate::config::ColorScheme::default());
-        for expected in ["tool-one", "tool-two", "approval (tool)", "provider disconnected"] {
+        for expected in [
+            "tool-one",
+            "tool-two",
+            "approval (tool)",
+            "named Brain turn produced no wire source",
+        ] {
             assert!(rendered.contains(expected), "missing {expected:?}:\n{rendered}");
             assert_eq!(rendered.matches(expected).count(), 1, "duplicated {expected:?}");
         }
