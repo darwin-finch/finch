@@ -184,7 +184,7 @@ impl ShadowBuffer {
         let mut all_lines: Vec<(String, Style)> = Vec::new(); // (line_text, style)
         for msg in messages {
             let formatted = msg.format(colors);
-            let style = msg.background_style().unwrap_or_default();
+            let style = msg.background_style(colors).unwrap_or_default();
             for line in formatted.lines() {
                 all_lines.push((line.to_string(), style));
             }
@@ -446,6 +446,9 @@ pub fn diff_buffers(current: &ShadowBuffer, previous: &ShadowBuffer) -> Vec<(usi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::messages::UserQueryMessage;
+    use crate::config::{ColorTheme, MessageBand};
+    use std::sync::Arc;
 
     #[test]
     fn test_visible_length() {
@@ -629,6 +632,20 @@ mod tests {
         assert_eq!(rows, 1);
         assert_eq!(buf.get(0, 0).unwrap().ch, 'r');
         assert_eq!(buf.get(2, 0).unwrap().ch, 'd');
+    }
+
+    #[test]
+    fn message_band_fills_the_complete_terminal_row() {
+        let colors = ColorTheme::Dark.to_scheme();
+        let expected = colors.message_band_style(MessageBand::LocalUser);
+        let messages: Vec<MessageRef> = vec![Arc::new(UserQueryMessage::new("hello"))];
+        let mut buf = ShadowBuffer::new(24, 2);
+
+        buf.render_messages(&messages, &colors);
+
+        for column in 0..buf.width {
+            assert_eq!(buf.get(column, 1).unwrap().style, expected);
+        }
     }
 
     #[test]

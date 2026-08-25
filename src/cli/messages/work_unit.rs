@@ -55,7 +55,7 @@ pub fn random_spinner_verb() -> &'static str {
 }
 
 use super::{Message, MessageId, MessageStatus};
-use crate::config::ColorScheme;
+use crate::config::{ColorScheme, MessageBand};
 
 // Animation frames: small → large → small (creates a "throb" pulse effect)
 const THROB_FRAMES: &[&str] = &["✦", "✳", "✼", "✳"];
@@ -545,6 +545,17 @@ impl Message for WorkUnit {
             .response_text
             .clone()
     }
+
+    fn background_style(&self, colors: &ColorScheme) -> Option<ratatui::style::Style> {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let band = match &inner.presentation {
+            WorkUnitPresentation::ProgramSource { .. } => MessageBand::ProgramSource,
+            WorkUnitPresentation::ProgramOutput { .. } => MessageBand::ProgramOutput,
+            WorkUnitPresentation::Assistant if !inner.rows.is_empty() => MessageBand::Tool,
+            WorkUnitPresentation::Assistant => MessageBand::Assistant,
+        };
+        Some(colors.message_band_style(band))
+    }
 }
 
 // ============================================================================
@@ -825,6 +836,28 @@ mod tests {
         output.add_tokens("one two");
         output.set_complete();
         assert_eq!(output.format(&colors()), "hello");
+    }
+
+    #[test]
+    fn presentation_and_tool_state_choose_distinct_semantic_bands() {
+        let colors = crate::config::ColorTheme::Dark.to_scheme();
+        let assistant = WorkUnit::new("assistant");
+        let source = WorkUnit::new("source");
+        source.set_program_source("forth");
+        let output = WorkUnit::new("output");
+        output.set_program_output();
+        let tools = WorkUnit::new("tools");
+        tools.add_row("bash(test)");
+
+        let styles = [
+            assistant.background_style(&colors),
+            source.background_style(&colors),
+            output.background_style(&colors),
+            tools.background_style(&colors),
+        ];
+        for (index, style) in styles.iter().enumerate() {
+            assert!(styles[index + 1..].iter().all(|other| style != other));
+        }
     }
 
     #[test]

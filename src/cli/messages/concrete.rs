@@ -4,7 +4,7 @@
 // No need for downcasting - handlers receive concrete types directly.
 
 use super::{Message, MessageId, MessageStatus};
-use crate::config::{ColorScheme, ColorSpec};
+use crate::config::{ColorScheme, ColorSpec, MessageBand};
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
 use std::fmt;
 use std::sync::{Arc, RwLock};
@@ -91,14 +91,8 @@ impl Message for UserQueryMessage {
         self.content.clone()
     }
 
-    fn background_style(&self) -> Option<ratatui::style::Style> {
-        use ratatui::style::{Color, Style};
-        // Grey background for user messages (like Claude Code)
-        Some(
-            Style::default()
-                .bg(Color::Rgb(220, 220, 220))
-                .fg(Color::Black),
-        )
+    fn background_style(&self, colors: &ColorScheme) -> Option<ratatui::style::Style> {
+        Some(colors.message_band_style(MessageBand::LocalUser))
     }
 }
 
@@ -141,20 +135,11 @@ impl BrainParticipantMessage {
             .fold(0xcbf29ce484222325_u64, |hash, byte| {
                 (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
             });
-        (hash as usize) % PARTICIPANT_BACKGROUNDS.len()
+        (hash as usize) % PARTICIPANT_PALETTE_SIZE
     }
 }
 
-const PARTICIPANT_BACKGROUNDS: [(u8, u8, u8); 8] = [
-    (226, 238, 255),
-    (232, 246, 230),
-    (255, 239, 219),
-    (243, 231, 255),
-    (224, 246, 246),
-    (255, 229, 235),
-    (241, 240, 218),
-    (231, 235, 242),
-];
+const PARTICIPANT_PALETTE_SIZE: usize = 8;
 
 impl Message for BrainParticipantMessage {
     fn id(&self) -> MessageId {
@@ -180,14 +165,8 @@ impl Message for BrainParticipantMessage {
         format!("{}: {}", self.subject, self.content)
     }
 
-    fn background_style(&self) -> Option<ratatui::style::Style> {
-        use ratatui::style::{Color, Style};
-        let (red, green, blue) = PARTICIPANT_BACKGROUNDS[self.palette_index()];
-        Some(
-            Style::default()
-                .bg(Color::Rgb(red, green, blue))
-                .fg(Color::Black),
-        )
+    fn background_style(&self, colors: &ColorScheme) -> Option<ratatui::style::Style> {
+        Some(colors.message_band_style(MessageBand::Participant(self.palette_index())))
     }
 }
 
@@ -352,6 +331,10 @@ impl Message for StreamingResponseMessage {
                 poisoned.into_inner().clone()
             }
         }
+    }
+
+    fn background_style(&self, colors: &ColorScheme) -> Option<ratatui::style::Style> {
+        Some(colors.message_band_style(MessageBand::Assistant))
     }
 }
 
@@ -561,6 +544,10 @@ impl Message for ToolExecutionMessage {
 
         format!("{}\n{}", stdout, stderr)
     }
+
+    fn background_style(&self, colors: &ColorScheme) -> Option<ratatui::style::Style> {
+        Some(colors.message_band_style(MessageBand::Tool))
+    }
 }
 
 // ============================================================================
@@ -687,6 +674,10 @@ impl Message for LiveToolMessage {
             self.header,
             self.content.read().map(|c| c.clone()).unwrap_or_default()
         )
+    }
+
+    fn background_style(&self, colors: &ColorScheme) -> Option<ratatui::style::Style> {
+        Some(colors.message_band_style(MessageBand::Tool))
     }
 }
 
@@ -818,6 +809,10 @@ impl Message for OperationMessage {
 
     fn content(&self) -> String {
         self.header.clone()
+    }
+
+    fn background_style(&self, colors: &ColorScheme) -> Option<ratatui::style::Style> {
+        Some(colors.message_band_style(MessageBand::Tool))
     }
 }
 
@@ -984,6 +979,10 @@ impl Message for ProgressMessage {
 
         format!("{}: {}/{}", self.label, current, self.total)
     }
+
+    fn background_style(&self, colors: &ColorScheme) -> Option<ratatui::style::Style> {
+        Some(colors.message_band_style(MessageBand::Tool))
+    }
 }
 
 // ============================================================================
@@ -1117,13 +1116,14 @@ mod tests {
         assert!(prompt.format(&colors).contains("❯ alice@box: please inspect"));
         assert!(relay.format(&colors).contains("◆ alice@box: I agree"));
         assert_eq!(
-            prompt.background_style(),
-            BrainParticipantMessage::new("alice@box", "again", true).background_style()
+            prompt.background_style(&colors),
+            BrainParticipantMessage::new("alice@box", "again", true).background_style(&colors)
         );
         assert_ne!(
-            prompt.background_style(),
-            BrainParticipantMessage::new("bob@box", "hello", false).background_style()
+            prompt.background_style(&colors),
+            BrainParticipantMessage::new("bob@box", "hello", false).background_style(&colors)
         );
+        assert_eq!(prompt.content(), "alice@box: please inspect");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 // Allows users to customize terminal UI colors for accessibility
 // and personal preference.
 
-use ratatui::style::Color;
+use ratatui::style::{Color, Style};
 use serde::{Deserialize, Serialize};
 
 /// Predefined color themes for different terminal backgrounds
@@ -208,6 +208,17 @@ pub struct ColorScheme {
     pub dialog: DialogColors,
 }
 
+/// Semantic full-row bands used by the transcript renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageBand {
+    LocalUser,
+    Participant(usize),
+    Assistant,
+    ProgramSource,
+    Tool,
+    ProgramOutput,
+}
+
 impl Default for ColorScheme {
     fn default() -> Self {
         Self {
@@ -216,6 +227,65 @@ impl Default for ColorScheme {
             ui: default_ui_colors(),
             dialog: default_dialog_colors(),
         }
+    }
+}
+
+impl ColorScheme {
+    /// Return a subtle, contrast-safe full-row style for a transcript role.
+    /// A light assistant foreground indicates a dark terminal palette (and
+    /// vice versa), so custom schemes need no second theme discriminator.
+    pub fn message_band_style(&self, band: MessageBand) -> Style {
+        const LIGHT_PARTICIPANTS: [(u8, u8, u8); 8] = [
+            (226, 238, 255),
+            (232, 246, 230),
+            (255, 239, 219),
+            (243, 231, 255),
+            (224, 246, 246),
+            (255, 229, 235),
+            (241, 240, 218),
+            (231, 235, 242),
+        ];
+        const DARK_PARTICIPANTS: [(u8, u8, u8); 8] = [
+            (24, 49, 70),
+            (27, 55, 42),
+            (62, 44, 24),
+            (51, 36, 66),
+            (22, 53, 55),
+            (65, 34, 43),
+            (54, 52, 27),
+            (42, 47, 58),
+        ];
+
+        let dark_terminal = color_luminance(&self.messages.assistant) >= 0.5;
+        let (foreground, background) = if dark_terminal {
+            let background = match band {
+                MessageBand::LocalUser => (28, 45, 64),
+                MessageBand::Participant(index) => {
+                    DARK_PARTICIPANTS[index % DARK_PARTICIPANTS.len()]
+                }
+                MessageBand::Assistant => (32, 36, 43),
+                MessageBand::ProgramSource => (45, 35, 55),
+                MessageBand::Tool => (50, 43, 22),
+                MessageBand::ProgramOutput => (24, 49, 42),
+            };
+            (Color::Rgb(245, 247, 250), background)
+        } else {
+            let background = match band {
+                MessageBand::LocalUser => (226, 238, 255),
+                MessageBand::Participant(index) => {
+                    LIGHT_PARTICIPANTS[index % LIGHT_PARTICIPANTS.len()]
+                }
+                MessageBand::Assistant => (247, 247, 244),
+                MessageBand::ProgramSource => (243, 231, 255),
+                MessageBand::Tool => (255, 243, 214),
+                MessageBand::ProgramOutput => (224, 246, 236),
+            };
+            (Color::Rgb(18, 22, 28), background)
+        };
+
+        Style::default()
+            .fg(foreground)
+            .bg(Color::Rgb(background.0, background.1, background.2))
     }
 }
 
@@ -370,6 +440,23 @@ impl ColorSpec {
     }
 }
 
+fn color_luminance(color: &ColorSpec) -> f32 {
+    let (red, green, blue) = match color.to_color() {
+        Color::Black => (0, 0, 0),
+        Color::Red | Color::LightRed => (255, 0, 0),
+        Color::Green | Color::LightGreen => (0, 255, 0),
+        Color::Yellow | Color::LightYellow => (255, 255, 0),
+        Color::Blue | Color::LightBlue => (0, 0, 255),
+        Color::Magenta | Color::LightMagenta => (255, 0, 255),
+        Color::Cyan | Color::LightCyan => (0, 255, 255),
+        Color::Gray | Color::White => (255, 255, 255),
+        Color::DarkGray => (128, 128, 128),
+        Color::Rgb(red, green, blue) => (red, green, blue),
+        _ => (255, 255, 255),
+    };
+    (0.2126 * f32::from(red) + 0.7152 * f32::from(green) + 0.0722 * f32::from(blue)) / 255.0
+}
+
 /// Parse named color string to ratatui Color
 fn parse_named_color(name: &str) -> Color {
     match name.to_lowercase().as_str() {
@@ -430,6 +517,31 @@ fn default_black() -> ColorSpec {
 mod tests {
     use super::*;
 
+    fn rgb(color: Color) -> (u8, u8, u8) {
+        match color {
+            Color::Rgb(red, green, blue) => (red, green, blue),
+            other => panic!("expected RGB color, got {other:?}"),
+        }
+    }
+
+    fn contrast(style: Style) -> f32 {
+        fn linear(component: u8) -> f32 {
+            let value = f32::from(component) / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn relative((red, green, blue): (u8, u8, u8)) -> f32 {
+            0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+        }
+
+        let foreground = relative(rgb(style.fg.expect("band foreground")));
+        let background = relative(rgb(style.bg.expect("band background")));
+        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+    }
+
     #[test]
     fn test_default_color_scheme() {
         let scheme = ColorScheme::default();
@@ -470,5 +582,52 @@ mod tests {
 
         let spec = ColorSpec::Rgb(128, 128, 128);
         assert_eq!(spec.to_color(), Color::Rgb(128, 128, 128));
+    }
+
+    #[test]
+    fn transcript_bands_are_distinct_and_legible_in_light_and_dark_themes() {
+        let bands = [
+            MessageBand::LocalUser,
+            MessageBand::Assistant,
+            MessageBand::ProgramSource,
+            MessageBand::Tool,
+            MessageBand::ProgramOutput,
+        ];
+
+        for theme in [ColorTheme::Dark, ColorTheme::Light] {
+            let scheme = theme.to_scheme();
+            let styles = bands.map(|band| scheme.message_band_style(band));
+            for style in styles {
+                assert!(
+                    contrast(style) >= 7.0,
+                    "{theme:?} band contrast was too low"
+                );
+            }
+            for (index, style) in styles.iter().enumerate() {
+                assert!(styles[index + 1..].iter().all(|other| style.bg != other.bg));
+            }
+        }
+    }
+
+    #[test]
+    fn participant_palette_switches_with_theme_and_is_index_stable() {
+        let dark = ColorTheme::Dark.to_scheme();
+        let light = ColorTheme::Light.to_scheme();
+        let dark_alice = dark.message_band_style(MessageBand::Participant(3));
+
+        assert_eq!(
+            dark_alice,
+            dark.message_band_style(MessageBand::Participant(3))
+        );
+        assert_ne!(
+            dark_alice.bg,
+            dark.message_band_style(MessageBand::Participant(4)).bg
+        );
+        assert_ne!(
+            dark_alice.bg,
+            light.message_band_style(MessageBand::Participant(3)).bg
+        );
+        assert!(contrast(dark_alice) >= 7.0);
+        assert!(contrast(light.message_band_style(MessageBand::Participant(3))) >= 7.0);
     }
 }

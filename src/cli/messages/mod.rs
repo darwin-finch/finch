@@ -72,7 +72,10 @@ pub trait Message: Send + Sync {
 
     /// Get the background style for this message type (for TUI rendering)
     /// Returns None for default (no background)
-    fn background_style(&self) -> Option<ratatui::style::Style> {
+    fn background_style(
+        &self,
+        _colors: &crate::config::ColorScheme,
+    ) -> Option<ratatui::style::Style> {
         None // Default: no background
     }
 }

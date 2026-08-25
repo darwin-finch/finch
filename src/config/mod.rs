@@ -13,7 +13,8 @@ mod settings;
 pub use backend::BackendDevice; // Deprecated alias for ExecutionTarget
 pub use backend::{BackendConfig, ExecutionTarget};
 pub use colors::{
-    ColorScheme, ColorSpec, ColorTheme, DialogColors, MessageColors, StatusColors, UiColors,
+    ColorScheme, ColorSpec, ColorTheme, DialogColors, MessageBand, MessageColors, StatusColors,
+    UiColors,
 };
 pub use loader::load_config;
 pub use persona::Persona;
