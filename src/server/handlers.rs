@@ -813,7 +813,12 @@ fn commit_named_brain_approval_decision(
     decision: serde_json::Value,
 ) -> anyhow::Result<crate::brain::shared::BrainEvent> {
     let snapshot = store.snapshot(name)?;
-    let claimed = approvals.claim(snapshot.brain_id, approval_id, attachment.attachment_id)?;
+    let claimed = approvals.claim(
+        snapshot.brain_id,
+        request_seq,
+        approval_id,
+        attachment.attachment_id,
+    )?;
     if claimed.request_seq != request_seq
         || claimed.audience.brain_id != snapshot.brain_id
         || claimed.audience.brain != name
@@ -3235,7 +3240,12 @@ mod named_brain_provider_context_tests {
         )
         .is_err());
         let claimed = approvals
-            .claim(snapshot.brain_id, "approval-1", attachment.attachment_id)
+            .claim(
+                snapshot.brain_id,
+                request_seq,
+                "approval-1",
+                attachment.attachment_id,
+            )
             .unwrap();
         claimed.complete(serde_json::json!({"choice": "deny"}));
         assert_eq!(registration.wait().await.unwrap()["choice"], "deny");

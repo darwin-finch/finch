@@ -16,6 +16,7 @@ use crate::brain::shared::{AttachmentId, BrainApprovalAudience, BrainId};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ApprovalKey {
     brain_id: BrainId,
+    request_seq: u64,
     approval_id: String,
 }
 
@@ -51,15 +52,17 @@ impl BrainApprovalBroker {
     ) -> Result<ApprovalRegistration> {
         let key = ApprovalKey {
             brain_id: audience.brain_id,
+            request_seq,
             approval_id: approval_id.into(),
         };
         let (response_tx, response_rx) = oneshot::channel();
         let mut pending = self.pending.lock().expect("approval broker lock poisoned");
         anyhow::ensure!(
             !pending.contains_key(&key),
-            "approval '{}' is already pending for Brain {}",
+            "approval '{}' is already pending for Brain {} request {}",
             key.approval_id,
-            key.brain_id.0
+            key.brain_id.0,
+            key.request_seq
         );
         pending.insert(
             key.clone(),
@@ -79,17 +82,21 @@ impl BrainApprovalBroker {
     pub fn claim(
         &self,
         brain_id: BrainId,
+        request_seq: u64,
         approval_id: &str,
         attachment_id: AttachmentId,
     ) -> Result<ClaimedApproval> {
         let key = ApprovalKey {
             brain_id,
+            request_seq,
             approval_id: approval_id.to_string(),
         };
         let mut pending = self.pending.lock().expect("approval broker lock poisoned");
         let request = pending
             .get(&key)
-            .with_context(|| format!("approval '{approval_id}' is not pending"))?;
+            .with_context(|| {
+                format!("approval '{approval_id}' is not pending for request {request_seq}")
+            })?;
         anyhow::ensure!(
             request.audience.attachment_id == attachment_id,
             "attachment is not the approval audience"
@@ -205,12 +212,13 @@ mod tests {
         assert!(broker
             .claim(
                 audience.brain_id,
+                7,
                 "approval-1",
                 AttachmentId(uuid::Uuid::new_v4()),
             )
             .is_err());
         let claimed = broker
-            .claim(audience.brain_id, "approval-1", attachment_id)
+            .claim(audience.brain_id, 7, "approval-1", attachment_id)
             .unwrap();
         assert_eq!(claimed.request_seq, 7);
         claimed.complete(serde_json::json!({"choice": "allow_once"}));
@@ -248,10 +256,30 @@ mod tests {
         waiter.abort();
         let _ = waiter.await;
 
-        let error = match broker.claim(audience.brain_id, "approval-1", attachment_id) {
+        let error = match broker.claim(audience.brain_id, 7, "approval-1", attachment_id) {
             Ok(_) => panic!("cancelled approval remained pending"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("not pending"));
+    }
+
+    #[tokio::test]
+    async fn stale_request_sequence_cannot_consume_a_pending_approval() {
+        let broker = BrainApprovalBroker::default();
+        let attachment_id = AttachmentId(uuid::Uuid::new_v4());
+        let audience = audience(attachment_id);
+        let registration = broker.register(7, "approval-1", audience.clone()).unwrap();
+
+        let stale_error = match broker.claim(audience.brain_id, 6, "approval-1", attachment_id) {
+            Ok(_) => panic!("stale sequence consumed the pending approval"),
+            Err(error) => error,
+        };
+        assert!(stale_error.to_string().contains("request 6"));
+
+        let claimed = broker
+            .claim(audience.brain_id, 7, "approval-1", attachment_id)
+            .unwrap();
+        claimed.complete(serde_json::json!({"choice": "allow_once"}));
+        assert_eq!(registration.wait().await.unwrap()["choice"], "allow_once");
     }
 }
