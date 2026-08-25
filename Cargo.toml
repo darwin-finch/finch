@@ -34,6 +34,8 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "str
 axum = { version = "0.7", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+rustls = "0.22"
+rustls23 = { package = "rustls", version = "0.23", default-features = false, features = ["ring", "std"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 

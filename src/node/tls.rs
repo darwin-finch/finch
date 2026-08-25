@@ -59,6 +59,13 @@ impl NodeTlsIdentity {
     }
 }
 
+/// Finch's dependency graph contains both ring and aws-lc users. Rustls 0.23
+/// requires the application to choose one process-wide provider explicitly
+/// when that happens.
+pub fn install_server_crypto_provider() {
+    let _ = rustls23::crypto::ring::default_provider().install_default();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

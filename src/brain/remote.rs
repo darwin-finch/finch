@@ -16,7 +16,7 @@ use super::shared::{
     BrainWireMessage,
 };
 
-pub const DEFAULT_BRAIN_PORT: u16 = 11435;
+pub const DEFAULT_BRAIN_PORT: u16 = crate::config::constants::DEFAULT_BRAIN_TLS_PORT;
 const ATTACHMENT_IDENTITIES_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +131,7 @@ pub struct RemoteBrainTarget {
     pub brain: String,
     pub machine: String,
     pub address: String,
+    pub secure: bool,
 }
 
 impl RemoteBrainTarget {
@@ -159,6 +160,7 @@ impl RemoteBrainTarget {
             brain: brain.to_string(),
             machine,
             address,
+            secure: true,
         })
     }
 
@@ -176,15 +178,38 @@ impl RemoteBrainTarget {
         if address.is_empty() || address.contains('/') {
             anyhow::bail!("local daemon address is invalid");
         }
-        Self::parse(&format!("{brain}@{address}"))
+        let mut target = Self::parse(&format!("{brain}@{address}"))?;
+        target.secure = false;
+        Ok(target)
+    }
+
+    fn http_scheme(&self) -> &'static str {
+        if self.secure {
+            "https"
+        } else {
+            "http"
+        }
+    }
+
+    fn websocket_scheme(&self) -> &'static str {
+        if self.secure {
+            "wss"
+        } else {
+            "ws"
+        }
     }
 
     fn http_url(&self) -> String {
-        format!("http://{}/v1/brains/named/{}", self.address, self.brain)
+        format!(
+            "{}://{}/v1/brains/named/{}",
+            self.http_scheme(),
+            self.address,
+            self.brain
+        )
     }
 
     fn collection_url(&self) -> String {
-        format!("http://{}/v1/brains/named", self.address)
+        format!("{}://{}/v1/brains/named", self.http_scheme(), self.address)
     }
 
     fn attachments_url(&self) -> String {
@@ -200,7 +225,11 @@ impl RemoteBrainTarget {
     }
 
     fn invitation_redemption_url(&self) -> String {
-        format!("http://{}/v1/brains/invitations/redeem", self.address)
+        format!(
+            "{}://{}/v1/brains/invitations/redeem",
+            self.http_scheme(),
+            self.address
+        )
     }
 
     fn ws_url(&self, attachment: &BrainAttachment) -> Result<String> {
@@ -208,8 +237,12 @@ impl RemoteBrainTarget {
             .connection_id
             .context("Brain attachment has no live connection")?;
         Ok(format!(
-            "ws://{}/v1/brains/named/{}/ws?attachment_id={}&connection_id={}",
-            self.address, self.brain, attachment.attachment_id.0, connection_id.0
+            "{}://{}/v1/brains/named/{}/ws?attachment_id={}&connection_id={}",
+            self.websocket_scheme(),
+            self.address,
+            self.brain,
+            attachment.attachment_id.0,
+            connection_id.0
         ))
     }
 }
@@ -225,6 +258,7 @@ pub struct RemoteBrainClient {
     bootstrap: RemoteBrainBootstrap,
     credential: std::sync::Arc<tokio::sync::Mutex<Option<RemoteBrainCredential>>>,
     http: Client,
+    websocket_connector: Option<tokio_tungstenite::Connector>,
     attachment: Option<BrainAttachment>,
     session: std::sync::Arc<tokio::sync::Mutex<Option<RemoteBrainSession>>>,
 }
@@ -264,6 +298,10 @@ struct RemoteBrainRequest {
 
 impl RemoteBrainClient {
     pub fn new(target: RemoteBrainTarget, password: impl Into<String>) -> Result<Self> {
+        anyhow::ensure!(
+            !target.secure,
+            "remote Brain password bootstrap is disabled; join with a signed invitation"
+        );
         Ok(Self {
             target,
             bootstrap: RemoteBrainBootstrap::Password(password.into()),
@@ -271,6 +309,7 @@ impl RemoteBrainClient {
             http: Client::builder()
                 .timeout(std::time::Duration::from_secs(180))
                 .build()?,
+            websocket_connector: None,
             attachment: None,
             session: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
@@ -286,6 +325,35 @@ impl RemoteBrainClient {
         if claims.brain != target.brain {
             anyhow::bail!("Brain invitation names a different Brain target");
         }
+        let certificate_der = super::credential::invitation_tls_certificate_der(&claims)?;
+        let (http, websocket_connector) = if target.secure {
+            let certificate = reqwest::Certificate::from_der(&certificate_der)
+                .context("Brain invitation contains an invalid TLS certificate")?;
+            let http = Client::builder()
+                .timeout(std::time::Duration::from_secs(180))
+                .add_root_certificate(certificate)
+                .build()?;
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(rustls::pki_types::CertificateDer::from(certificate_der))
+                .context("Brain invitation TLS certificate cannot be trusted")?;
+            let tls = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            (
+                http,
+                Some(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
+                    tls,
+                ))),
+            )
+        } else {
+            (
+                Client::builder()
+                    .timeout(std::time::Duration::from_secs(180))
+                    .build()?,
+                None,
+            )
+        };
         Ok(Self {
             target,
             bootstrap: RemoteBrainBootstrap::Invitation {
@@ -293,9 +361,8 @@ impl RemoteBrainClient {
                 node_public_key,
             },
             credential: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-            http: Client::builder()
-                .timeout(std::time::Duration::from_secs(180))
-                .build()?,
+            http,
+            websocket_connector,
             attachment: None,
             session: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
@@ -694,9 +761,14 @@ impl RemoteBrainClient {
             tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
             format!("Bearer {}", self.authorized_token().await?).parse()?,
         );
-        let (mut socket, _) = tokio_tungstenite::connect_async(request)
-            .await
-            .context("could not open brain event stream")?;
+        let (mut socket, _) = tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            None,
+            false,
+            self.websocket_connector.clone(),
+        )
+        .await
+        .context("could not open brain event stream")?;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<RemoteBrainRequest>();
         let session_id = uuid::Uuid::new_v4();
@@ -1163,7 +1235,8 @@ mod tests {
     fn target_defaults_to_daemon_port_and_keeps_mdns_name() {
         let target = RemoteBrainTarget::parse("finch@workstation.local").unwrap();
         assert_eq!(target.display_name(), "finch@workstation.local");
-        assert_eq!(target.address, "workstation.local:11435");
+        assert_eq!(target.address, "workstation.local:11436");
+        assert!(target.secure);
     }
 
     #[test]
@@ -1178,6 +1251,7 @@ mod tests {
         let target = RemoteBrainTarget::local("review", "http://127.0.0.1:11435").unwrap();
         assert_eq!(target.brain, "review");
         assert_eq!(target.address, "127.0.0.1:11435");
+        assert!(!target.secure);
     }
 
     #[test]
@@ -1286,6 +1360,7 @@ mod tests {
             brain: "shared".into(),
             machine: "fixture.local".into(),
             address: address.to_string(),
+            secure: false,
         };
 
         let owner = RemoteBrainClient::new(target.clone(), "owner-secret").unwrap();
@@ -1307,6 +1382,103 @@ mod tests {
         );
         assert_eq!(fixture.issues.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.redemptions.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn invitation_pins_the_https_redemption_endpoint() {
+        use axum::{routing::post, Json, Router};
+
+        #[derive(Deserialize)]
+        struct RedeemRequest {
+            invitation: String,
+            subject: String,
+        }
+
+        let secret = [41; 32];
+        let authority = super::super::credential::BrainCredentialAuthority::ephemeral(secret);
+        let brain_id = BrainId(uuid::Uuid::new_v4());
+        let (invitation, invitation_claims) = authority
+            .issue_invitation(
+                super::super::credential::BrainInvitationRequest {
+                    issuer: "fixture.local".into(),
+                    brain_id,
+                    brain: "shared".into(),
+                    environment_generation: 1,
+                    role: AttachmentRole::Consultant,
+                    scopes: super::super::credential::default_participant_scopes(
+                        AttachmentRole::Consultant,
+                    ),
+                    delegation_chain: Vec::new(),
+                    ttl_ms: 60_000,
+                },
+                unix_epoch_millis(),
+            )
+            .unwrap();
+        let expected_invitation = invitation.clone();
+        let app = Router::new().route(
+            "/v1/brains/invitations/redeem",
+            post(move |Json(request): Json<RedeemRequest>| {
+                let expected_invitation = expected_invitation.clone();
+                async move {
+                    assert_eq!(request.invitation, expected_invitation);
+                    Json(serde_json::json!({
+                        "token": "scoped-token",
+                        "claims": {
+                            "version": 1,
+                            "credential_id": uuid::Uuid::new_v4(),
+                            "issuer": "fixture.local",
+                            "subject": request.subject,
+                            "brain_id": brain_id,
+                            "brain": "shared",
+                            "environment_generation": 1,
+                            "role": "consultant",
+                            "scopes": ["brain:read", "brain:attach", "brain:detach", "brain:submit"],
+                            "delegation_chain": [],
+                            "issued_ms": 1,
+                            "expires_ms": u64::MAX
+                        }
+                    }))
+                }
+            }),
+        );
+        let node = crate::node::identity::NodeSigningIdentity::from_secret(secret);
+        let tls =
+            crate::node::tls::NodeTlsIdentity::from_signing_identity(&node, "localhost").unwrap();
+        let invitation_certificate =
+            super::super::credential::invitation_tls_certificate_der(&invitation_claims).unwrap();
+        crate::node::tls::install_server_crypto_provider();
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
+            vec![invitation_certificate],
+            tls.private_key_der().to_vec(),
+        )
+        .await
+        .unwrap();
+        let handle = axum_server::Handle::new();
+        let server = tokio::spawn(
+            axum_server::bind_rustls(
+                "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
+                tls_config,
+            )
+            .handle(handle.clone())
+            .serve(app.into_make_service()),
+        );
+        let address = handle.listening().await.unwrap();
+        let target = RemoteBrainTarget {
+            brain: "shared".into(),
+            machine: "localhost".into(),
+            address: format!("localhost:{}", address.port()),
+            secure: true,
+        };
+        let client = RemoteBrainClient::new_with_invitation(target, invitation).unwrap();
+
+        assert_eq!(
+            client
+                .redeem_invitation("alice@laptop.local")
+                .await
+                .unwrap(),
+            AttachmentRole::Consultant
+        );
         server.abort();
     }
 
@@ -1549,6 +1721,7 @@ mod tests {
             brain: "shared".into(),
             machine: "fixture".into(),
             address: address.to_string(),
+            secure: false,
         };
         let mut client = RemoteBrainClient::new(target, "unused").unwrap();
         client.attachment = Some(attachment.clone());
@@ -2028,7 +2201,7 @@ mod tests {
     #[tokio::test]
     async fn cloned_client_reuses_a_live_scoped_credential() {
         let client = RemoteBrainClient::new(
-            RemoteBrainTarget::parse("shared@box.local").unwrap(),
+            RemoteBrainTarget::local("shared", "http://127.0.0.1:11435").unwrap(),
             "bootstrap-secret",
         )
         .unwrap();
@@ -2064,7 +2237,7 @@ mod tests {
     #[tokio::test]
     async fn ordinary_operations_require_bootstrapping_first() {
         let client = RemoteBrainClient::new(
-            RemoteBrainTarget::parse("shared@box.local").unwrap(),
+            RemoteBrainTarget::local("shared", "http://127.0.0.1:11435").unwrap(),
             "bootstrap-secret",
         )
         .unwrap();

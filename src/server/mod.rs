@@ -350,6 +350,7 @@ impl AgentServer {
         );
 
         if let Some(brain_bind_address) = &app_state.config.brain_bind_address {
+            crate::node::tls::install_server_crypto_provider();
             let brain_addr: SocketAddr = brain_bind_address.parse()?;
             let hostname = hostname_or_default();
             let tls_identity = crate::node::tls::NodeTlsIdentity::from_signing_identity(

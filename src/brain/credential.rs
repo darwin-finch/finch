@@ -331,9 +331,11 @@ impl BrainCredentialAuthority {
     pub(crate) fn ephemeral(signing_key: [u8; 32]) -> Self {
         let invitation_signer =
             crate::node::identity::NodeSigningIdentity::from_secret(signing_key);
-        let invitation_tls =
-            crate::node::tls::NodeTlsIdentity::from_signing_identity(&invitation_signer, "test")
-                .expect("test node identity creates TLS material");
+        let invitation_tls = crate::node::tls::NodeTlsIdentity::from_signing_identity(
+            &invitation_signer,
+            "localhost",
+        )
+        .expect("test node identity creates TLS material");
         Self {
             signing_key: Arc::new(signing_key),
             invitation_signer: Arc::new(invitation_signer),
