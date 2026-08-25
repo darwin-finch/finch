@@ -39,7 +39,7 @@ use crate::review::store::DiffStore;
 use crate::tools::executor::ToolExecutor;
 use crate::tools::types::ToolDefinition;
 
-use super::events::{LlmRequest, ReplEvent};
+use super::events::{LlmRequest, ReplEvent, RunnerReconnectTarget};
 use super::llm_loop::LlmLoop;
 use super::model_selection::{activate_local_when_ready, LocalActivationOutcome, ModelSelection};
 use super::query_processor::{refresh_context_strip, ActiveToolUsesMap};
@@ -317,6 +317,8 @@ pub struct EventLoop {
     /// home Brain. The UI never infers runner status from local process role.
     home_runner_lease_active: bool,
     home_runner_lease_id: Option<crate::brain::store::RunnerLeaseId>,
+    /// Exact durable runner target, retained while its callback is offline.
+    runner_reconnect_target: Option<RunnerReconnectTarget>,
     /// Exact Brain currently served by this frontend's ProgramRuntime. This
     /// starts as the home Brain but may change through an addressed handoff.
     runner_brain: Option<String>,
@@ -1325,6 +1327,7 @@ impl EventLoop {
             home_brain: None,
             home_runner_lease_active: false,
             home_runner_lease_id: None,
+            runner_reconnect_target: None,
             runner_brain: None,
             runner_renewal_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_home_runner_error: None,
@@ -1371,22 +1374,31 @@ impl EventLoop {
         };
         self.home_runner_lease_id = home_runner_state
             .as_ref()
-            .and_then(|state| state.as_ref().ok())
-            .copied();
-        self.home_runner_lease_active = self.home_runner_lease_id.is_some();
-        self.runner_brain = self
-            .home_runner_lease_active
-            .then(|| self.session_label.clone());
+            .and_then(|state| state.target.lease_id);
+        self.home_runner_lease_active = home_runner_state
+            .as_ref()
+            .is_some_and(|state| state.registration.is_ok());
+        self.runner_reconnect_target = home_runner_state
+            .as_ref()
+            .map(|state| state.target.clone());
+        self.runner_brain = home_runner_state.as_ref().and_then(|state| {
+            state
+                .registration
+                .is_ok()
+                .then(|| state.target.brain.clone())
+        });
         let home_runner_error = home_runner_state
             .as_ref()
-            .and_then(|state| state.as_ref().err())
+            .and_then(|state| state.registration.as_ref().err())
             .cloned();
         self.last_home_runner_error = home_runner_error.clone();
         self.status_bar.update_line(
             crate::cli::status_bar::StatusLineType::SessionLabel,
             match &home_runner_state {
-                Some(Ok(_)) => format!("◆ brain: {} · runner", self.session_label),
-                Some(Err(_)) => {
+                Some(state) if state.registration.is_ok() => {
+                    format!("◆ brain: {} · runner", state.target.brain)
+                }
+                Some(_) => {
                     format!("◆ brain: {} · home · no runner lease", self.session_label)
                 }
                 None => format!("◆ brain: {} · home · daemon offline", self.session_label),
@@ -1414,7 +1426,9 @@ impl EventLoop {
             let epoch = self
                 .runner_renewal_epoch
                 .load(std::sync::atomic::Ordering::SeqCst);
-            self.schedule_home_runner_reconnect(epoch, 0);
+            if let Some(target) = self.runner_reconnect_target.clone() {
+                self.schedule_home_runner_reconnect(epoch, 0, target);
+            }
         }
         if self.daemon_base_url.is_some() {
             if let Err(error) = self.attach_home_brain().await {
@@ -3829,7 +3843,11 @@ Rules:\n\
                     }
                 }
             }
-            ReplEvent::ReconnectHomeRunner { epoch, attempt } => {
+            ReplEvent::ReconnectHomeRunner {
+                epoch,
+                attempt,
+                target,
+            } => {
                 if epoch
                     != self
                         .runner_renewal_epoch
@@ -3838,7 +3856,7 @@ Rules:\n\
                 {
                     return Ok(());
                 }
-                match self.restore_home_runner().await {
+                match self.restore_home_runner(target.clone()).await {
                     Ok(()) => {
                         self.output_manager.write_info(format!(
                             "{}: runner callback reconnected",
@@ -3868,6 +3886,7 @@ Rules:\n\
                             self.schedule_home_runner_reconnect(
                                 epoch,
                                 attempt.saturating_add(1),
+                                target,
                             );
                         }
                     }
@@ -3875,6 +3894,7 @@ Rules:\n\
             }
             ReplEvent::RunnerLeaseStatus {
                 brain,
+                environment,
                 epoch,
                 lease_id,
                 detail,
@@ -3896,17 +3916,26 @@ Rules:\n\
                         .await
                     {
                         Ok(bootstrap) => {
-                            self.agent_scheduler
-                                .bind_brain_control(bootstrap.subagent_control)
-                                .await;
-                            self.program_runtime
+                            match self
+                                .program_runtime
                                 .hydrate_reducible_state_if_newer(
                                     bootstrap.checkpoint,
                                     bootstrap.runtime_revision,
                                 )
                                 .await
-                                .map(|_| ())
-                                .map_err(|error| error.to_string())
+                            {
+                                Ok(_) => {
+                                    self.agent_scheduler
+                                        .bind_brain_control(bootstrap.subagent_control)
+                                        .await;
+                                    Ok(())
+                                }
+                                Err(error) => {
+                                    let _ = ipc.brain_release_runner(&brain, lease_id).await;
+                                    self.agent_scheduler.clear_brain_control().await;
+                                    Err(error.to_string())
+                                }
+                            }
                         }
                         Err(error) => Err(error.to_string()),
                     },
@@ -3929,8 +3958,14 @@ Rules:\n\
                     active,
                     handed_off,
                 );
+                let reconnect_target = RunnerReconnectTarget {
+                    brain: brain.clone(),
+                    environment,
+                    lease_id: self.home_runner_lease_id,
+                };
+                self.runner_reconnect_target = (!handed_off).then(|| reconnect_target.clone());
                 if !active && !handed_off {
-                    self.schedule_home_runner_reconnect(epoch, 0);
+                    self.schedule_home_runner_reconnect(epoch, 0, reconnect_target);
                 }
                 if self.active_remote_brain.is_none() {
                     if self.home_brain.is_some() {
@@ -4500,6 +4535,7 @@ Rules:\n\
         self.home_runner_lease_active = false;
         self.home_runner_lease_id = None;
         self.runner_brain = None;
+        self.runner_reconnect_target = None;
         self.agent_scheduler.clear_brain_control().await;
 
         // Recheck after the asynchronous lease release narrows the replacement
