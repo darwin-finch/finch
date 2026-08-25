@@ -840,8 +840,12 @@ still blocks the corresponding Brain phase until it is unified.
   attachment now creates a 15-second pending reservation; only the exact WebSocket activation emits
   `ClientAttached`, concurrent identity reuse fails closed, and expiry clears only the matching
   pending connection without moving its durable acknowledgement cursor or Brain revision.
-- [ ] Add remote brain creation while preserving the invariant that one environment is an
-  indivisible machine/workspace authority boundary.
+- [x] Add explicit remote Brain creation while preserving the invariant that one environment is an
+  indivisible machine/workspace authority boundary. `/brain create <name>[@machine]` calls an
+  authenticated bootstrap/admin endpoint whose request contains only the alias; the owning daemon
+  supplies its fixed canonical machine, workspace, and generation and rejects alias reuse. The same
+  operation lives on `BrainLifecycleService`, and hermetic plus live-daemon tests cover environment
+  ownership, conflict behavior, and scoped archive cleanup.
 - [x] Treat the global brain password as a local/bootstrap credential only. Mint scoped, revocable,
   expiring participant credentials containing subject, audience, brain, environment generation,
   and permitted roles. Initial scopes: `brain:read`, `brain:attach`, `brain:submit`,

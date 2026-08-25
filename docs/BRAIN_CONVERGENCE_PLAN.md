@@ -474,6 +474,10 @@ attach/watch/prompt/queued-run/acknowledge/detach script and compares normalized
 Ordinary HTTP and WebSocket lifecycle operations now require scoped credentials on loopback as well
 as remote addresses. Attachment lifecycle has its own `brain:attach` scope, and archival obtains an
 explicit one-purpose `environment:admin` credential instead of relying on localhost trust.
+Remote creation is now an explicit bootstrap/admin operation rather than merely an attachment side
+effect: its request carries only a validated alias, while the owning daemon fixes the Brain's
+machine, canonical workspace, and environment generation. Alias reuse fails closed, and
+`/brain create <name>[@machine]` exposes the same lifecycle-service operation.
 The rebuilt-daemon remote lifecycle smoke test and local/remote conformance fixture both pass with
 that stricter boundary, including explicit archive cleanup.
 
