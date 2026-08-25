@@ -30,6 +30,17 @@ CREATE TABLE IF NOT EXISTS tree_nodes (
     FOREIGN KEY (parent_id) REFERENCES tree_nodes(node_id)
 );
 
+-- Stable provenance for semantic leaves. A NULL node_id records that the
+-- quality classifier deliberately excluded this conversation from semantic
+-- retrieval, making projection retries idempotent as well.
+CREATE TABLE IF NOT EXISTS memory_sources (
+    conversation_id TEXT PRIMARY KEY,
+    node_id INTEGER UNIQUE,
+    indexed_at INTEGER NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id) REFERENCES tree_nodes(node_id) ON DELETE CASCADE
+);
+
 -- Metadata for tracking system state
 CREATE TABLE IF NOT EXISTS metadata (
     key TEXT PRIMARY KEY,
@@ -77,5 +88,6 @@ CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id
 CREATE INDEX IF NOT EXISTS idx_tree_nodes_parent ON tree_nodes(parent_id);
 CREATE INDEX IF NOT EXISTS idx_tree_nodes_level ON tree_nodes(level);
 CREATE INDEX IF NOT EXISTS idx_tree_nodes_created ON tree_nodes(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_sources_node ON memory_sources(node_id);
 CREATE INDEX IF NOT EXISTS idx_program_registry_name ON program_registry(name, language, scope);
 CREATE INDEX IF NOT EXISTS idx_program_registry_source_hash ON program_registry(source_hash);

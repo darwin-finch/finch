@@ -385,9 +385,10 @@ impl Repl {
         // Phase 4: Register memory tools if memory system is enabled
         if let Some(ref memory) = memory_system {
             use crate::tools::implementations::{
-                CreateMemoryTool, ListRecentTool, SearchMemoryTool,
+                CreateMemoryTool, InspectMemoryTool, ListRecentTool, SearchMemoryTool,
             };
             tool_registry.register(Box::new(SearchMemoryTool::new(memory.clone())));
+            tool_registry.register(Box::new(InspectMemoryTool::new(memory.clone())));
             tool_registry.register(Box::new(CreateMemoryTool::new(memory.clone())));
             tool_registry.register(Box::new(ListRecentTool::new(memory.clone())));
         }

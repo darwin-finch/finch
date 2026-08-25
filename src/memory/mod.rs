@@ -60,6 +60,10 @@ impl Default for MemoryConfig {
 pub struct MemorySystem {
     db: Arc<Mutex<Connection>>,
     tree: Arc<Mutex<MemTree>>,
+    /// Serialize conversation projection through semantic indexing. This keeps
+    /// the SQLite identity, in-memory leaf, and durable leaf provenance from
+    /// racing when the daemon retries one completed Brain run.
+    insert_lock: Arc<Mutex<()>>,
     embedding_engine: Arc<dyn EmbeddingEngine>,
     config: MemoryConfig,
 }
@@ -71,6 +75,72 @@ pub struct BrainConversationProvenance {
     pub brain_id: String,
     pub run_id: String,
     pub request_seq: u64,
+}
+
+/// Stable metadata for the canonical conversation row behind one semantic
+/// memory. The full content is returned only by explicit inspection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MemorySourceMetadata {
+    pub source_id: String,
+    pub role: String,
+    pub model: Option<String>,
+    pub session_id: Option<String>,
+    pub brain_id: Option<String>,
+    pub run_id: Option<String>,
+    pub request_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct MemorySearchResult {
+    /// Pass this exact value to `inspect_memory`.
+    pub memory_id: String,
+    pub node_id: NodeId,
+    pub text: String,
+    pub score: f32,
+    pub source: Option<MemorySourceMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct InspectedMemory {
+    pub memory_id: String,
+    pub node_id: Option<NodeId>,
+    pub source: Option<MemorySourceMetadata>,
+    pub content: String,
+}
+
+fn optional_request_seq(value: Option<i64>) -> Result<Option<u64>> {
+    value
+        .map(|value| {
+            u64::try_from(value)
+                .with_context(|| format!("stored request sequence {value} is negative"))
+        })
+        .transpose()
+}
+
+fn source_metadata_for_node(
+    conn: &Connection,
+    node_id: NodeId,
+) -> Result<Option<MemorySourceMetadata>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.role, c.model, c.session_id,
+                c.brain_id, c.run_id, c.request_seq
+         FROM memory_sources ms
+         JOIN conversations c ON c.id = ms.conversation_id
+         WHERE ms.node_id = ?1",
+    )?;
+    let mut rows = stmt.query([node_id as i64])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(Some(MemorySourceMetadata {
+        source_id: row.get(0)?,
+        role: row.get(1)?,
+        model: row.get(2)?,
+        session_id: row.get(3)?,
+        brain_id: row.get(4)?,
+        run_id: row.get(5)?,
+        request_seq: optional_request_seq(row.get(6)?)?,
+    }))
 }
 
 impl MemorySystem {
@@ -202,6 +272,7 @@ impl MemorySystem {
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             tree: Arc::new(Mutex::new(tree)),
+            insert_lock: Arc::new(Mutex::new(())),
             embedding_engine,
             config,
         })
@@ -245,14 +316,8 @@ impl MemorySystem {
         session_id: Option<&str>,
         provenance: &BrainConversationProvenance,
     ) -> Result<bool> {
-        self.insert_conversation_record(
-            role,
-            content,
-            model,
-            session_id,
-            Some(provenance),
-        )
-        .await
+        self.insert_conversation_record(role, content, model, session_id, Some(provenance))
+            .await
     }
 
     async fn insert_conversation_record(
@@ -263,12 +328,18 @@ impl MemorySystem {
         session_id: Option<&str>,
         provenance: Option<&BrainConversationProvenance>,
     ) -> Result<bool> {
+        let _insert_guard = self.insert_lock.lock().await;
         let timestamp = chrono::Utc::now()
             .timestamp_nanos_opt()
             .ok_or_else(|| anyhow::anyhow!("Timestamp out of range"))?;
         let id = provenance.map_or_else(
             || uuid::Uuid::new_v4().to_string(),
-            |source| format!("brain:{}:run:{}:role:{role}", source.brain_id, source.run_id),
+            |source| {
+                format!(
+                    "brain:{}:run:{}:role:{role}",
+                    source.brain_id, source.run_id
+                )
+            },
         );
         let brain_id = provenance.map(|source| source.brain_id.as_str());
         let run_id = provenance.map(|source| source.run_id.as_str());
@@ -304,24 +375,41 @@ impl MemorySystem {
                         "SELECT role, content, brain_id, run_id, request_seq
                          FROM conversations WHERE id = ?1",
                         [&id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
                     )?;
                 anyhow::ensure!(
-                    existing == (
-                        role.to_string(),
-                        content.to_string(),
-                        brain_id.map(str::to_owned),
-                        run_id.map(str::to_owned),
-                        request_seq,
-                    ),
+                    existing
+                        == (
+                            role.to_string(),
+                            content.to_string(),
+                            brain_id.map(str::to_owned),
+                            run_id.map(str::to_owned),
+                            request_seq,
+                        ),
                     "named-Brain memory identity {id} was reused with conflicting content"
                 );
             }
             changed != 0
         };
 
-        if !inserted {
-            return Ok(false);
+        let already_classified = {
+            let conn = self.db.lock().await;
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_sources WHERE conversation_id = ?1)",
+                [&id],
+                |row| row.get::<_, bool>(0),
+            )?
+        };
+        if already_classified {
+            return Ok(inserted);
         }
 
         // Quality filter: classify and extract key content before indexing.
@@ -330,13 +418,32 @@ impl MemorySystem {
         let classifier = MemoryClassifier::new();
         if let Some((key_content, importance)) = classifier.process(role, content) {
             let embedding = self.embedding_engine.embed(&key_content)?;
-            {
+            let node_id = {
                 let mut tree = self.tree.lock().await;
-                tree.insert(key_content, embedding, importance.as_u8())?;
-            }
+                tree.insert(key_content, embedding, importance.as_u8())?
+            };
             // Persist all nodes (root + ancestors + new leaf) so the DB stays
             // consistent across process restarts and FK constraints are satisfied.
-            self.save_all_nodes_to_db().await?;
+            // The source mapping commits in the same SQLite transaction, so a
+            // retry cannot create a second semantic leaf for the same turn.
+            if let Err(error) = self
+                .save_all_nodes_to_db(Some((node_id, &id, timestamp)))
+                .await
+            {
+                // The SQLite transaction rolled back, but insertion already
+                // mutated the in-memory tree. Rebuild it from the durable
+                // snapshot before returning so a retry cannot add a duplicate
+                // semantic leaf for the same canonical turn.
+                self.reload_tree_from_db().await?;
+                return Err(error);
+            }
+        } else {
+            let conn = self.db.lock().await;
+            conn.execute(
+                "INSERT INTO memory_sources (conversation_id, node_id, indexed_at)
+                 VALUES (?1, NULL, ?2)",
+                params![&id, timestamp],
+            )?;
         }
 
         tracing::debug!("Inserted conversation into memory: {} chars", content.len());
@@ -346,21 +453,93 @@ impl MemorySystem {
 
     /// Query memory for relevant context
     pub async fn query(&self, query_text: &str, top_k: Option<usize>) -> Result<Vec<String>> {
-        let k = top_k.unwrap_or(self.config.max_context_items);
-
-        // Generate query embedding
-        let query_embedding = self.embedding_engine.embed(query_text)?;
-
-        // Retrieve from MemTree
-        let tree = self.tree.lock().await;
-        let results = tree.retrieve(&query_embedding, k);
-
-        // Extract texts
-        let texts: Vec<String> = results.into_iter().map(|(_, text, _)| text).collect();
+        let results = self.query_with_sources(query_text, top_k).await?;
+        let texts: Vec<String> = results.into_iter().map(|result| result.text).collect();
 
         tracing::debug!("Memory query returned {} results", texts.len());
 
         Ok(texts)
+    }
+
+    /// Query semantic memory while retaining a stable reference to the
+    /// canonical stored turn behind every new-format leaf.
+    pub async fn query_with_sources(
+        &self,
+        query_text: &str,
+        top_k: Option<usize>,
+    ) -> Result<Vec<MemorySearchResult>> {
+        let k = top_k.unwrap_or(self.config.max_context_items);
+        let query_embedding = self.embedding_engine.embed(query_text)?;
+        let retrieved = {
+            let tree = self.tree.lock().await;
+            tree.retrieve(&query_embedding, k)
+        };
+        let conn = self.db.lock().await;
+        let mut results = Vec::with_capacity(retrieved.len());
+        for (node_id, text, score) in retrieved {
+            let source = source_metadata_for_node(&conn, node_id)?;
+            let memory_id = source
+                .as_ref()
+                .map(|source| source.source_id.clone())
+                .unwrap_or_else(|| format!("node:{node_id}"));
+            results.push(MemorySearchResult {
+                memory_id,
+                node_id,
+                text,
+                score,
+                source,
+            });
+        }
+        tracing::debug!("Memory query returned {} sourced results", results.len());
+        Ok(results)
+    }
+
+    /// Resolve the stable ID returned by `query_with_sources`. New memories
+    /// return their complete conversation row; historical unattributed leaves
+    /// remain inspectable by their explicit `node:<id>` fallback.
+    pub async fn inspect_memory(&self, memory_id: &str) -> Result<Option<InspectedMemory>> {
+        let memory_id = memory_id.trim();
+        if let Some(node_id) = memory_id.strip_prefix("node:") {
+            let node_id = node_id
+                .parse::<NodeId>()
+                .with_context(|| format!("invalid memory node reference '{memory_id}'"))?;
+            let tree = self.tree.lock().await;
+            return Ok(tree.get_node(node_id).map(|node| InspectedMemory {
+                memory_id: memory_id.to_string(),
+                node_id: Some(node_id),
+                source: None,
+                content: node.text.clone(),
+            }));
+        }
+
+        let conn = self.db.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.role, c.content, c.model, c.session_id,
+                    c.brain_id, c.run_id, c.request_seq, ms.node_id
+             FROM conversations c
+             LEFT JOIN memory_sources ms ON ms.conversation_id = c.id
+             WHERE c.id = ?1",
+        )?;
+        let mut rows = stmt.query([memory_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let request_seq = optional_request_seq(row.get::<_, Option<i64>>(7)?)?;
+        let source = MemorySourceMetadata {
+            source_id: row.get(0)?,
+            role: row.get(1)?,
+            model: row.get(3)?,
+            session_id: row.get(4)?,
+            brain_id: row.get(5)?,
+            run_id: row.get(6)?,
+            request_seq,
+        };
+        Ok(Some(InspectedMemory {
+            memory_id: source.source_id.clone(),
+            node_id: row.get::<_, Option<i64>>(8)?.map(|value| value as NodeId),
+            source: Some(source),
+            content: row.get(2)?,
+        }))
     }
 
     /// Get recent conversations (for context window)
@@ -406,7 +585,7 @@ impl MemorySystem {
     ///      libsqlite3-sys bundles SQLite compiled with SQLITE_DEFAULT_FOREIGN_KEYS=1.
     ///   2. Parent embeddings updated by `update_parent_aggregation` were never
     ///      persisted, so embeddings went stale across process restarts.
-    async fn save_all_nodes_to_db(&self) -> Result<()> {
+    async fn save_all_nodes_to_db(&self, source: Option<(NodeId, &str, i64)>) -> Result<()> {
         let mut nodes: Vec<TreeNode> = {
             let tree = self.tree.lock().await;
             tree.all_nodes().values().cloned().collect()
@@ -440,7 +619,24 @@ impl MemorySystem {
                 ],
             )?;
         }
+        if let Some((node_id, conversation_id, indexed_at)) = source {
+            tx.execute(
+                "INSERT INTO memory_sources (conversation_id, node_id, indexed_at)
+                 VALUES (?1, ?2, ?3)",
+                params![conversation_id, node_id as i64, indexed_at],
+            )?;
+        }
         tx.commit()?;
+        Ok(())
+    }
+
+    async fn reload_tree_from_db(&self) -> Result<()> {
+        let mut restored = MemTree::new_with_dim(self.embedding_engine.dimension());
+        {
+            let conn = self.db.lock().await;
+            Self::load_tree_from_db_conn(&conn, &mut restored)?;
+        }
+        *self.tree.lock().await = restored;
         Ok(())
     }
 
@@ -836,24 +1032,28 @@ mod tests {
             request_seq: 17,
         };
 
-        assert!(memory
-            .insert_brain_conversation(
-                "user",
-                "inspect the scheduler cancellation path",
-                Some("test-model"),
-                Some("test-brain"),
-                &provenance,
-            )
-            .await?);
-        assert!(!memory
-            .insert_brain_conversation(
-                "user",
-                "inspect the scheduler cancellation path",
-                Some("test-model"),
-                Some("test-brain"),
-                &provenance,
-            )
-            .await?);
+        assert!(
+            memory
+                .insert_brain_conversation(
+                    "user",
+                    "inspect the scheduler cancellation path",
+                    Some("test-model"),
+                    Some("test-brain"),
+                    &provenance,
+                )
+                .await?
+        );
+        assert!(
+            !memory
+                .insert_brain_conversation(
+                    "user",
+                    "inspect the scheduler cancellation path",
+                    Some("test-model"),
+                    Some("test-brain"),
+                    &provenance,
+                )
+                .await?
+        );
         assert!(memory
             .insert_brain_conversation(
                 "user",
@@ -866,6 +1066,7 @@ mod tests {
             .is_err());
 
         assert_eq!(memory.stats().await?.conversation_count, 1);
+        assert_eq!(memory.stats().await?.tree_node_count, 1);
         let stored: (String, String, i64) = {
             let conn = memory.db.lock().await;
             conn.query_row(
@@ -875,6 +1076,85 @@ mod tests {
             )?
         };
         assert_eq!(stored, ("brain-1".into(), "run-1".into(), 17));
+
+        let results = memory
+            .query_with_sources("scheduler cancellation", Some(1))
+            .await?;
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        let source = result.source.as_ref().expect("new leaf has provenance");
+        assert_eq!(source.brain_id.as_deref(), Some("brain-1"));
+        assert_eq!(source.run_id.as_deref(), Some("run-1"));
+        assert_eq!(source.request_seq, Some(17));
+
+        let inspected = memory
+            .inspect_memory(&result.memory_id)
+            .await?
+            .expect("stable memory id resolves");
+        assert_eq!(inspected.content, "inspect the scheduler cancellation path");
+
+        drop(memory);
+        let reopened = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?;
+        let reopened_memory = reopened
+            .inspect_memory(&result.memory_id)
+            .await?
+            .expect("source mapping survives restart");
+        assert_eq!(reopened_memory, inspected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_memory_projection_restores_tree_before_retry() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let memory = MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?;
+        let provenance = BrainConversationProvenance {
+            brain_id: "brain-retry".into(),
+            run_id: "run-retry".into(),
+            request_seq: 3,
+        };
+        {
+            let conn = memory.db.lock().await;
+            conn.execute_batch(
+                "CREATE TRIGGER reject_memory_node BEFORE INSERT ON tree_nodes
+                 BEGIN SELECT RAISE(FAIL, 'injected projection failure'); END;",
+            )?;
+        }
+        assert!(memory
+            .insert_brain_conversation(
+                "assistant",
+                "The durable scheduler retry must create exactly one semantic memory.",
+                Some("test-model"),
+                Some("test-brain"),
+                &provenance,
+            )
+            .await
+            .is_err());
+        assert_eq!(memory.stats().await?.conversation_count, 1);
+        assert_eq!(memory.stats().await?.tree_node_count, 0);
+
+        {
+            let conn = memory.db.lock().await;
+            conn.execute_batch("DROP TRIGGER reject_memory_node;")?;
+        }
+        memory
+            .insert_brain_conversation(
+                "assistant",
+                "The durable scheduler retry must create exactly one semantic memory.",
+                Some("test-model"),
+                Some("test-brain"),
+                &provenance,
+            )
+            .await?;
+        assert_eq!(memory.stats().await?.conversation_count, 1);
+        assert_eq!(memory.stats().await?.tree_node_count, 1);
         Ok(())
     }
 

@@ -2,6 +2,7 @@
 //
 // Provides:
 // - search_memory: Query past conversations by semantic similarity
+// - inspect_memory: Resolve a search result to its complete canonical source
 // - create_memory: Store important facts/notes explicitly
 // - list_recent: Show recent conversation history
 
@@ -64,7 +65,10 @@ impl Tool for SearchMemoryTool {
 
         tracing::info!("Searching memory: query='{}', limit={}", query, limit);
 
-        let results = self.memory_system.query(query, Some(limit)).await?;
+        let results = self
+            .memory_system
+            .query_with_sources(query, Some(limit))
+            .await?;
 
         if results.is_empty() {
             return Ok("No relevant memories found for this query.".to_string());
@@ -77,20 +81,87 @@ impl Tool for SearchMemoryTool {
             results
                 .iter()
                 .enumerate()
-                .map(|(i, text)| {
+                .map(|(i, result)| {
                     // Truncate very long memories
-                    let preview = if text.len() > 500 {
-                        format!("{}...", text.chars().take(500).collect::<String>())
+                    let preview = if result.text.chars().count() > 500 {
+                        format!("{}...", result.text.chars().take(500).collect::<String>())
                     } else {
-                        text.clone()
+                        result.text.clone()
                     };
-                    format!("{}. {}", i + 1, preview)
+                    let provenance = result.source.as_ref().map_or_else(
+                        || "legacy source unavailable".to_string(),
+                        |source| {
+                            let mut fields = vec![format!("role={}", source.role)];
+                            if let Some(brain_id) = &source.brain_id {
+                                fields.push(format!("brain={brain_id}"));
+                            }
+                            if let Some(run_id) = &source.run_id {
+                                fields.push(format!("run={run_id}"));
+                            }
+                            if let Some(request_seq) = source.request_seq {
+                                fields.push(format!("request={request_seq}"));
+                            }
+                            fields.join(", ")
+                        },
+                    );
+                    format!(
+                        "{}. memory_id={} ({})\n{}",
+                        i + 1,
+                        result.memory_id,
+                        provenance,
+                        preview
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n")
         );
 
         Ok(formatted)
+    }
+}
+
+/// Inspect the complete canonical turn behind a semantic search result.
+pub struct InspectMemoryTool {
+    memory_system: Arc<MemorySystem>,
+}
+
+impl InspectMemoryTool {
+    pub fn new(memory_system: Arc<MemorySystem>) -> Self {
+        Self { memory_system }
+    }
+}
+
+#[async_trait]
+impl Tool for InspectMemoryTool {
+    fn name(&self) -> &str {
+        "inspect_memory"
+    }
+
+    fn description(&self) -> &str {
+        "Inspect the full, untruncated canonical source of one result returned by search_memory. Pass the exact memory_id from that result."
+    }
+
+    fn input_schema(&self) -> ToolInputSchema {
+        ToolInputSchema {
+            schema_type: "object".to_string(),
+            properties: serde_json::json!({
+                "memory_id": {
+                    "type": "string",
+                    "description": "Exact stable memory_id returned by search_memory"
+                }
+            }),
+            required: vec!["memory_id".to_string()],
+        }
+    }
+
+    async fn execute(&self, params: Value, _context: &ToolContext<'_>) -> Result<String> {
+        let memory_id = params["memory_id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: memory_id"))?;
+        let Some(memory) = self.memory_system.inspect_memory(memory_id).await? else {
+            return Ok(format!("No memory found for memory_id={memory_id}"));
+        };
+        serde_json::to_string_pretty(&memory).map_err(Into::into)
     }
 }
 
@@ -293,7 +364,48 @@ mod tests {
 
         assert!(result.contains("relevant"));
         assert!(result.contains("Rust") || result.contains("lifetimes"));
+        assert!(result.contains("memory_id="));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inspect_memory_returns_complete_source() -> Result<()> {
+        let temp = NamedTempFile::new()?;
+        let memory = Arc::new(MemorySystem::new(MemoryConfig {
+            db_path: temp.path().to_path_buf(),
+            use_neural_embeddings: false,
+            ..Default::default()
+        })?);
+        let content = format!(
+            "Remember this complete source: {}",
+            "long provenance payload ".repeat(30)
+        );
+        memory
+            .insert_conversation("user", &content, Some("test"), Some("session-1"))
+            .await?;
+        let result = memory
+            .query_with_sources("complete source provenance", Some(1))
+            .await?
+            .pop()
+            .expect("memory search result");
+        let tool = InspectMemoryTool::new(memory);
+        let context = ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+            live_output: None,
+            poset: None,
+        };
+        let output = tool
+            .execute(serde_json::json!({"memory_id": result.memory_id}), &context)
+            .await?;
+        assert!(output.contains(&content));
+        assert!(output.contains("session-1"));
         Ok(())
     }
 

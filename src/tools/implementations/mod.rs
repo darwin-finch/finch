@@ -93,7 +93,7 @@ pub use excel::{
 
 pub use llm_tools::LLMDelegationTool;
 
-pub use memory_tools::{CreateMemoryTool, ListRecentTool, SearchMemoryTool};
+pub use memory_tools::{CreateMemoryTool, InspectMemoryTool, ListRecentTool, SearchMemoryTool};
 
 pub use vocabulary_tools::{InspectProgramTool, SearchVocabularyTool};
 
