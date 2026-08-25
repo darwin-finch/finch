@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -26,8 +27,17 @@ impl NodeSigningIdentity {
     pub fn load_or_create(state_directory: &Path) -> Result<Self> {
         std::fs::create_dir_all(state_directory)
             .with_context(|| format!("create {}", state_directory.display()))?;
+        let lock_path = state_directory.join("node-signing.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("open {}", lock_path.display()))?;
+        lock.lock_exclusive()
+            .with_context(|| format!("lock {}", lock_path.display()))?;
         let path = state_directory.join(NODE_SIGNING_KEY_FILE);
-        match std::fs::read(&path) {
+        let result = match std::fs::read(&path) {
             Ok(bytes) => {
                 let secret: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
                     anyhow::anyhow!(
@@ -46,7 +56,10 @@ impl NodeSigningIdentity {
                 Ok(Self::from_secret(secret))
             }
             Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
-        }
+        };
+        FileExt::unlock(&lock)
+            .with_context(|| format!("unlock {}", lock_path.display()))?;
+        result
     }
 
     pub fn from_secret(secret: [u8; 32]) -> Self {
@@ -302,5 +315,30 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn concurrent_first_start_converges_on_one_signing_identity() {
+        let temp = TempDir::new().unwrap();
+        let path = std::sync::Arc::new(temp.path().to_path_buf());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let workers = (0..8)
+            .map(|_| {
+                let path = std::sync::Arc::clone(&path);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    NodeSigningIdentity::load_or_create(&path)
+                        .unwrap()
+                        .public_key_bytes()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let keys = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys.len(), 1);
     }
 }
