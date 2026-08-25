@@ -124,8 +124,9 @@ also has an exclusive, expiring runner lease bound to its exact environment gene
 ordinary frontend/daemon Cap'n Proto channel now carries a lease-bound runner callback, correlated
 ProgramRun request/result records, and bootstrap revision/checkpoint state. It also exposes the
 first versioned `BrainService` capability for snapshots, attachments, acknowledged cursors, detach,
-participant submissions, ordered snapshot-first watches, runner-lease management, and addressed
-runner handoffs. A handoff is a durable reservation naming the exact source lease, target runner
+participant submissions, ordered snapshot-first watches, runner-lease management, addressed runner
+handoffs, and exact run inspection/cancellation. A handoff is a durable reservation naming the exact
+source lease, target runner
 subject, and environment generation. A remote `brain:control` participant may request or cancel it,
 but only the environment-owning local service may accept it; acceptance atomically installs a new
 lease, so the old frontend callback immediately becomes stale. Participant
@@ -157,6 +158,15 @@ run becomes failed, and the reverse approval capability projects suspension and 
 same run. Reconstruction after daemon restart leaves never-started queued work eligible for the next
 valid lease but marks previously running or approval-suspended work interrupted; it never implicitly
 replays work with unknown external progress.
+Runs may name a parent only while that parent exists in the same Brain and remains nonterminal; the
+event log preserves and reconstructs that ancestry. Cancellation is attachment-scoped: only the
+connected driver that initiated a run may request it. Queued and interrupted runs cancel directly;
+running and approval-suspended runs first require acknowledgement from the exact live runner lease.
+Runner requests carry `RunId`, and the callback bridge services control calls concurrently so
+`cancelRun` can overtake the execution RPC it stops. Local Cap'n Proto and authenticated remote
+binary clients share the same cancellation contract. Live daemon fixtures prove both queued-run
+cancellation and a running ProgramRun blocked in its frontend callback, including final durable
+inspection as `cancelled`.
 Each named Brain also owns one daemon turn lane, so concurrent attached consoles cannot interleave
 input acceptance, VM commit, checkpoint publication, and Result events. Its WebSocket subscription
 is snapshot-first without a snapshot/subscribe gap. A 2026-08-24 two-console smoke test shared a
@@ -172,8 +182,8 @@ exposes the complete first lifecycle surface. Remote command correlation is inde
 projection, so long provider/runner
 requests do not stop that socket from receiving canonical events. JSON submit, acknowledge, detach,
 and runner-lease routes are gone; HTTP remains for authenticated discovery, credential/attachment
-bootstrap, and explicit administrative archive. Run ancestry/budgets/cancellation and generalized
-effect-resume correlation still need the unified service. Runtime ownership has moved to the leased
+bootstrap, and explicit administrative archive. Run budgets and generalized effect-resume
+correlation still need the unified service. Runtime ownership has moved to the leased
 environment runner; the daemon is now the durable coordinator for interactive prompt/program runs.
 The obsolete client-local speculative agent and hidden context-injection path are absent, so they
 can no longer bypass this coordinator or consume a separate provider session while the user types.

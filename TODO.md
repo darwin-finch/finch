@@ -791,7 +791,15 @@ still blocks the corresponding Brain phase until it is unified.
   callbacks leave never-started work `queued_for_environment`, registration drains that queue under
   the Brain turn lane, approval suspension is visible on the same run, runner failures become
   correlated failed runs, and daemon restart marks already-started work interrupted without
-  replaying it.
+  replaying it. Runs may now name a validated nonterminal parent; ancestry survives event-log
+  reconstruction and is inspectable through the transport-neutral lifecycle service. Exact run IDs
+  cross the leased-runner callback. The initiating driver can cancel its own queued, interrupted,
+  running, or approval-suspended run; running cancellation overtakes the outstanding Cap'n Proto
+  execution RPC, is acknowledged by the exact frontend callback, and records `cancelled` rather
+  than misclassifying the callback error as `failed`. Local Cap'n Proto and authenticated remote
+  binary transports expose the same inspect/cancel operation, `/brain runs` and `/brain cancel
+  <id-prefix>` use that shared client surface, and live-daemon tests cover both queued cancellation
+  and cancellation of a still-running callback.
 - [ ] Route the ordinary home-console conversation and its complete coding-agent/tool loop through
   the same named-Brain event log. Ordinary home prompts now use a durable driver attachment and the
   daemon turn lane; the leased frontend runs the complete provider/tool/VM callback, while both home
