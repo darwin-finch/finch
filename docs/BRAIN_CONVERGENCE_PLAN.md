@@ -360,6 +360,9 @@ Exit: every current state transition has one canonical event representation.
 - Add daemon-coordinated run state and final-summary events directly to the aggregate; do not revive
   the removed parallel registry.
 - Persist typed VM checkpoint/delta references alongside committed programs.
+- Event-source the ordinary home-console prompt, provider, tool, program, and result lifecycle;
+  `ConversationHistory` and MemTree become projections/indexes rather than an unshareable parallel
+  history. Do not synthesize missing historical Brain events from lossy semantic summaries.
 
 Exit: one store reconstructs Brain and run projections after restart.
 

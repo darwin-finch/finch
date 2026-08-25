@@ -736,6 +736,12 @@ still blocks the corresponding Brain phase until it is unified.
   returns a correlated output/revision/checkpoint. The daemon validates and content-addresses that
   checkpoint; missing and stale callbacks fail closed. Request-boundary, replacement-callback,
   authority-separation, pending-continuation, and daemon-restart tests cover the path.
+- [ ] Route the ordinary home-console conversation and its complete coding-agent/tool loop through
+  the same named-Brain event log. Today local prompts, tool calls, and assistant turns still live in
+  `ConversationHistory`/MemTree while only explicit remote submissions are durable Brain events;
+  consequently attaching to an older Brain cannot replay local scrollback that was never logged.
+  Add canonical user/program/tool/result events and project both home and remote consoles from them
+  without moving workspace execution or provider tools into the daemon.
 - [ ] Complete Brain control and approval ownership above that substrate. Put the role and approval
   audience on every permission/proposal view and add scoped participant credentials. ProgramRuns
   now execute on the leased frontend, but approval/control authority still needs explicit audience,
@@ -777,6 +783,12 @@ still blocks the corresponding Brain phase until it is unified.
   from an ordinary `/v1/chat/completions` request.
 - [ ] Run the complete coding-agent/tool loop on the brain environment. Remote clients submit
   prompts and approvals; file/process actions execute only in that environment.
+- [ ] Make memory persistence independent of the provider's completion path: store successful turns
+  that used tools as well as no-tool turns, correlate them to Brain/run/event identity, and test that
+  failures and retries do not duplicate memories. Separate always-applied user/project policy from
+  best-effort semantic recall; a preference that must govern behavior cannot depend on reaching the
+  top-k TF-IDF/neural results. Give recalled summaries stable provenance/IDs and an explicit path to
+  inspect their fuller source instead of injecting anonymous truncated text alone.
 - [ ] Make OpenAI tool-call behavior respect control ownership: a participant client must not
   accidentally execute workspace tools on its own machine.
 
