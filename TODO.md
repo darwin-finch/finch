@@ -211,6 +211,19 @@ still blocks the corresponding Brain phase until it is unified.
   Interactive, one-shot, and named-Brain receivers append source-free JSONL metrics, while `/metrics`
   groups results by provider/model; the visible program/error history remains independent and never
   hides a rejected source merely because bounded repair succeeds.
+- [ ] Make configured model switching as cheap as it is in single-provider coding harnesses without
+  collapsing Finch's richer provider identity. Split reusable connection/authentication profiles
+  (provider kind, endpoint or local runtime, account/credential reference, transport options) from
+  selectable model variants (model ID, context/capability overrides, pricing/budget defaults).
+  Support cloning a configured provider variant with only the model changed, a fast `/model`
+  picker over compatible variants, and explicit full-profile selection when endpoint or account
+  also changes. Never duplicate secret material into every model entry.
+- [ ] Generalize provider authentication beyond static API tokens. Add secure-store-backed OAuth,
+  browser/device authorization, refreshable account sessions, and provider-native subscription
+  credentials where their terms and APIs permit them (including Codex/OpenAI and Claude account
+  flows), alongside API keys and local/no-auth runtimes. Credentials must be opaque references with
+  expiry/refresh/revocation state, redacted diagnostics, and an explicit provider/endpoint audience;
+  model clones reuse the reference rather than copying bearer material.
 - [ ] Run the fixed protocol-conformance workload across every supported configured provider/model,
   publish sample size and recovery rates, and keep regressions as replayable fixtures. A live
   configured-Grok first-pass Lisp result proves the recorder path, not cross-provider conformance.
