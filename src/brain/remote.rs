@@ -3862,14 +3862,16 @@ mod tests {
         async fn start(
             root: &std::path::Path,
             credentials: crate::brain::credential::BrainCredentialAuthority,
+            environment_generation: u64,
         ) -> (
             RemoteBrainTarget,
             tokio::task::JoinHandle<()>,
             mpsc::UnboundedReceiver<crate::server::RunnerRequest>,
             super::super::store::BrainRunnerLease,
+            crate::server::BrainLifecycleService,
         ) {
-            let store = crate::brain::store::BrainStore::with_root(
-                "box.local", Some(root.to_path_buf()),
+            let store = crate::brain::store::BrainStore::with_test_environment_generation(
+                "box.local", Some(root.to_path_buf()), environment_generation,
             );
             store.snapshot("shared").unwrap();
             let server = std::sync::Arc::new(crate::server::AgentServer::for_brain_protocol_test(
@@ -3896,7 +3898,7 @@ mod tests {
             (RemoteBrainTarget {
                 brain: "shared".into(), machine: "box.local".into(),
                 address: address.to_string(), secure: false,
-            }, task, runner_rx, lease)
+            }, task, runner_rx, lease, lifecycle)
         }
 
         async fn attach(
@@ -3916,14 +3918,15 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let credentials = crate::brain::credential::BrainCredentialAuthority::ephemeral([83; 32]);
-        let (target, daemon, mut runner_rx, _) = start(temp.path(), credentials.clone()).await;
+        let (target, daemon, mut runner_rx, _, _) = start(temp.path(), credentials.clone(), 1).await;
         let (client, events, attachment) = attach(target, None).await;
-        let source_program = "(define (exactly-once) : int 1)";
+        let source_program = "(emit \"exactly once\")";
         let program = BrainEventKind::Program {
             language: ProgramLanguage::Lisp,
             source: source_program.into(),
         };
         let handle = client.prepare_push_mutation(&program).await.unwrap();
+        let effect_execution_id = uuid::Uuid::new_v4();
         tokio::spawn(async move {
             let crate::server::RunnerRequest::Program(request) = runner_rx.recv().await.unwrap()
             else { panic!("expected runner Program request") };
@@ -3931,7 +3934,10 @@ mod tests {
             let outcome = runtime.submit_typed_only(crate::runtime::ProgramSubmission {
                 language: crate::programs::ProgramLanguage::Lisp,
                 source_id: Some("remote-idempotency".into()),
-                source: request.source,
+                // The fixture runner supplies an authoritative checkpoint and
+                // the acknowledged effect journal separately, as a real
+                // frontend runner does after executing the submitted effect.
+                source: "(define (checkpoint) : int 1)".into(),
                 intent: "remote idempotency fixture".into(),
                 effect: crate::programs::ExecutionEffect::Pure,
                 declared_capabilities: Vec::new(),
@@ -3946,7 +3952,25 @@ mod tests {
                 output: "completed exactly once".into(),
                 runtime_revision: outcome.output_revision,
                 checkpoint,
-                effect_journal: Vec::new(),
+                effect_journal: vec![crate::server::RunnerEffectRecord {
+                    execution_id: effect_execution_id,
+                    entry: crate::vm::EffectJournalEntry {
+                        effect: crate::vm::VmSideEffect {
+                            protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                            sequence: 0,
+                            requirement: crate::vm::CapabilityRequirement {
+                                capability: crate::vm::CapabilityKind::SessionEmit,
+                                selector: crate::vm::ResourceSelector::None,
+                            },
+                            event: crate::vm::HostSideEffect::Emit {
+                                text: "exactly once".into(),
+                            },
+                            output: Vec::new(),
+                            origin: crate::vm::SourceOrigin::generated("remote-idempotency"),
+                        },
+                        state: crate::vm::EffectJournalState::Acknowledged { values: Vec::new() },
+                    },
+                }],
             })).unwrap();
         });
         crate::server::handlers::drop_next_remote_brain_reply_after_commit();
@@ -3955,7 +3979,7 @@ mod tests {
         daemon.abort();
         let _ = daemon.await;
 
-        let (target, daemon, _runner_rx, lease) = start(temp.path(), credentials.clone()).await;
+        let (target, daemon, _runner_rx, lease, _) = start(temp.path(), credentials.clone(), 1).await;
         let (client, events, rebound) = attach(target, Some(attachment.attachment_id)).await;
         assert_eq!(rebound.attachment_id, handle.attachment_id);
         let reply = client.send_remote_command_with_handle(
@@ -3974,6 +3998,9 @@ mod tests {
         }).count(), 1);
         assert_eq!(snapshot.events.iter().filter(|event| matches!(event.kind,
             BrainEventKind::Program { ref source, .. } if source == source_program)).count(), 1);
+        assert_eq!(snapshot.events.iter().filter(|event| matches!(&event.kind,
+            BrainEventKind::EffectRecorded { execution_id, .. }
+                if *execution_id == effect_execution_id)).count(), 1);
         assert_eq!(snapshot.runs.iter().filter(|run| run.kind == BrainRunKind::Interactive
             && run.request_seq == snapshot.events.iter().find(|event| {
                 event.mutation.as_ref().is_some_and(|receipt| receipt.mutation_id == handle.idempotency_key)
@@ -4000,7 +4027,7 @@ mod tests {
         daemon.abort();
         let _ = daemon.await;
 
-        let (target, daemon, _runner_rx, _) = start(temp.path(), credentials.clone()).await;
+        let (target, daemon, _runner_rx, _, _) = start(temp.path(), credentials.clone(), 2).await;
         let (client, events, _) = attach(target, Some(attachment.attachment_id)).await;
         let handoff = client.request_runner_handoff_with_handle(
             "runner-b", lease.lease_id, environment_generation, 30_000, &handoff_handle,
@@ -4023,7 +4050,7 @@ mod tests {
         daemon.abort();
         let _ = daemon.await;
 
-        let (target, daemon, _runner_rx, _) = start(temp.path(), credentials.clone()).await;
+        let (target, daemon, _runner_rx, _, _) = start(temp.path(), credentials.clone(), 2).await;
         let (client, events, _) = attach(target, Some(attachment.attachment_id)).await;
         client.cancel_runner_handoff_with_handle(handoff.handoff_id, &cancel_handle)
             .await.unwrap();
@@ -4058,7 +4085,7 @@ mod tests {
         daemon.abort();
         let _ = daemon.await;
 
-        let (target, daemon, _runner_rx, _) = start(temp.path(), credentials).await;
+        let (target, daemon, _runner_rx, _, _) = start(temp.path(), credentials.clone(), 2).await;
         let (client, _events, _) = attach(target, Some(attachment.attachment_id)).await;
         let schedule = client.create_schedule_with_handle(
             ProgramLanguage::Lisp, source, ceiling, 50_000, None,
@@ -4073,6 +4100,131 @@ mod tests {
                 receipt.mutation_id == schedule_handle.idempotency_key
             })
         }).count(), 1);
+        let cancel_schedule_handle = client.prepare_cancel_schedule_mutation(schedule.schedule_id)
+            .await.unwrap();
+        crate::server::handlers::drop_next_remote_brain_reply_after_commit();
+        assert!(client.cancel_schedule_with_handle(
+            schedule.schedule_id, &cancel_schedule_handle,
+        ).await.is_err());
+        daemon.abort();
+        let _ = daemon.await;
+
+        let (target, daemon, mut runner_rx, _, lifecycle) =
+            start(temp.path(), credentials.clone(), 2).await;
+        let (client, events, current_attachment) =
+            attach(target, Some(attachment.attachment_id)).await;
+        assert!(client.cancel_schedule_with_handle(
+            schedule.schedule_id, &cancel_schedule_handle,
+        ).await.unwrap());
+
+        let cancel_request = lifecycle.push_test_event(
+            "shared", "alice", BrainEventKind::Prompt { text: "cancel remotely".into() },
+        ).unwrap();
+        let cancellable = lifecycle.start_run_with_parent(
+            "shared", "alice", BrainRunKind::Interactive, cancel_request.seq,
+            current_attachment.attachment_id,
+            super::super::store::BrainRunStatus::Running, None,
+        ).unwrap();
+        let cancel_run_handle = client.prepare_cancel_run_mutation(cancellable.run_id)
+            .await.unwrap();
+        let cancellable_run_id = cancellable.run_id;
+        tokio::spawn(async move {
+            let crate::server::RunnerRequest::Cancel(request) = runner_rx.recv().await.unwrap()
+            else { panic!("expected real runner cancellation") };
+            assert_eq!(request.run_id, cancellable_run_id);
+            request.response_tx.send(Ok(true)).unwrap();
+        });
+        crate::server::handlers::drop_next_remote_brain_reply_after_commit();
+        assert!(client.cancel_run_with_handle(
+            cancellable.run_id, &cancel_run_handle,
+        ).await.is_err());
+        drop(events);
+        daemon.abort();
+        let _ = daemon.await;
+
+        let (target, daemon, _runner_rx, _, lifecycle) =
+            start(temp.path(), credentials.clone(), 2).await;
+        let (client, events, current_attachment) =
+            attach(target, Some(attachment.attachment_id)).await;
+        assert_eq!(client.cancel_run_with_handle(
+            cancellable.run_id, &cancel_run_handle,
+        ).await.unwrap().status, super::super::store::BrainRunStatus::Cancelled);
+
+        let initialization_handle = client.prepare_schedule_initialization_mutation(75_000)
+            .await.unwrap();
+        let initialization = client.schedule_initialization_with_handle(
+            75_000, &initialization_handle,
+        ).await.unwrap();
+        assert!(initialization.module_identity.is_some());
+
+        let concurrent_source = "(define (concurrent) : int 2)".to_string();
+        let concurrent_ceiling = crate::vm::EffectSet::default();
+        let concurrent_handle = client.prepare_create_schedule_mutation(
+            ProgramLanguage::Lisp, &concurrent_source, &concurrent_ceiling,
+            90_000, None, BrainScheduleDeliveryPolicy::Coalesce,
+        ).await.unwrap();
+        let first = client.create_schedule_with_handle(
+            ProgramLanguage::Lisp, concurrent_source.clone(), concurrent_ceiling.clone(),
+            90_000, None, BrainScheduleDeliveryPolicy::Coalesce, &concurrent_handle,
+        );
+        let second = client.create_schedule_with_handle(
+            ProgramLanguage::Lisp, concurrent_source, concurrent_ceiling,
+            90_000, None, BrainScheduleDeliveryPolicy::Coalesce, &concurrent_handle,
+        );
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap().schedule_id, second.unwrap().schedule_id);
+
+        let before_approval = lifecycle.push_test_event(
+            "shared", "provider", BrainEventKind::ParticipantMessage {
+                text: "approval fixture".into(),
+            },
+        ).unwrap();
+        let approval_id = "remote-replay-approval";
+        let approval_audience = crate::brain::store::BrainApprovalAudience {
+            brain_id: client.snapshot().await.unwrap().brain_id,
+            brain: "shared".into(),
+            attachment_id: current_attachment.attachment_id,
+            subject: current_attachment.subject.clone(),
+            role: current_attachment.role,
+            environment_generation: client.snapshot().await.unwrap().environment.generation,
+        };
+        lifecycle.push_test_event(
+            "shared", "provider", BrainEventKind::ApprovalRequested {
+                request_seq: before_approval.seq,
+                approval_id: approval_id.into(),
+                approval_kind: "effect".into(),
+                subject: "fixture effect".into(),
+                audience: Some(approval_audience.clone()),
+                detail: serde_json::json!({"capability": "fixture"}),
+            },
+        ).unwrap();
+        let _approval = lifecycle.register_test_approval(
+            before_approval.seq, approval_id, approval_audience,
+        ).unwrap();
+        let decision = BrainEventKind::ApprovalDecided {
+            request_seq: before_approval.seq,
+            approval_id: approval_id.into(),
+            decision: serde_json::json!({"choice": "approve_once"}),
+        };
+        let decision_handle = client.prepare_push_mutation(&decision).await.unwrap();
+        crate::server::handlers::drop_next_remote_brain_reply_after_commit();
+        assert!(client.push_with_handle(decision.clone(), &decision_handle).await.is_err());
+        drop(events);
+        daemon.abort();
+        let _ = daemon.await;
+
+        let (target, daemon, _runner_rx, _, _) = start(temp.path(), credentials, 2).await;
+        let (client, _events, _) = attach(target, Some(attachment.attachment_id)).await;
+        client.push_with_handle(decision, &decision_handle).await.unwrap();
+        let snapshot = client.snapshot().await.unwrap();
+        for mutation_id in [cancel_schedule_handle.idempotency_key,
+            cancel_run_handle.idempotency_key, initialization_handle.idempotency_key,
+            concurrent_handle.idempotency_key,
+            decision_handle.idempotency_key]
+        {
+            assert_eq!(snapshot.events.iter().filter(|event| event.mutation.as_ref()
+                .is_some_and(|receipt| receipt.mutation_id == mutation_id)).count(), 1);
+        }
         daemon.abort();
         let _ = daemon.await;
     }
