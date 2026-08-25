@@ -927,7 +927,7 @@ still blocks the corresponding Brain phase until it is unified.
   the runner, and deduplicates the final lifecycle flush. The obsolete client-local `BrainSession`,
   separate typing-time provider, hidden context injection, and ambient question/action shell path
   have been deleted; any future speculative helper must be a visible cancellable `BrainRun` here.
-- [ ] Complete Brain control and approval ownership above that substrate. Put the role and approval
+- [x] Complete Brain control and approval ownership above that substrate. Put the role and approval
   audience on every permission/proposal view. ProgramRuns
   now execute on the leased frontend. Each approval request now carries the daemon-selected
   initiating attachment ID, subject, actual participant role, Brain identity, and environment
@@ -943,8 +943,10 @@ still blocks the corresponding Brain phase until it is unified.
   exact connection;
   sibling replay fails even for the same subject, ancestor revocation reaches the child, and a
   pending authenticated reservation prevents another detach from deleting the provisional Brain.
-  Signed invitation bootstrap and addressed handoff now exist; finish the remaining
-  scope-specific hostile/replay cases before closing this ownership milestone.
+  Signed invitation bootstrap and addressed handoff now exist. Role and `brain:approve` scope are
+  enforced independently at the shared lifecycle boundary, including explicitly elevated
+  consultants; default consultants, sibling attachments, stale requests, and cross-Brain replays
+  cannot consume an approval addressed elsewhere.
 - [x] Persist a frontend attachment identity across frontend process restarts, not merely reconnects
   in one process, while keeping the daemon cursor authoritative. The client stores only the opaque
   attachment ID, keyed by durable Brain ID plus console slot/subject/role; the daemon still owns the
