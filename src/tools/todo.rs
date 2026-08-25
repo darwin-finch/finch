@@ -1,48 +1,122 @@
-// Session-scoped task list for TodoWrite / TodoRead tools
+// Local projection for TodoWrite / TodoRead tools
 //
-// TodoList is never persisted to disk — it lives only for the duration of the
-// REPL session.  The LLM writes to it via TodoWrite and reads from it via
-// TodoRead.  The TUI renders the active (non-completed) items in the live area.
+// Named-Brain sessions journal replacements before updating this local TUI
+// projection. Standalone tool tests may still use it without a Brain target.
 
-use serde::{Deserialize, Serialize};
+pub use crate::brain::tasks::{
+    BrainTask as TodoItem, BrainTaskPriority as TodoPriority, BrainTaskStatus as TodoStatus,
+};
+use anyhow::Result;
+use std::cell::RefCell;
+use std::rc::Rc;
+use tokio::sync::{mpsc, oneshot};
 
-/// Priority of a task item
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum TodoPriority {
-    High,
-    #[default]
-    Medium,
-    Low,
+struct TodoJournalRequest {
+    tasks: Vec<TodoItem>,
+    reply: oneshot::Sender<Result<bool>>,
 }
 
-/// Lifecycle status of a task item
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum TodoStatus {
-    #[default]
-    Pending,
-    InProgress,
-    Completed,
+/// Send-safe model-tool endpoint for the frontend-local Brain journal worker.
+#[derive(Clone)]
+pub struct TodoJournalWriter {
+    tx: mpsc::UnboundedSender<TodoJournalRequest>,
 }
 
-/// A single task item in the session task list
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TodoItem {
-    /// Stable identifier across updates (e.g. "1", "2")
-    pub id: String,
-    /// Human-readable description
-    pub content: String,
-    pub status: TodoStatus,
-    #[serde(default)]
-    pub priority: TodoPriority,
+impl TodoJournalWriter {
+    /// Persist a replacement when a Brain is selected. `false` means this is
+    /// a standalone session and the caller may retain session-local behavior.
+    pub async fn replace(&self, tasks: Vec<TodoItem>) -> Result<bool> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(TodoJournalRequest { tasks, reply })
+            .map_err(|_| anyhow::anyhow!("Brain task journal worker stopped"))?;
+        response
+            .await
+            .map_err(|_| anyhow::anyhow!("Brain task journal worker dropped its response"))?
+    }
 }
 
-/// Session-scoped task list.
+/// Frontend-local selector for the Brain that owns model-facing task writes.
+/// The Cap'n Proto client is deliberately confined to this LocalSet thread;
+/// tools communicate with it through the send-safe writer above.
+#[derive(Clone)]
+pub struct TodoJournalTarget {
+    selected: Rc<RefCell<Option<crate::brain::remote::AttachedBrainClient>>>,
+}
+
+impl TodoJournalTarget {
+    pub fn set(&self, selected: Option<crate::brain::remote::AttachedBrainClient>) {
+        *self.selected.borrow_mut() = selected;
+    }
+}
+
+pub struct TodoJournalReceiver {
+    rx: mpsc::UnboundedReceiver<TodoJournalRequest>,
+    selected: Rc<RefCell<Option<crate::brain::remote::AttachedBrainClient>>>,
+    projection: std::sync::Arc<tokio::sync::RwLock<TodoList>>,
+}
+
+impl TodoJournalReceiver {
+    /// Start the non-Send Cap'n Proto worker after the REPL enters its LocalSet.
+    pub fn spawn(mut self) {
+        let worker_target = Rc::clone(&self.selected);
+        tokio::task::spawn_local(async move {
+            while let Some(request) = self.rx.recv().await {
+                let target = worker_target.borrow().clone();
+                let result = match target {
+                    Some(target) => {
+                        let tasks = request.tasks;
+                        match target
+                            .push(crate::brain::store::BrainEventKind::TaskListReplaced {
+                                tasks: tasks.clone(),
+                            })
+                            .await
+                        {
+                            Ok(()) => {
+                                self.projection.write().await.replace_all(tasks);
+                                Ok(true)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    None => Ok(false),
+                };
+                let _ = request.reply.send(result);
+            }
+        });
+    }
+}
+
+pub fn todo_journal(
+    projection: std::sync::Arc<tokio::sync::RwLock<TodoList>>,
+) -> (
+    TodoJournalWriter,
+    TodoJournalTarget,
+    TodoJournalReceiver,
+) {
+    let (tx, rx) = mpsc::unbounded_channel::<TodoJournalRequest>();
+    let selected = Rc::new(RefCell::new(None::<
+        crate::brain::remote::AttachedBrainClient,
+    >));
+    (
+        TodoJournalWriter { tx },
+        TodoJournalTarget {
+            selected: Rc::clone(&selected),
+        },
+        TodoJournalReceiver {
+            rx,
+            selected,
+            projection,
+        },
+    )
+}
+
+/// Local projection of the selected Brain's durable task list.
 ///
 /// Shared behind `Arc<RwLock<TodoList>>` between the tool implementations
-/// and the TUI renderer.
-#[derive(Debug, Default)]
+/// and the TUI renderer. Standalone tool instances retain this projection as
+/// their session-local authority when no Brain journal target is installed.
+#[derive(Default)]
 pub struct TodoList {
     items: Vec<TodoItem>,
 }
@@ -105,6 +179,28 @@ mod tests {
             status,
             priority,
         }
+    }
+
+    #[test]
+    fn journal_worker_starts_only_inside_the_frontend_local_set() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let projection = std::sync::Arc::new(tokio::sync::RwLock::new(TodoList::default()));
+            let (writer, _target, receiver) = todo_journal(projection);
+            receiver.spawn();
+            assert!(!writer
+                .replace(vec![item(
+                    "1",
+                    TodoStatus::InProgress,
+                    TodoPriority::High,
+                )])
+                .await
+                .unwrap());
+        }));
     }
 
     #[test]

@@ -159,8 +159,10 @@ pub struct Repl {
     // Phase 4: Hierarchical memory system
     memory_system: Option<Arc<crate::memory::MemorySystem>>,
 
-    // Session task list (TodoWrite / TodoRead tools)
+    // Projection of the selected Brain task list (TodoWrite / TodoRead tools)
     todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
+    todo_journal_target: crate::tools::todo::TodoJournalTarget,
+    todo_journal_receiver: Option<crate::tools::todo::TodoJournalReceiver>,
 
     // Human-readable label for this session (e.g. "swift-falcon")
     session_label: String,
@@ -395,9 +397,14 @@ impl Repl {
         let todo_list = Arc::new(tokio::sync::RwLock::new(
             crate::tools::todo::TodoList::default(),
         ));
+        let (todo_journal, todo_journal_target, todo_journal_receiver) =
+            crate::tools::todo::todo_journal(Arc::clone(&todo_list));
         {
             use crate::tools::implementations::{TodoReadTool, TodoWriteTool};
-            tool_registry.register(Box::new(TodoWriteTool::new(Arc::clone(&todo_list))));
+            tool_registry.register(Box::new(TodoWriteTool::journaled(
+                Arc::clone(&todo_list),
+                todo_journal,
+            )));
             tool_registry.register(Box::new(TodoReadTool::new(Arc::clone(&todo_list))));
             tool_registry.register_alias("TodoWrite", "todo_write");
             tool_registry.register_alias("TodoRead", "todo_read");
@@ -726,6 +733,8 @@ impl Repl {
 
             // Session task list
             todo_list,
+            todo_journal_target,
+            todo_journal_receiver: Some(todo_journal_receiver),
 
             // Session identity
             session_label,
@@ -1769,6 +1778,10 @@ impl Repl {
             self.max_verbatim_messages,
             self.context_recall_k,
             Arc::clone(&self.todo_list),
+            self.todo_journal_target.clone(),
+            self.todo_journal_receiver
+                .take()
+                .expect("task journal receiver is consumed by one event loop"),
             self.enable_summarization,
             self.auto_compact_enabled,
             self.daemon_client

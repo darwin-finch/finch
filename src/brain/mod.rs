@@ -8,3 +8,4 @@ pub mod credential;
 pub mod names;
 pub mod remote;
 pub mod store;
+pub mod tasks;

@@ -401,11 +401,13 @@ still blocks the corresponding Brain phase until it is unified.
   runs reviewed Lisp/Co-Forth nodes only through `ProgramRuntime` and no longer receives the legacy
   shared stack; replace its remaining string labels/results and direct tool registry with this typed
   plan contract. Keep plans ephemeral unless an explicit promotion persists a reusable procedure.
-- [ ] Reimplement the existing model-facing `TodoRead`/`TodoWrite` tools over a typed, journaled
-  task-list projection owned by the Brain/runtime. Keep their useful visible-plan UX and stable tool
-  surface, but make task creation, status changes, hierarchy, progress, cancellation, and durable
-  recovery ordinary typed task events—not a second session-local JSON source of truth beside VM
-  `task<T>` handles. Project the active goal, current plan step, and concise unfinished-task summary
+- [x] Move the existing model-facing `TodoRead`/`TodoWrite` atomic replacement over a typed,
+  journaled task-list projection owned by the Brain. Preserve the stable tool surface and visible
+  TUI projection, rebuild it from snapshots/live events, and cover codec plus daemon-restart
+  recovery so named-Brain task state is no longer a second session-local source of truth.
+- [ ] Converge the remaining task lifecycle with typed runtime `task<T>` handles: task creation,
+  incremental status changes, hierarchy, progress, and cancellation. Project the active goal,
+  current plan step, and concise unfinished-task summary
   into every provider turn automatically; `todo_read` is an inspection operation, not the mechanism
   by which a model discovers that work exists. Plan mode must read and update this same state,
   enforce its advertised read-only/exploration boundary, survive reconnect/restart, and have

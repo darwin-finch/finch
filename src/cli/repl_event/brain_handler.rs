@@ -264,6 +264,7 @@ impl EventLoop {
         let target_name = client.target.display_name();
         client.acknowledge(snapshot.revision).await?;
         self.home_brain = Some(client);
+        self.todo_journal_target.set(self.home_brain.clone());
         self.render_remote_brain_message(crate::brain::store::BrainWireMessage::Snapshot {
             brain: snapshot.clone(),
         })

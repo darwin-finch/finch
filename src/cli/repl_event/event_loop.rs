@@ -283,8 +283,9 @@ pub struct EventLoop {
     /// From config.features.context_recall_k.
     context_recall_k: usize,
 
-    /// Session task list shared with TodoWrite / TodoRead tools
+    /// Projection of the selected Brain task list shared with Todo tools.
     todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
+    todo_journal_target: crate::tools::todo::TodoJournalTarget,
 
     /// Whether to summarise dropped messages (Infinite Context Phase 2).
     /// From config.features.enable_summarization.
@@ -1121,6 +1122,8 @@ impl EventLoop {
         max_verbatim_messages: usize,
         context_recall_k: usize,
         todo_list: Arc<tokio::sync::RwLock<crate::tools::todo::TodoList>>,
+        todo_journal_target: crate::tools::todo::TodoJournalTarget,
+        todo_journal_receiver: crate::tools::todo::TodoJournalReceiver,
         enable_summarization: bool,
         auto_compact_enabled: bool,
         daemon_base_url: Option<String>,
@@ -1128,6 +1131,7 @@ impl EventLoop {
         agent_scheduler: Arc<crate::runtime::scheduler::AgentScheduler>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        todo_journal_receiver.spawn();
         let (llm_tx, llm_rx) = mpsc::unbounded_channel::<LlmRequest>();
 
         let mut agent_events = agent_scheduler.subscribe();
@@ -1292,6 +1296,7 @@ impl EventLoop {
             max_verbatim_messages,
             context_recall_k,
             todo_list,
+            todo_journal_target,
             enable_summarization,
             auto_compact_enabled,
             pending_dialog_tx: None,
@@ -4833,6 +4838,8 @@ Rules:\n\
         let target_name = client.target.display_name();
         let runner_online = snapshot.runner_lease.is_some();
         self.active_remote_brain = Some(client);
+        self.todo_journal_target
+            .set(self.active_remote_brain.clone());
         self.update_remote_brain_status(runner_online);
         self.render_remote_brain_message(crate::brain::store::BrainWireMessage::Snapshot {
             brain: snapshot,
@@ -4924,6 +4931,7 @@ Rules:\n\
             self.output_manager
                 .write_info(format!("detached from {}", client.target.display_name()));
         }
+        self.todo_journal_target.set(self.home_brain.clone());
         if let Some(home) = self.home_brain.as_ref() {
             let snapshot = home.snapshot().await?;
             self.render_remote_brain_message(
@@ -5048,6 +5056,10 @@ Rules:\n\
                     .selected_brain()
                     .is_some_and(|client| !client.target.secure)
                     .then_some(brain.environment.machine.as_str());
+                self.todo_list
+                    .write()
+                    .await
+                    .replace_all(brain.tasks.clone());
                 project_brain_context(
                     &self.status_bar,
                     &brain.events,
@@ -5065,7 +5077,7 @@ Rules:\n\
                     .filter(|event| event.seq > acknowledged_seq)
                 {
                     if replay_event_belongs_in_transcript(event) {
-                        self.render_remote_brain_event(event);
+                        self.render_remote_brain_event(event).await;
                     }
                     self.observe_remote_brain_approval(event);
                 }
@@ -5094,7 +5106,7 @@ Rules:\n\
                         }
                     }
                 }
-                self.render_remote_brain_event(&event);
+                self.render_remote_brain_event(&event).await;
                 self.observe_remote_brain_approval(&event);
             }
         }
@@ -5262,7 +5274,7 @@ Rules:\n\
         );
     }
 
-    fn render_remote_brain_event(&mut self, event: &crate::brain::store::BrainEvent) {
+    async fn render_remote_brain_event(&mut self, event: &crate::brain::store::BrainEvent) {
         use crate::brain::store::BrainEventKind;
         let local_machine = self
             .selected_brain()
@@ -5348,6 +5360,9 @@ Rules:\n\
             BrainEventKind::ParticipantMessage { text } => self
                 .output_manager
                 .write_brain_participant(sender, text.clone(), false),
+            BrainEventKind::TaskListReplaced { tasks } => {
+                self.todo_list.write().await.replace_all(tasks.clone());
+            }
             BrainEventKind::ToolCall {
                 tool_id,
                 name,

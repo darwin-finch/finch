@@ -5,9 +5,62 @@ use crate::brain::store::{
     BrainScheduleDue, BrainSnapshot, BrainWireMessage, ConnectionId, ProgramLanguage, RunId,
     RunnerHandoffId, RunnerLeaseId, ScheduleId,
 };
+use crate::brain::tasks::{BrainTask, BrainTaskPriority, BrainTaskStatus};
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_approval_audience};
 
 const MAX_JSON_VALUE_DEPTH: usize = 64;
+
+fn encode_task(mut builder: finch_ipc_capnp::brain_task::Builder<'_>, task: &BrainTask) {
+    builder.set_id(&task.id);
+    builder.set_content(&task.content);
+    builder.set_status(match task.status {
+        BrainTaskStatus::Pending => finch_ipc_capnp::BrainTaskStatus::Pending,
+        BrainTaskStatus::InProgress => finch_ipc_capnp::BrainTaskStatus::InProgress,
+        BrainTaskStatus::Completed => finch_ipc_capnp::BrainTaskStatus::Completed,
+    });
+    builder.set_priority(match task.priority {
+        BrainTaskPriority::High => finch_ipc_capnp::BrainTaskPriority::High,
+        BrainTaskPriority::Medium => finch_ipc_capnp::BrainTaskPriority::Medium,
+        BrainTaskPriority::Low => finch_ipc_capnp::BrainTaskPriority::Low,
+    });
+}
+
+fn decode_task(reader: finch_ipc_capnp::brain_task::Reader<'_>) -> anyhow::Result<BrainTask> {
+    Ok(BrainTask {
+        id: text(reader.get_id()?)?,
+        content: text(reader.get_content()?)?,
+        status: match reader.get_status()? {
+            finch_ipc_capnp::BrainTaskStatus::Pending => BrainTaskStatus::Pending,
+            finch_ipc_capnp::BrainTaskStatus::InProgress => BrainTaskStatus::InProgress,
+            finch_ipc_capnp::BrainTaskStatus::Completed => BrainTaskStatus::Completed,
+        },
+        priority: match reader.get_priority()? {
+            finch_ipc_capnp::BrainTaskPriority::High => BrainTaskPriority::High,
+            finch_ipc_capnp::BrainTaskPriority::Medium => BrainTaskPriority::Medium,
+            finch_ipc_capnp::BrainTaskPriority::Low => BrainTaskPriority::Low,
+        },
+    })
+}
+
+fn encode_task_list(
+    mut builder: finch_ipc_capnp::brain_task_list::Builder<'_>,
+    tasks: &[BrainTask],
+) {
+    let mut encoded = builder.reborrow().init_tasks(tasks.len() as u32);
+    for (index, task) in tasks.iter().enumerate() {
+        encode_task(encoded.reborrow().get(index as u32), task);
+    }
+}
+
+fn decode_task_list(
+    reader: finch_ipc_capnp::brain_task_list::Reader<'_>,
+) -> anyhow::Result<Vec<BrainTask>> {
+    reader
+        .get_tasks()?
+        .iter()
+        .map(decode_task)
+        .collect::<anyhow::Result<Vec<_>>>()
+}
 
 pub(super) fn encode_json_value(
     builder: finch_ipc_capnp::json_value::Builder<'_>,
@@ -395,6 +448,9 @@ pub(super) fn encode_brain_submission(
     match kind {
         BrainEventKind::Prompt { text } => builder.set_prompt(text),
         BrainEventKind::ParticipantMessage { text } => builder.set_participant_message(text),
+        BrainEventKind::TaskListReplaced { tasks } => {
+            encode_task_list(builder.init_task_list_replaced(), tasks);
+        }
         BrainEventKind::Program { language, source } => {
             let mut program = builder.init_program();
             program.set_language(language_to_capnp(*language));
@@ -427,6 +483,9 @@ pub(super) fn decode_brain_submission(
         Which::Prompt(value) => BrainEventKind::Prompt { text: text(value?)? },
         Which::ParticipantMessage(value) => BrainEventKind::ParticipantMessage {
             text: text(value?)?,
+        },
+        Which::TaskListReplaced(tasks) => BrainEventKind::TaskListReplaced {
+            tasks: decode_task_list(tasks?)?,
         },
         Which::Program(program) => {
             let program = program?;
@@ -812,6 +871,10 @@ pub(super) fn encode_snapshot(
     for (index, due) in snapshot.pending_schedule_dues.iter().enumerate() {
         encode_schedule_due(dues.reborrow().get(index as u32), due);
     }
+    let mut tasks = builder.reborrow().init_tasks(snapshot.tasks.len() as u32);
+    for (index, task) in snapshot.tasks.iter().enumerate() {
+        encode_task(tasks.reborrow().get(index as u32), task);
+    }
     Ok(())
 }
 
@@ -848,6 +911,11 @@ pub(super) fn decode_snapshot(
         .iter()
         .map(decode_schedule_due)
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let tasks = reader
+        .get_tasks()?
+        .iter()
+        .map(decode_task)
+        .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(BrainSnapshot {
         brain_id: parse_brain_id(reader.get_brain_id()?)?,
         name: text(reader.get_name()?)?,
@@ -869,6 +937,7 @@ pub(super) fn decode_snapshot(
             .map(decode_runner_handoff)
             .transpose()?,
         runs,
+        tasks,
         schedules,
         pending_schedule_dues,
     })
@@ -1218,6 +1287,9 @@ pub(super) fn encode_event(
         }
         BrainEventKind::Prompt { text } => builder.set_prompt(text),
         BrainEventKind::ParticipantMessage { text } => builder.set_participant_message(text),
+        BrainEventKind::TaskListReplaced { tasks } => {
+            encode_task_list(builder.init_task_list_replaced(), tasks);
+        }
         BrainEventKind::ToolCall {
             request_seq,
             tool_id,
@@ -1391,6 +1463,9 @@ pub(super) fn decode_event(
         },
         Which::ParticipantMessage(value) => BrainEventKind::ParticipantMessage {
             text: text(value?)?,
+        },
+        Which::TaskListReplaced(tasks) => BrainEventKind::TaskListReplaced {
+            tasks: decode_task_list(tasks?)?,
         },
         Which::ToolCall(call) => {
             let call = call?;
@@ -1631,6 +1706,14 @@ mod tests {
             },
             BrainEventKind::ParticipantMessage {
                 text: "hello, collaborators".into(),
+            },
+            BrainEventKind::TaskListReplaced {
+                tasks: vec![BrainTask {
+                    id: "verify".into(),
+                    content: "Verify restart".into(),
+                    status: BrainTaskStatus::InProgress,
+                    priority: BrainTaskPriority::High,
+                }],
             },
             BrainEventKind::Program {
                 language: ProgramLanguage::Lisp,
@@ -2008,6 +2091,12 @@ mod tests {
             missed_count: 2,
             next_due_ms: Some(1_500),
         };
+        let task = BrainTask {
+            id: "verify".into(),
+            content: "Verify the candidate".into(),
+            status: BrainTaskStatus::InProgress,
+            priority: BrainTaskPriority::High,
+        };
         let expected = BrainWireMessage::Snapshot {
             brain: BrainSnapshot {
                 brain_id,
@@ -2017,14 +2106,23 @@ mod tests {
                     workspace: "/workspace/project".into(),
                     generation: 7,
                 },
-                revision: 1,
-                events: vec![event(
-                    brain_id,
-                    1,
-                    BrainEventKind::Prompt {
-                        text: "hello".into(),
-                    },
-                )],
+                revision: 2,
+                events: vec![
+                    event(
+                        brain_id,
+                        1,
+                        BrainEventKind::Prompt {
+                            text: "hello".into(),
+                        },
+                    ),
+                    event(
+                        brain_id,
+                        2,
+                        BrainEventKind::TaskListReplaced {
+                            tasks: vec![task.clone()],
+                        },
+                    ),
+                ],
                 program_stack: vec![BrainProgram {
                     seq: 2,
                     sender: "provider".into(),
@@ -2053,6 +2151,7 @@ mod tests {
                     updated_ms: 200,
                     detail: None,
                 }, scheduled_run],
+                tasks: vec![task],
                 schedules: vec![schedule],
                 pending_schedule_dues: vec![pending_due],
             },

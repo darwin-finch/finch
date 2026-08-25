@@ -15,14 +15,28 @@ use tokio::sync::RwLock;
 
 // ─── TodoWriteTool ────────────────────────────────────────────────────────────
 
-/// Replace the entire session task list atomically.
+/// Replace the selected Brain's task list atomically.
 pub struct TodoWriteTool {
     todo_list: Arc<RwLock<TodoList>>,
+    journal: Option<crate::tools::todo::TodoJournalWriter>,
 }
 
 impl TodoWriteTool {
     pub fn new(todo_list: Arc<RwLock<TodoList>>) -> Self {
-        Self { todo_list }
+        Self {
+            todo_list,
+            journal: None,
+        }
+    }
+
+    pub fn journaled(
+        todo_list: Arc<RwLock<TodoList>>,
+        journal: crate::tools::todo::TodoJournalWriter,
+    ) -> Self {
+        Self {
+            todo_list,
+            journal: Some(journal),
+        }
     }
 }
 
@@ -98,7 +112,16 @@ impl Tool for TodoWriteTool {
             .filter(|i| matches!(i.status, crate::tools::todo::TodoStatus::Completed))
             .count();
 
-        self.todo_list.write().await.replace_all(items);
+        // Persist first: the shared list is a projection and must not claim a
+        // successful update when its owning Brain rejected the mutation.
+        let persisted = if let Some(journal) = &self.journal {
+            journal.replace(items.clone()).await?
+        } else {
+            false
+        };
+        if !persisted {
+            self.todo_list.write().await.replace_all(items);
+        }
 
         Ok(format!(
             "Todo list updated: {} task{} ({} in_progress, {} pending, {} completed)",
@@ -113,7 +136,7 @@ impl Tool for TodoWriteTool {
 
 // ─── TodoReadTool ─────────────────────────────────────────────────────────────
 
-/// Return the current session task list as JSON.
+/// Return the selected Brain's current task-list projection as JSON.
 pub struct TodoReadTool {
     todo_list: Arc<RwLock<TodoList>>,
 }

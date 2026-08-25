@@ -673,6 +673,7 @@ fn attachment_can_submit(
             kind,
             BrainEventKind::Prompt { .. }
                 | BrainEventKind::ParticipantMessage { .. }
+                | BrainEventKind::TaskListReplaced { .. }
                 | BrainEventKind::Program { .. }
                 | BrainEventKind::ProgramPopped { .. }
         ),
@@ -725,6 +726,7 @@ pub(crate) async fn submit_named_brain_event_with_authority(
         kind,
         BrainEventKind::Prompt { .. }
             | BrainEventKind::ParticipantMessage { .. }
+            | BrainEventKind::TaskListReplaced { .. }
             | BrainEventKind::Program { .. }
             | BrainEventKind::ProgramPopped { .. }
             | BrainEventKind::ApprovalDecided { .. }
@@ -794,6 +796,7 @@ pub(crate) async fn submit_named_brain_event_with_authority(
         Some(_) => None,
         None => match kind {
             BrainEventKind::ParticipantMessage { .. }
+            | BrainEventKind::TaskListReplaced { .. }
             | BrainEventKind::ProgramPopped { .. }
             | BrainEventKind::ToolCall { .. }
             | BrainEventKind::ToolResult { .. }
@@ -1640,6 +1643,7 @@ fn named_brain_provider_messages(snapshot: &crate::brain::store::BrainSnapshot) 
             !matches!(
                 event.kind,
                 BrainEventKind::RuntimeCommitted { .. }
+                    | BrainEventKind::TaskListReplaced { .. }
                     | BrainEventKind::ApprovalRequested { .. }
                     | BrainEventKind::ApprovalDecided { .. }
                     | BrainEventKind::EffectRecorded { .. }
@@ -1724,6 +1728,7 @@ fn named_brain_provider_messages(snapshot: &crate::brain::store::BrainSnapshot) 
                 ))
             }
             BrainEventKind::RuntimeCommitted { .. }
+            | BrainEventKind::TaskListReplaced { .. }
             | BrainEventKind::EffectRecorded { .. }
             | BrainEventKind::ApprovalRequested { .. }
             | BrainEventKind::ApprovalDecided { .. }
@@ -2971,6 +2976,7 @@ mod handler_tests {
             runner_lease: None,
             runner_handoff: None,
             runs: Vec::new(),
+            tasks: Vec::new(),
             schedules: Vec::new(),
             pending_schedule_dues: Vec::new(),
         };
@@ -3058,6 +3064,7 @@ mod handler_tests {
             runner_lease: None,
             runner_handoff: None,
             runs: Vec::new(),
+            tasks: Vec::new(),
             schedules: Vec::new(),
             pending_schedule_dues: Vec::new(),
         };
@@ -3121,6 +3128,7 @@ mod handler_tests {
         let participant_message = BrainEventKind::ParticipantMessage {
             text: "hello, collaborators".into(),
         };
+        let tasks = BrainEventKind::TaskListReplaced { tasks: Vec::new() };
         let program = BrainEventKind::Program {
             language: ProgramLanguage::Lisp,
             source: "(say \"hello\")".into(),
@@ -3137,6 +3145,7 @@ mod handler_tests {
             false,
         ));
         assert!(attachment_can_submit(AttachmentRole::Driver, &program, false));
+        assert!(attachment_can_submit(AttachmentRole::Driver, &tasks, false));
         assert!(!attachment_can_submit(AttachmentRole::Driver, &decision, false));
         assert!(attachment_can_submit(AttachmentRole::Driver, &decision, true));
         assert!(!attachment_can_submit(
@@ -3162,6 +3171,11 @@ mod handler_tests {
         assert!(!attachment_can_submit(
             AttachmentRole::Consultant,
             &program,
+            true,
+        ));
+        assert!(!attachment_can_submit(
+            AttachmentRole::Consultant,
+            &tasks,
             true,
         ));
         assert!(!attachment_can_submit(
@@ -3247,6 +3261,54 @@ mod handler_tests {
                     )
             }));
         assert_eq!(registration.wait().await.unwrap(), decision);
+    }
+
+    #[tokio::test]
+    async fn driver_task_replacement_is_durable_without_starting_a_run() {
+        use crate::brain::tasks::{BrainTask, BrainTaskPriority, BrainTaskStatus};
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().into()),
+        );
+        let attachment = store
+            .attach(
+                "shared",
+                "alice@box.local",
+                crate::brain::store::AttachmentRole::Driver,
+                None,
+            )
+            .unwrap();
+        let tasks = vec![BrainTask {
+            id: "test".into(),
+            content: "Run restart coverage".into(),
+            status: BrainTaskStatus::InProgress,
+            priority: BrainTaskPriority::High,
+        }];
+        let outcome = submit_named_brain_event(
+            &store,
+            &crate::server::BrainRunnerBroker::default(),
+            &crate::server::BrainApprovalBroker::default(),
+            "shared",
+            &attachment,
+            BrainEventKind::TaskListReplaced {
+                tasks: tasks.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.run.is_none());
+        assert!(outcome.result.is_none());
+        assert_eq!(store.snapshot("shared").unwrap().tasks, tasks);
+        drop(store);
+
+        let restarted = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().into()),
+        );
+        assert_eq!(restarted.snapshot("shared").unwrap().tasks, tasks);
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 10;
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 11;
 const BRAIN_METADATA_VERSION: u32 = 1;
 
 /// Stable identity of one durable Brain. Names are mutable human aliases;
@@ -329,6 +329,11 @@ pub enum BrainEventKind {
     ParticipantMessage {
         text: String,
     },
+    /// Atomically replace the Brain-owned task list. The append-only event is
+    /// authoritative; frontend lists are projections rebuilt from snapshots.
+    TaskListReplaced {
+        tasks: Vec<super::tasks::BrainTask>,
+    },
     ToolCall {
         request_seq: u64,
         tool_id: String,
@@ -432,6 +437,9 @@ pub struct BrainSnapshot {
     pub runner_handoff: Option<BrainRunnerHandoff>,
     #[serde(default)]
     pub runs: Vec<BrainRun>,
+    /// Current task-list projection derived from `TaskListReplaced` events.
+    #[serde(default)]
+    pub tasks: Vec<super::tasks::BrainTask>,
     #[serde(default)]
     pub schedules: Vec<BrainSchedule>,
     #[serde(default)]
@@ -478,6 +486,7 @@ struct BrainState {
     program_stack: Vec<BrainProgram>,
     attachments: HashMap<AttachmentId, BrainAttachment>,
     runs: HashMap<RunId, BrainRun>,
+    tasks: Vec<super::tasks::BrainTask>,
     schedules: HashMap<ScheduleId, BrainSchedule>,
     pending_schedule_dues: HashMap<RunId, BrainScheduleDue>,
     runner_lease: Option<BrainRunnerLease>,
@@ -503,6 +512,7 @@ impl BrainState {
             program_stack: Vec::new(),
             attachments: HashMap::new(),
             runs: HashMap::new(),
+            tasks: Vec::new(),
             schedules: HashMap::new(),
             pending_schedule_dues: HashMap::new(),
             runner_lease: None,
@@ -650,6 +660,9 @@ impl BrainState {
                 }
                 self.runs.insert(due.run.run_id, due.run.clone());
                 self.pending_schedule_dues.insert(due.run.run_id, due);
+            }
+            BrainEventKind::TaskListReplaced { tasks } => {
+                self.tasks.clone_from(tasks);
             }
             BrainEventKind::Program { language, source } => {
                 self.program_stack.push(BrainProgram {
@@ -821,6 +834,7 @@ impl BrainStore {
                 .clone()
                 .filter(|handoff| handoff.expires_ms > unix_millis()),
             runs: sorted_runs(&state.runs),
+            tasks: state.tasks.clone(),
             schedules: sorted_schedules(&state.schedules),
             pending_schedule_dues: sorted_schedule_dues(&state.pending_schedule_dues),
         })
@@ -1697,6 +1711,7 @@ impl BrainStore {
                     event.kind,
                     BrainEventKind::Prompt { .. }
                         | BrainEventKind::ParticipantMessage { .. }
+                        | BrainEventKind::TaskListReplaced { .. }
                         | BrainEventKind::ToolCall { .. }
                         | BrainEventKind::ToolResult { .. }
                         | BrainEventKind::ApprovalRequested { .. }
@@ -3309,6 +3324,39 @@ mod tests {
             .any(|event| {
                 matches!(&event.kind, BrainEventKind::Prompt { text } if text == "remember this")
             }));
+    }
+
+    #[test]
+    fn task_list_projection_survives_daemon_restart() {
+        use crate::brain::tasks::{BrainTask, BrainTaskPriority, BrainTaskStatus};
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let tasks = vec![BrainTask {
+            id: "compile".into(),
+            content: "Compile the candidate frontend".into(),
+            status: BrainTaskStatus::InProgress,
+            priority: BrainTaskPriority::High,
+        }];
+        store
+            .push(
+                "durable-tasks",
+                "provider",
+                BrainEventKind::TaskListReplaced {
+                    tasks: tasks.clone(),
+                },
+            )
+            .unwrap();
+        assert_eq!(store.snapshot("durable-tasks").unwrap().tasks, tasks);
+        drop(store);
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let snapshot = restarted.snapshot("durable-tasks").unwrap();
+        assert_eq!(snapshot.tasks, tasks);
+        assert!(matches!(
+            &snapshot.events.last().unwrap().kind,
+            BrainEventKind::TaskListReplaced { tasks: restored } if restored == &tasks
+        ));
     }
 
     #[test]
