@@ -5,6 +5,7 @@
 use anyhow::{bail, Context, Result};
 
 use super::claude::ClaudeProvider;
+use super::codex_app_server::CodexAppServerProvider;
 use super::gemini::GeminiProvider;
 use super::openai::OpenAIProvider;
 use super::LlmProvider;
@@ -20,6 +21,14 @@ use crate::config::{ProviderEntry, TeacherEntry};
 /// (`create_local_generator`).
 pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmProvider>> {
     match entry {
+        ProviderEntry::ChatgptSubscription {
+            credential_ref,
+            model,
+            ..
+        } => Ok(Box::new(CodexAppServerProvider::new(
+            credential_ref.clone(),
+            model.clone().unwrap_or_else(|| "gpt-5.6-terra".to_string()),
+        )?)),
         ProviderEntry::Claude {
             api_key,
             model,
