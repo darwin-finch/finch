@@ -19,7 +19,8 @@ use crate::ipc::brain_codec::{
 };
 use crate::ipc::checkpoint_codec::{decode_checkpoint, encode_checkpoint};
 use crate::ipc::schema::finch_ipc_capnp::{
-    self, brain_runner, brain_service, brain_wire_receiver, finch_daemon, stream_receiver,
+    self, brain_runner, brain_runner_control, brain_service, brain_wire_receiver, finch_daemon,
+    stream_receiver,
 };
 use crate::ipc::transport::sock_path;
 use crate::tools::types::{ToolDefinition, ToolUse};
@@ -27,6 +28,8 @@ use crate::tools::types::{ToolDefinition, ToolUse};
 pub struct BrainRunnerBootstrap {
     pub runtime_revision: u64,
     pub checkpoint: crate::vm::TypedRuntimeCheckpoint,
+    pub subagent_control:
+        mpsc::UnboundedSender<crate::runtime::scheduler::AgentBrainControlRequest>,
 }
 
 pub struct BrainSubmissionResult {
@@ -582,10 +585,67 @@ impl IpcClient {
             .await
             .map_err(map_runner_registration_error)?;
         let response = reply.get()?;
+        let control: brain_runner_control::Client = response.get_control()?;
+        let (subagent_control, mut subagent_rx) = mpsc::unbounded_channel::<
+            crate::runtime::scheduler::AgentBrainControlRequest,
+        >();
+        tokio::task::spawn_local(async move {
+            while let Some(request) = subagent_rx.recv().await {
+                match request {
+                    crate::runtime::scheduler::AgentBrainControlRequest::Start {
+                        parent_run_id,
+                        task_id,
+                        detail,
+                        response_tx,
+                    } => {
+                        let result = async {
+                            let mut call = control.start_subagent_request();
+                            {
+                                let mut params = call.get();
+                                params.set_parent_run_id(&parent_run_id.0.to_string());
+                                params.set_task_id(&task_id.to_string());
+                                params.set_detail(&detail);
+                            }
+                            let reply = call.send().promise.await?;
+                            decode_run(reply.get()?.get_run()?)
+                                .map_err(|error| capnp::Error::failed(error.to_string()))
+                        }
+                        .await
+                        .map_err(|error| error.to_string());
+                        let _ = response_tx.send(result);
+                    }
+                    crate::runtime::scheduler::AgentBrainControlRequest::Finish {
+                        run_id,
+                        status,
+                        detail,
+                        response_tx,
+                    } => {
+                        let result = async {
+                            let mut call = control.finish_subagent_request();
+                            {
+                                let mut params = call.get();
+                                params.set_run_id(&run_id.0.to_string());
+                                params.set_status(
+                                    crate::ipc::brain_codec::run_status_to_capnp(status),
+                                );
+                                params.set_detail(&detail);
+                            }
+                            let reply = call.send().promise.await?;
+                            decode_run(reply.get()?.get_run()?)
+                                .map_err(|error| capnp::Error::failed(error.to_string()))
+                        }
+                        .await
+                        .map_err(|error| error.to_string());
+                        let _ = response_tx.send(result);
+                    }
+                }
+            }
+        });
         Ok(BrainRunnerBootstrap {
             runtime_revision: response.get_runtime_revision(),
             checkpoint: decode_checkpoint(response.get_checkpoint()?)
                 .context("daemon returned an invalid named-Brain checkpoint")?,
+            subagent_control,
         })
     }
 }

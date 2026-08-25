@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{broadcast, Notify, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -335,6 +335,10 @@ pub struct AgentIdentity {
     /// an exact task-scoped user approval remains an explicit escalation.
     #[serde(default)]
     pub grant_ceiling: EffectSet,
+    /// Canonical durable run for this child when it was spawned from a named
+    /// Brain turn/program. Absent for legacy local-only agent tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brain_run_id: Option<crate::brain::store::RunId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -389,6 +393,31 @@ pub enum AgentEvent {
     },
 }
 
+/// Transport-neutral lifecycle requests from the child-agent scheduler to the
+/// daemon that owns the canonical Brain log. The frontend IPC adapter services
+/// this channel through its lease-scoped reverse capability.
+#[derive(Debug)]
+pub enum AgentBrainControlRequest {
+    Start {
+        parent_run_id: crate::brain::store::RunId,
+        task_id: Uuid,
+        detail: String,
+        response_tx: oneshot::Sender<Result<crate::brain::store::BrainRun, String>>,
+    },
+    Finish {
+        run_id: crate::brain::store::RunId,
+        status: crate::brain::store::BrainRunStatus,
+        detail: String,
+        response_tx: oneshot::Sender<Result<crate::brain::store::BrainRun, String>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AgentBrainContext {
+    pub run_id: crate::brain::store::RunId,
+    pub request_seq: u64,
+}
+
 struct TaskRecord {
     snapshot: AgentTaskSnapshot,
     cancellation: CancellationToken,
@@ -402,6 +431,8 @@ pub struct AgentScheduler {
     concurrency: Arc<Semaphore>,
     events: broadcast::Sender<AgentEvent>,
     context_store: Arc<AgentContextStore>,
+    brain_control: RwLock<Option<mpsc::UnboundedSender<AgentBrainControlRequest>>>,
+    active_brain_parent: RwLock<Option<AgentBrainContext>>,
 }
 
 impl AgentScheduler {
@@ -422,6 +453,8 @@ impl AgentScheduler {
             concurrency: Arc::new(Semaphore::new(4)),
             events,
             context_store,
+            brain_control: RwLock::new(None),
+            active_brain_parent: RwLock::new(None),
         });
         runtime.attach_agent_scheduler(&scheduler);
         scheduler
@@ -433,6 +466,22 @@ impl AgentScheduler {
 
     pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
         self.events.subscribe()
+    }
+
+    pub async fn bind_brain_control(
+        &self,
+        control: mpsc::UnboundedSender<AgentBrainControlRequest>,
+    ) {
+        *self.brain_control.write().await = Some(control);
+    }
+
+    pub async fn clear_brain_control(&self) {
+        *self.brain_control.write().await = None;
+        *self.active_brain_parent.write().await = None;
+    }
+
+    pub async fn set_active_brain_parent(&self, parent: Option<AgentBrainContext>) {
+        *self.active_brain_parent.write().await = parent;
     }
 
     pub async fn spawn(
@@ -471,6 +520,44 @@ impl AgentScheduler {
             manifest_generation,
             &grant_ceiling,
         )?;
+        let parent_brain_run_id = match parent.and_then(|identity| identity.brain_run_id) {
+            Some(run_id) => Some(run_id),
+            None => self
+                .active_brain_parent
+                .read()
+                .await
+                .as_ref()
+                .map(|context| context.run_id),
+        };
+        let brain_run_id = if let Some(parent_run_id) = parent_brain_run_id {
+            let control = self
+                .brain_control
+                .read()
+                .await
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("named-Brain child lifecycle channel is unavailable"))?;
+            let (response_tx, response_rx) = oneshot::channel();
+            control
+                .send(AgentBrainControlRequest::Start {
+                    parent_run_id,
+                    task_id,
+                    detail: spec.task.clone(),
+                    response_tx,
+                })
+                .map_err(|_| anyhow::anyhow!("named-Brain child lifecycle channel closed"))?;
+            let run = response_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("named-Brain child lifecycle response dropped"))?
+                .map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                run.run_id == crate::brain::store::RunId(task_id)
+                    && run.parent_run_id == Some(parent_run_id),
+                "daemon returned a conflicting named-Brain child identity"
+            );
+            Some(run.run_id)
+        } else {
+            None
+        };
         let identity = AgentIdentity {
             agent_id,
             task_id,
@@ -482,6 +569,7 @@ impl AgentScheduler {
             manifest_generation,
             starting_context_hash,
             grant_ceiling,
+            brain_run_id,
         };
         let snapshot = AgentTaskSnapshot {
             identity: identity.clone(),
@@ -646,7 +734,51 @@ impl AgentScheduler {
         .await;
     }
 
-    async fn store_result(&self, result: AgentTaskResult) {
+    async fn store_result(&self, mut result: AgentTaskResult) {
+        if let Some(run_id) = result.identity.brain_run_id {
+            let status = match result.status {
+                AgentTaskStatus::Completed => crate::brain::store::BrainRunStatus::Completed,
+                AgentTaskStatus::Cancelled => crate::brain::store::BrainRunStatus::Cancelled,
+                AgentTaskStatus::Failed | AgentTaskStatus::Queued | AgentTaskStatus::Running => {
+                    crate::brain::store::BrainRunStatus::Failed
+                }
+            };
+            let detail = if result.final_message.is_empty() {
+                result.diagnostics.join("; ")
+            } else {
+                result.final_message.clone()
+            };
+            let publication = async {
+                let control = self
+                    .brain_control
+                    .read()
+                    .await
+                    .clone()
+                    .ok_or_else(|| "named-Brain child lifecycle channel is unavailable".to_string())?;
+                let (response_tx, response_rx) = oneshot::channel();
+                control
+                    .send(AgentBrainControlRequest::Finish {
+                        run_id,
+                        status,
+                        detail,
+                        response_tx,
+                    })
+                    .map_err(|_| "named-Brain child lifecycle channel closed".to_string())?;
+                response_rx
+                    .await
+                    .map_err(|_| "named-Brain child lifecycle response dropped".to_string())??;
+                Ok::<(), String>(())
+            }
+            .await;
+            if let Err(error) = publication {
+                result.diagnostics.push(format!(
+                    "could not publish canonical named-Brain child outcome: {error}"
+                ));
+                if result.status == AgentTaskStatus::Completed {
+                    result.status = AgentTaskStatus::Failed;
+                }
+            }
+        }
         let notify = {
             let mut tasks = self.tasks.write().await;
             let Some(record) = tasks.get_mut(&result.identity.task_id) else {
@@ -944,6 +1076,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn named_brain_spawn_publishes_one_canonical_child_lifecycle() {
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(EchoGenerator)),
+            Arc::new(ProgramRuntime::new()),
+        );
+        let parent_run_id = crate::brain::store::RunId(Uuid::new_v4());
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        scheduler.bind_brain_control(control_tx).await;
+        scheduler
+            .set_active_brain_parent(Some(AgentBrainContext {
+                run_id: parent_run_id,
+                request_seq: 7,
+            }))
+            .await;
+        let (finished_tx, finished_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let AgentBrainControlRequest::Start {
+                parent_run_id: requested_parent,
+                task_id,
+                detail,
+                response_tx,
+            } = control_rx.recv().await.unwrap()
+            else {
+                panic!("expected child start")
+            };
+            assert_eq!(requested_parent, parent_run_id);
+            assert_eq!(detail, "inspect");
+            response_tx
+                .send(Ok(crate::brain::store::BrainRun {
+                    run_id: crate::brain::store::RunId(task_id),
+                    kind: crate::brain::store::BrainRunKind::Subagent,
+                    parent_run_id: Some(parent_run_id),
+                    request_seq: 7,
+                    initiating_attachment_id: crate::brain::store::AttachmentId(Uuid::new_v4()),
+                    initiated_by: "alice".into(),
+                    status: crate::brain::store::BrainRunStatus::Running,
+                    started_ms: 1,
+                    updated_ms: 1,
+                    detail: Some(detail),
+                }))
+                .unwrap();
+            let AgentBrainControlRequest::Finish {
+                run_id,
+                status,
+                response_tx,
+                ..
+            } = control_rx.recv().await.unwrap()
+            else {
+                panic!("expected child finish")
+            };
+            assert_eq!(run_id, crate::brain::store::RunId(task_id));
+            assert_eq!(status, crate::brain::store::BrainRunStatus::Completed);
+            let _ = response_tx.send(Ok(crate::brain::store::BrainRun {
+                run_id,
+                kind: crate::brain::store::BrainRunKind::Subagent,
+                parent_run_id: Some(parent_run_id),
+                request_seq: 7,
+                initiating_attachment_id: crate::brain::store::AttachmentId(Uuid::new_v4()),
+                initiated_by: "alice".into(),
+                status,
+                started_ms: 1,
+                updated_ms: 2,
+                detail: Some("done".into()),
+            }));
+            let _ = finished_tx.send(run_id);
+        });
+
+        let identity = scheduler
+            .spawn(
+                AgentTaskSpec {
+                    task: "inspect".into(),
+                    role: AgentRole::Explore,
+                    background: None,
+                    provider: None,
+                    model: None,
+                    context: Vec::new(),
+                    capability_grant_ids: None,
+                    budget: AgentBudget::default(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            identity.brain_run_id,
+            Some(crate::brain::store::RunId(identity.task_id))
+        );
+        let result = scheduler.wait(identity.task_id).await.unwrap();
+        assert_eq!(result.status, AgentTaskStatus::Completed);
+        assert_eq!(
+            finished_rx.await.unwrap(),
+            crate::brain::store::RunId(identity.task_id)
+        );
+    }
+
+    #[tokio::test]
     async fn explicit_unavailable_model_is_rejected() {
         let resolver = ProviderResolver::new(Arc::new(EchoGenerator));
         let error = match resolver.resolve(Some("other"), None).await {
@@ -1145,6 +1373,7 @@ mod tests {
             manifest_generation: runtime.manifest_generation(),
             starting_context_hash: "test-context".into(),
             grant_ceiling: EffectSet::pure(),
+            brain_run_id: None,
         };
         let names = scheduler
             .child_tools(&identity)

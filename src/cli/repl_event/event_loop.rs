@@ -177,6 +177,7 @@ pub struct EventLoop {
     /// verified portable effect; the daemon never acquires workspace authority
     /// through this field.
     program_runtime: Arc<crate::runtime::ProgramRuntime>,
+    agent_scheduler: Arc<crate::runtime::scheduler::AgentScheduler>,
 
     /// Tool results collected per query (query_id -> Vec<(tool_id, result)>)
     tool_results: ToolResultsMap,
@@ -1228,6 +1229,7 @@ impl EventLoop {
             streaming_enabled,
             tool_coordinator,
             program_runtime,
+            agent_scheduler,
             tool_results: Arc::new(RwLock::new(std::collections::HashMap::new())),
             active_query_id: Arc::new(RwLock::new(None)),
             pending_queries: std::collections::VecDeque::new(),
@@ -3189,6 +3191,7 @@ Rules:\n\
                     .write_error(format!("Query failed: {}", error));
 
                 if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
+                    self.agent_scheduler.set_active_brain_parent(None).await;
                     let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
                         message: error.clone(),
                         turn_events: pending.turn_events,
@@ -3391,7 +3394,8 @@ Rules:\n\
                 // Update context usage indicator now that the message is committed
                 self.update_compaction_status().await;
 
-                self.finish_named_brain_turn(query_id, full_response.clone());
+                self.finish_named_brain_turn(query_id, full_response.clone())
+                    .await;
 
                 // Render TUI to write the complete message to scrollback
                 self.render_tui().await?;
@@ -3631,21 +3635,28 @@ Rules:\n\
                         )
                         .await
                     {
-                        Ok(bootstrap) => self
-                            .program_runtime
-                            .hydrate_reducible_state_if_newer(
-                                bootstrap.checkpoint,
-                                bootstrap.runtime_revision,
-                            )
-                            .await
-                            .map(|_| ())
-                            .map_err(|error| error.to_string()),
+                        Ok(bootstrap) => {
+                            self.agent_scheduler
+                                .bind_brain_control(bootstrap.subagent_control)
+                                .await;
+                            self.program_runtime
+                                .hydrate_reducible_state_if_newer(
+                                    bootstrap.checkpoint,
+                                    bootstrap.runtime_revision,
+                                )
+                                .await
+                                .map(|_| ())
+                                .map_err(|error| error.to_string())
+                        }
                         Err(error) => Err(error.to_string()),
                     },
                     (Some(_), None) => Err("Cap'n Proto daemon connection unavailable".into()),
                     (None, _) => Err(detail.clone()),
                 };
                 let active = registration.is_ok();
+                if !active {
+                    self.agent_scheduler.clear_brain_control().await;
+                }
                 self.home_runner_lease_active = active;
                 self.home_runner_lease_id = if active { lease_id } else { None };
                 self.runner_brain = active.then_some(brain.clone());
@@ -3720,12 +3731,22 @@ Rules:\n\
             return;
         }
         let runtime = Arc::clone(&self.program_runtime);
+        let agent_scheduler = Arc::clone(&self.agent_scheduler);
         let event_tx = self.event_tx.clone();
         let run_id = request.run_id;
+        let request_seq = request.request_seq;
         let cancel = tokio_util::sync::CancellationToken::new();
         self.pending_named_brain_programs
             .insert(run_id, cancel.clone());
         tokio::task::spawn_local(async move {
+            agent_scheduler
+                .set_active_brain_parent(Some(
+                    crate::runtime::scheduler::AgentBrainContext {
+                        run_id,
+                        request_seq,
+                    },
+                ))
+                .await;
             let brain_language = request.language;
             let language = match brain_language {
                 crate::brain::store::ProgramLanguage::Forth => {
@@ -3830,6 +3851,7 @@ Rules:\n\
                 })
             };
             let result = execution.await;
+            agent_scheduler.set_active_brain_parent(None).await;
             let _ = request.response_tx.send(result);
             let _ = event_tx.send(ReplEvent::NamedBrainProgramFinished(run_id));
         });
@@ -3896,6 +3918,14 @@ Rules:\n\
                 approval_tx: request.approval_tx,
             },
         );
+        self.agent_scheduler
+            .set_active_brain_parent(Some(
+                crate::runtime::scheduler::AgentBrainContext {
+                    run_id: request.run_id,
+                    request_seq: request.request_seq,
+                },
+            ))
+            .await;
         self.update_compaction_status().await;
         if self
             .llm_tx
@@ -3907,6 +3937,7 @@ Rules:\n\
             .is_err()
         {
             *self.active_query_id.write().await = None;
+            self.agent_scheduler.set_active_brain_parent(None).await;
             if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
                 let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
                     message: "frontend LLM worker is unavailable".to_string(),
@@ -3995,10 +4026,11 @@ Rules:\n\
         let _ = request.response_tx.send(result);
     }
 
-    fn finish_named_brain_turn(&mut self, query_id: Uuid, output: String) {
+    async fn finish_named_brain_turn(&mut self, query_id: Uuid, output: String) {
         let Some(pending) = self.pending_named_brain_turns.remove(&query_id) else {
             return;
         };
+        self.agent_scheduler.set_active_brain_parent(None).await;
         let PendingNamedBrainTurn {
             response_tx,
             turn_events,

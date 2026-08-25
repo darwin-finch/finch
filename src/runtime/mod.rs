@@ -6296,6 +6296,7 @@ mod tests {
             manifest_generation: runtime.manifest_generation(),
             starting_context_hash: "test-context".into(),
             grant_ceiling: EffectSet::pure(),
+            brain_run_id: None,
         };
         let request = submission(
             ProgramLanguage::Lisp,
@@ -6363,6 +6364,7 @@ mod tests {
             manifest_generation: runtime.manifest_generation(),
             starting_context_hash: "test-context".into(),
             grant_ceiling: EffectSet::pure(),
+            brain_run_id: None,
         };
         let source = || {
             submission(
@@ -6403,6 +6405,7 @@ mod tests {
             manifest_generation: runtime.manifest_generation(),
             starting_context_hash: "test-context".into(),
             grant_ceiling: runtime.effective_grants_for(None).unwrap(),
+            brain_run_id: None,
         };
         let requirement = crate::vm::CapabilityRequirement::file(
             crate::vm::FileOperation::Read,
