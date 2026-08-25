@@ -190,6 +190,11 @@ pub struct EventLoop {
     /// the single shared conversation and VM revision advance in order.
     pending_queries: std::collections::VecDeque<(String, bool, bool)>,
 
+    /// Full turns requested by the daemon for the Brain whose runner lease
+    /// this frontend owns. Completion is correlated to the ordinary query ID
+    /// so tool continuations use the exact same pipeline as local turns.
+    pending_named_brain_turns: std::collections::HashMap<Uuid, PendingNamedBrainTurn>,
+
     /// Pending tool approval requests (query_id -> (tool_use, response_tx))
     pending_approvals: PendingApprovalsMap,
 
@@ -404,6 +409,12 @@ struct DeferredProposal {
 /// asking the model to resubmit or broaden its source declaration.
 struct DeferredVmApproval {
     prompt: crate::vm::ApprovalPrompt,
+}
+
+struct PendingNamedBrainTurn {
+    response_tx: tokio::sync::oneshot::Sender<
+        std::result::Result<crate::server::RunnerTurnResult, String>,
+    >,
 }
 
 fn deferred_vm_approval_from_tool_result(
@@ -800,6 +811,7 @@ impl EventLoop {
             tool_results: Arc::new(RwLock::new(std::collections::HashMap::new())),
             active_query_id: Arc::new(RwLock::new(None)),
             pending_queries: std::collections::VecDeque::new(),
+            pending_named_brain_turns: std::collections::HashMap::new(),
             pending_approvals: Arc::new(RwLock::new(std::collections::HashMap::new())),
             pending_vm_approval: None,
             ipc_client,
@@ -2592,6 +2604,10 @@ Rules:\n\
                 self.output_manager
                     .write_error(format!("Query failed: {}", error));
 
+                if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
+                    let _ = pending.response_tx.send(Err(error.clone()));
+                }
+
                 // Render TUI to ensure viewport is redrawn after error message
                 if let Err(e) = self.render_tui().await {
                     tracing::warn!("Failed to render TUI after query error: {}", e);
@@ -2757,6 +2773,8 @@ Rules:\n\
                 // Update context usage indicator now that the message is committed
                 self.update_compaction_status().await;
 
+                self.finish_named_brain_turn(query_id, full_response.clone());
+
                 // Render TUI to write the complete message to scrollback
                 self.render_tui().await?;
                 tracing::debug!("[EVENT_LOOP] StreamingComplete handled, TUI rendered");
@@ -2856,6 +2874,11 @@ Rules:\n\
                     *self.active_query_id.write().await = None;
                     // Clear tool-call history for cancelled query
                     self.tool_call_history.write().await.remove(&qid);
+                    if let Some(pending) = self.pending_named_brain_turns.remove(&qid) {
+                        let _ = pending
+                            .response_tx
+                            .send(Err("named Brain turn cancelled by runner user".into()));
+                    }
 
                     // If we were in plan/executing mode, cancel that too so the
                     // user doesn't have to press Ctrl+C again to escape.
@@ -3038,9 +3061,7 @@ Rules:\n\
                 self.dispatch_named_brain_program(request);
             }
             ReplEvent::NamedBrainTurnRequested(request) => {
-                let _ = request.response_tx.send(Err(
-                    "named Brain full-turn dispatch is not initialized yet".to_string(),
-                ));
+                self.dispatch_named_brain_turn(request).await?;
             }
             ReplEvent::ShowDialog {
                 dialog: _,
@@ -3126,6 +3147,109 @@ Rules:\n\
             .map_err(|error: anyhow::Error| error.to_string());
             let _ = request.response_tx.send(result);
         });
+    }
+
+    async fn dispatch_named_brain_turn(
+        &mut self,
+        request: crate::server::RunnerTurnRequest,
+    ) -> Result<()> {
+        if request.brain != self.session_label || !self.home_runner_lease_active {
+            let _ = request.response_tx.send(Err(format!(
+                "frontend does not hold the runner lease for named Brain '{}'",
+                request.brain
+            )));
+            return Ok(());
+        }
+        if self.active_query_id.read().await.is_some() {
+            let _ = request.response_tx.send(Err(format!(
+                "named Brain '{}' runner is already executing a turn",
+                request.brain
+            )));
+            return Ok(());
+        }
+
+        let mut context = request.context;
+        if context.is_empty() {
+            context.push(crate::claude::Message::user(request.prompt.clone()));
+        }
+        self.conversation
+            .write()
+            .await
+            .restore_snapshot(context.clone());
+        let query_id = self.query_states.create_query(context).await;
+        *self.active_query_id.write().await = Some(query_id);
+        self.pending_named_brain_turns.insert(
+            query_id,
+            PendingNamedBrainTurn {
+                response_tx: request.response_tx,
+            },
+        );
+        self.update_compaction_status().await;
+        if self
+            .llm_tx
+            .send(LlmRequest::Query {
+                id: query_id,
+                text: request.prompt,
+                no_tools: false,
+            })
+            .is_err()
+        {
+            *self.active_query_id.write().await = None;
+            if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
+                let _ = pending.response_tx.send(Err(
+                    "frontend LLM worker is unavailable".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_named_brain_turn(&mut self, query_id: Uuid, output: String) {
+        let Some(pending) = self.pending_named_brain_turns.remove(&query_id) else {
+            return;
+        };
+        let result = (|| -> anyhow::Result<crate::server::RunnerTurnResult> {
+            let source = self
+                .conversation
+                .try_read()
+                .map_err(|_| anyhow::anyhow!("named Brain conversation is busy"))?
+                .get_messages()
+                .into_iter()
+                .rev()
+                .find(|message| message.role == "assistant")
+                .map(|message| message.text())
+                .filter(|source| !source.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("named Brain turn produced no wire source"))?;
+            let language = match crate::programs::ProgramLanguage::infer_wire_source(&source)? {
+                crate::programs::ProgramLanguage::Forth => {
+                    crate::brain::shared::ProgramLanguage::Forth
+                }
+                crate::programs::ProgramLanguage::Lisp => {
+                    crate::brain::shared::ProgramLanguage::Lisp
+                }
+            };
+            let runtime_revision = self.program_runtime.revision();
+            let checkpoint = self
+                .program_runtime
+                .revision_history()?
+                .into_iter()
+                .find(|snapshot| snapshot.revision == runtime_revision)
+                .and_then(|snapshot| snapshot.checkpoint)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "named Brain revision {runtime_revision} is not checkpointable"
+                    )
+                })?;
+            Ok(crate::server::RunnerTurnResult {
+                source,
+                language,
+                output,
+                runtime_revision,
+                checkpoint,
+            })
+        })()
+        .map_err(|error| error.to_string());
+        let _ = pending.response_tx.send(result);
     }
 
     /// The editor runs outside the VM; once it finishes, resume precisely the
