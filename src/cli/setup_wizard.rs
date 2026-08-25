@@ -441,6 +441,7 @@ struct WizardState {
     current_section: WizardSection,
     sections: HashMap<WizardSection, SectionState>,
     completed: HashSet<WizardSection>,
+    confirming_cancel: bool,
 }
 
 impl WizardState {
@@ -622,6 +623,7 @@ impl WizardState {
             current_section: WizardSection::Themes,
             sections,
             completed: HashSet::new(),
+            confirming_cancel: false,
         }
     }
 
@@ -874,6 +876,89 @@ fn is_overlay_active(state: &WizardState) -> bool {
     }
 }
 
+/// Returns true while a section owns keyboard input for a nested editor or overlay.
+/// Global save/navigation shortcuts must not steal keys from these interactions.
+fn is_nested_interaction_active(state: &WizardState) -> bool {
+    match state.sections.get(&state.current_section) {
+        Some(SectionState::Models {
+            editing_mode,
+            editing_model_mode,
+            ..
+        }) => *editing_mode || *editing_model_mode || is_overlay_active(state),
+        Some(SectionState::Personas { editing_prompt, .. }) => *editing_prompt,
+        Some(SectionState::Features {
+            editing_hf_token,
+            editing_finch_api_key,
+            ..
+        }) => *editing_hf_token || *editing_finch_api_key,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WizardAction {
+    Continue,
+    Save,
+    Cancel,
+}
+
+/// Apply one key event independently of terminal I/O so navigation behavior is
+/// consistent and directly testable.
+fn handle_wizard_key(
+    state: &mut WizardState,
+    key: crossterm::event::KeyEvent,
+) -> Result<WizardAction> {
+    if state.confirming_cancel {
+        return Ok(match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => WizardAction::Cancel,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                state.confirming_cancel = false;
+                WizardAction::Continue
+            }
+            _ => WizardAction::Continue,
+        });
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        state.confirming_cancel = true;
+        return Ok(WizardAction::Continue);
+    }
+
+    let nested = is_nested_interaction_active(state);
+    if !nested
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+    {
+        return Ok(WizardAction::Save);
+    }
+
+    match key.code {
+        KeyCode::Tab if !nested => {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                state.prev_section();
+            } else {
+                state.next_section();
+            }
+        }
+        KeyCode::Left | KeyCode::Right if !nested => {
+            if key.code == KeyCode::Left {
+                state.prev_section();
+            } else {
+                state.next_section();
+            }
+        }
+        _ => {
+            if handle_section_input(state, key)? {
+                return Ok(WizardAction::Save);
+            }
+        }
+    }
+
+    Ok(WizardAction::Continue)
+}
+
 /// If a network scan has finished, advance to SelectAgent (or close overlay if no agents)
 fn advance_scan_if_done(state: &mut WizardState) {
     if let Some(SectionState::Models {
@@ -936,43 +1021,10 @@ fn run_tabbed_wizard(
             continue;
         };
 
-        // Global navigation (works in any section)
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            anyhow::bail!("Setup cancelled");
-        }
-
-        match key.code {
-            // Tab navigation
-            KeyCode::Tab => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    state.prev_section();
-                } else {
-                    state.next_section();
-                }
-            }
-            // Left/Right navigate sections only when no overlay is open; otherwise
-            // forward to the section handler so dialogs can use ←→ to cycle options.
-            KeyCode::Left | KeyCode::Right => {
-                if is_overlay_active(&state) {
-                    let should_exit = handle_section_input(&mut state, key)?;
-                    if should_exit {
-                        return build_setup_result(&state);
-                    }
-                } else if key.code == KeyCode::Left {
-                    state.prev_section();
-                } else {
-                    state.next_section();
-                }
-            }
-
-            // Section-specific handling
-            _ => {
-                let should_exit = handle_section_input(&mut state, key)?;
-                if should_exit {
-                    // User confirmed in Review section - build result
-                    return build_setup_result(&state);
-                }
-            }
+        match handle_wizard_key(&mut state, key)? {
+            WizardAction::Continue => {}
+            WizardAction::Save => return build_setup_result(&state),
+            WizardAction::Cancel => anyhow::bail!("Setup cancelled"),
         }
     }
 }
@@ -1012,7 +1064,7 @@ fn handle_themes_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                 state.next_section();
             }
             KeyCode::Esc => {
-                anyhow::bail!("Setup cancelled");
+                state.prev_section();
             }
             _ => {}
         }
@@ -1092,20 +1144,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
 
             match key.code {
                 KeyCode::Esc => {
-                    match adding_provider {
-                        // From single-screen dialogs, go back to type selection
-                        Some(AddProviderStep::ConfigureRemote {
-                            editing_idx: Some(_),
-                            ..
-                        }) => *adding_provider = None,
-                        Some(AddProviderStep::ConfigureLocal { .. })
-                        | Some(AddProviderStep::ConfigureRemote { .. }) => {
-                            *adding_provider = Some(AddProviderStep::SelectAddType { selected: 0 });
-                        }
-                        _ => {
-                            *adding_provider = None;
-                        }
-                    }
+                    *adding_provider = None;
                 }
                 KeyCode::Up => match adding_provider {
                     Some(AddProviderStep::SelectAddType { selected }) => {
@@ -1674,7 +1713,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     state.next_section();
                 }
                 KeyCode::Esc => {
-                    anyhow::bail!("Setup cancelled");
+                    state.prev_section();
                 }
                 _ => {}
             }
@@ -1841,7 +1880,7 @@ fn handle_personas_input(state: &mut WizardState, key: crossterm::event::KeyEven
                 state.next_section();
             }
             KeyCode::Esc => {
-                anyhow::bail!("Setup cancelled");
+                state.prev_section();
             }
             _ => {}
         }
@@ -1991,7 +2030,7 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                 state.next_section();
             }
             KeyCode::Esc => {
-                anyhow::bail!("Setup cancelled");
+                state.prev_section();
             }
             _ => {}
         }
@@ -2000,14 +2039,15 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
 }
 
 /// Handle input for Review section
-fn handle_review_input(_state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
+fn handle_review_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Enter => {
             // Confirm and exit
             Ok(true)
         }
-        KeyCode::Char('n') | KeyCode::Esc => {
-            anyhow::bail!("Setup cancelled");
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            state.prev_section();
+            Ok(false)
         }
         _ => Ok(false),
     }
@@ -2045,14 +2085,19 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         selected_idx,
         default_persona,
         ..
-    }) = state.sections.get(&WizardSection::Personas)
+    }) =
+        state.sections.get(&WizardSection::Personas)
     {
         let custom_prompt = available_personas.get(*selected_idx).and_then(|persona| {
             let builtin = crate::config::Persona::load_builtin(&persona.slug).ok()?;
             (persona.system_prompt != builtin.behavior.system_prompt)
                 .then(|| persona.system_prompt.clone())
         });
-        (default_persona.clone(), custom_prompt)
+        let selected_persona = available_personas
+            .get(*selected_idx)
+            .map(|persona| persona.slug.clone())
+            .unwrap_or_else(|| default_persona.clone());
+        (selected_persona, custom_prompt)
     } else {
         ("default".to_string(), None)
     };
@@ -2370,15 +2415,15 @@ fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
     render_section_content(f, chunks[1], state);
 
     // Render help text
-    let help_text = match state.current_section {
-        WizardSection::Themes => "↑/↓: Choose theme | Enter: Next | Tab: Jump to section",
-        WizardSection::Models => "Enter: Edit provider  A: Add  D: Remove  Tab: Next",
-        WizardSection::Personas => "↑/↓: Choose style | E: Edit prompt | Enter: Next | Tab: Jump",
-        WizardSection::Features => {
-            "↑/↓: Navigate | Space: Toggle | Enter: Save | Tab: Jump to section"
-        }
-        WizardSection::Review => "Enter: Save & start | Tab: Go back to edit",
+    let section_help = match state.current_section {
+        WizardSection::Themes => "↑/↓: Choose theme | Enter: Next",
+        WizardSection::Models => "Enter: Edit provider | A: Add | D: Remove",
+        WizardSection::Personas => "↑/↓: Choose style | E: Edit prompt | Enter: Next",
+        WizardSection::Features => "↑/↓: Navigate | Space: Toggle | Enter: Next",
+        WizardSection::Review => "Enter: Save & start",
     };
+    let help_text =
+        format!("{section_help} | Ctrl+S: Save | Esc: Back | Tab: Next | Ctrl+C: Cancel");
 
     let help = Paragraph::new(help_text)
         .style(
@@ -2388,6 +2433,34 @@ fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
         )
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[2]);
+
+    if state.confirming_cancel {
+        render_cancel_confirmation(f, size);
+    }
+}
+
+fn render_cancel_confirmation(f: &mut Frame, area: Rect) {
+    let width = 56.min(area.width);
+    let height = 7.min(area.height);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let dialog = Paragraph::new(
+        "Discard all setup changes and cancel?\n\nY / Enter: Discard    N / Esc: Keep editing",
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(" Cancel setup? "),
+    )
+    .style(Style::default().bg(Color::Black).fg(Color::White))
+    .alignment(Alignment::Center)
+    .wrap(Wrap { trim: false });
+    f.render_widget(dialog, popup);
 }
 
 /// Render the content area for the current section
@@ -3787,13 +3860,13 @@ fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
     lines.push(Line::from(""));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "Press Enter to save & start chatting",
+        "Press Enter or Ctrl+S to save & start chatting",
         Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::from(vec![Span::styled(
-        "Tab: Go back to change anything",
+        "Esc: Back to settings · Ctrl+C: Cancel setup",
         Style::default().fg(Color::Gray),
     )]));
 
@@ -3822,6 +3895,152 @@ mod tests {
     #[test]
     fn models_tab_describes_model_setup() {
         assert_eq!(WizardSection::Models.name(), "Model Setup");
+    }
+
+    #[test]
+    fn global_save_is_available_from_every_top_level_screen() {
+        for section in WizardSection::all() {
+            let mut state = WizardState::new(None);
+            state.current_section = section;
+            assert_eq!(
+                handle_wizard_key(
+                    &mut state,
+                    modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL),
+                )
+                .unwrap(),
+                WizardAction::Save,
+                "Ctrl+S should save from {}",
+                section.name()
+            );
+        }
+    }
+
+    #[test]
+    fn editor_local_ctrl_s_is_not_stolen_by_global_save() {
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Personas;
+        handle_personas_input(&mut state, key(KeyCode::Char('e'))).unwrap();
+
+        assert_eq!(
+            handle_wizard_key(
+                &mut state,
+                modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            )
+            .unwrap(),
+            WizardAction::Continue
+        );
+        assert!(!is_nested_interaction_active(&state));
+    }
+
+    #[test]
+    fn escape_closes_nested_overlay_before_leaving_screen() {
+        let mut state = state_with_step(default_configure_remote(0));
+        state.current_section = WizardSection::Models;
+        assert_eq!(state.current_section, WizardSection::Models);
+
+        assert_eq!(
+            handle_wizard_key(&mut state, key(KeyCode::Esc)).unwrap(),
+            WizardAction::Continue
+        );
+        assert!(get_step(&state).is_none());
+        assert_eq!(state.current_section, WizardSection::Models);
+    }
+
+    #[test]
+    fn escape_closes_nested_editor_before_leaving_screen() {
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Personas;
+        handle_personas_input(&mut state, key(KeyCode::Char('e'))).unwrap();
+        assert!(is_nested_interaction_active(&state));
+
+        assert_eq!(
+            handle_wizard_key(&mut state, key(KeyCode::Esc)).unwrap(),
+            WizardAction::Continue
+        );
+        assert!(!is_nested_interaction_active(&state));
+        assert_eq!(state.current_section, WizardSection::Personas);
+    }
+
+    #[test]
+    fn escape_moves_back_one_top_level_screen_without_cancelling() {
+        let expected = [
+            (WizardSection::Themes, WizardSection::Themes),
+            (WizardSection::Models, WizardSection::Themes),
+            (WizardSection::Personas, WizardSection::Models),
+            (WizardSection::Features, WizardSection::Personas),
+            (WizardSection::Review, WizardSection::Features),
+        ];
+
+        for (current, previous) in expected {
+            let mut state = WizardState::new(None);
+            state.current_section = current;
+            assert_eq!(
+                handle_wizard_key(&mut state, key(KeyCode::Esc)).unwrap(),
+                WizardAction::Continue
+            );
+            assert_eq!(state.current_section, previous);
+            assert!(!state.confirming_cancel);
+        }
+    }
+
+    #[test]
+    fn cancellation_requires_explicit_confirmation() {
+        let mut state = WizardState::new(None);
+        assert_eq!(
+            handle_wizard_key(
+                &mut state,
+                modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            )
+            .unwrap(),
+            WizardAction::Continue
+        );
+        assert!(state.confirming_cancel);
+
+        assert_eq!(
+            handle_wizard_key(&mut state, key(KeyCode::Esc)).unwrap(),
+            WizardAction::Continue
+        );
+        assert!(!state.confirming_cancel);
+
+        handle_wizard_key(
+            &mut state,
+            modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(
+            handle_wizard_key(&mut state, key(KeyCode::Char('y'))).unwrap(),
+            WizardAction::Cancel
+        );
+    }
+
+    #[test]
+    fn save_from_non_review_uses_accumulated_selection() {
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Personas;
+        let expected_slug = if let Some(SectionState::Personas {
+            available_personas,
+            selected_idx,
+            ..
+        }) = state.sections.get_mut(&WizardSection::Personas)
+        {
+            *selected_idx = 1;
+            available_personas[1].slug.clone()
+        } else {
+            panic!("expected personas section");
+        };
+
+        assert_eq!(
+            handle_wizard_key(
+                &mut state,
+                modified_key(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            )
+            .unwrap(),
+            WizardAction::Save
+        );
+        assert_eq!(
+            build_setup_result(&state).unwrap().default_persona,
+            expected_slug
+        );
     }
 
     #[test]
@@ -3949,6 +4168,10 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
     }
 
     fn state_with_step(step: AddProviderStep) -> WizardState {
@@ -4258,16 +4481,10 @@ mod tests {
     // ── ConfigureLocal: Esc goes back ─────────────────────────────────────────
 
     #[test]
-    fn test_configure_local_esc_returns_to_select_add_type() {
+    fn test_configure_local_esc_closes_overlay() {
         let mut state = state_with_step(default_configure_local(0));
         handle_models_input(&mut state, key(KeyCode::Esc)).unwrap();
-        assert!(
-            matches!(
-                get_step(&state),
-                Some(AddProviderStep::SelectAddType { .. })
-            ),
-            "Esc from ConfigureLocal should return to SelectAddType"
-        );
+        assert!(get_step(&state).is_none());
     }
 
     // ── ConfigureRemote: focus navigation ────────────────────────────────────
@@ -4519,16 +4736,10 @@ mod tests {
     // ── ConfigureRemote: Esc goes back ────────────────────────────────────────
 
     #[test]
-    fn test_configure_remote_esc_returns_to_select_add_type() {
+    fn test_configure_remote_esc_closes_overlay() {
         let mut state = state_with_step(default_configure_remote(0));
         handle_models_input(&mut state, key(KeyCode::Esc)).unwrap();
-        assert!(
-            matches!(
-                get_step(&state),
-                Some(AddProviderStep::SelectAddType { .. })
-            ),
-            "Esc from ConfigureRemote should return to SelectAddType"
-        );
+        assert!(get_step(&state).is_none());
     }
 
     // ── SelectAddType routing ─────────────────────────────────────────────────
