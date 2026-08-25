@@ -12,6 +12,7 @@ use tokio::net::UnixListener;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::ipc::schema::finch_ipc_capnp::{self, finch_daemon};
+use crate::ipc::brain_codec::{decode_approval_audience, encode_approval_audience};
 use crate::server::AgentServer;
 
 // ---------------------------------------------------------------------------
@@ -411,6 +412,10 @@ impl finch_daemon::Server for FinchDaemonImpl {
                                     payload.set_request_seq(request.request_seq);
                                     payload.set_prompt(&request.prompt);
                                     payload.set_context_json(&context_json);
+                                    encode_approval_audience(
+                                        payload.reborrow().init_approval_audience(),
+                                        &request.approval_audience,
+                                    );
                                 }
                                 match call.send().promise.await {
                                     Ok(reply) => (
@@ -569,6 +574,12 @@ fn decode_runner_turn_result(
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or("")
                         .to_string(),
+                    audience: decode_approval_audience(
+                        encoded
+                            .get_approval_audience()
+                            .map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?,
                     detail,
                 });
             }
@@ -626,6 +637,22 @@ fn decode_runner_turn_result(
 #[cfg(test)]
 mod tests {
     use super::{decode_runner_turn_result, execute_typed_forth_ipc};
+    use crate::ipc::brain_codec::encode_approval_audience;
+
+    fn test_approval_audience() -> crate::brain::shared::BrainApprovalAudience {
+        crate::brain::shared::BrainApprovalAudience {
+            brain_id: crate::brain::shared::BrainId(
+                uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+            ),
+            brain: "shared".into(),
+            attachment_id: crate::brain::shared::AttachmentId(
+                uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+            ),
+            subject: "alice@box.local".into(),
+            role: crate::brain::shared::AttachmentRole::Driver,
+            environment_generation: 3,
+        }
+    }
 
     #[test]
     fn runner_turn_result_decodes_ordered_capnp_lifecycle() {
@@ -661,6 +688,10 @@ mod tests {
             approval.set_approval_id("tool-1");
             approval.set_approval_kind("tool");
             approval.set_subject("search_word");
+            encode_approval_audience(
+                approval.reborrow().init_approval_audience(),
+                &test_approval_audience(),
+            );
             approval.set_detail_json(br#"{"input":{"query":"fib"}}"#);
             let mut decision = events.reborrow().get(2);
             decision.set_kind(super::finch_ipc_capnp::BrainTurnEventKind::ApprovalDecided);
@@ -689,6 +720,7 @@ mod tests {
                     approval_id: "tool-1".into(),
                     approval_kind: "tool".into(),
                     subject: "search_word".into(),
+                    audience: test_approval_audience(),
                     detail: serde_json::json!({"input": {"query": "fib"}}),
                 },
                 crate::server::RunnerTurnEvent::ApprovalDecided {

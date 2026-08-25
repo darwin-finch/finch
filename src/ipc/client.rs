@@ -12,6 +12,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::claude::{ContentBlock, Message};
 use crate::generators::StreamChunk;
+use crate::ipc::brain_codec::{decode_approval_audience, encode_approval_audience};
 use crate::ipc::schema::finch_ipc_capnp::{
     self, brain_runner, finch_daemon, stream_receiver,
 };
@@ -289,6 +290,14 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(context) => context,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
+        let approval_audience = match request
+            .get_approval_audience()
+            .map_err(anyhow::Error::new)
+            .and_then(decode_approval_audience)
+        {
+            Ok(audience) => audience,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if self
             .event_tx
@@ -298,6 +307,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                     request_seq: request.get_request_seq(),
                     prompt,
                     context,
+                    approval_audience,
                     response_tx,
                 },
             ))
@@ -374,12 +384,14 @@ fn encode_brain_turn_events(
                 approval_id,
                 approval_kind,
                 subject,
+                audience,
                 detail,
             } => {
                 encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::ApprovalRequested);
                 encoded.set_approval_id(approval_id);
                 encoded.set_approval_kind(approval_kind);
                 encoded.set_subject(subject);
+                encode_approval_audience(encoded.reborrow().init_approval_audience(), audience);
                 let detail = serde_json::to_vec(detail)
                     .map_err(|error| capnp::Error::failed(error.to_string()))?;
                 encoded.set_detail_json(&detail);

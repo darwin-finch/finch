@@ -118,6 +118,23 @@ struct BrainTurnRequest {
   requestSeq  @1 :UInt64;
   prompt      @2 :Text;
   contextJson @3 :Data; # Transitional canonical Message list; schema becomes native later.
+  approvalAudience @4 :BrainApprovalAudience;
+}
+
+enum BrainAttachmentRole {
+  runner     @0;
+  driver     @1;
+  consultant @2;
+  observer   @3;
+}
+
+struct BrainApprovalAudience {
+  brainId               @0 :Text;
+  brain                 @1 :Text;
+  subject               @2 :Text;
+  role                  @3 :BrainAttachmentRole;
+  environmentGeneration @4 :UInt64;
+  attachmentId          @5 :Text;
 }
 
 struct BrainTurnResult {
@@ -152,6 +169,7 @@ struct BrainTurnEvent {
   subject      @8 :Text; # Tool name or capability name.
   detailJson   @9 :Data; # Present for approval requests.
   decisionJson @10 :Data; # Present for approval decisions.
+  approvalAudience @11 :BrainApprovalAudience; # Present for approval requests.
 }
 
 interface BrainRunner {

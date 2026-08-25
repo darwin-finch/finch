@@ -542,8 +542,14 @@ async fn push_named_brain_event(
             ))
         }
         BrainEventKind::Prompt { text } => {
-            let execution =
-                execute_named_brain_prompt(&server, &name, accepted.seq, &text).await;
+            let execution = execute_named_brain_prompt(
+                &server,
+                &name,
+                accepted.seq,
+                &text,
+                &attachment,
+            )
+            .await;
             Some(match execution {
                 Ok(result) => Ok(result),
                 Err(error) => push_named_brain_result(
@@ -655,6 +661,7 @@ async fn execute_named_brain_prompt(
     name: &str,
     request_seq: u64,
     prompt: &str,
+    requester: &crate::brain::shared::BrainAttachment,
 ) -> anyhow::Result<crate::brain::shared::BrainEvent> {
     dispatch_named_brain_turn(
         server.shared_brains(),
@@ -662,6 +669,7 @@ async fn execute_named_brain_prompt(
         name,
         request_seq,
         prompt,
+        requester,
     )
     .await
 }
@@ -672,6 +680,7 @@ async fn dispatch_named_brain_turn(
     name: &str,
     request_seq: u64,
     prompt: &str,
+    requester: &crate::brain::shared::BrainAttachment,
 ) -> anyhow::Result<crate::brain::shared::BrainEvent> {
     let snapshot = store.snapshot(name)?;
     ensure_named_brain_store_environment(store, &snapshot)?;
@@ -685,6 +694,14 @@ async fn dispatch_named_brain_turn(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("named Brain '{name}' has no live environment runner"))?;
     let lease_id = lease.lease_id;
+    let approval_audience = crate::brain::shared::BrainApprovalAudience {
+        brain_id: snapshot.brain_id,
+        brain: name.to_string(),
+        attachment_id: requester.attachment_id,
+        subject: requester.subject.clone(),
+        role: requester.role,
+        environment_generation: snapshot.environment.generation,
+    };
     let outcome = match runners
         .dispatch_turn(
             name,
@@ -692,6 +709,7 @@ async fn dispatch_named_brain_turn(
             request_seq,
             prompt.to_string(),
             named_brain_provider_messages(&snapshot),
+            approval_audience.clone(),
         )
         .await
     {
@@ -703,6 +721,7 @@ async fn dispatch_named_brain_turn(
                     name,
                     request_seq,
                     &lease.subject,
+                    &approval_audience,
                     failure.turn_events.clone(),
                 )?;
             }
@@ -714,6 +733,7 @@ async fn dispatch_named_brain_turn(
         name,
         request_seq,
         &lease.subject,
+        &approval_audience,
         outcome.turn_events,
     )?;
     let program = store.push(
@@ -738,6 +758,7 @@ fn persist_named_brain_turn_events(
     name: &str,
     request_seq: u64,
     runner_subject: &str,
+    expected_approval_audience: &crate::brain::shared::BrainApprovalAudience,
     turn_events: Vec<crate::server::RunnerTurnEvent>,
 ) -> anyhow::Result<()> {
     for turn_event in turn_events {
@@ -778,8 +799,13 @@ fn persist_named_brain_turn_events(
                 approval_id,
                 approval_kind,
                 subject,
+                audience,
                 detail,
             } => {
+                anyhow::ensure!(
+                    audience == *expected_approval_audience,
+                    "runner substituted the approval audience for request {request_seq}"
+                );
                 store.push(
                     name,
                     "runner",
@@ -788,6 +814,7 @@ fn persist_named_brain_turn_events(
                         approval_id,
                         approval_kind,
                         subject,
+                        audience: Some(expected_approval_audience.clone()),
                         detail,
                     },
                 )?;
@@ -2123,8 +2150,20 @@ async fn handle_file_put(
 mod named_brain_provider_context_tests {
     use super::*;
     use crate::brain::shared::{
-        BrainEnvironment, BrainEvent, BrainEventKind, BrainId, BrainSnapshot, ProgramLanguage,
+        AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
+        BrainEvent, BrainEventKind, BrainId, BrainSnapshot, ProgramLanguage,
     };
+
+    fn driver_attachment(subject: &str) -> BrainAttachment {
+        BrainAttachment {
+            attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            subject: subject.into(),
+            role: AttachmentRole::Driver,
+            acknowledged_seq: 0,
+            connected: true,
+            connection_id: Some(crate::brain::shared::ConnectionId(uuid::Uuid::new_v4())),
+        }
+    }
 
     fn event(seq: u64, sender: &str, kind: BrainEventKind) -> BrainEvent {
         BrainEvent {
@@ -2341,6 +2380,48 @@ mod named_brain_provider_context_tests {
         assert!(!attachment_can_submit(AttachmentRole::Runner, &program));
     }
 
+    #[test]
+    fn runner_cannot_substitute_the_daemon_selected_approval_audience() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::shared::SharedBrainStore::with_root(
+            "box.local",
+            Some(temp.path().into()),
+        );
+        let snapshot = store.snapshot("shared").unwrap();
+        let requester = driver_attachment("alice@box.local");
+        let expected = BrainApprovalAudience {
+            brain_id: snapshot.brain_id,
+            brain: snapshot.name,
+            attachment_id: requester.attachment_id,
+            subject: requester.subject,
+            role: requester.role,
+            environment_generation: snapshot.environment.generation,
+        };
+        let mut substituted = expected.clone();
+        substituted.subject = "mallory@box.local".into();
+
+        let error = persist_named_brain_turn_events(
+            &store,
+            "shared",
+            1,
+            "runner@box.local",
+            &expected,
+            vec![crate::server::RunnerTurnEvent::ApprovalRequested {
+                approval_id: "approval-1".into(),
+                approval_kind: "tool".into(),
+                subject: "bash".into(),
+                audience: substituted,
+                detail: serde_json::json!({}),
+            }],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("substituted the approval audience"));
+        assert!(!store.snapshot("shared").unwrap().events.iter().any(|event| {
+            matches!(event.kind, BrainEventKind::ApprovalRequested { .. })
+        }));
+    }
+
     #[tokio::test]
     async fn named_brain_program_runs_on_registered_frontend_and_commits_checkpoint() {
         let temp = tempfile::tempdir().unwrap();
@@ -2448,6 +2529,7 @@ mod named_brain_provider_context_tests {
             )
             .unwrap();
         let prompt_seq = prompt.seq;
+        let requester = driver_attachment("driver@box.local");
         let generation = store.environment().generation;
         let lease = store
             .acquire_runner_lease("shared", "runner@box.local", generation, None, 60_000)
@@ -2488,6 +2570,7 @@ mod named_brain_provider_context_tests {
                 .find(|snapshot| snapshot.revision == outcome.output_revision)
                 .and_then(|snapshot| snapshot.checkpoint)
                 .unwrap();
+            let approval_audience = request.approval_audience.clone();
             request
                 .response_tx
                 .send(Ok(crate::server::RunnerTurnResult {
@@ -2504,6 +2587,7 @@ mod named_brain_provider_context_tests {
                             approval_id: "tool-1".into(),
                             approval_kind: "tool".into(),
                             subject: "search_word".into(),
+                            audience: approval_audience,
                             detail: serde_json::json!({"input": {"query": "triple"}}),
                         },
                         crate::server::RunnerTurnEvent::ApprovalDecided {
@@ -2528,6 +2612,7 @@ mod named_brain_provider_context_tests {
             "shared",
             prompt_seq,
             "define triple",
+            &requester,
         )
         .await
         .unwrap();
@@ -2551,7 +2636,19 @@ mod named_brain_provider_context_tests {
                 BrainEventKind::ToolResult { tool_id, .. } => {
                     Some(("result", tool_id.as_str()))
                 }
-                BrainEventKind::ApprovalRequested { approval_id, .. } => {
+                BrainEventKind::ApprovalRequested {
+                    approval_id,
+                    audience: Some(audience),
+                    ..
+                } => {
+                    assert_eq!(audience.brain, "shared");
+                    assert_eq!(audience.attachment_id, requester.attachment_id);
+                    assert_eq!(audience.subject, "driver@box.local");
+                    assert_eq!(audience.role, AttachmentRole::Driver);
+                    assert_eq!(
+                        audience.environment_generation,
+                        store.environment().generation
+                    );
                     Some(("approval_requested", approval_id.as_str()))
                 }
                 BrainEventKind::ApprovalDecided { approval_id, .. } => {
@@ -2610,6 +2707,7 @@ mod named_brain_provider_context_tests {
             )
             .unwrap()
             .seq;
+        let requester = driver_attachment("driver@box.local");
         let lease = store
             .acquire_runner_lease(
                 "shared",
@@ -2626,6 +2724,7 @@ mod named_brain_provider_context_tests {
             let crate::server::RunnerRequest::Turn(request) = rx.recv().await.unwrap() else {
                 panic!("expected full turn request")
             };
+            let approval_audience = request.approval_audience.clone();
             request
                 .response_tx
                 .send(Err(crate::server::RunnerTurnError {
@@ -2635,6 +2734,7 @@ mod named_brain_provider_context_tests {
                             approval_id: "approval-1".into(),
                             approval_kind: "vm_capability".into(),
                             subject: "FileRead".into(),
+                            audience: approval_audience,
                             detail: serde_json::json!({"reason": "read manifest"}),
                         },
                         crate::server::RunnerTurnEvent::ApprovalDecided {
@@ -2652,6 +2752,7 @@ mod named_brain_provider_context_tests {
             "shared",
             prompt_seq,
             "try an effect",
+            &requester,
         )
         .await
         .unwrap_err();
@@ -2659,8 +2760,15 @@ mod named_brain_provider_context_tests {
         let snapshot = store.snapshot("shared").unwrap();
         assert!(matches!(
             &snapshot.events[snapshot.events.len() - 2].kind,
-            BrainEventKind::ApprovalRequested { approval_id, .. }
+            BrainEventKind::ApprovalRequested {
+                approval_id,
+                audience: Some(audience),
+                ..
+            }
                 if approval_id == "approval-1"
+                    && audience.attachment_id == requester.attachment_id
+                    && audience.subject == "driver@box.local"
+                    && audience.role == AttachmentRole::Driver
         ));
         assert!(matches!(
             &snapshot.events[snapshot.events.len() - 1].kind,

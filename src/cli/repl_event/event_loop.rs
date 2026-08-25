@@ -407,6 +407,20 @@ fn participant_subject_from(user: &str, machine: &str) -> String {
         .collect()
 }
 
+fn approval_audience_summary(
+    audience: &crate::brain::shared::BrainApprovalAudience,
+) -> String {
+    format!(
+        "Brain: {} ({})\nApproval audience: {} ({:?}, attachment {})\nEnvironment generation: {}",
+        audience.brain,
+        audience.brain_id.0,
+        audience.subject,
+        audience.role,
+        audience.attachment_id.0,
+        audience.environment_generation
+    )
+}
+
 /// Application-owned data extracted from one verified, suspended
 /// `proposal-open` effect. The effect handle—not source text—is the authority
 /// to resume this exact VM frame.
@@ -431,6 +445,7 @@ struct PendingNamedBrainTurn {
     /// Exact lifecycle order observed by this frontend while servicing the
     /// delegated turn. The daemon persists these as canonical Brain events.
     turn_events: Vec<crate::server::RunnerTurnEvent>,
+    approval_audience: crate::brain::shared::BrainApprovalAudience,
 }
 
 struct PendingVmApproval {
@@ -2756,7 +2771,16 @@ Rules:\n\
                         "Proposal {} is awaiting editor review",
                         proposal.handle.sequence
                     ));
-                    self.spawn_deferred_proposal(query_id, tool_id, proposal);
+                    let approval_audience = self
+                        .pending_named_brain_turns
+                        .get(&query_id)
+                        .map(|turn| turn.approval_audience.clone());
+                    self.spawn_deferred_proposal(
+                        query_id,
+                        tool_id,
+                        proposal,
+                        approval_audience,
+                    );
                 } else if let Some(approval) = deferred_vm_approval_from_tool_result(&result) {
                     self.output_manager.write_status(format!(
                         "VM capability request {} is awaiting approval",
@@ -3332,6 +3356,7 @@ Rules:\n\
             PendingNamedBrainTurn {
                 response_tx: request.response_tx,
                 turn_events: Vec::new(),
+                approval_audience: request.approval_audience,
             },
         );
         self.update_compaction_status().await;
@@ -3362,6 +3387,7 @@ Rules:\n\
         let PendingNamedBrainTurn {
             response_tx,
             turn_events,
+            ..
         } = pending;
         let result = (|| -> anyhow::Result<crate::server::RunnerTurnResult> {
             let messages = self
@@ -3452,14 +3478,25 @@ Rules:\n\
         query_id: Uuid,
         tool_id: String,
         proposal: DeferredProposal,
+        approval_audience: Option<crate::brain::shared::BrainApprovalAudience>,
     ) {
         let event_tx = self.event_tx.clone();
         let runtime = Arc::clone(&self.program_runtime);
         tokio::spawn(async move {
             let result = async {
+                let intent = approval_audience
+                    .as_ref()
+                    .map(|audience| {
+                        format!(
+                            "{}\n\n{}",
+                            proposal.intent,
+                            approval_audience_summary(audience)
+                        )
+                    })
+                    .unwrap_or_else(|| proposal.intent.clone());
                 let decision = crate::tools::implementations::propose::propose_artifact_with_decision(
                     &proposal.language,
-                    &proposal.intent,
+                    &intent,
                     &proposal.source,
                 )
                 .await?;
@@ -4118,6 +4155,7 @@ Rules:\n\
                 approval_id,
                 approval_kind,
                 subject,
+                audience,
                 detail,
                 ..
             } => {
@@ -4134,7 +4172,18 @@ Rules:\n\
                 let unit = self
                     .remote_brain_tool_unit
                     .get_or_insert_with(|| self.output_manager.start_work_unit("Brain tools"));
-                let row = unit.add_row(format!("approval ({approval_kind}): {subject}"));
+                let audience_summary = audience
+                    .as_ref()
+                    .map(|audience| {
+                        format!(
+                            "{} ({:?}, environment {})",
+                            audience.subject, audience.role, audience.environment_generation
+                        )
+                    })
+                    .unwrap_or_else(|| "legacy audience unspecified".to_string());
+                let row = unit.add_row(format!(
+                    "approval ({approval_kind}) for {audience_summary}: {subject}"
+                ));
                 let body = serde_json::to_string_pretty(detail)
                     .unwrap_or_else(|_| detail.to_string())
                     .lines()
@@ -4168,14 +4217,15 @@ Rules:\n\
                     .remote_brain_approval_rows
                     .remove(approval_id)
                     .unwrap_or_else(|| unit.add_row(format!("approval {approval_id}")));
-                let summary = decision
+                let choice = decision
                     .get("choice")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("decided");
-                if summary == "deny" {
-                    unit.fail_row(row, "denied");
+                let summary = format!("{choice} by {}", event.sender);
+                if choice == "deny" {
+                    unit.fail_row(row, &summary);
                 } else {
-                    unit.complete_row(row, summary);
+                    unit.complete_row(row, &summary);
                 }
             }
             BrainEventKind::Program { language, source } => {
@@ -5008,19 +5058,31 @@ Rules:\n\
 
         tracing::debug!("[EVENT_LOOP] Requesting tool approval: {}", tool_use.name);
 
-        if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
+        let approval_audience = self
+            .pending_named_brain_turns
+            .get(&query_id)
+            .map(|turn| turn.approval_audience.clone());
+        if let (Some(turn), Some(audience)) = (
+            self.pending_named_brain_turns.get_mut(&query_id),
+            approval_audience.as_ref(),
+        ) {
             turn.turn_events
                 .push(crate::server::RunnerTurnEvent::ApprovalRequested {
                     approval_id: tool_use.id.clone(),
                     approval_kind: "tool".to_string(),
                     subject: tool_use.name.clone(),
+                    audience: audience.clone(),
                     detail: serde_json::json!({"input": tool_use.input.clone()}),
                 });
         }
 
         // Create approval dialog — compact 3-option style matching Claude Code UX
         let tool_name = &tool_use.name;
-        let summary = tool_approval_summary(&tool_use);
+        let mut summary = tool_approval_summary(&tool_use);
+        if let Some(audience) = approval_audience {
+            summary.push_str("\n\n");
+            summary.push_str(&approval_audience_summary(&audience));
+        }
 
         let dialog = Dialog::tool_approval(tool_name, &summary);
 
@@ -5073,6 +5135,7 @@ Rules:\n\
                         approval_id: approval_id.clone(),
                         approval_kind: "vm_capability".to_string(),
                         subject: format!("{:?}", prompt.exact.capability),
+                        audience: turn.approval_audience.clone(),
                         detail: serde_json::to_value(&prompt).unwrap_or_else(|_| {
                             serde_json::json!({"reason": prompt.request.reason.clone()})
                         }),
@@ -5122,9 +5185,18 @@ Rules:\n\
         } else {
             ""
         };
+        let audience = query_id
+            .and_then(|query_id| self.pending_named_brain_turns.get(&query_id))
+            .map(|turn| {
+                format!(
+                    "\n\n{}",
+                    approval_audience_summary(&turn.approval_audience)
+                )
+            })
+            .unwrap_or_default();
         let dialog = Dialog::select("Finch VM capability request", options).with_body(format!(
-            "Reason: {}\nHost availability: {:?}\n\nRequired capability:\n{}{}",
-            prompt.request.reason, availability, exact, warning
+            "Reason: {}\nHost availability: {:?}\n\nRequired capability:\n{}{}{}",
+            prompt.request.reason, availability, exact, warning, audience
         ));
 
         self.pending_vm_approval = Some(PendingVmApproval {

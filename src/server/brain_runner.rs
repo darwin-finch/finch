@@ -37,6 +37,7 @@ pub struct RunnerTurnRequest {
     pub request_seq: u64,
     pub prompt: String,
     pub context: Vec<crate::claude::Message>,
+    pub approval_audience: crate::brain::shared::BrainApprovalAudience,
     pub response_tx: oneshot::Sender<Result<RunnerTurnResult, RunnerTurnError>>,
 }
 
@@ -82,6 +83,7 @@ pub enum RunnerTurnEvent {
         approval_id: String,
         approval_kind: String,
         subject: String,
+        audience: crate::brain::shared::BrainApprovalAudience,
         detail: serde_json::Value,
     },
     ApprovalDecided {
@@ -192,6 +194,7 @@ impl BrainRunnerBroker {
         request_seq: u64,
         prompt: String,
         context: Vec<crate::claude::Message>,
+        approval_audience: crate::brain::shared::BrainApprovalAudience,
     ) -> Result<RunnerTurnResult> {
         let registration = self
             .registrations
@@ -211,6 +214,7 @@ impl BrainRunnerBroker {
                 request_seq,
                 prompt,
                 context,
+                approval_audience,
                 response_tx,
             }))
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
@@ -227,6 +231,17 @@ mod tests {
 
     fn lease() -> RunnerLeaseId {
         RunnerLeaseId(uuid::Uuid::new_v4())
+    }
+
+    fn test_approval_audience() -> crate::brain::shared::BrainApprovalAudience {
+        crate::brain::shared::BrainApprovalAudience {
+            brain_id: crate::brain::shared::BrainId(uuid::Uuid::new_v4()),
+            brain: "brain".into(),
+            attachment_id: crate::brain::shared::AttachmentId(uuid::Uuid::new_v4()),
+            subject: "driver@box.local".into(),
+            role: crate::brain::shared::AttachmentRole::Driver,
+            environment_generation: 1,
+        }
     }
 
     #[tokio::test]
@@ -306,6 +321,7 @@ mod tests {
             assert_eq!(request.prompt, "double it");
             assert_eq!(request.context.len(), 1);
             assert_eq!(request.context[0].text(), "21");
+            assert_eq!(request.approval_audience.brain, "brain");
             let runtime = crate::runtime::ProgramRuntime::new();
             let checkpoint = runtime
                 .revision_history()
@@ -334,6 +350,7 @@ mod tests {
                 8,
                 "double it".into(),
                 vec![crate::claude::Message::user("21")],
+                test_approval_audience(),
             )
             .await
             .unwrap();

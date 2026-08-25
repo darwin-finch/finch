@@ -776,8 +776,12 @@ still blocks the corresponding Brain phase until it is unified.
   execution and provider tools in the frontend runner.
 - [ ] Complete Brain control and approval ownership above that substrate. Put the role and approval
   audience on every permission/proposal view and add scoped participant credentials. ProgramRuns
-  now execute on the leased frontend, but approval/control authority still needs explicit audience,
-  disconnect, cancellation, and handoff semantics rather than relying on the local dialog alone.
+  now execute on the leased frontend. Each approval request now carries the daemon-selected
+  initiating attachment ID, subject, actual participant role, Brain identity, and environment
+  generation through Cap'n Proto into tool, VM-capability, and editor-backed proposal views; the
+  daemon rejects a runner that substitutes that audience before journaling it. Still route the
+  decision to that attachment, authorize it with scoped credentials, and define disconnect,
+  cancellation, delegation, and handoff semantics instead of relying on the runner-local dialog.
 - [x] Persist a frontend attachment identity across frontend process restarts, not merely reconnects
   in one process, while keeping the daemon cursor authoritative. The client stores only the opaque
   attachment ID, keyed by durable Brain ID plus console slot/subject/role; the daemon still owns the

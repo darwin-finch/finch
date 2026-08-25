@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
-const BRAIN_EVENT_SCHEMA_VERSION: u32 = 6;
+const BRAIN_EVENT_SCHEMA_VERSION: u32 = 7;
 const BRAIN_METADATA_VERSION: u32 = 1;
 
 /// Stable identity of one durable Brain. Names are mutable human aliases;
@@ -132,6 +132,19 @@ pub struct BrainEnvironment {
     pub generation: u64,
 }
 
+/// Exact participant/environment boundary to which a Brain-owned approval
+/// request is addressed. This is policy input, not a bearer credential;
+/// possession of this record does not authorize a decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainApprovalAudience {
+    pub brain_id: BrainId,
+    pub brain: String,
+    pub attachment_id: AttachmentId,
+    pub subject: String,
+    pub role: AttachmentRole,
+    pub environment_generation: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrainEventKind {
@@ -173,6 +186,8 @@ pub enum BrainEventKind {
         approval_id: String,
         approval_kind: String,
         subject: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audience: Option<BrainApprovalAudience>,
         detail: serde_json::Value,
     },
     ApprovalDecided {
@@ -1530,6 +1545,15 @@ mod tests {
     fn tool_and_approval_lifecycle_is_rebuilt_from_the_event_log() {
         let temp = tempfile::tempdir().unwrap();
         let store = SharedBrainStore::with_root("workstation.local", Some(temp.path().into()));
+        let brain_id = store.snapshot("finch").unwrap().brain_id;
+        let audience = BrainApprovalAudience {
+            brain_id,
+            brain: "finch".into(),
+            attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            subject: "alice".into(),
+            role: AttachmentRole::Driver,
+            environment_generation: 1,
+        };
         store
             .push(
                 "finch",
@@ -1551,6 +1575,7 @@ mod tests {
                     approval_id: "tool-1".into(),
                     approval_kind: "tool".into(),
                     subject: "search_word".into(),
+                    audience: Some(audience.clone()),
                     detail: serde_json::json!({"input": {"query": "fib"}}),
                 },
             )
@@ -1588,8 +1613,15 @@ mod tests {
         ));
         assert!(matches!(
             &snapshot.events[1].kind,
-            BrainEventKind::ApprovalRequested { approval_id, subject, .. }
-                if approval_id == "tool-1" && subject == "search_word"
+            BrainEventKind::ApprovalRequested {
+                approval_id,
+                subject,
+                audience: Some(event_audience),
+                ..
+            }
+                if approval_id == "tool-1"
+                    && subject == "search_word"
+                    && event_audience == &audience
         ));
         assert!(matches!(
             &snapshot.events[2].kind,
@@ -1600,6 +1632,29 @@ mod tests {
             &snapshot.events[3].kind,
             BrainEventKind::ToolResult { tool_id, output, is_error: false, .. }
                 if tool_id == "tool-1" && output == "found"
+        ));
+    }
+
+    #[test]
+    fn legacy_approval_event_without_audience_still_deserializes() {
+        let event: BrainEvent = serde_json::from_value(serde_json::json!({
+            "schema_version": 6,
+            "brain_id": uuid::Uuid::nil(),
+            "seq": 1,
+            "environment_generation": 1,
+            "sender": "runner",
+            "created_ms": 0,
+            "kind": "approval_requested",
+            "request_seq": 1,
+            "approval_id": "approval-1",
+            "approval_kind": "tool",
+            "subject": "search_word",
+            "detail": {}
+        }))
+        .unwrap();
+        assert!(matches!(
+            event.kind,
+            BrainEventKind::ApprovalRequested { audience: None, .. }
         ));
     }
 
