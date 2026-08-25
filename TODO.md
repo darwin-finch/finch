@@ -814,6 +814,15 @@ still blocks the corresponding Brain phase until it is unified.
   environments, project presence/runner state compactly in chrome or `/who`, and never replay
   attachment/lease churn as transcript messages. Give user turns, VM source, executed output, tools,
   and lifecycle diagnostics distinct structured presentation instead of mixing them as peer prose.
+- [ ] Stream named-Brain runner activity through the daemon while a turn is executing. Today the
+  leased frontend renders tool calls/results and approvals immediately but accumulates
+  `RunnerTurnEvent` values until the callback returns, so attached consoles see no progress until
+  completion and then render a differently shaped durable replay. Give every live event the Brain,
+  RunId, stable tool/approval ID, and monotonic sequence; append/broadcast it idempotently as it
+  occurs, then make the terminal callback confirm the final program/result/checkpoint transaction
+  without duplicating the streamed rows. Reconnect and replacement snapshots must converge on the
+  same structured WorkUnit presentation seen by the runner. Test two consoles during a long tool
+  turn, response loss, replay, cancellation, and daemon/frontend restart.
 - [x] Fix fresh-home Brain bootstrap so the event watch and lease-bound runner callback cannot close
   immediately after attachment with `Peer disconnected`, leaving the home console as a driver with
   `runner offline`. Treat event-watch loss and runner-registration loss as separate correlated
