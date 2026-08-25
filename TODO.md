@@ -1,6 +1,9 @@
 # Finch TODO
 
-This is the short, discoverable work queue. Detailed rationale and protocol sketches live in
+GitHub Issues are the authoritative queue for actionable work. This file is the architectural
+roadmap and discoverable index; mutable implementation status belongs on the linked issue. The
+remaining unchecked backlog is being triaged under
+[#54](https://github.com/darwin-finch/finch/issues/54). Detailed rationale and protocol sketches live in
 [`docs/TYPED_LISP_FORTH_CAPABILITY_JIT_PLAN.md`](docs/TYPED_LISP_FORTH_CAPABILITY_JIT_PLAN.md),
 [`docs/SHARED_PROGRAM_RUNTIME_PLAN.md`](docs/SHARED_PROGRAM_RUNTIME_PLAN.md), and
 [`docs/BRAIN_CONVERGENCE_PLAN.md`](docs/BRAIN_CONVERGENCE_PLAN.md).
@@ -296,7 +299,8 @@ still blocks the corresponding Brain phase until it is unified.
   fixtures for non-streaming, streaming, tools, tool continuation, reasoning, structured output,
   and each advertised input modality across Claude, OpenAI, Grok, Gemini, Mistral, Groq, Ollama,
   remote daemons, and every new compatible profile.
-- [ ] **P0 — make a ChatGPT/Codex subscription profile usable for Finch dogfooding.** Finch has an
+- [ ] **P0 — make a ChatGPT/Codex subscription profile usable for Finch dogfooding
+  ([#51](https://github.com/darwin-finch/finch/issues/51)).** Finch has an
   orphaned `src/providers/chatgpt_auth.rs` device-login implementation, but the module is not exported,
   no CLI/setup path invokes it, no `ProviderEntry` or factory consumes its refreshable credential, and
   the ordinary OpenAI provider still requires a Platform API key. Audit the existing implementation
@@ -836,6 +840,10 @@ still blocks the corresponding Brain phase until it is unified.
   without duplicating the streamed rows. Reconnect and replacement snapshots must converge on the
   same structured WorkUnit presentation seen by the runner. Test two consoles during a long tool
   turn, response loss, replay, cancellation, and daemon/frontend restart.
+- [x] Reconcile the runner's immediate home-console projection with the canonical Brain run log
+  ([#50](https://github.com/darwin-finch/finch/issues/50)). Canonical RunId-backed work units now
+  absorb durable tool, approval, program, result, reconnect, and failure events without duplicating
+  transient local output.
 - [x] Fix fresh-home Brain bootstrap so the event watch and lease-bound runner callback cannot close
   immediately after attachment with `Peer disconnected`, leaving the home console as a driver with
   `runner offline`. Treat event-watch loss and runner-registration loss as separate correlated
@@ -1073,6 +1081,11 @@ still blocks the corresponding Brain phase until it is unified.
   leases cannot publish, and child ancestry/outcome reconstructs from the event log after restart.
   B3 remains open for speculative helpers and any other background activity that still lacks the
   same canonical lifecycle.
+- [ ] Make every externally addressable remote Brain mutation crash-safe and idempotent
+  ([#49](https://github.com/darwin-finch/finch/issues/49)). Cancellation, runner handoff, schedule
+  cancellation, initialization, and approval decisions need durable reservations and replayable
+  receipts across retries, response loss, restart, and concurrent identical requests; approval
+  delivery must not deadlock against the originating turn lane.
 - [x] Complete Brain control and approval ownership above that substrate. Put the role and approval
   audience on every permission/proposal view. ProgramRuns
   now execute on the leased frontend. Each approval request now carries the daemon-selected
@@ -1247,7 +1260,8 @@ still blocks the corresponding Brain phase until it is unified.
 ## Client and model integration
 
 - [ ] Add optional, resource-bounded Language Server Protocol integration as structured editing
-  assistance, not as Finch's authoritative build/test oracle. Compiler, test, lint, and verifier
+  assistance ([#52](https://github.com/darwin-finch/finch/issues/52)),
+  not as Finch's authoritative build/test oracle. Compiler, test, lint, and verifier
   commands remain the final truth; an LSP adapter may add low-latency overlay diagnostics with exact
   spans/codes, definition/reference/symbol queries, and previewable rename or workspace edits. Expose
   these through typed VM capabilities and the per-run changeset/overlay so models never apply an
@@ -1258,7 +1272,8 @@ still blocks the corresponding Brain phase until it is unified.
   Separately provide a Finch Co-Lisp/Co-Forth language server once the Syntax/AST/module interfaces are
   stable, reusing the compiler's real diagnostics and symbol graph rather than implementing semantics
   twice. Reference: https://opencode.ai/docs/lsp/
-- [ ] Review and reproduce the useful local-first properties of Perplexity/NVIDIA Portable Computer,
+- [ ] Review and reproduce the useful local-first properties of Perplexity/NVIDIA Portable Computer
+  ([#53](https://github.com/darwin-finch/finch/issues/53)),
   without copying its subscription or hardware assumptions. The 2026-08-25 announcement claims that
   models, files, tools, and workflows run on-device, local work incurs no token charge, and each
   escalation to a cloud model requires permission; the reported initial floor is Linux on an RTX GPU
