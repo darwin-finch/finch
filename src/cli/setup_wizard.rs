@@ -52,6 +52,12 @@ enum AddProviderStep {
 /// Cloud provider options shown in the add-provider overlay
 const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
     (
+        "chatgpt_subscription",
+        "ChatGPT subscription (Codex)",
+        "gpt-5.6-terra",
+        "sign in first with: finch auth login chatgpt",
+    ),
+    (
         "grok",
         "Grok (xAI)",
         "",
@@ -473,6 +479,16 @@ impl ModelConfig {
 /// `teachers` projection.
 fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
     match provider {
+        ProviderEntry::ChatgptSubscription { model, name, .. } => Some(ModelConfig::Remote {
+            provider: "chatgpt_subscription".to_string(),
+            name: name
+                .clone()
+                .unwrap_or_else(|| "ChatGPT subscription".to_string()),
+            api_key: String::new(),
+            model: model.clone().unwrap_or_else(|| "gpt-5.6-terra".to_string()),
+            enabled: true,
+            persisted: Some(provider.clone()),
+        }),
         ProviderEntry::Local {
             inference_provider,
             execution_target,
@@ -530,6 +546,13 @@ fn provider_entry_from_remote_model(
     let model = (!model.is_empty()).then(|| model.to_string());
     let name = Some(name.to_string());
     match persisted {
+        Some(ProviderEntry::ChatgptSubscription { credential_ref, .. }) => {
+            ProviderEntry::ChatgptSubscription {
+                credential_ref: credential_ref.clone(),
+                model,
+                name,
+            }
+        }
         Some(ProviderEntry::Claude {
             base_url,
             chat_path,
@@ -607,6 +630,14 @@ fn provider_entry_from_remote_model(
             address: model.unwrap_or_default(),
             name,
         },
+        _ if provider.eq_ignore_ascii_case("chatgpt_subscription") => {
+            ProviderEntry::ChatgptSubscription {
+                credential_ref:
+                    crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF.to_string(),
+                model,
+                name,
+            }
+        }
         _ => ProviderEntry::from_teacher_entry(&TeacherEntry {
             provider: provider.to_string(),
             api_key: api_key.to_string(),
@@ -1837,6 +1868,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                 }
                 KeyCode::Char(c) => {
                     if let Some(AddProviderStep::ConfigureRemote {
+                        provider_idx,
                         name,
                         model,
                         api_key,
@@ -1855,9 +1887,11 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 *catalog_model_provenance = ModelSelectionProvenance::Manual;
                             }
                             3 => {
-                                api_key.push(c);
-                                *catalog_generation = catalog_generation.wrapping_add(1);
-                                *catalog_refresh = None;
+                                if CLOUD_PROVIDERS[*provider_idx].0 != "chatgpt_subscription" {
+                                    api_key.push(c);
+                                    *catalog_generation = catalog_generation.wrapping_add(1);
+                                    *catalog_refresh = None;
+                                }
                             }
                             _ => {}
                         }
@@ -1865,6 +1899,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                 }
                 KeyCode::Backspace => {
                     if let Some(AddProviderStep::ConfigureRemote {
+                        provider_idx,
                         name,
                         model,
                         api_key,
@@ -1887,9 +1922,11 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 };
                             }
                             3 => {
-                                api_key.pop();
-                                *catalog_generation = catalog_generation.wrapping_add(1);
-                                *catalog_refresh = None;
+                                if CLOUD_PROVIDERS[*provider_idx].0 != "chatgpt_subscription" {
+                                    api_key.pop();
+                                    *catalog_generation = catalog_generation.wrapping_add(1);
+                                    *catalog_refresh = None;
+                                }
                             }
                             _ => {}
                         }
@@ -4092,7 +4129,10 @@ fn render_configure_remote_overlay(
 
     let provider_value = format!("{} ({})", provider_name, provider_id);
     let model_display = if model.is_empty() { "(default)" } else { model };
-    let key_display = if api_key.is_empty() {
+    let managed_auth = provider_id == "chatgpt_subscription";
+    let key_display = if managed_auth {
+        "managed by Codex app-server".to_string()
+    } else if api_key.is_empty() {
         String::new()
     } else {
         let visible: String = api_key.chars().take(12).collect();
@@ -4104,7 +4144,12 @@ fn render_configure_remote_overlay(
         make_row("Provider", &provider_value, focused_field == 0, false),
         make_row("Name", name, focused_field == 1, true),
         make_row("Model", model_display, focused_field == 2, true),
-        make_row("API Key", &key_display, focused_field == 3, true),
+        make_row(
+            if managed_auth { "Auth" } else { "API Key" },
+            &key_display,
+            focused_field == 3,
+            !managed_auth,
+        ),
         Line::from(""),
         Line::from(Span::styled(
             "─".repeat(area.width as usize),
@@ -7421,5 +7466,37 @@ mod tests {
         );
         let config = config_from_setup_result(&result);
         assert_eq!(config.active_persona, "default");
+    }
+
+    #[test]
+    fn chatgpt_subscription_wizard_roundtrip_preserves_managed_reference() {
+        let original = ProviderEntry::ChatgptSubscription {
+            credential_ref:
+                crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF.to_string(),
+            model: Some("gpt-5.6-terra".into()),
+            name: Some("subscription-primary".into()),
+        };
+        let editable = model_config_from_provider(&original).unwrap();
+        let ModelConfig::Remote { persisted, .. } = editable else {
+            panic!("expected remote profile")
+        };
+        let rebuilt = provider_entry_from_remote_model(
+            "chatgpt_subscription",
+            "renamed",
+            "must-not-be-stored",
+            "gpt-5.6-terra",
+            persisted.as_ref(),
+        );
+        assert_eq!(rebuilt.api_key(), None);
+        assert!(matches!(
+            rebuilt,
+            ProviderEntry::ChatgptSubscription {
+                credential_ref,
+                model: Some(model),
+                name: Some(name),
+            } if credential_ref == crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
+                && model == "gpt-5.6-terra"
+                && name == "renamed"
+        ));
     }
 }

@@ -87,6 +87,11 @@ struct Args {
 enum Command {
     /// Run interactive setup wizard
     Setup,
+    /// Manage provider authentication owned by supported provider clients
+    Auth {
+        #[command(subcommand)]
+        auth_command: AuthCommand,
+    },
     /// Run HTTP daemon server
     Daemon {
         /// Bind address (default: 127.0.0.1:8000)
@@ -177,6 +182,21 @@ enum Command {
         #[command(subcommand)]
         sessions_command: SessionsCommand,
     },
+}
+
+#[derive(Parser, Debug)]
+enum AuthCommand {
+    /// Sign in to a ChatGPT subscription through Codex device authorization
+    Login { provider: AuthProvider },
+    /// Show managed provider sign-in status
+    Status { provider: AuthProvider },
+    /// Sign out and revoke the managed provider session
+    Logout { provider: AuthProvider },
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum AuthProvider {
+    Chatgpt,
 }
 
 #[derive(Parser, Debug)]
@@ -732,6 +752,9 @@ async fn main() -> Result<()> {
         Some(Command::Setup) => {
             return run_setup().await;
         }
+        Some(Command::Auth { auth_command }) => {
+            return run_auth_command(auth_command).await;
+        }
         Some(Command::Daemon { bind }) => {
             return run_daemon(bind).await;
         }
@@ -1209,6 +1232,43 @@ async fn main() -> Result<()> {
 
     if std::env::var("SHAMMAH_DEBUG").is_ok() {
         eprintln!("[DEBUG] REPL exited, returning from main");
+    }
+    Ok(())
+}
+
+async fn run_auth_command(command: AuthCommand) -> Result<()> {
+    use finch::providers::CodexAppServerAuth;
+
+    let auth = CodexAppServerAuth::new();
+    match command {
+        AuthCommand::Login {
+            provider: AuthProvider::Chatgpt,
+        } => {
+            let login = auth.begin_device_login().await?;
+            println!("Open: {}", login.details.verification_url);
+            println!("Enter code: {}", login.details.user_code);
+            auth.finish_device_login(login).await?;
+            println!("ChatGPT subscription sign-in complete.");
+        }
+        AuthCommand::Status {
+            provider: AuthProvider::Chatgpt,
+        } => {
+            let status = auth.status(true).await?;
+            if status.signed_in {
+                match status.plan_type {
+                    Some(plan) => println!("ChatGPT subscription: signed in ({plan})"),
+                    None => println!("ChatGPT subscription: signed in"),
+                }
+            } else {
+                println!("ChatGPT subscription: signed out");
+            }
+        }
+        AuthCommand::Logout {
+            provider: AuthProvider::Chatgpt,
+        } => {
+            auth.logout().await?;
+            println!("ChatGPT subscription: signed out");
+        }
     }
     Ok(())
 }
