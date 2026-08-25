@@ -122,7 +122,9 @@ canonical `ClientAttached` event. Abandoned reservations expire without advancin
 or cursor, and an old expiry/disconnect cannot affect a replacement connection. Each Brain
 also has an exclusive, expiring runner lease bound to its exact environment generation. The
 ordinary frontend/daemon Cap'n Proto channel now carries a lease-bound runner callback, correlated
-ProgramRun request/result records, and bootstrap revision/checkpoint state. It also exposes the
+ProgramRun request/result records, and bootstrap revision/checkpoint state. Checkpoints are a closed
+schema-native graph covering typed values and types, effect selectors, IR, verifier facts,
+continuations, diagnostics, and producer fibers rather than serialized JSON bytes. It also exposes the
 first versioned `BrainService` capability for snapshots, attachments, acknowledged cursors, detach,
 participant submissions, ordered snapshot-first watches, runner-lease management, addressed runner
 handoffs, and exact run inspection/cancellation. A handoff is a durable reservation naming the exact
@@ -262,17 +264,19 @@ merely become context.
 Approval and control are separate scoped permissions, not substitute roles:
 an authorized driver may decide an approval, while a `brain:control` holder may
 request a runner-lease handoff. Neither action silently transfers workspace
-handles. `brain:attach` independently permits a participant to create and close
-its own projection; it does not imply approval or runner control. Default
-consultants do not receive `brain:approve`, default observers receive only read
-and attach authority, and elevated scopes require an explicit bootstrap grant
+handles. `brain:attach` independently permits a participant to create its own
+projection, while `brain:detach` permits an attachment-bound child to close
+only its exact connection; neither implies approval or runner control. Default
+consultants do not receive `brain:approve`, default observers receive only read,
+attach, and detach authority, and elevated scopes require an explicit bootstrap grant
 within the role's ceiling. A `brain:control` holder can delegate only a subset of
 its live authority and remaining lifetime; bounded signed ancestry makes
 revoking any ancestor revoke every descendant. A remote bootstrap credential is
 used only to reserve an attachment. The daemon then returns an attenuated child
 credential signed over the exact attachment and connection identities, with
-`brain:attach` removed. It cannot create or operate a sibling connection, and
-revoking its bootstrap ancestor invalidates it. A compact status form should make the live condition obvious, for
+`brain:attach` removed and `brain:detach` retained. It cannot create or operate
+a sibling connection, and revoking its bootstrap ancestor invalidates it. A
+compact status form should make the live condition obvious, for
 example `brain: compiler-work · driver · runner online` or
 `brain: compiler-work · consultant · read-only`.
 
@@ -493,8 +497,10 @@ Brain approval continuations are now keyed by exact
 `(brain_id, request_seq, approval_id)` identity so a stale sequence cannot consume a live request.
 Tool inputs and approval detail/decision values use the recursive schema-native `JsonValue` union
 rather than opaque JSON bytes. Canonical provider context crosses the runner callback as typed
-`List(Message)`, with structured tool inputs preserved. Typed-runtime checkpoints remain the only
-transitional JSON blob in that callback pending a native schema. A cloneable in-process
+`List(Message)`, with structured tool inputs preserved. Typed-runtime checkpoints now use a closed
+native Cap'n Proto schema in registration and both runner result paths; exhaustive arm coverage plus
+a live addressed-handoff ProgramRun prove encode/decode, restore, commit, and stale-runner isolation.
+A cloneable in-process
 `BrainLifecycleService` now owns attachment
 reservation and expiry, watch activation, acknowledgement, detach cleanup, participant submission,
 queued-run resumption, and runner-lease lifetime. Embedded hosts call this boundary directly; local
@@ -503,7 +509,8 @@ exercise attachment, watch, queueing, projection, and cleanup, while the ignored
 fixture drives local RPC and remote binary clients through the same
 attach/watch/prompt/queued-run/acknowledge/detach script and compares normalized events and outcomes.
 Ordinary HTTP and WebSocket lifecycle operations now require scoped credentials on loopback as well
-as remote addresses. Attachment lifecycle has its own `brain:attach` scope, and archival obtains an
+as remote addresses. Attachment creation and exact-connection teardown use distinct `brain:attach`
+and `brain:detach` scopes, and archival obtains an
 explicit one-purpose `environment:admin` credential instead of relying on localhost trust.
 Remote creation is now an explicit bootstrap/admin operation rather than merely an attachment side
 effect: its request carries only a validated alias, while the owning daemon fixes the Brain's

@@ -774,8 +774,11 @@ still blocks the corresponding Brain phase until it is unified.
   `(execution_id, sequence)` identity, and Brain approvals now use exact
   `(brain_id, request_seq, approval_id)` keys so stale decisions cannot consume live continuations.
   Provider context now crosses the runner callback as typed `List(Message)`, and tool inputs in both
-  Brain context and ordinary query/stream IPC use `JsonValue`. Typed-runtime checkpoints remain the
-  only transitional JSON blob in the Brain callback, pending a native checkpoint schema.
+  Brain context and ordinary query/stream IPC use `JsonValue`. Runner registration, program results,
+  and full-turn results now carry a closed, schema-native `TypedRuntimeCheckpoint`: all typed values,
+  types, effect selectors, IR instructions, verified modules, continuations, diagnostics, and
+  producer fibers round-trip without an opaque JSON envelope. A live addressed-handoff test proves
+  native checkpoint bootstrap/result transport through the replacement frontend callback.
 - [ ] Define Brain initialization as a reviewed typed program/module with an explicit capability
   budget and journaled effects. Deterministic VM vocabulary/module loading may occur before a
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work
@@ -837,7 +840,9 @@ still blocks the corresponding Brain phase until it is unified.
   now bootstrap into signed, expiring, revocable credentials bound to Brain ID, environment
   generation, subject, role, and independent scopes; every ordinary route rechecks that live
   audience and the exact attachment identity. Attachment bootstrap now attenuates that credential
-  into a signed child bound to the exact attachment/connection pair and removes `brain:attach`;
+  into a signed child bound to the exact attachment/connection pair, removes attachment-creation
+  authority (`brain:attach`), and retains the separate `brain:detach` authority needed to close that
+  exact connection;
   sibling replay fails even for the same subject, ancestor revocation reaches the child, and a
   pending authenticated reservation prevents another detach from deleting the provisional Brain.
   Still finish the remaining explicit invitation/delegation and handoff semantics.
@@ -858,7 +863,7 @@ still blocks the corresponding Brain phase until it is unified.
   ownership, conflict behavior, and scoped archive cleanup.
 - [x] Treat the global brain password as a local/bootstrap credential only. Mint scoped, revocable,
   expiring participant credentials containing subject, audience, brain, environment generation,
-  and permitted roles. Initial scopes: `brain:read`, `brain:attach`, `brain:submit`,
+  and permitted roles. Initial scopes: `brain:read`, `brain:attach`, `brain:detach`, `brain:submit`,
   `brain:approve`, `brain:control`, `environment:execute`, `environment:admin`, and
   `compute:submit`. A daemon-owned
   random signing secret and revocation ledger survive restart; the password is accepted only by
@@ -868,8 +873,9 @@ still blocks the corresponding Brain phase until it is unified.
   approval, control-lease ownership, workspace effects, environment changes, credential minting,
   and distributed inference. mDNS advertisement and discovery now use an authority-free metadata
   allowlist; the reusable legacy peer token is neither broadcast nor copied into discovered peer
-  state. Self attachment/detachment now uses `brain:attach` rather than `brain:control`; default
-  consultant credentials no longer approve, default observer credentials are read/attach only,
+  state. Self attachment creation uses `brain:attach` and exact bound-connection teardown uses
+  `brain:detach`, rather than either operation requiring `brain:control`; default consultant
+  credentials no longer approve, default observer credentials are read/attach/detach only,
   elevated participant scopes must be requested explicitly within a role-specific ceiling, and
   ordinary HTTP/WebSocket operations require scoped credentials even over loopback. Keep all future
   discovery records credential-free. A `brain:control` credential may now mint a bounded descendant
