@@ -1,6 +1,7 @@
 // Shammah - Agent Server Module
 // HTTP daemon mode for multi-tenant agent serving
 
+mod brain_runner;
 mod feedback_handler;
 pub mod handlers;
 mod middleware;
@@ -11,6 +12,9 @@ pub mod session_registry;
 mod training_worker;
 
 pub use feedback_handler::{handle_feedback, handle_training_status};
+pub use brain_runner::{
+    BrainRunnerBroker, RunnerProgramRequest, RunnerProgramResult, RunnerRegistrationId,
+};
 pub use handlers::{
     create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint,
 };
@@ -100,6 +104,8 @@ pub struct AgentServer {
     >,
     /// Authoritative event logs and program stacks for named shared brains.
     shared_brains: crate::brain::shared::SharedBrainStore,
+    /// Send-safe bridge to frontend-owned Cap'n Proto runner callbacks.
+    brain_runners: BrainRunnerBroker,
     /// Application-owned MCP configuration and lazily connected transport for
     /// daemon-executed named-Brain programs. The transport is shared, while
     /// each Brain runtime installs its own verified vocabulary metadata.
@@ -174,6 +180,7 @@ impl AgentServer {
             training_tx: Arc::new(training_tx),
             training_rx: std::sync::Mutex::new(Some(training_rx)),
             shared_brains: crate::brain::shared::SharedBrainStore::new(machine),
+            brain_runners: BrainRunnerBroker::default(),
             mcp_servers,
             mcp_client: tokio::sync::OnceCell::new(),
             brain_password: Arc::new(RwLock::new(brain_password)),
@@ -398,6 +405,10 @@ impl AgentServer {
 
     pub fn shared_brains(&self) -> &crate::brain::shared::SharedBrainStore {
         &self.shared_brains
+    }
+
+    pub fn brain_runners(&self) -> &BrainRunnerBroker {
+        &self.brain_runners
     }
 
     /// Return the daemon-owned MCP transport, connecting it on first use.
