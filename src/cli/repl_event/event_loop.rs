@@ -3740,8 +3740,14 @@ Rules:\n\
                 run_id,
                 restart,
             } => {
-                self.restart_frontend_after_brain_commit(brain, run_id, restart)
-                    .await?;
+                if let Err(error) = self
+                    .restart_frontend_after_brain_commit(brain, run_id, restart)
+                    .await
+                {
+                    self.output_manager
+                        .write_error(format!("Frontend restart failed: {error:#}"));
+                    self.render_tui().await?;
+                }
             }
             ReplEvent::ShowDialog {
                 dialog: _,
@@ -4226,6 +4232,11 @@ Rules:\n\
             .as_ref()
             .context("cannot restart the frontend without the Cap'n Proto daemon connection")?
             .clone();
+        let environment = ipc
+            .brain_snapshot(&brain)
+            .await
+            .with_context(|| format!("inspect Brain '{brain}' before frontend restart"))?
+            .environment;
 
         // Check both the approved digest and basic loadability before giving
         // up the callback authority that can recover this Brain.
@@ -4254,7 +4265,15 @@ Rules:\n\
         // Recheck after the asynchronous lease release narrows the replacement
         // race. A fully race-free future implementation can exec an already
         // opened descriptor on platforms that support it.
-        restart.verify()?;
+        if let Err(error) = restart.verify() {
+            return Err(self
+                .fail_handoff_and_restore_runner(
+                    &ipc,
+                    Some((brain.clone(), environment.clone())),
+                    error.context("restart candidate verification after lease release"),
+                )
+                .await);
+        }
         let args = crate::tools::implementations::restart::frontend_replacement_args(
             std::env::args_os(),
             &brain,
@@ -4268,11 +4287,25 @@ Rules:\n\
         {
             use std::os::unix::process::CommandExt;
             let error = command.exec();
-            anyhow::bail!(
+            let error = anyhow::anyhow!(
                 "failed to exec restart candidate '{}': {}",
                 restart.binary_path.display(),
                 error
             );
+            let error = self
+                .fail_handoff_and_restore_runner(
+                    &ipc,
+                    Some((brain, environment)),
+                    error,
+                )
+                .await;
+            crate::set_tui_active(true);
+            self.tui_renderer
+                .lock()
+                .await
+                .resume_after_emergency_restore()
+                .context("restore terminal after failed frontend exec")?;
+            return Err(error);
         }
         #[cfg(not(unix))]
         {
