@@ -2071,6 +2071,50 @@ fn remote_brain_error(
     }
 }
 
+fn execute_authorized_remote_initialization(
+    lifecycle: &crate::server::BrainLifecycleService,
+    claims: &crate::brain::credential::BrainCredentialClaims,
+    name: &str,
+    attachment_id: crate::brain::store::AttachmentId,
+    connection_id: crate::brain::store::ConnectionId,
+    request_id: u64,
+    next_due_ms: u64,
+) -> crate::ipc::brain_codec::BrainRemoteReply {
+    use crate::brain::credential::BrainCredentialScope;
+    use crate::ipc::brain_codec::BrainRemoteReply;
+
+    if !claims.permits(BrainCredentialScope::BrainSubmit) {
+        return remote_brain_error(
+            request_id,
+            "forbidden",
+            "Brain credential no longer authorizes initialization scheduling",
+        );
+    }
+    let attachment = match lifecycle.connection(name, attachment_id, connection_id) {
+        Ok(attachment) => attachment,
+        Err(error) => return remote_brain_error(request_id, "conflict", error.to_string()),
+    };
+    if claims_match_attachment(claims, &attachment).is_err() {
+        return remote_brain_error(
+            request_id,
+            "forbidden",
+            "Brain credential participant no longer matches this attachment",
+        );
+    }
+    match lifecycle.schedule_initialization(
+        name,
+        attachment_id,
+        connection_id,
+        next_due_ms,
+    ) {
+        Ok(schedule) => BrainRemoteReply::InitializationScheduled {
+            request_id,
+            schedule,
+        },
+        Err(error) => remote_brain_error(request_id, "conflict", error.to_string()),
+    }
+}
+
 async fn execute_remote_brain_command(
     server: &Arc<AgentServer>,
     headers: &HeaderMap,
@@ -2423,6 +2467,32 @@ async fn execute_remote_brain_command(
                 },
                 Err(error) => remote_brain_error(request_id, "conflict", error.to_string()),
             }
+        }
+        BrainRemoteCommandKind::ScheduleInitialization { next_due_ms } => {
+            let claims = match authorize_named_brain(
+                server,
+                headers,
+                name,
+                BrainCredentialScope::BrainSubmit,
+            ) {
+                Ok(claims) => claims,
+                Err(_) => {
+                    return remote_brain_error(
+                        request_id,
+                        "forbidden",
+                        "Brain credential no longer authorizes initialization scheduling",
+                    );
+                }
+            };
+            execute_authorized_remote_initialization(
+                &lifecycle,
+                &claims,
+                name,
+                attachment_id,
+                connection_id,
+                request_id,
+                next_due_ms,
+            )
         }
     }
 }
@@ -3169,6 +3239,128 @@ mod handler_tests {
         assert!(driver_maximum.contains(&BrainCredentialScope::EnvironmentAdmin));
         assert!(!driver_maximum.contains(&BrainCredentialScope::EnvironmentExecute));
         assert!(!driver_maximum.contains(&BrainCredentialScope::ComputeSubmit));
+    }
+
+    #[tokio::test]
+    async fn remote_initialization_authority_is_bound_to_the_exact_active_driver() {
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let lifecycle = crate::server::BrainLifecycleService::new(
+            store,
+            crate::server::BrainRunnerBroker::default(),
+            crate::server::BrainApprovalBroker::default(),
+        );
+        let driver = lifecycle
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let driver_connection = driver.connection_id.unwrap();
+        let _watch = lifecycle
+            .watch("shared", driver.attachment_id, driver_connection)
+            .unwrap();
+        let snapshot = lifecycle.snapshot("shared").unwrap();
+        let claims = |attachment: &BrainAttachment| crate::brain::credential::BrainCredentialClaims {
+            version: 1,
+            credential_id: uuid::Uuid::new_v4(),
+            issuer: "box.local".into(),
+            subject: attachment.subject.clone(),
+            brain_id: snapshot.brain_id,
+            brain: "shared".into(),
+            environment_generation: snapshot.environment.generation,
+            role: attachment.role,
+            scopes: crate::brain::credential::default_participant_scopes(attachment.role),
+            attachment_id: Some(attachment.attachment_id),
+            connection_id: attachment.connection_id,
+            delegation_chain: Vec::new(),
+            issued_ms: 1,
+            expires_ms: u64::MAX,
+        };
+
+        let decode_command = |request_id, next_due_ms| {
+            let envelope = crate::ipc::brain_codec::BrainRemoteEnvelope::Command(
+                crate::ipc::brain_codec::BrainRemoteCommand {
+                    request_id,
+                    kind: crate::ipc::brain_codec::BrainRemoteCommandKind::ScheduleInitialization {
+                        next_due_ms,
+                    },
+                },
+            );
+            let encoded = crate::ipc::brain_codec::encode_brain_remote_envelope(&envelope).unwrap();
+            let crate::ipc::brain_codec::BrainRemoteEnvelope::Command(command) =
+                crate::ipc::brain_codec::decode_brain_remote_envelope(&encoded).unwrap()
+            else {
+                panic!("initialization command decoded as the wrong envelope")
+            };
+            command
+        };
+        let execute = |claims: &crate::brain::credential::BrainCredentialClaims,
+                       attachment: &BrainAttachment,
+                       command: crate::ipc::brain_codec::BrainRemoteCommand| {
+            let crate::ipc::brain_codec::BrainRemoteCommandKind::ScheduleInitialization {
+                next_due_ms,
+            } = command.kind
+            else {
+                panic!("decoded the wrong remote command")
+            };
+            execute_authorized_remote_initialization(
+                &lifecycle,
+                claims,
+                "shared",
+                attachment.attachment_id,
+                attachment.connection_id.unwrap(),
+                command.request_id,
+                next_due_ms,
+            )
+        };
+
+        let driver_claims = claims(&driver);
+        assert!(matches!(
+            execute(&driver_claims, &driver, decode_command(41, 1_000)),
+            crate::ipc::brain_codec::BrainRemoteReply::InitializationScheduled {
+                request_id: 41,
+                ..
+            }
+        ));
+
+        let sibling = lifecycle
+            .attach("shared", "mallory", AttachmentRole::Driver, None)
+            .unwrap();
+        let sibling_connection = sibling.connection_id.unwrap();
+        let _sibling_watch = lifecycle
+            .watch("shared", sibling.attachment_id, sibling_connection)
+            .unwrap();
+        let sibling_claims = claims(&sibling);
+        assert!(matches!(
+            execute(&sibling_claims, &driver, decode_command(42, 2_000)),
+            crate::ipc::brain_codec::BrainRemoteReply::Error {
+                request_id: 42,
+                ref code,
+                ..
+            } if code == "forbidden"
+        ));
+
+        let consultant = lifecycle
+            .attach("shared", "bob", AttachmentRole::Consultant, None)
+            .unwrap();
+        let consultant_connection = consultant.connection_id.unwrap();
+        let _consultant_watch = lifecycle
+            .watch(
+                "shared",
+                consultant.attachment_id,
+                consultant_connection,
+            )
+            .unwrap();
+        let consultant_claims = claims(&consultant);
+        assert!(consultant_claims.permits(
+            crate::brain::credential::BrainCredentialScope::BrainSubmit
+        ));
+        claims_match_attachment(&consultant_claims, &consultant).unwrap();
+        assert!(matches!(
+            execute(&consultant_claims, &consultant, decode_command(43, 3_000)),
+            crate::ipc::brain_codec::BrainRemoteReply::Error {
+                request_id: 43,
+                ref code,
+                ref message,
+            } if code == "conflict" && message.contains("only a Brain driver")
+        ));
     }
 
     fn event(seq: u64, sender: &str, kind: BrainEventKind) -> BrainEvent {

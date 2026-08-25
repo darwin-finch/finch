@@ -784,6 +784,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initialization_requires_the_exact_active_driver_connection() {
+        let service = service();
+        let driver = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let driver_connection = driver.connection_id.unwrap();
+
+        assert!(service
+            .schedule_initialization(
+                "shared",
+                driver.attachment_id,
+                driver_connection,
+                1_000,
+            )
+            .is_err());
+        let _watch = service
+            .watch("shared", driver.attachment_id, driver_connection)
+            .unwrap();
+        let schedule = service
+            .schedule_initialization(
+                "shared",
+                driver.attachment_id,
+                driver_connection,
+                1_000,
+            )
+            .unwrap();
+        assert!(schedule.module_identity.is_some());
+        assert!(service.snapshot("shared").unwrap().runs.is_empty());
+
+        let consultant = service
+            .attach("shared", "bob", AttachmentRole::Consultant, None)
+            .unwrap();
+        let consultant_connection = consultant.connection_id.unwrap();
+        let _consultant_watch = service
+            .watch(
+                "shared",
+                consultant.attachment_id,
+                consultant_connection,
+            )
+            .unwrap();
+        assert!(service
+            .schedule_initialization(
+                "shared",
+                consultant.attachment_id,
+                consultant_connection,
+                2_000,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("only a Brain driver"));
+
+        service
+            .detach("shared", driver.attachment_id, driver_connection)
+            .unwrap();
+        assert!(service
+            .schedule_initialization(
+                "shared",
+                driver.attachment_id,
+                driver_connection,
+                3_000,
+            )
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn only_the_initiating_driver_can_cancel_a_running_run() {
         let service = service();
         let attachment = service

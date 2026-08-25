@@ -329,6 +329,28 @@ impl IpcClient {
         Ok(request.send().promise.await?.get()?.get_cancelled())
     }
 
+    pub async fn brain_schedule_initialization(
+        &self,
+        brain: &str,
+        attachment: &crate::brain::store::BrainAttachment,
+        next_due_ms: u64,
+    ) -> Result<crate::brain::store::BrainSchedule> {
+        let connection_id = attachment
+            .connection_id
+            .context("Brain attachment has no live connection")?;
+        let service = self.brain_service().await?;
+        let mut request = service.schedule_initialization_request();
+        {
+            let mut params = request.get();
+            params.set_brain(brain);
+            params.set_attachment_id(&attachment.attachment_id.0.to_string());
+            params.set_connection_id(&connection_id.0.to_string());
+            params.set_next_due_ms(next_due_ms);
+        }
+        let reply = request.send().promise.await?;
+        decode_schedule(reply.get()?.get_schedule()?)
+    }
+
     pub async fn brain_attach(
         &self,
         brain: &str,
