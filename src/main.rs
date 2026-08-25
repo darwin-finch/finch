@@ -1377,7 +1377,7 @@ async fn run_daemon_status() -> Result<()> {
     struct HealthStatus {
         status: String,
         uptime_seconds: u64,
-        active_sessions: usize,
+        named_brains: usize,
     }
 
     let health: HealthStatus = response
@@ -1392,7 +1392,7 @@ async fn run_daemon_status() -> Result<()> {
     println!("  Status:          {}", health.status.green().bold());
     println!("  PID:             {}", pid);
     println!("  Uptime:          {}s", health.uptime_seconds);
-    println!("  Active Sessions: {}", health.active_sessions);
+    println!("  Named Brains:    {}", health.named_brains);
     println!(
         "  Bind Address:    {}",
         finch::config::constants::DEFAULT_DAEMON_ADDR
@@ -1718,8 +1718,6 @@ async fn run_daemon(bind_address: String) -> Result<()> {
             .server
             .advertise
             .then(|| config.server.brain_bind_address.clone()),
-        max_sessions: config.server.max_sessions,
-        session_timeout_minutes: config.server.session_timeout_minutes,
         auth_enabled: config.server.auth_enabled,
         api_keys: config.server.api_keys.clone(),
         brain_password: config.server.brain_password.clone(),

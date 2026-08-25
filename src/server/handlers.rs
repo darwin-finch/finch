@@ -58,7 +58,6 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
     Router::new()
         // Claude-compatible endpoints
         .route("/v1/messages", post(handle_message))
-        .route("/v1/session/:id", get(get_session).delete(delete_session))
         .route("/v1/status", get(get_status))
         // OpenAI-compatible endpoints
         .route("/v1/chat/completions", post(handle_chat_completions))
@@ -2108,9 +2107,6 @@ pub struct MessageRequest {
     /// System prompt
     #[serde(default)]
     pub system: Option<String>,
-    /// Session ID for conversation continuity
-    #[serde(default)]
-    pub session_id: Option<String>,
 }
 
 /// Response body for /v1/messages endpoint (Claude-compatible)
@@ -2123,7 +2119,16 @@ pub struct MessageResponse {
     pub content: Vec<ContentBlock>,
     pub model: String,
     pub stop_reason: String,
-    pub session_id: String,
+}
+
+fn upstream_message_request(request: &MessageRequest) -> crate::claude::MessageRequest {
+    let mut upstream = crate::claude::MessageRequest::with_context(request.messages.clone());
+    upstream.model = request.model.clone();
+    if let Some(max_tokens) = request.max_tokens {
+        upstream.max_tokens = max_tokens;
+    }
+    upstream.system = request.system.clone();
+    upstream
 }
 
 /// Handle POST /v1/messages - Main chat endpoint
@@ -2131,17 +2136,13 @@ async fn handle_message(
     State(server): State<Arc<AgentServer>>,
     Json(request): Json<MessageRequest>,
 ) -> Result<Json<MessageResponse>, AppError> {
-    use crate::claude::MessageRequest as ClaudeRequest;
     use crate::metrics::{RequestMetric, ResponseComparison};
     use crate::router::RouteDecision;
     use std::time::Instant;
 
     let start_time = Instant::now();
 
-    // Get or create session
-    let mut session = server
-        .session_manager()
-        .get_or_create(request.session_id.as_deref())?;
+    let request_id = uuid::Uuid::new_v4();
 
     // Extract user message (last message should be user role)
     let user_message = request
@@ -2152,9 +2153,6 @@ async fn handle_message(
     // Extract text content from the user message for routing
     let user_text = user_message.text();
 
-    // Add to conversation history
-    session.conversation.add_message(user_message.clone());
-
     // Process query through router
     let router = server.router().read().await;
     let decision = router.route(&user_text);
@@ -2163,13 +2161,13 @@ async fn handle_message(
         RouteDecision::Forward { reason } => {
             let reason_str = format!("{:?}", reason);
             tracing::info!(
-                session_id = %session.id,
+                request_id = %request_id,
                 reason = %reason_str,
                 "Forwarding to Claude API"
             );
 
-            // Build Claude API request with full conversation context
-            let claude_request = ClaudeRequest::with_context(session.conversation.get_messages());
+            // The API is stateless: the caller supplies the complete context.
+            let claude_request = upstream_message_request(&request);
 
             // Forward to Claude
             let response = server.claude_client().send_message(&claude_request).await?;
@@ -2180,7 +2178,7 @@ async fn handle_message(
             (text, "forward".to_string())
         }
         RouteDecision::Local { .. } => {
-            tracing::info!(session_id = %session.id, "Handling locally");
+            tracing::info!(request_id = %request_id, "Handling locally");
 
             // Check if local generator is ready
             use crate::models::GeneratorState;
@@ -2190,7 +2188,7 @@ async fn handle_message(
                 GeneratorState::Ready { .. } => {
                     drop(state); // Release lock before generating
 
-                    tracing::info!(session_id = %session.id, "Using local Qwen model");
+                    tracing::info!(request_id = %request_id, "Using local Qwen model");
 
                     // Use local generator (need write lock for try_generate)
                     let mut generator = server.local_generator().write().await;
@@ -2200,13 +2198,12 @@ async fn handle_message(
                         Ok(None) => {
                             // Confidence too low, fall back to Claude
                             tracing::info!(
-                                session_id = %session.id,
+                                request_id = %request_id,
                                 "Local confidence too low, falling back to Claude"
                             );
                             drop(generator); // Release lock
 
-                            let claude_request =
-                                ClaudeRequest::with_context(session.conversation.get_messages());
+                            let claude_request = upstream_message_request(&request);
                             let response =
                                 server.claude_client().send_message(&claude_request).await?;
                             let text = response.text();
@@ -2215,15 +2212,14 @@ async fn handle_message(
                         }
                         Err(e) => {
                             tracing::warn!(
-                                session_id = %session.id,
+                                request_id = %request_id,
                                 error = %e,
                                 "Local generation failed, falling back to Claude"
                             );
                             drop(generator); // Release lock
 
                             // Fall back to Claude on error
-                            let claude_request =
-                                ClaudeRequest::with_context(session.conversation.get_messages());
+                            let claude_request = upstream_message_request(&request);
                             let response =
                                 server.claude_client().send_message(&claude_request).await?;
                             let text = response.text();
@@ -2236,14 +2232,13 @@ async fn handle_message(
                 | GeneratorState::Downloading { .. }
                 | GeneratorState::Loading { .. } => {
                     tracing::info!(
-                        session_id = %session.id,
+                        request_id = %request_id,
                         "Model still loading, forwarding to Claude"
                     );
                     drop(state); // Release lock
 
                     // Model not ready yet, forward to Claude
-                    let claude_request =
-                        ClaudeRequest::with_context(session.conversation.get_messages());
+                    let claude_request = upstream_message_request(&request);
                     let response = server.claude_client().send_message(&claude_request).await?;
                     let text = response.text();
 
@@ -2251,15 +2246,14 @@ async fn handle_message(
                 }
                 GeneratorState::Failed { error } => {
                     tracing::warn!(
-                        session_id = %session.id,
+                        request_id = %request_id,
                         error = %error,
                         "Model failed to load, forwarding to Claude"
                     );
                     drop(state); // Release lock
 
                     // Model failed to load, forward to Claude
-                    let claude_request =
-                        ClaudeRequest::with_context(session.conversation.get_messages());
+                    let claude_request = upstream_message_request(&request);
                     let response = server.claude_client().send_message(&claude_request).await?;
                     let text = response.text();
 
@@ -2267,14 +2261,13 @@ async fn handle_message(
                 }
                 GeneratorState::NotAvailable => {
                     tracing::info!(
-                        session_id = %session.id,
+                        request_id = %request_id,
                         "Model not available, forwarding to Claude"
                     );
                     drop(state); // Release lock
 
                     // No model available, forward to Claude
-                    let claude_request =
-                        ClaudeRequest::with_context(session.conversation.get_messages());
+                    let claude_request = upstream_message_request(&request);
                     let response = server.claude_client().send_message(&claude_request).await?;
                     let text = response.text();
 
@@ -2307,68 +2300,17 @@ async fn handle_message(
     );
     server.metrics_logger().log(&metric)?;
 
-    // Create assistant response message
-    let assistant_message = Message::assistant(&response_text);
-
-    // Add response to conversation history
-    session.conversation.add_message(assistant_message);
-
-    // Update session
-    session.touch();
-    server
-        .session_manager()
-        .update(&session.id, session.clone())?;
-
     // Build Claude-compatible response
     let response = MessageResponse {
-        id: format!("msg_{}", uuid::Uuid::new_v4()),
+        id: format!("msg_{request_id}"),
         response_type: "message".to_string(),
         role: "assistant".to_string(),
         content: vec![ContentBlock::text(&response_text)],
         model: request.model,
         stop_reason: "end_turn".to_string(),
-        session_id: session.id,
     };
 
     Ok(Json(response))
-}
-
-/// Handle GET /v1/session/:id - Retrieve session state
-async fn get_session(
-    State(server): State<Arc<AgentServer>>,
-    Path(session_id): Path<String>,
-) -> Result<Json<SessionInfo>, AppError> {
-    let session = server.session_manager().get_or_create(Some(&session_id))?;
-
-    let info = SessionInfo {
-        id: session.id,
-        created_at: session.created_at.to_rfc3339(),
-        last_activity: session.last_activity.to_rfc3339(),
-        message_count: session.conversation.message_count(),
-    };
-
-    Ok(Json(info))
-}
-
-/// Session information
-#[derive(Debug, Serialize)]
-pub struct SessionInfo {
-    pub id: String,
-    pub created_at: String,
-    pub last_activity: String,
-    pub message_count: usize,
-}
-
-/// Handle DELETE /v1/session/:id - Delete session
-async fn delete_session(
-    State(server): State<Arc<AgentServer>>,
-    Path(session_id): Path<String>,
-) -> Result<StatusCode, AppError> {
-    if server.session_manager().delete(&session_id) {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(AppError(anyhow::anyhow!("Session not found")))
-    }
 }
 
 /// Generator status information
@@ -2398,7 +2340,7 @@ pub enum GeneratorStatus {
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
     pub generator: GeneratorStatus,
-    pub active_sessions: usize,
+    pub named_brains: usize,
     pub training_enabled: bool,
 }
 
@@ -2435,7 +2377,7 @@ async fn get_status(
 
     let response = StatusResponse {
         generator: generator_status,
-        active_sessions: server.session_manager().active_count(),
+        named_brains: server.brain_store().list()?.len(),
         training_enabled: true, // LoRA training is always enabled
     };
 
@@ -2447,7 +2389,7 @@ async fn get_status(
 pub struct HealthStatus {
     pub status: String,
     pub uptime_seconds: u64,
-    pub active_sessions: usize,
+    pub named_brains: usize,
 }
 
 /// Handle GET /health - Health check endpoint
@@ -2458,7 +2400,7 @@ pub async fn health_check(
     let status = HealthStatus {
         status: "healthy".to_string(),
         uptime_seconds: 0, // Placeholder
-        active_sessions: server.session_manager().active_count(),
+        named_brains: server.brain_store().list()?.len(),
     };
 
     Ok(Json(status))
@@ -2891,12 +2833,44 @@ async fn handle_file_put(
 }
 
 #[cfg(test)]
-mod named_brain_provider_context_tests {
+mod handler_tests {
     use super::*;
     use crate::brain::store::{
         AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
         BrainEvent, BrainEventKind, BrainId, BrainSnapshot, ProgramLanguage,
     };
+
+    #[test]
+    fn messages_endpoint_forwards_the_complete_caller_owned_context() {
+        let request = MessageRequest {
+            model: "requested-model".into(),
+            messages: vec![Message::user("first"), Message::assistant("second")],
+            max_tokens: Some(321),
+            system: Some("policy".into()),
+        };
+
+        let upstream = upstream_message_request(&request);
+        assert_eq!(upstream.model, "requested-model");
+        assert_eq!(upstream.max_tokens, 321);
+        assert_eq!(upstream.system.as_deref(), Some("policy"));
+        assert_eq!(upstream.messages.len(), 2);
+        assert_eq!(upstream.messages[0].text(), "first");
+        assert_eq!(upstream.messages[1].text(), "second");
+    }
+
+    #[test]
+    fn messages_response_has_no_server_session_identity() {
+        let response = MessageResponse {
+            id: "msg-1".into(),
+            response_type: "message".into(),
+            role: "assistant".into(),
+            content: vec![ContentBlock::text("done")],
+            model: "model".into(),
+            stop_reason: "end_turn".into(),
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert!(value.get("session_id").is_none());
+    }
 
     #[test]
     fn daemon_bootstrap_authority_is_loopback_only() {

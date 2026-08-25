@@ -11,7 +11,7 @@ When running in daemon mode, Shammah:
 - Manages multiple concurrent sessions with automatic cleanup
 - Shares trained models and router across all sessions
 - Provides health checks and Prometheus metrics
-- Maintains conversation history per session
+- Keeps ordinary model APIs stateless; durable shared history belongs to named Brains
 
 ## Quick Start
 
@@ -61,7 +61,6 @@ Send a message to Claude (or local model if trained). Claude-compatible endpoint
   "messages": [
     {"role": "user", "content": "Hello!"}
   ],
-  "session_id": "optional-session-id",
   "max_tokens": 4096,
   "system": "Optional system prompt"
 }
@@ -77,36 +76,14 @@ Send a message to Claude (or local model if trained). Claude-compatible endpoint
     {"type": "text", "text": "Hello! How can I help you?"}
   ],
   "model": "claude-sonnet-4-5-20250929",
-  "stop_reason": "end_turn",
-  "session_id": "auto-generated-or-provided"
+  "stop_reason": "end_turn"
 }
 ```
 
 **Features:**
-- Automatic session creation if no `session_id` provided
-- Maintains conversation history per session
+- Stateless request processing: clients send the complete message history
 - Routing decision (local vs Claude) tracked in metrics
 - Response time logged for analytics
-
-### GET /v1/session/:id
-
-Retrieve session metadata.
-
-**Response:**
-```json
-{
-  "id": "session-uuid",
-  "created_at": "2026-01-31T10:00:00Z",
-  "last_activity": "2026-01-31T10:05:00Z",
-  "message_count": 12
-}
-```
-
-### DELETE /v1/session/:id
-
-Delete a session and its conversation history.
-
-**Response:** 204 No Content
 
 ### GET /health
 
@@ -117,7 +94,7 @@ Health check endpoint.
 {
   "status": "healthy",
   "uptime_seconds": 3600,
-  "active_sessions": 5
+  "named_brains": 5
 }
 ```
 
@@ -157,8 +134,6 @@ Add daemon mode settings to `~/.finch/config.toml`:
 [server]
 enabled = false  # Set to true to enable by default
 bind_address = "127.0.0.1:8000"
-max_sessions = 100
-session_timeout_minutes = 30
 auth_enabled = true
 api_keys = ["replace-with-a-long-random-key"]  # one key for all model providers
 ```
@@ -189,14 +164,14 @@ protocol and the daemon health probe are unaffected.
 ┌─────────────────────────────────────────┐
 │       AgentServer (Arc<Self>)           │
 │  - Shared across all requests           │
-└────┬───────┬────────┬─────────┬─────────┘
-     │       │        │         │
-     v       v        v         v
-┌─────┐  ┌──────┐ ┌───────┐ ┌──────────┐
-│Claude│  │Router│ │Metrics│ │ Session  │
-│Client│  │      │ │Logger │ │ Manager  │
-│      │  │RwLock│ │       │ │(DashMap) │
-└─────┘  └──────┘ └───────┘ └──────────┘
+└────┬───────┬────────┬─────────┘
+     │       │        │
+     v       v        v
+┌─────┐  ┌──────┐ ┌───────┐
+│Claude│  │Router│ │Metrics│
+│Client│  │      │ │Logger │
+│      │  │RwLock│ │       │
+└─────┘  └──────┘ └───────┘
 ```
 
 ### Key Components
@@ -205,11 +180,6 @@ protocol and the daemon health probe are unaffected.
 - Main server struct wrapped in `Arc` for sharing
 - Holds references to all shared components
 - Created once at startup, cloned per request
-
-**SessionManager:**
-- Uses `DashMap` for concurrent session storage
-- Lock-free concurrent HashMap (no mutex contention)
-- Background cleanup task runs every minute
 
 **Router:**
 - Wrapped in `RwLock<Router>` for thread-safe access
@@ -364,9 +334,7 @@ main();
 Structured logs via `tracing`:
 ```
 2026-01-31T10:00:00Z INFO Starting Shammah agent server on 127.0.0.1:8000
-2026-01-31T10:00:15Z INFO Created new session session_id=abc123
-2026-01-31T10:00:16Z INFO Forwarding to Claude API session_id=abc123 reason="crisis_detected"
-2026-01-31T10:05:00Z INFO Cleaned up expired sessions removed=2 active=3
+2026-01-31T10:00:16Z INFO Forwarding to Claude API request_id=abc123 reason="crisis_detected"
 ```
 
 ### Metrics (Phase 1 - Basic)
@@ -375,13 +343,13 @@ Currently provides basic Prometheus metrics endpoint. Phase 4 will add:
 - Query count by routing decision
 - Response time histograms
 - Error rates
-- Active session count
+- Named Brain count
 - Forward rate percentage
 
 ## Roadmap
 
 ### Phase 2: Efficient Training (Weeks 4-6)
-- Batch training across sessions
+- Batch training across requests
 - Model hot-reload via `/admin/reload_models`
 - Training metrics
 
@@ -391,7 +359,7 @@ Currently provides basic Prometheus metrics endpoint. Phase 4 will add:
 - Audit trail
 
 ### Phase 4: Production Readiness (Weeks 10-12)
-- **Rate limiting per session**
+- **Rate limiting per client credential**
 - **Tool sandboxing**
 - **Enhanced Prometheus metrics**
 - **Load testing results**
@@ -407,22 +375,6 @@ lsof -i :8000
 
 # Use different port
 finch daemon --bind 127.0.0.1:8001
-```
-
-### Session Limit Reached
-
-Increase in config:
-```toml
-[server]
-max_sessions = 200
-```
-
-### High Memory Usage
-
-Reduce session timeout:
-```toml
-[server]
-session_timeout_minutes = 10
 ```
 
 ### Router Not Learning
@@ -457,8 +409,8 @@ tail -f ~/.finch/metrics/$(date +%Y-%m-%d).jsonl
 **Q: Can I use Shammah as a drop-in Claude API replacement?**
 A: Almost! The `/v1/messages` endpoint is Claude-compatible. However, streaming and tool use are not yet supported in daemon mode (Phase 2).
 
-**Q: How do sessions work with multiple clients?**
-A: Each client can provide a `session_id` in requests to maintain conversation history. If omitted, a new session is created.
+**Q: How does conversation continuity work with multiple clients?**
+A: Ordinary `/v1/messages` clients own their context and send the complete message list. Clients that deliberately want durable shared state attach to a named Brain.
 
 **Q: Can I run multiple Shammah daemons?**
 A: Yes! Each daemon instance shares the same `~/.finch/` data directory safely via file locking. Models are loaded per-daemon.

@@ -9,7 +9,6 @@ pub mod handlers;
 mod middleware;
 mod openai_handlers;
 pub mod openai_types; // Public for client access
-mod session;
 mod training_worker;
 
 pub use brain_approval::BrainApprovalBroker;
@@ -28,7 +27,6 @@ pub use handlers::{
 pub use middleware::{auth_middleware, DaemonAuth, RateLimiter};
 pub use openai_handlers::{handle_chat_completions, handle_list_models};
 pub use openai_types::*;
-pub use session::{SessionManager, SessionState};
 pub use training_worker::TrainingWorker;
 
 use anyhow::Result;
@@ -57,10 +55,6 @@ pub struct ServerConfig {
     pub bind_address: String,
     /// Optional TLS-only listener for remote named-Brain collaboration.
     pub brain_bind_address: Option<String>,
-    /// Maximum number of concurrent sessions
-    pub max_sessions: usize,
-    /// Session timeout in minutes
-    pub session_timeout_minutes: u64,
     /// Enable API key authentication
     pub auth_enabled: bool,
     /// Valid API keys for authentication
@@ -74,8 +68,6 @@ impl Default for ServerConfig {
         Self {
             bind_address: crate::config::constants::DEFAULT_HTTP_ADDR.to_string(),
             brain_bind_address: None,
-            max_sessions: 100,
-            session_timeout_minutes: 30,
             auth_enabled: false,
             api_keys: vec![],
             brain_password: String::new(),
@@ -94,8 +86,6 @@ pub struct AgentServer {
     router: Arc<RwLock<Router>>,
     /// Metrics logger (shared)
     metrics_logger: Arc<MetricsLogger>,
-    /// Session manager
-    session_manager: Arc<SessionManager>,
     /// Server configuration
     config: ServerConfig,
     /// Local generator (Qwen model with LoRA)
@@ -147,11 +137,6 @@ impl AgentServer {
         training_coordinator: Arc<TrainingCoordinator>,
         providers: Vec<Box<dyn LlmProvider>>,
     ) -> Result<Self> {
-        let session_manager = SessionManager::new(
-            server_config.max_sessions,
-            server_config.session_timeout_minutes,
-        );
-
         // Create training channel; receiver is taken by serve() to hand to the worker.
         let (training_tx, training_rx) = tokio::sync::mpsc::unbounded_channel();
         let profile_names = config
@@ -189,7 +174,6 @@ impl AgentServer {
             providers,
             router: Arc::new(RwLock::new(router)),
             metrics_logger: Arc::new(metrics_logger),
-            session_manager: Arc::new(session_manager),
             config: server_config,
             local_generator,
             bootstrap_loader,
@@ -429,10 +413,6 @@ impl AgentServer {
     }
 
     /// Get reference to session manager
-    pub fn session_manager(&self) -> &Arc<SessionManager> {
-        &self.session_manager
-    }
-
     /// Get reference to training examples sender
     pub fn training_tx(
         &self,

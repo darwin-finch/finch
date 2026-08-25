@@ -575,6 +575,15 @@ audiences, sibling attachment-connection replay, and runner approval-audience su
 
 Exit: `Brain`, `BrainRun`, `BrainAttachment`, `BrainStore`, and `BrainService` have one meaning each.
 
+Current cleanup status: the unauthenticated named-session relay server, its WebSocket transport,
+the client-local `SessionBus`/`SessionEvent` collaboration protocol, and session-named Brain identity
+helpers are gone. Reviewed changesets now have a separate local `ReviewEvent` projection, while
+durable collaboration remains exclusively in the Brain event log. The sole aggregate is named
+`brain::store::BrainStore`. The legacy `/v1/messages` compatibility endpoint is stateless and
+accepts caller-owned message history; its in-memory `SessionManager` and `/v1/session/:id` lifecycle
+were removed rather than retained as a second conversation authority. The older peer/gas registry
+still requires an explicit distributed-compute disposition before this phase can close.
+
 ## Test matrix
 
 - embedded, client/daemon, remote, reconnecting, and restarted deployments;

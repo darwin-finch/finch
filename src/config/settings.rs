@@ -165,10 +165,6 @@ pub struct ServerConfig {
     /// TLS-only remote Brain listener. It is opened only when service
     /// advertisement (and therefore LAN collaboration) is enabled.
     pub brain_bind_address: String,
-    /// Maximum number of concurrent sessions
-    pub max_sessions: usize,
-    /// Session timeout in minutes
-    pub session_timeout_minutes: u64,
     /// Enable API key authentication
     pub auth_enabled: bool,
     /// Valid API keys for authentication
@@ -209,8 +205,6 @@ impl Default for ServerConfig {
             enabled: false,
             bind_address: crate::config::constants::DEFAULT_HTTP_ADDR.to_string(),
             brain_bind_address: crate::config::constants::DEFAULT_BRAIN_TLS_ADDR.to_string(),
-            max_sessions: 100,
-            session_timeout_minutes: 30,
             auth_enabled: false,
             api_keys: vec![],
             mode: "full".to_string(), // "full" (daemon + REPL) or "daemon-only"
@@ -577,26 +571,6 @@ impl Config {
                 "Daemon address should be in format 'IP:PORT'\n\
                  Example: 127.0.0.1:11435"
             ));
-        }
-
-        // Validate numeric ranges
-        if self.server.max_sessions == 0 {
-            anyhow::bail!("max_sessions must be greater than 0");
-        }
-
-        if self.server.max_sessions > 10000 {
-            anyhow::bail!(errors::wrap_error_with_suggestion(
-                format!(
-                    "max_sessions ({}) is unreasonably high",
-                    self.server.max_sessions
-                ),
-                "Recommended range: 1-1000\n\
-                 High values may cause memory issues"
-            ));
-        }
-
-        if self.server.session_timeout_minutes == 0 {
-            anyhow::bail!("session_timeout_minutes must be greater than 0");
         }
 
         if self.server.auth_enabled

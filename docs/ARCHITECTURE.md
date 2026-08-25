@@ -794,7 +794,7 @@ FINCH-<base64url(JSON payload)>.<base64url(Ed25519 signature over payload bytes)
 5. Accept client connections
 6. Handle queries concurrently
 7. On SIGTERM/SIGINT, gracefully shutdown
-8. Clean up sessions and resources
+8. Clean up resources
 9. Remove PID file
 ```
 
@@ -804,9 +804,8 @@ FINCH-<base64url(JSON payload)>.<base64url(Ed25519 signature over payload bytes)
 
 ```
 1. Receive user query (HTTP POST)
-2. Extract session_id (or create new session)
-3. Add to conversation history
-4. Router decision: local vs. teacher
+2. Validate the caller-supplied message history
+3. Router decision: local vs. teacher
 5. If local:
      a. ONNX inference → local response
      b. Return response
@@ -819,7 +818,6 @@ FINCH-<base64url(JSON payload)>.<base64url(Ed25519 signature over payload bytes)
      f. Forward tool results to teacher
      g. Return final response
 7. Log metrics (routing, latency, tokens)
-8. Update session last_activity
 ```
 
 ### Metrics Collection
@@ -828,7 +826,7 @@ Every request logs:
 ```json
 {
   "timestamp": "2026-02-14T12:00:00Z",
-  "session_id": "abc123",
+  "request_id": "abc123",
   "routing_decision": "local",
   "response_time_ms": 650,
   "tokens_generated": 127,
