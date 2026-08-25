@@ -1231,6 +1231,18 @@ still blocks the corresponding Brain phase until it is unified.
 
 ## Client and model integration
 
+- [ ] Review and reproduce the useful local-first properties of Perplexity/NVIDIA Portable Computer,
+  without copying its subscription or hardware assumptions. The 2026-08-25 announcement claims that
+  models, files, tools, and workflows run on-device, local work incurs no token charge, and each
+  escalation to a cloud model requires permission; the reported initial floor is Linux on an RTX GPU
+  with at least 24 GB VRAM, with access limited to paid Perplexity tiers and Windows promised later.
+  Verify those claims against primary product documentation as it becomes accessible, then benchmark
+  Finch on the same dimensions: offline task completion, local model/tool conformance, capability and
+  data-residency disclosure, per-step cloud-escalation approval, Brain continuity across local/cloud
+  model switches, latency, energy, hardware coverage (Apple Silicon, NVIDIA, CPU, and portable ONNX),
+  and actual total cost. Treat “zero token cost” as local inference accounting rather than zero compute
+  cost, and keep the Brain log plus VM checkpoint authoritative across every routing decision.
+  Reference: https://www.perplexity.ai/hub/products/portable-computer
 - [ ] Package an enterprise Finch deployment around the authoritative Brain/environment boundary:
   reproducible developer-workspace bootstrap, organization model/provider profiles, OIDC/SSO and
   secret-manager integration, policy-as-code capability grants, signed artifacts, audit export,
