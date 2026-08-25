@@ -840,7 +840,11 @@ struct PendingVmApproval {
 struct RemoteBrainRunProjection {
     unit: Arc<crate::cli::messages::WorkUnit>,
     status_row: usize,
+    prompt_row: Option<usize>,
     program_row: Option<usize>,
+    result_row: Option<usize>,
+    tool_rows: std::collections::HashMap<String, usize>,
+    approval_rows: std::collections::HashMap<String, usize>,
 }
 
 fn brain_run_group_label(
@@ -849,6 +853,226 @@ fn brain_run_group_label(
 ) -> String {
     kind.map(|kind| format!("{kind:?} run {}", run_id.0))
         .unwrap_or_else(|| format!("Brain run {}", run_id.0))
+}
+
+fn ensure_remote_brain_run_projection<'a>(
+    output_manager: &crate::cli::output_manager::OutputManager,
+    projections: &'a mut std::collections::HashMap<
+        crate::brain::store::RunId,
+        RemoteBrainRunProjection,
+    >,
+    run_id: crate::brain::store::RunId,
+    kind: Option<crate::brain::store::BrainRunKind>,
+    status: crate::brain::store::BrainRunStatus,
+) -> &'a mut RemoteBrainRunProjection {
+    projections.entry(run_id).or_insert_with(|| {
+        let label = brain_run_group_label(run_id, kind);
+        let unit = output_manager.start_work_unit(&label);
+        // WorkUnit's completed row presentation otherwise uses the generic
+        // "Tools" title. Keep the canonical kind/id visible on the group.
+        unit.set_response(&label);
+        let status_row = unit.add_row("status");
+        unit.complete_row(status_row, format!("{status:?}").to_lowercase());
+        RemoteBrainRunProjection {
+            unit,
+            status_row,
+            prompt_row: None,
+            program_row: None,
+            result_row: None,
+            tool_rows: std::collections::HashMap::new(),
+            approval_rows: std::collections::HashMap::new(),
+        }
+    })
+}
+
+/// Project a correlated event into its canonical RunId work unit. Snapshot
+/// reattachment and live delivery share this path, so acknowledgement never
+/// strips durable run contents from the shadow buffer.
+fn project_remote_brain_run_event(
+    output_manager: &crate::cli::output_manager::OutputManager,
+    projections: &mut std::collections::HashMap<
+        crate::brain::store::RunId,
+        RemoteBrainRunProjection,
+    >,
+    event: &crate::brain::store::BrainEvent,
+) -> bool {
+    use crate::brain::store::{BrainEventKind, BrainRunKind, BrainRunStatus, ProgramLanguage};
+
+    let Some(run_id) = event.run_id else {
+        return false;
+    };
+    let (kind, status) = match &event.kind {
+        BrainEventKind::RunStarted { run } => (Some(run.kind), run.status),
+        BrainEventKind::SpeculativePrompt { .. } => (
+            Some(BrainRunKind::Speculative),
+            BrainRunStatus::QueuedForEnvironment,
+        ),
+        BrainEventKind::RunStatusChanged { status, .. } => (None, *status),
+        BrainEventKind::ToolCall { .. }
+        | BrainEventKind::ToolResult { .. }
+        | BrainEventKind::ApprovalRequested { .. }
+        | BrainEventKind::ApprovalDecided { .. }
+        | BrainEventKind::Program { .. }
+        | BrainEventKind::Result { .. } => (None, BrainRunStatus::Running),
+        _ => return false,
+    };
+    let projection = ensure_remote_brain_run_projection(
+        output_manager,
+        projections,
+        run_id,
+        kind,
+        status,
+    );
+
+    match &event.kind {
+        BrainEventKind::RunStarted { .. } => {}
+        BrainEventKind::RunStatusChanged { status, detail, .. } => {
+            let summary = detail
+                .as_deref()
+                .map(|detail| format!("{}: {detail}", format!("{status:?}").to_lowercase()))
+                .unwrap_or_else(|| format!("{status:?}").to_lowercase());
+            if *status == BrainRunStatus::Failed {
+                projection.unit.fail_row(projection.status_row, summary);
+            } else {
+                projection.unit.complete_row(projection.status_row, summary);
+            }
+            if status.is_terminal() {
+                projection.unit.set_complete();
+            }
+        }
+        BrainEventKind::SpeculativePrompt { text } => {
+            let row = *projection
+                .prompt_row
+                .get_or_insert_with(|| projection.unit.add_row("prompt"));
+            projection.unit.complete_row_with_body(
+                row,
+                "accepted",
+                text.lines().map(str::to_owned).collect(),
+            );
+        }
+        BrainEventKind::ToolCall {
+            tool_id,
+            name,
+            input,
+            ..
+        } => {
+            projection.tool_rows.entry(tool_id.clone()).or_insert_with(|| {
+                let input = input.to_string();
+                let input = if input.chars().count() > 80 {
+                    format!("{}…", input.chars().take(79).collect::<String>())
+                } else {
+                    input
+                };
+                projection.unit.add_row(format!("{name} {input}"))
+            });
+        }
+        BrainEventKind::ToolResult {
+            tool_id,
+            output,
+            is_error,
+            ..
+        } => {
+            let row = *projection
+                .tool_rows
+                .entry(tool_id.clone())
+                .or_insert_with(|| projection.unit.add_row(tool_id));
+            if *is_error {
+                projection.unit.fail_row(row, output);
+            } else {
+                let first = output.lines().next().unwrap_or_default();
+                let summary = if first.chars().count() > 80 {
+                    format!("{}…", first.chars().take(79).collect::<String>())
+                } else {
+                    first.to_string()
+                };
+                projection.unit.complete_row_with_body(
+                    row,
+                    summary,
+                    output.lines().skip(1).map(str::to_owned).collect(),
+                );
+            }
+        }
+        BrainEventKind::ApprovalRequested {
+            approval_id,
+            approval_kind,
+            subject,
+            audience,
+            detail,
+            ..
+        } => {
+            if !projection.approval_rows.contains_key(approval_id) {
+                let audience_summary = audience
+                    .as_ref()
+                    .map(|audience| {
+                        format!(
+                            "{} ({:?}, environment {})",
+                            audience.subject, audience.role, audience.environment_generation
+                        )
+                    })
+                    .unwrap_or_else(|| "legacy audience unspecified".to_string());
+                let row = projection.unit.add_row(format!(
+                    "approval ({approval_kind}) for {audience_summary}: {subject}"
+                ));
+                for line in serde_json::to_string_pretty(detail)
+                    .unwrap_or_else(|_| detail.to_string())
+                    .lines()
+                {
+                    projection.unit.append_row_body_line(row, line.to_owned());
+                }
+                projection.approval_rows.insert(approval_id.clone(), row);
+            }
+        }
+        BrainEventKind::ApprovalDecided {
+            approval_id,
+            decision,
+            ..
+        } => {
+            let row = *projection
+                .approval_rows
+                .entry(approval_id.clone())
+                .or_insert_with(|| projection.unit.add_row(format!("approval {approval_id}")));
+            let choice = decision
+                .get("choice")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("decided");
+            let summary = format!("{choice} by {}", event.sender);
+            if choice == "deny" {
+                projection.unit.fail_row(row, summary);
+            } else {
+                projection.unit.complete_row(row, summary);
+            }
+        }
+        BrainEventKind::Program { language, source } => {
+            let language = match language {
+                ProgramLanguage::Forth => "Co-Forth",
+                ProgramLanguage::Lisp => "Lisp",
+            };
+            let row = *projection
+                .program_row
+                .get_or_insert_with(|| projection.unit.add_row(format!("{language} program")));
+            projection.unit.complete_row_with_body(
+                row,
+                format!("event #{}", event.seq),
+                source.lines().map(str::to_owned).collect(),
+            );
+        }
+        BrainEventKind::Result { output, error, .. } => {
+            let row = *projection
+                .result_row
+                .get_or_insert_with(|| projection.unit.add_row("result"));
+            if let Some(error) = error {
+                projection.unit.fail_row(row, error);
+            } else {
+                projection.unit.complete_row_with_body(
+                    row,
+                    "completed",
+                    output.lines().map(str::to_owned).collect(),
+                );
+            }
+        }
+        _ => unreachable!("correlated run event was filtered above"),
+    }
+    true
 }
 
 struct LocalBrainProjection {
@@ -5320,13 +5544,11 @@ Rules:\n\
                     .selected_brain()
                     .is_some_and(|client| !client.target.secure)
                     .then_some(brain.environment.machine.as_str());
-                for group in projected_brain_run_groups(&brain.events) {
-                    self.ensure_remote_brain_run_projection(
-                        group.run_id,
-                        Some(group.kind),
-                        group.status,
-                    );
-                }
+                project_remote_brain_snapshot_runs(
+                    &self.output_manager,
+                    &mut self.remote_brain_run_units,
+                    &brain.events,
+                );
                 self.todo_list
                     .write()
                     .await
@@ -5347,7 +5569,7 @@ Rules:\n\
                     .iter()
                     .filter(|event| event.seq > acknowledged_seq)
                 {
-                    if replay_event_belongs_in_transcript(event) {
+                    if event.run_id.is_none() && replay_event_belongs_in_transcript(event) {
                         self.render_remote_brain_event(event).await;
                     }
                     self.observe_remote_brain_approval(event);
@@ -5563,27 +5785,45 @@ Rules:\n\
         kind: Option<crate::brain::store::BrainRunKind>,
         status: crate::brain::store::BrainRunStatus,
     ) -> &mut RemoteBrainRunProjection {
-        if !self.remote_brain_run_units.contains_key(&run_id) {
-            let label = brain_run_group_label(run_id, kind);
-            let unit = self.output_manager.start_work_unit(label);
-            let status_row = unit.add_row("status");
-            unit.complete_row(status_row, format!("{status:?}").to_lowercase());
-            self.remote_brain_run_units.insert(
-                run_id,
-                RemoteBrainRunProjection {
-                    unit,
-                    status_row,
-                    program_row: None,
-                },
-            );
-        }
-        self.remote_brain_run_units
-            .get_mut(&run_id)
-            .expect("run projection inserted above")
+        ensure_remote_brain_run_projection(
+            &self.output_manager,
+            &mut self.remote_brain_run_units,
+            run_id,
+            kind,
+            status,
+        )
     }
 
     async fn render_remote_brain_event(&mut self, event: &crate::brain::store::BrainEvent) {
         use crate::brain::store::BrainEventKind;
+        if event.run_id.is_some() {
+            let projection_match = self
+                .selected_brain_is_home()
+                .then(|| self.local_brain_projections.front_mut())
+                .flatten()
+                .map(|projection| projection.observe(event))
+                .unwrap_or(LocalProjectionMatch::None);
+            let locally_owned_tool_event = matches!(
+                event.kind,
+                BrainEventKind::ToolCall { .. }
+                    | BrainEventKind::ToolResult { .. }
+                    | BrainEventKind::ApprovalRequested { .. }
+                    | BrainEventKind::ApprovalDecided { .. }
+            ) && projection_match != LocalProjectionMatch::None;
+            if locally_owned_tool_event {
+                return;
+            }
+            if project_remote_brain_run_event(
+                &self.output_manager,
+                &mut self.remote_brain_run_units,
+                event,
+            ) {
+                if projection_match == LocalProjectionMatch::SuppressAndComplete {
+                    self.local_brain_projections.pop_front();
+                }
+                return;
+            }
+        }
         let local_machine = self
             .selected_brain()
             .filter(|client| !client.target.secure)
@@ -7325,6 +7565,28 @@ fn projected_brain_run_groups(
     groups
 }
 
+fn project_remote_brain_snapshot_runs(
+    output_manager: &crate::cli::output_manager::OutputManager,
+    projections: &mut std::collections::HashMap<
+        crate::brain::store::RunId,
+        RemoteBrainRunProjection,
+    >,
+    events: &[crate::brain::store::BrainEvent],
+) {
+    for group in projected_brain_run_groups(events) {
+        ensure_remote_brain_run_projection(
+            output_manager,
+            projections,
+            group.run_id,
+            Some(group.kind),
+            group.status,
+        );
+    }
+    for event in events.iter().filter(|event| event.run_id.is_some()) {
+        project_remote_brain_run_event(output_manager, projections, event);
+    }
+}
+
 /// Advance the visible projection's canonical cursor. Watch snapshots include
 /// every event through their revision, while the live receiver may already
 /// have buffered some of those same events. Sequence numbers are authoritative
@@ -8272,6 +8534,119 @@ mod tests {
             brain_run_group_label(run_id, Some(BrainRunKind::Speculative)),
             format!("Speculative run {}", run_id.0)
         );
+    }
+
+    #[test]
+    fn acknowledged_snapshot_reattaches_complete_run_as_one_work_unit() {
+        use crate::brain::store::{
+            AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, ProgramLanguage,
+            RunId,
+        };
+
+        let output = crate::cli::output_manager::OutputManager::new(
+            crate::config::ColorScheme::default(),
+        );
+        output.disable_stdout();
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let run = BrainRun {
+            run_id,
+            kind: BrainRunKind::Speculative,
+            parent_run_id: None,
+            request_seq: 1,
+            initiating_attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+            initiated_by: "alice".into(),
+            status: BrainRunStatus::QueuedForEnvironment,
+            started_ms: 1,
+            updated_ms: 1,
+            detail: None,
+        };
+        let kinds = vec![
+            BrainEventKind::SpeculativePrompt {
+                text: "inspect the cache".into(),
+            },
+            BrainEventKind::RunStarted { run },
+            BrainEventKind::ToolCall {
+                request_seq: 1,
+                tool_id: "tool-1".into(),
+                name: "read_cache".into(),
+                input: serde_json::json!({"key": "alpha"}),
+            },
+            BrainEventKind::ToolResult {
+                request_seq: 1,
+                tool_id: "tool-1".into(),
+                output: "cache hit\nvalue=7".into(),
+                is_error: false,
+            },
+            BrainEventKind::ApprovalRequested {
+                request_seq: 1,
+                approval_id: "approval-1".into(),
+                approval_kind: "tool".into(),
+                subject: "write_cache".into(),
+                audience: None,
+                detail: serde_json::json!({"key": "beta"}),
+            },
+            BrainEventKind::ApprovalDecided {
+                request_seq: 1,
+                approval_id: "approval-1".into(),
+                decision: serde_json::json!({"choice": "approve_once"}),
+            },
+            BrainEventKind::Program {
+                language: ProgramLanguage::Lisp,
+                source: "(say \"cache checked\")".into(),
+            },
+            BrainEventKind::Result {
+                request_seq: 1,
+                output: "cache checked".into(),
+                error: None,
+            },
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status: BrainRunStatus::Completed,
+                detail: None,
+            },
+        ];
+        let events = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                let mut event = brain_event(index as u64 + 1, "daemon", kind);
+                event.run_id = Some(run_id);
+                event
+            })
+            .collect::<Vec<_>>();
+        let mut projections = std::collections::HashMap::new();
+
+        // All events may be at or below the attachment acknowledgement. The
+        // snapshot projector must still rebuild their selectable run group.
+        super::project_remote_brain_snapshot_runs(&output, &mut projections, &events);
+        // A replacement snapshot is idempotent and does not duplicate rows.
+        super::project_remote_brain_snapshot_runs(&output, &mut projections, &events);
+
+        let messages = output.get_messages();
+        assert_eq!(messages.len(), 1);
+        let rendered = messages[0].format(&crate::config::ColorScheme::default());
+        for expected in [
+            &format!("Speculative run {}", run_id.0),
+            "inspect the cache",
+            "read_cache",
+            "cache hit",
+            "approval (tool)",
+            "approve_once by daemon",
+            "Lisp program",
+            "(say \"cache checked\")",
+            "cache checked",
+            "completed",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?} from projected WorkUnit:\n{rendered}"
+            );
+        }
+        assert_eq!(rendered.matches("inspect the cache").count(), 1);
+        assert_eq!(rendered.matches("read_cache").count(), 1);
+        assert_eq!(rendered.matches("approval (tool)").count(), 1);
+        assert_eq!(rendered.matches("Lisp program").count(), 1);
+        assert_eq!(rendered.matches("result").count(), 1);
     }
 
     #[test]
