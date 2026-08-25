@@ -767,8 +767,11 @@ still blocks the corresponding Brain phase until it is unified.
   acknowledgement, detach cleanup, participant submission, queued-run resumption, and runner-lease
   lifetime; embedded hosts can call it directly, while both transport adapters contain only
   authentication, encoding, socket, and callback mechanics. Hermetic service tests and the live
-  cross-transport fixture exercise that same boundary. Still replace residual JSON-encoded values
-  inside typed messages with explicit schema types and generalize approval/effect resume correlation.
+  cross-transport fixture exercise that same boundary. Tool inputs, approval details, and approval
+  decisions now use a recursive schema-native `JsonValue` union across durable events, runner turn
+  callbacks, and reverse approval RPC rather than opaque JSON byte strings, with exact signed,
+  unsigned, float, string, list, and object preservation. Checkpoint/context blobs remain explicitly
+  versioned payload boundaries. Still generalize approval/effect resume correlation.
 - [ ] Define Brain initialization as a reviewed typed program/module with an explicit capability
   budget and journaled effects. Deterministic VM vocabulary/module loading may occur before a
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work
