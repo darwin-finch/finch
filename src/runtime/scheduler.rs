@@ -512,14 +512,6 @@ impl AgentScheduler {
         };
         let vm_revision = self.runtime.revision();
         let manifest_generation = self.runtime.manifest_generation();
-        let starting_context_hash = starting_context_hash(
-            &spec,
-            parent,
-            provider.name(),
-            vm_revision,
-            manifest_generation,
-            &grant_ceiling,
-        )?;
         let parent_brain_run_id = match parent.and_then(|identity| identity.brain_run_id) {
             Some(run_id) => Some(run_id),
             None => self
@@ -529,6 +521,15 @@ impl AgentScheduler {
                 .as_ref()
                 .map(|context| context.run_id),
         };
+        let starting_context_hash = starting_context_hash(
+            &spec,
+            parent,
+            parent_brain_run_id,
+            provider.name(),
+            vm_revision,
+            manifest_generation,
+            &grant_ceiling,
+        )?;
         let brain_run_id = if let Some(parent_run_id) = parent_brain_run_id {
             let control = self
                 .brain_control
@@ -879,6 +880,7 @@ impl AgentScheduler {
 fn starting_context_hash(
     spec: &AgentTaskSpec,
     parent: Option<&AgentIdentity>,
+    parent_brain_run_id: Option<crate::brain::store::RunId>,
     provider_model: &str,
     vm_revision: u64,
     manifest_generation: u64,
@@ -899,6 +901,7 @@ fn starting_context_hash(
         &spec.background,
         &spec.budget,
         parent_identity,
+        parent_brain_run_id,
         provider_model,
         vm_revision,
         manifest_generation,
@@ -1231,18 +1234,19 @@ mod tests {
         let (cancelled_tx, cancelled_rx) = oneshot::channel();
         tokio::spawn(async move {
             let AgentBrainControlRequest::Start {
-                task_id,
+                parent_run_id: first_parent,
+                task_id: first_task_id,
                 detail,
                 response_tx,
-                ..
             } = control_rx.recv().await.unwrap()
             else {
                 panic!("expected child start")
             };
-            let run_id = crate::brain::store::RunId(task_id);
+            assert_eq!(first_parent, parent_run_id);
+            let first_run_id = crate::brain::store::RunId(first_task_id);
             response_tx
                 .send(Ok(crate::brain::store::BrainRun {
-                    run_id,
+                    run_id: first_run_id,
                     kind: crate::brain::store::BrainRunKind::Subagent,
                     parent_run_id: Some(parent_run_id),
                     request_seq: 9,
@@ -1254,30 +1258,68 @@ mod tests {
                     detail: Some(detail),
                 }))
                 .unwrap();
-            let AgentBrainControlRequest::Finish {
-                status,
+            let AgentBrainControlRequest::Start {
+                parent_run_id: second_parent,
+                task_id: second_task_id,
+                detail,
                 response_tx,
-                ..
             } = control_rx.recv().await.unwrap()
             else {
-                panic!("expected child finish")
+                panic!("expected nested child start")
             };
-            assert_eq!(status, crate::brain::store::BrainRunStatus::Cancelled);
+            assert_eq!(second_parent, first_run_id);
+            let second_run_id = crate::brain::store::RunId(second_task_id);
             response_tx
                 .send(Ok(crate::brain::store::BrainRun {
-                    run_id,
+                    run_id: second_run_id,
                     kind: crate::brain::store::BrainRunKind::Subagent,
-                    parent_run_id: Some(parent_run_id),
+                    parent_run_id: Some(first_run_id),
                     request_seq: 9,
                     initiating_attachment_id: crate::brain::store::AttachmentId(Uuid::new_v4()),
                     initiated_by: "alice".into(),
-                    status,
+                    status: crate::brain::store::BrainRunStatus::Running,
                     started_ms: 1,
-                    updated_ms: 2,
-                    detail: Some("cancelled".into()),
+                    updated_ms: 1,
+                    detail: Some(detail),
                 }))
                 .unwrap();
-            let _ = cancelled_tx.send(run_id);
+            let mut finished = Vec::new();
+            for _ in 0..2 {
+                let AgentBrainControlRequest::Finish {
+                    run_id,
+                    status,
+                    response_tx,
+                    ..
+                } = control_rx.recv().await.unwrap()
+                else {
+                    panic!("expected child finish")
+                };
+                assert_eq!(status, crate::brain::store::BrainRunStatus::Cancelled);
+                let parent = if run_id == first_run_id {
+                    parent_run_id
+                } else {
+                    assert_eq!(run_id, second_run_id);
+                    first_run_id
+                };
+                response_tx
+                    .send(Ok(crate::brain::store::BrainRun {
+                        run_id,
+                        kind: crate::brain::store::BrainRunKind::Subagent,
+                        parent_run_id: Some(parent),
+                        request_seq: 9,
+                        initiating_attachment_id: crate::brain::store::AttachmentId(
+                            Uuid::new_v4(),
+                        ),
+                        initiated_by: "alice".into(),
+                        status,
+                        started_ms: 1,
+                        updated_ms: 2,
+                        detail: Some("cancelled".into()),
+                    }))
+                    .unwrap();
+                finished.push(run_id);
+            }
+            let _ = cancelled_tx.send(finished);
         });
 
         let identity = scheduler
@@ -1297,13 +1339,36 @@ mod tests {
             .await
             .unwrap();
         started.notified().await;
-        scheduler.cancel(identity.task_id).await.unwrap();
-        let result = scheduler.wait(identity.task_id).await.unwrap();
-        assert_eq!(result.status, AgentTaskStatus::Cancelled);
+        let nested = scheduler
+            .spawn(
+                AgentTaskSpec {
+                    task: "nested wait".into(),
+                    role: AgentRole::Explore,
+                    background: None,
+                    provider: None,
+                    model: None,
+                    context: Vec::new(),
+                    capability_grant_ids: None,
+                    budget: AgentBudget::default(),
+                },
+                Some(&identity),
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            cancelled_rx.await.unwrap(),
-            crate::brain::store::RunId(identity.task_id)
+            nested.brain_run_id,
+            Some(crate::brain::store::RunId(nested.task_id))
         );
+        started.notified().await;
+        scheduler.cancel(identity.task_id).await.unwrap();
+        scheduler.cancel(nested.task_id).await.unwrap();
+        let result = scheduler.wait(identity.task_id).await.unwrap();
+        let nested_result = scheduler.wait(nested.task_id).await.unwrap();
+        assert_eq!(result.status, AgentTaskStatus::Cancelled);
+        assert_eq!(nested_result.status, AgentTaskStatus::Cancelled);
+        let finished = cancelled_rx.await.unwrap();
+        assert!(finished.contains(&crate::brain::store::RunId(identity.task_id)));
+        assert!(finished.contains(&crate::brain::store::RunId(nested.task_id)));
     }
 
     #[tokio::test]
@@ -1451,12 +1516,25 @@ mod tests {
             capability_grant_ids: None,
             budget: AgentBudget::default(),
         };
-        let first = starting_context_hash(&spec, None, "echo", 7, 3, &EffectSet::pure()).unwrap();
-        let same = starting_context_hash(&spec, None, "echo", 7, 3, &EffectSet::pure()).unwrap();
+        let first =
+            starting_context_hash(&spec, None, None, "echo", 7, 3, &EffectSet::pure()).unwrap();
+        let same =
+            starting_context_hash(&spec, None, None, "echo", 7, 3, &EffectSet::pure()).unwrap();
         let next_revision =
-            starting_context_hash(&spec, None, "echo", 8, 3, &EffectSet::pure()).unwrap();
+            starting_context_hash(&spec, None, None, "echo", 8, 3, &EffectSet::pure()).unwrap();
+        let other_brain_parent = starting_context_hash(
+            &spec,
+            None,
+            Some(crate::brain::store::RunId(Uuid::new_v4())),
+            "echo",
+            7,
+            3,
+            &EffectSet::pure(),
+        )
+        .unwrap();
         assert_eq!(first, same);
         assert_ne!(first, next_revision);
+        assert_ne!(first, other_brain_parent);
     }
 
     #[tokio::test]
