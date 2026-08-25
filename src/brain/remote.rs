@@ -1036,6 +1036,143 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    #[ignore = "requires a running Finch daemon on the default local IPC and HTTP endpoints"]
+    fn live_local_and_remote_transports_produce_equivalent_lifecycle() {
+        use crate::brain::shared::{BrainRunKind, BrainRunStatus};
+        use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
+
+        fn lifecycle(snapshot: &BrainSnapshot) -> Vec<&'static str> {
+            snapshot
+                .events
+                .iter()
+                .filter_map(|event| match event.kind {
+                    BrainEventKind::ClientAttached { .. } => Some("attached"),
+                    BrainEventKind::Prompt { .. } => Some("prompt"),
+                    BrainEventKind::RunStarted { .. } => Some("run-started"),
+                    BrainEventKind::ClientDetached { .. } => Some("detached"),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local_set = tokio::task::LocalSet::new();
+        runtime.block_on(local_set.run_until(async {
+            let local_brain = "codex-conformance-local-20260825";
+            let remote_brain = "codex-conformance-remote-20260825";
+            let http = reqwest::Client::new();
+            for brain in [local_brain, remote_brain] {
+                let _ = http
+                    .delete(format!(
+                        "http://127.0.0.1:{DEFAULT_BRAIN_PORT}/v1/brains/named/{brain}"
+                    ))
+                    .send()
+                    .await;
+            }
+
+            let ipc = crate::ipc::IpcClient::connect().await.unwrap();
+            let local_attachment = ipc
+                .brain_attach(
+                    local_brain,
+                    "conformance@localhost",
+                    AttachmentRole::Driver,
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut local_events = ipc
+                .brain_watch(local_brain, &local_attachment)
+                .await
+                .unwrap();
+            let local_initial = local_events.recv().await.unwrap().unwrap();
+            assert!(matches!(local_initial, BrainWireMessage::Snapshot { .. }));
+            let local_outcome = ipc
+                .brain_submit(
+                    local_brain,
+                    &local_attachment,
+                    BrainEventKind::Prompt {
+                        text: "same lifecycle".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let local_ack = ipc
+                .brain_acknowledge(local_brain, &local_attachment, local_outcome.accepted.seq)
+                .await
+                .unwrap();
+            ipc.brain_detach(local_brain, &local_ack).await.unwrap();
+            let local_snapshot = ipc.brain_snapshot(local_brain).await.unwrap();
+
+            let target = RemoteBrainTarget::parse(&format!(
+                "{remote_brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}"
+            ))
+            .unwrap();
+            let mut remote = RemoteBrainClient::new(target, "loopback").unwrap();
+            remote
+                .attach(
+                    "conformance@localhost",
+                    AttachmentRole::Driver,
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut remote_events = remote.watch().await.unwrap();
+            assert!(matches!(
+                remote_events.recv().await.unwrap(),
+                BrainWireMessage::Snapshot { .. }
+            ));
+            let remote_outcome = remote
+                .send_remote_command(BrainRemoteCommandKind::Submit(BrainEventKind::Prompt {
+                    text: "same lifecycle".into(),
+                }))
+                .await
+                .unwrap();
+            let BrainRemoteReply::Submitted {
+                accepted: remote_accepted,
+                run: remote_run,
+                result: remote_result,
+                ..
+            } = remote_outcome
+            else {
+                panic!("remote transport returned a non-submission outcome")
+            };
+            remote.acknowledge(remote_accepted.seq).await.unwrap();
+            remote.disconnect().await.unwrap();
+            let remote_snapshot = remote.snapshot().await.unwrap();
+
+            assert_eq!(local_outcome.accepted.kind, remote_accepted.kind);
+            assert_eq!(local_outcome.result, remote_result);
+            let local_run = local_outcome.run.unwrap();
+            let remote_run = remote_run.unwrap();
+            assert_eq!(local_run.kind, BrainRunKind::Interactive);
+            assert_eq!(local_run.kind, remote_run.kind);
+            assert_eq!(local_run.status, BrainRunStatus::QueuedForEnvironment);
+            assert_eq!(local_run.status, remote_run.status);
+            assert_eq!(
+                local_run.request_seq - local_snapshot.events[0].seq,
+                remote_run.request_seq - remote_snapshot.events[0].seq
+            );
+            assert_eq!(lifecycle(&local_snapshot), lifecycle(&remote_snapshot));
+
+            drop(local_events);
+            drop(remote_events);
+            for brain in [local_brain, remote_brain] {
+                http.delete(format!(
+                    "http://127.0.0.1:{DEFAULT_BRAIN_PORT}/v1/brains/named/{brain}"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            }
+        }));
+    }
+
     #[tokio::test]
     async fn cloned_client_reuses_a_live_scoped_credential() {
         let client = RemoteBrainClient::new(
