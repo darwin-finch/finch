@@ -753,9 +753,13 @@ still blocks the corresponding Brain phase until it is unified.
   implementation, typed IPC client, snapshot-first watch, and shared transport-neutral submission
   operation now exist. The home TUI now uses that capability for snapshot, persistent attachment,
   watch, acknowledgement, submit, runner-lease renewal/release, and detach; an ignored live test
-  exercises the full local lifecycle against a daemon. Still encode remote mutations with the same
-  schema behind scoped authentication, add cross-transport conformance fixtures, and then remove
-  duplicated lifecycle HTTP routes.
+  exercises the full local lifecycle against a daemon. Remote watches now use one correlated,
+  bidirectional Cap'n Proto envelope for snapshot/event projections and submit, acknowledge, and
+  detach commands. The server binds commands to the authenticated socket attachment, revalidates
+  scoped credentials on every command and while idle, and preserves event delivery while a long
+  runner request is in flight. A loopback fixture and ignored live-daemon test cover the remote
+  command lifecycle. Still consolidate attach/bootstrap cleanup, add one cross-transport
+  conformance fixture that asserts identical outcomes, and remove duplicated lifecycle HTTP routes.
 - [ ] Define Brain initialization as a reviewed typed program/module with an explicit capability
   budget and journaled effects. Deterministic VM vocabulary/module loading may occur before a
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work

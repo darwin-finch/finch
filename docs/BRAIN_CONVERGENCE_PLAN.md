@@ -128,7 +128,11 @@ input is a closed union rather than a forgeable event envelope; the daemon still
 identity, timestamps, results, and run transitions. The home TUI now keeps a cloneable local
 capability on the frontend `LocalSet` and uses it for snapshot, persistent attachment, ordered watch,
 acknowledgement, submission, lease renewal/release, and detach. Foreign remote attachments retain
-the scoped-auth HTTP/binary-WebSocket adapter behind the same client projection.
+the scoped-auth adapter behind the same client projection. HTTP performs credential and attachment
+bootstrap; the resulting WebSocket is a correlated bidirectional Cap'n Proto session carrying
+snapshot/event projections plus submit, acknowledge, and detach commands. Commands inherit the
+exact socket attachment rather than accepting client-authored attachment IDs, and the daemon
+revalidates the signed credential for each mutation and periodically while the connection is idle.
 
 The named-Brain HTTP compatibility handler no longer executes ProgramRuns inside the daemon. It
 serializes the accepted event, requires the active environment lease's registered callback, and
@@ -157,12 +161,13 @@ against the restored dictionary. A second live provider test rejected a three-ar
 then committed the corrected program; another daemon restart restored the earlier definition and
 continued the runtime revision. Static wire repair never retries host effects, approvals,
 cancellation, or runtime-limit failures.
-The transport-neutral participant-submission operation is now shared by HTTP and local Cap'n Proto,
-and the local RPC exposes the complete first lifecycle surface. The HTTP/WebSocket client remains a
-compatibility projection rather than the final transport arrangement: remote mutation messages are
-still JSON, run ancestry/budgets/cancellation are incomplete, and generalized effect-resume
-correlation still needs the unified service. Runtime ownership has moved to the leased environment
-runner; the daemon is now the durable coordinator for interactive prompt/program runs.
+The transport-neutral participant-submission operation is now shared by HTTP, local Cap'n Proto,
+and the authenticated remote binary session, and the local RPC exposes the complete first lifecycle
+surface. Remote command correlation is independent of event projection, so long provider/runner
+requests do not stop that socket from receiving canonical events. Run ancestry/budgets/cancellation
+and generalized effect-resume correlation still need the unified service, and compatibility HTTP
+mutation routes remain to be removed. Runtime ownership has moved to the leased environment runner;
+the daemon is now the durable coordinator for interactive prompt/program runs.
 
 On 2026-08-24 a live attachment test used separate driver and consultant consoles against one
 Brain. The driver defined and invoked a shared Lisp word, the consultant was forbidden from
@@ -411,16 +416,17 @@ Exit: every background activity has identical lifecycle and ancestry semantics.
 
 Exit: the transport conformance suite produces equivalent events and outcomes.
 
-Current compatibility status: HTTP/WebSocket implement authenticated attachment, cursor, role, and
-runner-lease operations. They are test scaffolding for this phase, not permission to preserve a
-second service implementation. Local Cap'n Proto now has a typed `BrainService` for the complete
-event envelope, participant submission/outcome, attachment cursor, ordered watch, and runner lease,
-alongside the lease-bound runner callback and checkpoint bootstrap. Its submission adapter enters
-the same transport-neutral role/order/run operation as HTTP. The local TUI now consumes that
+Current compatibility status: HTTP performs authenticated remote discovery, credential issuance,
+and attachment bootstrap. Local Cap'n Proto has a typed `BrainService` for the complete event
+envelope, participant submission/outcome, attachment cursor, ordered watch, and runner lease,
+alongside the lease-bound runner callback and checkpoint bootstrap. The local TUI consumes that
 capability entirely on its `LocalSet`; a live ignored test verifies snapshot-first watch, queued run
-submission, cursor acknowledgement, and detach against a restarted daemon. Remote mutations still
-need the same binary request schema and scoped-auth adapter, and generalized approval/effect
-resumptions remain incomplete. Embedded mode likewise does not yet implement the same contract.
+submission, cursor acknowledgement, and detach against a restarted daemon. Remote consoles carry
+the same closed submission union and typed outcomes in correlated binary WebSocket envelopes;
+fixture and live-daemon tests cover attach, watch, submit, acknowledge, final detach projection, and
+cleanup. Compatibility JSON mutation handlers still need removal, a shared conformance fixture must
+compare transport outcomes directly, generalized approval/effect resumptions remain incomplete, and
+embedded mode likewise does not yet implement the same contract.
 
 ### B5: Client projections and shadow-buffer UI
 
