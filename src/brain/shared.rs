@@ -74,6 +74,16 @@ impl RunnerLeaseId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+pub struct RunnerHandoffId(pub uuid::Uuid);
+
+impl RunnerHandoffId {
+    fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct RunId(pub uuid::Uuid);
 
 impl RunId {
@@ -132,6 +142,17 @@ pub struct BrainRunnerLease {
     pub subject: String,
     pub environment_generation: u64,
     pub acquired_ms: u64,
+    pub expires_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrainRunnerHandoff {
+    pub handoff_id: RunnerHandoffId,
+    pub from_lease_id: RunnerLeaseId,
+    pub requested_by: String,
+    pub target_subject: String,
+    pub environment_generation: u64,
+    pub requested_ms: u64,
     pub expires_ms: u64,
 }
 
@@ -207,6 +228,16 @@ pub enum BrainEventKind {
     },
     RunnerLeaseReleased {
         lease_id: RunnerLeaseId,
+    },
+    RunnerHandoffRequested {
+        handoff: BrainRunnerHandoff,
+    },
+    RunnerHandoffCompleted {
+        handoff_id: RunnerHandoffId,
+        lease: BrainRunnerLease,
+    },
+    RunnerHandoffCancelled {
+        handoff_id: RunnerHandoffId,
     },
     ClientAttached {
         attachment_id: AttachmentId,
@@ -318,6 +349,8 @@ pub struct BrainSnapshot {
     pub attachments: Vec<BrainAttachment>,
     pub runner_lease: Option<BrainRunnerLease>,
     #[serde(default)]
+    pub runner_handoff: Option<BrainRunnerHandoff>,
+    #[serde(default)]
     pub runs: Vec<BrainRun>,
 }
 
@@ -335,6 +368,7 @@ struct BrainState {
     attachments: HashMap<AttachmentId, BrainAttachment>,
     runs: HashMap<RunId, BrainRun>,
     runner_lease: Option<BrainRunnerLease>,
+    runner_handoff: Option<BrainRunnerHandoff>,
     runtime_checkpoint: Option<RuntimeCheckpointState>,
     runtime_commit_count: u64,
     tx: broadcast::Sender<BrainEvent>,
@@ -357,6 +391,7 @@ impl BrainState {
             attachments: HashMap::new(),
             runs: HashMap::new(),
             runner_lease: None,
+            runner_handoff: None,
             runtime_checkpoint: None,
             runtime_commit_count: 0,
             tx,
@@ -373,6 +408,13 @@ impl BrainState {
     fn apply(&mut self, event: BrainEvent) {
         match &event.kind {
             BrainEventKind::RunnerLeaseAcquired { lease } => {
+                if self
+                    .runner_handoff
+                    .as_ref()
+                    .is_some_and(|handoff| handoff.from_lease_id != lease.lease_id)
+                {
+                    self.runner_handoff = None;
+                }
                 self.runner_lease = Some(lease.clone());
             }
             BrainEventKind::RunnerLeaseReleased { lease_id } => {
@@ -382,6 +424,35 @@ impl BrainState {
                     .is_some_and(|lease| lease.lease_id == *lease_id)
                 {
                     self.runner_lease = None;
+                }
+                if self
+                    .runner_handoff
+                    .as_ref()
+                    .is_some_and(|handoff| handoff.from_lease_id == *lease_id)
+                {
+                    self.runner_handoff = None;
+                }
+            }
+            BrainEventKind::RunnerHandoffRequested { handoff } => {
+                self.runner_handoff = Some(handoff.clone());
+            }
+            BrainEventKind::RunnerHandoffCompleted { handoff_id, lease } => {
+                if self
+                    .runner_handoff
+                    .as_ref()
+                    .is_some_and(|handoff| handoff.handoff_id == *handoff_id)
+                {
+                    self.runner_handoff = None;
+                    self.runner_lease = Some(lease.clone());
+                }
+            }
+            BrainEventKind::RunnerHandoffCancelled { handoff_id } => {
+                if self
+                    .runner_handoff
+                    .as_ref()
+                    .is_some_and(|handoff| handoff.handoff_id == *handoff_id)
+                {
+                    self.runner_handoff = None;
                 }
             }
             BrainEventKind::ClientAttached {
@@ -595,6 +666,10 @@ impl SharedBrainStore {
                 .runner_lease
                 .clone()
                 .filter(|lease| lease.expires_ms > unix_millis()),
+            runner_handoff: state
+                .runner_handoff
+                .clone()
+                .filter(|handoff| handoff.expires_ms > unix_millis()),
             runs: sorted_runs(&state.runs),
         })
     }
@@ -743,6 +818,161 @@ impl SharedBrainStore {
             state,
             &subject,
             BrainEventKind::RunnerLeaseReleased { lease_id },
+        )?;
+        Ok(())
+    }
+
+    pub fn request_runner_handoff(
+        &self,
+        name: &str,
+        requested_by: &str,
+        target_subject: &str,
+        expected_lease_id: RunnerLeaseId,
+        environment_generation: u64,
+        ttl_ms: u64,
+    ) -> Result<BrainRunnerHandoff> {
+        let name = Self::validate_name(name)?;
+        let requested_by = validate_participant_subject("handoff requester", requested_by)?;
+        let target_subject = validate_participant_subject("handoff target", target_subject)?;
+        if environment_generation != self.environment.generation {
+            anyhow::bail!("runner handoff environment generation does not match this Brain");
+        }
+        if !(5_000..=300_000).contains(&ttl_ms) {
+            anyhow::bail!("runner handoff TTL must be between 5 and 300 seconds");
+        }
+        self.ensure_loaded(name)?;
+        let now = unix_millis();
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).expect("brain loaded above");
+        let current = state
+            .runner_lease
+            .as_ref()
+            .filter(|lease| lease.expires_ms > now)
+            .context("Brain has no live runner lease to hand off")?;
+        if current.lease_id != expected_lease_id {
+            anyhow::bail!("runner lease is no longer current");
+        }
+        if current.environment_generation != environment_generation {
+            anyhow::bail!("runner lease belongs to a different environment generation");
+        }
+        if current.subject == target_subject {
+            anyhow::bail!("runner handoff target already owns the lease");
+        }
+        if state
+            .runner_handoff
+            .as_ref()
+            .is_some_and(|handoff| handoff.expires_ms > now)
+        {
+            anyhow::bail!("Brain already has a pending runner handoff");
+        }
+        let expires_ms = now.saturating_add(ttl_ms).min(current.expires_ms);
+        if expires_ms.saturating_sub(now) < 5_000 {
+            anyhow::bail!("runner lease expires too soon to create a handoff");
+        }
+        let handoff = BrainRunnerHandoff {
+            handoff_id: RunnerHandoffId::new(),
+            from_lease_id: current.lease_id,
+            requested_by: requested_by.to_string(),
+            target_subject: target_subject.to_string(),
+            environment_generation,
+            requested_ms: now,
+            expires_ms,
+        };
+        self.push_locked(
+            name,
+            state,
+            requested_by,
+            BrainEventKind::RunnerHandoffRequested {
+                handoff: handoff.clone(),
+            },
+        )?;
+        Ok(handoff)
+    }
+
+    pub fn accept_runner_handoff(
+        &self,
+        name: &str,
+        target_subject: &str,
+        handoff_id: RunnerHandoffId,
+        environment_generation: u64,
+        ttl_ms: u64,
+    ) -> Result<BrainRunnerLease> {
+        let name = Self::validate_name(name)?;
+        let target_subject = validate_participant_subject("handoff target", target_subject)?;
+        if environment_generation != self.environment.generation {
+            anyhow::bail!("runner handoff environment generation does not match this Brain");
+        }
+        if !(5_000..=300_000).contains(&ttl_ms) {
+            anyhow::bail!("runner lease TTL must be between 5 and 300 seconds");
+        }
+        self.ensure_loaded(name)?;
+        let now = unix_millis();
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).expect("brain loaded above");
+        let handoff = state
+            .runner_handoff
+            .as_ref()
+            .filter(|handoff| handoff.handoff_id == handoff_id)
+            .context("runner handoff is no longer current")?;
+        if handoff.expires_ms <= now {
+            anyhow::bail!("runner handoff has expired");
+        }
+        if handoff.target_subject != target_subject {
+            anyhow::bail!("runner handoff is addressed to a different subject");
+        }
+        if handoff.environment_generation != environment_generation {
+            anyhow::bail!("runner handoff belongs to a different environment generation");
+        }
+        let current = state
+            .runner_lease
+            .as_ref()
+            .filter(|lease| lease.expires_ms > now)
+            .context("source runner lease is no longer live")?;
+        if current.lease_id != handoff.from_lease_id {
+            anyhow::bail!("source runner lease is no longer current");
+        }
+        let lease = BrainRunnerLease {
+            lease_id: RunnerLeaseId::new(),
+            subject: target_subject.to_string(),
+            environment_generation,
+            acquired_ms: now,
+            expires_ms: now.saturating_add(ttl_ms),
+        };
+        self.push_locked(
+            name,
+            state,
+            target_subject,
+            BrainEventKind::RunnerHandoffCompleted {
+                handoff_id,
+                lease: lease.clone(),
+            },
+        )?;
+        Ok(lease)
+    }
+
+    pub fn cancel_runner_handoff(
+        &self,
+        name: &str,
+        handoff_id: RunnerHandoffId,
+        sender: &str,
+    ) -> Result<()> {
+        let name = Self::validate_name(name)?;
+        let sender = validate_participant_subject("handoff canceller", sender)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).expect("brain loaded above");
+        if !state
+            .runner_handoff
+            .as_ref()
+            .is_some_and(|handoff| handoff.handoff_id == handoff_id)
+        {
+            anyhow::bail!("runner handoff is no longer current");
+        }
+        self.push_locked(
+            name,
+            state,
+            sender,
+            BrainEventKind::RunnerHandoffCancelled { handoff_id },
         )?;
         Ok(())
     }
@@ -1659,6 +1889,14 @@ impl SharedBrainStore {
     }
 }
 
+fn validate_participant_subject<'a>(label: &str, subject: &'a str) -> Result<&'a str> {
+    let subject = subject.trim();
+    if subject.is_empty() || subject.len() > 128 || subject.chars().any(char::is_control) {
+        anyhow::bail!("{label} must be 1-128 printable characters");
+    }
+    Ok(subject)
+}
+
 pub(crate) fn unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2480,6 +2718,115 @@ mod tests {
             .expire_runner_lease("shared", replacement.lease_id, replacement.expires_ms)
             .unwrap());
         assert!(restarted.snapshot("shared").unwrap().runner_lease.is_none());
+    }
+
+    #[test]
+    fn runner_handoff_is_addressed_durable_and_atomically_replaces_the_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        let generation = store.environment().generation;
+        let source = store
+            .acquire_runner_lease("shared", "runner-a", generation, None, 60_000)
+            .unwrap();
+        let handoff = store
+            .request_runner_handoff(
+                "shared",
+                "controller",
+                "runner-b",
+                source.lease_id,
+                generation,
+                30_000,
+            )
+            .unwrap();
+        assert!(store
+            .acquire_runner_lease("shared", "runner-b", generation, None, 60_000)
+            .is_err());
+
+        let restarted = SharedBrainStore::with_root("box.local", Some(temp.path().into()));
+        assert_eq!(
+            restarted
+                .snapshot("shared")
+                .unwrap()
+                .runner_handoff
+                .as_ref()
+                .unwrap()
+                .handoff_id,
+            handoff.handoff_id
+        );
+        assert!(restarted
+            .accept_runner_handoff(
+                "shared",
+                "runner-c",
+                handoff.handoff_id,
+                generation,
+                60_000,
+            )
+            .is_err());
+        let replacement = restarted
+            .accept_runner_handoff(
+                "shared",
+                "runner-b",
+                handoff.handoff_id,
+                generation,
+                60_000,
+            )
+            .unwrap();
+        assert_ne!(replacement.lease_id, source.lease_id);
+        let snapshot = restarted.snapshot("shared").unwrap();
+        assert_eq!(snapshot.runner_lease.as_ref().unwrap(), &replacement);
+        assert!(snapshot.runner_handoff.is_none());
+        assert!(snapshot.events.iter().any(|event| matches!(
+            event.kind,
+            BrainEventKind::RunnerHandoffCompleted { handoff_id, .. }
+                if handoff_id == handoff.handoff_id
+        )));
+    }
+
+    #[test]
+    fn releasing_or_cancelling_the_source_invalidates_a_runner_handoff() {
+        let store = SharedBrainStore::with_root("box.local", None);
+        let generation = store.environment().generation;
+        let source = store
+            .acquire_runner_lease("shared", "runner-a", generation, None, 60_000)
+            .unwrap();
+        let first = store
+            .request_runner_handoff(
+                "shared",
+                "controller",
+                "runner-b",
+                source.lease_id,
+                generation,
+                30_000,
+            )
+            .unwrap();
+        store
+            .cancel_runner_handoff("shared", first.handoff_id, "controller")
+            .unwrap();
+        assert!(store.snapshot("shared").unwrap().runner_handoff.is_none());
+
+        let second = store
+            .request_runner_handoff(
+                "shared",
+                "controller",
+                "runner-b",
+                source.lease_id,
+                generation,
+                30_000,
+            )
+            .unwrap();
+        store
+            .release_runner_lease("shared", source.lease_id)
+            .unwrap();
+        assert!(store.snapshot("shared").unwrap().runner_handoff.is_none());
+        assert!(store
+            .accept_runner_handoff(
+                "shared",
+                "runner-b",
+                second.handoff_id,
+                generation,
+                60_000,
+            )
+            .is_err());
     }
 
     #[test]

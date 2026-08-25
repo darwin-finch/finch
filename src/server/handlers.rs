@@ -577,6 +577,9 @@ pub(crate) async fn submit_named_brain_event(
             | BrainEventKind::RuntimeCommitted { .. }
             | BrainEventKind::RunnerLeaseAcquired { .. }
             | BrainEventKind::RunnerLeaseReleased { .. }
+            | BrainEventKind::RunnerHandoffRequested { .. }
+            | BrainEventKind::RunnerHandoffCompleted { .. }
+            | BrainEventKind::RunnerHandoffCancelled { .. }
             | BrainEventKind::ClientAttached { .. }
             | BrainEventKind::ClientDetached { .. }
             | BrainEventKind::RunStarted { .. }
@@ -1079,6 +1082,9 @@ fn named_brain_provider_messages(snapshot: &crate::brain::shared::BrainSnapshot)
                     | BrainEventKind::ApprovalDecided { .. }
                     | BrainEventKind::RunnerLeaseAcquired { .. }
                     | BrainEventKind::RunnerLeaseReleased { .. }
+                    | BrainEventKind::RunnerHandoffRequested { .. }
+                    | BrainEventKind::RunnerHandoffCompleted { .. }
+                    | BrainEventKind::RunnerHandoffCancelled { .. }
                     | BrainEventKind::ClientAttached { .. }
                     | BrainEventKind::ClientDetached { .. }
                     | BrainEventKind::RunStarted { .. }
@@ -1154,6 +1160,9 @@ fn named_brain_provider_messages(snapshot: &crate::brain::shared::BrainSnapshot)
             | BrainEventKind::ApprovalDecided { .. }
             | BrainEventKind::RunnerLeaseAcquired { .. }
             | BrainEventKind::RunnerLeaseReleased { .. }
+            | BrainEventKind::RunnerHandoffRequested { .. }
+            | BrainEventKind::RunnerHandoffCompleted { .. }
+            | BrainEventKind::RunnerHandoffCancelled { .. }
             | BrainEventKind::ClientAttached { .. }
             | BrainEventKind::ClientDetached { .. }
             | BrainEventKind::RunStarted { .. }
@@ -2757,6 +2766,7 @@ mod named_brain_provider_context_tests {
             program_stack: Vec::new(),
             attachments: Vec::new(),
             runner_lease: None,
+            runner_handoff: None,
             runs: Vec::new(),
         };
 
@@ -2841,6 +2851,7 @@ mod named_brain_provider_context_tests {
             program_stack: Vec::new(),
             attachments: Vec::new(),
             runner_lease: None,
+            runner_handoff: None,
             runs: Vec::new(),
         };
 

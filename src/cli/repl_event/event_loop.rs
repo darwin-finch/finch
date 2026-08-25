@@ -4282,6 +4282,18 @@ Rules:\n\
             BrainEventKind::RunnerLeaseReleased { .. } => self
                 .output_manager
                 .write_info("environment runner disconnected"),
+            BrainEventKind::RunnerHandoffRequested { handoff } => self.output_manager.write_info(
+                format!(
+                    "{} requested runner handoff to {}",
+                    handoff.requested_by, handoff.target_subject
+                ),
+            ),
+            BrainEventKind::RunnerHandoffCompleted { lease, .. } => self
+                .output_manager
+                .write_info(format!("runner handoff completed to {}", lease.subject)),
+            BrainEventKind::RunnerHandoffCancelled { .. } => self
+                .output_manager
+                .write_info("runner handoff cancelled"),
             BrainEventKind::ClientAttached {
                 subject, role, ..
             } => self.output_manager.write_info(format!(

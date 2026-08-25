@@ -212,6 +212,21 @@ struct BrainRunnerLease {
   expiresMs             @4 :UInt64;
 }
 
+struct BrainRunnerHandoff {
+  handoffId            @0 :Text;
+  fromLeaseId          @1 :Text;
+  requestedBy          @2 :Text;
+  targetSubject        @3 :Text;
+  environmentGeneration @4 :UInt64;
+  requestedMs          @5 :UInt64;
+  expiresMs            @6 :UInt64;
+}
+
+struct BrainRunnerHandoffCompleted {
+  handoffId @0 :Text;
+  lease     @1 :BrainRunnerLease;
+}
+
 struct BrainProgram {
   seq      @0 :UInt64;
   sender   @1 :Text;
@@ -342,6 +357,9 @@ struct BrainEvent {
     runtimeCommitted    @18 :BrainRuntimeCommitted;
     runStarted          @19 :BrainRun;
     runStatusChanged    @20 :BrainRunStatusChanged;
+    runnerHandoffRequested @21 :BrainRunnerHandoff;
+    runnerHandoffCompleted @22 :BrainRunnerHandoffCompleted;
+    runnerHandoffCancelled @23 :Text;
   }
 }
 
@@ -356,6 +374,8 @@ struct BrainSnapshot {
   hasRunnerLease  @7 :Bool;
   runnerLease     @8 :BrainRunnerLease;
   runs            @9 :List(BrainRun);
+  hasRunnerHandoff @10 :Bool;
+  runnerHandoff    @11 :BrainRunnerHandoff;
 }
 
 struct BrainWireMessage {

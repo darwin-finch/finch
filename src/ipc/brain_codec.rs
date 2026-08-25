@@ -1,8 +1,8 @@
 use crate::brain::shared::{
     AttachmentId, AttachmentRole, BrainApprovalAudience, BrainAttachment, BrainEnvironment,
     BrainEvent, BrainEventKind, BrainId, BrainProgram, BrainRun, BrainRunKind, BrainRunStatus,
-    BrainRunnerLease, BrainSnapshot, BrainWireMessage, ConnectionId, ProgramLanguage, RunId,
-    RunnerLeaseId,
+    BrainRunnerHandoff, BrainRunnerLease, BrainSnapshot, BrainWireMessage, ConnectionId,
+    ProgramLanguage, RunId, RunnerHandoffId, RunnerLeaseId,
 };
 use crate::ipc::schema::finch_ipc_capnp::{self, brain_approval_audience};
 
@@ -427,6 +427,10 @@ pub(super) fn encode_snapshot(
         builder.set_has_runner_lease(true);
         encode_runner_lease(builder.reborrow().init_runner_lease(), lease);
     }
+    if let Some(handoff) = &snapshot.runner_handoff {
+        builder.set_has_runner_handoff(true);
+        encode_runner_handoff(builder.reborrow().init_runner_handoff(), handoff);
+    }
     let mut runs = builder.reborrow().init_runs(snapshot.runs.len() as u32);
     for (index, run) in snapshot.runs.iter().enumerate() {
         encode_run(runs.reborrow().get(index as u32), run);
@@ -470,6 +474,12 @@ pub(super) fn decode_snapshot(
             .then(|| reader.get_runner_lease())
             .transpose()?
             .map(decode_runner_lease)
+            .transpose()?,
+        runner_handoff: reader
+            .get_has_runner_handoff()
+            .then(|| reader.get_runner_handoff())
+            .transpose()?
+            .map(decode_runner_handoff)
             .transpose()?,
         runs,
     })
@@ -547,6 +557,33 @@ pub(super) fn decode_runner_lease(
         subject: text(reader.get_subject()?)?,
         environment_generation: reader.get_environment_generation(),
         acquired_ms: reader.get_acquired_ms(),
+        expires_ms: reader.get_expires_ms(),
+    })
+}
+
+fn encode_runner_handoff(
+    mut builder: finch_ipc_capnp::brain_runner_handoff::Builder<'_>,
+    handoff: &BrainRunnerHandoff,
+) {
+    builder.set_handoff_id(&handoff.handoff_id.0.to_string());
+    builder.set_from_lease_id(&handoff.from_lease_id.0.to_string());
+    builder.set_requested_by(&handoff.requested_by);
+    builder.set_target_subject(&handoff.target_subject);
+    builder.set_environment_generation(handoff.environment_generation);
+    builder.set_requested_ms(handoff.requested_ms);
+    builder.set_expires_ms(handoff.expires_ms);
+}
+
+fn decode_runner_handoff(
+    reader: finch_ipc_capnp::brain_runner_handoff::Reader<'_>,
+) -> anyhow::Result<BrainRunnerHandoff> {
+    Ok(BrainRunnerHandoff {
+        handoff_id: RunnerHandoffId(parse_uuid(reader.get_handoff_id()?)?),
+        from_lease_id: RunnerLeaseId(parse_uuid(reader.get_from_lease_id()?)?),
+        requested_by: text(reader.get_requested_by()?)?,
+        target_subject: text(reader.get_target_subject()?)?,
+        environment_generation: reader.get_environment_generation(),
+        requested_ms: reader.get_requested_ms(),
         expires_ms: reader.get_expires_ms(),
     })
 }
@@ -635,6 +672,17 @@ pub(super) fn encode_event(
         }
         BrainEventKind::RunnerLeaseReleased { lease_id } => {
             builder.set_runner_lease_released(&lease_id.0.to_string());
+        }
+        BrainEventKind::RunnerHandoffRequested { handoff } => {
+            encode_runner_handoff(builder.init_runner_handoff_requested(), handoff);
+        }
+        BrainEventKind::RunnerHandoffCompleted { handoff_id, lease } => {
+            let mut completed = builder.init_runner_handoff_completed();
+            completed.set_handoff_id(&handoff_id.0.to_string());
+            encode_runner_lease(completed.init_lease(), lease);
+        }
+        BrainEventKind::RunnerHandoffCancelled { handoff_id } => {
+            builder.set_runner_handoff_cancelled(&handoff_id.0.to_string());
         }
         BrainEventKind::ClientAttached {
             attachment_id,
@@ -769,6 +817,19 @@ pub(super) fn decode_event(
         },
         Which::RunnerLeaseReleased(lease_id) => BrainEventKind::RunnerLeaseReleased {
             lease_id: RunnerLeaseId(parse_uuid(lease_id?)?),
+        },
+        Which::RunnerHandoffRequested(handoff) => BrainEventKind::RunnerHandoffRequested {
+            handoff: decode_runner_handoff(handoff?)?,
+        },
+        Which::RunnerHandoffCompleted(completed) => {
+            let completed = completed?;
+            BrainEventKind::RunnerHandoffCompleted {
+                handoff_id: RunnerHandoffId(parse_uuid(completed.get_handoff_id()?)?),
+                lease: decode_runner_lease(completed.get_lease()?)?,
+            }
+        }
+        Which::RunnerHandoffCancelled(handoff_id) => BrainEventKind::RunnerHandoffCancelled {
+            handoff_id: RunnerHandoffId(parse_uuid(handoff_id?)?),
         },
         Which::ClientAttached(attached) => {
             let attached = attached?;
@@ -1178,6 +1239,7 @@ mod tests {
                     connection_id: Some(connection_id),
                 }],
                 runner_lease: Some(lease),
+                runner_handoff: None,
                 runs: vec![BrainRun {
                     run_id: RunId(uuid::Uuid::new_v4()),
                     kind: BrainRunKind::Interactive,
