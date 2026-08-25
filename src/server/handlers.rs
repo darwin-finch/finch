@@ -981,10 +981,7 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
             atomic_run = Some(appended.run.clone());
             if appended.replayed {
                 let snapshot = store.snapshot(name)?;
-                let result = snapshot.events.into_iter().find(|event| {
-                    matches!(event.kind, BrainEventKind::Result { request_seq, .. }
-                        if request_seq == appended.accepted.seq)
-                });
+                let result = completed_run_result(&snapshot, &appended.run);
                 return Ok(BrainSubmissionOutcome {
                     accepted: appended.accepted,
                     run: Some(appended.run),
@@ -1049,7 +1046,8 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
         }
         Some(_) => None,
         None => match kind {
-            BrainEventKind::ParticipantMessage { .. }
+            BrainEventKind::MutationRecorded { .. }
+            | BrainEventKind::ParticipantMessage { .. }
             | BrainEventKind::TaskListReplaced { .. }
             | BrainEventKind::ProgramPopped { .. }
             | BrainEventKind::ToolCall { .. }
@@ -1087,6 +1085,25 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
         run,
         result,
     })
+}
+
+fn completed_run_result(
+    snapshot: &crate::brain::store::BrainSnapshot,
+    run: &crate::brain::store::BrainRun,
+) -> Option<crate::brain::store::BrainEvent> {
+    let terminal_seq = snapshot.events.iter().find_map(|event| match event.kind {
+        crate::brain::store::BrainEventKind::RunStatusChanged {
+            run_id,
+            status,
+            ..
+        } if run_id == run.run_id && status.is_terminal() => Some(event.seq),
+        _ => None,
+    })?;
+    snapshot.events.iter().rev().find(|event| {
+        event.seq > run.request_seq
+            && event.seq < terminal_seq
+            && matches!(event.kind, crate::brain::store::BrainEventKind::Result { .. })
+    }).cloned()
 }
 
 fn named_brain_runner_is_ready(
@@ -2087,7 +2104,8 @@ fn named_brain_provider_messages_at(
         .filter(|event| {
             !matches!(
                 event.kind,
-                BrainEventKind::RuntimeCommitted { .. }
+                BrainEventKind::MutationRecorded { .. }
+                    | BrainEventKind::RuntimeCommitted { .. }
                     | BrainEventKind::TaskListReplaced { .. }
                     | BrainEventKind::ApprovalRequested { .. }
                     | BrainEventKind::ApprovalDecided { .. }
@@ -2183,7 +2201,8 @@ fn named_brain_provider_messages_at(
                     "[Finch VM result for program event #{request_seq}]\n{result}"
                 ))
             }
-            BrainEventKind::RuntimeCommitted { .. }
+            BrainEventKind::MutationRecorded { .. }
+            | BrainEventKind::RuntimeCommitted { .. }
             | BrainEventKind::TaskListReplaced { .. }
             | BrainEventKind::EffectRecorded { .. }
             | BrainEventKind::ApprovalRequested { .. }
