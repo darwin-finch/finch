@@ -946,7 +946,43 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
     // two attached consoles cannot race commits or interleave turn events.
     let execution_lock = store.execution_lock(name)?;
     let _turn = execution_lock.lock_owned().await;
+    let executable_status = if matches!(kind, BrainEventKind::Program { .. }
+        | BrainEventKind::Prompt { .. }
+        | BrainEventKind::SpeculativePrompt { .. }) {
+        Some(if named_brain_runner_is_ready(store, runners, name)? {
+            crate::brain::store::BrainRunStatus::Running
+        } else {
+            crate::brain::store::BrainRunStatus::QueuedForEnvironment
+        })
+    } else {
+        None
+    };
+    let mut atomic_run = None;
     let accepted = match mutation {
+        Some(receipt) if executable_status.is_some() => {
+            let appended = store.push_executable_idempotent(
+                name,
+                &attachment.subject,
+                kind.clone(),
+                receipt,
+                attachment.attachment_id,
+                executable_status.expect("executable status exists"),
+            )?;
+            atomic_run = Some(appended.run.clone());
+            if appended.replayed {
+                let snapshot = store.snapshot(name)?;
+                let result = snapshot.events.into_iter().find(|event| {
+                    matches!(event.kind, BrainEventKind::Result { request_seq, .. }
+                        if request_seq == appended.accepted.seq)
+                });
+                return Ok(BrainSubmissionOutcome {
+                    accepted: appended.accepted,
+                    run: Some(appended.run),
+                    result,
+                });
+            }
+            appended.accepted
+        }
         Some(receipt) => {
             let appended = store.push_idempotent(
                 name,
@@ -978,17 +1014,9 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
         None => store.push(name, &attachment.subject, kind.clone())?,
     };
 
-    let run = if matches!(
-        kind,
-        BrainEventKind::Program { .. }
-            | BrainEventKind::Prompt { .. }
-            | BrainEventKind::SpeculativePrompt { .. }
-    ) {
-        let status = if named_brain_runner_is_ready(store, runners, name)? {
-            crate::brain::store::BrainRunStatus::Running
-        } else {
-            crate::brain::store::BrainRunStatus::QueuedForEnvironment
-        };
+    let run = if let Some(run) = atomic_run {
+        Some(run)
+    } else if let Some(status) = executable_status {
         Some(store.start_run(
             name,
             &attachment.subject,

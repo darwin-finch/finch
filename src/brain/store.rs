@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
@@ -64,6 +64,13 @@ pub struct BrainMutationReceipt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BrainMutationAppend {
     pub event: BrainEvent,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrainExecutableMutationAppend {
+    pub accepted: BrainEvent,
+    pub run: BrainRun,
     pub replayed: bool,
 }
 
@@ -552,6 +559,15 @@ pub struct BrainEvent {
     pub mutation: Option<BrainMutationReceipt>,
     #[serde(flatten)]
     pub kind: BrainEventKind,
+}
+
+/// One physical canonical journal append. Legacy lines remain bare events;
+/// compound transitions use this tagged record while preserving a cursor for
+/// every contained logical event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "journal_record", rename_all = "snake_case")]
+enum BrainJournalRecord {
+    EventBatch { events: Vec<BrainEvent> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2418,8 +2434,8 @@ impl BrainStore {
         }) {
             let recorded = existing.mutation.as_ref().expect("matched mutation receipt");
             anyhow::ensure!(
-                recorded.command_sha256 == receipt.command_sha256,
-                "Brain mutation idempotency key was reused with a different command"
+                recorded == &receipt,
+                "Brain mutation idempotency key was reused with a different command or precondition"
             );
             return Ok(BrainMutationAppend {
                 event: existing.clone(),
@@ -2441,6 +2457,83 @@ impl BrainStore {
             event,
             replayed: false,
         })
+    }
+
+    /// Durably append an executable request and its RunStarted projection in
+    /// one physical record, then apply and broadcast both logical events in
+    /// native sequence order.
+    pub fn push_executable_idempotent(
+        &self,
+        name: &str,
+        sender: &str,
+        kind: BrainEventKind,
+        receipt: BrainMutationReceipt,
+        initiating_attachment_id: AttachmentId,
+        status: BrainRunStatus,
+    ) -> Result<BrainExecutableMutationAppend> {
+        anyhow::ensure!(
+            matches!(kind, BrainEventKind::Prompt { .. } | BrainEventKind::Program { .. }),
+            "only executable Prompt or Program events can atomically start a run"
+        );
+        let name = Self::validate_name(name)?;
+        let sender = validate_participant_subject("run initiator", sender)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        if let Some(existing) = state.events.iter().find(|event| {
+            event.mutation.as_ref().is_some_and(|recorded| {
+                recorded.attachment_id == receipt.attachment_id
+                    && recorded.mutation_id == receipt.mutation_id
+            })
+        }) {
+            anyhow::ensure!(
+                existing.mutation.as_ref() == Some(&receipt),
+                "Brain mutation idempotency key was reused with a different command or precondition"
+            );
+            let run = state.runs.values()
+                .find(|run| run.request_seq == existing.seq)
+                .cloned()
+                .context("replayed executable Brain mutation has no canonical run")?;
+            return Ok(BrainExecutableMutationAppend {
+                accepted: existing.clone(), run, replayed: true,
+            });
+        }
+        anyhow::ensure!(receipt.attachment_id == initiating_attachment_id,
+            "Brain mutation attachment does not match run initiator");
+        anyhow::ensure!(receipt.environment_generation == self.environment.generation,
+            "Brain mutation environment generation is stale");
+        let revision = state.events.last().map(|event| event.seq).unwrap_or(0);
+        anyhow::ensure!(receipt.expected_revision == revision,
+            "Brain mutation expected revision {} but current revision is {revision}",
+            receipt.expected_revision);
+        let now = unix_millis();
+        let accepted = BrainEvent {
+            schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+            brain_id: state.brain_id,
+            seq: revision + 1,
+            environment_generation: self.environment.generation,
+            sender: sender.to_string(), created_ms: now,
+            mutation: Some(receipt), kind,
+        };
+        let run = BrainRun {
+            run_id: RunId::new(), kind: BrainRunKind::Interactive,
+            parent_run_id: None, request_seq: accepted.seq,
+            initiating_attachment_id, initiated_by: sender.to_string(), status,
+            started_ms: now, updated_ms: now, detail: None,
+        };
+        let started = BrainEvent {
+            schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+            brain_id: state.brain_id, seq: revision + 2,
+            environment_generation: self.environment.generation,
+            sender: sender.to_string(), created_ms: now, mutation: None,
+            kind: BrainEventKind::RunStarted { run: run.clone() },
+        };
+        self.append_event_batch(name, &[accepted.clone(), started.clone()])?;
+        for event in [accepted.clone(), started] {
+            state.apply(event.clone());
+            let _ = state.tx.send(event);
+        }
+        Ok(BrainExecutableMutationAppend { accepted, run, replayed: false })
     }
 
     fn push_locked(
@@ -3151,25 +3244,45 @@ impl BrainStore {
         let Some(path) = self.event_path(name) else {
             return Ok(Vec::new());
         };
-        let Ok(file) = std::fs::File::open(&path) else {
+        let Ok(bytes) = std::fs::read(&path) else {
             return Ok(Vec::new());
         };
-        BufReader::new(file)
-            .lines()
-            .enumerate()
-            .filter_map(|(line_no, line)| match line {
-                Ok(line) if line.trim().is_empty() => None,
-                other => Some((line_no, other)),
-            })
-            .map(|(line_no, line)| {
-                let line = line.with_context(|| format!("read {}", path.display()))?;
-                serde_json::from_str(&line)
-                    .with_context(|| format!("parse {} line {}", path.display(), line_no + 1))
-            })
-            .collect()
+        let mut events = Vec::new();
+        for (line_no, terminated) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+            // Committed records are newline-terminated. A torn final append
+            // projects none of its logical events after restart.
+            if terminated.last() != Some(&b'\n') {
+                break;
+            }
+            let line = &terminated[..terminated.len() - 1];
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            if let Ok(BrainJournalRecord::EventBatch { events: batch }) =
+                serde_json::from_slice::<BrainJournalRecord>(line)
+            {
+                events.extend(batch);
+            } else {
+                events.push(serde_json::from_slice(line).with_context(|| {
+                    format!("parse {} line {}", path.display(), line_no + 1)
+                })?);
+            }
+        }
+        Ok(events)
     }
 
     fn append_event(&self, name: &str, event: &BrainEvent) -> Result<()> {
+        self.append_journal_value(name, event)
+    }
+
+    fn append_event_batch(&self, name: &str, events: &[BrainEvent]) -> Result<()> {
+        anyhow::ensure!(!events.is_empty(), "Brain event batch cannot be empty");
+        self.append_journal_value(name, &BrainJournalRecord::EventBatch {
+            events: events.to_vec(),
+        })
+    }
+
+    fn append_journal_value<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
         let Some(path) = self.event_path(name) else {
             return Ok(());
         };
@@ -3177,14 +3290,24 @@ impl BrainStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
         }
+        let new_file = !path.exists();
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
-        serde_json::to_writer(&mut file, event)?;
-        file.write_all(b"\n")?;
-        file.flush()?;
+        let mut record = serde_json::to_vec(value)?;
+        record.push(b'\n');
+        file.write_all(&record)?;
+        file.sync_all().with_context(|| format!("sync {}", path.display()))?;
+        if new_file {
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)
+                    .with_context(|| format!("open {} for directory sync", parent.display()))?
+                    .sync_all()
+                    .with_context(|| format!("sync directory {}", parent.display()))?;
+            }
+        }
         Ok(())
     }
 }
@@ -3414,6 +3537,45 @@ const fn legacy_schedule_language() -> ProgramLanguage {
 mod tests {
     use super::*;
 
+    fn journal_event(brain_id: BrainId, seq: u64, text: &str) -> BrainEvent {
+        BrainEvent {
+            schema_version: BRAIN_EVENT_SCHEMA_VERSION, brain_id, seq,
+            environment_generation: 1, sender: "alice".into(), created_ms: seq,
+            mutation: None, kind: BrainEventKind::Prompt { text: text.into() },
+        }
+    }
+
+    #[test]
+    fn journal_reads_legacy_and_batch_records_with_logical_cursors() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let id = store.snapshot("shared").unwrap().brain_id;
+        store.append_event("shared", &journal_event(id, 1, "legacy")).unwrap();
+        store.append_event_batch("shared", &[
+            journal_event(id, 2, "first"), journal_event(id, 3, "second")
+        ]).unwrap();
+        drop(store);
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        assert_eq!(restarted.snapshot("shared").unwrap().revision, 3);
+    }
+
+    #[test]
+    fn restart_ignores_torn_batch_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let id = store.snapshot("shared").unwrap().brain_id;
+        store.append_event("shared", &journal_event(id, 1, "committed")).unwrap();
+        let encoded = serde_json::to_vec(&BrainJournalRecord::EventBatch { events: vec![
+            journal_event(id, 2, "hidden"), journal_event(id, 3, "hidden-too")
+        ]}).unwrap();
+        OpenOptions::new().append(true)
+            .open(temp.path().join("shared/events.jsonl")).unwrap()
+            .write_all(&encoded[..encoded.len() / 2]).unwrap();
+        drop(store);
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        assert_eq!(restarted.snapshot("shared").unwrap().revision, 1);
+    }
+
     fn mutation_receipt(
         store: &BrainStore,
         attachment_id: AttachmentId,
@@ -3468,6 +3630,30 @@ mod tests {
         assert!(replayed.replayed);
         assert_eq!(replayed.event.seq, first.event.seq);
         assert_eq!(restarted.snapshot("shared").unwrap().revision, 1);
+    }
+
+    #[test]
+    fn executable_mutation_and_run_replay_from_one_record_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = AttachmentId::new();
+        let receipt = mutation_receipt(&store, attachment, uuid::Uuid::new_v4(), 0, "prompt");
+        let first = store.push_executable_idempotent(
+            "shared", "alice", BrainEventKind::Prompt { text: "once".into() },
+            receipt.clone(), attachment, BrainRunStatus::QueuedForEnvironment,
+        ).unwrap();
+        assert_eq!(std::fs::read_to_string(temp.path().join("shared/events.jsonl"))
+            .unwrap().lines().count(), 1);
+        drop(store);
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let replay = restarted.push_executable_idempotent(
+            "shared", "alice", BrainEventKind::Prompt { text: "once".into() },
+            receipt, attachment, BrainRunStatus::Running,
+        ).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.accepted, first.accepted);
+        assert_eq!(replay.run, first.run);
+        assert_eq!(restarted.snapshot("shared").unwrap().revision, 2);
     }
 
     #[test]
