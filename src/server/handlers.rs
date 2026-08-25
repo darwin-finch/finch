@@ -78,6 +78,14 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
             post(attach_named_brain),
         )
         .route(
+            "/v1/brains/named/:name/credentials",
+            post(issue_named_brain_credential),
+        )
+        .route(
+            "/v1/brains/credentials/:credential_id",
+            axum::routing::delete(revoke_named_brain_credential),
+        )
+        .route(
             "/v1/brains/named/:name/attachments/:attachment_id/ack",
             post(acknowledge_named_brain),
         )
@@ -134,7 +142,7 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
 
 const BRAIN_PASSWORD_HEADER: &str = "x-finch-brain-password";
 
-async fn check_brain_access(
+async fn check_brain_bootstrap_access(
     server: &AgentServer,
     addr: SocketAddr,
     headers: &HeaderMap,
@@ -163,6 +171,171 @@ async fn check_brain_access(
     }
 }
 
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
+fn brain_auth_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(serde_json::json!({"error": message.into()}))).into_response()
+}
+
+fn authorize_named_brain(
+    server: &AgentServer,
+    addr: SocketAddr,
+    headers: &HeaderMap,
+    name: &str,
+    scope: crate::brain::credential::BrainCredentialScope,
+) -> Result<Option<crate::brain::credential::BrainCredentialClaims>, Response> {
+    if addr.ip().is_loopback() {
+        return Ok(None);
+    }
+    let token = bearer_token(headers).ok_or_else(|| {
+        brain_auth_error(StatusCode::UNAUTHORIZED, "scoped Brain credential required")
+    })?;
+    let claims = server
+        .brain_credentials()
+        .verify(token, unix_epoch_millis())
+        .map_err(|error| brain_auth_error(StatusCode::UNAUTHORIZED, error.to_string()))?;
+    let snapshot = server
+        .shared_brains()
+        .snapshot(name)
+        .map_err(|error| AppError(error).into_response())?;
+    claims
+        .require_audience(
+            snapshot.brain_id,
+            name,
+            snapshot.environment.generation,
+            scope,
+        )
+        .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
+    Ok(Some(claims))
+}
+
+const DEFAULT_BRAIN_CREDENTIAL_TTL_MS: u64 = 8 * 60 * 60 * 1_000;
+const MAX_BRAIN_CREDENTIAL_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+
+#[derive(Debug, Deserialize)]
+struct IssueNamedBrainCredentialRequest {
+    subject: String,
+    role: crate::brain::shared::AttachmentRole,
+    ttl_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IssueNamedBrainCredentialResponse {
+    token: String,
+    claims: crate::brain::credential::BrainCredentialClaims,
+}
+
+fn participant_scopes(
+    role: crate::brain::shared::AttachmentRole,
+) -> std::collections::BTreeSet<crate::brain::credential::BrainCredentialScope> {
+    use crate::brain::credential::BrainCredentialScope;
+    use crate::brain::shared::AttachmentRole;
+    match role {
+        AttachmentRole::Driver => [
+            BrainCredentialScope::BrainRead,
+            BrainCredentialScope::BrainSubmit,
+            BrainCredentialScope::BrainApprove,
+            BrainCredentialScope::BrainControl,
+        ]
+        .into_iter()
+        .collect(),
+        AttachmentRole::Consultant => [
+            BrainCredentialScope::BrainRead,
+            BrainCredentialScope::BrainSubmit,
+            BrainCredentialScope::BrainApprove,
+            BrainCredentialScope::BrainControl,
+        ]
+        .into_iter()
+        .collect(),
+        AttachmentRole::Observer => [
+            BrainCredentialScope::BrainRead,
+            BrainCredentialScope::BrainControl,
+        ]
+        .into_iter()
+        .collect(),
+        AttachmentRole::Runner => std::collections::BTreeSet::new(),
+    }
+}
+
+fn claims_match_attachment(
+    claims: Option<&crate::brain::credential::BrainCredentialClaims>,
+    attachment: &crate::brain::shared::BrainAttachment,
+) -> Result<(), Response> {
+    if let Some(claims) = claims {
+        claims
+            .require_participant(&attachment.subject, attachment.role)
+            .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn issue_named_brain_credential(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(request): Json<IssueNamedBrainCredentialRequest>,
+) -> Result<Json<IssueNamedBrainCredentialResponse>, Response> {
+    check_brain_bootstrap_access(&server, addr, &headers).await?;
+    if request.role == crate::brain::shared::AttachmentRole::Runner {
+        return Err(brain_auth_error(
+            StatusCode::BAD_REQUEST,
+            "runner authority cannot be minted as a participant credential",
+        ));
+    }
+    let snapshot = server
+        .shared_brains()
+        .snapshot(&name)
+        .map_err(|error| AppError(error).into_response())?;
+    let ttl_ms = request
+        .ttl_ms
+        .unwrap_or(DEFAULT_BRAIN_CREDENTIAL_TTL_MS)
+        .min(MAX_BRAIN_CREDENTIAL_TTL_MS);
+    let token = server
+        .brain_credentials()
+        .issue(
+            crate::brain::credential::BrainCredentialRequest {
+                issuer: snapshot.environment.machine.clone(),
+                subject: request.subject,
+                brain_id: snapshot.brain_id,
+                brain: name,
+                environment_generation: snapshot.environment.generation,
+                role: request.role,
+                scopes: participant_scopes(request.role),
+                ttl_ms,
+            },
+            unix_epoch_millis(),
+        )
+        .map_err(|error| AppError(error).into_response())?;
+    let claims = server
+        .brain_credentials()
+        .verify(&token, unix_epoch_millis())
+        .map_err(|error| AppError(error).into_response())?;
+    Ok(Json(IssueNamedBrainCredentialResponse { token, claims }))
+}
+
+async fn revoke_named_brain_credential(
+    State(server): State<Arc<AgentServer>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(credential_id): Path<uuid::Uuid>,
+) -> Result<StatusCode, Response> {
+    check_brain_bootstrap_access(&server, addr, &headers).await?;
+    server
+        .brain_credentials()
+        .revoke(credential_id)
+        .map_err(|error| AppError(error).into_response())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Debug, Serialize)]
 struct NamedBrainListEntry {
     name: String,
@@ -177,7 +350,7 @@ async fn list_named_brains(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<NamedBrainListEntry>>, Response> {
-    check_brain_access(&server, addr, &headers).await?;
+    check_brain_bootstrap_access(&server, addr, &headers).await?;
     let mut result = Vec::new();
     for name in server
         .shared_brains()
@@ -205,7 +378,13 @@ async fn get_named_brain(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<crate::brain::shared::BrainSnapshot>, Response> {
-    check_brain_access(&server, addr, &headers).await?;
+    authorize_named_brain(
+        &server,
+        addr,
+        &headers,
+        &name,
+        crate::brain::credential::BrainCredentialScope::BrainRead,
+    )?;
     server
         .shared_brains()
         .snapshot(&name)
@@ -229,7 +408,18 @@ async fn attach_named_brain(
     Path(name): Path<String>,
     Json(request): Json<AttachNamedBrainRequest>,
 ) -> Result<Json<crate::brain::shared::BrainAttachment>, Response> {
-    check_brain_access(&server, addr, &headers).await?;
+    let claims = authorize_named_brain(
+        &server,
+        addr,
+        &headers,
+        &name,
+        crate::brain::credential::BrainCredentialScope::BrainControl,
+    )?;
+    if let Some(claims) = claims {
+        claims
+            .require_participant(&request.subject, request.role)
+            .map_err(|error| brain_auth_error(StatusCode::FORBIDDEN, error.to_string()))?;
+    }
     if request.role == crate::brain::shared::AttachmentRole::Runner {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -274,7 +464,22 @@ async fn acknowledge_named_brain(
     Path((name, attachment_id)): Path<(String, uuid::Uuid)>,
     Json(request): Json<AcknowledgeNamedBrainRequest>,
 ) -> Result<Json<crate::brain::shared::BrainAttachment>, Response> {
-    check_brain_access(&server, addr, &headers).await?;
+    let claims = authorize_named_brain(
+        &server,
+        addr,
+        &headers,
+        &name,
+        crate::brain::credential::BrainCredentialScope::BrainRead,
+    )?;
+    let attachment = server
+        .shared_brains()
+        .require_connection(
+            &name,
+            crate::brain::shared::AttachmentId(attachment_id),
+            request.connection_id,
+        )
+        .map_err(brain_state_conflict)?;
+    claims_match_attachment(claims.as_ref(), &attachment)?;
     server
         .shared_brains()
         .acknowledge(
@@ -293,8 +498,20 @@ async fn detach_named_brain(
     headers: HeaderMap,
     Path((name, attachment_id, connection_id)): Path<(String, uuid::Uuid, uuid::Uuid)>,
 ) -> Result<StatusCode, Response> {
-    check_brain_access(&server, addr, &headers).await?;
+    let claims = authorize_named_brain(
+        &server,
+        addr,
+        &headers,
+        &name,
+        crate::brain::credential::BrainCredentialScope::BrainControl,
+    )?;
     let attachment_id = crate::brain::shared::AttachmentId(attachment_id);
+    let connection_id = crate::brain::shared::ConnectionId(connection_id);
+    let attachment = server
+        .shared_brains()
+        .require_connection(&name, attachment_id, connection_id)
+        .map_err(brain_state_conflict)?;
+    claims_match_attachment(claims.as_ref(), &attachment)?;
     let brain_id = server
         .shared_brains()
         .snapshot(&name)
@@ -302,11 +519,7 @@ async fn detach_named_brain(
         .brain_id;
     server
         .shared_brains()
-        .detach(
-            &name,
-            attachment_id,
-            crate::brain::shared::ConnectionId(connection_id),
-        )
+        .detach(&name, attachment_id, connection_id)
         .map_err(brain_state_conflict)?;
     server
         .brain_approvals()
@@ -427,7 +640,13 @@ async fn archive_named_brain(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<ArchiveNamedBrainResponse>, Response> {
-    check_brain_access(&server, addr, &headers).await?;
+    authorize_named_brain(
+        &server,
+        addr,
+        &headers,
+        &name,
+        crate::brain::credential::BrainCredentialScope::EnvironmentAdmin,
+    )?;
     let execution_lock = server
         .shared_brains()
         .execution_lock(&name)
@@ -488,11 +707,17 @@ async fn push_named_brain_event(
 ) -> Result<Json<PushNamedBrainResponse>, Response> {
     use crate::brain::shared::BrainEventKind;
 
-    check_brain_access(&server, addr, &headers).await?;
+    let required_scope = if matches!(request.kind, BrainEventKind::ApprovalDecided { .. }) {
+        crate::brain::credential::BrainCredentialScope::BrainApprove
+    } else {
+        crate::brain::credential::BrainCredentialScope::BrainSubmit
+    };
+    let claims = authorize_named_brain(&server, addr, &headers, &name, required_scope)?;
     let attachment = server
         .shared_brains()
         .require_connection(&name, request.attachment_id, request.connection_id)
         .map_err(|error| AppError(error).into_response())?;
+    claims_match_attachment(claims.as_ref(), &attachment)?;
     if !matches!(
         request.kind,
         BrainEventKind::Prompt { .. }
@@ -1084,9 +1309,20 @@ async fn watch_named_brain(
     Query(connection): Query<WatchNamedBrainQuery>,
     ws: axum::extract::WebSocketUpgrade,
 ) -> Result<Response, Response> {
-    check_brain_access(&server, addr, &headers).await?;
+    let claims = authorize_named_brain(
+        &server,
+        addr,
+        &headers,
+        &name,
+        crate::brain::credential::BrainCredentialScope::BrainRead,
+    )?;
     let attachment_id = crate::brain::shared::AttachmentId(connection.attachment_id);
     let connection_id = crate::brain::shared::ConnectionId(connection.connection_id);
+    let attachment = server
+        .shared_brains()
+        .require_connection(&name, attachment_id, connection_id)
+        .map_err(brain_state_conflict)?;
+    claims_match_attachment(claims.as_ref(), &attachment)?;
     server
         .shared_brains()
         .activate_connection(&name, attachment_id, connection_id)
@@ -2252,6 +2488,26 @@ mod named_brain_provider_context_tests {
             connected: true,
             connection_id: Some(crate::brain::shared::ConnectionId(uuid::Uuid::new_v4())),
         }
+    }
+
+    #[test]
+    fn participant_credentials_are_least_privilege_by_role() {
+        use crate::brain::credential::BrainCredentialScope;
+
+        let driver = participant_scopes(AttachmentRole::Driver);
+        assert!(driver.contains(&BrainCredentialScope::BrainRead));
+        assert!(driver.contains(&BrainCredentialScope::BrainSubmit));
+        assert!(driver.contains(&BrainCredentialScope::BrainApprove));
+        assert!(driver.contains(&BrainCredentialScope::BrainControl));
+        assert!(!driver.contains(&BrainCredentialScope::EnvironmentExecute));
+        assert!(!driver.contains(&BrainCredentialScope::EnvironmentAdmin));
+        assert!(!driver.contains(&BrainCredentialScope::ComputeSubmit));
+
+        let observer = participant_scopes(AttachmentRole::Observer);
+        assert!(observer.contains(&BrainCredentialScope::BrainRead));
+        assert!(observer.contains(&BrainCredentialScope::BrainControl));
+        assert!(!observer.contains(&BrainCredentialScope::BrainSubmit));
+        assert!(!observer.contains(&BrainCredentialScope::BrainApprove));
     }
 
     fn event(seq: u64, sender: &str, kind: BrainEventKind) -> BrainEvent {

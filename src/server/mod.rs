@@ -112,6 +112,8 @@ pub struct AgentServer {
     brain_runners: BrainRunnerBroker,
     /// Pending approval continuations keyed to their exact Brain attachment.
     brain_approvals: BrainApprovalBroker,
+    /// Persistent signer and revocation ledger for scoped remote participants.
+    brain_credentials: crate::brain::credential::BrainCredentialAuthority,
     /// Application-owned MCP configuration and lazily connected transport for
     /// daemon-executed named-Brain programs. The transport is shared, while
     /// each Brain runtime installs its own verified vocabulary metadata.
@@ -167,6 +169,13 @@ impl AgentServer {
             format!("{machine}.local")
         };
         let brain_password = server_config.brain_password.clone();
+        let credential_state = dirs::home_dir()
+            .ok_or_else(|| {
+                anyhow::anyhow!("cannot initialize Brain credentials without a home directory")
+            })?
+            .join(".finch");
+        let brain_credentials =
+            crate::brain::credential::BrainCredentialAuthority::load_or_create(&credential_state)?;
         let mcp_servers = config.mcp_servers.clone();
 
         Ok(Self {
@@ -185,6 +194,7 @@ impl AgentServer {
             shared_brains: crate::brain::shared::SharedBrainStore::new(machine),
             brain_runners: BrainRunnerBroker::default(),
             brain_approvals: BrainApprovalBroker::default(),
+            brain_credentials,
             mcp_servers,
             mcp_client: tokio::sync::OnceCell::new(),
             brain_password: Arc::new(RwLock::new(brain_password)),
@@ -450,6 +460,10 @@ impl AgentServer {
 
     pub async fn set_brain_password(&self, password: String) {
         *self.brain_password.write().await = password;
+    }
+
+    pub fn brain_credentials(&self) -> &crate::brain::credential::BrainCredentialAuthority {
+        &self.brain_credentials
     }
 
     /// Get reference to local generator

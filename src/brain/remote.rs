@@ -186,6 +186,10 @@ impl RemoteBrainTarget {
         format!("{}/attachments", self.http_url())
     }
 
+    fn credentials_url(&self) -> String {
+        format!("{}/credentials", self.http_url())
+    }
+
     fn ws_url(&self, attachment: &BrainAttachment) -> Result<String> {
         let connection_id = attachment
             .connection_id
@@ -205,16 +209,24 @@ fn has_explicit_port(host: &str) -> bool {
 #[derive(Clone)]
 pub struct RemoteBrainClient {
     pub target: RemoteBrainTarget,
-    password: String,
+    bootstrap_password: String,
+    credential: std::sync::Arc<tokio::sync::Mutex<Option<RemoteBrainCredential>>>,
     http: Client,
     attachment: Option<BrainAttachment>,
+}
+
+#[derive(Clone)]
+struct RemoteBrainCredential {
+    token: String,
+    claims: super::credential::BrainCredentialClaims,
 }
 
 impl RemoteBrainClient {
     pub fn new(target: RemoteBrainTarget, password: impl Into<String>) -> Result<Self> {
         Ok(Self {
             target,
-            password: password.into(),
+            bootstrap_password: password.into(),
+            credential: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             http: Client::builder()
                 .timeout(std::time::Duration::from_secs(180))
                 .build()?,
@@ -239,10 +251,12 @@ impl RemoteBrainClient {
             attachment_id: Option<AttachmentId>,
         }
 
+        self.ensure_credential(subject, role).await?;
+        let token = self.authorized_token().await?;
         let attachment = self
             .http
             .post(self.target.attachments_url())
-            .bearer_auth(&self.password)
+            .bearer_auth(token)
             .json(&Attach {
                 subject,
                 role,
@@ -270,6 +284,7 @@ impl RemoteBrainClient {
         role: AttachmentRole,
         client_slot: &str,
     ) -> Result<BrainAttachment> {
+        self.ensure_credential(subject, role).await?;
         let snapshot = self.snapshot().await?;
         let store = AttachmentIdentityStore::new(AttachmentIdentityStore::default_path()?);
         let attachment_id = store.find(snapshot.brain_id, client_slot, subject, role)?;
@@ -293,7 +308,7 @@ impl RemoteBrainClient {
     pub async fn snapshot(&self) -> Result<BrainSnapshot> {
         self.http
             .get(self.target.http_url())
-            .bearer_auth(&self.password)
+            .bearer_auth(self.authorized_token().await?)
             .send()
             .await
             .context("could not reach brain host")?
@@ -323,7 +338,7 @@ impl RemoteBrainClient {
 
         self.http
             .post(self.target.http_url())
-            .bearer_auth(&self.password)
+            .bearer_auth(self.authorized_token().await?)
             .json(&Push {
                 attachment_id: attachment.attachment_id,
                 connection_id,
@@ -352,7 +367,7 @@ impl RemoteBrainClient {
                 self.target.attachments_url(),
                 attachment.attachment_id.0
             ))
-            .bearer_auth(&self.password)
+            .bearer_auth(self.authorized_token().await?)
             .json(&serde_json::json!({
                 "connection_id": connection_id,
                 "seq": seq
@@ -384,7 +399,7 @@ impl RemoteBrainClient {
                 attachment.attachment_id.0,
                 connection_id.0
             ))
-            .bearer_auth(&self.password)
+            .bearer_auth(self.authorized_token().await?)
             .send()
             .await
             .context("could not reach brain host")?
@@ -402,7 +417,7 @@ impl RemoteBrainClient {
         let mut request = self.target.ws_url(attachment)?.into_client_request()?;
         request.headers_mut().insert(
             tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
-            format!("Bearer {}", self.password).parse()?,
+            format!("Bearer {}", self.authorized_token().await?).parse()?,
         );
         let (mut socket, _) = tokio_tungstenite::connect_async(request)
             .await
@@ -432,6 +447,79 @@ impl RemoteBrainClient {
         });
         Ok(rx)
     }
+
+    async fn ensure_credential(&self, subject: &str, role: AttachmentRole) -> Result<()> {
+        let now_ms = unix_epoch_millis();
+        let mut credential = self.credential.lock().await;
+        if credential.as_ref().is_some_and(|credential| {
+            credential.claims.subject == subject
+                && credential.claims.role == role
+                && credential.claims.brain == self.target.brain
+                && credential.claims.expires_ms > now_ms.saturating_add(60_000)
+        }) {
+            return Ok(());
+        }
+
+        #[derive(Serialize)]
+        struct Issue<'a> {
+            subject: &'a str,
+            role: AttachmentRole,
+        }
+        #[derive(Deserialize)]
+        struct Issued {
+            token: String,
+            claims: super::credential::BrainCredentialClaims,
+        }
+
+        let issued = self
+            .http
+            .post(self.target.credentials_url())
+            .bearer_auth(&self.bootstrap_password)
+            .json(&Issue { subject, role })
+            .send()
+            .await
+            .context("could not reach Brain credential issuer")?
+            .error_for_status()
+            .context("Brain credential request rejected")?
+            .json::<Issued>()
+            .await
+            .context("invalid Brain credential response")?;
+        if issued.claims.subject != subject
+            || issued.claims.role != role
+            || issued.claims.brain != self.target.brain
+        {
+            anyhow::bail!("Brain credential issuer returned the wrong participant audience");
+        }
+        *credential = Some(RemoteBrainCredential {
+            token: issued.token,
+            claims: issued.claims,
+        });
+        Ok(())
+    }
+
+    async fn authorized_token(&self) -> Result<String> {
+        let identity = self
+            .credential
+            .lock()
+            .await
+            .as_ref()
+            .map(|credential| (credential.claims.subject.clone(), credential.claims.role))
+            .context("client has not bootstrapped a scoped Brain credential")?;
+        self.ensure_credential(&identity.0, identity.1).await?;
+        self.credential
+            .lock()
+            .await
+            .as_ref()
+            .map(|credential| credential.token.clone())
+            .context("Brain credential refresh did not produce a token")
+    }
+}
+
+fn unix_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -464,6 +552,50 @@ mod tests {
         assert!(RemoteBrainTarget::parse("brain-only").is_err());
         assert!(RemoteBrainTarget::parse("../brain@host").is_err());
         assert!(RemoteBrainTarget::parse("brain@host/path").is_err());
+    }
+
+    #[tokio::test]
+    async fn cloned_client_reuses_a_live_scoped_credential() {
+        let client = RemoteBrainClient::new(
+            RemoteBrainTarget::parse("shared@box.local").unwrap(),
+            "bootstrap-secret",
+        )
+        .unwrap();
+        *client.credential.lock().await = Some(RemoteBrainCredential {
+            token: "scoped-token".into(),
+            claims: crate::brain::credential::BrainCredentialClaims {
+                version: 1,
+                credential_id: uuid::Uuid::new_v4(),
+                issuer: "box.local".into(),
+                subject: "alice@laptop.local".into(),
+                brain_id: BrainId(uuid::Uuid::new_v4()),
+                brain: "shared".into(),
+                environment_generation: 1,
+                role: AttachmentRole::Driver,
+                scopes: [crate::brain::credential::BrainCredentialScope::BrainRead]
+                    .into_iter()
+                    .collect(),
+                issued_ms: 0,
+                expires_ms: u64::MAX,
+            },
+        });
+
+        assert_eq!(client.authorized_token().await.unwrap(), "scoped-token");
+        assert_eq!(
+            client.clone().authorized_token().await.unwrap(),
+            "scoped-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_operations_require_bootstrapping_first() {
+        let client = RemoteBrainClient::new(
+            RemoteBrainTarget::parse("shared@box.local").unwrap(),
+            "bootstrap-secret",
+        )
+        .unwrap();
+        let error = client.snapshot().await.unwrap_err();
+        assert!(error.to_string().contains("scoped Brain credential"));
     }
 
     #[test]
