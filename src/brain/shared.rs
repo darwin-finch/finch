@@ -354,6 +354,33 @@ pub struct BrainSnapshot {
     pub runs: Vec<BrainRun>,
 }
 
+impl BrainSnapshot {
+    /// Whether this exact runner lease was durably replaced by an addressed
+    /// handoff. Frontends use this terminal fact to stop renewal instead of
+    /// treating a deliberate transfer like an incidental lease expiry.
+    pub fn runner_lease_was_handed_off(&self, lease_id: RunnerLeaseId) -> bool {
+        let requested: std::collections::HashSet<_> = self
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                BrainEventKind::RunnerHandoffRequested { handoff }
+                    if handoff.from_lease_id == lease_id =>
+                {
+                    Some(handoff.handoff_id)
+                }
+                _ => None,
+            })
+            .collect();
+        self.events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                BrainEventKind::RunnerHandoffCompleted { handoff_id, .. }
+                    if requested.contains(handoff_id)
+            )
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrainWireMessage {
@@ -2800,6 +2827,8 @@ mod tests {
         let snapshot = restarted.snapshot("shared").unwrap();
         assert_eq!(snapshot.runner_lease.as_ref().unwrap(), &replacement);
         assert!(snapshot.runner_handoff.is_none());
+        assert!(snapshot.runner_lease_was_handed_off(source.lease_id));
+        assert!(!snapshot.runner_lease_was_handed_off(replacement.lease_id));
         assert!(snapshot.events.iter().any(|event| matches!(
             event.kind,
             BrainEventKind::RunnerHandoffCompleted { handoff_id, .. }

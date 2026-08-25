@@ -97,16 +97,39 @@ impl EventLoop {
                         had_lease = true;
                     }
                     Err(error) => {
-                        // A retry with an expired/stale lease must acquire a
-                        // fresh identity; it may never revive the old lease.
-                        lease_id = None;
+                        // A deliberate handoff is a terminal ownership
+                        // transition, not an ordinary expiry. Preserve the
+                        // old identity until the durable log proves which
+                        // case occurred; otherwise a disconnected source
+                        // could reclaim the Brain after the target exits.
+                        let inspected_handoff = match lease_id {
+                            Some(previous) => ipc
+                                .brain_snapshot(&snapshot.name)
+                                .await
+                                .ok()
+                                .map(|brain| brain.runner_lease_was_handed_off(previous)),
+                            None => Some(false),
+                        };
+                        let handed_off = inspected_handoff == Some(true);
                         if had_lease {
                             let _ = event_tx.send(ReplEvent::HomeRunnerLeaseStatus {
                                 lease_id: None,
-                                detail: error.to_string(),
+                                detail: if handed_off {
+                                    "runner lease handed off to another frontend".into()
+                                } else {
+                                    error.to_string()
+                                },
                             });
                         }
                         had_lease = false;
+                        if handed_off {
+                            break;
+                        }
+                        // Only a successfully inspected, non-handoff expiry
+                        // may discard the old identity and acquire a new one.
+                        if inspected_handoff == Some(false) {
+                            lease_id = None;
+                        }
                     }
                 }
             }
