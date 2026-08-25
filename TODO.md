@@ -1107,6 +1107,23 @@ still blocks the corresponding Brain phase until it is unified.
   reviewable proposal and must never infer that an offline or zero-program Brain is empty. Add a
   user-facing `/brain cleanup` preview over the same VM/library operations rather than an unrelated
   deletion implementation.
+- [ ] Make noninteractive CLI and stdin behavior Brain-aware instead of silently ignoring
+  `--brain`. Today piped input enters stateless `run_query` before REPL/Brain initialization, so
+  `echo hello | finch --brain NAME` neither targets NAME nor reports that the flag was discarded.
+  Add a `finch brain` command family over the same Cap'n Proto lifecycle/event services and typed
+  authority used by the REPL: `list [--json]`, `inspect`, `create`, `archive`, `cleanup --dry-run`,
+  `submit NAME [PROMPT]`, and `relay NAME [MESSAGE]`. `submit` reads stdin when the prompt is omitted,
+  appends one correlated Prompt/ProgramRun, streams events when requested, waits for its terminal
+  RunId result, and maps rejection/cancellation/failure to stable exit codes and JSON. `relay`
+  appends a participant message without triggering inference. An unaddressed piped query remains
+  explicitly stateless and must not create an ephemeral Brain; remote targets require a stored
+  scoped invitation-derived credential/profile, never a password on the command line. Follow
+  composable container-tool conventions: concise tables for terminals; stable, versioned,
+  decoration-free JSON/JSONL for pipes and `jq`; multiple names or `{brain_id, expected_revision}`
+  records accepted from stdin; no prompts when stdout is not a terminal unless approval was
+  explicitly requested; and predictable exit codes. Bulk archive/delete remains dry-run by default
+  and uses stable IDs plus expected revisions so a name cannot be deleted and recreated between a
+  listing pipeline and its mutation.
 - [ ] If remote Brain administration is needed, design an explicit node-administrator credential
   and audited create operation distinct from participant invitations. Do not reuse the daemon
   bootstrap password or let an invitation for an existing Brain mint a new environment namespace;
