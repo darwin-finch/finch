@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc::Receiver;
 
 pub mod endpoints;
+pub mod model_catalog;
 pub mod types;
 
 // Provider implementations
