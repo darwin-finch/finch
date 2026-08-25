@@ -5947,6 +5947,19 @@ mod handler_tests {
             )
             .unwrap();
         store
+            .push_for_run(
+                "shared",
+                "runner",
+                queued.run_id,
+                BrainEventKind::ToolResult {
+                    request_seq: queued.request_seq,
+                    tool_id: "v13-tool".into(),
+                    output: "v13-secret-tool-result".into(),
+                    is_error: false,
+                },
+            )
+            .unwrap();
+        store
             .push(
                 "shared",
                 "bob@box.local",
@@ -6049,6 +6062,7 @@ mod handler_tests {
             for hidden in [
                 "v13-secret-prompt",
                 "v13-secret-tool",
+                "v13-secret-tool-result",
                 "v13-secret-program",
                 "v13-secret-result",
             ] {
