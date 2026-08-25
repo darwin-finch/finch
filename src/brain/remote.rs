@@ -288,14 +288,12 @@ fn issued_interval_is_valid(
     issued_ms: u64,
     expires_ms: u64,
     requested_ttl_ms: Option<u64>,
-    request_started_ms: u64,
-    response_received_ms: u64,
+    endpoint_default_ttl_ms: u64,
+    now_ms: u64,
 ) -> bool {
-    const MAX_ISSUED_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
-    let maximum_ttl = requested_ttl_ms.unwrap_or(MAX_ISSUED_TTL_MS);
-    issued_ms >= request_started_ms
-        && issued_ms <= response_received_ms
-        && expires_ms > request_started_ms
+    let maximum_ttl = requested_ttl_ms.unwrap_or(endpoint_default_ttl_ms);
+    issued_ms <= now_ms.saturating_add(super::credential::MAX_SIGNED_CLOCK_SKEW_MS)
+        && expires_ms.saturating_add(super::credential::MAX_SIGNED_CLOCK_SKEW_MS) > now_ms
         && expires_ms > issued_ms
         && expires_ms.saturating_sub(issued_ms) <= maximum_ttl
 }
@@ -492,7 +490,6 @@ impl RemoteBrainClient {
         let requested_scopes = scopes
             .clone()
             .unwrap_or_else(|| super::credential::default_participant_scopes(role));
-        let request_started_ms = unix_epoch_millis();
         let (authorization, delegator) = self.delegation_authorization().await?;
         let issued = self
             .http
@@ -519,7 +516,7 @@ impl RemoteBrainClient {
                 issued.claims.issued_ms,
                 issued.claims.expires_ms,
                 ttl_ms,
-                request_started_ms,
+                15 * 60 * 1_000,
                 response_received_ms,
             )
         {
@@ -560,7 +557,6 @@ impl RemoteBrainClient {
             ttl_ms: Option<u64>,
         }
 
-        let request_started_ms = unix_epoch_millis();
         let (authorization, delegator) = self.delegation_authorization().await?;
         let issued = self
             .http
@@ -594,7 +590,7 @@ impl RemoteBrainClient {
                 issued.claims.issued_ms,
                 issued.claims.expires_ms,
                 ttl_ms,
-                request_started_ms,
+                8 * 60 * 60 * 1_000,
                 response_received_ms,
             )
         {
@@ -1746,28 +1742,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn issued_intervals_respect_request_time_and_requested_ttl() {
+    fn issued_intervals_allow_skew_and_use_endpoint_defaults() {
+        let now = 1_000_000;
+        let skew = super::super::credential::MAX_SIGNED_CLOCK_SKEW_MS;
         assert!(issued_interval_is_valid(
-            1_000,
-            2_000,
+            now + skew,
+            now + skew + 1_000,
             Some(1_000),
-            900,
-            1_100
+            15 * 60 * 1_000,
+            now,
         ));
-        for invalid in [
-            (1_000, 2_001, 900, 1_100),
-            (1_200, 2_000, 900, 1_100),
-            (1_000, 1_000, 900, 1_100),
-            (1_000, 2_000, 2_000, 2_100),
-        ] {
-            assert!(!issued_interval_is_valid(
-                invalid.0,
-                invalid.1,
-                Some(1_000),
-                invalid.2,
-                invalid.3,
-            ));
-        }
+        assert!(!issued_interval_is_valid(
+            now + skew + 1,
+            now + skew + 1_000,
+            Some(1_000),
+            15 * 60 * 1_000,
+            now,
+        ));
+        assert!(issued_interval_is_valid(
+            now,
+            now + 8 * 60 * 60 * 1_000,
+            None,
+            8 * 60 * 60 * 1_000,
+            now,
+        ));
+        assert!(!issued_interval_is_valid(
+            now,
+            now + 8 * 60 * 60 * 1_000 + 1,
+            None,
+            8 * 60 * 60 * 1_000,
+            now,
+        ));
+        assert!(issued_interval_is_valid(
+            now,
+            now + 15 * 60 * 1_000,
+            None,
+            15 * 60 * 1_000,
+            now,
+        ));
+        assert!(!issued_interval_is_valid(
+            now,
+            now + 15 * 60 * 1_000 + 1,
+            None,
+            15 * 60 * 1_000,
+            now,
+        ));
+        assert!(!issued_interval_is_valid(
+            now,
+            now,
+            None,
+            15 * 60 * 1_000,
+            now,
+        ));
     }
 
     #[test]
