@@ -445,7 +445,8 @@ correlated binary WebSocket envelopes;
 fixture and live-daemon tests cover attach, watch, submit, acknowledge, final detach projection, and
 cleanup, including detach before an explicit watch. An additional live-daemon fixture requests an
 addressed handoff with scoped remote control authority, accepts it through local Cap'n Proto,
-replaces the registered callback, and proves the next ProgramRun reaches only the target runner.
+revokes that controller before its next command, replaces the registered callback, and proves a
+fresh ordinary driver sends the next ProgramRun only to the target runner.
 Frontend acceptance also verifies the local Unix-socket host, normalized hostname, and canonical
 workspace against the Brain environment. Generalized approval/effect resumptions remain incomplete,
 as does replacement of the remaining JSON-encoded detail/context/checkpoint values with explicit

@@ -860,9 +860,10 @@ still blocks the corresponding Brain phase until it is unified.
   ephemeral per-process runner identity plus request/accept/cancel commands, restore their previous
   runner if a transfer fails, and accept only through the local Unix-socket service when normalized
   hostname and canonical workspace exactly match the Brain environment. A live daemon test transfers
-  a registered runner, proves only the target callback receives the next ProgramRun, and observes the
-  correlated durable result. Still run the credential-revocation half of the live smoke and close the
-  remaining scope-specific hostile/replay cases before completing this least-privilege milestone.
+  a registered runner, revokes the requesting controller before its next command, proves only a
+  freshly authorized driver and the target callback receive the next ProgramRun, and observes the
+  correlated durable result. Close the remaining scope-specific hostile/replay cases before
+  completing this least-privilege milestone.
 - [ ] Revisit shared channels only after the Brain event log, runner lease, and participant-role
   model are complete. The eventual channel should be a threaded/multi-participant projection of a
   Brain: people and models share one durable conversation, while programs run only on the remote
