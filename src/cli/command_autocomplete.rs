@@ -347,6 +347,12 @@ impl CommandRegistry {
                     category: CommandCategory::Brain,
                 },
                 CommandSpec {
+                    name: "/brain initialize",
+                    params: None,
+                    description: "Schedule the reviewed Brain initialization module",
+                    category: CommandCategory::Brain,
+                },
+                CommandSpec {
                     name: "/brain cancel",
                     params: Some("<run>"),
                     description: "Cancel an initiated run by ID prefix",
@@ -559,6 +565,7 @@ mod tests {
             "/brain list",
             "/brains",
             "/brain runs",
+            "/brain initialize",
             "/brain cancel",
             "/brain create",
             "/brain attach",

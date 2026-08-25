@@ -757,6 +757,26 @@ impl EventLoop {
         self.render_tui().await
     }
 
+    async fn handle_brain_initialize(&mut self) -> Result<()> {
+        let client = self
+            .selected_brain()
+            .cloned()
+            .context("no Brain is attached")?;
+        let next_due_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_millis()
+            .try_into()
+            .context("system clock does not fit the Brain scheduler")?;
+        let schedule = client.schedule_initialization(next_due_ms).await?;
+        let schedule_id = schedule.schedule_id.0.to_string();
+        self.output_manager.write_info(format!(
+            "reviewed Brain initialization scheduled as {}",
+            &schedule_id[..8]
+        ));
+        self.render_tui().await
+    }
+
     async fn handle_brain_say(&mut self, text: String) -> Result<()> {
         anyhow::ensure!(self.selected_brain().is_some(), "no Brain is attached");
         self.push_remote_brain(crate::brain::store::BrainEventKind::ParticipantMessage { text })
