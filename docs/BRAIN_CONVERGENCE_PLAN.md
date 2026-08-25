@@ -462,9 +462,13 @@ addressed handoff with scoped remote control authority, accepts it through local
 revokes that controller before its next command, replaces the registered callback, and proves a
 fresh ordinary driver sends the next ProgramRun only to the target runner.
 Frontend acceptance also verifies the local Unix-socket host, normalized hostname, and canonical
-workspace against the Brain environment. Generalized approval/effect resumptions remain incomplete,
-as does replacement of the remaining JSON-encoded detail/context/checkpoint values with explicit
-schema types. A cloneable in-process `BrainLifecycleService` now owns attachment
+workspace against the Brain environment. VM host effects already resume against an exact
+`(execution_id, sequence)` pair; Brain approval continuations are now keyed by exact
+`(brain_id, request_seq, approval_id)` identity so a stale sequence cannot consume a live request.
+Tool inputs and approval detail/decision values use the recursive schema-native `JsonValue` union
+rather than opaque JSON bytes. Canonical provider context and typed-runtime checkpoints remain
+explicitly versioned payload boundaries pending native schemas. A cloneable in-process
+`BrainLifecycleService` now owns attachment
 reservation and expiry, watch activation, acknowledgement, detach cleanup, participant submission,
 queued-run resumption, and runner-lease lifetime. Embedded hosts call this boundary directly; local
 RPC and remote WebSocket code are encoding/authentication adapters over it. Hermetic service tests

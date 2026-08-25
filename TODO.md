@@ -770,8 +770,10 @@ still blocks the corresponding Brain phase until it is unified.
   cross-transport fixture exercise that same boundary. Tool inputs, approval details, and approval
   decisions now use a recursive schema-native `JsonValue` union across durable events, runner turn
   callbacks, and reverse approval RPC rather than opaque JSON byte strings, with exact signed,
-  unsigned, float, string, list, and object preservation. Checkpoint/context blobs remain explicitly
-  versioned payload boundaries. Still generalize approval/effect resume correlation.
+  unsigned, float, string, list, and object preservation. VM effects resume against exact
+  `(execution_id, sequence)` identity, and Brain approvals now use exact
+  `(brain_id, request_seq, approval_id)` keys so stale decisions cannot consume live continuations.
+  Checkpoint/context blobs remain explicitly versioned payload boundaries pending native schemas.
 - [ ] Define Brain initialization as a reviewed typed program/module with an explicit capability
   budget and journaled effects. Deterministic VM vocabulary/module loading may occur before a
   runner accepts turns; proofs, poetry, provider calls, and other observable initialization work
