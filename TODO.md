@@ -728,6 +728,15 @@ still blocks the corresponding Brain phase until it is unified.
   environments, project presence/runner state compactly in chrome or `/who`, and never replay
   attachment/lease churn as transcript messages. Give user turns, VM source, executed output, tools,
   and lifecycle diagnostics distinct structured presentation instead of mixing them as peer prose.
+- [ ] Fix fresh-home Brain bootstrap so the event watch and lease-bound runner callback cannot close
+  immediately after attachment with `Peer disconnected`, leaving the home console as a driver with
+  `runner offline`. Treat event-watch loss and runner-registration loss as separate correlated
+  failures, reconnect them from the durable attachment/runner identities, and add a rebuilt-daemon
+  startup regression that reaches a live runner without requiring a daemon restart.
+- [ ] Restore the memory/context status projection after fresh Brain attachment. `tfidf · recalled 0`
+  must not replace or erase available conversation-context rows merely because semantic recall
+  returned no matches; render the recall engine/count and canonical conversation context as distinct
+  projections, with startup/reconnect tests for zero-recall and nonzero-recall cases.
 - [ ] Add theme-aware author/channel backgrounds so user input, model-authored VM source, tool
   activity, and VM/user-visible output are distinguishable without relying on low-contrast cyan
   foreground text alone. Use subtle full-width turn bands like other modern coding harnesses rather
