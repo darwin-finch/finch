@@ -534,15 +534,15 @@ impl BrainLifecycleService {
     ) -> Result<()> {
         // Validate the exact generation before deriving any run authority. A
         // stale socket must not cancel work started by its replacement.
-        self.store.require_connection(brain, attachment_id, connection_id)?;
+        let ordinary = self.store.retire_connection_and_owned_active_runs(
+            brain, attachment_id, connection_id,
+        )?;
         let snapshot = self.store.snapshot(brain)?;
         let brain_id = snapshot.brain_id;
         let reserved = self
             .store
             .pending_reserved_cancellations_for_attachment(brain, attachment_id)?;
-        let ordinary = self
-            .store
-            .connection_owned_active_runs(brain, attachment_id, connection_id)?
+        let ordinary = ordinary
             .into_iter()
             .filter(|run_id| !reserved.contains(run_id))
             .collect::<Vec<_>>();
@@ -668,9 +668,26 @@ impl BrainLifecycleService {
             .store
             .accept_speculative_run(brain, &attachment.subject, attachment_id, prompt)
             .map_err(BrainSubmissionError::State)?;
-        self.store
-            .bind_run_connection(brain, run.run_id, connection_id)
-            .map_err(BrainSubmissionError::State)?;
+        if let Err(error) = self.store.bind_run_connection(
+            brain, run.run_id, attachment_id, connection_id,
+        ) {
+            self.runners.fence_run_cancellation(brain, run.run_id);
+            let detail = "initiating Brain connection disconnected".to_string();
+            match self.store.terminalize_run_with_result_if_active(
+                brain, "daemon", run.run_id, run.request_seq,
+                BrainRunStatus::Failed, detail.clone(),
+            ) {
+                Ok(Some(_)) => {}
+                Ok(None) if self.store.inspect_run(brain, run.run_id)
+                    .is_ok_and(|current| current.status.is_terminal()) => {}
+                Ok(None) | Err(_) => self.store.schedule_disconnect_terminalization_retry(
+                    brain.to_string(), "daemon".into(), run.run_id, run.request_seq,
+                    BrainRunStatus::Failed, detail,
+                ),
+            }
+            self.runners.abort_run(brain, run.run_id);
+            return Err(BrainSubmissionError::State(error));
+        }
         let snapshot = self.snapshot(brain).map_err(BrainSubmissionError::State)?;
         let ready_lease = snapshot.runner_lease.filter(|lease| {
             lease.environment_generation == snapshot.environment.generation

@@ -248,6 +248,7 @@ pub struct BrainRunnerBroker {
     registrations: Arc<RwLock<HashMap<String, Registration>>>,
     connection_authority: Arc<Mutex<ConnectionAuthority>>,
     inflight: Arc<Mutex<HashMap<(String, RunId), HashMap<uuid::Uuid, oneshot::Sender<()>>>>>,
+    cancelled_before_dispatch: Arc<Mutex<std::collections::HashSet<(String, RunId)>>>,
 }
 
 struct InflightRequest {
@@ -303,6 +304,7 @@ impl BrainRunnerBroker {
         lease_id: RunnerLeaseId,
         run_id: RunId,
     ) -> Result<()> {
+        self.fence_run_cancellation(brain, run_id);
         let registration = self
             .registrations
             .read()
@@ -323,6 +325,12 @@ impl BrainRunnerBroker {
                 response_tx,
             }))
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))
+    }
+
+    pub(crate) fn fence_run_cancellation(&self, brain: &str, run_id: RunId) {
+        self.cancelled_before_dispatch.lock()
+            .expect("runner cancellation-fence lock poisoned")
+            .insert((brain.to_string(), run_id));
     }
 
     pub fn register(
@@ -616,9 +624,12 @@ impl BrainRunnerBroker {
         }
         let (response_tx, response_rx) = oneshot::channel();
         let (abort_rx, _inflight) = self.track_inflight(brain, run_id);
-        registration
-            .tx
-            .send(RunnerRequest::Program(RunnerProgramRequest {
+        {
+            let dispatch_fence = self.cancelled_before_dispatch.lock()
+                .expect("runner cancellation-fence lock poisoned");
+            anyhow::ensure!(!dispatch_fence.contains(&(brain.to_string(), run_id)),
+                "named Brain run cancelled before runner dispatch");
+            registration.tx.send(RunnerRequest::Program(RunnerProgramRequest {
                 brain: brain.to_string(),
                 run_id,
                 request_seq,
@@ -628,8 +639,8 @@ impl BrainRunnerBroker {
                 grant_ceiling,
                 control_tx: None,
                 response_tx,
-            }))
-            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
+            })).map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
+        }
         tokio::select! {
             response = response_rx => response
                 .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
@@ -661,9 +672,12 @@ impl BrainRunnerBroker {
         }
         let (response_tx, response_rx) = oneshot::channel();
         let (abort_rx, _inflight) = self.track_inflight(brain, run_id);
-        registration
-            .tx
-            .send(RunnerRequest::Turn(RunnerTurnRequest {
+        {
+            let dispatch_fence = self.cancelled_before_dispatch.lock()
+                .expect("runner cancellation-fence lock poisoned");
+            anyhow::ensure!(!dispatch_fence.contains(&(brain.to_string(), run_id)),
+                "named Brain run cancelled before runner dispatch");
+            registration.tx.send(RunnerRequest::Turn(RunnerTurnRequest {
                 brain: brain.to_string(),
                 run_id,
                 request_seq,
@@ -673,8 +687,8 @@ impl BrainRunnerBroker {
                 approval_connection_id,
                 approval_tx: None,
                 response_tx,
-            }))
-            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
+            })).map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
+        }
         tokio::select! {
             response = response_rx => response
                 .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?

@@ -949,7 +949,7 @@ pub struct BrainStore {
     /// Ephemeral transport generation that currently supervises a live run.
     /// This is deliberately not replayed: restored queued work is transport
     /// independent until a new connection explicitly dispatches it.
-    run_connection_owners: Arc<RwLock<HashMap<(String, RunId), ConnectionId>>>,
+    run_connection_authority: Arc<RwLock<RunConnectionAuthority>>,
     disconnect_retry_owners: Arc<std::sync::Mutex<HashSet<(String, RunId)>>>,
     #[cfg(test)]
     fail_event_batches: Arc<std::sync::atomic::AtomicUsize>,
@@ -965,6 +965,12 @@ pub struct BrainStore {
 #[derive(Debug, Default)]
 pub(crate) struct RunPublicationGate {
     cancel_requested: bool,
+}
+
+#[derive(Debug, Default)]
+struct RunConnectionAuthority {
+    owners: HashMap<(String, RunId), ConnectionId>,
+    retired: HashSet<(String, AttachmentId, ConnectionId)>,
 }
 
 impl RunPublicationGate {
@@ -1137,7 +1143,7 @@ impl BrainStore {
             runtime_checkpoints: Arc::new(RwLock::new(HashMap::new())),
             execution_locks: Arc::new(RwLock::new(HashMap::new())),
             run_publication_gates: Arc::new(RwLock::new(HashMap::new())),
-            run_connection_owners: Arc::new(RwLock::new(HashMap::new())),
+            run_connection_authority: Arc::new(RwLock::new(RunConnectionAuthority::default())),
             disconnect_retry_owners: Arc::new(std::sync::Mutex::new(HashSet::new())),
             #[cfg(test)]
             fail_event_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1186,41 +1192,56 @@ impl BrainStore {
         &self,
         name: &str,
         run_id: RunId,
+        attachment_id: AttachmentId,
         connection_id: ConnectionId,
     ) -> Result<()> {
         let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brains = self.brains.read().expect("shared brain lock poisoned");
+        let state = brains.get(name).context("Brain was removed concurrently")?;
+        let attachment = state.attachments.get(&attachment_id).context("unknown Brain attachment")?;
         anyhow::ensure!(
-            !self.inspect_run(name, run_id)?.status.is_terminal(),
+            attachment.connected && attachment.connection_id == Some(connection_id),
+            "Brain attachment connection is no longer current"
+        );
+        anyhow::ensure!(
+            state.runs.get(&run_id).is_some_and(|run| !run.status.is_terminal()),
             "terminal Brain run cannot acquire connection ownership"
         );
-        self.run_connection_owners
-            .write()
-            .expect("shared Brain run-owner map poisoned")
-            .insert((name.to_string(), run_id), connection_id);
+        let mut authority = self.run_connection_authority.write()
+            .expect("shared Brain run-authority map poisoned");
+        anyhow::ensure!(
+            !authority.retired.contains(&(name.to_string(), attachment_id, connection_id)),
+            "Brain attachment connection is no longer current"
+        );
+        authority.owners.insert((name.to_string(), run_id), connection_id);
         Ok(())
     }
 
-    pub(crate) fn connection_owned_active_runs(
+    pub(crate) fn retire_connection_and_owned_active_runs(
         &self,
         name: &str,
         attachment_id: AttachmentId,
         connection_id: ConnectionId,
     ) -> Result<Vec<RunId>> {
-        let snapshot = self.snapshot(name)?;
-        let owners = self
-            .run_connection_owners
-            .read()
-            .expect("shared Brain run-owner map poisoned");
-        Ok(snapshot
-            .runs
-            .into_iter()
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brains = self.brains.read().expect("shared brain lock poisoned");
+        let state = brains.get(name).context("Brain was removed concurrently")?;
+        let attachment = state.attachments.get(&attachment_id).context("unknown Brain attachment")?;
+        anyhow::ensure!(attachment.connected && attachment.connection_id == Some(connection_id),
+            "Brain attachment connection is no longer current");
+        let mut authority = self.run_connection_authority.write()
+            .expect("shared Brain run-authority map poisoned");
+        authority.retired.insert((name.to_string(), attachment_id, connection_id));
+        Ok(state.runs.values()
             .filter(|run| {
                 run.initiating_attachment_id == attachment_id
                     && matches!(
                         run.status,
                         BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
                     )
-                    && owners.get(&(name.to_string(), run.run_id)) == Some(&connection_id)
+                    && authority.owners.get(&(name.to_string(), run.run_id)) == Some(&connection_id)
             })
             .map(|run| run.run_id)
             .collect())
@@ -1284,10 +1305,10 @@ impl BrainStore {
             .write()
             .expect("shared Brain run-gate map poisoned")
             .remove(&(name.to_string(), run_id));
-        self.run_connection_owners
+        self.run_connection_authority
             .write()
-            .expect("shared Brain run-owner map poisoned")
-            .remove(&(name.to_string(), run_id));
+            .expect("shared Brain run-authority map poisoned")
+            .owners.remove(&(name.to_string(), run_id));
         Ok(())
     }
 

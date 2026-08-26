@@ -23,6 +23,35 @@ static DROP_NEXT_REMOTE_BRAIN_REPLY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
+type RunAdmissionPause = (
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+#[cfg(test)]
+static PAUSE_AFTER_RUN_START: std::sync::LazyLock<std::sync::Mutex<Option<RunAdmissionPause>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+#[cfg(test)]
+static PAUSE_AFTER_RUN_BIND: std::sync::LazyLock<std::sync::Mutex<Option<RunAdmissionPause>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+async fn take_run_admission_pause(
+    pause: &std::sync::Mutex<Option<RunAdmissionPause>>, brain: &str,
+) {
+    let selected = {
+        let mut pause = pause.lock().unwrap();
+        if pause.as_ref().is_some_and(|(target, _, _)| target == brain) {
+            pause.take()
+        } else { None }
+    };
+    if let Some((_, reached, release)) = selected {
+        let _ = reached.send(());
+        let _ = release.await;
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn drop_next_remote_brain_reply_after_commit() {
     DROP_NEXT_REMOTE_BRAIN_REPLY.store(true, std::sync::atomic::Ordering::SeqCst);
 }
@@ -840,6 +869,45 @@ fn attachment_can_submit(
         && matches!(kind, BrainEventKind::ApprovalDecided { .. })
 }
 
+struct RunAdmissionTerminalizer {
+    store: crate::brain::store::BrainStore,
+    runners: crate::server::BrainRunnerBroker,
+    brain: String,
+    run: Option<crate::brain::store::BrainRun>,
+    armed: bool,
+}
+
+impl Drop for RunAdmissionTerminalizer {
+    fn drop(&mut self) {
+        if !self.armed { return; }
+        let Some(run) = self.run.as_ref() else { return; };
+        if self.store.inspect_run(&self.brain, run.run_id)
+            .is_ok_and(|current| current.status.is_terminal()) { return; }
+        self.runners.fence_run_cancellation(&self.brain, run.run_id);
+        let detail = "initiating Brain connection disconnected".to_string();
+        match self.store.terminalize_run_with_result_if_active(
+            &self.brain, "daemon", run.run_id, run.request_seq,
+            crate::brain::store::BrainRunStatus::Failed, detail.clone(),
+        ) {
+            Ok(Some(_)) => {}
+            Ok(None) if self.store.inspect_run(&self.brain, run.run_id)
+                .is_ok_and(|current| current.status.is_terminal()) => {}
+            Ok(None) | Err(_) => self.store.schedule_disconnect_terminalization_retry(
+                self.brain.clone(), "daemon".into(), run.run_id, run.request_seq,
+                crate::brain::store::BrainRunStatus::Failed, detail,
+            ),
+        }
+        if let Ok(snapshot) = self.store.snapshot(&self.brain) {
+            if let Some(lease) = snapshot.runner_lease {
+                let _ = self.runners.request_run_cancellation(
+                    &self.brain, lease.lease_id, run.run_id,
+                );
+            }
+        }
+        self.runners.abort_run(&self.brain, run.run_id);
+    }
+}
+
 /// One transport-neutral mutation boundary for an authenticated Brain
 /// attachment. Local RPC and remote binary adapters must both enter here so role
 /// checks, ordering, run creation, queueing, and terminal persistence cannot
@@ -1042,9 +1110,20 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
     } else {
         None
     };
+    let mut admission_terminalizer = RunAdmissionTerminalizer {
+        store: store.clone(), runners: runners.clone(), brain: name.to_string(),
+        run: run.clone(), armed: run.is_some() && attachment.connection_id.is_some(),
+    };
+    #[cfg(test)]
+    take_run_admission_pause(&PAUSE_AFTER_RUN_START, name).await;
     if let (Some(run), Some(connection_id)) = (run.as_ref(), attachment.connection_id) {
-        store.bind_run_connection(name, run.run_id, connection_id)?;
+        store.bind_run_connection(
+            name, run.run_id, attachment.attachment_id, connection_id,
+        )?;
     }
+    admission_terminalizer.armed = false;
+    #[cfg(test)]
+    take_run_admission_pause(&PAUSE_AFTER_RUN_BIND, name).await;
 
     let result = match run.as_ref() {
         Some(run) if run.status == crate::brain::store::BrainRunStatus::Running => {
@@ -3867,6 +3946,15 @@ mod handler_tests {
         socket
     }
 
+    fn install_run_admission_pause(
+        pause: &std::sync::Mutex<Option<RunAdmissionPause>>, brain: &str,
+    ) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *pause.lock().unwrap() = Some((brain.to_string(), reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn websocket_teardown_is_bounded_and_connection_scoped() {
         use crate::brain::store::{BrainStore, ConnectionId};
@@ -4509,6 +4597,230 @@ mod handler_tests {
             "shared", replacement_attachment, replacement_connection,
         ).is_ok());
         assert!(lifecycle.connection("shared", driver.attachment_id, connection_id).is_err());
+        http_server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn websocket_disconnect_fences_start_bind_and_turn_enqueue_races() {
+        use crate::brain::store::{BrainRunStatus, BrainStore};
+        use crate::server::BrainLifecycleService;
+        use futures::SinkExt;
+
+        struct CancelBeforeTurnRunner(
+            tokio::sync::mpsc::UnboundedSender<crate::brain::store::RunId>,
+        );
+        impl crate::finch_ipc_capnp::brain_runner::Server for CancelBeforeTurnRunner {
+            fn run_program(
+                &mut self,
+                _: crate::finch_ipc_capnp::brain_runner::RunProgramParams,
+                _: crate::finch_ipc_capnp::brain_runner::RunProgramResults,
+            ) -> capnp::capability::Promise<(), capnp::Error> {
+                capnp::capability::Promise::err(capnp::Error::failed(
+                    "Turn must stay fenced".into(),
+                ))
+            }
+            fn run_turn(
+                &mut self,
+                _: crate::finch_ipc_capnp::brain_runner::RunTurnParams,
+                _: crate::finch_ipc_capnp::brain_runner::RunTurnResults,
+            ) -> capnp::capability::Promise<(), capnp::Error> {
+                capnp::capability::Promise::err(capnp::Error::failed(
+                    "stale Turn reached runner".into(),
+                ))
+            }
+            fn cancel_run(
+                &mut self,
+                params: crate::finch_ipc_capnp::brain_runner::CancelRunParams,
+                mut results: crate::finch_ipc_capnp::brain_runner::CancelRunResults,
+            ) -> capnp::capability::Promise<(), capnp::Error> {
+                let parsed = params
+                    .get()
+                    .and_then(|value| value.get_run_id())
+                    .and_then(|value| value.to_str().map_err(capnp::Error::from))
+                    .and_then(|value| {
+                        uuid::Uuid::parse_str(value)
+                            .map_err(|error| capnp::Error::failed(error.to_string()))
+                    });
+                match parsed {
+                    Ok(run_id) => {
+                        let _ = self.0.send(crate::brain::store::RunId(run_id));
+                        // Reproduce a real frontend that has not admitted Turn yet.
+                        results.get().set_cancelled(false);
+                        capnp::capability::Promise::ok(())
+                    }
+                    Err(error) => capnp::capability::Promise::err(error),
+                }
+            }
+            fn project_memory(
+                &mut self,
+                _: crate::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
+                _: crate::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
+            ) -> capnp::capability::Promise<(), capnp::Error> {
+                capnp::capability::Promise::err(capnp::Error::unimplemented("unused".into()))
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let server = Arc::new(
+            crate::server::AgentServer::for_brain_protocol_test(
+                BrainStore::with_root("box.local", Some(temp.path().into())),
+                crate::brain::credential::BrainCredentialAuthority::ephemeral([62; 32]),
+                "test-password".into(),
+                temp.path(),
+            )
+            .unwrap(),
+        );
+        let lifecycle = BrainLifecycleService::from_server(&server);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let http_agent = server.clone();
+        let http_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                create_remote_brain_router(http_agent)
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        for (brain, pause_after_start) in [("race-start-bind", true), ("race-bind-turn", false)] {
+            let driver = lifecycle
+                .attach(brain, "alice", AttachmentRole::Driver, None)
+                .unwrap();
+            let connection_id = driver.connection_id.unwrap();
+            let mut socket = connect_test_brain_socket(&server, address, brain, &driver).await;
+            let snapshot = lifecycle.snapshot(brain).unwrap();
+            let lease = lifecycle
+                .acquire_runner(brain, "runner", &snapshot.environment, None, 60_000)
+                .unwrap();
+            let (runner_tx, mut runner_rx) = tokio::sync::mpsc::unbounded_channel();
+            lifecycle.register_test_runner(brain, lease.lease_id, runner_tx);
+            let (reached, release) = if pause_after_start {
+                install_run_admission_pause(&PAUSE_AFTER_RUN_START, brain)
+            } else {
+                install_run_admission_pause(&PAUSE_AFTER_RUN_BIND, brain)
+            };
+            let mut release = Some(release);
+            let current = lifecycle.snapshot(brain).unwrap();
+            let command = crate::ipc::brain_codec::BrainRemoteCommand {
+                request_id: 1,
+                mutation: Some(crate::ipc::brain_codec::BrainRemoteMutation {
+                    brain_id: current.brain_id,
+                    expected_revision: current.revision,
+                    environment_generation: current.environment.generation,
+                    idempotency_key: uuid::Uuid::new_v4(),
+                }),
+                kind: crate::ipc::brain_codec::BrainRemoteCommandKind::Submit(
+                    BrainEventKind::Prompt {
+                        text: "race admission".into(),
+                    },
+                ),
+            };
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Binary(
+                    crate::ipc::brain_codec::encode_brain_remote_envelope(
+                        &crate::ipc::brain_codec::BrainRemoteEnvelope::Command(command),
+                    )
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), reached)
+                .await
+                .expect("run admission barrier was not reached")
+                .expect("run admission barrier sender dropped");
+            tokio::time::timeout(std::time::Duration::from_secs(2), socket.close(None))
+                .await
+                .expect("WebSocket close handshake stalled")
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while lifecycle
+                    .connection(brain, driver.attachment_id, connection_id)
+                    .is_ok()
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("WebSocket teardown did not retire the connection generation");
+            if pause_after_start {
+                // Teardown may already have aborted the socket-owned command
+                // future, which drops this test-only receiver after the
+                // admission guard has performed fail-closed cleanup.
+                let _ = release.take().unwrap().send(());
+            }
+            let cancel = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    match runner_rx.recv().await {
+                        Some(crate::server::RunnerRequest::Cancel(cancel)) => break cancel,
+                        Some(crate::server::RunnerRequest::Turn(_)) => {
+                            panic!("stale Turn crossed runner boundary before cancellation")
+                        }
+                        Some(crate::server::RunnerRequest::Program(_)) => {
+                            panic!("unexpected Program crossed runner boundary")
+                        }
+                        Some(crate::server::RunnerRequest::ProjectMemory(_)) => {
+                            panic!("unexpected memory projection crossed runner boundary")
+                        }
+                        None => panic!("runner request channel closed before cancellation"),
+                    }
+                }
+            })
+            .await
+            .expect("exact-run cancellation was not forwarded");
+            let run_id = cancel.run_id;
+            let (cancelled_tx, mut cancelled_rx) = tokio::sync::mpsc::unbounded_channel();
+            let runner: crate::finch_ipc_capnp::brain_runner::Client =
+                capnp_rpc::new_client(CancelBeforeTurnRunner(cancelled_tx));
+            assert!(
+                !crate::ipc::server::forward_test_runner_request(
+                    runner,
+                    server.clone(),
+                    crate::server::RunnerRequest::Cancel(cancel),
+                )
+                .await
+            );
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), cancelled_rx.recv(),)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                run_id
+            );
+            if !pause_after_start {
+                let _ = release.take().unwrap().send(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            assert!(
+                runner_rx.try_recv().is_err(),
+                "Turn was enqueued after cancellation fence"
+            );
+            let final_snapshot = lifecycle.snapshot(brain).unwrap();
+            assert_eq!(
+                lifecycle.inspect_run(brain, run_id).unwrap().status,
+                BrainRunStatus::Failed
+            );
+            assert_eq!(
+                final_snapshot
+                    .events
+                    .iter()
+                    .filter(|event| event.run_id == Some(run_id)
+                        && matches!(event.kind, BrainEventKind::Result { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                final_snapshot
+                    .events
+                    .iter()
+                    .filter(|event| matches!(event.kind,
+                BrainEventKind::RunStatusChanged { run_id: event_run_id, status, .. }
+                    if event_run_id == run_id && status.is_terminal()))
+                    .count(),
+                1
+            );
+            assert_eq!(final_snapshot.runner_lease, Some(lease));
+        }
         http_server.abort();
     }
 
