@@ -336,24 +336,26 @@ still blocks the corresponding Brain phase until it is unified.
   fixtures for non-streaming, streaming, tools, tool continuation, reasoning, structured output,
   and each advertised input modality across Claude, OpenAI, Grok, Gemini, Mistral, Groq, Ollama,
   remote daemons, and every new compatible profile.
-- [ ] **P0 — make a ChatGPT/Codex subscription profile usable for Finch dogfooding
+- [ ] **P0 — make a native ChatGPT subscription profile usable for Finch dogfooding
   ([#51](https://github.com/darwin-finch/finch/issues/51)).** Finch has an
   orphaned `src/providers/chatgpt_auth.rs` device-login implementation, but the module is not exported,
   no CLI/setup path invokes it, no `ProviderEntry` or factory consumes its refreshable credential, and
-  the ordinary OpenAI provider still requires a Platform API key. Audit the existing implementation
-  against current official OpenAI terms and supported authentication surfaces; finish it only if Finch
-  can legitimately act as its own client, otherwise integrate through a supported Codex app-server or
-  enterprise access-token boundary. Never scrape, copy, or reinterpret `~/.codex/auth.json`: Codex's
-  ChatGPT subscription session is not a general OpenAI API key. Expose `OpenAI API key` and `ChatGPT /
-  Codex subscription` as distinct credential-backed provider profiles in setup and `/provider`, store
-  only opaque secure-store references in config, refresh/revoke safely, preserve account/workspace
-  audience, and redact every token-bearing error. Add mock login/refresh/revocation tests plus an opt-in
-  live streaming/tool-continuation/Finch-wire conformance run, then make the verified ChatGPT profile
-  selectable as the primary dogfooding model without deleting the configured Grok fallback.
+  the ordinary OpenAI provider still requires a Platform API key. Finch owns the browser/device
+  authorization state machine, secure credential lifecycle, refresh/revocation, account discovery,
+  and direct provider transport; an installed Codex CLI or app-server is not a prerequisite. Never
+  scrape, copy, or reinterpret `~/.codex/auth.json`: a ChatGPT subscription session is not a general
+  OpenAI API key. Expose `OpenAI Platform API key` and `ChatGPT subscription` as distinct
+  credential-backed provider profiles in setup and `/provider`. Store only opaque, named
+  secure-store references in config; allow one account credential to serve multiple compatible model
+  profiles while keeping issuer, endpoint audience, account/tenant, and scopes bound; support multiple
+  explicitly named subscriptions without implicit cross-account fallback. Redact every token-bearing
+  error. Add mock login/refresh/revocation tests plus an opt-in live streaming/tool-continuation/
+  Finch-wire conformance run, then make the verified ChatGPT profile selectable as the primary
+  dogfooding model without deleting the configured Grok fallback.
 - [ ] Generalize provider authentication beyond static API tokens. Add secure-store-backed OAuth,
   browser/device authorization, refreshable account sessions, and provider-native subscription
-  credentials where their terms and APIs permit them (including Codex/OpenAI and Claude account
-  flows), alongside API keys and local/no-auth runtimes. Credentials must be opaque references with
+  credentials where their terms and APIs permit them (including ChatGPT/OpenAI and supported Claude
+  account flows), alongside API keys and local/no-auth runtimes. Credentials must be opaque references with
   expiry/refresh/revocation state, redacted diagnostics, and an explicit provider/endpoint audience;
   model clones reuse the reference rather than copying bearer material.
 - [ ] Run the fixed protocol-conformance workload across every supported configured provider/model,
