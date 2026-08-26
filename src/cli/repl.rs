@@ -28,8 +28,7 @@ use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
     AnsibleTool, AskUserQuestionTool, BashTool, EditTool, EnterPlanModeTool, GlobTool, GrepTool,
-    HashCompareTool, PatchTool, PresentPlanTool, ReadTool, RestartTool,
-    WebFetchTool, WriteTool,
+    HashCompareTool, PatchTool, PresentPlanTool, ReadTool, RestartTool, WebFetchTool, WriteTool,
 };
 #[cfg(target_os = "macos")]
 use crate::tools::implementations::{GuiClickTool, GuiInspectTool, GuiTypeTool};
@@ -63,6 +62,8 @@ enum ConfirmationChoice {
 
 #[cfg(test)]
 mod disabled_training_tests {
+    use super::*;
+
     #[test]
     fn legacy_repl_has_no_automatic_training_queue_producer() {
         let source = include_str!("repl.rs");
@@ -73,6 +74,81 @@ mod disabled_training_tests {
         assert!(!source.contains(&disabled_flag));
         assert!(!source.contains(&queue_writer));
         assert!(!source.contains(&python_script));
+    }
+
+    #[tokio::test]
+    async fn fallback_repl_completion_does_not_mutate_legacy_conversation_or_training_logs() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy_conversations = temp.path().join("conversations.jsonl");
+        let legacy_training_queue = temp.path().join("training_queue.jsonl");
+        std::fs::write(&legacy_conversations, "preserved conversation data\n").unwrap();
+        std::fs::write(&legacy_training_queue, "preserved training data\n").unwrap();
+        let conversations_before = std::fs::read(&legacy_conversations).unwrap();
+        let training_before = std::fs::read(&legacy_training_queue).unwrap();
+
+        let mut upstream = mockito::Server::new_async().await;
+        let response = upstream
+            .mock("POST", "/v1/messages")
+            .with_status(200)
+            .with_body(
+                r#"{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"text","text":"fallback response"}],"model":"claude-test","stop_reason":"end_turn"}"#,
+            )
+            .create_async()
+            .await;
+        let teacher = crate::config::TeacherEntry {
+            provider: "claude".into(),
+            api_key: "sk-ant-test-key-for-fallback-boundary".into(),
+            model: Some("claude-test".into()),
+            base_url: Some(upstream.url()),
+            name: Some("fallback-test".into()),
+        };
+        let mut config = Config::new(vec![teacher]);
+        config.metrics_dir = temp.path().join("metrics");
+        config.tui_enabled = false;
+        config.features.streaming_enabled = false;
+        #[allow(deprecated)]
+        {
+            config.streaming_enabled = false;
+        }
+        config.memory.enabled = false;
+        let metrics = MetricsLogger::new(config.metrics_dir.clone()).unwrap();
+        let client = ClaudeClient::new("sk-ant-unused-facade-key".into()).unwrap();
+        let router = Router::new(crate::models::ThresholdRouter::default());
+        let mut repl = Repl::new(
+            config,
+            client,
+            router,
+            metrics,
+            None,
+            "fallback-boundary".into(),
+        )
+        .await;
+        repl.conversation_logger = Arc::new(tokio::sync::Mutex::new(
+            crate::logging::ConversationLogger::new(legacy_conversations.clone()).unwrap(),
+        ));
+
+        let actual = repl.process_query("ordinary fallback query").await.unwrap();
+
+        assert_eq!(actual, "fallback response");
+        response.assert_async().await;
+        assert_eq!(
+            std::fs::read(&legacy_conversations).unwrap(),
+            conversations_before
+        );
+        assert_eq!(
+            std::fs::read(&legacy_training_queue).unwrap(),
+            training_before
+        );
+        assert!(repl.feedback_logger.is_none());
+        drop(repl);
+        assert_eq!(
+            std::fs::read(&legacy_conversations).unwrap(),
+            conversations_before
+        );
+        assert_eq!(
+            std::fs::read(&legacy_training_queue).unwrap(),
+            training_before
+        );
     }
 }
 
@@ -165,6 +241,8 @@ pub struct Repl {
 
     // Phase 1: Multi-LLM system
     llm_registry: Option<Arc<crate::llms::LLMRegistry>>,
+    // Legacy automatic conversation collector. Its persistence API is
+    // fail-closed; retained only for compatibility with explicit callers.
     conversation_logger: Arc<tokio::sync::Mutex<crate::logging::ConversationLogger>>,
 
     // Phase 2: Persona system
@@ -593,7 +671,9 @@ impl Repl {
         ));
         let local_generator = Arc::new(RwLock::new(LocalGenerator::new()));
 
-        let feedback_logger = FeedbackLogger::new().ok();
+        // Explicit feedback storage is opened lazily by handle_feedback. An
+        // ordinary query must not create or mutate any feedback/training file.
+        let feedback_logger = None;
 
         let sampling_config = SamplingConfig::default(); // 5% baseline, 3x arch, 5x security
         let sampler = Arc::new(RwLock::new(Sampler::new(sampling_config)));
@@ -657,7 +737,8 @@ impl Repl {
         // The direct-provider fallback is normal standalone operation.  Do not
         // render configuration chatter before the first user-visible turn.
 
-        // Phase 1: Initialize conversation logger
+        // Legacy collector construction is side-effect free and persistence is
+        // disabled. Keep the value only for API compatibility.
         let log_path = dirs::home_dir()
             .map(|home| home.join(".finch").join("conversations.jsonl"))
             .unwrap_or_else(|| PathBuf::from(".finch/conversations.jsonl"));
@@ -3312,23 +3393,15 @@ impl Repl {
         let router_confidence = Some(router_stats.confidence_threshold);
         let validator_confidence = Some(quality_score);
 
-        // Phase 1: Log conversation BEFORE creating metric (routing_decision_str is moved)
+        // Resolve the model label before creating the metric
+        // (routing_decision_str is moved below). Ordinary completions are not
+        // persisted as conversation or training data; only explicit feedback
+        // submitted through handle_feedback reaches private storage.
         let model_name = if routing_decision_str == "local" {
             "local".to_string()
         } else {
             "teacher".to_string()
         };
-        let tools_used = vec![]; // TODO: Track tools used during execution
-        if let Err(e) = self
-            .conversation_logger
-            .lock()
-            .await
-            .log_interaction(query, &claude_response, &model_name, &tools_used)
-            .await
-        {
-            tracing::warn!("Failed to log conversation: {}", e);
-        }
-
         let metric = RequestMetric::new(
             query_hash,
             routing_decision_str,
@@ -3422,10 +3495,13 @@ impl Repl {
         });
 
         let entry = FeedbackEntry::weighted(query, response, weight, Some(feedback.clone()));
+        if self.feedback_logger.is_none() {
+            self.feedback_logger = Some(FeedbackLogger::new()?);
+        }
         let logger = self
             .feedback_logger
             .as_ref()
-            .context("Feedback logger is unavailable")?;
+            .context("Private feedback persistence is unavailable on this platform")?;
         logger.log(&entry).context("Failed to persist feedback")?;
 
         // Display confirmation

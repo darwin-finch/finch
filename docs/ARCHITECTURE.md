@@ -123,12 +123,15 @@ REPL appears instantly (<100ms)
 │   - Session cleanup                 │
 └───────────┬─────────────────────────┘
             │
-      ┌─────┴─────┬─────────┬─────────┐
-      v           v         v         v
-┌─────────┐ ┌─────────┐ ┌──────┐ ┌──────┐
-│ ONNX    │ │ Teacher │ │ Tool │ │ LoRA │
-│ Runtime │ │ APIs    │ │ Exec │ │Train │
-└─────────┘ └─────────┘ └──────┘ └──────┘
+      ┌─────┴─────┬─────────┐
+      v           v         v
+┌─────────┐ ┌─────────┐ ┌──────┐
+│ ONNX    │ │ Teacher │ │ Tool │
+│ Runtime │ │ APIs    │ │ Exec │
+└─────────┘ └─────────┘ └──────┘
+
+Legacy LoRA training and adapter loading are disabled and are not daemon
+components.
 ```
 
 **Key Files:**
@@ -841,22 +844,23 @@ Every request logs:
 
 Stored in: `~/.finch/metrics/YYYY-MM-DD.jsonl`
 
-### Training Data Format
+### Explicit Feedback Format
 
 ```json
 {
-  "id": "uuid",
-  "timestamp": "2026-02-14T12:00:00Z",
+  "timestamp": 1771099200,
   "query": "What is the golden rule?",
   "response": "The golden rule refers to...",
-  "feedback_weight": 1.0,
-  "feedback_type": "normal",
-  "used_for_training": false
+  "rating": "good",
+  "weight": 1.0,
+  "note": "Helpful answer"
 }
 ```
 
-Stored in: `~/.finch/feedback.jsonl`. Feedback is retained data, not an
-executable training queue.
+Stored in: `~/.finch/feedback.jsonl` on supported platforms, with private
+permissions, descriptor-bound locking, and a 16 MiB append ceiling. Feedback is
+written only after an explicit rating. It is retained metadata, not an
+executable training queue, and does not trigger training or adapter loading.
 
 ## File Structure
 

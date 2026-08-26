@@ -1,7 +1,7 @@
-// Conversation logging for future LoRA training
+// Legacy conversation-logging compatibility API.
 //
-// Logs all interactions (query + response + metadata) to JSONL format
-// for later use in fine-tuning when ONNX/CoreML supports LoRA.
+// Automatic query/response persistence is disabled. Explicit ratings use the
+// private, bounded FeedbackLogger instead.
 
 pub mod conversation_logger;
 
