@@ -9,11 +9,11 @@
 // It lives in the shadow buffer, rendered by the blit cycle (~100ms tick).
 // The throb animation is TIME-DRIVEN — no external counter required.
 
+use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
+use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
-use std::fmt;
 
 /// Curated word list for the thinking spinner verb.
 const SPINNER_WORDS: &[&str] = &[
@@ -55,6 +55,7 @@ pub fn random_spinner_verb() -> &'static str {
 }
 
 use super::{Message, MessageId, MessageStatus};
+use crate::cli::diff::{DiffColorMode, FileDiff};
 use crate::config::{ColorScheme, MessageBand};
 
 // Animation frames: small → large → small (creates a "throb" pulse effect)
@@ -105,11 +106,15 @@ pub enum WorkRowStatus {
 pub enum WorkUnitPresentation {
     #[default]
     Assistant,
-    ProgramSource { language: String },
+    ProgramSource {
+        language: String,
+    },
     /// Plain `say` output has no title or conversational chrome. Explicit
     /// VM output handles retain their title while independently tracking a
     /// body, transient status, and progress.
-    ProgramOutput { title: Option<String> },
+    ProgramOutput {
+        title: Option<String>,
+    },
 }
 
 /// A single tool-call sub-item rendered below the WorkUnit header
@@ -339,6 +344,17 @@ impl WorkUnit {
         }
     }
 
+    /// Complete a tool row with a structured, theme-independent file diff.
+    pub fn complete_row_with_diff(&self, idx: usize, diff: FileDiff) {
+        let summary = format!("+{} -{}", diff.added(), diff.removed());
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(row) = inner.rows.get_mut(idx) {
+            row.elapsed_at_finish = Some(row.started_at.elapsed());
+            row.status = WorkRowStatus::Complete(summary);
+            row.body_lines = diff.to_unified().lines().map(str::to_owned).collect();
+        }
+    }
+
     /// Append a live output line to a Running sub-row's body.
     ///
     /// Called by the bash tool's streaming path once per stdout line.
@@ -386,7 +402,7 @@ impl Message for WorkUnit {
         self.id
     }
 
-    fn format(&self, _colors: &ColorScheme) -> String {
+    fn format(&self, colors: &ColorScheme) -> String {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let elapsed = self.started_at.elapsed();
 
@@ -418,8 +434,10 @@ impl Message for WorkUnit {
                 // effect, not an assistant message or a spinner; hiding it
                 // until completion made `say` chunks appear and then vanish
                 // during longer programs.
-                if matches!(inner.presentation, WorkUnitPresentation::ProgramOutput { .. })
-                    && program_output_has_visible_state(&inner)
+                if matches!(
+                    inner.presentation,
+                    WorkUnitPresentation::ProgramOutput { .. }
+                ) && program_output_has_visible_state(&inner)
                 {
                     return format_program_output(&inner);
                 }
@@ -440,7 +458,7 @@ impl Message for WorkUnit {
                     );
                     for row in &inner.rows {
                         out.push('\n');
-                        out.push_str(&format_row(row));
+                        out.push_str(&format_row_themed(row, colors));
                     }
                     return out;
                 }
@@ -467,7 +485,7 @@ impl Message for WorkUnit {
 
                 for row in &inner.rows {
                     out.push('\n');
-                    out.push_str(&format_row(row));
+                    out.push_str(&format_row_themed(row, colors));
                 }
 
                 out
@@ -526,7 +544,7 @@ impl Message for WorkUnit {
                 // Collapsed sub-rows: show what tools ran (label + summary + body lines)
                 for row in &inner.rows {
                     out.push('\n');
-                    out.push_str(&format_row_collapsed(row));
+                    out.push_str(&format_row_collapsed(row, colors));
                 }
 
                 out
@@ -588,7 +606,7 @@ impl Message for WorkUnit {
         let tool_line_count = inner
             .rows
             .iter()
-            .map(|row| format_row_collapsed(row).lines().count())
+            .map(|row| format_row_collapsed(row, colors).lines().count())
             .sum::<usize>();
         let band = if line_index >= line_count.saturating_sub(tool_line_count) {
             MessageBand::Tool
@@ -659,6 +677,10 @@ fn format_progress(completed: u64, total: Option<u64>) -> String {
 }
 
 fn format_row(row: &WorkRow) -> String {
+    format_row_themed(row, &ColorScheme::default())
+}
+
+fn format_row_themed(row: &WorkRow, colors: &ColorScheme) -> String {
     match &row.status {
         WorkRowStatus::Running => {
             let mut out = format!("  {}⎿{} {}{}…{}", GRAY, RESET, row.label, GRAY_DIM, RESET);
@@ -688,9 +710,16 @@ fn format_row(row: &WorkRow) -> String {
                 )
             };
             // Render body lines (diff, bash output, grep matches, etc.) indented below
-            for line in &row.body_lines {
-                out.push('\n');
-                out.push_str(&format!("    {}", line));
+            if let Some(diff) = FileDiff::parse(&row.body_lines.join("\n")) {
+                for line in diff.render(colors, DiffColorMode::Theme).lines() {
+                    out.push('\n');
+                    out.push_str(&format!("    {line}"));
+                }
+            } else {
+                for line in &row.body_lines {
+                    out.push('\n');
+                    out.push_str(&format!("    {}", line));
+                }
             }
             out
         }
@@ -710,7 +739,7 @@ fn format_row(row: &WorkRow) -> String {
 
 /// Compact one-line row for the collapsed (Complete) state.
 /// Same as `format_row` but skips body lines — keeps scrollback tidy.
-fn format_row_collapsed(row: &WorkRow) -> String {
+fn format_row_collapsed(row: &WorkRow, colors: &ColorScheme) -> String {
     match &row.status {
         WorkRowStatus::Running => {
             // Shouldn't happen in Complete state, but render gracefully.
@@ -730,9 +759,16 @@ fn format_row_collapsed(row: &WorkRow) -> String {
                     GRAY, RESET, row.label, GRAY_DIM, summary, RESET, timing
                 )
             };
-            for line in &row.body_lines {
-                out.push('\n');
-                out.push_str(&format!("    {}", line));
+            if let Some(diff) = FileDiff::parse(&row.body_lines.join("\n")) {
+                for line in diff.render(colors, DiffColorMode::Theme).lines() {
+                    out.push('\n');
+                    out.push_str(&format!("    {line}"));
+                }
+            } else {
+                for line in &row.body_lines {
+                    out.push('\n');
+                    out.push_str(&format!("    {}", line));
+                }
             }
             out
         }
@@ -786,6 +822,24 @@ mod tests {
         assert_eq!(wu.verb, "Channeling");
         assert_eq!(wu.status(), MessageStatus::InProgress);
         assert_eq!(wu.content(), "");
+    }
+
+    #[test]
+    fn test_structured_diff_direct_and_retained_render_match() {
+        let diff = FileDiff::parse("--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n")
+            .unwrap();
+        let direct = diff.render(&colors(), DiffColorMode::Theme);
+        let wu = WorkUnit::new("Tools");
+        let row = wu.add_row("edit(src/a.rs)");
+        wu.complete_row_with_diff(row, diff);
+        wu.set_complete();
+        let retained = wu.format(&colors());
+        for line in direct.lines() {
+            assert!(
+                retained.contains(line),
+                "missing retained diff line: {line:?}\n{retained}"
+            );
+        }
     }
 
     #[test]

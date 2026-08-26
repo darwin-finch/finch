@@ -12,7 +12,6 @@ use crate::tools::types::{ToolContext, ToolInputSchema};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
-use crossterm::style::{Attribute, Color, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use serde_json::Value;
 use std::fs;
 use std::io::IsTerminal;
@@ -30,15 +29,6 @@ fn run_post_save_hook(file_path: &str) {
         }
     }
 }
-
-const RED: SetForegroundColor = SetForegroundColor(Color::Red);
-const GREEN: SetForegroundColor = SetForegroundColor(Color::Green);
-const GRAY: SetForegroundColor = SetForegroundColor(Color::DarkGrey);
-const RED_BG: SetBackgroundColor = SetBackgroundColor(Color::AnsiValue(52));
-const GREEN_BG: SetBackgroundColor = SetBackgroundColor(Color::AnsiValue(22));
-const RESET: SetAttribute = SetAttribute(Attribute::Reset);
-
-const CONTEXT_LINES: usize = 3;
 
 /// Build a bash/python script that applies an edit to a file.
 /// Used by the propose-before-execute flow.
@@ -140,6 +130,8 @@ impl Tool for EditTool {
 
         // Interactive: propose the script in $EDITOR before applying.
         if std::io::stdin().is_terminal() {
+            let original = fs::read_to_string(file_path)
+                .with_context(|| format!("Failed to read file: {}", file_path))?;
             let old_lines = old_string.lines().count();
             let new_lines = new_string.lines().count();
             let description = format!(
@@ -152,10 +144,15 @@ impl Tool for EditTool {
             );
             let code = build_edit_code(file_path, old_string, new_string, replace_all);
             let approved = propose_in_editor(&description, &code).await?;
-            return match approved {
-                None => Ok("Edit aborted by user.".to_string()),
-                Some(script) => run_script_async(&script).await,
+            let Some(script) = approved else {
+                return Ok("Edit aborted by user.".to_string());
             };
+            run_script_async(&script).await?;
+            let updated = fs::read_to_string(file_path)
+                .with_context(|| format!("Failed to read edited file: {}", file_path))?;
+            return Ok(
+                crate::cli::diff::FileDiff::from_texts(file_path, &original, &updated).to_unified(),
+            );
         }
 
         // Non-interactive (tests, daemon): apply in Rust.
@@ -195,12 +192,7 @@ impl Tool for EditTool {
         run_post_save_hook(file_path);
 
         // Generate and return colored diff
-        Ok(generate_edit_diff(
-            &original,
-            old_string,
-            new_string,
-            match_count.min(if replace_all { match_count } else { 1 }),
-        ))
+        Ok(crate::cli::diff::FileDiff::from_texts(file_path, &original, &new_content).to_unified())
     }
 }
 
@@ -217,100 +209,12 @@ pub fn generate_edit_diff(
     new_string: &str,
     occurrences: usize,
 ) -> String {
-    let orig_lines: Vec<&str> = original.lines().collect();
-    let old_str_lines: Vec<&str> = old_string.lines().collect();
-    let new_str_lines: Vec<&str> = new_string.lines().collect();
-
-    let added = new_str_lines.len();
-    let removed = old_str_lines.len();
-
-    // Build summary
-    let mut summary_parts = Vec::new();
-    if added > 0 {
-        summary_parts.push(format!(
-            "Added {} line{}",
-            added,
-            if added == 1 { "" } else { "s" }
-        ));
-    }
-    if removed > 0 {
-        summary_parts.push(format!(
-            "removed {} line{}",
-            removed,
-            if removed == 1 { "" } else { "s" }
-        ));
-    }
-    if occurrences > 1 {
-        summary_parts.push(format!("{} occurrences replaced", occurrences));
-    }
-    let summary = if summary_parts.is_empty() {
-        "No changes".to_string()
+    let new_content = if occurrences > 1 {
+        original.replace(old_string, new_string)
     } else {
-        summary_parts.join(", ")
+        original.replacen(old_string, new_string, 1)
     };
-
-    // Find the byte offset of first occurrence
-    let start_byte = original.find(old_string).unwrap_or(0);
-    let start_line = original[..start_byte].lines().count(); // 0-indexed
-
-    let context_start = start_line.saturating_sub(CONTEXT_LINES);
-    let context_end = (start_line + removed + CONTEXT_LINES).min(orig_lines.len());
-
-    // Determine line number width for alignment
-    let max_line_num = orig_lines.len().max(start_line + added + CONTEXT_LINES);
-    let num_width = max_line_num.to_string().len().max(3);
-
-    let mut output = format!("{}\n", summary);
-
-    // Context before
-    for (i, line) in orig_lines[context_start..start_line].iter().enumerate() {
-        let line_num = context_start + i + 1;
-        output.push_str(&format!(
-            "  {GRAY}{:>width$}{RESET}     {}\n",
-            line_num,
-            line,
-            width = num_width
-        ));
-    }
-
-    // Removed lines (red)
-    for (i, line) in old_str_lines.iter().enumerate() {
-        let line_num = start_line + i + 1;
-        output.push_str(&format!(
-            "  {RED_BG}{RED}{:>width$} -{RESET}{RED_BG}   {}{RESET}\n",
-            line_num,
-            line,
-            width = num_width
-        ));
-    }
-
-    // Added lines (green)
-    // New line numbers after the edit
-    let new_start_line = start_line + 1;
-    for (i, line) in new_str_lines.iter().enumerate() {
-        let line_num = new_start_line + i;
-        output.push_str(&format!(
-            "  {GREEN_BG}{GREEN}{:>width$} +{RESET}{GREEN_BG}   {}{RESET}\n",
-            line_num,
-            line,
-            width = num_width
-        ));
-    }
-
-    // Context after (using new line numbers)
-    let after_orig_start = start_line + removed;
-    let new_context_start = start_line + added;
-    for (i, line) in orig_lines[after_orig_start..context_end].iter().enumerate() {
-        let new_line_num = new_context_start + i + 1;
-        output.push_str(&format!(
-            "  {GRAY}{:>width$}{RESET}     {}\n",
-            new_line_num,
-            line,
-            width = num_width
-        ));
-    }
-
-    output
+    crate::cli::diff::FileDiff::from_texts("file", original, &new_content).to_unified()
 }
 
 #[cfg(test)]
@@ -325,8 +229,8 @@ mod tests {
             "new line A\nnew line B",
             1,
         );
-        assert!(diff.contains("Added 2 lines"), "got: {}", diff);
-        assert!(diff.contains("removed 1 line"), "got: {}", diff);
+        let parsed = crate::cli::diff::FileDiff::parse(&diff).unwrap();
+        assert_eq!((parsed.added(), parsed.removed()), (2, 1));
     }
 
     #[test]
