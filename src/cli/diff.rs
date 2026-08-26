@@ -359,10 +359,17 @@ mod tests {
     fn test_no_color_is_accessible_and_numbered() {
         let d = FileDiff::parse(SAMPLE).unwrap();
         let s = d.render(&ColorScheme::default(), DiffColorMode::NoColor);
-        assert!(!s.contains("\x1b["));
-        assert!(s.contains("src/old.rs → src/new.rs  +2 -1"));
-        assert!(s.contains("2 2   keep"));
-        assert!(s.contains("3   - old"));
+        assert_eq!(
+            s,
+            concat!(
+                "src/old.rs → src/new.rs  +2 -1  renamed\n",
+                "@@ -2,2 +2,3 @@ fn x\n",
+                "2 2   keep\n",
+                "3   - old\n",
+                "  3 + new\n",
+                "  4 + more"
+            )
+        );
     }
     #[test]
     fn test_light_and_dark_choose_distinct_composition() {
