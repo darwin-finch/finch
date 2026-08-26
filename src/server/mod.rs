@@ -543,7 +543,7 @@ impl AgentServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Clone)]
@@ -717,6 +717,105 @@ mod tests {
         assert!(logs.contains("storage-error"));
         assert!(!logs.contains("customer-secret-project"));
         assert!(!logs.contains(temp.path().to_string_lossy().as_ref()));
+
+        serving.abort();
+        let _ = serving.await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_daemon_feedback_quota_is_redacted_unchanged_and_never_trains() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("customer-secret-project");
+        let feedback_path = state_root.join("feedback.jsonl");
+        let legacy_queue = state_root.join("training_queue.jsonl");
+        let adapter = state_root.join("adapters/latest.safetensors");
+        let launches = Arc::new(AtomicUsize::new(0));
+        let observed_launches = Arc::clone(&launches);
+        let _launch_observer = crate::training::lora_subprocess::observe_training_process_launches(
+            Arc::new(move || {
+                observed_launches.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let authority = crate::brain::credential::BrainCredentialAuthority::ephemeral([8; 32]);
+        let server = Arc::new(
+            AgentServer::for_brain_http_test("feedback-fixture.local", &state_root, authority)
+                .unwrap(),
+        );
+        std::fs::write(&legacy_queue, "legacy queued example\n").unwrap();
+        let mut feedback = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&feedback_path)
+            .unwrap();
+        feedback
+            .set_len(crate::feedback::FEEDBACK_LOG_MAX_BYTES)
+            .unwrap();
+        feedback.seek(SeekFrom::End(-1)).unwrap();
+        feedback.write_all(b"\n").unwrap();
+        feedback.sync_all().unwrap();
+        drop(feedback);
+        let bytes_before = std::fs::read(&feedback_path).unwrap();
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_writer = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || CapturedLogs(Arc::clone(&captured_writer)))
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener));
+
+        let client = reqwest::Client::new();
+        let mut response = None;
+        for _ in 0..20 {
+            match client
+                .post(format!("http://{address}/v1/feedback"))
+                .json(&serde_json::json!({
+                    "query": "quota boundary",
+                    "response": "metadata only",
+                    "weight": 1.0
+                }))
+                .send()
+                .await
+            {
+                Ok(result) => {
+                    response = Some(result);
+                    break;
+                }
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+        let response = response.expect("feedback daemon did not accept a local request");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = response.text().await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "status": "error",
+                "message": "Could not persist feedback"
+            })
+        );
+        tokio::time::advance(tokio::time::Duration::from_secs(10 * 60)).await;
+        tokio::task::yield_now().await;
+
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("Failed to persist private feedback"));
+        assert!(logs.contains("quota-exceeded"));
+        assert!(!body.contains("customer-secret-project"));
+        assert!(!logs.contains("customer-secret-project"));
+        assert!(!logs.contains(temp.path().to_string_lossy().as_ref()));
+        assert_eq!(std::fs::read(&feedback_path).unwrap(), bytes_before);
+        assert_eq!(
+            std::fs::read_to_string(&legacy_queue).unwrap(),
+            "legacy queued example\n"
+        );
+        assert!(!adapter.exists());
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
 
         serving.abort();
         let _ = serving.await;

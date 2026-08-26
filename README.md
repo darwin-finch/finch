@@ -177,6 +177,11 @@ To use the local model, run `finch` without `--cloud-only`. The REPL starts imme
 | **In dialogs:** o/O  | Jump to "Other" row and start typing                   |
 | **In dialogs:** Shift+Enter | Insert newline in custom text field             |
 
+Explicit feedback is private metadata, not an automatic training signal. Finch
+stops appending to `~/.finch/feedback.jsonl` at 16 MiB; at the limit, new
+ratings are rejected without deleting or rotating existing feedback. A legacy
+file already over the ceiling is preserved unchanged and rejects new ratings.
+
 ---
 
 ## Privacy

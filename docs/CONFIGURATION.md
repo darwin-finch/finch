@@ -115,7 +115,9 @@ cpu_fallback = true
 data_dir = "~/.claude-proxy"
 
 # Explicit feedback is stored separately in ~/.finch/feedback.jsonl.
-# Finch never prunes, trains on, or uploads it automatically.
+# Finch appends only while the file stays at or below 16 MiB. At the ceiling it
+# rejects new ratings without changing the existing file. An already-oversized
+# legacy file is preserved. Finch never prunes, trains on, or uploads feedback.
 
 # Statistics file
 stats_file = "~/.claude-proxy/stats.json"
@@ -357,7 +359,10 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 Finch does not log ordinary forwarded requests for training. Only explicit
 ratings are retained, in `~/.finch/feedback.jsonl`, with private permissions on
-Unix. Ratings do not launch Python, process a queue, or alter the model.
+Unix. Appends are capped at a 16 MiB file size: once an append would cross that
+limit, Finch rejects the rating without deleting, rotating, or migrating data.
+An already-oversized legacy file is preserved unchanged and also rejects new
+ratings. Ratings do not launch Python, process a queue, or alter the model.
 
 Existing legacy queues and adapters are preserved until the user chooses a
 supported disposition; Finch does not delete or migrate them automatically.
@@ -486,8 +491,11 @@ finch models download
 finch daemon --port 8001
 ```
 
-**Feedback retention**: Finch does not automatically prune explicit feedback or
-legacy training data. Review files manually before choosing any disposition.
+**Feedback retention**: Finch stops appending explicit feedback when the file
+reaches 16 MiB. At the limit it rejects new ratings and leaves the existing file
+untouched; an already-oversized legacy file is likewise preserved unchanged.
+Finch does not silently prune or rotate feedback, and does not prune legacy
+training data. Review files manually before choosing any disposition.
 
 ## Advanced Configuration
 

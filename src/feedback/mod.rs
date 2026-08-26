@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -21,6 +21,33 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 compile_error!("secure feedback storage is currently supported only on Linux and macOS");
+
+/// Maximum retained feedback size. Sixteen MiB permits thousands of ordinary
+/// ratings while placing a conservative, deterministic ceiling on local disk
+/// and read-buffer use. Finch never deletes existing feedback to enforce it.
+pub const FEEDBACK_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct FeedbackQuotaExceeded;
+
+impl std::fmt::Display for FeedbackQuotaExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Private feedback storage quota exceeded")
+    }
+}
+
+impl std::error::Error for FeedbackQuotaExceeded {}
+
+fn feedback_quota_error() -> anyhow::Error {
+    FeedbackQuotaExceeded.into()
+}
+
+fn checked_feedback_final_len(current: u64, separator: u64, encoded: u64) -> Result<u64> {
+    current
+        .checked_add(separator)
+        .and_then(|length| length.checked_add(encoded))
+        .ok_or_else(feedback_quota_error)
+}
 
 /// Feedback rating for a response
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -220,7 +247,10 @@ impl FeedbackLogger {
         after_lock();
         validate_feedback_file_for_use(&file)?;
 
+        let mut json = serde_json::to_vec(entry).context("Failed to serialize feedback entry")?;
+        json.push(b'\n');
         let len = file.metadata()?.len();
+        let mut needs_separator = false;
         if len > 0 {
             file.seek(SeekFrom::End(-1))?;
             let mut last = [0_u8; 1];
@@ -228,13 +258,21 @@ impl FeedbackLogger {
             if last[0] != b'\n' {
                 // Preserve a complete legacy line or torn bytes verbatim, but
                 // ensure the next canonical record starts on a fresh line.
-                validate_feedback_file_for_use(&file)?;
-                file.write_all(b"\n")?;
+                needs_separator = true;
             }
         }
 
-        let mut json = serde_json::to_vec(entry).context("Failed to serialize feedback entry")?;
-        json.push(b'\n');
+        let separator_len: u64 = if needs_separator { 1 } else { 0 };
+        let encoded_len = u64::try_from(json.len()).map_err(|_| feedback_quota_error())?;
+        let final_len = checked_feedback_final_len(len, separator_len, encoded_len)?;
+        if final_len > FEEDBACK_LOG_MAX_BYTES {
+            return Err(feedback_quota_error());
+        }
+
+        if needs_separator {
+            validate_feedback_file_for_use(&file)?;
+            file.write_all(b"\n")?;
+        }
         validate_feedback_file_for_use(&file)?;
         file.write_all(&json)
             .context("Failed to write feedback entry")?;
@@ -254,17 +292,38 @@ impl FeedbackLogger {
 
     /// Load all feedback entries
     pub fn load_all(&self) -> Result<Vec<FeedbackEntry>> {
+        self.load_all_with_metadata_hook(|| {})
+    }
+
+    fn load_all_with_metadata_hook(
+        &self,
+        after_metadata_check: impl FnOnce(),
+    ) -> Result<Vec<FeedbackEntry>> {
         let file = self.open_private(false)?;
         file.lock_shared()
             .context("Failed to lock private feedback log")?;
         validate_feedback_file_for_use(&file)?;
+        let length = file.metadata()?.len();
+        if length > FEEDBACK_LOG_MAX_BYTES {
+            return Err(feedback_quota_error());
+        }
+        after_metadata_check();
+
+        let read_limit = FEEDBACK_LOG_MAX_BYTES
+            .checked_add(1)
+            .expect("feedback quota leaves room for a sentinel byte");
+        let mut contents = Vec::with_capacity(length as usize);
+        (&file).take(read_limit).read_to_end(&mut contents)?;
+        if contents.len() as u64 > FEEDBACK_LOG_MAX_BYTES {
+            return Err(feedback_quota_error());
+        }
+
         let mut entries = Vec::new();
-        for line in BufReader::new(&file).split(b'\n') {
-            let line = line.context("Failed to read feedback log")?;
+        for line in contents.split(|byte| *byte == b'\n') {
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            match serde_json::from_slice::<FeedbackEntry>(&line) {
+            match serde_json::from_slice::<FeedbackEntry>(line) {
                 Ok(entry) => entries.push(entry),
                 Err(error) => tracing::warn!(
                     %error,
@@ -277,26 +336,31 @@ impl FeedbackLogger {
     }
 
     fn ensure_private_storage(&self) -> Result<()> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let parent_directory = open_or_create_storage_parent(&self.file_path)?;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let parent_directory = open_fallback_storage_parent(&self.file_path)?;
-
-        validate_storage_directory(&parent_directory)?;
-        make_object_private(&parent_directory, "private feedback directory", 0o700)?;
-        validate_storage_directory_for_use(&parent_directory)?;
-
-        let (file, file_created) = self.open_from(&parent_directory, OpenPurpose::Initialize)?;
-        validate_feedback_file(&file)?;
-        make_object_private(&file, "private feedback log", 0o600)?;
-        validate_feedback_file_for_use(&file)?;
-        file.sync_all()?;
-        if file_created {
-            parent_directory
-                .sync_all()
-                .context("Failed to sync private feedback directory")?;
+        {
+            return ensure_fallback_private_storage(&self.file_path);
         }
-        Ok(())
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let parent_directory = open_or_create_storage_parent(&self.file_path)?;
+            validate_storage_directory(&parent_directory)?;
+            make_object_private(&parent_directory, "private feedback directory", 0o700)?;
+            validate_storage_directory_for_use(&parent_directory)?;
+
+            let (file, file_created) =
+                self.open_from(&parent_directory, OpenPurpose::Initialize)?;
+            validate_feedback_file(&file)?;
+            make_object_private(&file, "private feedback log", 0o600)?;
+            validate_feedback_file_for_use(&file)?;
+            file.sync_all()?;
+            if file_created {
+                parent_directory
+                    .sync_all()
+                    .context("Failed to sync private feedback directory")?;
+            }
+            Ok(())
+        }
     }
 
     fn open_private(&self, append: bool) -> Result<File> {
@@ -309,20 +373,33 @@ impl FeedbackLogger {
         after_parent_opened: impl FnOnce(),
     ) -> Result<File> {
         self.ensure_private_storage()?;
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let parent_directory = open_or_create_storage_parent(&self.file_path)?;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let parent_directory = open_fallback_storage_parent(&self.file_path)?;
-        validate_storage_directory_for_use(&parent_directory)?;
-        after_parent_opened();
-        let purpose = if append {
-            OpenPurpose::Append
-        } else {
-            OpenPurpose::Read
-        };
-        let (file, _) = self.open_from(&parent_directory, purpose)?;
-        validate_feedback_file_for_use(&file)?;
-        Ok(file)
+        {
+            after_parent_opened();
+            let purpose = if append {
+                OpenPurpose::Append
+            } else {
+                OpenPurpose::Read
+            };
+            let file = self.open_fallback(purpose)?;
+            validate_feedback_file_for_use(&file)?;
+            return Ok(file);
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let parent_directory = open_or_create_storage_parent(&self.file_path)?;
+            validate_storage_directory_for_use(&parent_directory)?;
+            after_parent_opened();
+            let purpose = if append {
+                OpenPurpose::Append
+            } else {
+                OpenPurpose::Read
+            };
+            let (file, _) = self.open_from(&parent_directory, purpose)?;
+            validate_feedback_file_for_use(&file)?;
+            Ok(file)
+        }
     }
 
     #[cfg(test)]
@@ -342,7 +419,7 @@ impl FeedbackLogger {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn open_from(&self, _parent: &File, purpose: OpenPurpose) -> Result<(File, bool)> {
+    fn open_fallback(&self, purpose: OpenPurpose) -> Result<File> {
         let mut options = OpenOptions::new();
         options.read(true);
         if purpose == OpenPurpose::Append {
@@ -350,11 +427,10 @@ impl FeedbackLogger {
         } else if purpose == OpenPurpose::Initialize {
             options.write(true).create(true);
         }
-        let existed = self.file_path.try_exists()?;
         let file = options
             .open(&self.file_path)
             .context("Failed to open private feedback log")?;
-        Ok((file, !existed))
+        Ok(file)
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -505,12 +581,22 @@ fn trusted_storage_root(parent: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn open_fallback_storage_parent(file_path: &Path) -> Result<File> {
+fn ensure_fallback_private_storage(file_path: &Path) -> Result<()> {
     let parent = file_path
         .parent()
         .context("Private feedback log has no parent directory")?;
     fs::create_dir_all(parent).context("Failed to create private feedback directory")?;
-    File::open(parent).context("Failed to open private feedback directory")
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(file_path)
+        .context("Failed to open private feedback log")?;
+    validate_feedback_file(&file)?;
+    make_object_private(&file, "private feedback log", 0o600)?;
+    validate_feedback_file_for_use(&file)?;
+    file.sync_all()
+        .context("Failed to sync private feedback log")
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -726,6 +812,27 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::unix::fs::symlink;
     use std::process::Command;
+
+    fn quota_test_entry() -> FeedbackEntry {
+        FeedbackEntry {
+            timestamp: 1,
+            query: "quota-query".into(),
+            response: "quota-response".into(),
+            rating: FeedbackRating::Good,
+            weight: 1.0,
+            note: None,
+        }
+    }
+
+    fn fill_feedback_file_to(path: &Path, length: u64) {
+        let mut file = OpenOptions::new().write(true).open(path).unwrap();
+        file.set_len(length).unwrap();
+        if length > 0 {
+            file.seek(SeekFrom::Start(length - 1)).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        file.sync_all().unwrap();
+    }
 
     #[test]
     fn test_feedback_rating_weights() {
@@ -1044,6 +1151,154 @@ mod tests {
     }
 
     #[test]
+    fn test_feedback_append_reaches_quota_then_rejects_without_changing_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".finch/feedback.jsonl");
+        let logger = FeedbackLogger::at(&path).unwrap();
+        let entry = quota_test_entry();
+        let encoded_len = serde_json::to_vec(&entry).unwrap().len() as u64 + 1;
+        fill_feedback_file_to(&path, FEEDBACK_LOG_MAX_BYTES - encoded_len);
+
+        logger.log(&entry).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), FEEDBACK_LOG_MAX_BYTES);
+        let bytes_at_quota = fs::read(&path).unwrap();
+
+        let error = logger.log(&entry).unwrap_err();
+        assert!(error.downcast_ref::<FeedbackQuotaExceeded>().is_some());
+        assert_eq!(fs::read(&path).unwrap(), bytes_at_quota);
+    }
+
+    #[test]
+    fn test_torn_feedback_at_record_boundary_accounts_for_separator_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".finch/feedback.jsonl");
+        let logger = FeedbackLogger::at(&path).unwrap();
+        let entry = quota_test_entry();
+        let encoded_len = serde_json::to_vec(&entry).unwrap().len() as u64 + 1;
+        fill_feedback_file_to(&path, FEEDBACK_LOG_MAX_BYTES - encoded_len);
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.write_all(b"x").unwrap();
+        file.sync_all().unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let error = logger.log(&entry).unwrap_err();
+        assert!(error.downcast_ref::<FeedbackQuotaExceeded>().is_some());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn test_feedback_quota_arithmetic_overflow_is_rejected() {
+        let error = checked_feedback_final_len(u64::MAX, 1, 1).unwrap_err();
+        assert!(error.downcast_ref::<FeedbackQuotaExceeded>().is_some());
+    }
+
+    #[test]
+    fn test_oversized_preexisting_feedback_rejects_append_untouched_and_redacted() {
+        let temp = tempfile::tempdir().unwrap();
+        let sensitive = temp.path().join("customer-secret-project/feedback.jsonl");
+        let logger = FeedbackLogger::at(&sensitive).unwrap();
+        fill_feedback_file_to(&sensitive, FEEDBACK_LOG_MAX_BYTES + 1);
+        let before = fs::read(&sensitive).unwrap();
+
+        let error = logger.log(&quota_test_entry()).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(error.downcast_ref::<FeedbackQuotaExceeded>().is_some());
+        assert_eq!(
+            fs::metadata(&sensitive).unwrap().len(),
+            FEEDBACK_LOG_MAX_BYTES + 1
+        );
+        assert_eq!(fs::read(&sensitive).unwrap(), before);
+        assert!(!rendered.contains("customer-secret-project"));
+        assert!(!rendered.contains(temp.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn test_load_all_rejects_oversized_feedback_with_bounded_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".finch/feedback.jsonl");
+        let logger = FeedbackLogger::at(&path).unwrap();
+        fill_feedback_file_to(&path, FEEDBACK_LOG_MAX_BYTES + 1);
+
+        let error = logger.load_all().unwrap_err();
+        assert!(error.downcast_ref::<FeedbackQuotaExceeded>().is_some());
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            FEEDBACK_LOG_MAX_BYTES + 1
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_load_all_sentinel_rejects_growth_after_metadata_check() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".finch/feedback.jsonl");
+        let logger = FeedbackLogger::at(&path).unwrap();
+        fs::write(&path, b"{}\n").unwrap();
+
+        let error = logger
+            .load_all_with_metadata_hook(|| {
+                fill_feedback_file_to(&path, FEEDBACK_LOG_MAX_BYTES + 1)
+            })
+            .unwrap_err();
+
+        assert!(error.downcast_ref::<FeedbackQuotaExceeded>().is_some());
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            FEEDBACK_LOG_MAX_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn test_process_locked_feedback_appends_cannot_race_quota() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".finch/feedback.jsonl");
+        FeedbackLogger::at(&path).unwrap();
+        let encoded_len = serde_json::to_vec(&quota_test_entry()).unwrap().len() as u64 + 1;
+        fill_feedback_file_to(&path, FEEDBACK_LOG_MAX_BYTES - encoded_len);
+        let outcomes = temp.path().join("outcomes");
+        fs::create_dir(&outcomes).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for process in 0..4 {
+            children.push(
+                Command::new(&executable)
+                    .args(["--exact", "feedback::tests::feedback_quota_child_writer"])
+                    .env("FINCH_FEEDBACK_QUOTA_CHILD_PATH", &path)
+                    .env(
+                        "FINCH_FEEDBACK_QUOTA_CHILD_OUTCOME",
+                        outcomes.join(process.to_string()),
+                    )
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+
+        let mut recorded = Vec::new();
+        for process in 0..4 {
+            recorded.push(fs::read_to_string(outcomes.join(process.to_string())).unwrap());
+        }
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|value| value.as_str() == "appended")
+                .count(),
+            1
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|value| value.as_str() == "quota")
+                .count(),
+            3
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), FEEDBACK_LOG_MAX_BYTES);
+    }
+
+    #[test]
     fn independent_processes_serialize_feedback_records() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(".finch/feedback.jsonl");
@@ -1083,6 +1338,22 @@ mod tests {
                     FeedbackRating::Good,
                 ))
                 .unwrap();
+        }
+    }
+
+    #[test]
+    fn feedback_quota_child_writer() {
+        let Ok(path) = std::env::var("FINCH_FEEDBACK_QUOTA_CHILD_PATH") else {
+            return;
+        };
+        let outcome = std::env::var("FINCH_FEEDBACK_QUOTA_CHILD_OUTCOME").unwrap();
+        let logger = FeedbackLogger::at(path).unwrap();
+        match logger.log(&quota_test_entry()) {
+            Ok(()) => fs::write(outcome, "appended").unwrap(),
+            Err(error) => {
+                assert!(error.downcast_ref::<FeedbackQuotaExceeded>().is_some());
+                fs::write(outcome, "quota").unwrap();
+            }
         }
     }
 }

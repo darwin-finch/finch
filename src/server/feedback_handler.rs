@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::feedback::{FeedbackEntry, FeedbackLogger};
+use crate::feedback::{FeedbackEntry, FeedbackLogger, FeedbackQuotaExceeded};
 
 /// Request body for /v1/feedback endpoint
 #[derive(Debug, Deserialize)]
@@ -94,6 +94,12 @@ pub async fn handle_feedback(
 }
 
 fn feedback_error_category(error: &anyhow::Error) -> &'static str {
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<FeedbackQuotaExceeded>().is_some())
+    {
+        return "quota-exceeded";
+    }
     let Some(io_error) = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<std::io::Error>())
@@ -165,6 +171,9 @@ mod tests {
             "/Users/customer/secret-project",
         ));
         assert_eq!(feedback_error_category(&io_error), "permission-denied");
+
+        let quota_error = anyhow::Error::new(FeedbackQuotaExceeded);
+        assert_eq!(feedback_error_category(&quota_error), "quota-exceeded");
     }
 
     #[tokio::test(start_paused = true)]

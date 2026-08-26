@@ -749,6 +749,7 @@ pub fn format_help() -> String {
          {reset}\n\
          {gray}  Aliases:{reset} /feedback critical|high|medium|good [note]\n\
          {gray}  Feedback is stored privately and never starts training.{reset}\n\
+         {gray}  Appends stop at 16 MiB; existing oversized files are preserved.{reset}\n\
          {gray}  Weights are metadata only; Finch does not use them for prioritization or training.{reset}\n\
          {gray}  Native training is not supported or enabled in this build.{reset}\n\
          {reset}\n\
@@ -1059,6 +1060,7 @@ mod tests {
         let help = format_help();
         assert!(help.contains("🎓 Private Feedback:"));
         assert!(help.contains("Feedback is stored privately and never starts training."));
+        assert!(help.contains("Appends stop at 16 MiB; existing oversized files are preserved."));
         assert!(help.contains(
             "Weights are metadata only; Finch does not use them for prioritization or training."
         ));
