@@ -91,6 +91,9 @@ jobs:
           exit 1
         fi
 
+    - name: Run tests behind the Brain production-store guard
+      run: ./scripts/test_brains.sh cargo test --lib --tests
+
   runtime-authority:
     name: Runtime Authority (Ubuntu)
     runs-on: ubuntu-24.04

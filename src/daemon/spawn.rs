@@ -126,7 +126,7 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
     #[cfg(target_family = "unix")]
     {
         use std::os::unix::process::CommandExt;
-        Command::new(&exe_path)
+        let child = Command::new(&exe_path)
             .arg("daemon")
             .arg("--bind")
             .arg(bind_address)
@@ -143,6 +143,7 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
             .process_group(0)
             .spawn()
             .with_context(|| format!("Failed to spawn daemon: {}", exe_path.display()))?;
+        register_isolated_child(child.id())?;
     }
 
     #[cfg(target_family = "windows")]
@@ -150,7 +151,7 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-        Command::new(&exe_path)
+        let child = Command::new(&exe_path)
             .arg("daemon")
             .arg("--bind")
             .arg(bind_address)
@@ -164,10 +165,43 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
             .stderr(Stdio::from(log_file))
             .spawn()
             .with_context(|| format!("Failed to spawn daemon: {}", exe_path.display()))?;
+        register_isolated_child(child.id())?;
     }
 
     debug!(log = %log_path.display(), "Daemon subprocess spawned, logs at {}", log_path.display());
     Ok(())
+}
+
+fn register_isolated_child(pid: u32) -> Result<()> {
+    let Some(path) = std::env::var_os("FINCH_TEST_PROCESS_REGISTRY").map(std::path::PathBuf::from)
+    else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        std::env::var_os("FINCH_BRAIN_TEST_ISOLATED").as_deref() == Some(std::ffi::OsStr::new("1")),
+        "test process registry requires the Brain isolation wrapper"
+    );
+    let home = dirs::home_dir()
+        .context("Cannot determine isolated HOME for process registration")?
+        .canonicalize()
+        .context("Cannot resolve isolated HOME for process registration")?;
+    let test_home = std::env::var_os("FINCH_BRAIN_TEST_HOME")
+        .map(std::path::PathBuf::from)
+        .context("Missing isolated HOME for process registration")?;
+    anyhow::ensure!(
+        test_home.canonicalize()? == home && path == home.join(".finch/owned-processes"),
+        "test process registry must be the wrapper-owned file"
+    );
+    anyhow::ensure!(
+        path.is_file() && !path.is_symlink(),
+        "test process registry must be an existing regular file"
+    );
+    use std::io::Write;
+    let mut registry = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .context("Failed to open isolated process registry")?;
+    writeln!(registry, "{pid} {pid}").context("Failed to register isolated daemon process")
 }
 
 /// Check if daemon health endpoint responds

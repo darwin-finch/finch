@@ -126,9 +126,9 @@ REPL appears in <100ms; model loads in the background. Queries forward to teache
 
 - **Interactive REPL:** `finch`
 - **Single query / pipe:** `finch query "..."` or `echo "..." | finch`
-- **Daemon (auto-spawned, OpenAI-compatible API):** `finch daemon --bind 127.0.0.1:11435`
-  - VS Code / Continue.dev: point at `http://localhost:11435`, provider = `openai`, model = `local`
-  - mDNS discovery: `finch daemon --bind 0.0.0.0:11435 --mdns`
+- **Daemon (auto-spawned, OpenAI-compatible API):** `finch daemon`
+  - Configure editor clients with the address printed by the owned daemon.
+  - Tests must use the isolated launchers and kernel-assigned endpoints.
 
 ## Technology Stack
 
@@ -196,10 +196,15 @@ fn load_config() -> Result<Config> {
 - **Stubs must have tests** confirming they return errors (not panic)
 
 ```bash
-cargo test                          # all tests
-cargo test --lib tools::permissions # specific module
-cargo test -- --nocapture           # with output
+./scripts/test_brains.sh cargo test                          # all tests
+./scripts/test_brains.sh cargo test --lib tools::permissions # specific module
+./scripts/test_brains.sh cargo test -- --nocapture           # with output
 ```
+
+Never launch Brain, daemon, server, TUI, or live tests directly. Use
+`scripts/test_brains.sh` or a launcher that re-executes through it. Test
+daemons must bind `127.0.0.1:0`, use a disposable HOME/socket, and be stopped
+by their exact owned PID; process-name killing is forbidden.
 
 ### Logging
 

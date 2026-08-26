@@ -5,7 +5,15 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 source "$repo_root/scripts/lib/brain_test_isolation.sh"
 
 scratch="$(mktemp -d "$(cd "${TMPDIR:-/tmp}" && pwd -P)/finch-brain-isolation-regression.XXXXXX")"
-trap 'rm -rf -- "$scratch"' EXIT
+sentinel_pid=''
+cleanup_regression() {
+  if [[ -n "$sentinel_pid" ]]; then
+    kill -TERM "$sentinel_pid" 2>/dev/null || true
+    wait "$sentinel_pid" 2>/dev/null || true
+  fi
+  rm -rf -- "$scratch"
+}
+trap cleanup_regression EXIT
 fake_home="$scratch/real-home"
 temp_parent="$scratch/temp-homes"
 mkdir -p "$fake_home/.finch/brains/existing" "$temp_parent"
@@ -109,6 +117,46 @@ child_pid="$(cat "$child_pid_file")"
 ! kill -0 "$child_pid" 2>/dev/null
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
+failure_child_pid_file="$scratch/failure-child.pid"
+if FINCH_FAILURE_CHILD_PID_FILE="$failure_child_pid_file" run_isolated bash -c '
+  sleep 30 & echo $! >"$FINCH_FAILURE_CHILD_PID_FILE"
+  sleep 0.1
+  exit 27
+'; then
+  exit 1
+else
+  test "$?" -eq 27
+fi
+failure_child_pid="$(cat "$failure_child_pid_file")"
+! kill -0 "$failure_child_pid" 2>/dev/null
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+success_child_pid_file="$scratch/success-child.pid"
+FINCH_SUCCESS_CHILD_PID_FILE="$success_child_pid_file" run_isolated bash -c '
+  sleep 30 & echo $! >"$FINCH_SUCCESS_CHILD_PID_FILE"
+  sleep 0.1
+'
+success_child_pid="$(cat "$success_child_pid_file")"
+! kill -0 "$success_child_pid" 2>/dev/null
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+if command -v python3 >/dev/null 2>&1; then
+  detached_pid_file="$scratch/detached-child.pid"
+  if FINCH_DETACHED_PID_FILE="$detached_pid_file" run_isolated bash -c '
+    python3 -c '\''import os,time; os.setsid(); open(os.environ["FINCH_DETACHED_PID_FILE"], "w").write(str(os.getpid())); time.sleep(30)'\'' &
+    while [[ ! -s "$FINCH_DETACHED_PID_FILE" ]]; do sleep 0.01; done
+    sleep 0.1
+    exit 29
+  '; then
+    exit 1
+  else
+    test "$?" -eq 29
+  fi
+  detached_pid="$(cat "$detached_pid_file")"
+  ! kill -0 "$detached_pid" 2>/dev/null
+  test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+fi
+
 hostile_pid_file="$fake_home/.finch/brains/pid-file-sentinel"
 printf 'unchanged\n' >"$hostile_pid_file"
 FINCH_TEST_WRAPPER_PID_FILE="$hostile_pid_file" run_isolated true
@@ -135,10 +183,39 @@ else
 fi
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
-launchers=(demo_boot.sh smoke_vm_wire_provider.sh stress_test.sh test_persistence.sh test_server.sh test_tui_debug.sh)
+cleanup_bin="$scratch/cleanup-bin"; mkdir "$cleanup_bin"
+real_rm="$(command -v rm)"
+printf '%s\n' '#!/bin/bash' \
+  'if [[ "$*" == *finch-brain-test-home.* && ! -e "$FINCH_CLEANUP_SIGNAL_ONCE" ]]; then : >"$FINCH_CLEANUP_SIGNAL_ONCE"; kill -TERM "$PPID"; fi' \
+  'exec "$FINCH_REAL_RM" "$@"' >"$cleanup_bin/rm"
+chmod +x "$cleanup_bin/rm"
+if PATH="$cleanup_bin:$PATH" FINCH_REAL_RM="$real_rm" FINCH_CLEANUP_SIGNAL_ONCE="$scratch/cleanup-signal-once" run_isolated true; then
+  exit 1
+else
+  test "$?" -eq 143
+fi
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+launchers=(demo_boot.sh smoke_vm_wire_provider.sh stress_test.sh test_persistence.sh test_server.sh test_tool_passthrough.sh test_tui_debug.sh)
 for launcher in "${launchers[@]}"; do
   test -x "$repo_root/scripts/$launcher"
   rg -q 'brain_test_isolation_reexec_launcher' "$repo_root/scripts/$launcher"
+  launcher_probe="$scratch/probe-$launcher"
+  FINCH_TEST_LAUNCHER_PROBE_FILE="$launcher_probe" FINCH_TEST_LAUNCHER_PROBE_ONLY=1 run_isolated "$repo_root/scripts/$launcher"
+  [[ "$(cat "$launcher_probe")" == "$temp_parent"/finch-brain-test-home.* ]]
 done
+
+sentinel_pid_file="$scratch/unrelated-finch.pid"
+bash -c 'exec -a finch sleep 30' & sentinel_pid=$!
+printf '%s\n' "$sentinel_pid" >"$sentinel_pid_file"
+ps -o command= -p "$sentinel_pid" | rg -q '(^|[[:space:]])finch([[:space:]]|$)'
+mock_finch="$scratch/mock-finch"
+printf '%s\n' '#!/bin/bash' 'trap "exit 0" INT TERM HUP' 'while :; do sleep 1; done' >"$mock_finch"
+chmod +x "$mock_finch"
+FINCH_BIN="$mock_finch" run_isolated "$repo_root/scripts/test_tui_debug.sh" >/dev/null
+kill -0 "$sentinel_pid"
+kill -TERM "$sentinel_pid"
+wait "$sentinel_pid" 2>/dev/null || true
+sentinel_pid=''
 
 echo 'Brain test isolation regression checks passed.'

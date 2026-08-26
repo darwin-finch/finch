@@ -361,10 +361,10 @@ impl AgentServer {
             .layer(axum::middleware::from_fn_with_state(auth, auth_middleware))
             .layer(TraceLayer::new_for_http());
 
-        tracing::info!("Starting Finch agent server on {}", addr);
-
         // Start server — ConnectInfo requires into_make_service_with_connect_info
         // so handlers can read the peer's IP for auth logging.
+        publish_isolated_test_address(addr)?;
+        tracing::info!("Starting Finch agent server on {}", addr);
         let local_server = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -533,6 +533,39 @@ impl AgentServer {
             .first()
             .map(|slot| Arc::clone(&slot.provider))
     }
+}
+
+fn publish_isolated_test_address(bound_addr: SocketAddr) -> Result<()> {
+    let Some(path) = std::env::var_os("FINCH_TEST_BOUND_ADDR_FILE").map(std::path::PathBuf::from)
+    else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        std::env::var_os("FINCH_BRAIN_TEST_ISOLATED").as_deref() == Some(std::ffi::OsStr::new("1")),
+        "FINCH_TEST_BOUND_ADDR_FILE requires the Brain isolation wrapper"
+    );
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("test HOME is unavailable"))?;
+    let home = home.canonicalize()?;
+    let test_home = std::env::var_os("FINCH_BRAIN_TEST_HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("FINCH_BRAIN_TEST_HOME is unavailable"))?;
+    anyhow::ensure!(
+        test_home.canonicalize()? == home
+            && std::env::var_os("FINCH_BRAIN_TEST_ROOT").as_deref()
+                == Some(test_home.join(".finch/brains").as_os_str()),
+        "test address publication requires the isolated HOME contract"
+    );
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("test address file has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let parent = parent.canonicalize()?;
+    anyhow::ensure!(
+        path.is_absolute() && parent.starts_with(&home),
+        "test address file must be inside the isolated HOME"
+    );
+    std::fs::write(path, bound_addr.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -814,6 +847,129 @@ mod tests {
 
         serving.abort();
         let _ = serving.await;
+    }
+
+    fn isolated_http_server() -> (tempfile::TempDir, Arc<AgentServer>) {
+        let state = tempfile::tempdir().unwrap();
+        let credentials = crate::brain::credential::BrainCredentialAuthority::load_or_create(
+            &state.path().join("credentials"),
+        )
+        .unwrap();
+        let server =
+            AgentServer::for_brain_http_test("test.local", state.path(), credentials).unwrap();
+        (state, Arc::new(server))
+    }
+
+    fn isolated_http_router(server: Arc<AgentServer>) -> axum::Router {
+        crate::server::handlers::create_router(server)
+            .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
+    }
+
+    #[tokio::test]
+    async fn production_router_health_is_hermetic() {
+        use tower::ServiceExt as _;
+        let (_state, server) = isolated_http_server();
+        let response = isolated_http_router(server)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn production_router_rejects_malformed_and_oversized_messages() {
+        use tower::ServiceExt as _;
+        let (_state, server) = isolated_http_server();
+        let malformed = isolated_http_router(Arc::clone(&server))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"bad": json"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(malformed.status().as_u16(), 400 | 422));
+
+        let oversized = isolated_http_router(server)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("0".repeat(5 * 1024 * 1024)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            oversized.status(),
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn production_constructor_persists_named_brain_only_in_isolated_home() {
+        assert_eq!(
+            std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref(),
+            Ok("1")
+        );
+        let home = std::path::PathBuf::from(
+            std::env::var_os("HOME").expect("Brain tests require scripts/test_brains.sh"),
+        );
+        let expected_root = std::path::PathBuf::from(
+            std::env::var_os("FINCH_BRAIN_TEST_ROOT")
+                .expect("Brain tests require an explicit isolated root"),
+        );
+        assert_eq!(expected_root, home.join(".finch/brains"));
+
+        let config =
+            crate::config::Config::with_providers(vec![crate::config::ProviderEntry::Claude {
+                api_key: "isolated-constructor-test".into(),
+                model: None,
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: Some("isolated-constructor-test".into()),
+            }]);
+        let generator_state = Arc::new(RwLock::new(GeneratorState::NotAvailable));
+        let server = AgentServer::new(
+            config,
+            ServerConfig::default(),
+            ClaudeClient::new("isolated-constructor-test".to_string()).unwrap(),
+            Router::new(crate::models::ThresholdRouter::new()),
+            MetricsLogger::new(home.join(".finch/constructor-metrics")).unwrap(),
+            Arc::new(RwLock::new(LocalGenerator::new())),
+            Arc::new(BootstrapLoader::new(Arc::clone(&generator_state), None)),
+            generator_state,
+            Arc::new(TrainingCoordinator::with_queue_path(
+                4,
+                4,
+                false,
+                home.join(".finch/constructor-training.jsonl"),
+            )),
+            Vec::new(),
+        )
+        .unwrap();
+        let name = format!("constructor-boundary-{}", uuid::Uuid::new_v4().simple());
+        server
+            .brain_store()
+            .push(
+                &name,
+                "isolation-test",
+                crate::brain::store::BrainEventKind::Prompt {
+                    text: "boundary proof".into(),
+                },
+            )
+            .unwrap();
+        assert!(expected_root.join(name).join("events.jsonl").is_file());
     }
 
     #[test]

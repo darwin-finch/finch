@@ -72,7 +72,90 @@ brain_manifest_summary() {
   printf 'bytes=%s sha256=%s' "$bytes" "$digest"
 }
 
+brain_isolation_record_process() {
+  local registry="$1" pid="$2" pgid="$3"
+  [[ "$pid" =~ ^[0-9]+$ && "$pgid" =~ ^[0-9]+$ ]] || return 0
+  printf '%s %s\n' "$pid" "$pgid" >>"$registry"
+}
+
+brain_test_isolation_register_owned_pid() {
+  local pid="$1" pgid
+  [[ -n "${FINCH_TEST_PROCESS_REGISTRY:-}" ]] || return 0
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [[ -n "$pgid" ]] || return 0
+  brain_isolation_record_process "$FINCH_TEST_PROCESS_REGISTRY" "$pid" "$pgid"
+}
+
+brain_isolation_record_descendants() {
+  local registry="$1" root_pid="$2"
+  ps -eo pid=,ppid=,pgid= 2>/dev/null | awk -v root="$root_pid" '
+    { pid[NR]=$1; parent[NR]=$2; group[NR]=$3 }
+    END {
+      owned[root]=1
+      changed=1
+      while (changed) {
+        changed=0
+        for (i=1; i<=NR; i++) {
+          if (owned[parent[i]] && !owned[pid[i]]) {
+            owned[pid[i]]=1
+            changed=1
+          }
+        }
+      }
+      for (i=1; i<=NR; i++) if (owned[pid[i]]) print pid[i], group[i]
+    }
+  ' >>"$registry"
+}
+
+brain_isolation_monitor_descendants() {
+  local registry="$1" root_pid="$2" stop_file="$3"
+  while [[ ! -e "$stop_file" ]]; do
+    brain_isolation_record_descendants "$registry" "$root_pid"
+    sleep 0.02
+  done
+  brain_isolation_record_descendants "$registry" "$root_pid"
+}
+
+brain_isolation_terminate_owned() {
+  local registry="$1" own_pgid pid pgid attempt
+  [[ -f "$registry" ]] || return 0
+  own_pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+
+  # Signal exact recorded groups first so descendants that changed parent remain
+  # covered. Never signal the wrapper's own group.
+  while read -r pgid; do
+    [[ -n "$pgid" && "$pgid" != "$own_pgid" ]] || continue
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+  done < <(awk '{print $2}' "$registry" | LC_ALL=C sort -u)
+  while read -r pid; do
+    [[ -n "$pid" && "$pid" != "$$" ]] || continue
+    kill -TERM -- "$pid" 2>/dev/null || true
+  done < <(awk '{print $1}' "$registry" | LC_ALL=C sort -u)
+
+  attempt=0
+  while [[ "$attempt" -lt 20 ]]; do
+    local alive=0
+    while read -r pid; do
+      [[ -n "$pid" && "$pid" != "$$" ]] || continue
+      if kill -0 -- "$pid" 2>/dev/null; then alive=1; break; fi
+    done < <(awk '{print $1}' "$registry" | LC_ALL=C sort -u)
+    [[ "$alive" -eq 1 ]] || break
+    sleep 0.05
+    attempt=$((attempt + 1))
+  done
+
+  while read -r pgid; do
+    [[ -n "$pgid" && "$pgid" != "$own_pgid" ]] || continue
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+  done < <(awk '{print $2}' "$registry" | LC_ALL=C sort -u)
+  while read -r pid; do
+    [[ -n "$pid" && "$pid" != "$$" ]] || continue
+    kill -KILL -- "$pid" 2>/dev/null || true
+  done < <(awk '{print $1}' "$registry" | LC_ALL=C sort -u)
+}
+
 brain_test_isolation_run() (
+  set +e
   set -uo pipefail
   [[ "$#" -gt 0 ]] || { echo 'brain_test_isolation_run requires a command' >&2; exit 64; }
 
@@ -97,14 +180,19 @@ brain_test_isolation_run() (
     echo 'Brain test isolation rejects a temporary parent related to the real Brain store' >&2; exit 64
   fi
 
-  local before_manifest after_manifest isolated_home child_pid='' pending_signal=''
+  local before_manifest after_manifest isolated_home child_pid='' child_pgid=''
+  local monitor_pid='' process_registry='' monitor_stop='' pending_signal=''
   before_manifest="$(mktemp "$temp_parent/finch-brain-manifest-before.XXXXXX")" || exit 74
   early_cleanup() {
     local status="$1"
-    trap - EXIT INT TERM HUP
+    trap '' INT TERM HUP
+    [[ -z "${monitor_stop:-}" ]] || : >"$monitor_stop"
+    [[ -z "${monitor_pid:-}" ]] || wait "$monitor_pid" 2>/dev/null || true
+    [[ -z "${process_registry:-}" ]] || brain_isolation_terminate_owned "$process_registry"
     [[ -z "${isolated_home:-}" ]] || rm -rf -- "$isolated_home"
     [[ -z "${before_manifest:-}" ]] || rm -f -- "$before_manifest"
     [[ -z "${after_manifest:-}" ]] || rm -f -- "$after_manifest"
+    trap - EXIT INT TERM HUP
     exit "$status"
   }
   trap 'early_cleanup $?' EXIT
@@ -113,12 +201,13 @@ brain_test_isolation_run() (
   trap 'early_cleanup 129' HUP
   after_manifest="$(mktemp "$temp_parent/finch-brain-manifest-after.XXXXXX")" || { rm -f -- "$before_manifest"; exit 74; }
   isolated_home="$(mktemp -d "$temp_parent/finch-brain-test-home.XXXXXX")" || { rm -f -- "$before_manifest" "$after_manifest"; exit 74; }
+  process_registry="$isolated_home/.finch/owned-processes"
+  monitor_stop="$isolated_home/.finch/process-monitor.stop"
 
   forward_signal() {
     pending_signal="$1"
     if [[ -n "$child_pid" ]]; then kill -"$1" -- "-$child_pid" 2>/dev/null || kill -"$1" "$child_pid" 2>/dev/null || true; fi
   }
-  trap - EXIT
   trap 'forward_signal INT' INT; trap 'forward_signal TERM' TERM; trap 'forward_signal HUP' HUP
 
   if ! brain_store_manifest "$real_store" >"$before_manifest"; then
@@ -129,16 +218,26 @@ brain_test_isolation_run() (
   mkdir -p "$isolated_home/.finch/brains" || {
     rm -rf -- "$isolated_home"; rm -f -- "$before_manifest" "$after_manifest"; exit 74
   }
+  : >"$process_registry" || exit 74
   local isolation_token="${RANDOM:-0}:$$:$(basename "$isolated_home")"
   if [[ -z "${RUSTUP_HOME:-}" && -d "$real_home/.rustup" ]]; then export RUSTUP_HOME="$real_home/.rustup"; fi
   if [[ -z "${CARGO_HOME:-}" && -d "$real_home/.cargo" ]]; then export CARGO_HOME="$real_home/.cargo"; fi
   export HOME="$isolated_home" FINCH_BRAIN_TEST_HOME="$isolated_home" FINCH_BRAIN_TEST_ROOT="$isolated_home/.finch/brains"
+  export FINCH_TEST_IPC_SOCKET="$isolated_home/.finch/daemon.sock"
   export FINCH_BRAIN_TEST_ISOLATED=1 FINCH_BRAIN_TEST_TOKEN="$isolation_token" FINCH_BRAIN_TEST_PROOF_FD=9 FINCH_TEST_TMP_PARENT="$temp_parent" FINCH_TEST_REAL_HOME="$real_home"
+  export FINCH_TEST_PROCESS_REGISTRY="$process_registry"
   exec 9< <(printf '%s\n' "$isolation_token")
 
   set -m; "$@" & child_pid=$!; set +m
+  child_pgid="$(ps -o pgid= -p "$child_pid" 2>/dev/null | tr -d ' ')"
+  [[ -z "$child_pgid" ]] || brain_isolation_record_process "$process_registry" "$child_pid" "$child_pgid"
+  brain_isolation_monitor_descendants "$process_registry" "$child_pid" "$monitor_stop" & monitor_pid=$!
   local command_status=0
   wait "$child_pid" || command_status=$?
+  : >"$monitor_stop"
+  wait "$monitor_pid" 2>/dev/null || true
+  monitor_pid=''
+  brain_isolation_terminate_owned "$process_registry"
   exec 9<&-
   if [[ -n "$pending_signal" ]]; then
     local attempts=0
@@ -147,7 +246,6 @@ brain_test_isolation_run() (
     case "$pending_signal" in INT) command_status=130 ;; TERM) command_status=143 ;; HUP) command_status=129 ;; esac
   fi
 
-  trap - INT TERM HUP
   local guard_status=0
   if ! brain_store_manifest "$real_store" >"$after_manifest"; then
     echo 'ERROR: could not snapshot the real Brain store after the isolated command' >&2; guard_status=74
@@ -160,7 +258,11 @@ brain_test_isolation_run() (
     rm -rf -- "$isolated_home" || guard_status=74
   fi
   rm -f -- "$before_manifest" "$after_manifest" || guard_status=74
+  trap '' INT TERM HUP
+  trap - EXIT
   [[ "$guard_status" -eq 0 ]] || exit "$guard_status"
+  case "$pending_signal" in INT) command_status=130 ;; TERM) command_status=143 ;; HUP) command_status=129 ;; esac
+  trap - INT TERM HUP
   exit "$command_status"
 )
 
@@ -181,7 +283,10 @@ brain_test_isolation_is_active() {
 brain_test_isolation_reexec_launcher() {
   local launcher="$1" repo_root; shift
   if brain_test_isolation_is_active; then
-    if [[ -n "${FINCH_TEST_LAUNCHER_PROBE_FILE:-}" ]]; then printf '%s\n' "$HOME" >"$FINCH_TEST_LAUNCHER_PROBE_FILE"; fi
+    if [[ -n "${FINCH_TEST_LAUNCHER_PROBE_FILE:-}" ]]; then
+      printf '%s\n' "$HOME" >"$FINCH_TEST_LAUNCHER_PROBE_FILE"
+      [[ "${FINCH_TEST_LAUNCHER_PROBE_ONLY:-}" != 1 ]] || exit 0
+    fi
     return 0
   fi
   repo_root="$(cd "$(dirname "$launcher")/.." && pwd -P)" || exit 64

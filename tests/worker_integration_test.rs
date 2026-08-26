@@ -7,10 +7,9 @@
 // are tested WITHOUT a running daemon: we build a minimal Axum Router
 // containing only those handlers and drive it with tower::ServiceExt::oneshot().
 //
-// Tests that require State<Arc<AgentServer>> (health_check, the /v1/messages
-// body-size guards) are tested against a real daemon on 127.0.0.1:11435.
-// Those tests detect whether the daemon is available and skip gracefully
-// if it is not, so CI never fails because of a missing daemon.
+// Stateful HTTP and binary lifecycle coverage lives in
+// daemon_integration_test.rs, where each case owns a disposable HOME and a
+// kernel-assigned endpoint. This file never discovers or contacts a daemon.
 
 use axum::{
     body::Body,
@@ -19,7 +18,6 @@ use axum::{
     Router,
 };
 use serde_json::Value;
-use std::time::Duration;
 use tower::ServiceExt; // provides .oneshot()
 
 // ---------------------------------------------------------------------------
@@ -33,35 +31,6 @@ fn node_test_router() -> Router {
     Router::new()
         .route("/v1/node/info", get(handle_node_info))
         .route("/v1/node/stats", get(handle_node_stats))
-}
-
-/// Returns true when a finch daemon is accepting connections on the default port.
-async fn daemon_is_available() -> bool {
-    reqwest::Client::builder()
-        .timeout(Duration::from_millis(500))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
-        .get("http://127.0.0.1:11435/health")
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
-}
-
-/// Return the bearer token used by the locally configured daemon, if model
-/// endpoint authentication is enabled. These tests intentionally exercise
-/// request parsing *after* authentication: rejecting an unauthenticated body
-/// before parsing it is the desired DoS-resistant server behavior.
-fn daemon_authorization() -> Option<Option<String>> {
-    let config = finch::config::load_config().ok()?;
-    if !config.server.auth_enabled {
-        return Some(None);
-    }
-    config
-        .server
-        .api_keys
-        .first()
-        .map(|key| Some(format!("Bearer {key}")))
 }
 
 /// Convenience wrapper: GET a path on the node_test_router via oneshot.
@@ -249,130 +218,6 @@ async fn test_concurrent_foreign_requests() {
         success_count, CONCURRENCY,
         "all {CONCURRENCY} concurrent requests must return 200"
     );
-}
-
-// ---------------------------------------------------------------------------
-// Daemon-based tests (require a running daemon on 127.0.0.1:11435)
-// ---------------------------------------------------------------------------
-
-/// /health must return 200 with {"status": "healthy", ...}.
-#[tokio::test]
-async fn test_health_endpoint() {
-    if !daemon_is_available().await {
-        println!("Skipping test_health_endpoint: no daemon running on 127.0.0.1:11435");
-        return;
-    }
-
-    let resp = reqwest::Client::new()
-        .get("http://127.0.0.1:11435/health")
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .expect("request failed");
-
-    assert!(
-        resp.status().is_success(),
-        "/health should return 2xx; got {}",
-        resp.status()
-    );
-
-    let json: Value = resp.json().await.expect("body is not JSON");
-    assert_eq!(
-        json["status"].as_str(),
-        Some("healthy"),
-        "health.status must be 'healthy'; got: {json}"
-    );
-}
-
-/// POST /v1/messages with syntactically invalid JSON must return 422
-/// (Axum's JSON extractor returns 422 Unprocessable Entity for parse errors).
-/// A 400 Bad Request is also acceptable if the router rejects before parsing.
-#[tokio::test]
-async fn test_malformed_json_rejected() {
-    if !daemon_is_available().await {
-        println!("Skipping test_malformed_json_rejected: no daemon running on 127.0.0.1:11435");
-        return;
-    }
-
-    let Some(authorization) = daemon_authorization() else {
-        // An authenticated daemon without a local configured key is not a
-        // usable test target. Do not weaken the endpoint just for this test.
-        println!("Skipping test_malformed_json_rejected: daemon API key unavailable");
-        return;
-    };
-
-    let client = reqwest::Client::new();
-    let mut request = client
-        .post("http://127.0.0.1:11435/v1/messages")
-        .header("Content-Type", "application/json")
-        .body(r#"{"bad": json"#); // deliberately broken JSON
-    if let Some(authorization) = authorization {
-        request = request.header("Authorization", authorization);
-    }
-    let resp = request
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .expect("request failed");
-
-    let status = resp.status().as_u16();
-    assert!(
-        status == 400 || status == 422,
-        "malformed JSON should return 400 or 422, got {status}"
-    );
-}
-
-/// POST /v1/messages with a body larger than 4 MB must be rejected.
-/// Axum's DefaultBodyLimit either returns 413 or resets the connection —
-/// both are acceptable rejection behaviors.
-#[tokio::test]
-async fn test_oversized_payload_rejected() {
-    if !daemon_is_available().await {
-        println!("Skipping test_oversized_payload_rejected: no daemon running on 127.0.0.1:11435");
-        return;
-    }
-
-    let Some(authorization) = daemon_authorization() else {
-        println!("Skipping test_oversized_payload_rejected: daemon API key unavailable");
-        return;
-    };
-
-    // 5 MB of ASCII zeroes — well above the 4 MB limit
-    let oversized_body = "0".repeat(5 * 1024 * 1024);
-
-    let client = reqwest::Client::new();
-    let mut request = client
-        .post("http://127.0.0.1:11435/v1/messages")
-        .header("Content-Type", "application/json")
-        .body(oversized_body);
-    if let Some(authorization) = authorization {
-        request = request.header("Authorization", authorization);
-    }
-    let result = request
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await;
-
-    match result {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            assert!(
-                status == 413 || status == 400,
-                "5 MB body should be rejected with 413 or 400, got {status}"
-            );
-        }
-        Err(e) => {
-            // Axum may reset the connection rather than sending 413 — acceptable
-            let msg = e.to_string();
-            assert!(
-                msg.contains("connection")
-                    || msg.contains("reset")
-                    || msg.contains("closed")
-                    || msg.contains("BodyWrite"),
-                "unexpected error for oversized payload: {e}"
-            );
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

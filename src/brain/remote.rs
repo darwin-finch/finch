@@ -2170,6 +2170,52 @@ fn unix_epoch_millis() -> u64 {
 mod tests {
     use super::*;
 
+    fn isolated_live_brain_target(brain: &str) -> RemoteBrainTarget {
+        assert_eq!(
+            std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref(),
+            Ok("1")
+        );
+        let address = std::env::var("FINCH_TEST_BRAIN_ADDR")
+            .expect("FINCH_TEST_BRAIN_ADDR must name the owned ephemeral Brain listener");
+        let socket: std::net::SocketAddr = address.parse().expect("invalid test Brain address");
+        assert!(socket.ip().is_loopback() && socket.port() != 0);
+        assert_ne!(socket.port(), DEFAULT_BRAIN_PORT);
+        RemoteBrainTarget::parse(&format!("{brain}@{address}")).unwrap()
+    }
+
+    fn isolated_live_daemon_address() -> String {
+        assert_eq!(
+            std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref(),
+            Ok("1")
+        );
+        let address = std::env::var("FINCH_TEST_DAEMON_ADDR")
+            .expect("FINCH_TEST_DAEMON_ADDR must name the owned ephemeral daemon");
+        let socket: std::net::SocketAddr = address.parse().expect("invalid test daemon address");
+        assert!(socket.ip().is_loopback() && socket.port() != 0);
+        assert_ne!(address, crate::config::constants::DEFAULT_DAEMON_ADDR);
+        address
+    }
+
+    fn isolated_live_password() -> String {
+        std::env::var("FINCH_TEST_BRAIN_PASSWORD")
+            .expect("FINCH_TEST_BRAIN_PASSWORD must match the isolated daemon fixture")
+    }
+
+    async fn connect_isolated_live_ipc() -> crate::ipc::IpcClient {
+        let path = std::env::var_os("FINCH_TEST_IPC_SOCKET")
+            .map(std::path::PathBuf::from)
+            .expect("FINCH_TEST_IPC_SOCKET must name the owned daemon socket");
+        let home = std::env::var_os("FINCH_BRAIN_TEST_HOME")
+            .map(std::path::PathBuf::from)
+            .expect("FINCH_BRAIN_TEST_HOME is required");
+        let parent = path.parent().expect("test IPC socket has no parent");
+        assert!(parent
+            .canonicalize()
+            .unwrap()
+            .starts_with(home.canonicalize().unwrap()));
+        crate::ipc::IpcClient::connect_path(path).await.unwrap()
+    }
+
     #[test]
     fn issued_intervals_allow_skew_and_use_endpoint_defaults() {
         let now = 1_000_000;
@@ -2304,9 +2350,9 @@ mod tests {
 
     #[test]
     fn bare_name_can_resolve_through_the_local_daemon() {
-        let target = RemoteBrainTarget::local("review", "http://127.0.0.1:11435").unwrap();
+        let target = RemoteBrainTarget::local("review", "http://127.0.0.1:32123").unwrap();
         assert_eq!(target.brain, "review");
-        assert_eq!(target.address, "127.0.0.1:11435");
+        assert_eq!(target.address, "127.0.0.1:32123");
         assert!(!target.secure);
     }
 
@@ -3382,7 +3428,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a running Finch daemon on the default loopback port"]
+    #[ignore = "requires an owned listener at FINCH_TEST_BRAIN_ADDR"]
     fn live_remote_creation_is_explicit_and_environment_owned() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3390,10 +3436,8 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let brain = format!("codex-create-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-            let target =
-                RemoteBrainTarget::parse(&format!("{brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}"))
-                    .unwrap();
-            let client = RemoteBrainClient::new(target, "loopback").unwrap();
+            let target = isolated_live_brain_target(&brain);
+            let client = RemoteBrainClient::new(target, isolated_live_password()).unwrap();
             let created = client.create().await.unwrap();
             assert_eq!(created.name, brain);
             assert_eq!(created.revision, 0);
@@ -3404,12 +3448,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a running Finch daemon on the default loopback port"]
+    #[ignore = "requires an owned listener at FINCH_TEST_BRAIN_ADDR"]
     async fn live_invitation_issues_redeems_attaches_and_cannot_be_replayed() {
         let brain = format!("codex-invite-live-{}", uuid::Uuid::new_v4());
-        let target =
-            RemoteBrainTarget::parse(&format!("{brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}")).unwrap();
-        let owner = RemoteBrainClient::new(target.clone(), "loopback").unwrap();
+        let target = isolated_live_brain_target(&brain);
+        let owner =
+            RemoteBrainClient::new(target.clone(), isolated_live_password()).unwrap();
         owner.create().await.unwrap();
         let (invitation, _) = owner
             .issue_invitation(AttachmentRole::Observer, Some(60_000))
@@ -4559,12 +4603,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a running Finch daemon on the default loopback port"]
+    #[ignore = "requires an owned listener at FINCH_TEST_BRAIN_ADDR"]
     async fn live_remote_binary_session_attaches_submits_acknowledges_and_detaches() {
         let brain = format!("codex-remote-binary-smoke-{}", uuid::Uuid::new_v4());
-        let target =
-            RemoteBrainTarget::parse(&format!("{brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}")).unwrap();
-        let mut client = RemoteBrainClient::new(target, "loopback").unwrap();
+        let target = isolated_live_brain_target(&brain);
+        let mut client = RemoteBrainClient::new(target, isolated_live_password()).unwrap();
 
         client
             .attach("codex-smoke@localhost", AttachmentRole::Driver, None)
@@ -4629,21 +4672,21 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a running Finch daemon on the default loopback port"]
+    #[ignore = "requires an owned listener at FINCH_TEST_BRAIN_ADDR"]
     async fn live_remote_attachment_credential_cannot_claim_a_sibling_connection() {
         let brain = format!(
             "remote-auth-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         );
-        let target =
-            RemoteBrainTarget::parse(&format!("{brain}@127.0.0.1:{DEFAULT_BRAIN_PORT}")).unwrap();
+        let target = isolated_live_brain_target(&brain);
         let subject = "same-subject@localhost";
-        let mut first = RemoteBrainClient::new(target.clone(), "loopback").unwrap();
+        let mut first =
+            RemoteBrainClient::new(target.clone(), isolated_live_password()).unwrap();
         let first_attachment = first
             .attach(subject, AttachmentRole::Driver, None)
             .await
             .unwrap();
-        let mut second = RemoteBrainClient::new(target, "loopback").unwrap();
+        let mut second = RemoteBrainClient::new(target, isolated_live_password()).unwrap();
         second
             .attach(subject, AttachmentRole::Driver, None)
             .await
@@ -4666,7 +4709,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a running Finch daemon on the default local IPC and HTTP endpoints"]
+    #[ignore = "requires explicitly owned IPC and HTTP endpoints"]
     fn live_local_and_remote_transports_produce_equivalent_lifecycle() {
         use crate::brain::store::{BrainRunKind, BrainRunStatus};
         use crate::ipc::brain_codec::{BrainRemoteCommandKind, BrainRemoteReply};
@@ -4696,7 +4739,7 @@ mod tests {
             let local_brain = format!("codex-conformance-local-{suffix}");
             let remote_brain = format!("codex-conformance-remote-{suffix}");
 
-            let ipc = crate::ipc::IpcClient::connect().await.unwrap();
+            let ipc = connect_isolated_live_ipc().await;
             let local_attachment = ipc
                 .brain_attach(
                     &local_brain,
@@ -4737,9 +4780,9 @@ mod tests {
             ipc.brain_detach(&local_brain, &local_ack).await.unwrap();
             let local_snapshot = ipc.brain_snapshot(&local_brain).await.unwrap();
 
-            let daemon_address = crate::config::constants::DEFAULT_DAEMON_ADDR;
-            let owner_password = crate::config::load_config().unwrap().server.brain_password;
-            let target = RemoteBrainTarget::local(&remote_brain, daemon_address).unwrap();
+            let daemon_address = isolated_live_daemon_address();
+            let owner_password = isolated_live_password();
+            let target = RemoteBrainTarget::local(&remote_brain, &daemon_address).unwrap();
             let owner = RemoteBrainClient::new(target.clone(), owner_password.clone()).unwrap();
             owner.create().await.unwrap();
             let (invitation, _) = owner
@@ -4799,7 +4842,7 @@ mod tests {
             drop(local_events);
             drop(remote_events);
             owner.archive("conformance@localhost").await.unwrap();
-            let local_target = RemoteBrainTarget::local(&local_brain, daemon_address).unwrap();
+            let local_target = RemoteBrainTarget::local(&local_brain, &daemon_address).unwrap();
             RemoteBrainClient::new(local_target, owner_password)
                 .unwrap()
                 .archive("conformance@localhost")
@@ -4809,7 +4852,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a running Finch daemon on the default local IPC and HTTP endpoints"]
+    #[ignore = "requires explicitly owned IPC and HTTP endpoints"]
     fn live_addressed_handoff_moves_program_dispatch_to_the_target_runner() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4820,7 +4863,7 @@ mod tests {
             let brain = format!("codex-handoff-live-{}", uuid::Uuid::new_v4());
             let source_subject = "codex-source/frontend-live";
             let target_subject = "codex-target/frontend-live";
-            let ipc = crate::ipc::IpcClient::connect().await.unwrap();
+            let ipc = connect_isolated_live_ipc().await;
             let snapshot = ipc.brain_snapshot(&brain).await.unwrap();
 
             ipc.brain_claim_runner_identity(source_subject)
@@ -4845,15 +4888,9 @@ mod tests {
                 .await
                 .unwrap();
 
-            let target = RemoteBrainTarget::local(
-                &brain,
-                crate::config::constants::DEFAULT_DAEMON_ADDR,
-            )
-            .unwrap();
-            let password = crate::config::load_config()
-                .unwrap()
-                .server
-                .brain_password;
+            let daemon_address = isolated_live_daemon_address();
+            let target = RemoteBrainTarget::local(&brain, &daemon_address).unwrap();
+            let password = isolated_live_password();
             let mut controller = RemoteBrainClient::new(target, password).unwrap();
             controller
                 .authorize_runner_handoff_control(
@@ -5008,7 +5045,7 @@ mod tests {
     #[tokio::test]
     async fn cloned_client_reuses_a_live_scoped_credential() {
         let client = RemoteBrainClient::new(
-            RemoteBrainTarget::local("shared", "http://127.0.0.1:11435").unwrap(),
+            RemoteBrainTarget::local("shared", "http://127.0.0.1:32123").unwrap(),
             "bootstrap-secret",
         )
         .unwrap();
@@ -5044,7 +5081,7 @@ mod tests {
     #[tokio::test]
     async fn ordinary_operations_require_bootstrapping_first() {
         let client = RemoteBrainClient::new(
-            RemoteBrainTarget::local("shared", "http://127.0.0.1:11435").unwrap(),
+            RemoteBrainTarget::local("shared", "http://127.0.0.1:32123").unwrap(),
             "bootstrap-secret",
         )
         .unwrap();
