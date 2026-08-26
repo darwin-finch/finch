@@ -362,11 +362,11 @@ Different providers (Claude vs. Gemini vs. Groq vs. Grok) have subtly different 
 ```
 User Feedback (10x/3x/1x weight)
     ↓
-Feedback logged with weight to JSONL
+Feedback logged with weight to append-only JSONL
     ↓
-~/.finch/training_queue.jsonl
+~/.finch/feedback.jsonl
     ↓
-[Pending] External training step:
+[Blocked; not invoked by Finch] External training step:
   macOS  → MLX (mlx-lm, Apple Silicon native)
   Linux  → PyTorch + PEFT (transformers)
     ↓
@@ -387,7 +387,11 @@ Feedback logged with weight to JSONL
   - Impact: Model learns normally
 
 **Current Status:**
-The feedback collection pipeline works; training and adapter loading are not yet implemented (see Issue #1). Key clarifications:
+Explicit feedback collection works, but it does not enqueue or trigger training.
+The daemon's former Python worker and automatic OpenAI request collection are
+disabled (see Issue #139). Existing `training_queue.jsonl` data is retained
+untouched. Training and adapter loading remain blocked on Issues #1, #7, and
+#74. Key clarifications:
 - ONNX Runtime itself has no training API. The training step uses an external tool: **MLX** on macOS (Apple Silicon) or **PyTorch/PEFT** on Linux/CUDA.
 - `onnxruntime-genai` *does* support loading pre-trained adapters at inference time via `.onnx_adapter` format — this is not blocked by ONNX's lack of training API.
 - `candle-metal` cannot be used for LoRA training on macOS — same missing ops (layer norm) that break inference also break training.
@@ -847,11 +851,12 @@ Stored in: `~/.finch/metrics/YYYY-MM-DD.jsonl`
   "response": "The golden rule refers to...",
   "feedback_weight": 1.0,
   "feedback_type": "normal",
-  "used_for_training": true
+  "used_for_training": false
 }
 ```
 
-Stored in: `~/.finch/training_queue.jsonl`
+Stored in: `~/.finch/feedback.jsonl`. Feedback is retained data, not an
+executable training queue.
 
 ## File Structure
 
@@ -865,7 +870,8 @@ Stored in: `~/.finch/training_queue.jsonl`
 │   └── rust_advanced.safetensors
 ├── metrics/                 # Daily JSONL logs
 │   └── 2026-02-14.jsonl
-├── training_queue.jsonl     # Pending training examples
+├── feedback.jsonl           # Explicit feedback; does not trigger training
+├── training_queue.jsonl     # Preserved legacy queue; not processed by daemon
 └── tool_patterns.json       # Approved tool patterns
 
 ~/.cache/huggingface/hub/    # Base models (HF standard)

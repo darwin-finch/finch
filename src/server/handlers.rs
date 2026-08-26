@@ -32,14 +32,13 @@ pub fn create_router(server: Arc<AgentServer>) -> Router {
     use super::feedback_handler::{handle_feedback, handle_training_status};
     use super::openai_handlers::{handle_chat_completions, handle_list_models};
 
-    // Get training sender for feedback endpoint
-    let training_tx = Arc::clone(server.training_tx());
+    let feedback_store = Arc::clone(server.feedback_store());
 
-    // Create feedback router with training_tx state
+    // Explicit feedback is durably recorded, but it is not a training trigger.
     let feedback_router = Router::new()
         .route("/v1/feedback", post(handle_feedback))
         .route("/v1/training/status", post(handle_training_status))
-        .with_state(training_tx);
+        .with_state(feedback_store);
 
     // Create main router with server state
     Router::new()
@@ -3609,7 +3608,7 @@ async fn get_status(
     let response = StatusResponse {
         generator: generator_status,
         named_brains: server.brain_store().list()?.len(),
-        training_enabled: true, // LoRA training is always enabled
+        training_enabled: false,
     };
 
     Ok(Json(response))

@@ -1,11 +1,20 @@
 # Automatic Training Collection & Adapter Reload
 
 **Implemented**: 2026-02-11
-**Status**: ✅ Auto-collection works | ⚠️ Adapter reload placeholder
+**Status**: Disabled as of 2026-08-25 (GitHub issue #139)
+
+> This document describes a retired experimental design. Finch no longer
+> auto-collects OpenAI-compatible requests, starts a training timer, rewrites
+> `~/.finch/training_queue.jsonl`, launches Python, or generates adapters from
+> the daemon. Explicit `/v1/feedback` submissions are retained separately in
+> append-only `~/.finch/feedback.jsonl`; they do not consent to or trigger
+> training. Existing training queues and adapters are preserved untouched.
+> Training remains blocked on issues #1, #7, and #74 until a supported native
+> path has explicit privacy, resource, cancellation, and retention controls.
 
 ## What Was Added
 
-### 1. Automatic Collection (✅ Complete)
+### 1. Automatic Collection (retired)
 
 **Every query/response is now automatically collected for training**
 

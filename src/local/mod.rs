@@ -125,9 +125,6 @@ impl LocalGenerator {
     where
         F: FnMut(u32, &str) + Send + 'static,
     {
-        // Check for newer adapter before generation
-        self.check_and_reload_adapter()?;
-
         if !self.enabled {
             return Ok(None);
         }
@@ -146,9 +143,6 @@ impl LocalGenerator {
         messages: &[Message],
         _tools: Option<Vec<ToolDefinition>>,
     ) -> Result<Option<GeneratorResponse>> {
-        // Check for newer adapter before generation
-        self.check_and_reload_adapter()?;
-
         if !self.enabled {
             return Ok(None);
         }
@@ -196,56 +190,6 @@ impl LocalGenerator {
                 Ok(None)
             }
         }
-    }
-
-    /// Check if a newer adapter is available and reload if so
-    fn check_and_reload_adapter(&mut self) -> Result<()> {
-        let adapters_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
-            .join(".finch")
-            .join("adapters");
-
-        if !adapters_dir.exists() {
-            return Ok(());
-        }
-
-        // Find latest adapter
-        if let Some(latest_adapter) = self.find_latest_adapter(&adapters_dir)? {
-            // TODO: Track last loaded adapter timestamp and only reload if newer
-            // For now, we skip reload since adapter loading isn't implemented yet
-            tracing::debug!(
-                "Found adapter: {} (reload not yet implemented)",
-                latest_adapter.display()
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Find the most recent adapter in the adapters directory
-    fn find_latest_adapter(
-        &self,
-        adapters_dir: &std::path::Path,
-    ) -> Result<Option<std::path::PathBuf>> {
-        use std::fs;
-
-        let mut latest: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
-
-        for entry in fs::read_dir(adapters_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.extension().and_then(|s| s.to_str()) == Some("safetensors") {
-                let metadata = fs::metadata(&path)?;
-                let modified = metadata.modified()?;
-
-                if latest.is_none() || modified > latest.as_ref().unwrap().1 {
-                    latest = Some((path, modified));
-                }
-            }
-        }
-
-        Ok(latest.map(|(path, _)| path))
     }
 
     /// Learn from a Claude response
@@ -317,6 +261,16 @@ impl Default for LocalGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_has_no_adapter_hot_reload_path() {
+        let source = include_str!("mod.rs");
+        let reload_method = ["check_and_reload", "_adapter"].concat();
+        let adapter_directory = [".join(", "\"adapters\")"].concat();
+
+        assert!(!source.contains(&reload_method));
+        assert!(!source.contains(&adapter_directory));
+    }
 
     #[test]
     fn test_local_generation_greeting() {

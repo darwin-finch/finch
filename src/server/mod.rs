@@ -9,7 +9,6 @@ pub mod handlers;
 mod middleware;
 mod openai_handlers;
 pub mod openai_types; // Public for client access
-mod training_worker;
 
 pub use brain_approval::BrainApprovalBroker;
 pub use brain_runner::{
@@ -22,14 +21,13 @@ pub use brain_runner::{
 pub use brain_service::{
     BrainLifecycleService, BrainSubmissionError, BrainSubmissionOutcome, BrainWatch,
 };
-pub use feedback_handler::{handle_feedback, handle_training_status};
+pub use feedback_handler::{handle_feedback, handle_training_status, FeedbackStore};
 pub use handlers::{
     create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint,
 };
 pub use middleware::{auth_middleware, DaemonAuth, RateLimiter};
 pub use openai_handlers::{handle_chat_completions, handle_list_models};
 pub use openai_types::*;
-pub use training_worker::TrainingWorker;
 
 use anyhow::Result;
 use std::net::SocketAddr;
@@ -41,7 +39,7 @@ use crate::claude::ClaudeClient;
 use crate::config::Config;
 use crate::local::LocalGenerator;
 use crate::metrics::MetricsLogger;
-use crate::models::{BootstrapLoader, GeneratorState, TrainingCoordinator};
+use crate::models::{BootstrapLoader, GeneratorState};
 use crate::providers::LlmProvider;
 use crate::router::Router;
 
@@ -96,14 +94,8 @@ pub struct AgentServer {
     bootstrap_loader: Arc<BootstrapLoader>,
     /// Generator state (tracks model loading progress)
     generator_state: Arc<RwLock<GeneratorState>>,
-    /// Training coordinator for LoRA fine-tuning
-    training_coordinator: Arc<TrainingCoordinator>,
-    /// Training examples sender (for feedback endpoint)
-    training_tx: Arc<tokio::sync::mpsc::UnboundedSender<crate::models::WeightedExample>>,
-    /// Training examples receiver — taken once by `serve()` to hand to the worker.
-    training_rx: std::sync::Mutex<
-        Option<tokio::sync::mpsc::UnboundedReceiver<crate::models::WeightedExample>>,
-    >,
+    /// Append-only explicit user feedback. This is not a training queue.
+    feedback_store: Arc<FeedbackStore>,
     /// Authoritative event logs and program stacks for named shared brains.
     brain_store: crate::brain::store::BrainStore,
     /// Send-safe bridge to frontend-owned Cap'n Proto runner callbacks.
@@ -129,7 +121,6 @@ impl AgentServer {
         brain_credentials: crate::brain::credential::BrainCredentialAuthority,
     ) -> Result<Self> {
         let generator_state = Arc::new(RwLock::new(GeneratorState::NotAvailable));
-        let (training_tx, training_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             claude_client: Arc::new(ClaudeClient::new(String::new())?),
             providers: Vec::new(),
@@ -144,14 +135,7 @@ impl AgentServer {
                 None,
             )),
             generator_state,
-            training_coordinator: Arc::new(TrainingCoordinator::with_queue_path(
-                4,
-                4,
-                false,
-                state_root.join("training.jsonl"),
-            )),
-            training_tx: Arc::new(training_tx),
-            training_rx: std::sync::Mutex::new(Some(training_rx)),
+            feedback_store: Arc::new(FeedbackStore::new(state_root.join("feedback.jsonl"))),
             brain_store: crate::brain::store::BrainStore::with_root(
                 machine,
                 Some(state_root.join("brains")),
@@ -174,7 +158,6 @@ impl AgentServer {
     ) -> Result<Self> {
         let generator_state = Arc::new(RwLock::new(GeneratorState::Initializing));
         let bootstrap_loader = Arc::new(BootstrapLoader::new(generator_state.clone(), None));
-        let (training_tx, training_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             claude_client: Arc::new(ClaudeClient::new("brain-protocol-test".into())?),
             providers: Vec::new(),
@@ -186,11 +169,7 @@ impl AgentServer {
             local_generator: Arc::new(RwLock::new(LocalGenerator::default())),
             bootstrap_loader,
             generator_state,
-            training_coordinator: Arc::new(TrainingCoordinator::with_queue_path(
-                8, 8, false, state_root.join("training.jsonl"),
-            )),
-            training_tx: Arc::new(training_tx),
-            training_rx: std::sync::Mutex::new(Some(training_rx)),
+            feedback_store: Arc::new(FeedbackStore::new(state_root.join("feedback.jsonl"))),
             brain_store: store,
             brain_runners: BrainRunnerBroker::default(),
             brain_approvals: BrainApprovalBroker::default(),
@@ -215,11 +194,8 @@ impl AgentServer {
         local_generator: Arc<RwLock<LocalGenerator>>,
         bootstrap_loader: Arc<BootstrapLoader>,
         generator_state: Arc<RwLock<GeneratorState>>,
-        training_coordinator: Arc<TrainingCoordinator>,
         providers: Vec<Box<dyn LlmProvider>>,
     ) -> Result<Self> {
-        // Create training channel; receiver is taken by serve() to hand to the worker.
-        let (training_tx, training_rx) = tokio::sync::mpsc::unbounded_channel();
         let profile_names = config
             .providers
             .iter()
@@ -259,9 +235,7 @@ impl AgentServer {
             local_generator,
             bootstrap_loader,
             generator_state,
-            training_coordinator,
-            training_tx: Arc::new(training_tx),
-            training_rx: std::sync::Mutex::new(Some(training_rx)),
+            feedback_store: Arc::new(FeedbackStore::new(FeedbackStore::default_path()?)),
             brain_store: crate::brain::store::BrainStore::new(machine),
             brain_runners: BrainRunnerBroker::default(),
             brain_approvals: BrainApprovalBroker::default(),
@@ -278,29 +252,6 @@ impl AgentServer {
     /// Cap'n Proto IPC server that runs concurrently.
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         let addr: SocketAddr = self.config.bind_address.parse()?;
-
-        // Take the training receiver that was created in new().  Panics if
-        // serve() is called more than once on the same instance (shouldn't happen).
-        let training_rx = self
-            .training_rx
-            .lock()
-            .unwrap()
-            .take()
-            .expect("AgentServer::serve() called twice");
-
-        // Spawn training worker in background
-        let worker = TrainingWorker::new(
-            training_rx,
-            Arc::clone(&self.training_coordinator),
-            10, // batch_threshold: trigger after 10 examples
-            5,  // batch_timeout_minutes: trigger after 5 minutes
-        );
-
-        tokio::spawn(async move {
-            worker.run().await;
-        });
-
-        tracing::info!("Training worker spawned");
 
         // The daemon owns only due-time calculation and durable queueing.
         // Actual ProgramRuns remain on each Brain's leased environment runner.
@@ -487,12 +438,9 @@ impl AgentServer {
         &self.metrics_logger
     }
 
-    /// Get reference to session manager
-    /// Get reference to training examples sender
-    pub fn training_tx(
-        &self,
-    ) -> &Arc<tokio::sync::mpsc::UnboundedSender<crate::models::WeightedExample>> {
-        &self.training_tx
+    /// Get the append-only explicit feedback store.
+    pub fn feedback_store(&self) -> &Arc<FeedbackStore> {
+        &self.feedback_store
     }
 
     /// Get server configuration
@@ -564,11 +512,6 @@ impl AgentServer {
         &self.generator_state
     }
 
-    /// Get reference to training coordinator
-    pub fn training_coordinator(&self) -> &Arc<TrainingCoordinator> {
-        &self.training_coordinator
-    }
-
     /// Return the primary cloud provider (first in the configured list, if any).
     ///
     /// Used by the IPC server to service CLI queries without going through the
@@ -583,6 +526,18 @@ impl AgentServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_server_has_no_trainer_lifecycle() {
+        let server_source = include_str!("mod.rs");
+        let worker_type = ["Training", "Worker"].concat();
+        let worker_module = ["training", "_worker"].concat();
+        let python_trainer = ["LoRATraining", "Subprocess"].concat();
+
+        assert!(!server_source.contains(&worker_type));
+        assert!(!server_source.contains(&worker_module));
+        assert!(!server_source.contains(&python_trainer));
+    }
 
     #[test]
     fn brain_password_comparison_checks_length_and_contents() {

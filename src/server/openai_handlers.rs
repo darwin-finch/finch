@@ -16,7 +16,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::openai_types::*;
 use super::AgentServer;
@@ -670,27 +670,6 @@ pub async fn handle_chat_completions(
         "Chat completion handled"
     );
 
-    // Automatically collect query/response for training (if not a tool call)
-    if !has_tool_calls(&content_blocks) {
-        let response_text = extract_text_from_blocks(&content_blocks);
-        if !user_query.is_empty() && !response_text.is_empty() {
-            // Send to training queue (non-blocking)
-            let training_tx = server.training_tx();
-            let example = crate::models::WeightedExample {
-                query: user_query.to_string(),
-                response: response_text,
-                weight: 1.0,    // Normal weight for automatic collection
-                feedback: None, // No explicit feedback for auto-collected examples
-            };
-
-            if let Err(e) = training_tx.send(example) {
-                warn!("Failed to send example to training queue: {}", e);
-            } else {
-                debug!("Auto-collected query/response for training");
-            }
-        }
-    }
-
     // Convert internal response to OpenAI format (handles tool_calls)
     let openai_response =
         match convert_response_to_openai(content_blocks, &request.model, &request.messages) {
@@ -1064,25 +1043,6 @@ fn convert_messages_to_internal(messages: &[ChatMessage]) -> anyhow::Result<Vec<
     Ok(result)
 }
 
-/// Check if content blocks contain tool calls
-fn has_tool_calls(blocks: &[ContentBlock]) -> bool {
-    blocks
-        .iter()
-        .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
-}
-
-/// Extract text from content blocks
-fn extract_text_from_blocks(blocks: &[ContentBlock]) -> String {
-    blocks
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Create error response
 fn error_response(message: &str, error_type: &str) -> Response {
     let error = ErrorResponse::new(message.to_string(), error_type.to_string());
@@ -1092,6 +1052,16 @@ fn error_response(message: &str, error_type: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openai_requests_have_no_automatic_training_producer() {
+        let handler_source = include_str!("openai_handlers.rs");
+        let weighted_example = ["Weighted", "Example"].concat();
+        let training_sender = ["training", "_tx"].concat();
+
+        assert!(!handler_source.contains(&weighted_example));
+        assert!(!handler_source.contains(&training_sender));
+    }
 
     #[test]
     fn model_id_selects_provider_profile() {
