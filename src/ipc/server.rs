@@ -2065,6 +2065,203 @@ mod tests {
     };
     use crate::ipc::brain_codec::encode_approval_audience;
 
+    struct SocketApprovalRunner {
+        failed_tx: Option<tokio::sync::oneshot::Sender<String>>,
+    }
+
+    impl super::finch_ipc_capnp::brain_runner::Server for SocketApprovalRunner {
+        fn run_program(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented(
+                "socket approval runner accepts only turns".into(),
+            ))
+        }
+
+        fn run_turn(
+            &mut self,
+            params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            let request = match params.get().and_then(|params| params.get_request()) {
+                Ok(request) => request,
+                Err(error) => return capnp::capability::Promise::err(error),
+            };
+            let request_seq = request.get_request_seq();
+            let audience = match request.get_approval_audience()
+                .map_err(anyhow::Error::new)
+                .and_then(super::decode_approval_audience)
+            {
+                Ok(audience) => audience,
+                Err(error) => return capnp::capability::Promise::err(
+                    capnp::Error::failed(error.to_string()),
+                ),
+            };
+            let control = match request.get_control() {
+                Ok(control) => control,
+                Err(error) => return capnp::capability::Promise::err(error),
+            };
+            let failed_tx = self.failed_tx.take().expect("runner received more than one turn");
+            capnp::capability::Promise::from_future(async move {
+                let mut call = control.request_approval_request();
+                crate::ipc::client::encode_brain_turn_event(
+                    call.get().init_event(),
+                    &crate::server::RunnerTurnEvent::ApprovalRequested {
+                        approval_id: "socket-approval".into(),
+                        approval_kind: "tool".into(),
+                        subject: "bash".into(),
+                        audience,
+                        detail: serde_json::json!({"input": {"command": "true"}}),
+                    },
+                )?;
+                let error = match call.send().promise.await {
+                    Ok(_) => "approval unexpectedly succeeded".to_string(),
+                    Err(error) => error.to_string(),
+                };
+                let _ = failed_tx.send(error.clone());
+                Err(capnp::Error::failed(format!(
+                    "approval for request {request_seq} failed closed: {error}"
+                )))
+            })
+        }
+
+        fn cancel_run(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
+            _results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented(
+                "socket approval runner does not cancel".into(),
+            ))
+        }
+
+        fn project_memory(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
+            _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented(
+                "socket approval runner does not project memory".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn unix_socket_disconnect_fails_reverse_approval_for_exact_attachment_generation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let socket_path = temp.path().join("finch.sock");
+            let _socket_path = crate::ipc::transport::set_test_sock_path(socket_path.clone());
+            let store = crate::brain::store::BrainStore::with_root(
+                "box.local", Some(temp.path().join("brains")),
+            );
+            let server = std::sync::Arc::new(crate::server::AgentServer::for_brain_protocol_test(
+                store.clone(),
+                crate::brain::credential::BrainCredentialAuthority::ephemeral([91; 32]),
+                "test-password".into(),
+                temp.path(),
+            ).unwrap());
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let server_task = tokio::task::spawn_local(super::start_ipc_server(
+                server.clone(), shutdown.clone(),
+            ));
+            tokio::time::timeout(std::time::Duration::from_millis(250), async {
+                while !socket_path.exists() {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+
+            let participant = crate::ipc::IpcClient::connect_path(socket_path.clone()).await.unwrap();
+            let attachment = participant.brain_attach(
+                "shared", "alice", crate::brain::store::AttachmentRole::Driver, None,
+            ).await.unwrap();
+            let mut participant_events = participant.brain_watch("shared", &attachment).await.unwrap();
+            participant_events.recv().await.unwrap().unwrap();
+
+            let runner = crate::ipc::IpcClient::connect_path(socket_path.clone()).await.unwrap();
+            let snapshot = runner.brain_snapshot("shared").await.unwrap();
+            runner.brain_claim_runner_identity("runner@box.local/socket").await.unwrap();
+            let lease = runner.brain_acquire_runner(
+                "shared", "runner@box.local/socket", &snapshot.environment, None, 60_000,
+            ).await.unwrap();
+            let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
+            let callback: super::finch_ipc_capnp::brain_runner::Client =
+                capnp_rpc::new_client(SocketApprovalRunner { failed_tx: Some(failed_tx) });
+            runner.register_test_brain_runner_client("shared", lease.lease_id, callback)
+                .await.unwrap();
+
+            let run = participant.brain_start_speculative(
+                "shared", &attachment, "request approval".into(),
+            ).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_millis(250), async {
+                loop {
+                    let current = store.snapshot("shared").unwrap();
+                    if current.events.iter().any(|event| matches!(
+                        &event.kind,
+                        crate::brain::store::BrainEventKind::ApprovalRequested {
+                            approval_id, ..
+                        } if approval_id == "socket-approval"
+                    )) {
+                        assert_eq!(store.inspect_run("shared", run.run_id).unwrap().status,
+                            crate::brain::store::BrainRunStatus::AwaitingApproval);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("reverse approval did not become durable");
+
+            let old_connection = attachment.connection_id.unwrap();
+            drop(participant_events);
+            drop(participant);
+            let error = tokio::time::timeout(
+                std::time::Duration::from_millis(250), failed_rx,
+            ).await.expect("physical IPC loss did not fail approval promptly").unwrap();
+            assert!(error.contains("approval audience disconnected"), "{error}");
+            tokio::time::timeout(std::time::Duration::from_millis(250), async {
+                while store.require_connection(
+                    "shared", attachment.attachment_id, old_connection,
+                ).is_ok() {
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("physical IPC loss did not detach exact generation");
+
+            let replacement = crate::ipc::IpcClient::connect_path(socket_path).await.unwrap();
+            let replacement_attachment = replacement.brain_attach(
+                "shared", "alice", crate::brain::store::AttachmentRole::Driver,
+                Some(attachment.attachment_id),
+            ).await.unwrap();
+            let replacement_connection = replacement_attachment.connection_id.unwrap();
+            let mut replacement_events = replacement.brain_watch(
+                "shared", &replacement_attachment,
+            ).await.unwrap();
+            replacement_events.recv().await.unwrap().unwrap();
+            assert!(store.require_connection(
+                "shared", replacement_attachment.attachment_id, replacement_connection,
+            ).is_ok());
+            assert_eq!(store.snapshot("shared").unwrap().runner_lease, Some(lease));
+            let terminal = store.snapshot("shared").unwrap();
+            assert_eq!(terminal.events.iter().filter(|event| matches!(
+                event.kind,
+                crate::brain::store::BrainEventKind::RunStatusChanged {
+                    run_id, status, ..
+                } if run_id == run.run_id && status.is_terminal()
+            )).count(), 1);
+
+            drop(replacement_events);
+            drop(replacement);
+            drop(runner);
+            shutdown.cancel();
+            server_task.await.unwrap().unwrap();
+        }));
+    }
+
     #[test]
     fn restored_connectionless_turn_fails_closed_if_it_requests_approval() {
         let result = require_approval_connection(None);

@@ -550,6 +550,40 @@ impl BrainLifecycleService {
                 run_id,
             )? {
                 self.runners.abort_run(brain, run_id);
+            } else {
+                let store = self.store.clone();
+                let runners = self.runners.clone();
+                let brain = brain.to_string();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        let publication = match store.acquire_run_publication(&brain, run_id).await {
+                            Ok(publication) => publication,
+                            Err(error) => {
+                                tracing::error!(brain = %brain, run_id = %run_id.0, %error,
+                                    "could not acquire reserved cancellation publication owner");
+                                return;
+                            }
+                        };
+                        let pending = store.run_cancellation_reserved(&brain, run_id)
+                            .unwrap_or(false)
+                            && store.inspect_run(&brain, run_id)
+                                .is_ok_and(|run| !run.status.is_terminal());
+                        if pending {
+                            if let Err(error) = store.complete_reserved_run_cancellation(
+                                &brain, "daemon", run_id,
+                            ) {
+                                tracing::error!(brain = %brain, run_id = %run_id.0, %error,
+                                    "could not publish reserved disconnect cancellation");
+                            }
+                        }
+                        drop(publication);
+                        let _ = store.prune_run_publication(&brain, run_id);
+                        runners.abort_run(&brain, run_id);
+                    });
+                } else {
+                    tracing::error!(brain = %brain, run_id = %run_id.0,
+                        "durable cancellation reservation awaits daemon runtime reconciliation");
+                }
             }
         }
         self.store.remove_if_unused(brain)?;
@@ -738,7 +772,7 @@ impl BrainLifecycleService {
         let reserved = match receipt {
             Some(receipt) => Some(self.store.reserve_run_cancellation(
                 brain, &attachment.subject, attachment_id, run_id, receipt,
-            )?),
+            ).await?),
             None => None,
         };
         let run = match &reserved {
@@ -1284,6 +1318,79 @@ mod tests {
             event.kind,
             BrainEventKind::RunStatusChanged { run_id: event_run_id, status, .. }
                 if event_run_id == run_id && status.is_terminal()
+        )).count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_cancellation_reservation_fences_disconnect_before_owner_spawn() {
+        let service = service();
+        let driver = service.attach(
+            "shared", "alice", AttachmentRole::Driver, None,
+        ).unwrap();
+        let connection_id = driver.connection_id.unwrap();
+        let _watch = service.watch(
+            "shared", driver.attachment_id, connection_id,
+        ).unwrap();
+        let prompt = service.store.push(
+            "shared", "alice", BrainEventKind::SpeculativePrompt {
+                text: "pause at durable reservation".into(),
+            },
+        ).unwrap();
+        let run = service.store.start_run(
+            "shared", "alice", crate::brain::store::BrainRunKind::Speculative,
+            prompt.seq, driver.attachment_id, BrainRunStatus::Running,
+        ).unwrap();
+        let receipt = crate::brain::store::BrainMutationReceipt {
+            mutation_id: uuid::Uuid::new_v4(),
+            attachment_id: driver.attachment_id,
+            expected_revision: service.snapshot("shared").unwrap().revision,
+            environment_generation: service.store.environment().generation,
+            command_sha256: "barrier-cancel".into(),
+        };
+        let (reserved, release) = service.store
+            .pause_after_cancellation_reservation_for_test();
+        let reserving = {
+            let store = service.store.clone();
+            let receipt = receipt.clone();
+            tokio::spawn(async move {
+                store.reserve_run_cancellation(
+                    "shared", "alice", driver.attachment_id, run.run_id, receipt,
+                ).await
+            })
+        };
+        tokio::task::spawn_blocking(move || reserved.recv())
+            .await.unwrap().unwrap();
+        assert!(service.store.run_cancellation_reserved("shared", run.run_id).unwrap());
+        service.detach("shared", driver.attachment_id, connection_id).unwrap();
+        release.send(()).unwrap();
+        reserving.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            while service.inspect_run("shared", run.run_id).unwrap().status
+                != BrainRunStatus::Cancelled
+            {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("durable cancellation reservation lost its disconnect owner");
+        assert!(service.store.terminalize_run_with_result_if_active(
+            "shared", "runner", run.run_id, prompt.seq, BrainRunStatus::Failed,
+            "late turn response".into(),
+        ).unwrap().is_none());
+        let snapshot = service.snapshot("shared").unwrap();
+        assert_eq!(snapshot.events.iter().filter(|event| {
+            event.mutation.as_ref() == Some(&receipt)
+        }).count(), 1);
+        assert!(!snapshot.events.iter().any(|event| {
+            event.run_id == Some(run.run_id) && matches!(
+                event.kind,
+                BrainEventKind::Program { .. }
+                    | BrainEventKind::EffectRecorded { .. }
+                    | BrainEventKind::Result { .. }
+            )
+        }));
+        assert_eq!(snapshot.events.iter().filter(|event| matches!(
+            event.kind,
+            BrainEventKind::RunStatusChanged { run_id, status, .. }
+                if run_id == run.run_id && status.is_terminal()
         )).count(), 1);
     }
 

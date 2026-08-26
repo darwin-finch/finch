@@ -1153,27 +1153,10 @@ async fn dispatch_named_brain_run(
             ) {
                 tracing::error!(brain = %self.brain, run_id = %self.run_id.0, %error,
                     "failed to publish disconnect terminalization; scheduling durable retry");
-                let store = self.store.clone();
-                let brain = self.brain.clone();
-                let run_id = self.run_id;
-                let request_seq = self.request_seq;
-                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    runtime.spawn(async move {
-                        for _ in 0..8 {
-                            tokio::task::yield_now().await;
-                            match store.terminalize_run_with_result_if_active(
-                                &brain, "daemon", run_id, request_seq,
-                                BrainRunStatus::Failed, detail.clone(),
-                            ) {
-                                Ok(_) => return,
-                                Err(error) => tracing::warn!(brain = %brain, run_id = %run_id.0,
-                                    %error, "retrying disconnect terminalization"),
-                            }
-                        }
-                        tracing::error!(brain = %brain, run_id = %run_id.0,
-                            "disconnect terminalization retries exhausted; durable intent remains for restart");
-                    });
-                }
+                self.store.schedule_disconnect_terminalization_retry(
+                    self.brain.clone(), "daemon".into(), self.run_id,
+                    self.request_seq, BrainRunStatus::Failed, detail,
+                );
             }
         }
     }
@@ -1746,7 +1729,9 @@ async fn dispatch_named_brain_program(
         Err(error) => {
             if let Some(failure) = error.downcast_ref::<crate::server::RunnerProgramError>() {
                 let publication = store.acquire_run_publication(name, run_id).await?;
-                if publication.cancel_requested() {
+                if publication.cancel_requested()
+                    || store.run_cancellation_reserved(name, run_id)?
+                {
                     drop(publication);
                     anyhow::bail!("named Brain run cancelled");
                 }
@@ -1779,7 +1764,7 @@ async fn dispatch_named_brain_program(
         }
     };
     let publication = store.acquire_run_publication(name, run_id).await?;
-    if publication.cancel_requested() {
+    if publication.cancel_requested() || store.run_cancellation_reserved(name, run_id)? {
         drop(publication);
         anyhow::bail!("named Brain run cancelled");
     }
@@ -1871,7 +1856,9 @@ async fn dispatch_named_brain_turn(
         Err(error) => {
             if let Some(failure) = error.downcast_ref::<crate::server::RunnerTurnError>() {
                 let publication = store.acquire_run_publication(name, run_id).await?;
-                if publication.cancel_requested() {
+                if publication.cancel_requested()
+                    || store.run_cancellation_reserved(name, run_id)?
+                {
                     drop(publication);
                     anyhow::bail!("named Brain run cancelled");
                 }
@@ -1913,7 +1900,7 @@ async fn dispatch_named_brain_turn(
         }
     };
     let publication = store.acquire_run_publication(name, run_id).await?;
-    if publication.cancel_requested() {
+    if publication.cancel_requested() || store.run_cancellation_reserved(name, run_id)? {
         drop(publication);
         anyhow::bail!("named Brain run cancelled");
     }
@@ -3736,6 +3723,7 @@ pub struct HealthStatus {
     pub status: String,
     pub uptime_seconds: u64,
     pub named_brains: usize,
+    pub pending_brain_terminalizations: usize,
 }
 
 /// Handle GET /health - Health check endpoint
@@ -3743,10 +3731,18 @@ pub async fn health_check(
     State(server): State<Arc<AgentServer>>,
 ) -> Result<Json<HealthStatus>, AppError> {
     // TODO: Track actual uptime
+    let pending_brain_terminalizations = server
+        .brain_store()
+        .pending_disconnect_terminalization_retries();
     let status = HealthStatus {
-        status: "healthy".to_string(),
+        status: if pending_brain_terminalizations == 0 {
+            "healthy"
+        } else {
+            "degraded"
+        }.to_string(),
         uptime_seconds: 0, // Placeholder
         named_brains: server.brain_store().list()?.len(),
+        pending_brain_terminalizations,
     };
 
     Ok(Json(status))
