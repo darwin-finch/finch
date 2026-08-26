@@ -54,7 +54,7 @@ const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
     (
         "chatgpt_subscription",
         "ChatGPT subscription (Codex)",
-        "gpt-5.6-terra",
+        "gpt-5.6-sol",
         "sign in first with: finch auth login chatgpt",
     ),
     (
@@ -485,7 +485,7 @@ fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
                 .clone()
                 .unwrap_or_else(|| "ChatGPT subscription".to_string()),
             api_key: String::new(),
-            model: model.clone().unwrap_or_else(|| "gpt-5.6-terra".to_string()),
+            model: model.clone().unwrap_or_else(|| "gpt-5.6-sol".to_string()),
             enabled: true,
             persisted: Some(provider.clone()),
         }),
@@ -632,8 +632,8 @@ fn provider_entry_from_remote_model(
         },
         _ if provider.eq_ignore_ascii_case("chatgpt_subscription") => {
             ProviderEntry::ChatgptSubscription {
-                credential_ref:
-                    crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF.to_string(),
+                credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
+                    .to_string(),
                 model,
                 name,
             }
@@ -7471,9 +7471,9 @@ mod tests {
     #[test]
     fn chatgpt_subscription_wizard_roundtrip_preserves_managed_reference() {
         let original = ProviderEntry::ChatgptSubscription {
-            credential_ref:
-                crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF.to_string(),
-            model: Some("gpt-5.6-terra".into()),
+            credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
+                .to_string(),
+            model: Some("gpt-5.6-sol".into()),
             name: Some("subscription-primary".into()),
         };
         let editable = model_config_from_provider(&original).unwrap();
@@ -7484,7 +7484,7 @@ mod tests {
             "chatgpt_subscription",
             "renamed",
             "must-not-be-stored",
-            "gpt-5.6-terra",
+            "gpt-5.6-sol",
             persisted.as_ref(),
         );
         assert_eq!(rebuilt.api_key(), None);
@@ -7495,7 +7495,7 @@ mod tests {
                 model: Some(model),
                 name: Some(name),
             } if credential_ref == crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
-                && model == "gpt-5.6-terra"
+                && model == "gpt-5.6-sol"
                 && name == "renamed"
         ));
     }

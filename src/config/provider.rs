@@ -351,7 +351,7 @@ mod tests {
     fn chatgpt_subscription_serializes_only_opaque_reference() {
         let entry = ProviderEntry::ChatgptSubscription {
             credential_ref: default_chatgpt_credential_ref(),
-            model: Some("gpt-5.6-terra".into()),
+            model: Some("gpt-5.6-sol".into()),
             name: Some("subscription".into()),
         };
         let encoded = toml::to_string(&entry).unwrap();

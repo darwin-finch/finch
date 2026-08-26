@@ -27,7 +27,7 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
             ..
         } => Ok(Box::new(CodexAppServerProvider::new(
             credential_ref.clone(),
-            model.clone().unwrap_or_else(|| "gpt-5.6-terra".to_string()),
+            model.clone().unwrap_or_else(|| "gpt-5.6-sol".to_string()),
         )?)),
         ProviderEntry::Claude {
             api_key,
@@ -225,7 +225,10 @@ pub fn create_provider_from_teacher(entry: &TeacherEntry) -> Result<Box<dyn LlmP
         "claude" => {
             let mut provider = ClaudeProvider::new_with_endpoints(
                 entry.api_key.clone(),
-                entry.base_url.as_deref().unwrap_or("https://api.anthropic.com"),
+                entry
+                    .base_url
+                    .as_deref()
+                    .unwrap_or("https://api.anthropic.com"),
                 "/v1/messages",
                 "/v1/models",
             )?;

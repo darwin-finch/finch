@@ -8,7 +8,8 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use sha2::{Digest, Sha256};
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -37,7 +38,9 @@ const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SCHEMA_GENERATION_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 // Each accepted release requires an audit of effective app-server configuration,
 // built-in tools, and sandbox enforcement. Schema compatibility alone is not trust.
-const AUDITED_CODEX_VERSIONS: &[&str] = &[];
+// (version, launcher SHA-256, interpreter SHA-256). Deliberately empty until an
+// official release is audited end-to-end and its immutable artifacts are pinned.
+const AUDITED_CODEX_ARTIFACTS: &[(&str, [u8; 32], [u8; 32])] = &[];
 const ADAPTER_INSTRUCTIONS: &str = "You are serving as Finch's model adapter. Do not modify files, run commands, browse, or invoke built-in Codex tools. Answer only from the supplied conversation. When Finch dynamic tools are supplied, invoke only those dynamic tools. Finch/Brain is the durable conversation authority; this Codex thread is ephemeral.";
 
 #[derive(Debug, Clone)]
@@ -56,6 +59,7 @@ struct FileIdentity {
     path: PathBuf,
     len: u64,
     modified: Option<std::time::SystemTime>,
+    sha256: [u8; 32],
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -68,42 +72,49 @@ struct ExecutableIdentity {
     version: String,
 }
 
+fn hardened_app_server_args() -> Vec<String> {
+    [
+        "-c",
+        "mcp_servers={}",
+        "-c",
+        "environments={}",
+        "-c",
+        "profiles={}",
+        "-c",
+        "apps={_default={enabled=false}}",
+        "-c",
+        "features.apps=false",
+        "-c",
+        "features.plugins=false",
+        "-c",
+        "features.remote_plugin=false",
+        "-c",
+        "features.shell_tool=false",
+        "-c",
+        "features.unified_exec=false",
+        "-c",
+        "features.multi_agent=false",
+        "-c",
+        "features.hooks=false",
+        "-c",
+        "web_search=\"disabled\"",
+        "-c",
+        "allow_login_shell=false",
+        "-c",
+        "shell_environment_policy.inherit=\"none\"",
+        "app-server",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 impl AppServerCommand {
     fn production() -> Result<Self> {
         let codex = resolve_trusted_program("codex")?;
         let (program, mut prefix, mut files) = resolve_codex_launcher(&codex)?;
         let version = run_version_bounded(&program, &prefix, SCHEMA_GENERATION_TIMEOUT)?;
-        let mut args = vec![
-            "-c".into(),
-            "mcp_servers={}".into(),
-            "-c".into(),
-            "environments={}".into(),
-            "-c".into(),
-            "profiles={}".into(),
-            "-c".into(),
-            "apps={_default={enabled=false}}".into(),
-            "-c".into(),
-            "features.apps=false".into(),
-            "-c".into(),
-            "features.plugins=false".into(),
-            "-c".into(),
-            "features.remote_plugin=false".into(),
-            "-c".into(),
-            "features.shell_tool=false".into(),
-            "-c".into(),
-            "features.unified_exec=false".into(),
-            "-c".into(),
-            "features.multi_agent=false".into(),
-            "-c".into(),
-            "features.hooks=false".into(),
-            "-c".into(),
-            "web_search=\"disabled\"".into(),
-            "-c".into(),
-            "allow_login_shell=false".into(),
-            "-c".into(),
-            "shell_environment_policy.inherit=\"none\"".into(),
-            "app-server".into(),
-        ];
+        let mut args = hardened_app_server_args();
         prefix.append(&mut args);
         files.push(file_identity(&program)?);
         Ok(Self {
@@ -189,9 +200,7 @@ impl AppServerCommand {
         ProtocolCapabilities {
             dynamic_tools,
             restricted_read_only,
-            audited_contract: self.identity.as_ref().is_some_and(|identity| {
-                AUDITED_CODEX_VERSIONS.contains(&identity.version.as_str())
-            }),
+            audited_contract: self.has_audited_identity(),
         }
     }
 
@@ -204,6 +213,33 @@ impl AppServerCommand {
             }
         }
         Ok(())
+    }
+
+    fn has_audited_identity(&self) -> bool {
+        let Some(identity) = &self.identity else {
+            return false;
+        };
+        let [launcher, interpreter] = identity.files.as_slice() else {
+            return false;
+        };
+        AUDITED_CODEX_ARTIFACTS.iter().any(|audited| {
+            identity.version == audited.0
+                && launcher.sha256 == audited.1
+                && interpreter.sha256 == audited.2
+        })
+    }
+
+    fn require_audited_identity(&self) -> Result<()> {
+        #[cfg(test)]
+        if self.identity.is_none() {
+            return Ok(());
+        }
+        self.validate_identity()?;
+        if self.has_audited_identity() {
+            Ok(())
+        } else {
+            bail!("Installed Codex artifacts are not audited for Finch managed authentication")
+        }
     }
 }
 
@@ -264,6 +300,23 @@ fn validate_trusted_file(path: &Path) -> Result<()> {
         if metadata.permissions().mode() & 0o022 != 0 {
             bail!("Codex executable is group/world writable");
         }
+        let mut ancestor = path.parent();
+        while let Some(directory) = ancestor {
+            let metadata = std::fs::metadata(directory)?;
+            if metadata.permissions().mode() & 0o022 != 0 {
+                bail!("Codex executable has a group/world-writable ancestor");
+            }
+            if [
+                Path::new("/usr"),
+                Path::new("/opt"),
+                Path::new("/Applications"),
+            ]
+            .contains(&directory)
+            {
+                break;
+            }
+            ancestor = directory.parent();
+        }
     }
     Ok(())
 }
@@ -277,6 +330,7 @@ fn file_identity(path: &Path) -> Result<FileIdentity> {
         path: path.to_path_buf(),
         len: metadata.len(),
         modified: metadata.modified().ok(),
+        sha256: Sha256::digest(std::fs::read(path)?).into(),
         #[cfg(unix)]
         device: metadata.dev(),
         #[cfg(unix)]
@@ -538,6 +592,15 @@ impl RpcClient {
             .await
     }
 
+    async fn attest_effective_surface(&mut self) -> Result<()> {
+        let config = self
+            .request("config/read", json!({ "includeLayers": false }))
+            .await?;
+        verify_effective_config(&config)?;
+        let requirements = self.request("configRequirements/read", json!({})).await?;
+        verify_effective_requirements(&requirements)
+    }
+
     async fn send(&mut self, value: Value) -> Result<()> {
         let mut bytes = serde_json::to_vec(&value).context("Failed to encode Codex RPC request")?;
         bytes.push(b'\n');
@@ -627,6 +690,63 @@ impl RpcClient {
     }
 }
 
+fn verify_effective_config(result: &Value) -> Result<()> {
+    let config = result
+        .get("config")
+        .context("Codex app-server omitted effective config")?;
+    for field in ["mcp_servers", "plugins", "environments", "hooks"] {
+        if !config
+            .get(field)
+            .and_then(Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+        {
+            bail!("Codex effective config retains an unaudited capability");
+        }
+    }
+    let apps = config
+        .get("apps")
+        .and_then(Value::as_object)
+        .context("Codex effective config omitted app controls")?;
+    if apps.values().any(|app| {
+        app.get("enabled").and_then(Value::as_bool) != Some(false)
+            || app
+                .get("destructive_enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            || app
+                .get("open_world_enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+    }) {
+        bail!("Codex effective config retains an enabled app capability");
+    }
+    for feature in [
+        "apps",
+        "plugins",
+        "remote_plugin",
+        "shell_tool",
+        "unified_exec",
+        "multi_agent",
+        "hooks",
+        "web_search",
+        "browser_use",
+        "computer_use",
+    ] {
+        if config.pointer(&format!("/features/{feature}")) != Some(&Value::Bool(false)) {
+            bail!("Codex effective config did not attest all disabled features");
+        }
+    }
+    Ok(())
+}
+
+fn verify_effective_requirements(result: &Value) -> Result<()> {
+    if result.get("requirements").is_some_and(Value::is_null) {
+        Ok(())
+    } else {
+        bail!("Managed Codex requirements prevent Finch capability attestation")
+    }
+}
+
 #[cfg(unix)]
 fn configure_tokio_process_group(process: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -699,7 +819,9 @@ impl CodexAppServerAuth {
     }
 
     pub async fn status(&self, refresh: bool) -> Result<ChatGptAccountStatus> {
+        self.command.require_audited_identity()?;
         let mut client = RpcClient::spawn(&self.command).await?;
+        client.attest_effective_surface().await?;
         let outcome = client
             .request("account/read", json!({ "refreshToken": refresh }))
             .await;
@@ -724,7 +846,9 @@ impl CodexAppServerAuth {
     }
 
     pub async fn begin_device_login(&self) -> Result<ChatGptDeviceLogin> {
+        self.command.require_audited_identity()?;
         let mut client = RpcClient::spawn(&self.command).await?;
+        client.attest_effective_surface().await?;
         let result = client
             .request(
                 "account/login/start",
@@ -766,7 +890,9 @@ impl CodexAppServerAuth {
     }
 
     pub async fn logout(&self) -> Result<()> {
+        self.command.require_audited_identity()?;
         let mut client = RpcClient::spawn(&self.command).await?;
+        client.attest_effective_surface().await?;
         let outcome = client
             .request("account/logout", json!({}))
             .await
@@ -834,6 +960,7 @@ impl CodexAppServerProvider {
             bail!("Installed Codex app-server does not advertise dynamic tool support");
         }
         let mut rpc = RpcClient::spawn(&self.command).await?;
+        rpc.attest_effective_surface().await?;
         let account = rpc
             .request("account/read", json!({ "refreshToken": true }))
             .await?;
@@ -903,6 +1030,13 @@ impl CodexAppServerProvider {
             turn_id,
             _isolated_cwd: isolated_cwd,
             turn_timeout: self.command.turn_timeout,
+            allowed_tools: request
+                .tools
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .map(|tool| tool.name.clone())
+                .collect(),
         })
     }
 }
@@ -975,6 +1109,7 @@ struct TurnSession {
     turn_id: String,
     _isolated_cwd: tempfile::TempDir,
     turn_timeout: Duration,
+    allowed_tools: HashSet<String>,
 }
 
 impl TurnSession {
@@ -986,6 +1121,7 @@ impl TurnSession {
 
     async fn drive_until(&mut self, tx: &mpsc::Sender<Result<StreamChunk>>, deadline: Instant) {
         let mut text = String::new();
+        let mut active_tool_calls = HashSet::new();
         loop {
             let event = tokio::select! {
                 _ = tx.closed() => {
@@ -1025,7 +1161,11 @@ impl TurnSession {
                         }
                     }
                 }
-                Some("item/completed") if text.is_empty() => {
+                Some("item/completed")
+                    if text.is_empty()
+                        && event.pointer("/params/item/type").and_then(Value::as_str)
+                            == Some("agentMessage") =>
+                {
                     if event.pointer("/params/item/type").and_then(Value::as_str)
                         == Some("agentMessage")
                     {
@@ -1060,20 +1200,19 @@ impl TurnSession {
                         .await;
                         return;
                     };
-                    let id = params
-                        .get("callId")
-                        .and_then(Value::as_str)
-                        .unwrap_or("codex-tool-call")
-                        .to_string();
-                    let name = params
-                        .get("tool")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let input = params
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}));
+                    let (id, name, input) = match validate_dynamic_tool_request(
+                        params,
+                        &self.thread_id,
+                        &self.turn_id,
+                        &self.allowed_tools,
+                        &active_tool_calls,
+                    ) {
+                        Ok(call) => call,
+                        Err(error) => {
+                            let _ = deliver(tx, deadline, Err(error)).await;
+                            return;
+                        }
+                    };
                     let interrupt_id = self.rpc.next_id;
                     self.rpc.next_id = self.rpc.next_id.saturating_add(1);
                     let _ = timeout_at(
@@ -1151,6 +1290,70 @@ impl TurnSession {
                     }
                     return;
                 }
+                method @ (Some("item/started") | Some("item/completed")) => {
+                    let Some(item_type) =
+                        event.pointer("/params/item/type").and_then(Value::as_str)
+                    else {
+                        let _ = deliver(
+                            tx,
+                            deadline,
+                            Err(anyhow::anyhow!("Invalid Codex item lifecycle notification")),
+                        )
+                        .await;
+                        return;
+                    };
+                    if !matches!(item_type, "agentMessage" | "dynamicToolCall") {
+                        let _ = deliver(
+                            tx,
+                            deadline,
+                            Err(anyhow::anyhow!(
+                                "Codex app-server exposed an unaudited built-in capability"
+                            )),
+                        )
+                        .await;
+                        return;
+                    }
+                    if item_type == "dynamicToolCall" {
+                        let tool = event.pointer("/params/item/tool").and_then(Value::as_str);
+                        if !tool.is_some_and(|tool| self.allowed_tools.contains(tool)) {
+                            let _ = deliver(
+                                tx,
+                                deadline,
+                                Err(anyhow::anyhow!(
+                                    "Codex lifecycle referenced an unadvertised dynamic tool"
+                                )),
+                            )
+                            .await;
+                            return;
+                        }
+                        let Some(call_id) =
+                            event.pointer("/params/item/id").and_then(Value::as_str)
+                        else {
+                            let _ = deliver(
+                                tx,
+                                deadline,
+                                Err(anyhow::anyhow!(
+                                    "Codex dynamic-tool lifecycle omitted its call id"
+                                )),
+                            )
+                            .await;
+                            return;
+                        };
+                        if method == Some("item/started") {
+                            active_tool_calls.insert(call_id.to_string());
+                        } else if !active_tool_calls.remove(call_id) {
+                            let _ = deliver(
+                                tx,
+                                deadline,
+                                Err(anyhow::anyhow!(
+                                    "Codex dynamic-tool lifecycle correlation failed"
+                                )),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                }
                 Some(method)
                     if method.starts_with("item/")
                         || method.starts_with("tool/")
@@ -1179,6 +1382,36 @@ async fn deliver(
     item: Result<StreamChunk>,
 ) -> bool {
     matches!(timeout_at(deadline, tx.send(item)).await, Ok(Ok(())))
+}
+
+fn validate_dynamic_tool_request(
+    params: &Value,
+    thread_id: &str,
+    turn_id: &str,
+    allowed_tools: &HashSet<String>,
+    active_calls: &HashSet<String>,
+) -> Result<(String, String, Value)> {
+    if params.get("threadId").and_then(Value::as_str) != Some(thread_id)
+        || params.get("turnId").and_then(Value::as_str) != Some(turn_id)
+    {
+        bail!("Codex dynamic-tool request correlation failed");
+    }
+    let id = required_string(params, "callId")?;
+    let name = required_string(params, "tool")?;
+    if !allowed_tools.contains(&name) {
+        bail!("Codex requested an unadvertised dynamic tool");
+    }
+    if !active_calls.contains(&id) {
+        bail!("Codex dynamic-tool call lacked a correlated lifecycle");
+    }
+    Ok((
+        id,
+        name,
+        params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    ))
 }
 
 fn completed_agent_text(event: &Value) -> Option<String> {
@@ -1272,6 +1505,9 @@ for line in sys.stdin:
         continue
     if method == 'initialize':
         result = {'capabilities': {}}
+    elif method == 'config/read':
+        result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+    elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read':
         assert m['params']['refreshToken'] is True
         result = {'account': {'type': account_type, 'planType': 'plus'}}
@@ -1312,7 +1548,9 @@ for line in sys.stdin:
     if method == 'account/login/start':
         print(json.dumps({'method': 'account/login/completed', 'params': {'loginId': 'login-1', 'success': True}}), flush=True)
     if method == 'turn/start':
+        print(json.dumps({'method': 'item/started', 'params': {'item': {'type': 'agentMessage', 'id': 'agent-1'}}}), flush=True)
         print(json.dumps({'method': 'item/agentMessage/delta', 'params': {'delta': 'hello'}}), flush=True)
+        print(json.dumps({'method': 'item/completed', 'params': {'item': {'type': 'agentMessage', 'id': 'agent-1', 'text': 'hello'}}}), flush=True)
         print(json.dumps({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}}), flush=True)
 "#,
         )
@@ -1347,6 +1585,8 @@ for line in sys.stdin:
     if hang_initialize and method == 'initialize':
         continue
     if method == 'initialize': result = {}
+    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+    elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read': result = {'account': {'type': 'chatgpt'}}
     elif method == 'thread/start': result = {'thread': {'id': 'thread'}}
     elif method == 'turn/start': result = {'turn': {'id': 'turn'}}
@@ -1388,6 +1628,8 @@ for line in sys.stdin:
     m = json.loads(line); method = m.get('method')
     if method == 'initialized': continue
     if method == 'initialize': result = {}
+    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+    elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read': result = {'account': {'type': 'chatgpt'}}
     elif method == 'thread/start': result = {'thread': {'id': 'thread'}}
     elif method == 'turn/start': result = {'turn': {'id': 'turn'}}
@@ -1423,8 +1665,7 @@ for line in sys.stdin:
 
     #[test]
     fn production_process_clears_inherited_capabilities() {
-        let command = AppServerCommand::production().unwrap();
-        let args = command.args.join(" ");
+        let args = hardened_app_server_args().join(" ");
         for required in [
             "mcp_servers={}",
             "environments={}",
@@ -1511,6 +1752,101 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn effective_managed_config_must_attest_empty_capabilities() {
+        let safe = json!({"config": {
+            "mcp_servers": {}, "plugins": {}, "environments": {}, "hooks": {},
+            "apps": {"_default": {"enabled": false}},
+            "features": {
+                "apps": false, "plugins": false, "remote_plugin": false,
+                "shell_tool": false, "unified_exec": false, "multi_agent": false,
+                "hooks": false, "web_search": false, "browser_use": false,
+                "computer_use": false
+            }
+        }});
+        verify_effective_config(&safe).unwrap();
+        let mut managed_mcp = safe;
+        managed_mcp["config"]["mcp_servers"]["managed"] = json!({"enabled": true});
+        assert!(verify_effective_config(&managed_mcp).is_err());
+        verify_effective_requirements(&json!({"requirements": null})).unwrap();
+        assert!(verify_effective_requirements(&json!({
+            "requirements": {"features": {"apps": true}}
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn dynamic_tool_requests_require_allowlist_and_exact_correlation() {
+        let allowed = HashSet::from(["lookup".to_string()]);
+        let active = HashSet::from(["call-1".to_string()]);
+        let valid = json!({
+            "threadId": "thread-1", "turnId": "turn-1", "callId": "call-1",
+            "tool": "lookup", "arguments": {"query": "safe"}
+        });
+        validate_dynamic_tool_request(&valid, "thread-1", "turn-1", &allowed, &active).unwrap();
+        let mut unadvertised = valid.clone();
+        unadvertised["tool"] = json!("shell");
+        assert!(validate_dynamic_tool_request(
+            &unadvertised,
+            "thread-1",
+            "turn-1",
+            &allowed,
+            &active
+        )
+        .is_err());
+        let mut wrong_turn = valid;
+        wrong_turn["turnId"] = json!("other");
+        assert!(validate_dynamic_tool_request(
+            &wrong_turn,
+            "thread-1",
+            "turn-1",
+            &allowed,
+            &active
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auth_rejects_same_length_artifact_replacement_before_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("codex");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let expected = file_identity(&executable).unwrap();
+        let mut command = AppServerCommand::test(executable.clone(), vec![]);
+        command.identity = Some(ExecutableIdentity {
+            files: vec![expected.clone(), expected],
+            version: "codex-cli 0.149.1".into(),
+        });
+        std::fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
+        let auth = CodexAppServerAuth::with_command(command);
+        let error = auth.status(false).await.unwrap_err();
+        assert!(error.to_string().contains("changed after validation"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_install_ancestor_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("writable");
+        std::fs::create_dir(&nested).unwrap();
+        let mut permissions = std::fs::metadata(&nested).unwrap().permissions();
+        permissions.set_mode(0o777);
+        std::fs::set_permissions(&nested, permissions).unwrap();
+        let executable = nested.join("codex");
+        std::fs::write(&executable, "binary").unwrap();
+        assert!(validate_trusted_file(&executable)
+            .unwrap_err()
+            .to_string()
+            .contains("writable ancestor"));
+    }
+
+    #[test]
     fn missing_restricted_read_roots_fail_closed() {
         let error = require_restricted_boundary(ProtocolCapabilities {
             dynamic_tools: true,
@@ -1568,13 +1904,12 @@ for line in sys.stdin:
             output.status.success()
                 && String::from_utf8_lossy(&output.stdout).contains("codex-cli 0.149.1")
         }) {
-            let capabilities = AppServerCommand::production()
-                .unwrap()
-                .detect_protocol_capabilities();
-            assert!(
-                !capabilities.restricted_read_only,
-                "update this regression when the installed production schema gains restricted readable roots"
-            );
+            match AppServerCommand::production() {
+                Ok(command) => {
+                    assert!(!command.detect_protocol_capabilities().restricted_read_only)
+                }
+                Err(error) => assert!(error.to_string().contains("writable ancestor")),
+            }
         }
     }
 
@@ -1803,6 +2138,8 @@ for line in sys.stdin:
     m = json.loads(line); method = m.get('method')
     if method == 'initialized': continue
     if method == 'initialize': result = {}
+    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+    elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read': result = {'account': {'type': 'chatgpt'}}
     elif method == 'thread/start': result = {'thread': {'id': 'thread'}}
     elif method == 'turn/start': result = {'turn': {'id': 'turn'}}
@@ -1852,11 +2189,9 @@ for line in sys.stdin:
         if std::env::var("FINCH_LIVE_CHATGPT_APP_SERVER").as_deref() != Ok("1") {
             return;
         }
-        let provider = CodexAppServerProvider::new(
-            MANAGED_CODEX_CREDENTIAL_REF.into(),
-            "gpt-5.6-terra".into(),
-        )
-        .unwrap();
+        let provider =
+            CodexAppServerProvider::new(MANAGED_CODEX_CREDENTIAL_REF.into(), "gpt-5.6-sol".into())
+                .unwrap();
         let request = ProviderRequest::new(vec![Message {
             role: "user".into(),
             content: vec![ContentBlock::Text {
