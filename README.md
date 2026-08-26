@@ -99,6 +99,10 @@ Configured tools are also available to `finch query`. See
 Finch's OpenAI-compatible HTTP endpoint is the interface for clients that drive
 Finch as a model; Finch does not expose an MCP server.
 
+On macOS, optional GUI automation requires both Finch capability consent and a
+separate operating-system Accessibility grant. See the
+[macOS GUI automation permission guide](docs/MACOS_GUI_AUTOMATION.md).
+
 ---
 
 ## Shared brains (experimental)

@@ -26,6 +26,10 @@ use crate::models::{
 };
 use crate::providers::{TeacherContextConfig, TeacherSession};
 use crate::router::{ForwardReason, RouteDecision, Router};
+#[cfg(target_os = "macos")]
+use crate::runtime::automation::{
+    permission_context_key, permission_target_description, AutomationState,
+};
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
     AnsibleTool, AskUserQuestionTool, BashTool, EditTool, EnterPlanModeTool, GlobTool, GrepTool,
@@ -74,6 +78,122 @@ fn model_visible_tool(tool: &ToolDefinition) -> bool {
 /// Get current terminal width, or default to 80 if not a TTY
 fn terminal_width() -> usize {
     terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
+}
+
+#[cfg(target_os = "macos")]
+fn gui_automation_startup_messages(
+    state: AutomationState,
+    permission_context_matches: bool,
+    prompted: bool,
+    last_known_available: bool,
+    target_description: &str,
+) -> Vec<String> {
+    let mut messages = match state {
+        AutomationState::Available => vec![
+            "✓ GUI automation configured; macOS reports the current Finch process is Accessibility-trusted. Finch capability approval still applies."
+                .to_string(),
+        ],
+        AutomationState::PermissionRequired => {
+            let mut messages = vec![
+                "⚠️  GUI automation is configured, but macOS reports the current Finch process is not Accessibility-trusted."
+                    .to_string(),
+            ];
+            if permission_context_matches && last_known_available {
+                messages.push(
+                    "   A previous check in this executable/launcher context reported trust; access may have been revoked or the code identity may have changed."
+                        .to_string(),
+                );
+            } else if permission_context_matches && prompted {
+                messages.push(
+                    "   An earlier prompt request in this executable/launcher context did not produce trust for the current process."
+                        .to_string(),
+                );
+            } else if prompted || last_known_available {
+                messages.push(
+                    "   Saved permission history belongs to a different executable/launcher context and is not being applied."
+                        .to_string(),
+                );
+            }
+            messages.push(
+                "   A grant visible in System Settings may apply to a different responsible app, signature, or build; Finch cannot identify that TCC record from the public trust check."
+                    .to_string(),
+            );
+            messages
+        }
+        AutomationState::Disabled | AutomationState::Unsupported => return Vec::new(),
+    };
+
+    messages.extend(
+        target_description
+            .lines()
+            .map(|line| format!("   Diagnostic only — {line}")),
+    );
+    if state == AutomationState::PermissionRequired {
+        messages.push(
+            "   Run /setup and press R for a passive re-check, P to request the macOS prompt, or O to open System Settings → Privacy & Security → Accessibility."
+                .to_string(),
+        );
+    }
+    messages
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod gui_automation_startup_tests {
+    use super::*;
+
+    const DIAGNOSTIC: &str = "executable: /tmp/target/debug/finch\nlauncher hint: Apple_Terminal (diagnostic only, not the macOS TCC identity)\nuse the app name macOS shows in its Accessibility prompt/Settings";
+
+    #[test]
+    fn startup_reports_current_process_trust_without_attributing_it_to_launcher_hint() {
+        let output = gui_automation_startup_messages(
+            AutomationState::Available,
+            true,
+            true,
+            true,
+            DIAGNOSTIC,
+        )
+        .join("\n");
+
+        assert!(output.contains("current Finch process is Accessibility-trusted"));
+        assert!(output.contains("Diagnostic only — executable: /tmp/target/debug/finch"));
+        assert!(!output.contains("granted to"));
+    }
+
+    #[test]
+    fn startup_reports_revocation_as_an_observation_not_a_certain_identity_change() {
+        let output = gui_automation_startup_messages(
+            AutomationState::PermissionRequired,
+            true,
+            true,
+            true,
+            DIAGNOSTIC,
+        )
+        .join("\n");
+
+        assert!(output.contains("current Finch process is not Accessibility-trusted"));
+        assert!(output.contains("may have been revoked"));
+        assert!(output.contains("may have changed"));
+        assert!(output.contains("Finch cannot identify that TCC record"));
+        assert!(output.contains("R for a passive re-check"));
+        assert!(output.contains("P to request the macOS prompt"));
+    }
+
+    #[test]
+    fn startup_ignores_history_for_an_ad_hoc_binary_context() {
+        let output = gui_automation_startup_messages(
+            AutomationState::PermissionRequired,
+            false,
+            true,
+            true,
+            DIAGNOSTIC,
+        )
+        .join("\n");
+
+        assert!(output.contains("different executable/launcher context"));
+        assert!(output.contains("not being applied"));
+        assert!(output.contains("different responsible app, signature, or build"));
+        assert!(!output.contains("revoked or identity changed for"));
+    }
 }
 
 /// REPL operating mode
@@ -275,6 +395,21 @@ impl Repl {
                 false
             }
         }));
+        #[cfg(target_os = "macos")]
+        if config.features.gui_automation && is_interactive {
+            let permission_context_matches =
+                config.features.gui_automation_permission_context == permission_context_key();
+            let messages = gui_automation_startup_messages(
+                program_runtime.automation().availability().state,
+                permission_context_matches,
+                config.features.gui_automation_prompted,
+                config.features.gui_automation_last_known_available,
+                &permission_target_description(),
+            );
+            for message in messages {
+                output_status!("{}", message);
+            }
+        }
         tool_registry.register(Box::new(ReadTool));
         tool_registry.register(Box::new(GlobTool));
         tool_registry.register(Box::new(GrepTool));

@@ -966,6 +966,14 @@ async fn main() -> Result<()> {
                             debug_logging: result.debug_logging,
                             #[cfg(target_os = "macos")]
                             gui_automation: result.gui_automation,
+                            #[cfg(target_os = "macos")]
+                            gui_automation_prompted: result.gui_automation_prompted,
+                            #[cfg(target_os = "macos")]
+                            gui_automation_last_known_available: result
+                                .gui_automation_last_known_available,
+                            #[cfg(target_os = "macos")]
+                            gui_automation_permission_context: result
+                                .gui_automation_permission_context,
                             memory_context_lines: result.memory_context_lines,
                             max_verbatim_messages: new_config.features.max_verbatim_messages,
                             context_recall_k: new_config.features.context_recall_k,

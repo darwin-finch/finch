@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
     Frame,
 };
 use std::collections::{HashMap, HashSet};
@@ -92,6 +92,13 @@ use crate::providers::model_catalog::{
     self, CatalogAuth, CatalogSource, ModelCatalog, ModelCatalogProfile,
 };
 use chrono::{DateTime, Utc};
+
+#[cfg(target_os = "macos")]
+use crate::runtime::automation::{
+    permission_context_key, permission_target_description, AutomationAvailability,
+    AutomationBroker, AutomationPermissionResult, AutomationPromptContext,
+    AutomationPromptDisposition, AutomationState,
+};
 
 type CatalogRefreshResult = Option<(ModelCatalog, Option<String>)>;
 
@@ -336,6 +343,22 @@ enum SectionState {
         editing_finch_api_key: bool,
         #[cfg(target_os = "macos")]
         gui_automation: bool,
+        #[cfg(target_os = "macos")]
+        gui_automation_availability: AutomationAvailability,
+        #[cfg(target_os = "macos")]
+        gui_automation_prompt: AutomationPromptDisposition,
+        #[cfg(target_os = "macos")]
+        gui_automation_prompted: bool,
+        #[cfg(target_os = "macos")]
+        gui_automation_last_known_available: bool,
+        #[cfg(target_os = "macos")]
+        gui_automation_permission_context: String,
+        #[cfg(target_os = "macos")]
+        gui_automation_settings_feedback: Option<GuiSettingsFeedback>,
+        #[cfg(target_os = "macos")]
+        gui_automation_details_expanded: bool,
+        #[cfg(target_os = "macos")]
+        gui_automation_details_scroll: u16,
         daemon_only_mode: bool,
         mdns_discovery: bool,
         auto_discover: bool,
@@ -344,6 +367,41 @@ enum SectionState {
         selected_idx: usize, // For arrow key navigation
     },
     Review,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GuiSettingsFeedback {
+    OpenRequested,
+    Suppressed,
+    Failed(String),
+}
+
+#[cfg(target_os = "macos")]
+impl GuiSettingsFeedback {
+    fn compact_message(&self) -> &str {
+        match self {
+            Self::OpenRequested => "Open requested; R re-checks.",
+            Self::Suppressed => "Not opened (SSH/headless).",
+            Self::Failed(_) => "Open failed; D has the error.",
+        }
+    }
+
+    fn full_message(&self) -> String {
+        match self {
+            Self::OpenRequested => {
+                "System Settings open requested. Grant the app macOS identifies, then press R to re-check the current Finch process."
+                    .to_string()
+            }
+            Self::Suppressed => {
+                "System Settings was not opened in this SSH/headless session. From a local interactive session, press O, or open System Settings → Privacy & Security → Accessibility manually."
+                    .to_string()
+            }
+            Self::Failed(error) => format!(
+                "Could not open System Settings: {error}. Open System Settings → Privacy & Security → Accessibility manually."
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -716,6 +774,34 @@ impl WizardState {
         );
 
         // Features section
+        #[cfg(target_os = "macos")]
+        let configured_gui_automation = existing_config
+            .map(|c| c.features.gui_automation)
+            .unwrap_or(false);
+        #[cfg(target_os = "macos")]
+        let current_gui_automation_context = permission_context_key();
+        #[cfg(target_os = "macos")]
+        let gui_automation_context_matches = existing_config.is_some_and(|config| {
+            config.features.gui_automation_permission_context == current_gui_automation_context
+        });
+        #[cfg(target_os = "macos")]
+        let native_gui_automation_available = AutomationBroker::new(configured_gui_automation)
+            .availability()
+            .state
+            == AutomationState::Available;
+        #[cfg(target_os = "macos")]
+        let (gui_automation_prompted, gui_automation_last_known_available) =
+            scoped_permission_history(
+                existing_config
+                    .map(|config| config.features.gui_automation_prompted)
+                    .unwrap_or(false),
+                existing_config
+                    .map(|config| config.features.gui_automation_last_known_available)
+                    .unwrap_or(false),
+                gui_automation_context_matches,
+                native_gui_automation_available,
+            );
+
         sections.insert(
             WizardSection::Features,
             SectionState::Features {
@@ -737,9 +823,24 @@ impl WizardState {
                     .unwrap_or_default(),
                 editing_finch_api_key: false,
                 #[cfg(target_os = "macos")]
-                gui_automation: existing_config
-                    .map(|c| c.features.gui_automation)
-                    .unwrap_or(false),
+                gui_automation: configured_gui_automation,
+                #[cfg(target_os = "macos")]
+                gui_automation_availability: AutomationBroker::new(configured_gui_automation)
+                    .availability(),
+                #[cfg(target_os = "macos")]
+                gui_automation_prompt: AutomationPromptDisposition::NotNeeded,
+                #[cfg(target_os = "macos")]
+                gui_automation_prompted,
+                #[cfg(target_os = "macos")]
+                gui_automation_last_known_available,
+                #[cfg(target_os = "macos")]
+                gui_automation_permission_context: current_gui_automation_context,
+                #[cfg(target_os = "macos")]
+                gui_automation_settings_feedback: None,
+                #[cfg(target_os = "macos")]
+                gui_automation_details_expanded: false,
+                #[cfg(target_os = "macos")]
+                gui_automation_details_scroll: 0,
                 daemon_only_mode: existing_config
                     .map(|c| c.server.mode == "daemon-only")
                     .unwrap_or(false),
@@ -792,6 +893,19 @@ impl WizardState {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn scoped_permission_history(
+    prompted: bool,
+    last_known_available: bool,
+    context_matches: bool,
+    native_available: bool,
+) -> (bool, bool) {
+    (
+        prompted && context_matches,
+        (last_known_available && context_matches) || native_available,
+    )
+}
+
 /// Check if a model family is compatible with an execution target
 /// Setup wizard result containing all collected configuration
 pub struct SetupResult {
@@ -831,6 +945,12 @@ pub struct SetupResult {
     pub debug_logging: bool,
     #[cfg(target_os = "macos")]
     pub gui_automation: bool,
+    #[cfg(target_os = "macos")]
+    pub gui_automation_prompted: bool,
+    #[cfg(target_os = "macos")]
+    pub gui_automation_last_known_available: bool,
+    #[cfg(target_os = "macos")]
+    pub gui_automation_permission_context: String,
     pub daemon_only_mode: bool,
     pub mdns_discovery: bool,
     pub auto_discover: bool,
@@ -959,6 +1079,12 @@ fn config_from_setup_result(result: &SetupResult) -> crate::config::Config {
         debug_logging: result.debug_logging,
         #[cfg(target_os = "macos")]
         gui_automation: result.gui_automation,
+        #[cfg(target_os = "macos")]
+        gui_automation_prompted: result.gui_automation_prompted,
+        #[cfg(target_os = "macos")]
+        gui_automation_last_known_available: result.gui_automation_last_known_available,
+        #[cfg(target_os = "macos")]
+        gui_automation_permission_context: result.gui_automation_permission_context.clone(),
         memory_context_lines: result.memory_context_lines,
         max_verbatim_messages: new_config.features.max_verbatim_messages,
         context_recall_k: new_config.features.context_recall_k,
@@ -1122,8 +1248,20 @@ fn is_nested_interaction_active(state: &WizardState) -> bool {
         Some(SectionState::Features {
             editing_hf_token,
             editing_finch_api_key,
+            #[cfg(target_os = "macos")]
+            gui_automation_details_expanded,
             ..
-        }) => *editing_hf_token || *editing_finch_api_key,
+        }) => {
+            let editing = *editing_hf_token || *editing_finch_api_key;
+            #[cfg(target_os = "macos")]
+            {
+                editing || *gui_automation_details_expanded
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                editing
+            }
+        }
         _ => false,
     }
 }
@@ -2369,6 +2507,40 @@ const SETTINGS_CONTEXT_IDX: usize = 8;
 
 /// Handle input for Features section (with arrow key navigation)
 fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        return handle_features_input_with_gui_actions(
+            state,
+            key,
+            &mut || AutomationBroker::new(true).availability(),
+            &mut || {
+                AutomationBroker::new(true)
+                    .request_permission(AutomationPromptContext::for_current_session(true))
+            },
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        handle_features_input_impl(state, key)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn handle_features_input_with_gui_actions(
+    state: &mut WizardState,
+    key: crossterm::event::KeyEvent,
+    passive_check: &mut dyn FnMut() -> AutomationAvailability,
+    request_permission: &mut dyn FnMut() -> AutomationPermissionResult,
+) -> Result<bool> {
+    handle_features_input_impl(state, key, passive_check, request_permission)
+}
+
+fn handle_features_input_impl(
+    state: &mut WizardState,
+    key: crossterm::event::KeyEvent,
+    #[cfg(target_os = "macos")] passive_check: &mut dyn FnMut() -> AutomationAvailability,
+    #[cfg(target_os = "macos")] request_permission: &mut dyn FnMut() -> AutomationPermissionResult,
+) -> Result<bool> {
     if let Some(SectionState::Features {
         auto_approve,
         streaming,
@@ -2379,6 +2551,22 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
         editing_finch_api_key,
         #[cfg(target_os = "macos")]
         gui_automation,
+        #[cfg(target_os = "macos")]
+        gui_automation_availability,
+        #[cfg(target_os = "macos")]
+        gui_automation_prompt,
+        #[cfg(target_os = "macos")]
+        gui_automation_prompted,
+        #[cfg(target_os = "macos")]
+        gui_automation_last_known_available,
+        #[cfg(target_os = "macos")]
+        gui_automation_permission_context,
+        #[cfg(target_os = "macos")]
+        gui_automation_settings_feedback,
+        #[cfg(target_os = "macos")]
+        gui_automation_details_expanded,
+        #[cfg(target_os = "macos")]
+        gui_automation_details_scroll,
         daemon_only_mode,
         mdns_discovery,
         auto_discover,
@@ -2386,6 +2574,37 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
         selected_idx,
     }) = state.sections.get_mut(&WizardSection::Features)
     {
+        #[cfg(target_os = "macos")]
+        if *gui_automation_details_expanded {
+            match key.code {
+                KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Esc => {
+                    *gui_automation_details_expanded = false;
+                    *gui_automation_details_scroll = 0;
+                }
+                KeyCode::Up => {
+                    *gui_automation_details_scroll =
+                        gui_automation_details_scroll.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    *gui_automation_details_scroll =
+                        gui_automation_details_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    *gui_automation_details_scroll =
+                        gui_automation_details_scroll.saturating_sub(5);
+                }
+                KeyCode::PageDown => {
+                    *gui_automation_details_scroll =
+                        gui_automation_details_scroll.saturating_add(5);
+                }
+                KeyCode::Home => {
+                    *gui_automation_details_scroll = 0;
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         if *editing_hf_token {
             // In HF token editing mode
             match key.code {
@@ -2414,6 +2633,25 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                 }
                 _ => {}
             }
+            return Ok(false);
+        }
+
+        #[cfg(target_os = "macos")]
+        if *selected_idx == 3
+            && *gui_automation
+            && handle_gui_permission_input_with(
+                key.code,
+                gui_automation_availability,
+                gui_automation_prompt,
+                gui_automation_prompted,
+                gui_automation_last_known_available,
+                gui_automation_permission_context,
+                gui_automation_settings_feedback,
+                gui_automation_details_scroll,
+                passive_check,
+                request_permission,
+            )
+        {
             return Ok(false);
         }
 
@@ -2449,7 +2687,23 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                     0 => *streaming = !*streaming,
                     1 => *auto_approve = !*auto_approve,
                     2 => *debug = !*debug,
-                    3 => *gui_automation = !*gui_automation,
+                    3 => {
+                        *gui_automation_settings_feedback = None;
+                        *gui_automation_details_scroll = 0;
+                        toggle_gui_automation_with(
+                            gui_automation,
+                            gui_automation_availability,
+                            gui_automation_prompt,
+                            gui_automation_prompted,
+                            gui_automation_last_known_available,
+                            gui_automation_permission_context,
+                            || {
+                                AutomationBroker::new(true).request_permission(
+                                    AutomationPromptContext::for_current_session(true),
+                                )
+                            },
+                        )
+                    }
                     SETTINGS_DAEMON_ONLY_IDX => *daemon_only_mode = !*daemon_only_mode,
                     SETTINGS_MDNS_IDX => *mdns_discovery = !*mdns_discovery,
                     SETTINGS_AUTO_DISCOVER_IDX => *auto_discover = !*auto_discover,
@@ -2475,6 +2729,19 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                     *editing_finch_api_key = true;
                 }
             }
+            #[cfg(target_os = "macos")]
+            KeyCode::Char('o') | KeyCode::Char('O') if *selected_idx == 3 && *gui_automation => {
+                open_gui_settings_with(gui_automation_settings_feedback, || {
+                    AutomationBroker::new(true).open_permission_settings(
+                        AutomationPromptContext::for_current_session(true),
+                    )
+                });
+            }
+            #[cfg(target_os = "macos")]
+            KeyCode::Char('d') | KeyCode::Char('D') if *selected_idx == 3 && *gui_automation => {
+                *gui_automation_details_expanded = true;
+                *gui_automation_details_scroll = 0;
+            }
             KeyCode::Enter => {
                 state.mark_completed(WizardSection::Features);
                 state.next_section();
@@ -2486,6 +2753,100 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
         }
     }
     Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn handle_gui_permission_input_with(
+    key: KeyCode,
+    availability: &mut AutomationAvailability,
+    prompt: &mut AutomationPromptDisposition,
+    prompted: &mut bool,
+    last_known_available: &mut bool,
+    permission_context: &mut String,
+    settings_feedback: &mut Option<GuiSettingsFeedback>,
+    details_scroll: &mut u16,
+    passive_check: impl FnOnce() -> AutomationAvailability,
+    request_permission: impl FnOnce() -> AutomationPermissionResult,
+) -> bool {
+    let result = match key {
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            let availability = passive_check();
+            AutomationPermissionResult {
+                availability,
+                prompt: AutomationPromptDisposition::NotNeeded,
+            }
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') => request_permission(),
+        _ => return false,
+    };
+
+    *settings_feedback = None;
+    *details_scroll = 0;
+    if result.prompt == AutomationPromptDisposition::Requested {
+        *prompted = true;
+    }
+    if result.availability.state == AutomationState::Available {
+        *last_known_available = true;
+    }
+    if result.prompt == AutomationPromptDisposition::Requested
+        || result.availability.state == AutomationState::Available
+    {
+        *permission_context = permission_context_key();
+    }
+    *availability = result.availability;
+    *prompt = result.prompt;
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn toggle_gui_automation_with(
+    configured: &mut bool,
+    availability: &mut AutomationAvailability,
+    prompt: &mut AutomationPromptDisposition,
+    prompted: &mut bool,
+    last_known_available: &mut bool,
+    permission_context: &mut String,
+    request_permission: impl FnOnce() -> AutomationPermissionResult,
+) {
+    if *configured {
+        *configured = false;
+        *availability = AutomationBroker::new(false).availability();
+        *prompt = AutomationPromptDisposition::NotNeeded;
+    } else {
+        // Persist Finch's explicit capability consent independently from the
+        // result of the native macOS permission request.
+        *configured = true;
+        let result = request_permission();
+        if result.prompt == AutomationPromptDisposition::Requested {
+            *prompted = true;
+        }
+        if result.availability.state == AutomationState::Available {
+            *last_known_available = true;
+        }
+        if result.prompt == AutomationPromptDisposition::Requested
+            || result.availability.state == AutomationState::Available
+        {
+            *permission_context = permission_context_key();
+        }
+        *availability = result.availability;
+        *prompt = result.prompt;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_gui_settings_with(
+    feedback: &mut Option<GuiSettingsFeedback>,
+    open_settings: impl FnOnce() -> Result<bool>,
+) {
+    *feedback = Some(match open_settings() {
+        Ok(true) => GuiSettingsFeedback::OpenRequested,
+        Ok(false) => GuiSettingsFeedback::Suppressed,
+        Err(error) => {
+            tracing::warn!("Could not open macOS Accessibility settings: {error}");
+            GuiSettingsFeedback::Failed(error.to_string())
+        }
+    });
 }
 
 /// Handle input for Review section
@@ -2612,6 +2973,27 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         *gui_automation
     } else {
         false
+    };
+
+    #[cfg(target_os = "macos")]
+    let (
+        gui_automation_prompted,
+        gui_automation_last_known_available,
+        gui_automation_permission_context,
+    ) = if let Some(SectionState::Features {
+        gui_automation_prompted,
+        gui_automation_last_known_available,
+        gui_automation_permission_context,
+        ..
+    }) = state.sections.get(&WizardSection::Features)
+    {
+        (
+            *gui_automation_prompted,
+            *gui_automation_last_known_available,
+            gui_automation_permission_context.clone(),
+        )
+    } else {
+        (false, false, String::new())
     };
 
     // Map to backward-compatible fields
@@ -2806,6 +3188,12 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         debug_logging: debug,
         #[cfg(target_os = "macos")]
         gui_automation,
+        #[cfg(target_os = "macos")]
+        gui_automation_prompted,
+        #[cfg(target_os = "macos")]
+        gui_automation_last_known_available,
+        #[cfg(target_os = "macos")]
+        gui_automation_permission_context,
         daemon_only_mode: daemon_only,
         mdns_discovery: mdns,
         auto_discover: auto_disc,
@@ -2815,6 +3203,18 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
 
 /// Render the tabbed wizard UI
 fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
+    #[cfg(target_os = "macos")]
+    let permission_target = permission_target_description();
+    #[cfg(not(target_os = "macos"))]
+    let permission_target = String::new();
+    render_tabbed_wizard_with_permission_target(f, state, &permission_target);
+}
+
+fn render_tabbed_wizard_with_permission_target(
+    f: &mut Frame,
+    state: &WizardState,
+    permission_target: &str,
+) {
     let size = f.area();
 
     // Main layout: [Tab bar | Content | Help]
@@ -2862,7 +3262,7 @@ fn render_tabbed_wizard(f: &mut Frame, state: &WizardState) {
     f.render_widget(tabs, chunks[0]);
 
     // Render current section content
-    render_section_content(f, chunks[1], state);
+    render_section_content(f, chunks[1], state, permission_target);
 
     // Render help text
     let section_help = match state.current_section {
@@ -2914,7 +3314,7 @@ fn render_cancel_confirmation(f: &mut Frame, area: Rect) {
 }
 
 /// Render the content area for the current section
-fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
+fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState, permission_target: &str) {
     let section_state = state.sections.get(&state.current_section);
 
     match section_state {
@@ -2978,6 +3378,22 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             editing_finch_api_key,
             #[cfg(target_os = "macos")]
             gui_automation,
+            #[cfg(target_os = "macos")]
+            gui_automation_availability,
+            #[cfg(target_os = "macos")]
+            gui_automation_prompt,
+            #[cfg(target_os = "macos")]
+            gui_automation_prompted,
+            #[cfg(target_os = "macos")]
+            gui_automation_last_known_available,
+            #[cfg(target_os = "macos")]
+                gui_automation_permission_context: _,
+            #[cfg(target_os = "macos")]
+            gui_automation_settings_feedback,
+            #[cfg(target_os = "macos")]
+            gui_automation_details_expanded,
+            #[cfg(target_os = "macos")]
+            gui_automation_details_scroll,
             daemon_only_mode,
             mdns_discovery,
             auto_discover,
@@ -2995,6 +3411,22 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             *editing_finch_api_key,
             #[cfg(target_os = "macos")]
             *gui_automation,
+            #[cfg(target_os = "macos")]
+            gui_automation_availability,
+            #[cfg(target_os = "macos")]
+            *gui_automation_prompt,
+            #[cfg(target_os = "macos")]
+            *gui_automation_prompted,
+            #[cfg(target_os = "macos")]
+            *gui_automation_last_known_available,
+            #[cfg(target_os = "macos")]
+            gui_automation_settings_feedback.as_ref(),
+            #[cfg(target_os = "macos")]
+            *gui_automation_details_expanded,
+            #[cfg(target_os = "macos")]
+            *gui_automation_details_scroll,
+            #[cfg(target_os = "macos")]
+            permission_target,
             *daemon_only_mode,
             *mdns_discovery,
             *auto_discover,
@@ -3951,6 +4383,75 @@ fn render_personas_section(
 }
 
 /// Render Features section (all settings visible)
+#[cfg(target_os = "macos")]
+fn gui_automation_status_lines(
+    configured: bool,
+    availability: &AutomationAvailability,
+    prompt: AutomationPromptDisposition,
+    prompted: bool,
+    last_known_available: bool,
+    target_description: &str,
+    settings_feedback: Option<&GuiSettingsFeedback>,
+) -> Vec<String> {
+    let summary = match (availability.state, prompt) {
+        (AutomationState::Disabled, _) => "Finch capability consent is disabled",
+        (AutomationState::Unsupported, _) => "Configured, but unsupported on this launch",
+        (AutomationState::Available, _) => {
+            "Configured; macOS reports the current Finch process is Accessibility-trusted; Finch still approves each effect"
+        }
+        (AutomationState::PermissionRequired, AutomationPromptDisposition::SuppressedRemote) => {
+            "Configured; current Finch process is not Accessibility-trusted (prompt suppressed over SSH); press P locally to request, or R to re-check"
+        }
+        (
+            AutomationState::PermissionRequired,
+            AutomationPromptDisposition::SuppressedNonInteractive,
+        ) => {
+            "Configured; current Finch process is not Accessibility-trusted (headless prompt suppressed); press P in an interactive session"
+        }
+        (AutomationState::PermissionRequired, _) if last_known_available => {
+            "Configured; current Finch process is not Accessibility-trusted after a prior successful observation (access revoked or code identity changed); press R to re-check or P to request"
+        }
+        (AutomationState::PermissionRequired, AutomationPromptDisposition::Requested) => {
+            "Configured; macOS prompt requested, but the current Finch process is not Accessibility-trusted yet; press R to verify or P to request again"
+        }
+        (AutomationState::PermissionRequired, _) if prompted => {
+            "Configured; current Finch process remains untrusted after an earlier request; press R to re-check or P to request again"
+        }
+        (AutomationState::PermissionRequired, _) => {
+            "Configured; current Finch process is not Accessibility-trusted; press R to check or P to request the macOS prompt"
+        }
+    };
+
+    let mut lines = Vec::new();
+    if let Some(feedback) = settings_feedback {
+        lines.push(format!("Settings action: {}", feedback.full_message()));
+    }
+    lines.push(format!("Trust status: {summary}"));
+    if configured
+        && matches!(
+            availability.state,
+            AutomationState::PermissionRequired | AutomationState::Available
+        )
+    {
+        lines.extend(
+            target_description
+                .lines()
+                .map(|line| format!("Diagnostic only — {line}")),
+        );
+    }
+    if availability.state == AutomationState::PermissionRequired {
+        lines.push(
+            "Recovery: a checkbox or prompt is not proof of access. Press P to request the macOS prompt, or open System Settings → Privacy & Security → Accessibility, then press R for a passive re-check of this live process. If it remains untrusted, relaunch the same executable/host context and check again."
+                .to_string(),
+        );
+    }
+    lines.push(
+        "This full view is read/scroll only; clipboard copying is unavailable in the setup wizard."
+            .to_string(),
+    );
+    lines
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_features_section(
     f: &mut Frame,
@@ -3963,19 +4464,61 @@ fn render_features_section(
     finch_api_key: &str,
     editing_finch_api_key: bool,
     #[cfg(target_os = "macos")] gui_automation: bool,
+    #[cfg(target_os = "macos")] gui_automation_availability: &AutomationAvailability,
+    #[cfg(target_os = "macos")] gui_automation_prompt: AutomationPromptDisposition,
+    #[cfg(target_os = "macos")] gui_automation_prompted: bool,
+    #[cfg(target_os = "macos")] gui_automation_last_known_available: bool,
+    #[cfg(target_os = "macos")] gui_automation_settings_feedback: Option<&GuiSettingsFeedback>,
+    #[cfg(target_os = "macos")] gui_automation_details_expanded: bool,
+    #[cfg(target_os = "macos")] gui_automation_details_scroll: u16,
+    #[cfg(target_os = "macos")] gui_automation_target_description: &str,
     daemon_only_mode: bool,
     mdns_discovery: bool,
     auto_discover: bool,
     memory_context_lines: usize,
     selected_idx: usize,
 ) {
+    #[cfg(target_os = "macos")]
+    let show_gui_details = selected_idx == 3 && gui_automation;
+    #[cfg(not(target_os = "macos"))]
+    let show_gui_details = false;
+
+    #[cfg(target_os = "macos")]
+    let gui_automation_status = gui_automation_status_lines(
+        gui_automation,
+        gui_automation_availability,
+        gui_automation_prompt,
+        gui_automation_prompted,
+        gui_automation_last_known_available,
+        gui_automation_target_description,
+        gui_automation_settings_feedback,
+    );
+
+    #[cfg(target_os = "macos")]
+    let expanded_gui_details = show_gui_details && gui_automation_details_expanded;
+    #[cfg(not(target_os = "macos"))]
+    let expanded_gui_details = false;
+
+    let condensed_layout = area.height < 18;
+    let title_height = if condensed_layout { 1 } else { 3 };
+    let instructions_height = if condensed_layout { 1 } else { 3 };
+    let detail_height = if show_gui_details && !expanded_gui_details {
+        let preferred = if area.width < 60 { 10 } else { 7 };
+        let available = area
+            .height
+            .saturating_sub(title_height + instructions_height + 4);
+        preferred.min(available)
+    } else {
+        0
+    };
+    let mut constraints = vec![Constraint::Length(title_height), Constraint::Min(4)];
+    if detail_height > 0 {
+        constraints.push(Constraint::Length(detail_height));
+    }
+    constraints.push(Constraint::Length(instructions_height));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Min(10),   // Feature list
-            Constraint::Length(3), // Instructions
-        ])
+        .constraints(constraints)
         .split(area);
 
     let title = Paragraph::new("Settings")
@@ -3987,7 +4530,35 @@ fn render_features_section(
         .alignment(Alignment::Center);
     f.render_widget(title, chunks[0]);
 
+    #[cfg(target_os = "macos")]
+    if expanded_gui_details {
+        let details = Paragraph::new(gui_automation_status.join("\n"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Full GUI automation status (read/scroll only)"),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((gui_automation_details_scroll, 0));
+        f.render_widget(details, chunks[1]);
+        let instructions =
+            Paragraph::new("↑/↓ or PgUp/PgDn: Scroll | Home: Top | D/Esc: Back to settings")
+                .style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .alignment(Alignment::Center);
+        f.render_widget(instructions, chunks[chunks.len() - 1]);
+        return;
+    }
+
     // Build feature list: toggle-able booleans, editable credentials, and a spinner.
+    #[cfg(target_os = "macos")]
+    let gui_automation_description = gui_automation_status
+        .iter()
+        .find_map(|line| line.strip_prefix("Trust status: "))
+        .unwrap_or("GUI automation status unavailable");
 
     #[cfg(not(target_os = "macos"))]
     let bool_features: Vec<(&str, bool, &str)> = vec![
@@ -4040,11 +4611,7 @@ fn render_features_section(
             debug,
             "Write verbose logs to ~/.finch/debug.log",
         ),
-        (
-            "GUI automation",
-            gui_automation,
-            "Allow tools to click/type in macOS apps",
-        ),
+        ("GUI automation", gui_automation, gui_automation_description),
         // index 4 = HF token (handled separately)
         (
             "Daemon-only mode",
@@ -4278,14 +4845,61 @@ fn render_features_section(
     }
 
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Options"));
-    f.render_widget(list, chunks[1]);
+    let mut list_state = ListState::default().with_selected(Some(selected_idx));
+    f.render_stateful_widget(list, chunks[1], &mut list_state);
+
+    #[cfg(target_os = "macos")]
+    if show_gui_details {
+        let mut compact_lines = Vec::new();
+        if let Some(feedback) = gui_automation_settings_feedback {
+            compact_lines.push(Line::from(feedback.compact_message()));
+        } else {
+            let compact_trust = if gui_automation_availability.state == AutomationState::Available {
+                "Current Finch process: trusted."
+            } else {
+                "Current Finch process: untrusted."
+            };
+            compact_lines.push(Line::from(compact_trust));
+        }
+        compact_lines.push(Line::from(Span::styled(
+            "R: Passive check | P: Request prompt",
+            Style::default().fg(Color::Cyan),
+        )));
+        compact_lines.push(Line::from(Span::styled(
+            "O: System Settings → Privacy & Security → Accessibility",
+            Style::default().fg(Color::Cyan),
+        )));
+        compact_lines.push(Line::from(Span::styled(
+            "D: Full process/host/status",
+            Style::default().fg(Color::Cyan),
+        )));
+        let status = Paragraph::new(compact_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("GUI automation status"),
+            )
+            .wrap(Wrap { trim: false });
+        f.render_widget(status, chunks[2]);
+    }
 
     let instructions_text = if editing_hf_token {
         "Type HuggingFace token | Enter/Esc: Done"
     } else if editing_finch_api_key {
         "Type Finch client key | Enter/Esc: Done"
     } else {
-        "↑/↓: Move | Space: Toggle | ◀/▶: Context lines | E: Edit selected key/token | Enter: Continue"
+        #[cfg(target_os = "macos")]
+        {
+            if show_gui_details {
+                "R: Check | P: Prompt | O/D: More"
+            } else {
+                "↑/↓: Move | Space: Toggle | E: Edit | Enter: Continue"
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            "↑/↓: Move | Space: Toggle | ◀/▶: Context lines | E: Edit selected key/token | Enter: Continue"
+        }
     };
     let instructions = Paragraph::new(instructions_text)
         .style(
@@ -4294,7 +4908,7 @@ fn render_features_section(
                 .add_modifier(Modifier::BOLD),
         )
         .alignment(Alignment::Center);
-    f.render_widget(instructions, chunks[2]);
+    f.render_widget(instructions, chunks[chunks.len() - 1]);
 }
 
 /// Render Review section
@@ -4627,6 +5241,12 @@ mod tests {
             auto_approve,
             #[cfg(target_os = "macos")]
             gui_automation,
+            #[cfg(target_os = "macos")]
+            gui_automation_prompted,
+            #[cfg(target_os = "macos")]
+            gui_automation_last_known_available,
+            #[cfg(target_os = "macos")]
+            gui_automation_permission_context,
             daemon_only_mode,
             mdns_discovery,
             auto_discover,
@@ -4637,6 +5257,9 @@ mod tests {
             #[cfg(target_os = "macos")]
             {
                 *gui_automation = true;
+                *gui_automation_prompted = true;
+                *gui_automation_last_known_available = true;
+                *gui_automation_permission_context = permission_context_key();
             }
             *daemon_only_mode = true;
             *mdns_discovery = true;
@@ -4650,6 +5273,15 @@ mod tests {
         assert!(config.features.auto_approve_tools);
         #[cfg(target_os = "macos")]
         assert!(config.features.gui_automation);
+        #[cfg(target_os = "macos")]
+        assert!(config.features.gui_automation_prompted);
+        #[cfg(target_os = "macos")]
+        assert!(config.features.gui_automation_last_known_available);
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            config.features.gui_automation_permission_context,
+            permission_context_key()
+        );
         assert_eq!(config.server.mode, "daemon-only");
         assert!(config.server.advertise);
         assert!(config.client.auto_discover);
@@ -4659,6 +5291,12 @@ mod tests {
             auto_approve,
             #[cfg(target_os = "macos")]
             gui_automation,
+            #[cfg(target_os = "macos")]
+            gui_automation_prompted,
+            #[cfg(target_os = "macos")]
+            gui_automation_last_known_available,
+            #[cfg(target_os = "macos")]
+            gui_automation_permission_context,
             daemon_only_mode,
             mdns_discovery,
             auto_discover,
@@ -4668,12 +5306,526 @@ mod tests {
             assert!(*auto_approve);
             #[cfg(target_os = "macos")]
             assert!(*gui_automation);
+            #[cfg(target_os = "macos")]
+            assert!(*gui_automation_prompted);
+            #[cfg(target_os = "macos")]
+            assert!(*gui_automation_last_known_available);
+            #[cfg(target_os = "macos")]
+            assert_eq!(gui_automation_permission_context, &permission_context_key());
             assert!(*daemon_only_mode);
             assert!(*mdns_discovery);
             assert!(*auto_discover);
         } else {
             panic!("expected settings section");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_gui_permission_keys_separate_passive_check_from_prompt_request() {
+        use std::cell::Cell;
+
+        let passive_checks = Cell::new(0);
+        let prompt_requests = Cell::new(0);
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Features;
+        if let Some(SectionState::Features {
+            gui_automation,
+            gui_automation_prompt,
+            gui_automation_prompted,
+            gui_automation_settings_feedback,
+            gui_automation_details_scroll,
+            selected_idx,
+            ..
+        }) = state.sections.get_mut(&WizardSection::Features)
+        {
+            *gui_automation = true;
+            *gui_automation_prompt = AutomationPromptDisposition::Requested;
+            *gui_automation_prompted = true;
+            *gui_automation_settings_feedback = Some(GuiSettingsFeedback::OpenRequested);
+            *gui_automation_details_scroll = 8;
+            *selected_idx = 3;
+        }
+
+        handle_features_input_with_gui_actions(
+            &mut state,
+            key(KeyCode::Char('r')),
+            &mut || {
+                passive_checks.set(passive_checks.get() + 1);
+                AutomationAvailability {
+                    state: AutomationState::PermissionRequired,
+                    backend: "test-native",
+                    operations: vec!["click", "type"],
+                }
+            },
+            &mut || {
+                prompt_requests.set(prompt_requests.get() + 1);
+                panic!("passive R must never invoke the native prompt callback")
+            },
+        )
+        .unwrap();
+        assert_eq!(passive_checks.get(), 1);
+        assert_eq!(prompt_requests.get(), 0);
+        if let Some(SectionState::Features {
+            gui_automation_prompt,
+            gui_automation_settings_feedback,
+            gui_automation_details_scroll,
+            ..
+        }) = state.sections.get(&WizardSection::Features)
+        {
+            assert_eq!(
+                *gui_automation_prompt,
+                AutomationPromptDisposition::NotNeeded
+            );
+            assert!(gui_automation_settings_feedback.is_none());
+            assert_eq!(*gui_automation_details_scroll, 0);
+        }
+
+        handle_features_input_with_gui_actions(
+            &mut state,
+            key(KeyCode::Char('p')),
+            &mut || panic!("explicit P must use the prompt callback"),
+            &mut || {
+                prompt_requests.set(prompt_requests.get() + 1);
+                AutomationPermissionResult {
+                    availability: AutomationAvailability {
+                        state: AutomationState::PermissionRequired,
+                        backend: "test-native",
+                        operations: vec!["click", "type"],
+                    },
+                    prompt: AutomationPromptDisposition::Requested,
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(passive_checks.get(), 1);
+        assert_eq!(prompt_requests.get(), 1);
+        if let Some(SectionState::Features {
+            gui_automation_prompt,
+            gui_automation_prompted,
+            gui_automation_permission_context,
+            ..
+        }) = state.sections.get(&WizardSection::Features)
+        {
+            assert_eq!(
+                *gui_automation_prompt,
+                AutomationPromptDisposition::Requested
+            );
+            assert!(*gui_automation_prompted);
+            assert_eq!(gui_automation_permission_context, &permission_context_key());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gui_toggle_persists_consent_without_claiming_prompt_granted_access() {
+        use crate::runtime::automation::{
+            AutomationAvailability, AutomationPermissionResult, AutomationPromptDisposition,
+            AutomationState,
+        };
+
+        let mut configured = false;
+        let mut availability = AutomationBroker::new(false).availability();
+        let mut prompt = AutomationPromptDisposition::NotNeeded;
+        let mut prompted = false;
+        let mut last_known_available = false;
+        let mut permission_context = String::new();
+
+        toggle_gui_automation_with(
+            &mut configured,
+            &mut availability,
+            &mut prompt,
+            &mut prompted,
+            &mut last_known_available,
+            &mut permission_context,
+            || AutomationPermissionResult {
+                availability: AutomationAvailability {
+                    state: AutomationState::PermissionRequired,
+                    backend: "test-native",
+                    operations: vec!["click", "type"],
+                },
+                prompt: AutomationPromptDisposition::Requested,
+            },
+        );
+
+        assert!(configured, "Finch consent should be persisted separately");
+        assert_eq!(availability.state, AutomationState::PermissionRequired);
+        assert_eq!(prompt, AutomationPromptDisposition::Requested);
+        assert!(prompted);
+        assert!(!last_known_available);
+        assert_eq!(permission_context, permission_context_key());
+
+        toggle_gui_automation_with(
+            &mut configured,
+            &mut availability,
+            &mut prompt,
+            &mut prompted,
+            &mut last_known_available,
+            &mut permission_context,
+            || panic!("disabling must not invoke the native prompt"),
+        );
+        assert!(!configured);
+        assert_eq!(availability.state, AutomationState::Disabled);
+        assert_eq!(prompt, AutomationPromptDisposition::NotNeeded);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gui_permission_history_is_scoped_and_current_native_state_wins() {
+        assert_eq!(
+            scoped_permission_history(true, true, true, false),
+            (true, true)
+        );
+        assert_eq!(
+            scoped_permission_history(true, true, false, false),
+            (false, false),
+            "history from a different executable/launcher context must not imply denial or revocation"
+        );
+        assert_eq!(
+            scoped_permission_history(false, false, false, true),
+            (false, true),
+            "a current native grant must be reported regardless of stale history"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gui_permission_required_status_includes_non_authoritative_process_diagnostics() {
+        let availability = AutomationAvailability {
+            state: AutomationState::PermissionRequired,
+            backend: "test-native",
+            operations: vec!["click", "type"],
+        };
+        let target = "executable: /tmp/target/debug/finch; launcher hint: Apple_Terminal (diagnostic only, not the macOS TCC identity)";
+        let lines = gui_automation_status_lines(
+            true,
+            &availability,
+            AutomationPromptDisposition::SuppressedNonInteractive,
+            false,
+            false,
+            target,
+            None,
+        );
+        let output = lines.join("\n");
+
+        assert!(output.contains("current Finch process is not Accessibility-trusted"));
+        assert!(output.contains("headless prompt suppressed"));
+        assert!(output.contains("Diagnostic only — executable: /tmp/target/debug/finch"));
+        assert!(output.contains("launcher hint: Apple_Terminal"));
+        assert!(!output.contains("Accessibility is not granted to"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_gui_accessibility_o_outcomes_visible_at_80x24() {
+        use ratatui::backend::TestBackend;
+
+        for (feedback, needle) in [
+            (GuiSettingsFeedback::OpenRequested, "Open requested"),
+            (GuiSettingsFeedback::Suppressed, "Not opened (SSH/headless)"),
+            (
+                GuiSettingsFeedback::Failed("test opener failure".to_string()),
+                "Open failed",
+            ),
+        ] {
+            let mut state = WizardState::new(None);
+            state.current_section = WizardSection::Features;
+            if let Some(SectionState::Features {
+                gui_automation,
+                gui_automation_availability,
+                gui_automation_prompt,
+                gui_automation_settings_feedback,
+                selected_idx,
+                ..
+            }) = state.sections.get_mut(&WizardSection::Features)
+            {
+                *gui_automation = true;
+                gui_automation_availability.state = AutomationState::PermissionRequired;
+                *gui_automation_prompt = AutomationPromptDisposition::SuppressedNonInteractive;
+                *gui_automation_settings_feedback = Some(feedback);
+                *selected_idx = 3;
+            }
+
+            for (width, height) in [(80, 24), (40, 18)] {
+                let backend = TestBackend::new(width, height);
+                let mut terminal = ratatui::Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render_tabbed_wizard_with_permission_target(
+                            frame,
+                            &state,
+                            "current Finch process: PID 42\nexecutable: /tmp/finch\nlauncher hint: Terminal",
+                        );
+                    })
+                    .unwrap();
+                let rendered = test_buffer_text(terminal.backend().buffer());
+                assert!(rendered.contains("GUI automation"));
+                assert!(rendered.contains(needle), "missing {needle}: {rendered}");
+                assert!(rendered.contains("D: Full"));
+                if !matches!(
+                    state.sections.get(&WizardSection::Features),
+                    Some(SectionState::Features {
+                        gui_automation_settings_feedback: Some(GuiSettingsFeedback::OpenRequested),
+                        ..
+                    })
+                ) {
+                    assert!(rendered.contains("System Settings"));
+                    assert!(rendered.contains("Privacy"));
+                    assert!(rendered.contains("Security"));
+                    assert!(rendered.contains("Accessibility"));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_gui_accessibility_fresh_40x18_shows_exact_recovery_keys_and_path() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Features;
+        if let Some(SectionState::Features {
+            gui_automation,
+            gui_automation_availability,
+            selected_idx,
+            ..
+        }) = state.sections.get_mut(&WizardSection::Features)
+        {
+            *gui_automation = true;
+            gui_automation_availability.state = AutomationState::PermissionRequired;
+            *selected_idx = 3;
+        }
+        let backend = TestBackend::new(40, 18);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_tabbed_wizard_with_permission_target(
+                    frame,
+                    &state,
+                    "current Finch process: PID 42\nexecutable: /tmp/finch\nlauncher hint: Terminal",
+                );
+            })
+            .unwrap();
+        let rendered = test_buffer_text(terminal.backend().buffer());
+
+        assert!(rendered.contains("Current Finch process"));
+        assert!(rendered.contains("R: Passive check"));
+        assert!(rendered.contains("P: Request prompt"));
+        assert!(rendered.contains("O: System Settings"));
+        assert!(rendered.contains("Privacy"));
+        assert!(rendered.contains("Security"));
+        assert!(rendered.contains("Accessibility"));
+        assert!(rendered.contains("D: Full"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_gui_accessibility_expanded_details_preserve_long_identity_hints() {
+        use ratatui::backend::TestBackend;
+
+        let long_path = format!(
+            "/private/tmp/{}/finch-ad-hoc-build",
+            "long-development-directory/".repeat(4)
+        );
+        let target = format!(
+            "executable: {long_path}\nlauncher hint: VeryLongLauncherNameForAccessibilityDiagnostics\nuse the app name macOS shows"
+        );
+        let feedback = GuiSettingsFeedback::Failed("test opener failure".to_string());
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Features;
+        if let Some(SectionState::Features {
+            gui_automation,
+            gui_automation_availability,
+            gui_automation_prompt,
+            gui_automation_prompted,
+            gui_automation_settings_feedback,
+            gui_automation_details_expanded,
+            selected_idx,
+            ..
+        }) = state.sections.get_mut(&WizardSection::Features)
+        {
+            *gui_automation = true;
+            gui_automation_availability.state = AutomationState::PermissionRequired;
+            *gui_automation_prompt = AutomationPromptDisposition::Requested;
+            *gui_automation_prompted = true;
+            *gui_automation_settings_feedback = Some(feedback);
+            *gui_automation_details_expanded = true;
+            *selected_idx = 3;
+        }
+
+        let mut render = |width, height, scroll| {
+            if let Some(SectionState::Features {
+                gui_automation_details_scroll,
+                ..
+            }) = state.sections.get_mut(&WizardSection::Features)
+            {
+                *gui_automation_details_scroll = scroll;
+            }
+            let backend = TestBackend::new(width, height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_tabbed_wizard_with_permission_target(frame, &state, &target);
+                })
+                .unwrap();
+            test_buffer_text(terminal.backend().buffer())
+        };
+
+        let full_status = gui_automation_status_lines(
+            true,
+            &AutomationAvailability {
+                state: AutomationState::PermissionRequired,
+                backend: "test-native",
+                operations: vec!["click", "type"],
+            },
+            AutomationPromptDisposition::Requested,
+            true,
+            false,
+            &target,
+            Some(&GuiSettingsFeedback::Failed(
+                "test opener failure".to_string(),
+            )),
+        )
+        .join("\n");
+        assert!(full_status.contains(&long_path));
+
+        let full_size_pages = (0..16)
+            .map(|scroll| render(80, 24, scroll))
+            .collect::<Vec<_>>();
+        assert!(full_size_pages
+            .iter()
+            .any(|page| page.contains("/private/tmp/long-development-directory")));
+        assert!(full_size_pages
+            .iter()
+            .any(|page| page.contains("finch-ad-hoc-build")));
+        assert!(full_size_pages
+            .iter()
+            .any(|page| page.contains("test opener failure")));
+        assert!(full_size_pages
+            .iter()
+            .any(|page| page.contains("VeryLongLauncherNameForAccessibilityDiagnostics")));
+        assert!(full_size_pages
+            .iter()
+            .any(|page| page.contains("clipboard copying is unavailable")));
+
+        let narrow_pages = (0..24)
+            .map(|scroll| render(40, 18, scroll))
+            .collect::<Vec<_>>();
+        let narrow_page_text = |page: &str| {
+            page.chars()
+                .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+                .collect::<String>()
+        };
+        assert!(narrow_pages
+            .iter()
+            .any(|page| narrow_page_text(page).contains("finch-ad-hoc-build")));
+        assert!(narrow_pages.iter().any(|page| narrow_page_text(page)
+            .contains("VeryLongLauncherNameForAccessibilityDiagnostics")));
+        assert!(narrow_pages.iter().any(|page| page.contains("PgUp/PgDn")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_gui_accessibility_navigation_and_resize_keep_selected_row_visible() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Features;
+        for _ in 0..SETTINGS_CONTEXT_IDX {
+            handle_features_input(&mut state, key(KeyCode::Down)).unwrap();
+        }
+        for (width, height) in [(80, 24), (40, 18)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render_tabbed_wizard(frame, &state))
+                .unwrap();
+            let rendered = test_buffer_text(terminal.backend().buffer());
+            assert!(
+                rendered.contains("Context lines: 4"),
+                "selected row clipped after resize to {width}x{height}: {rendered}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_gui_accessibility_full_status_scrolls_and_closes_without_native_actions() {
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Features;
+        if let Some(SectionState::Features {
+            gui_automation,
+            selected_idx,
+            ..
+        }) = state.sections.get_mut(&WizardSection::Features)
+        {
+            *gui_automation = true;
+            *selected_idx = 3;
+        }
+
+        handle_features_input(&mut state, key(KeyCode::Char('d'))).unwrap();
+        handle_wizard_key(&mut state, key(KeyCode::Right)).unwrap();
+        assert_eq!(state.current_section, WizardSection::Features);
+        handle_features_input(&mut state, key(KeyCode::Down)).unwrap();
+        handle_features_input(&mut state, key(KeyCode::PageDown)).unwrap();
+        if let Some(SectionState::Features {
+            gui_automation_details_expanded,
+            gui_automation_details_scroll,
+            selected_idx,
+            ..
+        }) = state.sections.get(&WizardSection::Features)
+        {
+            assert!(*gui_automation_details_expanded);
+            assert_eq!(*gui_automation_details_scroll, 6);
+            assert_eq!(
+                *selected_idx, 3,
+                "detail scrolling must not move the feature row"
+            );
+        }
+
+        handle_features_input(&mut state, key(KeyCode::Home)).unwrap();
+        if let Some(SectionState::Features {
+            gui_automation_details_scroll,
+            ..
+        }) = state.sections.get(&WizardSection::Features)
+        {
+            assert_eq!(*gui_automation_details_scroll, 0);
+        }
+
+        handle_features_input(&mut state, key(KeyCode::Esc)).unwrap();
+        if let Some(SectionState::Features {
+            gui_automation_details_expanded,
+            gui_automation_details_scroll,
+            ..
+        }) = state.sections.get(&WizardSection::Features)
+        {
+            assert!(!*gui_automation_details_expanded);
+            assert_eq!(*gui_automation_details_scroll, 0);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_gui_accessibility_settings_open_outcomes_are_visible_and_actionable() {
+        let mut feedback = None;
+        open_gui_settings_with(&mut feedback, || Ok(false));
+        let suppressed = feedback.as_ref().unwrap().full_message();
+        assert!(suppressed.contains("was not opened"));
+        assert!(suppressed.contains("local interactive session"));
+        assert!(suppressed.contains("open System Settings"));
+
+        open_gui_settings_with(&mut feedback, || {
+            Err(anyhow::anyhow!("test opener failure"))
+        });
+        let failed = feedback.as_ref().unwrap().full_message();
+        assert!(failed.contains("Could not open System Settings: test opener failure"));
+        assert!(failed.contains("Privacy & Security → Accessibility"));
+
+        open_gui_settings_with(&mut feedback, || Ok(true));
+        let opened = feedback.as_ref().unwrap().full_message();
+        assert!(opened.contains("open requested"));
+        assert!(opened.contains("press R"));
     }
 
     #[test]
@@ -4709,6 +5861,21 @@ mod tests {
 
     fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn test_buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .fold(String::new(), |mut line, symbol| {
+                        line.push_str(symbol);
+                        line
+                    })
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn state_with_step(step: AddProviderStep) -> WizardState {
