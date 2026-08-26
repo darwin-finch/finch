@@ -95,8 +95,9 @@ use chrono::{DateTime, Utc};
 
 #[cfg(target_os = "macos")]
 use crate::runtime::automation::{
-    permission_context_key, AutomationAvailability, AutomationBroker, AutomationPermissionResult,
-    AutomationPromptContext, AutomationPromptDisposition, AutomationState,
+    permission_context_key, permission_target_description, AutomationAvailability,
+    AutomationBroker, AutomationPermissionResult, AutomationPromptContext,
+    AutomationPromptDisposition, AutomationState,
 };
 
 type CatalogRefreshResult = Option<(ModelCatalog, Option<String>)>;
@@ -352,6 +353,8 @@ enum SectionState {
         gui_automation_last_known_available: bool,
         #[cfg(target_os = "macos")]
         gui_automation_permission_context: String,
+        #[cfg(target_os = "macos")]
+        gui_automation_settings_feedback: Option<String>,
         daemon_only_mode: bool,
         mdns_discovery: bool,
         auto_discover: bool,
@@ -793,6 +796,8 @@ impl WizardState {
                 gui_automation_last_known_available,
                 #[cfg(target_os = "macos")]
                 gui_automation_permission_context: current_gui_automation_context,
+                #[cfg(target_os = "macos")]
+                gui_automation_settings_feedback: None,
                 daemon_only_mode: existing_config
                     .map(|c| c.server.mode == "daemon-only")
                     .unwrap_or(false),
@@ -2467,6 +2472,8 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
         gui_automation_last_known_available,
         #[cfg(target_os = "macos")]
         gui_automation_permission_context,
+        #[cfg(target_os = "macos")]
+        gui_automation_settings_feedback,
         daemon_only_mode,
         mdns_discovery,
         auto_discover,
@@ -2537,19 +2544,22 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                     0 => *streaming = !*streaming,
                     1 => *auto_approve = !*auto_approve,
                     2 => *debug = !*debug,
-                    3 => toggle_gui_automation_with(
-                        gui_automation,
-                        gui_automation_availability,
-                        gui_automation_prompt,
-                        gui_automation_prompted,
-                        gui_automation_last_known_available,
-                        gui_automation_permission_context,
-                        || {
-                            AutomationBroker::new(true).request_permission(
-                                AutomationPromptContext::for_current_session(true),
-                            )
-                        },
-                    ),
+                    3 => {
+                        *gui_automation_settings_feedback = None;
+                        toggle_gui_automation_with(
+                            gui_automation,
+                            gui_automation_availability,
+                            gui_automation_prompt,
+                            gui_automation_prompted,
+                            gui_automation_last_known_available,
+                            gui_automation_permission_context,
+                            || {
+                                AutomationBroker::new(true).request_permission(
+                                    AutomationPromptContext::for_current_session(true),
+                                )
+                            },
+                        )
+                    }
                     SETTINGS_DAEMON_ONLY_IDX => *daemon_only_mode = !*daemon_only_mode,
                     SETTINGS_MDNS_IDX => *mdns_discovery = !*mdns_discovery,
                     SETTINGS_AUTO_DISCOVER_IDX => *auto_discover = !*auto_discover,
@@ -2577,6 +2587,7 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
             }
             #[cfg(target_os = "macos")]
             KeyCode::Char('r') | KeyCode::Char('R') if *selected_idx == 3 && *gui_automation => {
+                *gui_automation_settings_feedback = None;
                 let result = AutomationBroker::new(true)
                     .request_permission(AutomationPromptContext::for_current_session(true));
                 if result.prompt == AutomationPromptDisposition::Requested {
@@ -2595,11 +2606,11 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
             }
             #[cfg(target_os = "macos")]
             KeyCode::Char('o') | KeyCode::Char('O') if *selected_idx == 3 && *gui_automation => {
-                if let Err(error) = AutomationBroker::new(true)
-                    .open_permission_settings(AutomationPromptContext::for_current_session(true))
-                {
-                    tracing::warn!("Could not open macOS Accessibility settings: {error}");
-                }
+                open_gui_settings_with(gui_automation_settings_feedback, || {
+                    AutomationBroker::new(true).open_permission_settings(
+                        AutomationPromptContext::for_current_session(true),
+                    )
+                });
             }
             KeyCode::Enter => {
                 state.mark_completed(WizardSection::Features);
@@ -2647,6 +2658,29 @@ fn toggle_gui_automation_with(
         *availability = result.availability;
         *prompt = result.prompt;
     }
+}
+
+#[cfg(target_os = "macos")]
+fn open_gui_settings_with(
+    feedback: &mut Option<String>,
+    open_settings: impl FnOnce() -> Result<bool>,
+) {
+    *feedback = Some(match open_settings() {
+        Ok(true) => {
+            "System Settings open requested. Grant the app macOS identifies, then press R to re-check the current Finch process."
+                .to_string()
+        }
+        Ok(false) => {
+            "System Settings was not opened in this SSH/headless session. From a local interactive session, press O, or open System Settings → Privacy & Security → Accessibility manually."
+                .to_string()
+        }
+        Err(error) => {
+            tracing::warn!("Could not open macOS Accessibility settings: {error}");
+            format!(
+                "Could not open System Settings: {error}. Open System Settings → Privacy & Security → Accessibility manually."
+            )
+        }
+    });
 }
 
 /// Handle input for Review section
@@ -3176,6 +3210,8 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             gui_automation_last_known_available,
             #[cfg(target_os = "macos")]
                 gui_automation_permission_context: _,
+            #[cfg(target_os = "macos")]
+            gui_automation_settings_feedback,
             daemon_only_mode,
             mdns_discovery,
             auto_discover,
@@ -3201,6 +3237,8 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             *gui_automation_prompted,
             #[cfg(target_os = "macos")]
             *gui_automation_last_known_available,
+            #[cfg(target_os = "macos")]
+            gui_automation_settings_feedback.as_deref(),
             *daemon_only_mode,
             *mdns_discovery,
             *auto_discover,
@@ -4157,6 +4195,64 @@ fn render_personas_section(
 }
 
 /// Render Features section (all settings visible)
+#[cfg(target_os = "macos")]
+fn gui_automation_status_lines(
+    configured: bool,
+    availability: &AutomationAvailability,
+    prompt: AutomationPromptDisposition,
+    prompted: bool,
+    last_known_available: bool,
+    target_description: &str,
+    settings_feedback: Option<&str>,
+) -> Vec<String> {
+    let summary = match (availability.state, prompt) {
+        (AutomationState::Disabled, _) => "Finch capability consent is disabled",
+        (AutomationState::Unsupported, _) => "Configured, but unsupported on this launch",
+        (AutomationState::Available, _) => {
+            "Configured; macOS reports the current Finch process is Accessibility-trusted; Finch still approves each effect"
+        }
+        (AutomationState::PermissionRequired, AutomationPromptDisposition::SuppressedRemote) => {
+            "Configured; current Finch process is not Accessibility-trusted (prompt suppressed over SSH); press R locally"
+        }
+        (
+            AutomationState::PermissionRequired,
+            AutomationPromptDisposition::SuppressedNonInteractive,
+        ) => {
+            "Configured; current Finch process is not Accessibility-trusted (headless prompt suppressed); retry interactively"
+        }
+        (AutomationState::PermissionRequired, _) if last_known_available => {
+            "Configured; current Finch process is not Accessibility-trusted after a prior successful observation (access revoked or code identity changed); press R"
+        }
+        (AutomationState::PermissionRequired, AutomationPromptDisposition::Requested) => {
+            "Configured; macOS prompt requested, but the current Finch process is not Accessibility-trusted yet; press R to verify"
+        }
+        (AutomationState::PermissionRequired, _) if prompted => {
+            "Configured; current Finch process remains untrusted after an earlier request; press R to retry"
+        }
+        (AutomationState::PermissionRequired, _) => {
+            "Configured; current Finch process is not Accessibility-trusted; press R to request/check"
+        }
+    };
+
+    let mut lines = vec![summary.to_string()];
+    if configured
+        && matches!(
+            availability.state,
+            AutomationState::PermissionRequired | AutomationState::Available
+        )
+    {
+        lines.extend(
+            target_description
+                .lines()
+                .map(|line| format!("Diagnostic only — {line}")),
+        );
+    }
+    if let Some(feedback) = settings_feedback {
+        lines.push(feedback.to_string());
+    }
+    lines
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_features_section(
     f: &mut Frame,
@@ -4173,6 +4269,7 @@ fn render_features_section(
     #[cfg(target_os = "macos")] gui_automation_prompt: AutomationPromptDisposition,
     #[cfg(target_os = "macos")] gui_automation_prompted: bool,
     #[cfg(target_os = "macos")] gui_automation_last_known_available: bool,
+    #[cfg(target_os = "macos")] gui_automation_settings_feedback: Option<&str>,
     daemon_only_mode: bool,
     mdns_discovery: bool,
     auto_discover: bool,
@@ -4200,35 +4297,17 @@ fn render_features_section(
     // Build feature list: toggle-able booleans, editable credentials, and a spinner.
 
     #[cfg(target_os = "macos")]
-    let gui_automation_description = match (
-        gui_automation_availability.state,
+    let gui_automation_status = gui_automation_status_lines(
+        gui_automation,
+        gui_automation_availability,
         gui_automation_prompt,
-    ) {
-        (AutomationState::Disabled, _) => "Finch capability consent is disabled",
-        (AutomationState::Unsupported, _) => "Configured, but unsupported on this launch",
-        (AutomationState::Available, _) => {
-            "Configured; macOS Accessibility granted; Finch still approves each effect"
-        }
-        (AutomationState::PermissionRequired, AutomationPromptDisposition::SuppressedRemote) => {
-            "Configured; permission required (prompt suppressed over SSH); press R locally"
-        }
-        (
-            AutomationState::PermissionRequired,
-            AutomationPromptDisposition::SuppressedNonInteractive,
-        ) => "Configured; permission required (headless prompt suppressed); retry interactively",
-        (AutomationState::PermissionRequired, _) if gui_automation_last_known_available => {
-            "Configured; prior grant not observed (revoked/identity changed); press R"
-        }
-        (AutomationState::PermissionRequired, AutomationPromptDisposition::Requested) => {
-            "Configured; macOS prompt requested, but access is not granted yet; press R to verify"
-        }
-        (AutomationState::PermissionRequired, _) if gui_automation_prompted => {
-            "Configured; permission remains ungranted after an earlier request; press R to retry"
-        }
-        (AutomationState::PermissionRequired, _) => {
-            "Configured; macOS Accessibility permission required; press R to request/check"
-        }
-    };
+        gui_automation_prompted,
+        gui_automation_last_known_available,
+        &permission_target_description(),
+        gui_automation_settings_feedback,
+    );
+    #[cfg(target_os = "macos")]
+    let gui_automation_description = gui_automation_status[0].as_str();
 
     #[cfg(not(target_os = "macos"))]
     let bool_features: Vec<(&str, bool, &str)> = vec![
@@ -4419,7 +4498,7 @@ fn render_features_section(
             )
         };
 
-        let feat_lines = vec![
+        let mut feat_lines = vec![
             Line::from(vec![
                 Span::raw(prefix),
                 Span::raw(format!("{} ", checkbox)),
@@ -4431,6 +4510,15 @@ fn render_features_section(
                 Span::styled(*desc, Style::default().fg(Color::DarkGray)),
             ]),
         ];
+        #[cfg(target_os = "macos")]
+        if *name == "GUI automation" && is_selected {
+            feat_lines.extend(gui_automation_status.iter().skip(1).map(|line| {
+                Line::from(vec![
+                    Span::raw("        "),
+                    Span::styled(line.as_str(), Style::default().fg(Color::DarkGray)),
+                ])
+            }));
+        }
         items.push(ListItem::new(feat_lines));
         list_idx += 1;
     }
@@ -5020,6 +5108,112 @@ mod tests {
             (false, true),
             "a current native grant must be reported regardless of stale history"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gui_permission_required_status_includes_non_authoritative_process_diagnostics() {
+        let availability = AutomationAvailability {
+            state: AutomationState::PermissionRequired,
+            backend: "test-native",
+            operations: vec!["click", "type"],
+        };
+        let target = "executable: /tmp/target/debug/finch; launcher hint: Apple_Terminal (diagnostic only, not the macOS TCC identity)";
+        let lines = gui_automation_status_lines(
+            true,
+            &availability,
+            AutomationPromptDisposition::SuppressedNonInteractive,
+            false,
+            false,
+            target,
+            None,
+        );
+        let output = lines.join("\n");
+
+        assert!(output.contains("current Finch process is not Accessibility-trusted"));
+        assert!(output.contains("headless prompt suppressed"));
+        assert!(output.contains("Diagnostic only — executable: /tmp/target/debug/finch"));
+        assert!(output.contains("launcher hint: Apple_Terminal"));
+        assert!(!output.contains("Accessibility is not granted to"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn features_renderer_shows_permission_diagnostics_and_settings_feedback() {
+        use ratatui::backend::TestBackend;
+
+        let availability = AutomationAvailability {
+            state: AutomationState::PermissionRequired,
+            backend: "test-native",
+            operations: vec!["click", "type"],
+        };
+        let backend = TestBackend::new(120, 45);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_features_section(
+                    frame,
+                    frame.area(),
+                    false,
+                    true,
+                    false,
+                    "",
+                    false,
+                    "",
+                    false,
+                    true,
+                    &availability,
+                    AutomationPromptDisposition::SuppressedNonInteractive,
+                    false,
+                    false,
+                    Some("System Settings was not opened; open it manually."),
+                    false,
+                    false,
+                    true,
+                    4,
+                    3,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .fold(String::new(), |mut line, symbol| {
+                        line.push_str(symbol);
+                        line
+                    })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Diagnostic only — executable:"));
+        assert!(rendered.contains("launcher hint:"));
+        assert!(rendered.contains("System Settings was not opened"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gui_settings_open_outcomes_are_visible_and_actionable() {
+        let mut feedback = None;
+        open_gui_settings_with(&mut feedback, || Ok(false));
+        let suppressed = feedback.as_deref().unwrap();
+        assert!(suppressed.contains("was not opened"));
+        assert!(suppressed.contains("local interactive session"));
+        assert!(suppressed.contains("open System Settings"));
+
+        open_gui_settings_with(&mut feedback, || {
+            Err(anyhow::anyhow!("test opener failure"))
+        });
+        let failed = feedback.as_deref().unwrap();
+        assert!(failed.contains("Could not open System Settings: test opener failure"));
+        assert!(failed.contains("Privacy & Security → Accessibility"));
+
+        open_gui_settings_with(&mut feedback, || Ok(true));
+        let opened = feedback.as_deref().unwrap();
+        assert!(opened.contains("open requested"));
+        assert!(opened.contains("press R"));
     }
 
     #[test]

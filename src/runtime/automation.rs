@@ -97,7 +97,7 @@ pub fn permission_target_description() -> String {
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "the current Finch executable".to_string());
     format!(
-        "Finch executable {executable} (launch context: {}); use the app name macOS shows in its Accessibility prompt/Settings",
+        "executable: {executable}\nlauncher hint: {} (diagnostic only, not the macOS TCC identity)\nuse the app name macOS shows in its Accessibility prompt/Settings",
         permission_launch_context()
     )
 }
@@ -602,5 +602,14 @@ mod tests {
                 remote_session: false,
             }
         ));
+    }
+
+    #[test]
+    fn permission_target_is_explicitly_non_authoritative() {
+        let description = permission_target_description();
+        assert!(description.contains("executable:"));
+        assert!(description.contains("launcher hint:"));
+        assert!(description.contains("diagnostic only, not the macOS TCC identity"));
+        assert!(description.contains("use the app name macOS shows"));
     }
 }
