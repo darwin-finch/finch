@@ -533,9 +533,25 @@ impl BrainLifecycleService {
         connection_id: ConnectionId,
     ) -> Result<()> {
         let brain_id = self.store.snapshot(brain)?.brain_id;
+        let reserved = self
+            .store
+            .pending_reserved_cancellations_for_attachment(brain, attachment_id)?;
         self.store.detach(brain, attachment_id, connection_id)?;
         self.approvals
             .cancel_connection(brain_id, attachment_id, connection_id);
+        // A cancellation reservation is durable authority, not authority
+        // owned by the WebSocket command future. Once that exact initiating
+        // generation disconnects, finish its reserved terminal outcome and
+        // release only waits for that run, even if the runner never replies.
+        for run_id in reserved {
+            if self.store.complete_reserved_run_cancellation_on_disconnect(
+                brain,
+                "daemon",
+                run_id,
+            )? {
+                self.runners.abort_run(brain, run_id);
+            }
+        }
         self.store.remove_if_unused(brain)?;
         Ok(())
     }
@@ -738,56 +754,91 @@ impl BrainLifecycleService {
         }
         ensure!(!run.status.is_terminal() || run.status == BrainRunStatus::Interrupted,
             "Brain run has already finished");
+        let owner = self.clone();
+        let brain = brain.to_string();
+        let sender = attachment.subject;
+        // Dropping a WebSocket command future must not drop the only owner of
+        // a durable cancellation reservation. Tokio tasks remain owned by the
+        // daemon when their JoinHandle is dropped; exact-generation detach
+        // below can finish and abort this exact run if the runner withholds its
+        // cancellation reply.
+        tokio::spawn(async move {
+            owner
+                .reconcile_reserved_run_cancellation(
+                    brain,
+                    sender,
+                    run,
+                    reserved,
+                    mutation_id,
+                )
+                .await
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("Brain cancellation owner failed: {error}"))?
+    }
+
+    async fn reconcile_reserved_run_cancellation(
+        &self,
+        brain: String,
+        sender: String,
+        run: BrainRun,
+        reserved: Option<crate::brain::store::BrainRunCancellationReservation>,
+        mutation_id: Option<uuid::Uuid>,
+    ) -> Result<BrainRun> {
         let needs_runner_reconciliation = reserved.as_ref()
             .is_some_and(|reserved| reserved.needs_runner_cancel);
         if let Some(mutation_id) = mutation_id {
             self.store.mark_run_cancellation_dispatching(
-                brain, &attachment.subject, run_id, mutation_id,
+                &brain, &sender, run.run_id, mutation_id,
             )?;
         }
         if matches!(
             run.status,
             BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
         ) || needs_runner_reconciliation {
-            self.store.reserve_run_publication_cancellation(brain, run_id).await?;
-            let snapshot = self.snapshot(brain)?;
+            self.store.reserve_run_publication_cancellation(&brain, run.run_id).await?;
+            let snapshot = self.snapshot(&brain)?;
             let lease = match snapshot
                 .runner_lease
                 .filter(|lease| lease.expires_ms > crate::brain::store::unix_millis())
             {
                 Some(lease) => lease,
                 None => {
-                    self.store.clear_run_cancellation(brain, run_id).await?;
+                    self.store.clear_run_cancellation(&brain, run.run_id).await?;
                     anyhow::bail!("named Brain '{brain}' has no live runner");
                 }
             };
             // Cancellation at the runner is idempotent by RunId: `false`
             // means the run is already absent there, which reconciles the
             // durable cancellation intent just as safely as `true`.
-            if let Err(error) = self.runners.cancel_run(brain, lease.lease_id, run_id).await {
-                self.store.clear_run_cancellation(brain, run_id).await?;
+            if let Err(error) = self.runners.cancel_run(&brain, lease.lease_id, run.run_id).await {
+                let current = self.inspect_run(&brain, run.run_id)?;
+                if current.status == BrainRunStatus::Cancelled {
+                    return Ok(current);
+                }
+                self.store.clear_run_cancellation(&brain, run.run_id).await?;
                 return Err(error);
             }
         }
         if let Some(mutation_id) = mutation_id {
             self.store.mark_run_cancellation_reconciled(
-                brain, &attachment.subject, run_id, mutation_id,
+                &brain, &sender, run.run_id, mutation_id,
              )?;
         }
-        let publication = self.store.acquire_run_publication(brain, run_id).await?;
+        let publication = self.store.acquire_run_publication(&brain, run.run_id).await?;
         let transition = match reserved {
             Some(_) => self.store.complete_reserved_run_cancellation(
-                brain, &attachment.subject, run_id,
+                &brain, &sender, run.run_id,
             ),
             None => self.store.transition_run(
-                brain, &attachment.subject, run_id, BrainRunStatus::Cancelled,
+                &brain, &sender, run.run_id, BrainRunStatus::Cancelled,
                 Some("cancelled by initiating driver".into()),
             ),
         };
         let transitioned = match transition {
             Ok(run) => Ok(run),
             Err(error) => {
-                let current = self.inspect_run(brain, run_id)?;
+                let current = self.inspect_run(&brain, run.run_id)?;
                 if current.status == BrainRunStatus::Cancelled {
                     Ok(current)
                 } else {
@@ -800,7 +851,7 @@ impl BrainLifecycleService {
             run.status,
             BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
         ) {
-            self.store.prune_run_publication(brain, run_id)?;
+            self.store.prune_run_publication(&brain, run.run_id)?;
         }
         transitioned
     }
@@ -1114,7 +1165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_reservation_owns_terminal_outcome_before_runner_cancel_reply() {
+    async fn cancellation_reservation_survives_disconnect_with_withheld_runner_reply() {
         let service = service();
         let driver = service
             .attach("shared", "alice", AttachmentRole::Driver, None)
@@ -1201,8 +1252,9 @@ mod tests {
         service.detach("shared", driver_id, connection_id).unwrap();
         tokio::task::yield_now().await;
         assert_eq!(service.inspect_run("shared", run_id).unwrap().status,
-            BrainRunStatus::Running);
-        cancel.response_tx.send(Ok(true)).unwrap();
+            BrainRunStatus::Cancelled);
+        assert!(cancel.response_tx.send(Ok(true)).is_err(),
+            "exact runner cancellation wait survived initiating disconnect");
         assert_eq!(cancelling.await.unwrap().unwrap().status, BrainRunStatus::Cancelled);
         assert!(accepted.result.is_none());
         let snapshot = service.snapshot("shared").unwrap();

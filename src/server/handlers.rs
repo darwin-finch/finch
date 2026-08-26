@@ -1147,10 +1147,34 @@ async fn dispatch_named_brain_run(
         fn drop(&mut self) {
             if !self.armed { return; }
             let detail = "initiating Brain connection disconnected".to_string();
-            let _ = self.store.terminalize_run_with_result_if_active(
+            if let Err(error) = self.store.terminalize_run_with_result_if_active(
                 &self.brain, "daemon", self.run_id, self.request_seq,
-                BrainRunStatus::Failed, detail,
-            );
+                BrainRunStatus::Failed, detail.clone(),
+            ) {
+                tracing::error!(brain = %self.brain, run_id = %self.run_id.0, %error,
+                    "failed to publish disconnect terminalization; scheduling durable retry");
+                let store = self.store.clone();
+                let brain = self.brain.clone();
+                let run_id = self.run_id;
+                let request_seq = self.request_seq;
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        for _ in 0..8 {
+                            tokio::task::yield_now().await;
+                            match store.terminalize_run_with_result_if_active(
+                                &brain, "daemon", run_id, request_seq,
+                                BrainRunStatus::Failed, detail.clone(),
+                            ) {
+                                Ok(_) => return,
+                                Err(error) => tracing::warn!(brain = %brain, run_id = %run_id.0,
+                                    %error, "retrying disconnect terminalization"),
+                            }
+                        }
+                        tracing::error!(brain = %brain, run_id = %run_id.0,
+                            "disconnect terminalization retries exhausted; durable intent remains for restart");
+                    });
+                }
+            }
         }
     }
     let mut terminalizer = DisconnectTerminalizer {
@@ -3943,7 +3967,7 @@ mod handler_tests {
                 idempotency_key: uuid::Uuid::new_v4(),
             }),
             kind: crate::ipc::brain_codec::BrainRemoteCommandKind::Submit(
-                BrainEventKind::Prompt { text: "disconnect mid-turn".into() },
+                BrainEventKind::SpeculativePrompt { text: "disconnect mid-turn".into() },
             ),
         };
         let encoded = crate::ipc::brain_codec::encode_brain_remote_envelope(
@@ -3954,6 +3978,7 @@ mod handler_tests {
         else { panic!("expected a real dispatched turn") };
 
         let request_seq = late_request.request_seq;
+        let run_id = late_request.run_id;
         let approval_audience = late_request.approval_audience.clone();
         let (control_tx, control_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -3972,23 +3997,81 @@ mod handler_tests {
             _ = &mut forwarding => panic!("runner forwarder ended before exposing control"),
         };
         let approval_id = "disconnect-approval";
-        let registration = approvals.register_for_connection(request_seq, approval_id, BrainApprovalAudience {
-            brain_id: snapshot.brain_id,
-            brain: "shared".into(),
-            attachment_id: attached.attachment_id,
-            subject: attached.subject.clone(),
-            role: attached.role,
-            environment_generation: snapshot.environment.generation,
-        }, connection_id).unwrap();
-        let _approval_waiter = tokio::spawn(async move {
-            let _ = registration.wait().await;
-            std::future::pending::<()>().await;
-        });
+        let mut pending_approval = Box::pin(
+            crate::ipc::server::request_test_turn_approval_with_client(
+                stale_control.clone(),
+                crate::server::RunnerTurnEvent::ApprovalRequested {
+                    approval_id: approval_id.into(),
+                    approval_kind: "tool".into(),
+                    subject: "bash".into(),
+                    audience: approval_audience.clone(),
+                    detail: serde_json::json!({"input": {"command": "true"}}),
+                },
+            ),
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            loop {
+                tokio::select! {
+                    result = &mut pending_approval => panic!("approval completed before disconnect: {result:?}"),
+                    _ = &mut forwarding => panic!("runner forwarder ended before approval suspended"),
+                    _ = tokio::task::yield_now() => {}
+                }
+                let projected = lifecycle.snapshot("shared").unwrap();
+                if projected.events.iter().any(|event| matches!(
+                    &event.kind,
+                    BrainEventKind::ApprovalRequested { approval_id: id, .. }
+                        if id == approval_id
+                )) {
+                    assert_eq!(projected.runs.iter().find(|run| {
+                        run.request_seq == request_seq
+                    }).unwrap().status, crate::brain::store::BrainRunStatus::AwaitingApproval);
+                    break;
+                }
+            }
+        }).await.expect("reverse approval did not reach durable suspension");
 
-        tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            socket.close(None),
-        ).await.expect("WebSocket close was not bounded").unwrap();
+        let cancellation_snapshot = lifecycle.snapshot("shared").unwrap();
+        let cancellation_command = crate::ipc::brain_codec::BrainRemoteCommand {
+            request_id: 2,
+            mutation: Some(crate::ipc::brain_codec::BrainRemoteMutation {
+                brain_id: cancellation_snapshot.brain_id,
+                expected_revision: cancellation_snapshot.revision,
+                environment_generation: cancellation_snapshot.environment.generation,
+                idempotency_key: uuid::Uuid::new_v4(),
+            }),
+            kind: crate::ipc::brain_codec::BrainRemoteCommandKind::CancelRun(run_id),
+        };
+        let encoded = crate::ipc::brain_codec::encode_brain_remote_envelope(
+            &crate::ipc::brain_codec::BrainRemoteEnvelope::Command(cancellation_command),
+        ).unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Binary(encoded)).await.unwrap();
+        let withheld_cancel = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            loop {
+                tokio::select! {
+                    request = runner_rx.recv() => match request.unwrap() {
+                        crate::server::RunnerRequest::Cancel(cancel) => break cancel,
+                        crate::server::RunnerRequest::ProjectMemory(request) => {
+                            request.response_tx.send(Ok(0)).unwrap();
+                        }
+                        other => panic!("expected cancellation request, got {other:?}"),
+                    },
+                    result = &mut pending_approval => panic!("approval completed before disconnect: {result:?}"),
+                    _ = &mut forwarding => panic!("runner forwarder ended before cancellation reached runner"),
+                }
+            }
+        }).await.expect("WebSocket CancelRun did not reach the runner");
+        assert_eq!(withheld_cancel.run_id, run_id);
+
+        let mut close = Box::pin(socket.close(None));
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            loop {
+                tokio::select! {
+                    result = &mut close => break result,
+                    result = &mut pending_approval => panic!("approval completed before WebSocket close: {result:?}"),
+                    _ = &mut forwarding => panic!("runner forwarder ended before WebSocket close"),
+                }
+            }
+        }).await.expect("WebSocket close was not bounded").unwrap();
         tokio::time::timeout(std::time::Duration::from_millis(250), async {
             loop {
                 if lifecycle.connection(
@@ -4008,17 +4091,27 @@ mod handler_tests {
         assert!(approvals.claim_connection(
             snapshot.brain_id, request_seq, approval_id, attached.attachment_id, connection_id,
         ).is_err());
+        let approval_error = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            tokio::select! {
+                result = &mut pending_approval => result,
+                _ = &mut forwarding => panic!("runner forwarder ended before approval failed closed"),
+            }
+        }).await.expect("pre-disconnect reverse approval did not fail closed").unwrap_err();
+        assert!(approval_error.to_string().contains("approval audience disconnected"),
+            "unexpected approval failure: {approval_error}");
         let disconnected = lifecycle.snapshot("shared").unwrap();
         let run = disconnected.runs.iter().find(|run| run.request_seq == request_seq).unwrap();
-        assert_eq!(run.status, crate::brain::store::BrainRunStatus::Failed);
+        assert_eq!(run.status, crate::brain::store::BrainRunStatus::Cancelled);
         assert_eq!(disconnected.events.iter().filter(|event| {
             event.run_id == Some(run.run_id)
                 && matches!(event.kind, BrainEventKind::Result { .. })
-        }).count(), 1);
+        }).count(), 0);
         assert_eq!(disconnected.events.iter().filter(|event| matches!(
             event.kind, BrainEventKind::RunStatusChanged { run_id, status, .. }
                 if run_id == run.run_id && status.is_terminal()
         )).count(), 1);
+        assert!(withheld_cancel.response_tx.send(Ok(true)).is_err(),
+            "withheld runner cancel reply remained live after exact-run teardown");
         let terminal_seq = disconnected.events.iter().find_map(|event| match event.kind {
             BrainEventKind::RunStatusChanged { run_id, status, .. }
                 if run_id == run.run_id && status.is_terminal() => Some(event.seq),

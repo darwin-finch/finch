@@ -2590,10 +2590,9 @@ async fn handle_connection(stream: tokio::net::UnixStream, server: Arc<AgentServ
     let attachments = server
         .brain_runners()
         .disconnect_connection(connection_id);
+    let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
     for (brain, attachment_id, attachment_connection_id) in attachments {
-        let _ = server
-            .brain_store()
-            .detach(&brain, attachment_id, attachment_connection_id);
+        let _ = lifecycle.detach(&brain, attachment_id, attachment_connection_id);
     }
     result
 }

@@ -603,7 +603,25 @@ pub struct BrainEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "journal_record", rename_all = "snake_case")]
 enum BrainJournalRecord {
-    EventBatch { events: Vec<BrainEvent> },
+    EventBatch {
+        /// New batches carry their logical framing inside the physical JSONL
+        /// record. Optional fields keep journals written by the first batch
+        /// implementation readable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_count: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload_sha256: Option<String>,
+        events: Vec<BrainEvent>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DisconnectTerminalizationIntent {
+    sender: String,
+    run_id: RunId,
+    request_seq: u64,
+    status: BrainRunStatus,
+    detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1863,9 +1881,18 @@ impl BrainStore {
         let current = state.runs.get(&run_id)
             .with_context(|| format!("Brain run {} does not exist", run_id.0))?;
         if current.status.is_terminal() {
+            self.clear_disconnect_intent(name, run_id)?;
             return Ok(None);
         }
         validate_run_transition(current.status, status)?;
+        let intent = DisconnectTerminalizationIntent {
+            sender: sender.to_string(),
+            run_id,
+            request_seq,
+            status,
+            detail: detail.clone(),
+        };
+        self.persist_disconnect_intent(name, &intent)?;
         let existing = state.events.iter().find(|event| {
             event.run_id == Some(run_id)
                 && matches!(event.kind, BrainEventKind::Result { .. })
@@ -1913,6 +1940,7 @@ impl BrainStore {
             state.apply(event.clone());
             let _ = state.tx.send(event);
         }
+        self.clear_disconnect_intent(name, run_id)?;
         drop(brains);
         drop(publication);
         self.prune_run_publication(name, run_id)?;
@@ -2078,6 +2106,54 @@ impl BrainStore {
         }
         self.transition_run(name, sender, run_id, BrainRunStatus::Cancelled,
             Some("cancelled by initiating driver".into()))
+    }
+
+    pub(crate) fn pending_reserved_cancellations_for_attachment(
+        &self,
+        name: &str,
+        attachment_id: AttachmentId,
+    ) -> Result<Vec<RunId>> {
+        let snapshot = self.snapshot(name)?;
+        Ok(snapshot
+            .runs
+            .iter()
+            .filter(|run| {
+                run.initiating_attachment_id == attachment_id
+                    && !run.status.is_terminal()
+                    && snapshot.events.iter().any(|event| {
+                        matches!(
+                            event.kind,
+                            BrainEventKind::MutationRecorded {
+                                outcome: BrainMutationOutcome::RunCancellationReserved { run_id },
+                            } if run_id == run.run_id
+                        )
+                    })
+            })
+            .map(|run| run.run_id)
+            .collect())
+    }
+
+    pub(crate) fn complete_reserved_run_cancellation_on_disconnect(
+        &self,
+        name: &str,
+        sender: &str,
+        run_id: RunId,
+    ) -> Result<bool> {
+        let publication = match self.run_publication_gate(name, run_id)?.try_lock_owned() {
+            Ok(publication) => publication,
+            Err(_) => return Ok(false),
+        };
+        if !publication.cancel_requested() {
+            return Ok(false);
+        }
+        let current = self.inspect_run(name, run_id)?;
+        if current.status.is_terminal() {
+            return Ok(false);
+        }
+        self.complete_reserved_run_cancellation(name, sender, run_id)?;
+        drop(publication);
+        self.prune_run_publication(name, run_id)?;
+        Ok(true)
     }
 
     pub fn mark_run_cancellation_dispatching(
@@ -3625,6 +3701,7 @@ impl BrainStore {
         // valid runner lease. A run that was already executing or suspended
         // for approval has unknown external progress after daemon restart and
         // must never be replayed implicitly.
+        let mut disconnect_intents = self.read_disconnect_intents(name)?;
         let orphaned_runs = state
             .runs
             .values()
@@ -3637,6 +3714,45 @@ impl BrainStore {
             .map(|run| run.run_id)
             .collect::<Vec<_>>();
         for run_id in orphaned_runs {
+            if let Some(intent) = disconnect_intents.remove(&run_id) {
+                let next_seq = state.events.last().map(|event| event.seq + 1).unwrap_or(1);
+                let now = unix_millis();
+                let result = BrainEvent {
+                    schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+                    brain_id: state.brain_id,
+                    seq: next_seq,
+                    environment_generation: self.environment.generation,
+                    sender: intent.sender.clone(),
+                    created_ms: now,
+                    run_id: Some(run_id),
+                    mutation: None,
+                    kind: BrainEventKind::Result {
+                        request_seq: intent.request_seq,
+                        output: String::new(),
+                        error: Some(intent.detail.clone()),
+                    },
+                };
+                let terminal = BrainEvent {
+                    schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+                    brain_id: state.brain_id,
+                    seq: next_seq + 1,
+                    environment_generation: self.environment.generation,
+                    sender: intent.sender,
+                    created_ms: now,
+                    run_id: Some(run_id),
+                    mutation: None,
+                    kind: BrainEventKind::RunStatusChanged {
+                        run_id,
+                        status: intent.status,
+                        detail: Some(intent.detail),
+                    },
+                };
+                self.append_event_batch(name, &[result.clone(), terminal.clone()])?;
+                state.apply(result);
+                state.apply(terminal);
+                self.clear_disconnect_intent(name, run_id)?;
+                continue;
+            }
             let event = BrainEvent {
                 schema_version: BRAIN_EVENT_SCHEMA_VERSION,
                 brain_id: state.brain_id,
@@ -3654,6 +3770,11 @@ impl BrainStore {
             };
             self.append_event(name, &event)?;
             state.apply(event);
+        }
+        for run_id in disconnect_intents.keys().copied().collect::<Vec<_>>() {
+            if state.runs.get(&run_id).is_some_and(|run| run.status.is_terminal()) {
+                self.clear_disconnect_intent(name, run_id)?;
+            }
         }
         self.initializations
             .write()
@@ -3840,6 +3961,61 @@ impl BrainStore {
             .map(|root| root.join(name).join("events.jsonl"))
     }
 
+    fn disconnect_intent_path(&self, name: &str, run_id: RunId) -> Option<PathBuf> {
+        self.root.as_ref().map(|root| {
+            root.join(name)
+                .join("disconnect-terminalizations")
+                .join(format!("{}.json", run_id.0))
+        })
+    }
+
+    fn persist_disconnect_intent(
+        &self,
+        name: &str,
+        intent: &DisconnectTerminalizationIntent,
+    ) -> Result<()> {
+        let Some(path) = self.disconnect_intent_path(name, intent.run_id) else {
+            return Ok(());
+        };
+        let directory = path.parent().expect("disconnect intent has a parent");
+        create_dir_all_durable(directory)?;
+        let temporary = directory.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&temporary, serde_json::to_vec(intent)?)?;
+        std::fs::File::open(&temporary)?.sync_all()?;
+        std::fs::rename(&temporary, &path)?;
+        sync_directory(directory)
+    }
+
+    fn clear_disconnect_intent(&self, name: &str, run_id: RunId) -> Result<()> {
+        let Some(path) = self.disconnect_intent_path(name, run_id) else {
+            return Ok(());
+        };
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+            if let Some(parent) = path.parent() {
+                sync_directory(parent)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_disconnect_intents(&self, name: &str) -> Result<HashMap<RunId, DisconnectTerminalizationIntent>> {
+        let Some(root) = &self.root else { return Ok(HashMap::new()) };
+        let directory = root.join(name).join("disconnect-terminalizations");
+        let Ok(entries) = std::fs::read_dir(directory) else { return Ok(HashMap::new()) };
+        let mut intents = HashMap::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let intent: DisconnectTerminalizationIntent =
+                serde_json::from_slice(&std::fs::read(entry.path())?)?;
+            intents.insert(intent.run_id, intent);
+        }
+        Ok(intents)
+    }
+
     fn read_events(&self, name: &str) -> Result<Vec<BrainEvent>> {
         let Some(path) = self.event_path(name) else {
             return Ok(Vec::new());
@@ -3859,7 +4035,9 @@ impl BrainStore {
                 .with_context(|| format!("sync recovered {}", path.display()))?;
         }
         let mut events = Vec::new();
-        for (line_no, terminated) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let records = bytes.split_inclusive(|byte| *byte == b'\n').collect::<Vec<_>>();
+        let mut committed_offset = 0usize;
+        for (line_no, terminated) in records.iter().enumerate() {
             // Committed records are newline-terminated. A torn final append
             // projects none of its logical events after restart.
             if terminated.last() != Some(&b'\n') {
@@ -3869,15 +4047,43 @@ impl BrainStore {
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            if let Ok(BrainJournalRecord::EventBatch { events: batch }) =
-                serde_json::from_slice::<BrainJournalRecord>(line)
-            {
+            let parsed = match serde_json::from_slice::<BrainJournalRecord>(line) {
+                Ok(BrainJournalRecord::EventBatch {
+                    event_count,
+                    payload_sha256,
+                    events: batch,
+                }) => {
+                    let valid_framing = match (event_count, payload_sha256) {
+                        (None, None) => true,
+                        (Some(count), Some(checksum)) => {
+                            count == batch.len()
+                                && serde_json::to_vec(&batch).is_ok_and(|payload| {
+                                    hex::encode(Sha256::digest(payload)) == checksum
+                                })
+                        }
+                        _ => false,
+                    };
+                    valid_framing.then_some(batch)
+                }
+                Err(_) => serde_json::from_slice::<BrainEvent>(line)
+                    .ok()
+                    .map(|event| vec![event]),
+            };
+            if let Some(batch) = parsed {
                 events.extend(batch);
-            } else {
-                events.push(serde_json::from_slice(line).with_context(|| {
-                    format!("parse {} line {}", path.display(), line_no + 1)
-                })?);
+                committed_offset += terminated.len();
+                continue;
             }
+            if line_no + 1 == records.len() {
+                let file = OpenOptions::new().write(true).open(&path)
+                    .with_context(|| format!("open {} for corrupt-tail recovery", path.display()))?;
+                file.set_len(committed_offset as u64)
+                    .with_context(|| format!("truncate corrupt tail in {}", path.display()))?;
+                file.sync_all()
+                    .with_context(|| format!("sync recovered {}", path.display()))?;
+                break;
+            }
+            anyhow::bail!("parse {} line {}", path.display(), line_no + 1);
         }
         Ok(events)
     }
@@ -3892,7 +4098,10 @@ impl BrainStore {
         if self.fail_next_event_batch.swap(false, std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("injected Brain event batch append failure");
         }
+        let payload = serde_json::to_vec(events)?;
         self.append_journal_value(name, &BrainJournalRecord::EventBatch {
+            event_count: Some(events.len()),
+            payload_sha256: Some(hex::encode(Sha256::digest(payload))),
             events: events.to_vec(),
         })
     }
@@ -4212,9 +4421,14 @@ mod tests {
         let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let id = store.snapshot("shared").unwrap().brain_id;
         store.append_event("shared", &journal_event(id, 1, "committed")).unwrap();
-        let encoded = serde_json::to_vec(&BrainJournalRecord::EventBatch { events: vec![
-            journal_event(id, 2, "hidden"), journal_event(id, 3, "hidden-too")
-        ]}).unwrap();
+        let encoded = serde_json::to_vec(&BrainJournalRecord::EventBatch {
+            event_count: None,
+            payload_sha256: None,
+            events: vec![
+                journal_event(id, 2, "hidden"),
+                journal_event(id, 3, "hidden-too"),
+            ],
+        }).unwrap();
         OpenOptions::new().append(true)
             .open(temp.path().join("shared/events.jsonl")).unwrap()
             .write_all(&encoded[..encoded.len() / 2]).unwrap();
@@ -4817,27 +5031,42 @@ mod tests {
 
         drop(store);
         let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
-        let interrupted = restarted.snapshot("shared").unwrap();
-        assert_eq!(interrupted.runs.iter().find(|candidate| {
+        let recovered = restarted.snapshot("shared").unwrap();
+        assert_eq!(recovered.runs.iter().find(|candidate| {
             candidate.run_id == run.run_id
-        }).unwrap().status, BrainRunStatus::Interrupted);
-        assert!(!interrupted.events.iter().any(|event| {
+        }).unwrap().status, BrainRunStatus::Failed);
+        assert_eq!(recovered.events.iter().filter(|event| {
             event.run_id == Some(run.run_id)
                 && matches!(event.kind, BrainEventKind::Result { .. })
-        }));
+        }).count(), 1);
+        assert_eq!(recovered.events.iter().filter(|event| matches!(
+            event.kind,
+            BrainEventKind::RunStatusChanged { run_id: event_run_id, status, .. }
+                if event_run_id == run.run_id && status.is_terminal()
+        )).count(), 1);
+    }
 
-        let next_seq = interrupted.revision + 1;
+    #[test]
+    fn restart_ignores_newline_terminated_batch_with_invalid_checksum() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        store.push("shared", "alice", BrainEventKind::Prompt {
+            text: "committed".into(),
+        }).unwrap();
+        let snapshot = store.snapshot("shared").unwrap();
+        let next_seq = snapshot.revision + 1;
+        let run_id = RunId(uuid::Uuid::new_v4());
         let result = BrainEvent {
             schema_version: BRAIN_EVENT_SCHEMA_VERSION,
-            brain_id: interrupted.brain_id,
+            brain_id: snapshot.brain_id,
             seq: next_seq,
-            environment_generation: interrupted.environment.generation,
+            environment_generation: snapshot.environment.generation,
             sender: "daemon".into(),
             created_ms: unix_millis(),
-            run_id: Some(run.run_id),
+            run_id: Some(run_id),
             mutation: None,
             kind: BrainEventKind::Result {
-                request_seq: prompt.seq,
+                request_seq: 1,
                 output: String::new(),
                 error: Some("torn disconnect".into()),
             },
@@ -4845,49 +5074,26 @@ mod tests {
         let terminal = BrainEvent {
             seq: next_seq + 1,
             kind: BrainEventKind::RunStatusChanged {
-                run_id: run.run_id,
+                run_id,
                 status: BrainRunStatus::Failed,
                 detail: Some("torn disconnect".into()),
             },
             ..result.clone()
         };
         let encoded = serde_json::to_vec(&BrainJournalRecord::EventBatch {
+            event_count: Some(2),
+            payload_sha256: Some("invalid-checksum".into()),
             events: vec![result, terminal],
         }).unwrap();
         OpenOptions::new().append(true)
             .open(temp.path().join("shared/events.jsonl")).unwrap()
-            .write_all(&encoded[..encoded.len() / 2]).unwrap();
-        drop(restarted);
+            .write_all(&[encoded.as_slice(), b"\n"].concat()).unwrap();
+        drop(store);
 
         let recovered = BrainStore::with_root("box.local", Some(temp.path().into()));
         let recovered_snapshot = recovered.snapshot("shared").unwrap();
-        assert_eq!(recovered_snapshot.revision, interrupted.revision);
-        assert!(!recovered_snapshot.events.iter().any(|event| {
-            event.run_id == Some(run.run_id)
-                && matches!(event.kind, BrainEventKind::Result { .. })
-        }));
-        recovered.terminalize_run_with_result_if_active(
-            "shared", "daemon", run.run_id, prompt.seq, BrainRunStatus::Failed,
-            "initiating Brain connection disconnected".into(),
-        ).unwrap().unwrap();
-        drop(recovered);
-
-        let final_store = BrainStore::with_root("box.local", Some(temp.path().into()));
-        let final_snapshot = final_store.snapshot("shared").unwrap();
-        let result_seq = final_snapshot.events.iter().find_map(|event| {
-            (event.run_id == Some(run.run_id)
-                && matches!(event.kind, BrainEventKind::Result { .. })).then_some(event.seq)
-        }).unwrap();
-        let terminal_seq = final_snapshot.events.iter().find_map(|event| match event.kind {
-            BrainEventKind::RunStatusChanged { run_id: event_run_id, status, .. }
-                if event_run_id == run.run_id && status == BrainRunStatus::Failed =>
-                    Some(event.seq),
-            _ => None,
-        }).unwrap();
-        assert_eq!(terminal_seq, result_seq + 1);
-        assert_eq!(final_snapshot.runs.iter().find(|candidate| {
-            candidate.run_id == run.run_id
-        }).unwrap().status, BrainRunStatus::Failed);
+        assert_eq!(recovered_snapshot.revision, snapshot.revision);
+        assert!(recovered_snapshot.events.iter().all(|event| event.run_id != Some(run_id)));
     }
 
     #[tokio::test]
