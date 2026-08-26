@@ -11,17 +11,17 @@ pub mod outcome;
 pub mod scheduler;
 
 use crate::programs::{ExecutionEffect, ProgramLanguage, ProgramValue};
-use crate::vm::{
-    ApprovalChoice, ApprovalPrompt, AuthorizationContext, AuthorizationDecision,
-    CapabilityAvailability, CapabilityKind, CapabilityLedger, CapabilityPolicy, CapabilityRequest,
-    CapabilityRequirement, EffectSet, GrantScope, ResourceSelector,
-    SourceOrigin, Type, TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint,
-    TypedSuspension, TypedValue, VmDiagnostic, VmSideEffect,
-};
 use crate::vm::vocabulary::{
     agent_task_result_type, agent_task_snapshot_type, agent_task_spec_type,
     capability_grant_entry_type, core_word_spec, tree_entry_type, tree_listing_type,
     CoreHostBinding, CoreWordImplementation,
+};
+use crate::vm::{
+    ApprovalChoice, ApprovalPrompt, AuthorizationContext, AuthorizationDecision,
+    CapabilityAvailability, CapabilityKind, CapabilityLedger, CapabilityPolicy, CapabilityRequest,
+    CapabilityRequirement, EffectSet, GrantScope, ResourceSelector, SourceOrigin, Type,
+    TypedExecutionStatus, TypedRuntime, TypedRuntimeCheckpoint, TypedSuspension, TypedValue,
+    VmDiagnostic, VmSideEffect,
 };
 use anyhow::{bail, Context, Result};
 use automation::AutomationBroker;
@@ -365,6 +365,11 @@ struct OutputHandleRecord {
 struct HostStream {
     owner: uuid::Uuid,
     generation: u64,
+    /// Exact authority which minted this cursor. Follow-up operations replace
+    /// their static unscoped selector with this requirement before the live
+    /// ledger is consulted, so an unrelated file grant cannot keep a cursor
+    /// usable after revocation.
+    requirement: CapabilityRequirement,
     backend: HostStreamBackend,
 }
 
@@ -465,15 +470,17 @@ impl ProgramRuntime {
         checkpoint: TypedRuntimeCheckpoint,
         revision: u64,
     ) -> Result<Self> {
-        let typed_runtime = TypedRuntime::from_checkpoint(checkpoint.clone())
-            .map_err(|diagnostics| anyhow::anyhow!(
-                "cannot restore typed runtime checkpoint: {}",
-                diagnostics
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ))?;
+        let typed_runtime =
+            TypedRuntime::from_checkpoint(checkpoint.clone()).map_err(|diagnostics| {
+                anyhow::anyhow!(
+                    "cannot restore typed runtime checkpoint: {}",
+                    diagnostics
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            })?;
         let runtime = Self::new();
         let vocabulary = typed_runtime.vocabulary().keys().cloned().collect();
         let stack = typed_runtime.stack().to_vec();
@@ -484,15 +491,14 @@ impl ProgramRuntime {
         *runtime
             .revision_history
             .lock()
-            .map_err(|_| anyhow::anyhow!("revision history lock poisoned"))? = vec![
-            VmRevisionSnapshot {
+            .map_err(|_| anyhow::anyhow!("revision history lock poisoned"))? =
+            vec![VmRevisionSnapshot {
                 revision,
                 stack,
                 vocabulary,
                 checkpoint: Some(checkpoint),
                 checkpoint_diagnostic: None,
-            },
-        ];
+            }];
         runtime.revision.store(revision, Ordering::Release);
         Ok(runtime)
     }
@@ -642,15 +648,11 @@ impl ProgramRuntime {
             CapabilityKind::SessionEmit | CapabilityKind::VmRead => {
                 CapabilityAvailability::Available
             }
-            CapabilityKind::FileRead | CapabilityKind::FileWrite => {
-                match &requirement.selector {
-                    ResourceSelector::File { selector } => root_availability(&selector.root),
-                    ResourceSelector::FileTemplate { template } => {
-                        root_availability(&template.root)
-                    }
-                    _ => CapabilityAvailability::Unsupported,
-                }
-            }
+            CapabilityKind::FileRead | CapabilityKind::FileWrite => match &requirement.selector {
+                ResourceSelector::File { selector } => root_availability(&selector.root),
+                ResourceSelector::FileTemplate { template } => root_availability(&template.root),
+                _ => CapabilityAvailability::Unsupported,
+            },
             CapabilityKind::AutomationInspect | CapabilityKind::AutomationWrite => {
                 match self.automation.availability().state {
                     AutomationState::Disabled => CapabilityAvailability::Disabled,
@@ -665,9 +667,7 @@ impl ProgramRuntime {
             | CapabilityKind::AgentAwait
             | CapabilityKind::AgentPoll
             | CapabilityKind::AgentCancel => match self.agent_scheduler.read() {
-                Ok(scheduler) if scheduler.upgrade().is_some() => {
-                    CapabilityAvailability::Available
-                }
+                Ok(scheduler) if scheduler.upgrade().is_some() => CapabilityAvailability::Available,
                 Ok(_) => CapabilityAvailability::Disabled,
                 Err(_) => CapabilityAvailability::Degraded {
                     reason: "agent scheduler binding lock poisoned".into(),
@@ -686,9 +686,29 @@ impl ProgramRuntime {
             CapabilityKind::ScheduleCreate
             | CapabilityKind::ScheduleRead
             | CapabilityKind::ScheduleManage => CapabilityAvailability::Disabled,
-            CapabilityKind::NetworkConnect
-            | CapabilityKind::ProcessRun
-            | CapabilityKind::ProgramInvoke => CapabilityAvailability::Available,
+            CapabilityKind::NetworkConnect | CapabilityKind::ProgramInvoke => {
+                CapabilityAvailability::Available
+            }
+            CapabilityKind::ProcessRun => {
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "android",
+                    target_os = "freebsd",
+                    target_os = "dragonfly"
+                ))]
+                {
+                    CapabilityAvailability::Available
+                }
+                #[cfg(not(any(
+                    target_os = "linux",
+                    target_os = "android",
+                    target_os = "freebsd",
+                    target_os = "dragonfly"
+                )))]
+                {
+                    CapabilityAvailability::Unsupported
+                }
+            }
             CapabilityKind::McpCall => match self.mcp_client.read() {
                 Ok(client) if client.is_some() => CapabilityAvailability::Available,
                 Ok(_) => CapabilityAvailability::Disabled,
@@ -835,12 +855,7 @@ impl ProgramRuntime {
     /// Grant a typed capability after an approval decision. A saved typed
     /// execution rechecks this structured grant when it is resumed.
     pub fn grant_typed_capability(&self, requirement: CapabilityRequirement) -> Result<uuid::Uuid> {
-        self.issue_typed_capability(
-            requirement,
-            GrantScope::Global,
-            "local-user",
-            None,
-        )
+        self.issue_typed_capability(requirement, GrantScope::Global, "local-user", None)
     }
 
     /// Record reusable or exact authority without placing it in ambient VM
@@ -863,15 +878,16 @@ impl ProgramRuntime {
                     policy.policy_hash
                 );
             }
-            ledger.issue(
-                requirement,
-                scope,
-                policy.policy_hash.clone(),
-                actor,
-                unix_time_ms(),
-                expires_at_unix_ms,
-            )
-            .map_err(anyhow::Error::msg)
+            ledger
+                .issue(
+                    requirement,
+                    scope,
+                    policy.policy_hash.clone(),
+                    actor,
+                    unix_time_ms(),
+                    expires_at_unix_ms,
+                )
+                .map_err(anyhow::Error::msg)
         })
     }
 
@@ -886,9 +902,7 @@ impl ProgramRuntime {
     /// Revoke one recorded grant by stable identity. Pending and future runs
     /// observe the rebuilt active set at their next verified boundary.
     pub fn revoke_typed_capability(&self, grant_id: uuid::Uuid) -> Result<bool> {
-        self.mutate_authority(|_, ledger| {
-            Ok(ledger.revoke(grant_id, "local-user", unix_time_ms()))
-        })
+        self.mutate_authority(|_, ledger| Ok(ledger.revoke(grant_id, "local-user", unix_time_ms())))
     }
 
     pub fn capability_ledger(&self) -> Result<CapabilityLedger> {
@@ -1093,10 +1107,7 @@ impl ProgramRuntime {
     /// Restore authority only before this runtime is shared with concurrent
     /// callers. Active grants from another policy version are rejected rather
     /// than silently becoming ambient or unexpectedly inactive.
-    pub fn restore_authority_state(
-        &mut self,
-        state: ProgramRuntimeAuthorityState,
-    ) -> Result<()> {
+    pub fn restore_authority_state(&mut self, state: ProgramRuntimeAuthorityState) -> Result<()> {
         if state.format_version != PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION {
             bail!(
                 "unsupported ProgramRuntime authority state version {}; expected {}",
@@ -1108,6 +1119,7 @@ impl ProgramRuntime {
             bail!("ProgramRuntime authority state has no project identity");
         }
         state.policy.validate().map_err(anyhow::Error::msg)?;
+        validate_restored_process_authority(&state.ledger)?;
         let now = unix_time_ms();
         if state.ledger.grants.grants.iter().any(|grant| {
             grant.is_active(now)
@@ -1134,11 +1146,11 @@ impl ProgramRuntime {
     /// Restore host-owned authority records independently of a VM checkpoint.
     pub fn restore_capability_ledger(&self, ledger: CapabilityLedger) -> Result<()> {
         let policy = self.capability_policy()?;
+        validate_restored_process_authority(&ledger)?;
         let now = unix_time_ms();
         if ledger.grants.grants.iter().any(|grant| {
             grant.is_active(now)
-                && (grant.policy_hash != policy.policy_hash
-                    || !policy.permits(&grant.requirement))
+                && (grant.policy_hash != policy.policy_hash || !policy.permits(&grant.requirement))
         }) {
             bail!("capability ledger contains an active grant rejected by the current policy");
         }
@@ -1545,9 +1557,9 @@ impl ProgramRuntime {
                 .pending_typed
                 .lock()
                 .map_err(|_| anyhow::anyhow!("pending typed execution lock poisoned"))?;
-            let pending = pending_runs.get(&execution_id).ok_or_else(|| {
-                anyhow::anyhow!("no resumable typed execution {execution_id}")
-            })?;
+            let pending = pending_runs
+                .get(&execution_id)
+                .ok_or_else(|| anyhow::anyhow!("no resumable typed execution {execution_id}"))?;
             let actual = pending
                 .suspension
                 .pending_host_call
@@ -1665,9 +1677,9 @@ impl ProgramRuntime {
                 .pending_typed
                 .lock()
                 .map_err(|_| anyhow::anyhow!("pending typed execution lock poisoned"))?;
-            let pending = pending_runs.get(&execution_id).ok_or_else(|| {
-                anyhow::anyhow!("no resumable typed execution {execution_id}")
-            })?;
+            let pending = pending_runs
+                .get(&execution_id)
+                .ok_or_else(|| anyhow::anyhow!("no resumable typed execution {execution_id}"))?;
             let actual = pending
                 .suspension
                 .pending_host_call
@@ -1809,15 +1821,16 @@ impl ProgramRuntime {
                     }
                     let mut current_context = context.clone();
                     current_context.policy_hash = policy.policy_hash.clone();
-                    ledger.issue(
-                        requirement,
-                        scope,
-                        policy.policy_hash.clone(),
-                        actor.clone(),
-                        context.now_unix_ms,
-                        None,
-                    )
-                    .map_err(anyhow::Error::msg)?;
+                    ledger
+                        .issue(
+                            requirement,
+                            scope,
+                            policy.policy_hash.clone(),
+                            actor.clone(),
+                            context.now_unix_ms,
+                            None,
+                        )
+                        .map_err(anyhow::Error::msg)?;
                     if !matches!(
                         ledger.grants.authorize(&prompt.request, &current_context),
                         AuthorizationDecision::Allowed { .. }
@@ -1885,12 +1898,7 @@ impl ProgramRuntime {
         effect_sequence: u64,
         values: Vec<TypedValue>,
     ) -> Result<ExecutionOutcome> {
-        self.resume_typed_execution_inner(
-            execution_id,
-            Some(effect_sequence),
-            Some(values),
-            false,
-        )
+        self.resume_typed_execution_inner(execution_id, Some(effect_sequence), Some(values), false)
             .await
     }
 
@@ -1916,12 +1924,8 @@ impl ProgramRuntime {
                 .await
             }
             VmResumeResponse::Cancelled { reason } => {
-                self.cancel_typed_execution_for_effect(
-                    resume.execution_id,
-                    resume.sequence,
-                    reason,
-                )
-                .await
+                self.cancel_typed_execution_for_effect(resume.execution_id, resume.sequence, reason)
+                    .await
             }
         }
     }
@@ -2114,7 +2118,10 @@ impl ProgramRuntime {
                             execution_id,
                             status: ExecutionStatus::Failed,
                             values: Vec::new(),
-                            output: truncate_output(output, pending.context.budget.max_output_bytes),
+                            output: truncate_output(
+                                output,
+                                pending.context.budget.max_output_bytes,
+                            ),
                             output_chunks,
                             side_effects,
                             vm_side_effects,
@@ -2277,25 +2284,24 @@ impl ProgramRuntime {
         revision: u64,
         only_if_newer: bool,
     ) -> Result<bool> {
-        let mut restored = TypedRuntime::from_checkpoint(checkpoint.clone()).map_err(|diagnostics| {
-            anyhow::anyhow!(
-                "cannot hydrate typed runtime checkpoint: {}",
-                diagnostics
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            )
-        })?;
+        let mut restored =
+            TypedRuntime::from_checkpoint(checkpoint.clone()).map_err(|diagnostics| {
+                anyhow::anyhow!(
+                    "cannot hydrate typed runtime checkpoint: {}",
+                    diagnostics
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            })?;
         let _submission = self.submission_gate.lock().await;
         let current_revision = self.revision();
         if only_if_newer && revision <= current_revision {
             return Ok(false);
         }
         if self.pending_typed_execution_count()? != 0 {
-            bail!(
-                "cannot hydrate revision {revision} while typed continuations are pending"
-            );
+            bail!("cannot hydrate revision {revision} while typed continuations are pending");
         }
 
         let host_names = self
@@ -2332,15 +2338,14 @@ impl ProgramRuntime {
         *self
             .revision_history
             .lock()
-            .map_err(|_| anyhow::anyhow!("revision history lock poisoned"))? = vec![
-            VmRevisionSnapshot {
+            .map_err(|_| anyhow::anyhow!("revision history lock poisoned"))? =
+            vec![VmRevisionSnapshot {
                 revision,
                 stack,
                 vocabulary,
                 checkpoint: Some(checkpoint),
                 checkpoint_diagnostic: None,
-            },
-        ];
+            }];
         self.revision.store(revision, Ordering::Release);
         Ok(true)
     }
@@ -2538,7 +2543,7 @@ impl ProgramRuntime {
             DeferredHostEffects::None,
             None,
         )
-            .await
+        .await
     }
 
     /// Internal scheduled-callback entry point. The persisted ceiling is
@@ -2594,7 +2599,7 @@ impl ProgramRuntime {
             DeferredHostEffects::None,
             None,
         )
-            .await
+        .await
     }
 
     /// Typed-only variant retaining the per-ProgramRun presentation binding.
@@ -2736,10 +2741,13 @@ impl ProgramRuntime {
             working_runtime.set_grants(self.effective_grants_for(caller.as_ref())?);
         }
         let context = ExecutionContext::new(generation, submission.budget.unwrap_or_default());
-        let source_id = submission.source_id.clone().unwrap_or_else(|| match submission.language {
-            ProgramLanguage::Forth => "provider-response.forth".to_string(),
-            ProgramLanguage::Lisp => "provider-response.lisp".to_string(),
-        });
+        let source_id = submission
+            .source_id
+            .clone()
+            .unwrap_or_else(|| match submission.language {
+                ProgramLanguage::Forth => "provider-response.forth".to_string(),
+                ProgramLanguage::Lisp => "provider-response.lisp".to_string(),
+            });
         let started = Instant::now();
         let (working_runtime, execution) = self
             .execute_typed_program(
@@ -2785,7 +2793,10 @@ impl ProgramRuntime {
             self.release_output_handles(context.execution_id)?;
         }
         let completion_commit = if matches!(execution.status, TypedExecutionStatus::Completed) {
-            Some(self.commit_working_runtime(input_revision, working_runtime).await)
+            Some(
+                self.commit_working_runtime(input_revision, working_runtime)
+                    .await,
+            )
         } else {
             None
         };
@@ -2799,7 +2810,10 @@ impl ProgramRuntime {
                             execution_id: context.execution_id,
                             status: ExecutionStatus::Failed,
                             values: Vec::new(),
-                            output: truncate_output(execution.output, context.budget.max_output_bytes),
+                            output: truncate_output(
+                                execution.output,
+                                context.budget.max_output_bytes,
+                            ),
                             output_chunks: execution.output_chunks,
                             side_effects: execution.side_effects,
                             vm_side_effects: execution.vm_side_effects,
@@ -2978,38 +2992,38 @@ impl ProgramRuntime {
             agent_ancestry: agent_ancestry(caller.as_ref()),
         };
         let (runtime, execution) = tokio::task::spawn_blocking(move || {
-                    let vocabulary = serde_json::to_string(runtime.vocabulary())
-                        .unwrap_or_else(|_| "[]".to_string());
-                    // A host binding being installed is availability, not
-                    // authority.  The runtime's existing grants are the only
-                    // source of authority for automation and child agents.
-                    let grants = runtime.grants().clone();
-                    let mut handler = TypedHostHandler::new(
-                        Arc::clone(&automation),
-                        Arc::clone(&resource_roots),
-                        scheduler,
-                        memory,
-                        mcp_client,
-                        mcp_output_schemas,
-                        vocabulary,
-                        network,
-                        output_handles,
-                        streams,
-                        execution_id,
-                        authorization,
-                        grants,
-                        typed_effect_sink,
-                        deferred_host_effects,
-                    );
-                    let execution = runtime.execute_with_handler(
-                        language,
-                        &source_id,
-                        &source,
-                        fuel,
-                        declared.as_ref(),
-                        &mut handler,
-                    );
-                    (runtime, execution)
+            let vocabulary =
+                serde_json::to_string(runtime.vocabulary()).unwrap_or_else(|_| "[]".to_string());
+            // A host binding being installed is availability, not
+            // authority.  The runtime's existing grants are the only
+            // source of authority for automation and child agents.
+            let grants = runtime.grants().clone();
+            let mut handler = TypedHostHandler::new(
+                Arc::clone(&automation),
+                Arc::clone(&resource_roots),
+                scheduler,
+                memory,
+                mcp_client,
+                mcp_output_schemas,
+                vocabulary,
+                network,
+                output_handles,
+                streams,
+                execution_id,
+                authorization,
+                grants,
+                typed_effect_sink,
+                deferred_host_effects,
+            );
+            let execution = runtime.execute_with_handler(
+                language,
+                &source_id,
+                &source,
+                fuel,
+                declared.as_ref(),
+                &mut handler,
+            );
+            (runtime, execution)
         })
         .await?;
         Ok((runtime, execution))
@@ -3073,41 +3087,42 @@ impl ProgramRuntime {
             agent_ancestry: agent_ancestry(pending.caller.as_ref()),
         };
         let (runtime, execution) = tokio::task::spawn_blocking(move || {
-                    let vocabulary = serde_json::to_string(runtime.vocabulary())
-                        .unwrap_or_else(|_| "[]".to_string());
-                    // Resumption has the same authority boundary as initial
-                    // execution: bindings make effects possible, never
-                    // implicitly granted.
-                    let grants = runtime.grants().clone();
-                    let mut handler = TypedHostHandler::new(
-                        Arc::clone(&automation),
-                        Arc::clone(&resource_roots),
-                        scheduler,
-                        memory,
-                        mcp_client,
-                        mcp_output_schemas,
-                        vocabulary,
-                        network,
-                        output_handles,
-                        streams,
-                        execution_id,
-                        authorization,
-                        grants,
-                        typed_effect_sink,
-                        deferred_host_effects,
-                    );
-                    let execution = match external_effect_result {
-                        Some((effect_sequence, values)) => runtime.resume_with_effect_result(
-                            suspension,
-                            effect_sequence,
-                            values,
-                            &mut handler,
-                        ),
-                        None if authorize_pending_host_call => runtime
-                            .resume_authorized_host_call_with_handler(suspension, &mut handler),
-                        None => runtime.resume_with_handler(suspension, Vec::new(), &mut handler),
-                    };
-                    (runtime, execution)
+            let vocabulary =
+                serde_json::to_string(runtime.vocabulary()).unwrap_or_else(|_| "[]".to_string());
+            // Resumption has the same authority boundary as initial
+            // execution: bindings make effects possible, never
+            // implicitly granted.
+            let grants = runtime.grants().clone();
+            let mut handler = TypedHostHandler::new(
+                Arc::clone(&automation),
+                Arc::clone(&resource_roots),
+                scheduler,
+                memory,
+                mcp_client,
+                mcp_output_schemas,
+                vocabulary,
+                network,
+                output_handles,
+                streams,
+                execution_id,
+                authorization,
+                grants,
+                typed_effect_sink,
+                deferred_host_effects,
+            );
+            let execution = match external_effect_result {
+                Some((effect_sequence, values)) => runtime.resume_with_effect_result(
+                    suspension,
+                    effect_sequence,
+                    values,
+                    &mut handler,
+                ),
+                None if authorize_pending_host_call => {
+                    runtime.resume_authorized_host_call_with_handler(suspension, &mut handler)
+                }
+                None => runtime.resume_with_handler(suspension, Vec::new(), &mut handler),
+            };
+            (runtime, execution)
         })
         .await?;
         Ok((runtime, execution))
@@ -3133,6 +3148,23 @@ struct TypedHostHandler {
     network_grants: EffectSet,
     typed_effect_sink: Option<TypedEffectSink>,
     deferred_host_effects: DeferredHostEffects,
+    process_authorization_rollback: Option<ProcessAuthorizationRollback>,
+}
+
+struct ProcessAuthorizationRollback {
+    previous: CapabilityLedger,
+    authorized: CapabilityLedger,
+}
+
+fn rollback_process_authorization_if_unchanged(
+    ledger: &mut CapabilityLedger,
+    rollback: &ProcessAuthorizationRollback,
+) -> bool {
+    if ledger != &rollback.authorized {
+        return false;
+    }
+    *ledger = rollback.previous.clone();
+    true
 }
 
 struct HostAuthorizationAudit {
@@ -3182,7 +3214,59 @@ impl TypedHostHandler {
             network_grants,
             typed_effect_sink,
             deferred_host_effects,
+            process_authorization_rollback: None,
         }
+    }
+
+    fn rollback_failed_process_launch(
+        &mut self,
+        origin: &SourceOrigin,
+    ) -> std::result::Result<(), VmDiagnostic> {
+        let Some(rollback) = self.process_authorization_rollback.take() else {
+            return Ok(());
+        };
+        let mut ledger = self.authorization.ledger.lock().map_err(|_| {
+            host_binding_error(
+                origin,
+                "capability ledger lock poisoned during launch rollback",
+            )
+        })?;
+        if !rollback_process_authorization_if_unchanged(&mut ledger, &rollback) {
+            return Err(host_binding_error(
+                origin,
+                "process launch failed after concurrent authority mutation; the authorization fact and any once-grant consumption were retained",
+            ));
+        }
+        if let Some(sink) = &self.authorization.sink {
+            let policy = self
+                .authorization
+                .policy
+                .read()
+                .map_err(|_| host_binding_error(origin, "capability policy lock poisoned"))?
+                .clone();
+            let Some(project_id) = self.authorization.context.project_id.clone() else {
+                *ledger = rollback.authorized;
+                return Err(host_binding_error(
+                    origin,
+                    "host authorization has no project identity during launch rollback",
+                ));
+            };
+            sink(ProgramRuntimeAuthorityState {
+                format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
+                session_id: self.authorization.context.session_id,
+                project_id,
+                policy,
+                ledger: rollback.previous,
+            })
+            .map_err(|error| {
+                *ledger = rollback.authorized;
+                host_binding_error(
+                    origin,
+                    format!("persist failed process launch rollback: {error:#}"),
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// Advance one host-owned stream. The stream's opaque kind/ID is checked
@@ -3537,10 +3621,22 @@ fn typed_agent_task_result(
     let depth = i64::try_from(result.identity.depth)
         .map_err(|_| host_binding_error(origin, "agent depth exceeds VM integer range"))?;
     let value = TypedValue::Record(vec![
-        ("task-id".into(), TypedValue::String(result.identity.task_id.to_string())),
-        ("agent-id".into(), TypedValue::String(result.identity.agent_id.to_string())),
-        ("status".into(), TypedValue::String(agent_task_status_name(result.status).into())),
-        ("final-message".into(), TypedValue::String(result.final_message)),
+        (
+            "task-id".into(),
+            TypedValue::String(result.identity.task_id.to_string()),
+        ),
+        (
+            "agent-id".into(),
+            TypedValue::String(result.identity.agent_id.to_string()),
+        ),
+        (
+            "status".into(),
+            TypedValue::String(agent_task_status_name(result.status).into()),
+        ),
+        (
+            "final-message".into(),
+            TypedValue::String(result.final_message),
+        ),
         (
             "diagnostics".into(),
             TypedValue::List {
@@ -3581,11 +3677,23 @@ fn typed_agent_task_snapshot(
             | scheduler::AgentTaskStatus::Cancelled
     );
     let value = TypedValue::Record(vec![
-        ("task-id".into(), TypedValue::String(snapshot.identity.task_id.to_string())),
-        ("agent-id".into(), TypedValue::String(snapshot.identity.agent_id.to_string())),
-        ("status".into(), TypedValue::String(agent_task_status_name(snapshot.status).into())),
+        (
+            "task-id".into(),
+            TypedValue::String(snapshot.identity.task_id.to_string()),
+        ),
+        (
+            "agent-id".into(),
+            TypedValue::String(snapshot.identity.agent_id.to_string()),
+        ),
+        (
+            "status".into(),
+            TypedValue::String(agent_task_status_name(snapshot.status).into()),
+        ),
         ("task".into(), TypedValue::String(snapshot.task)),
-        ("role".into(), TypedValue::String(agent_role_name(snapshot.role).into())),
+        (
+            "role".into(),
+            TypedValue::String(agent_role_name(snapshot.role).into()),
+        ),
         (
             "provider-model".into(),
             TypedValue::String(snapshot.identity.provider_model),
@@ -3606,22 +3714,85 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         &mut self,
         effect: &mut VmSideEffect,
     ) -> std::result::Result<(), VmDiagnostic> {
+        let binding = registered_host_binding(&effect.requirement, &effect.origin)?;
+        let crate::vm::interpreter::HostSideEffect::Request { arguments } = &effect.event else {
+            return Err(host_binding_error(
+                &effect.origin,
+                "typed host operation requires a typed host request",
+            ));
+        };
+        if effect.requirement.capability == CapabilityKind::NetworkConnect
+            && binding == Some(CoreHostBinding::NetworkSend)
+        {
+            let Some(TypedValue::Resource { kind, handle, .. }) = arguments.first() else {
+                return Err(host_binding_error(
+                    &effect.origin,
+                    "network-send requires a socket resource",
+                ));
+            };
+            if kind != "network-socket" {
+                return Err(host_binding_error(
+                    &effect.origin,
+                    "network-send resource is not a network socket",
+                ));
+            }
+            let sockets = self
+                .network
+                .lock()
+                .map_err(|_| host_binding_error(&effect.origin, "network lock poisoned"))?;
+            let socket = sockets
+                .get(handle)
+                .ok_or_else(|| host_binding_error(&effect.origin, "unknown network socket"))?;
+            effect.requirement.selector = ResourceSelector::Network {
+                host: socket.host.clone(),
+                ports: vec![socket.port],
+            };
+            return Ok(());
+        }
+        if effect.requirement.capability == CapabilityKind::FileRead
+            && matches!(
+                binding,
+                Some(
+                    CoreHostBinding::FileLinesNext
+                        | CoreHostBinding::FileLinesClose
+                        | CoreHostBinding::CsvNext
+                        | CoreHostBinding::CsvClose
+                        | CoreHostBinding::StreamNext
+                        | CoreHostBinding::StreamClose
+                )
+            )
+        {
+            let Some(TypedValue::Stream { id, generation, .. }) = arguments.first() else {
+                return Err(host_binding_error(
+                    &effect.origin,
+                    "stream operation requires a stream resource",
+                ));
+            };
+            let streams = self
+                .streams
+                .lock()
+                .map_err(|_| host_binding_error(&effect.origin, "stream registry lock poisoned"))?;
+            let stream = streams
+                .get(id)
+                .ok_or_else(|| host_binding_error(&effect.origin, "stream is unknown or closed"))?;
+            if stream.owner != self.execution_id || stream.generation != *generation {
+                return Err(host_binding_error(
+                    &effect.origin,
+                    "stream does not belong to this ProgramRun",
+                ));
+            }
+            effect.requirement = stream.requirement.clone();
+            return Ok(());
+        }
         if effect.requirement.capability != CapabilityKind::ProcessRun {
             return Ok(());
         }
-        let binding = registered_host_binding(&effect.requirement, &effect.origin)?;
         if binding != Some(CoreHostBinding::ProcessRun) {
             return Err(host_binding_error(
                 &effect.origin,
                 "process execution requires the registered process-run host binding",
             ));
         }
-        let crate::vm::interpreter::HostSideEffect::Request { arguments } = &effect.event else {
-            return Err(host_binding_error(
-                &effect.origin,
-                "process-run requires a typed host request",
-            ));
-        };
         let Some(TypedValue::String(command)) = arguments.first() else {
             return Err(host_binding_error(
                 &effect.origin,
@@ -3690,21 +3861,17 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         let mut context = self.authorization.context.clone();
         context.now_unix_ms = unix_time_ms();
         context.policy_hash = policy.policy_hash.clone();
-        let mut ledger = self.authorization.ledger.lock().map_err(|_| {
-            host_binding_error(&effect.origin, "capability ledger lock poisoned")
-        })?;
+        let mut ledger =
+            self.authorization.ledger.lock().map_err(|_| {
+                host_binding_error(&effect.origin, "capability ledger lock poisoned")
+            })?;
         let recorded = ledger.recorded_authorization(&request);
         let previous = recorded.is_none().then(|| ledger.clone());
-        let decision = recorded.unwrap_or_else(|| {
-            ledger.authorize(
-                &request,
-                &context,
-                "typed-host-boundary",
-            )
-        });
-        if let (Some(previous), Some(sink)) = (previous, &self.authorization.sink) {
+        let decision =
+            recorded.unwrap_or_else(|| ledger.authorize(&request, &context, "typed-host-boundary"));
+        if let (Some(previous), Some(sink)) = (previous.as_ref(), &self.authorization.sink) {
             let Some(project_id) = context.project_id.clone() else {
-                *ledger = previous;
+                *ledger = previous.clone();
                 return Err(host_binding_error(
                     &effect.origin,
                     "host authorization has no project identity",
@@ -3718,7 +3885,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 ledger: ledger.clone(),
             };
             if let Err(error) = sink(state) {
-                *ledger = previous;
+                *ledger = previous.clone();
                 return Err(host_binding_error(
                     &effect.origin,
                     format!("persist host authorization audit: {error:#}"),
@@ -3726,7 +3893,16 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
             }
         }
         match decision {
-            AuthorizationDecision::Allowed { .. } => Ok(()),
+            AuthorizationDecision::Allowed { .. } => {
+                if effect.requirement.capability == CapabilityKind::ProcessRun {
+                    self.process_authorization_rollback =
+                        previous.map(|previous| ProcessAuthorizationRollback {
+                            previous,
+                            authorized: ledger.clone(),
+                        });
+                }
+                Ok(())
+            }
             AuthorizationDecision::ApprovalRequired => Err(VmDiagnostic::error(
                 "E-CAP-006",
                 crate::vm::DiagnosticPhase::HostCall,
@@ -3898,14 +4074,12 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         .grants
                         .active_grants_for(&self.authorization.context)
                         .filter(|grant| {
-                            self.network_grants.grants(&EffectSet::from_requirement(
-                                grant.requirement.clone(),
-                            ))
+                            self.network_grants
+                                .grants(&EffectSet::from_requirement(grant.requirement.clone()))
                         })
                         .map(|grant| {
-                            let requirement = serde_json::to_value(&grant.requirement).map_err(
-                                |error| host_binding_error(origin, error.to_string()),
-                            )?;
+                            let requirement = serde_json::to_value(&grant.requirement)
+                                .map_err(|error| host_binding_error(origin, error.to_string()))?;
                             Ok(TypedValue::Record(vec![
                                 (
                                     "grant".into(),
@@ -4019,6 +4193,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                                 HostStream {
                                     owner: self.execution_id,
                                     generation: 0,
+                                    requirement: requirement.clone(),
                                     backend: HostStreamBackend::WorkbookRows(rows.into_iter()),
                                 },
                             );
@@ -4114,6 +4289,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                                 HostStream {
                                     owner: self.execution_id,
                                     generation: 0,
+                                    requirement: requirement.clone(),
                                     backend: HostStreamBackend::CsvRecords(BufReader::new(file)),
                                 },
                             );
@@ -4169,6 +4345,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                                 HostStream {
                                     owner: self.execution_id,
                                     generation: 0,
+                                    requirement: requirement.clone(),
                                     backend: HostStreamBackend::FileLines(BufReader::new(file)),
                                 },
                             );
@@ -4235,7 +4412,10 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     }
                     Some("tree-merkle") => {
                         if arguments.len() != 1 {
-                            return Err(host_binding_error(origin, "tree-merkle requires one path"));
+                            return Err(host_binding_error(
+                                origin,
+                                "tree-merkle requires one path",
+                            ));
                         }
                         let digest = merkle_directory(&path)
                             .map_err(|message| host_binding_error(origin, message))?;
@@ -4431,7 +4611,8 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     ));
                 };
                 let parameters = match arguments.as_slice() {
-                    [TypedValue::String(server), TypedValue::String(tool), TypedValue::Json(parameters)] => {
+                    [TypedValue::String(server), TypedValue::String(tool), TypedValue::Json(parameters)] =>
+                    {
                         if server != authorized_server || tool != authorized_tool {
                             return Err(host_binding_error(
                                 origin,
@@ -4492,18 +4673,30 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     ));
                 };
                 let executable = validate_process_request(binding, requirement, command, origin)?;
-                let mut process = std::process::Command::new(executable);
-                for value in values {
-                    let TypedValue::String(value) = value else {
-                        return Err(host_binding_error(
+                let arguments = values
+                    .iter()
+                    .map(|value| match value {
+                        TypedValue::String(value) => Ok(value.clone()),
+                        _ => Err(host_binding_error(
                             origin,
                             "process-run arguments must be strings",
-                        ));
-                    };
-                    process.arg(value);
-                }
-                let output = process
-                    .output()
+                        )),
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let child = match spawn_open_process(executable, &arguments) {
+                    Ok(child) => child,
+                    Err(error) => {
+                        self.rollback_failed_process_launch(origin)?;
+                        return Err(host_binding_error(origin, error));
+                    }
+                };
+                // `Command::spawn` waits for the child-side exec error pipe.
+                // Once it returns a child, the verified descriptor has been
+                // executed and the authorization is a real use even if the
+                // program later exits unsuccessfully.
+                self.process_authorization_rollback = None;
+                let output = child
+                    .wait_with_output()
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 if !output.status.success() {
                     return Err(host_binding_error(
@@ -4770,7 +4963,6 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         self.side_effects.push(effect.event.clone());
         Ok(())
     }
-
 }
 
 impl TypedHostHandler {
@@ -4785,12 +4977,7 @@ impl TypedHostHandler {
             .map_err(|_| "resource-root binding lock poisoned".to_string())?
             .get(&selector.root)
             .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "{} root is not installed by this host",
-                    selector.root
-                )
-            })?;
+            .ok_or_else(|| format!("{} root is not installed by this host", selector.root))?;
         secure_resource_path(&root, selector, relative)
     }
 }
@@ -4810,10 +4997,8 @@ fn registered_host_binding(
         return Ok(None);
     };
     let Some(spec) = core_word_spec(name) else {
-        if let (
-            &CapabilityKind::McpCall,
-            ResourceSelector::Mcp { server, tool },
-        ) = (&requirement.capability, &requirement.selector)
+        if let (&CapabilityKind::McpCall, ResourceSelector::Mcp { server, tool }) =
+            (&requirement.capability, &requirement.selector)
         {
             if name == format!("mcp.{server}.{tool}") {
                 return Ok(Some(CoreHostBinding::McpCall));
@@ -4879,7 +5064,7 @@ fn validate_process_request(
     requirement: &CapabilityRequirement,
     command: &str,
     origin: &crate::vm::SourceOrigin,
-) -> std::result::Result<PathBuf, VmDiagnostic> {
+) -> std::result::Result<OpenedProcessExecutable, VmDiagnostic> {
     if binding != Some(CoreHostBinding::ProcessRun) {
         return Err(host_binding_error(
             origin,
@@ -4900,23 +5085,55 @@ fn validate_process_request(
     };
     let approved = ProcessExecutableIdentity::decode(encoded)
         .map_err(|message| host_binding_error(origin, message))?;
-    let current = resolve_process_executable(command)
-        .map_err(|message| host_binding_error(origin, message))?;
-    if approved != current {
+    let current =
+        open_process_executable(command).map_err(|message| host_binding_error(origin, message))?;
+    if approved != current.identity {
         return Err(host_binding_error(
             origin,
             "process-run executable identity no longer matches the authorized selector",
         ));
     }
-    Ok(PathBuf::from(current.path))
+    Ok(current)
 }
 
-const PROCESS_IDENTITY_PREFIX: &str = "finch-process-v1:";
+const PROCESS_IDENTITY_PREFIX: &str = "finch-process-v2:";
+
+fn validate_restored_process_authority(ledger: &CapabilityLedger) -> Result<()> {
+    for grant in &ledger.grants.grants {
+        if grant.requirement.capability != CapabilityKind::ProcessRun {
+            continue;
+        }
+        let ResourceSelector::Process { executables } = &grant.requirement.selector else {
+            bail!("stored process capability grant has an invalid selector");
+        };
+        for executable in executables {
+            ProcessExecutableIdentity::decode(executable).map_err(|_| {
+                anyhow::anyhow!(
+                    "legacy raw-path process capability grant cannot be restored; reapprove the executable to bind a stable v2 identity"
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ProcessExecutableIdentity {
     path: String,
     sha256: String,
+    device: u64,
+    inode: u64,
+}
+
+struct OpenedProcessExecutable {
+    identity: ProcessExecutableIdentity,
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    file: std::fs::File,
 }
 
 impl ProcessExecutableIdentity {
@@ -4935,49 +5152,258 @@ impl ProcessExecutableIdentity {
     }
 }
 
-/// Resolve an executable to the authority identity persisted in grants and
-/// audit. Replacing the file with different bytes invalidates the grant;
-/// byte-identical replacement retains the same identity. The identity is
-/// checked again immediately before spawning the canonical absolute path.
+/// Open an executable to the authority identity persisted in grants and
+/// audit. Device/inode and content are derived from the same open descriptor
+/// later passed to `fexecve`, so pathname replacement cannot change the
+/// object selected for execution.
 fn resolve_process_executable(
     command: &str,
 ) -> std::result::Result<ProcessExecutableIdentity, String> {
-    let supplied = Path::new(command);
-    if !supplied.is_absolute() {
-        return Err("process-run executable must be an absolute canonical path; PATH and relative lookup are forbidden".into());
-    }
-    #[cfg(windows)]
-    if supplied
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
-        })
+    Ok(open_process_executable(command)?.identity)
+}
+
+fn open_process_executable(command: &str) -> std::result::Result<OpenedProcessExecutable, String> {
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )))]
     {
-        return Err("process-run rejects .bat and .cmd because they require a command shell".into());
+        let _ = command;
+        return Err(
+            "process-run is unsupported on this platform because stable opened-object execution is unavailable"
+                .into(),
+        );
     }
-    let canonical = std::fs::canonicalize(supplied)
-        .map_err(|error| format!("resolve process executable '{}': {error}", supplied.display()))?;
-    if canonical != supplied {
-        return Err("process-run executable must already be canonical and must not be a symlink".into());
-    }
-    let metadata = std::fs::metadata(&canonical)
-        .map_err(|error| format!("inspect process executable '{}': {error}", canonical.display()))?;
-    if !metadata.is_file() {
-        return Err("process-run executable must be a regular file".into());
-    }
-    #[cfg(unix)]
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 == 0 {
-            return Err("process-run executable is not marked executable".into());
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let supplied = Path::new(command);
+        if !supplied.is_absolute() {
+            return Err("process-run executable must be an absolute canonical path; PATH and relative lookup are forbidden".into());
         }
+        let canonical = std::fs::canonicalize(supplied).map_err(|error| {
+            format!(
+                "resolve process executable '{}': {error}",
+                supplied.display()
+            )
+        })?;
+        if canonical != supplied {
+            return Err(
+                "process-run executable must already be canonical and must not be a symlink".into(),
+            );
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&canonical)
+            .map_err(|error| {
+                format!("open process executable '{}': {error}", canonical.display())
+            })?;
+        let metadata = file.metadata().map_err(|error| {
+            format!(
+                "inspect process executable '{}': {error}",
+                canonical.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err("process-run executable must be a regular file".into());
+        }
+        let path_metadata = std::fs::metadata(&canonical).map_err(|error| {
+            format!(
+                "recheck process executable '{}': {error}",
+                canonical.display()
+            )
+        })?;
+        if metadata.dev() != path_metadata.dev() || metadata.ino() != path_metadata.ino() {
+            return Err("process-run executable changed while it was being opened".into());
+        }
+        ensure_effective_execute_permission(&canonical, &metadata)?;
+        let digest = sha256_open_file(&file)?;
+        Ok(OpenedProcessExecutable {
+            identity: ProcessExecutableIdentity {
+                path: canonical.to_string_lossy().into_owned(),
+                sha256: hex_digest(&digest),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+            file,
+        })
     }
-    let digest = sha256_file(&canonical)?;
-    Ok(ProcessExecutableIdentity {
-        path: canonical.to_string_lossy().into_owned(),
-        sha256: hex_digest(&digest),
-    })
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+))]
+fn ensure_effective_execute_permission(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> std::result::Result<(), String> {
+    use nix::unistd::{access, getegid, geteuid, getgroups, AccessFlags};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mode = metadata.permissions().mode();
+    let euid = geteuid().as_raw();
+    let egid = getegid().as_raw();
+    let executable = if euid == 0 {
+        mode & 0o111 != 0
+    } else if euid == metadata.uid() {
+        mode & 0o100 != 0
+    } else {
+        let in_group = egid == metadata.gid()
+            || getgroups()
+                .map_err(|error| format!("read effective process groups: {error}"))?
+                .iter()
+                .any(|group| group.as_raw() == metadata.gid());
+        if in_group {
+            mode & 0o010 != 0
+        } else {
+            mode & 0o001 != 0
+        }
+    };
+    if !executable {
+        return Err("process-run executable is not executable by the effective user".into());
+    }
+    access(path, AccessFlags::X_OK)
+        .map_err(|error| format!("process executable fails launch access check: {error}"))
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+))]
+fn sha256_open_file(file: &std::fs::File) -> std::result::Result<[u8; 32], String> {
+    let mut file = file.try_clone().map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut output = [0_u8; 32];
+    output.copy_from_slice(&digest);
+    Ok(output)
+}
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
+type ProcessBeforeExecHook = (String, Box<dyn FnOnce() + Send>);
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
+static PROCESS_BEFORE_EXEC_HOOK: std::sync::OnceLock<Mutex<Option<ProcessBeforeExecHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )
+))]
+fn run_process_before_exec_hook(path: &str) {
+    let mut hook = PROCESS_BEFORE_EXEC_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("process before-exec test hook lock");
+    if hook.as_ref().is_some_and(|(expected, _)| expected == path) {
+        let (_, callback) = hook.take().expect("matching process hook");
+        callback();
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+))]
+fn spawn_open_process(
+    executable: OpenedProcessExecutable,
+    arguments: &[String],
+) -> std::result::Result<std::process::Child, String> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
+
+    let argv = std::iter::once(executable.identity.path.as_str())
+        .chain(arguments.iter().map(String::as_str))
+        .map(|value| CString::new(value).map_err(|_| "process argument contains NUL".to_string()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let environment = std::env::vars_os()
+        .map(|(key, value)| {
+            let mut entry = key.as_os_str().as_bytes().to_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_os_str().as_bytes());
+            CString::new(entry).map_err(|_| "process environment contains NUL".to_string())
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let fd = executable.file.as_raw_fd();
+    #[cfg(test)]
+    run_process_before_exec_hook(&executable.identity.path);
+    let mut command = std::process::Command::new("/bin/false");
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    unsafe {
+        command.pre_exec(
+            move || match nix::unistd::fexecve(fd, &argv, &environment) {
+                Ok(never) => match never {},
+                Err(error) => Err(std::io::Error::from_raw_os_error(error as i32)),
+            },
+        );
+    }
+    command.spawn().map_err(|error| error.to_string())
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "dragonfly"
+)))]
+fn spawn_open_process(
+    _executable: OpenedProcessExecutable,
+    _arguments: &[String],
+) -> std::result::Result<std::process::Child, String> {
+    Err("process-run is unsupported on this platform".into())
 }
 
 fn normalize_process_grant(
@@ -5135,9 +5561,7 @@ fn list_directory_tree(
                 .map_err(|_| format!("tree-list file '{relative}' is too large to represent"))?;
             ("file", size)
         } else {
-            return Err(format!(
-                "tree-list rejects unsupported entry '{relative}'"
-            ));
+            return Err(format!("tree-list rejects unsupported entry '{relative}'"));
         };
         entries.push(TypedValue::Record(vec![
             ("path".into(), TypedValue::String(relative)),
@@ -5189,7 +5613,13 @@ fn merkle_directory(root: &Path) -> std::result::Result<String, String> {
 
     let mut hasher = Sha256::new();
     let mut entries = 0;
-    merkle_walk(root, root, &mut hasher, &mut entries, MAX_TREE_MERKLE_ENTRIES)?;
+    merkle_walk(
+        root,
+        root,
+        &mut hasher,
+        &mut entries,
+        MAX_TREE_MERKLE_ENTRIES,
+    )?;
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -5202,7 +5632,11 @@ fn merkle_walk(
 ) -> std::result::Result<(), String> {
     let mut paths = std::fs::read_dir(directory)
         .map_err(|error| error.to_string())?
-        .map(|entry| entry.map(|entry| entry.path()).map_err(|error| error.to_string()))
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| error.to_string())
+        })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     paths.sort();
 
@@ -5232,7 +5666,10 @@ fn merkle_walk(
             hasher.update(b"\0");
             hasher.update(sha256_file(&path)?);
         } else {
-            return Err(format!("tree-merkle rejects unsupported entry '{}'", relative));
+            return Err(format!(
+                "tree-merkle rejects unsupported entry '{}'",
+                relative
+            ));
         }
     }
     Ok(())
@@ -5275,11 +5712,7 @@ fn read_workbook_rows(
                 "workbook sheet exceeds the {MAX_WORKBOOK_CELLS}-cell host cursor limit"
             ));
         }
-        rows.push(
-            row.iter()
-                .map(workbook_cell_to_string)
-                .collect(),
-        );
+        rows.push(row.iter().map(workbook_cell_to_string).collect());
     }
     Ok(rows)
 }
@@ -5374,8 +5807,9 @@ fn summarize_workbook(
         max: Option<f64>,
     }
 
-    let mut columns: Vec<ColumnSummary> =
-        (0..headers.len()).map(|_| ColumnSummary::default()).collect();
+    let mut columns: Vec<ColumnSummary> = (0..headers.len())
+        .map(|_| ColumnSummary::default())
+        .collect();
     let sampled_rows = data_rows.len().min(max_rows);
     for (row_index, row) in data_rows.iter().take(sampled_rows).enumerate() {
         if row.len() > headers.len() {
@@ -5659,8 +6093,9 @@ fn summarize_csv(
         max: Option<f64>,
     }
 
-    let mut columns: Vec<ColumnSummary> =
-        (0..headers.len()).map(|_| ColumnSummary::default()).collect();
+    let mut columns: Vec<ColumnSummary> = (0..headers.len())
+        .map(|_| ColumnSummary::default())
+        .collect();
     let mut sampled_rows = 0usize;
     while sampled_rows < max_rows {
         let Some(record) = read_bounded_csv_record(&mut reader)? else {
@@ -5839,13 +6274,7 @@ fn failed_pending_resume(
         effect_journal: pending.suspension.effect_journal.clone(),
         diagnostics: vec![diagnostic],
         vm_diagnostics: Vec::new(),
-        inferred_capabilities: pending
-            .suspension
-            .effects
-            .0
-            .iter()
-            .cloned()
-            .collect(),
+        inferred_capabilities: pending.suspension.effects.0.iter().cloned().collect(),
         required_capabilities: Vec::new(),
         approval_prompts: Vec::new(),
         input_revision: pending.input_revision,
@@ -6019,6 +6448,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failed_process_launch_rollback_never_overwrites_concurrent_authority_mutation() {
+        let previous = CapabilityLedger::default();
+        let mut authorized = previous.clone();
+        authorized
+            .issue(
+                CapabilityRequirement {
+                    capability: CapabilityKind::ProcessRun,
+                    selector: ResourceSelector::Process {
+                        executables: vec!["test-identity".into()],
+                    },
+                },
+                GrantScope::Global,
+                "test-policy",
+                "test-user",
+                1,
+                None,
+            )
+            .unwrap();
+        let rollback = ProcessAuthorizationRollback {
+            previous: previous.clone(),
+            authorized: authorized.clone(),
+        };
+
+        let mut unchanged = authorized.clone();
+        assert!(rollback_process_authorization_if_unchanged(
+            &mut unchanged,
+            &rollback
+        ));
+        assert_eq!(unchanged, previous);
+
+        let mut concurrently_mutated = authorized;
+        concurrently_mutated
+            .issue(
+                CapabilityRequirement {
+                    capability: CapabilityKind::MemoryRead,
+                    selector: ResourceSelector::Memory {
+                        tree: "session".into(),
+                        path: "**".into(),
+                    },
+                },
+                GrantScope::Global,
+                "test-policy",
+                "other-user",
+                2,
+                None,
+            )
+            .unwrap();
+        let expected = concurrently_mutated.clone();
+        assert!(!rollback_process_authorization_if_unchanged(
+            &mut concurrently_mutated,
+            &rollback
+        ));
+        assert_eq!(concurrently_mutated, expected);
+    }
+
+    #[test]
     fn host_requests_are_routed_through_registered_core_bindings() {
         let origin = SourceOrigin::generated("file-read");
         let requirement = core_word_spec("file-read")
@@ -6041,79 +6526,93 @@ mod tests {
         assert!(registered_host_binding(&wrong_requirement, &origin).is_err());
         assert!(registered_host_binding(&requirement, &SourceOrigin::generated("+"),).is_err());
 
-        let process_requirement = CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::ProcessRun,
-            selector: crate::vm::ResourceSelector::Process {
-                executables: vec![resolve_process_executable("/usr/bin/true").unwrap().encode()],
-            },
-        };
-        assert_eq!(
-            registered_host_binding(
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "dragonfly"
+        ))]
+        {
+            let process_requirement = CapabilityRequirement {
+                capability: crate::vm::CapabilityKind::ProcessRun,
+                selector: crate::vm::ResourceSelector::Process {
+                    executables: vec![resolve_process_executable("/usr/bin/true")
+                        .unwrap()
+                        .encode()],
+                },
+            };
+            assert_eq!(
+                registered_host_binding(
+                    &process_requirement,
+                    &SourceOrigin::generated("process-run"),
+                )
+                .unwrap(),
+                Some(CoreHostBinding::ProcessRun)
+            );
+            assert_eq!(
+                registered_host_binding(
+                    &process_requirement,
+                    &SourceOrigin::generated("legacy-process-run"),
+                )
+                .unwrap(),
+                None
+            );
+            let process_origin = SourceOrigin::generated("process-run");
+            assert!(validate_process_request(
+                Some(CoreHostBinding::ProcessRun),
                 &process_requirement,
-                &SourceOrigin::generated("process-run"),
+                "/usr/bin/true",
+                &process_origin,
             )
-            .unwrap(),
-            Some(CoreHostBinding::ProcessRun)
-        );
-        assert_eq!(
-            registered_host_binding(
+            .is_ok());
+            assert!(validate_process_request(
+                None,
                 &process_requirement,
+                "/usr/bin/true",
                 &SourceOrigin::generated("legacy-process-run"),
             )
-            .unwrap(),
-            None
-        );
-        let process_origin = SourceOrigin::generated("process-run");
-        assert!(validate_process_request(
-            Some(CoreHostBinding::ProcessRun),
-            &process_requirement,
-            "/usr/bin/true",
-            &process_origin,
-        )
-        .is_ok());
-        assert!(validate_process_request(
-            None,
-            &process_requirement,
-            "/usr/bin/true",
-            &SourceOrigin::generated("legacy-process-run"),
-        )
-        .is_err());
-        assert!(validate_process_request(
-            Some(CoreHostBinding::ProcessRun),
-            &process_requirement,
-            "/usr/bin/false",
-            &process_origin,
-        )
-        .is_err());
-        let empty = CapabilityRequirement {
-            capability: CapabilityKind::ProcessRun,
-            selector: ResourceSelector::Process {
-                executables: Vec::new(),
-            },
-        };
-        assert!(validate_process_request(
-            Some(CoreHostBinding::ProcessRun),
-            &empty,
-            "/usr/bin/true",
-            &process_origin,
-        )
-        .is_err());
-        let multiple = CapabilityRequirement {
-            capability: CapabilityKind::ProcessRun,
-            selector: ResourceSelector::Process {
-                executables: vec![
-                    resolve_process_executable("/usr/bin/true").unwrap().encode(),
-                    resolve_process_executable("/usr/bin/false").unwrap().encode(),
-                ],
-            },
-        };
-        assert!(validate_process_request(
-            Some(CoreHostBinding::ProcessRun),
-            &multiple,
-            "/usr/bin/true",
-            &process_origin,
-        )
-        .is_err());
+            .is_err());
+            assert!(validate_process_request(
+                Some(CoreHostBinding::ProcessRun),
+                &process_requirement,
+                "/usr/bin/false",
+                &process_origin,
+            )
+            .is_err());
+            let empty = CapabilityRequirement {
+                capability: CapabilityKind::ProcessRun,
+                selector: ResourceSelector::Process {
+                    executables: Vec::new(),
+                },
+            };
+            assert!(validate_process_request(
+                Some(CoreHostBinding::ProcessRun),
+                &empty,
+                "/usr/bin/true",
+                &process_origin,
+            )
+            .is_err());
+            let multiple = CapabilityRequirement {
+                capability: CapabilityKind::ProcessRun,
+                selector: ResourceSelector::Process {
+                    executables: vec![
+                        resolve_process_executable("/usr/bin/true")
+                            .unwrap()
+                            .encode(),
+                        resolve_process_executable("/usr/bin/false")
+                            .unwrap()
+                            .encode(),
+                    ],
+                },
+            };
+            assert!(validate_process_request(
+                Some(CoreHostBinding::ProcessRun),
+                &multiple,
+                "/usr/bin/true",
+                &process_origin,
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -6318,9 +6817,10 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.status, ExecutionStatus::Completed);
         assert!(outcome.required_capabilities.is_empty());
-        assert!(outcome.inferred_capabilities.iter().any(|requirement| {
-            requirement.capability == crate::vm::CapabilityKind::FileRead
-        }));
+        assert!(outcome
+            .inferred_capabilities
+            .iter()
+            .any(|requirement| { requirement.capability == crate::vm::CapabilityKind::FileRead }));
     }
 
     #[tokio::test]
@@ -6643,10 +7143,7 @@ mod tests {
             .submit_as(source(), Some(identity(uuid::Uuid::new_v4())))
             .await
             .unwrap();
-        assert_eq!(
-            unrelated.status,
-            ExecutionStatus::AuthorizationRequired
-        );
+        assert_eq!(unrelated.status, ExecutionStatus::AuthorizationRequired);
     }
 
     #[tokio::test]
@@ -6698,12 +7195,7 @@ mod tests {
             .unwrap();
 
         runtime
-            .issue_typed_capability(
-                requirement,
-                GrantScope::Task { task_id },
-                "test-user",
-                None,
-            )
+            .issue_typed_capability(requirement, GrantScope::Task { task_id }, "test-user", None)
             .unwrap();
         let explicitly_approved = runtime.submit_as(source(), Some(child)).await.unwrap();
         assert_eq!(explicitly_approved.status, ExecutionStatus::Completed);
@@ -6750,11 +7242,7 @@ mod tests {
             .unwrap();
         let first_prompt = first.approval_prompts[0].clone();
         let second = runtime
-            .resolve_typed_approval(
-                &first_prompt,
-                ApprovalChoice::AllowOnce,
-                "test-user",
-            )
+            .resolve_typed_approval(&first_prompt, ApprovalChoice::AllowOnce, "test-user")
             .await
             .unwrap();
         assert_eq!(second.status, ExecutionStatus::AuthorizationRequired);
@@ -6778,7 +7266,10 @@ mod tests {
             .expect("allow-once records an exact grant");
         assert!(once.consumed_at_unix_ms.is_some());
         assert!(matches!(
-            ledger.authorization_audit.last().map(|entry| &entry.decision),
+            ledger
+                .authorization_audit
+                .last()
+                .map(|entry| &entry.decision),
             Some(AuthorizationDecision::Allowed { .. })
         ));
     }
@@ -6831,8 +7322,7 @@ mod tests {
             AuthorizationDecision::Allowed { grant_id: used } if used == grant_id
         )));
         assert_ne!(
-            ledger.authorization_audit[0].execution_id,
-            ledger.authorization_audit[1].execution_id,
+            ledger.authorization_audit[0].execution_id, ledger.authorization_audit[1].execution_id,
             "each actual host boundary keeps its owning ProgramRun identity"
         );
     }
@@ -6976,10 +7466,12 @@ mod tests {
                 TypedValue::Record(fields) => fields
                     .iter()
                     .find_map(|(name, value)| {
-                        (name == "path").then_some(value).and_then(|value| match value {
-                            TypedValue::String(path) => Some(path.as_str()),
-                            _ => None,
-                        })
+                        (name == "path")
+                            .then_some(value)
+                            .and_then(|value| match value {
+                                TypedValue::String(path) => Some(path.as_str()),
+                                _ => None,
+                            })
                     })
                     .expect("tree entry path"),
                 _ => panic!("tree-list must return records"),
@@ -6995,14 +7487,8 @@ mod tests {
     async fn typed_tree_list_has_identical_lisp_and_forth_results() {
         let mut results = Vec::new();
         for (language, source) in [
-            (
-                ProgramLanguage::Lisp,
-                "(tree-list (path \"src/vm\") 5)",
-            ),
-            (
-                ProgramLanguage::Forth,
-                "s\"src/vm\" path 5 tree-list",
-            ),
+            (ProgramLanguage::Lisp, "(tree-list (path \"src/vm\") 5)"),
+            (ProgramLanguage::Forth, "s\"src/vm\" path 5 tree-list"),
         ] {
             let runtime = ProgramRuntime::new();
             runtime
@@ -7012,11 +7498,7 @@ mod tests {
                 ))
                 .unwrap();
             let outcome = runtime
-                .submit_typed_only(submission(
-                    language,
-                    source,
-                    ExecutionEffect::WorkspaceRead,
-                ))
+                .submit_typed_only(submission(language, source, ExecutionEffect::WorkspaceRead))
                 .await
                 .unwrap();
             assert_eq!(outcome.status, ExecutionStatus::Completed);
@@ -7065,6 +7547,53 @@ mod tests {
                 "[package]".into()
             ))))]
         );
+    }
+
+    #[tokio::test]
+    async fn file_stream_follow_up_rechecks_the_minting_selector_after_revocation() {
+        let runtime = ProgramRuntime::new();
+        let original_grant = runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("./**").unwrap(),
+            ))
+            .unwrap();
+        let suspended = runtime
+            .submit_typed_only(submission(
+                ProgramLanguage::Forth,
+                "s\"Cargo.toml\" path file-lines-open unit yield stream-next",
+                ExecutionEffect::WorkspaceRead,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(suspended.status, ExecutionStatus::Suspended);
+
+        assert!(runtime.revoke_typed_capability(original_grant).unwrap());
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("./README.md").unwrap(),
+            ))
+            .unwrap();
+        let resumed = runtime
+            .resume_typed_execution(suspended.execution_id)
+            .await
+            .unwrap();
+        assert_eq!(resumed.status, ExecutionStatus::Failed);
+        assert!(resumed.diagnostics.iter().any(
+            |diagnostic| diagnostic.contains("revoked, expired, or outside its approved scope")
+        ));
+        let ledger = runtime.capability_ledger().unwrap();
+        let audit = ledger
+            .authorization_audit
+            .last()
+            .expect("the rejected follow-up must remain auditable");
+        assert!(matches!(
+            &audit.requirement.selector,
+            ResourceSelector::File { selector }
+                if selector == &crate::vm::FileSelector::parse("./Cargo.toml").unwrap()
+        ));
+        assert_eq!(audit.decision, AuthorizationDecision::ApprovalRequired);
     }
 
     #[tokio::test]
@@ -7167,7 +7696,11 @@ mod tests {
                 ))
                 .unwrap();
             let outcome = runtime
-                .submit_typed_only(submission(language, &source, ExecutionEffect::WorkspaceRead))
+                .submit_typed_only(submission(
+                    language,
+                    &source,
+                    ExecutionEffect::WorkspaceRead,
+                ))
                 .await
                 .unwrap();
             assert_eq!(
@@ -7231,21 +7764,13 @@ mod tests {
         for (language, range_source, summary_source) in [
             (
                 ProgramLanguage::Lisp,
-                format!(
-                    "(workbook-range (path \"{relative}\") \"Stats\" 1 0 2 2)"
-                ),
-                format!(
-                    "(workbook-summary (path \"{relative}\") \"Stats\" 2)"
-                ),
+                format!("(workbook-range (path \"{relative}\") \"Stats\" 1 0 2 2)"),
+                format!("(workbook-summary (path \"{relative}\") \"Stats\" 2)"),
             ),
             (
                 ProgramLanguage::Forth,
-                format!(
-                    "\"{relative}\" path \"Stats\" 1 0 2 2 workbook-range"
-                ),
-                format!(
-                    "\"{relative}\" path \"Stats\" 2 workbook-summary"
-                ),
+                format!("\"{relative}\" path \"Stats\" 1 0 2 2 workbook-range"),
+                format!("\"{relative}\" path \"Stats\" 2 workbook-summary"),
             ),
         ] {
             for (source, expected) in [
@@ -7321,7 +7846,11 @@ mod tests {
                 ))
                 .unwrap();
             let outcome = runtime
-                .submit_typed_only(submission(language, &source, ExecutionEffect::WorkspaceRead))
+                .submit_typed_only(submission(
+                    language,
+                    &source,
+                    ExecutionEffect::WorkspaceRead,
+                ))
                 .await
                 .unwrap();
             assert_eq!(outcome.status, ExecutionStatus::Completed);
@@ -8086,17 +8615,21 @@ mod tests {
             )
         };
         let runtime = ProgramRuntime::new();
-        let grant_id = runtime
-            .grant_typed_capability(requirement.clone())
-            .unwrap();
+        let grant_id = runtime.grant_typed_capability(requirement.clone()).unwrap();
         let ledger = runtime.capability_ledger().unwrap();
         assert_eq!(ledger.grants.grants[0].id, grant_id);
         assert_eq!(ledger.audit.len(), 1);
-        assert_eq!(runtime.submit(request()).await.unwrap().status, ExecutionStatus::Completed);
+        assert_eq!(
+            runtime.submit(request()).await.unwrap().status,
+            ExecutionStatus::Completed
+        );
 
         let restored = ProgramRuntime::new();
         restored.restore_capability_ledger(ledger).unwrap();
-        assert_eq!(restored.submit(request()).await.unwrap().status, ExecutionStatus::Completed);
+        assert_eq!(
+            restored.submit(request()).await.unwrap().status,
+            ExecutionStatus::Completed
+        );
         assert!(restored.revoke_typed_capability(grant_id).unwrap());
         let denied = restored.submit(request()).await.unwrap();
         assert_eq!(denied.status, ExecutionStatus::AuthorizationRequired);
@@ -8341,7 +8874,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
                 timeout_secs: 5,
             },
         )]);
-        let client = Arc::new(crate::tools::mcp::McpClient::from_config(&config).await.unwrap());
+        let client = Arc::new(
+            crate::tools::mcp::McpClient::from_config(&config)
+                .await
+                .unwrap(),
+        );
         let runtime = ProgramRuntime::new();
         assert!(!runtime.has_mcp_client());
         assert!(runtime.bind_mcp_client(client).await.unwrap().is_empty());
@@ -8357,7 +8894,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .as_deref()
             .unwrap()
             .contains("record{value:string}"));
-        assert!(namespaced.version.as_deref().unwrap().starts_with("sha256:"));
+        assert!(namespaced
+            .version
+            .as_deref()
+            .unwrap()
+            .starts_with("sha256:"));
         assert!(namespaced
             .documentation
             .as_deref()
@@ -8405,11 +8946,15 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             "diagnostics: {:?}",
             outcome.diagnostics
         );
-        assert!(matches!(
-            outcome.values.last(),
-            Some(ProgramValue::Json(value))
-                if value["structuredContent"]["typed"] == serde_json::Value::Bool(true)
-        ), "values: {:?}", outcome.values);
+        assert!(
+            matches!(
+                outcome.values.last(),
+                Some(ProgramValue::Json(value))
+                    if value["structuredContent"]["typed"] == serde_json::Value::Bool(true)
+            ),
+            "values: {:?}",
+            outcome.values
+        );
 
         let mut forth = submission(
             ProgramLanguage::Forth,
@@ -8493,6 +9038,12 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         assert!(manifest.contains("file-read"));
     }
 
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
     #[tokio::test]
     async fn approved_typed_process_runs_without_a_shell() {
         let runtime = ProgramRuntime::new();
@@ -8503,8 +9054,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         );
         let pending = runtime.submit(request.clone()).await.unwrap();
         assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
-        let ResourceSelector::Process { executables } =
-            &pending.required_capabilities[0].selector
+        let ResourceSelector::Process { executables } = &pending.required_capabilities[0].selector
         else {
             panic!("process approval must expose a stable executable identity");
         };
@@ -8523,6 +9073,12 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         assert_eq!(approved.values, vec![ProgramValue::String("ok".into())]);
     }
 
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
     #[tokio::test]
     async fn process_run_rejects_bare_and_relative_commands_without_consulting_path() {
         let runtime = ProgramRuntime::new();
@@ -8553,7 +9109,12 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .is_empty());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
     #[tokio::test]
     async fn process_run_rejects_symlinks_even_after_retargeting() {
         use std::os::unix::fs::symlink;
@@ -8593,7 +9154,12 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .is_empty());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
     #[tokio::test]
     async fn replaced_process_executable_does_not_consume_once_grant() {
         use std::os::unix::fs::PermissionsExt;
@@ -8635,7 +9201,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .unwrap();
         assert_eq!(failed.status, ExecutionStatus::Failed);
         let ledger = runtime.capability_ledger().unwrap();
-        let once = ledger.grants.grants.last().expect("once grant was recorded");
+        let once = ledger
+            .grants
+            .grants
+            .last()
+            .expect("once grant was recorded");
         assert!(matches!(once.scope, GrantScope::Once { .. }));
         assert!(once.consumed_at_unix_ms.is_none());
         assert!(ledger.authorization_audit.is_empty());
@@ -8645,7 +9215,182 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .any(|entry| entry.action == crate::vm::CapabilityAuditAction::Consumed));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    #[tokio::test]
+    async fn atomic_path_replacement_executes_the_authorized_open_object() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("tool");
+        let replacement = directory.path().join("replacement");
+        std::fs::copy("/usr/bin/printf", &executable).unwrap();
+        std::fs::copy("/usr/bin/false", &replacement).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = std::fs::canonicalize(executable).unwrap();
+        let source = format!(
+            "(process-run {} (list \"opened-object\"))",
+            serde_json::to_string(&executable.to_string_lossy()).unwrap()
+        );
+        let runtime = ProgramRuntime::new();
+        let pending = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                &source,
+                ExecutionEffect::ExternalWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
+
+        let expected = executable.to_string_lossy().into_owned();
+        *PROCESS_BEFORE_EXEC_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = Some((
+            expected,
+            Box::new(move || std::fs::rename(replacement, executable).unwrap()),
+        ));
+        let completed = runtime
+            .resolve_typed_approval(
+                &pending.approval_prompts[0],
+                ApprovalChoice::AllowOnce,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ExecutionStatus::Completed);
+        assert_eq!(
+            completed.values,
+            vec![ProgramValue::String("opened-object".into())]
+        );
+        let ledger = runtime.capability_ledger().unwrap();
+        assert!(ledger
+            .grants
+            .grants
+            .last()
+            .unwrap()
+            .consumed_at_unix_ms
+            .is_some());
+        assert!(matches!(
+            ledger
+                .authorization_audit
+                .last()
+                .map(|entry| &entry.decision),
+            Some(AuthorizationDecision::Allowed { .. })
+        ));
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    #[tokio::test]
+    async fn owner_mode_other_execute_does_not_reach_authorization() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if nix::unistd::geteuid().as_raw() == 0 {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("tool");
+        std::fs::copy("/usr/bin/true", &executable).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o001)).unwrap();
+        let executable = std::fs::canonicalize(executable).unwrap();
+        assert_eq!(
+            std::fs::metadata(&executable).unwrap().uid(),
+            nix::unistd::geteuid().as_raw()
+        );
+        let source = format!(
+            "(process-run {} (list))",
+            serde_json::to_string(&executable.to_string_lossy()).unwrap()
+        );
+        let runtime = ProgramRuntime::new();
+        let failed = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                &source,
+                ExecutionEffect::ExternalWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(failed.status, ExecutionStatus::Failed);
+        assert!(failed
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("not executable by the effective user")));
+        let ledger = runtime.capability_ledger().unwrap();
+        assert!(ledger.grants.grants.is_empty());
+        assert!(ledger.authorization_audit.is_empty());
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    #[tokio::test]
+    async fn kernel_rejected_launch_does_not_consume_or_audit_once_grant() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("invalid-executable");
+        std::fs::write(&executable, b"not an executable image").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = std::fs::canonicalize(executable).unwrap();
+        let source = format!(
+            "(process-run {} (list))",
+            serde_json::to_string(&executable.to_string_lossy()).unwrap()
+        );
+        let runtime = ProgramRuntime::new();
+        let pending = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                &source,
+                ExecutionEffect::ExternalWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
+
+        let failed = runtime
+            .resolve_typed_approval(
+                &pending.approval_prompts[0],
+                ApprovalChoice::AllowOnce,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status, ExecutionStatus::Failed);
+        let ledger = runtime.capability_ledger().unwrap();
+        let once = ledger
+            .grants
+            .grants
+            .last()
+            .expect("once grant remains visible");
+        assert!(matches!(once.scope, GrantScope::Once { .. }));
+        assert!(once.consumed_at_unix_ms.is_none());
+        assert!(ledger.authorization_audit.is_empty());
+        assert!(!ledger
+            .audit
+            .iter()
+            .any(|entry| entry.action == CapabilityAuditAction::Consumed));
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
     #[tokio::test]
     async fn wrong_process_origin_is_rejected_before_once_grant_issuance() {
         let runtime = ProgramRuntime::new();
@@ -8679,16 +9424,41 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         assert!(ledger.authorization_audit.is_empty());
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn process_run_rejects_windows_batch_launchers() {
-        let directory = tempfile::tempdir().unwrap();
-        let batch = directory.path().join("tool.cmd");
-        std::fs::write(&batch, "@echo off\r\n").unwrap();
-        let canonical = std::fs::canonicalize(batch).unwrap();
-        assert!(resolve_process_executable(&canonical.to_string_lossy())
-            .unwrap_err()
-            .contains("command shell"));
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    )))]
+    #[tokio::test]
+    async fn process_run_is_unavailable_without_stable_opened_object_execution() {
+        let runtime = ProgramRuntime::new();
+        let requirement = CapabilityRequirement {
+            capability: CapabilityKind::ProcessRun,
+            selector: ResourceSelector::Process {
+                executables: Vec::new(),
+            },
+        };
+        assert_eq!(
+            runtime.capability_availability(&requirement),
+            CapabilityAvailability::Unsupported
+        );
+        let outcome = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(process-run \"/usr/bin/true\" (list))",
+                ExecutionEffect::ExternalWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionStatus::Failed);
+        assert!(outcome
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("stable opened-object execution is unavailable")));
+        let ledger = runtime.capability_ledger().unwrap();
+        assert!(ledger.grants.grants.is_empty());
+        assert!(ledger.authorization_audit.is_empty());
     }
 
     #[tokio::test]
@@ -8905,7 +9675,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             Some(crate::vm::EffectJournalState::Acknowledged { values })
                 if matches!(values.as_slice(), [TypedValue::Option { .. }])
         ));
-        assert!(receiver.try_recv().is_err(), "the VM must not redispatch the effect");
+        assert!(
+            receiver.try_recv().is_err(),
+            "the VM must not redispatch the effect"
+        );
     }
 
     #[tokio::test]
@@ -9111,6 +9884,12 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .any(|diagnostic| diagnostic.code == "E-CAP-003"));
     }
 
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
     #[tokio::test]
     async fn process_grant_cannot_be_reused_for_a_different_executable() {
         let runtime = ProgramRuntime::new();
@@ -9132,8 +9911,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .unwrap();
         assert_eq!(outcome.status, ExecutionStatus::AuthorizationRequired);
         assert_eq!(outcome.required_capabilities.len(), 1);
-        let ResourceSelector::Process { executables } =
-            &outcome.required_capabilities[0].selector
+        let ResourceSelector::Process { executables } = &outcome.required_capabilities[0].selector
         else {
             panic!("process request must use a stable executable identity");
         };
@@ -9259,9 +10037,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .unwrap();
         assert_eq!(connected.status, ExecutionStatus::Completed);
 
-        // The static socket operation can be invoked with any network grant,
-        // but the host must check the socket's actual endpoint rather than
-        // treating the opaque resource as ambient authority.
+        // Static verification recognizes the opaque socket type. The host
+        // then replaces its unscoped signature selector with this socket's
+        // exact endpoint before consulting and auditing the live ledger.
         assert!(runtime.revoke_typed_capability(original_grant).unwrap());
         runtime
             .grant_typed_capability(crate::vm::CapabilityRequirement {
@@ -9281,10 +10059,20 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .await
             .unwrap();
         assert_eq!(sent.status, ExecutionStatus::Failed);
-        assert!(sent
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.contains("no longer covered")));
+        assert!(sent.diagnostics.iter().any(
+            |diagnostic| diagnostic.contains("revoked, expired, or outside its approved scope")
+        ));
+        let ledger = runtime.capability_ledger().unwrap();
+        let audit = ledger
+            .authorization_audit
+            .last()
+            .expect("the rejected send must remain auditable");
+        assert!(matches!(
+            &audit.requirement.selector,
+            ResourceSelector::Network { host, ports }
+                if host == "127.0.0.1" && ports == &[port]
+        ));
+        assert_eq!(audit.decision, AuthorizationDecision::ApprovalRequired);
         server.join().unwrap();
     }
 
@@ -9373,7 +10161,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         assert_eq!(outcome.backend, ExecutionBackend::TypedVm);
         assert_eq!(
             outcome.values,
-            vec![crate::programs::ProgramValue::String("retained value".into())]
+            vec![crate::programs::ProgramValue::String(
+                "retained value".into()
+            )]
         );
         assert!(outcome.output.is_empty());
         assert!(outcome.side_effects.is_empty());
@@ -9455,10 +10245,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         output_manager.disable_stdout();
         let response = output_manager.start_work_unit("VM program output");
         response.set_program_output();
-        let projection = crate::cli::VmOutputProjection::new(
-            Arc::clone(&output_manager),
-            Arc::clone(&response),
-        );
+        let projection =
+            crate::cli::VmOutputProjection::new(Arc::clone(&output_manager), Arc::clone(&response));
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink: TypedEffectSink = {
             let events = Arc::clone(&events);
@@ -9516,7 +10304,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         }
         let messages = output_manager.get_messages();
         assert_eq!(messages.len(), 2, "response port plus output handle");
-        assert_eq!(messages[1].status(), crate::cli::messages::MessageStatus::Complete);
+        assert_eq!(
+            messages[1].status(),
+            crate::cli::messages::MessageStatus::Complete
+        );
         assert!(messages[1]
             .format(&crate::config::ColorScheme::default())
             .contains("download"));
@@ -9686,11 +10477,19 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         let runtime = ProgramRuntime::new();
         assert_eq!(runtime.revision_history().unwrap().len(), 1);
         runtime
-            .submit(submission(ProgramLanguage::Forth, "7", ExecutionEffect::Pure))
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "7",
+                ExecutionEffect::Pure,
+            ))
             .await
             .unwrap();
         let suspended = runtime
-            .submit(submission(ProgramLanguage::Forth, "unit yield 9", ExecutionEffect::Pure))
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "unit yield 9",
+                ExecutionEffect::Pure,
+            ))
             .await
             .unwrap();
         assert_eq!(suspended.status, ExecutionStatus::Suspended);
@@ -9767,11 +10566,19 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
 
         let runner = ProgramRuntime::new();
         runner
-            .submit(submission(ProgramLanguage::Forth, "10", ExecutionEffect::Pure))
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "10",
+                ExecutionEffect::Pure,
+            ))
             .await
             .unwrap();
         runner
-            .submit(submission(ProgramLanguage::Forth, "20", ExecutionEffect::Pure))
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "20",
+                ExecutionEffect::Pure,
+            ))
             .await
             .unwrap();
         assert!(runner.revision() > defined.output_revision);
@@ -9796,11 +10603,19 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
     async fn runner_hydration_never_replaces_pending_continuations() {
         let source = ProgramRuntime::new();
         let first = source
-            .submit(submission(ProgramLanguage::Forth, "1", ExecutionEffect::Pure))
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "1",
+                ExecutionEffect::Pure,
+            ))
             .await
             .unwrap();
         let second = source
-            .submit(submission(ProgramLanguage::Forth, "2", ExecutionEffect::Pure))
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "2",
+                ExecutionEffect::Pure,
+            ))
             .await
             .unwrap();
         let checkpoint = source
@@ -9891,10 +10706,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         // loadable even when their lineage began from an application-owned
         // nonzero checkpoint.
         let mut legacy_json = serde_json::to_value(archive).unwrap();
-        legacy_json
-            .as_object_mut()
-            .unwrap()
-            .remove("base_revision");
+        legacy_json.as_object_mut().unwrap().remove("base_revision");
         ProgramRuntime::from_archive(serde_json::from_value(legacy_json).unwrap()).unwrap();
     }
 
@@ -9911,7 +10723,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .unwrap();
         assert_eq!(defined.status, ExecutionStatus::Completed);
         runtime
-            .submit(submission(ProgramLanguage::Forth, "7", ExecutionEffect::Pure))
+            .submit(submission(
+                ProgramLanguage::Forth,
+                "7",
+                ExecutionEffect::Pure,
+            ))
             .await
             .unwrap();
 
@@ -9947,7 +10763,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
 
         let restored = ProgramRuntime::from_checkpoint(checkpoint).unwrap();
         let result = restored
-            .submit(submission(ProgramLanguage::Lisp, "(square 8)", ExecutionEffect::Pure))
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(square 8)",
+                ExecutionEffect::Pure,
+            ))
             .await
             .unwrap();
 
@@ -9988,9 +10808,15 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         assert_eq!(archive.current_revision, 1);
         assert_eq!(archive.revisions.len(), 2);
         let encoded = serde_json::to_string(&archive).unwrap();
-        let restored = ProgramRuntime::from_archive(serde_json::from_str(&encoded).unwrap()).unwrap();
+        let restored =
+            ProgramRuntime::from_archive(serde_json::from_str(&encoded).unwrap()).unwrap();
 
-        assert!(restored.capability_ledger().unwrap().grants.grants.is_empty());
+        assert!(restored
+            .capability_ledger()
+            .unwrap()
+            .grants
+            .grants
+            .is_empty());
         assert!(!restored
             .inspect()
             .await
@@ -10031,11 +10857,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             &serde_json::to_string(&runtime.authority_state().unwrap()).unwrap(),
         )
         .unwrap();
-        let restored = ProgramRuntime::from_archive_with_authority(
-            runtime.archive().unwrap(),
-            authority,
-        )
-        .unwrap();
+        let restored =
+            ProgramRuntime::from_archive_with_authority(runtime.archive().unwrap(), authority)
+                .unwrap();
 
         assert_eq!(
             restored.capability_session_id(),
@@ -10069,7 +10893,63 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         state.ledger.grants.grants[0].policy_hash = "obsolete-policy".into();
         let mut restored = ProgramRuntime::new();
         assert!(restored.restore_authority_state(state).is_err());
-        assert!(restored.capability_ledger().unwrap().grants.grants.is_empty());
+        assert!(restored
+            .capability_ledger()
+            .unwrap()
+            .grants
+            .grants
+            .is_empty());
+    }
+
+    #[test]
+    fn authority_restore_rejects_legacy_raw_path_process_grants() {
+        let runtime = ProgramRuntime::new();
+        let policy = runtime.capability_policy().unwrap();
+        let mut ledger = CapabilityLedger::default();
+        ledger
+            .issue(
+                CapabilityRequirement {
+                    capability: CapabilityKind::ProcessRun,
+                    selector: ResourceSelector::Process {
+                        executables: vec!["/usr/bin/true".into()],
+                    },
+                },
+                GrantScope::Global,
+                policy.policy_hash.clone(),
+                "legacy-state",
+                unix_time_ms(),
+                None,
+            )
+            .unwrap();
+
+        let error = runtime
+            .restore_capability_ledger(ledger.clone())
+            .expect_err("raw-path authority must not be restored");
+        assert!(format!("{error:#}").contains("legacy raw-path process capability grant"));
+        assert!(runtime
+            .capability_ledger()
+            .unwrap()
+            .grants
+            .grants
+            .is_empty());
+
+        let mut restored = ProgramRuntime::new();
+        let error = restored
+            .restore_authority_state(ProgramRuntimeAuthorityState {
+                format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
+                session_id: uuid::Uuid::new_v4(),
+                project_id: "legacy-project".into(),
+                policy,
+                ledger,
+            })
+            .expect_err("raw-path authority state must require explicit reapproval");
+        assert!(format!("{error:#}").contains("stable v2 identity"));
+        assert!(restored
+            .capability_ledger()
+            .unwrap()
+            .grants
+            .grants
+            .is_empty());
     }
 
     #[test]
@@ -10083,7 +10963,12 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             runtime.capability_availability(&workspace_read),
             crate::vm::CapabilityAvailability::Available
         );
-        assert!(runtime.capability_ledger().unwrap().grants.grants.is_empty());
+        assert!(runtime
+            .capability_ledger()
+            .unwrap()
+            .grants
+            .grants
+            .is_empty());
 
         let root = tempfile::tempdir().unwrap();
         let host_read = crate::vm::CapabilityRequirement::file(
@@ -10172,7 +11057,12 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         assert_eq!(outcome.status, ExecutionStatus::Completed);
         assert_eq!(outcome.vm_side_effects.len(), 1);
         assert_eq!(
-            outcome.vm_side_effects[0].origin.span.as_ref().unwrap().source_id,
+            outcome.vm_side_effects[0]
+                .origin
+                .span
+                .as_ref()
+                .unwrap()
+                .source_id,
             "scripts/demo.lisp"
         );
     }
@@ -10233,7 +11123,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         let state = runtime.inspect().await.unwrap();
         assert_eq!(state.revision, 1);
         assert_eq!(
-            state.typed_stack.iter().map(|cell| &cell.value).collect::<Vec<_>>(),
+            state
+                .typed_stack
+                .iter()
+                .map(|cell| &cell.value)
+                .collect::<Vec<_>>(),
             vec![&TypedValue::Int(2)]
         );
     }
@@ -10340,7 +11234,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .await
             .unwrap();
         assert_eq!(read.status, ExecutionStatus::Completed);
-        assert_eq!(read.values, vec![ProgramValue::Bytes(b"project-data".to_vec())]);
+        assert_eq!(
+            read.values,
+            vec![ProgramValue::Bytes(b"project-data".to_vec())]
+        );
 
         let write = runtime
             .submit_typed_only(submission(
