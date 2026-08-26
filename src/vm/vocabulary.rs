@@ -1,7 +1,7 @@
 use super::effects::{
     CapabilityKind, CapabilityRequirement, EffectSet, FileSelector, FileSelectorTemplate,
-    FileSelectorTemplatePart, McpSelectorTemplate, NetworkSelectorTemplate, ProcessSelectorTemplate,
-    ProgramSelectorTemplate, ResourceRoot, ResourceSelector,
+    FileSelectorTemplatePart, McpSelectorTemplate, NetworkSelectorTemplate,
+    ProcessSelectorTemplate, ProgramSelectorTemplate, ResourceRoot, ResourceSelector,
 };
 use super::signature::{ControlEffect, StackRow, StackSignature, SuspensionSignature};
 use super::types::Type;
@@ -143,7 +143,7 @@ fn core_word_documentation_template(name: &str) -> CoreWordDocumentation {
         "file-write" | "host-file-write" | "project-file-write" | "task-output-file-write" => CoreWordDocumentation { summary: "Write bytes to an authorized refined path. This is an external mutation and requires an explicit write capability grant.", lisp: "(file-write path bytes)", forth: "path bytes file-write", example: "(file-write (path \"generated.txt\") (bytes \"hello\\n\"))" },
         "host-file-read" => CoreWordDocumentation { summary: "Read all bytes from an authorized host-machine path. It requires both an installed host root and a matching read grant.", lisp: "(host-file-read path)", forth: "path host-file-read", example: "(host-file-read (host-path \"/tmp/report.txt\"))" },
         "project-file-read" | "task-output-file-read" => CoreWordDocumentation { summary: "Read bytes beneath the matching application-installed resource root after an exact file-read grant.", lisp: "(project-file-read (project-path \"README.md\"))", forth: "s\"README.md\" project-path project-file-read", example: "(project-file-read (project-path \"README.md\"))" },
-        "process-run" => CoreWordDocumentation { summary: "Run an approved executable directly by its canonical absolute path and content identity with a list of string arguments. PATH and relative lookup, symlinks, and Windows batch launchers are rejected. Use proposal-open for editable scripts.", lisp: "(process-run command arguments)", forth: "command arguments process-run", example: "(process-run \"/usr/bin/git\" (list \"status\" \"--short\"))" },
+        "process-run" => CoreWordDocumentation { summary: "Run an approved executable from the exact opened object bound to its canonical path, inode, and content identity, with a list of string arguments and no shell. PATH and relative lookup and symlinks are rejected. Platforms without stable opened-object execution report this capability as unsupported. Use proposal-open for editable scripts.", lisp: "(process-run command arguments)", forth: "command arguments process-run", example: "(process-run \"/usr/bin/git\" (list \"status\" \"--short\"))" },
         "mcp-call" => CoreWordDocumentation { summary: "Call one tool on one connected MCP server through the managed JSON boundary. Server and tool names are capability parameters; MCP descriptions remain untrusted data.", lisp: "(mcp-call server tool arguments-json)", forth: "server tool arguments-json mcp-call", example: "(mcp-call \"github\" \"issue_get\" (result-unwrap (json-parse \"{\\\"owner\\\":\\\"darwin-finch\\\",\\\"repo\\\":\\\"finch\\\",\\\"issue_number\\\":42}\")))" },
         "proposal-open" => CoreWordDocumentation { summary: "Ask the host to open a human-editable artifact proposal. Approval may execute the edited artifact through its normal validator, return edited text for chat, or cancel; this word does not run a shell itself.", lisp: "(proposal-open language title source)", forth: "language title source proposal-open", example: "(proposal-open \"python\" \"Report\" \"print('hello')\\n\")" },
         "mem-recall" | "mem-store" => CoreWordDocumentation { summary: "Read matching session memory entries or store one text memory entry. Both use the host memory tree and require their respective memory capability.", lisp: "(mem-recall query), (mem-store text)", forth: "query mem-recall; text mem-store", example: "(mem-store \"tested release candidate\")" },
@@ -443,10 +443,7 @@ fn core_signatures() -> Vocabulary {
         ),
         (
             "json-keys".into(),
-            pure(
-                vec![Type::Json],
-                vec![Type::list(Type::String)],
-            ),
+            pure(vec![Type::Json], vec![Type::list(Type::String)]),
         ),
         (
             "json-as-map".into(),
@@ -460,31 +457,19 @@ fn core_signatures() -> Vocabulary {
         ),
         (
             "json-as-string".into(),
-            pure(
-                vec![Type::Json],
-                vec![Type::Option(Box::new(Type::String))],
-            ),
+            pure(vec![Type::Json], vec![Type::Option(Box::new(Type::String))]),
         ),
         (
             "json-as-int".into(),
-            pure(
-                vec![Type::Json],
-                vec![Type::Option(Box::new(Type::Int))],
-            ),
+            pure(vec![Type::Json], vec![Type::Option(Box::new(Type::Int))]),
         ),
         (
             "json-as-float".into(),
-            pure(
-                vec![Type::Json],
-                vec![Type::Option(Box::new(Type::Float))],
-            ),
+            pure(vec![Type::Json], vec![Type::Option(Box::new(Type::Float))]),
         ),
         (
             "json-as-bool".into(),
-            pure(
-                vec![Type::Json],
-                vec![Type::Option(Box::new(Type::Bool))],
-            ),
+            pure(vec![Type::Json], vec![Type::Option(Box::new(Type::Bool))]),
         ),
         // The single typed suspension primitive. A unit payload is a plain
         // cooperative timeslice; other payload types are available to a
@@ -1059,10 +1044,7 @@ fn core_signatures() -> Vocabulary {
             "map-get".into(),
             pure(
                 vec![
-                    Type::Map(
-                        Box::new(Type::Variable("K".into())),
-                        Box::new(a.clone()),
-                    ),
+                    Type::Map(Box::new(Type::Variable("K".into())), Box::new(a.clone())),
                     Type::Variable("K".into()),
                 ],
                 vec![Type::Option(Box::new(a.clone()))],
@@ -1072,10 +1054,7 @@ fn core_signatures() -> Vocabulary {
             "map-set".into(),
             pure(
                 vec![
-                    Type::Map(
-                        Box::new(Type::Variable("K".into())),
-                        Box::new(a.clone()),
-                    ),
+                    Type::Map(Box::new(Type::Variable("K".into())), Box::new(a.clone())),
                     Type::Variable("K".into()),
                     a.clone(),
                 ],
@@ -1472,75 +1451,113 @@ static CORE_WORD_REGISTRY: Lazy<BTreeMap<String, CoreWordSpec>> = Lazy::new(|| {
                 // These forms are first-class IR instructions so that their
                 // suspension/output semantics cannot be reimplemented by a
                 // generic host-call path.
-                "yield"
-                | "defer"
-                | "defer-cpu"
-                | "fiber-next"
-                | "fiber-join"
-                | "fiber-cancel"
-                | "task-poll"
-                | "task-join"
-                | "task-cancel"
-                | "output-open"
-                | "output-append"
-                | "output-replace"
-                | "output-status"
-                | "output-progress"
-                | "output-complete"
+                "yield" | "defer" | "defer-cpu" | "fiber-next" | "fiber-join" | "fiber-cancel"
+                | "task-poll" | "task-join" | "task-cancel" | "output-open" | "output-append"
+                | "output-replace" | "output-status" | "output-progress" | "output-complete"
                 | "output-fail" => CoreWordImplementation::VmInstruction,
                 _ if signature.effects.is_pure() => CoreWordImplementation::Interpreter,
                 "say" | "emit" => CoreWordImplementation::HostEffect(CoreHostBinding::SessionEmit),
-                "vm-vocabulary" => CoreWordImplementation::HostEffect(CoreHostBinding::VmVocabulary),
-                "capability-list" => CoreWordImplementation::HostEffect(CoreHostBinding::CapabilityList),
-                "file-read" | "host-file-read" | "project-file-read" | "task-output-file-read" => CoreWordImplementation::HostEffect(CoreHostBinding::FileRead),
+                "vm-vocabulary" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::VmVocabulary)
+                }
+                "capability-list" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::CapabilityList)
+                }
+                "file-read" | "host-file-read" | "project-file-read" | "task-output-file-read" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::FileRead)
+                }
                 "file-hash" => CoreWordImplementation::HostEffect(CoreHostBinding::FileHash),
                 "tree-list" => CoreWordImplementation::HostEffect(CoreHostBinding::TreeList),
                 "tree-merkle" => CoreWordImplementation::HostEffect(CoreHostBinding::TreeMerkle),
                 "file-size" => CoreWordImplementation::HostEffect(CoreHostBinding::FileSize),
                 "file-slice" => CoreWordImplementation::HostEffect(CoreHostBinding::FileSlice),
-                "file-lines-open" => CoreWordImplementation::HostEffect(CoreHostBinding::FileLinesOpen),
-                "file-lines-next" => CoreWordImplementation::HostEffect(CoreHostBinding::FileLinesNext),
-                "file-lines-close" => CoreWordImplementation::HostEffect(CoreHostBinding::FileLinesClose),
+                "file-lines-open" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::FileLinesOpen)
+                }
+                "file-lines-next" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::FileLinesNext)
+                }
+                "file-lines-close" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::FileLinesClose)
+                }
                 "csv-open" => CoreWordImplementation::HostEffect(CoreHostBinding::CsvOpen),
                 "csv-summary" => CoreWordImplementation::HostEffect(CoreHostBinding::CsvSummary),
                 "csv-next" => CoreWordImplementation::HostEffect(CoreHostBinding::CsvNext),
                 "csv-close" => CoreWordImplementation::HostEffect(CoreHostBinding::CsvClose),
-                "workbook-open" => CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookOpen),
-                "workbook-sheet-open" => CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookSheetOpen),
-                "workbook-sheets" => CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookSheets),
-                "workbook-range" => CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookRange),
-                "workbook-summary" => CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookSummary),
+                "workbook-open" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookOpen)
+                }
+                "workbook-sheet-open" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookSheetOpen)
+                }
+                "workbook-sheets" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookSheets)
+                }
+                "workbook-range" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookRange)
+                }
+                "workbook-summary" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::WorkbookSummary)
+                }
                 "stream-next" => CoreWordImplementation::HostEffect(CoreHostBinding::StreamNext),
                 "stream-close" => CoreWordImplementation::HostEffect(CoreHostBinding::StreamClose),
-                "file-write" | "host-file-write" | "project-file-write" | "task-output-file-write" => CoreWordImplementation::HostEffect(CoreHostBinding::FileWrite),
+                "file-write"
+                | "host-file-write"
+                | "project-file-write"
+                | "task-output-file-write" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::FileWrite)
+                }
                 "process-run" => CoreWordImplementation::HostEffect(CoreHostBinding::ProcessRun),
                 "mcp-call" => CoreWordImplementation::HostEffect(CoreHostBinding::McpCall),
-                "proposal-open" => CoreWordImplementation::HostEffect(CoreHostBinding::ProposalOpen),
-                "network-connect" => CoreWordImplementation::HostEffect(CoreHostBinding::NetworkConnect),
+                "proposal-open" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::ProposalOpen)
+                }
+                "network-connect" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::NetworkConnect)
+                }
                 "network-send" => CoreWordImplementation::HostEffect(CoreHostBinding::NetworkSend),
                 "mem-recall" => CoreWordImplementation::HostEffect(CoreHostBinding::MemoryRecall),
                 "mem-store" => CoreWordImplementation::HostEffect(CoreHostBinding::MemoryStore),
-                "schedule-create" => CoreWordImplementation::HostEffect(CoreHostBinding::ScheduleCreate),
+                "schedule-create" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::ScheduleCreate)
+                }
                 "schedule-get" => CoreWordImplementation::HostEffect(CoreHostBinding::ScheduleGet),
-                "schedule-cancel" => CoreWordImplementation::HostEffect(CoreHostBinding::ScheduleCancel),
+                "schedule-cancel" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::ScheduleCancel)
+                }
                 "agent-spawn" => CoreWordImplementation::HostEffect(CoreHostBinding::AgentSpawn),
-                "agent-spawn-with" => CoreWordImplementation::HostEffect(CoreHostBinding::AgentSpawnWith),
+                "agent-spawn-with" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::AgentSpawnWith)
+                }
                 "agent-await" => CoreWordImplementation::HostEffect(CoreHostBinding::AgentAwait),
                 "agent-poll" => CoreWordImplementation::HostEffect(CoreHostBinding::AgentPoll),
                 "agent-cancel" => CoreWordImplementation::HostEffect(CoreHostBinding::AgentCancel),
-                "automation-availability" => CoreWordImplementation::HostEffect(CoreHostBinding::AutomationAvailability),
-                "automation-displays" => CoreWordImplementation::HostEffect(CoreHostBinding::AutomationDisplays),
-                "automation-windows" => CoreWordImplementation::HostEffect(CoreHostBinding::AutomationWindows),
-                "automation-click" => CoreWordImplementation::HostEffect(CoreHostBinding::AutomationClick),
-                "automation-type" => CoreWordImplementation::HostEffect(CoreHostBinding::AutomationType),
+                "automation-availability" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::AutomationAvailability)
+                }
+                "automation-displays" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::AutomationDisplays)
+                }
+                "automation-windows" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::AutomationWindows)
+                }
+                "automation-click" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::AutomationClick)
+                }
+                "automation-type" => {
+                    CoreWordImplementation::HostEffect(CoreHostBinding::AutomationType)
+                }
                 _ => unreachable!("every effectful core word needs a host binding: {name}"),
             };
             let documentation = core_word_documentation_template(&name);
-            (name, CoreWordSpec {
-                signature,
-                documentation,
-                implementation,
-            })
+            (
+                name,
+                CoreWordSpec {
+                    signature,
+                    documentation,
+                    implementation,
+                },
+            )
         })
         .collect()
 });
