@@ -178,16 +178,18 @@ fn load_config() -> Result<Config> {
 - **Every bug fix must have a regression test** that fails before and passes after. No exceptions.
 - **Reproduce the reported failure at the production boundary** — a helper-only unit test is
   insufficient when the bug crossed the TUI, provider, persistence, authority, runner, IPC, or
-  process-lifecycle boundary. Add a deterministic integration test that exercises the real path.
+  process-lifecycle boundary. Add a deterministic production-boundary test that exercises the real
+  path; cross-crate or executable-level cases belong in the integration-test tree.
 - **Test the hostile timing and restart cases** for concurrent or durable behavior: cancellation,
   disconnect, timeout, late completion, replacement connection, retry, restart, and replay as
   applicable. Assert exact-once terminal state and absence of post-terminal effects.
 - **A green unrelated suite is not regression evidence** — name the test that reproduces the bug
   in the commit message and GitHub verification comment, and record why it failed before the fix.
-- **If automation is genuinely impossible**, document the precise manual verification evidence and
-  open a linked follow-up issue before merge. Never silently omit regression coverage.
+- **Manual verification does not replace regression coverage** — document any manual evidence, but
+  keep the issue and branch unmerged until the failure has a deterministic automated regression.
 - **Every agreed-upon behavior must be covered** — if it's worth discussing, it's worth testing.
-- **Tests live in the same file** as the code they test (`#[cfg(test)] mod tests { ... }`).
+- **Unit tests live in the same file** as the code they test (`#[cfg(test)] mod tests { ... }`);
+  production-boundary and executable-level regressions may live under `tests/` with shared fixtures.
 - **Naming:** `test_<thing>_<behavior>` e.g. `test_peer_cannot_restart`
 - **Mocks for trait contracts** — use `#[ignore]` for tests requiring real model downloads
 - **Stubs must have tests** confirming they return errors (not panic)
