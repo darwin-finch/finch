@@ -11,6 +11,8 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::thread;
+use std::time::Duration as StdDuration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
@@ -27,6 +29,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TURN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+const SCHEMA_GENERATION_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const ADAPTER_INSTRUCTIONS: &str = "You are serving as Finch's model adapter. Do not modify files, run commands, browse, or invoke built-in Codex tools. Answer only from the supplied conversation. When Finch dynamic tools are supplied, invoke only those dynamic tools. Finch/Brain is the durable conversation authority; this Codex thread is ephemeral.";
 
 #[derive(Debug, Clone)]
@@ -36,6 +39,7 @@ struct AppServerCommand {
     rpc_timeout: Duration,
     login_timeout: Duration,
     turn_timeout: Duration,
+    schema_timeout: StdDuration,
 }
 
 impl AppServerCommand {
@@ -72,6 +76,7 @@ impl AppServerCommand {
             rpc_timeout: RPC_TIMEOUT,
             login_timeout: LOGIN_TIMEOUT,
             turn_timeout: TURN_TIMEOUT,
+            schema_timeout: SCHEMA_GENERATION_TIMEOUT,
         }
     }
 
@@ -83,6 +88,7 @@ impl AppServerCommand {
             rpc_timeout: RPC_TIMEOUT,
             login_timeout: LOGIN_TIMEOUT,
             turn_timeout: TURN_TIMEOUT,
+            schema_timeout: SCHEMA_GENERATION_TIMEOUT,
         }
     }
 
@@ -91,6 +97,7 @@ impl AppServerCommand {
         self.rpc_timeout = timeout;
         self.login_timeout = timeout;
         self.turn_timeout = timeout;
+        self.schema_timeout = timeout;
         self
     }
 
@@ -101,14 +108,29 @@ impl AppServerCommand {
         let Ok(directory) = tempfile::tempdir() else {
             return ProtocolCapabilities::default();
         };
-        let status = std::process::Command::new(&self.program)
-            .args(["app-server", "generate-json-schema", "--out"])
-            .arg(directory.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if !matches!(status, Ok(status) if status.success()) {
+        let mut process = std::process::Command::new(&self.program);
+        process.args(&self.args);
+        process.args(["generate-json-schema", "--out"]);
+        process.arg(directory.path());
+        harden_std_process(&mut process);
+        let Ok(mut child) = process.spawn() else {
+            return ProtocolCapabilities::default();
+        };
+        let deadline = std::time::Instant::now() + self.schema_timeout;
+        let generated = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    thread::sleep(StdDuration::from_millis(10));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break false;
+                }
+            }
+        };
+        if !generated {
             return ProtocolCapabilities::default();
         }
         let thread_schema = directory.path().join("v2").join("ThreadStartParams.json");
@@ -118,20 +140,112 @@ impl AppServerCommand {
             .and_then(|value| value.pointer("/properties/dynamicTools").cloned())
             .is_some();
         let turn_schema = directory.path().join("v2").join("TurnStartParams.json");
-        let restricted_read_only =
-            std::fs::read_to_string(turn_schema)
-                .ok()
-                .is_some_and(|schema| {
-                    schema.contains("\"sandboxPolicy\"")
-                        && schema.contains("\"readableRoots\"")
-                        && schema.contains("\"includePlatformDefaults\"")
-                        && schema.contains("\"restricted\"")
-                });
+        let restricted_read_only = std::fs::read(&turn_schema)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|schema| schema_supports_restricted_read_only(&schema));
         ProtocolCapabilities {
             dynamic_tools,
             restricted_read_only,
         }
     }
+}
+
+fn inherited_process_environment() -> impl Iterator<Item = (&'static str, std::ffi::OsString)> {
+    ["HOME", "CODEX_HOME", "PATH", "TMPDIR", "USER", "LOGNAME"]
+        .into_iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
+}
+
+fn harden_std_process(process: &mut std::process::Command) {
+    process
+        .env_clear()
+        .envs(inherited_process_environment())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+}
+
+fn resolve_schema<'a>(root: &'a Value, schema: &'a Value) -> Option<&'a Value> {
+    match schema.get("$ref").and_then(Value::as_str) {
+        Some(reference) if reference.starts_with("#/") => root.pointer(&reference[1..]),
+        Some(_) => None,
+        None => Some(schema),
+    }
+}
+
+fn variants<'a>(root: &'a Value, schema: &'a Value) -> Vec<&'a Value> {
+    fn collect<'a>(root: &'a Value, schema: &'a Value, depth: usize, out: &mut Vec<&'a Value>) {
+        if depth > 8 {
+            return;
+        }
+        let Some(schema) = resolve_schema(root, schema) else {
+            return;
+        };
+        if let Some(items) = schema
+            .get("oneOf")
+            .or_else(|| schema.get("anyOf"))
+            .and_then(Value::as_array)
+        {
+            for item in items {
+                collect(root, item, depth + 1, out);
+            }
+        } else {
+            out.push(schema);
+        }
+    }
+
+    let mut out = Vec::new();
+    collect(root, schema, 0, &mut out);
+    out
+}
+
+fn has_string_tag(schema: &Value, tag: &str) -> bool {
+    schema
+        .pointer("/properties/type/const")
+        .and_then(Value::as_str)
+        == Some(tag)
+        || schema
+            .pointer("/properties/type/enum")
+            .and_then(Value::as_array)
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(tag)))
+}
+
+fn schema_supports_restricted_read_only(root: &Value) -> bool {
+    let Some(policy) = root.pointer("/properties/sandboxPolicy") else {
+        return false;
+    };
+    variants(root, policy).into_iter().any(|read_only| {
+        if !has_string_tag(read_only, "readOnly") {
+            return false;
+        }
+        let Some(network) = read_only.pointer("/properties/networkAccess") else {
+            return false;
+        };
+        if resolve_schema(root, network).and_then(|value| value.get("type"))
+            != Some(&Value::String("boolean".into()))
+        {
+            return false;
+        }
+        let Some(access) = read_only.pointer("/properties/access") else {
+            return false;
+        };
+        variants(root, access).into_iter().any(|restricted| {
+            has_string_tag(restricted, "restricted")
+                && restricted
+                    .pointer("/properties/readableRoots/type")
+                    .and_then(Value::as_str)
+                    == Some("array")
+                && restricted
+                    .pointer("/properties/readableRoots/items/type")
+                    .and_then(Value::as_str)
+                    == Some("string")
+                && restricted
+                    .pointer("/properties/includePlatformDefaults/type")
+                    .and_then(Value::as_str)
+                    == Some("boolean")
+        })
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -161,12 +275,9 @@ impl RpcClient {
     async fn spawn(command: &AppServerCommand) -> Result<Self> {
         let mut process = Command::new(&command.program);
         process.args(&command.args);
-        let inherited = ["HOME", "CODEX_HOME", "PATH", "TMPDIR", "USER", "LOGNAME"];
         process.env_clear();
-        for name in inherited {
-            if let Some(value) = std::env::var_os(name) {
-                process.env(name, value);
-            }
+        for (name, value) in inherited_process_environment() {
+            process.env(name, value);
         }
         let mut child = process
             .stdin(Stdio::piped())
@@ -978,6 +1089,101 @@ for line in sys.stdin:
         assert!(error.to_string().contains("restricted read-only boundary"));
     }
 
+    #[test]
+    fn resolves_restricted_read_only_schema_variant_structurally() {
+        let schema = json!({
+            "properties": {"sandboxPolicy": {"anyOf": [
+                {"$ref": "#/definitions/SandboxPolicy"}, {"type": "null"}
+            ]}},
+            "definitions": {
+                "SandboxPolicy": {"oneOf": [
+                    {"properties": {"type": {"enum": ["dangerFullAccess"]}}},
+                    {"$ref": "#/definitions/ReadOnlySandboxPolicy"}
+                ]},
+                "ReadOnlySandboxPolicy": {"properties": {
+                    "type": {"enum": ["readOnly"]},
+                    "networkAccess": {"type": "boolean"},
+                    "access": {"$ref": "#/definitions/ReadOnlyAccess"}
+                }},
+                "ReadOnlyAccess": {"oneOf": [
+                    {"properties": {"type": {"enum": ["full"]}}},
+                    {"properties": {
+                        "type": {"enum": ["restricted"]},
+                        "readableRoots": {"type": "array", "items": {"type": "string"}},
+                        "includePlatformDefaults": {"type": "boolean"}
+                    }}
+                ]}
+            }
+        });
+        assert!(schema_supports_restricted_read_only(&schema));
+
+        let mut unsupported = schema;
+        unsupported
+            .pointer_mut("/definitions/ReadOnlySandboxPolicy/properties")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .remove("access");
+        assert!(!schema_supports_restricted_read_only(&unsupported));
+    }
+
+    #[test]
+    fn installed_production_schema_fails_closed_without_readable_roots() {
+        let version = std::process::Command::new("codex")
+            .arg("--version")
+            .stderr(Stdio::null())
+            .output();
+        if version.is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("codex-cli 0.149.1")
+        }) {
+            let capabilities = AppServerCommand::production().detect_protocol_capabilities();
+            assert!(
+                !capabilities.restricted_read_only,
+                "update this regression when the installed production schema gains restricted readable roots"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_schema_generator_is_isolated_bounded_and_killed() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("codex");
+        let python = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        let python = String::from_utf8(python.stdout).unwrap();
+        std::os::unix::fs::symlink(python.trim(), &program).unwrap();
+        let script = directory.path().join("generator.py");
+        let pid_file = directory.path().join("pid");
+        std::fs::write(
+            &script,
+            "import os, sys, time\nassert 'CARGO_HOME' not in os.environ\nopen(sys.argv[1], 'w').write(str(os.getpid()))\nwhile True: time.sleep(1)\n",
+        )
+        .unwrap();
+        let command = AppServerCommand::test(
+            program,
+            vec![
+                script.to_string_lossy().into_owned(),
+                pid_file.to_string_lossy().into_owned(),
+            ],
+        )
+        .with_test_timeouts(Duration::from_millis(250));
+        let started = std::time::Instant::now();
+        let capabilities = command.detect_protocol_capabilities();
+        assert!(!capabilities.restricted_read_only);
+        assert!(started.elapsed() < StdDuration::from_secs(2));
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(!alive, "hung schema generator was not reaped");
+    }
+
     #[tokio::test]
     async fn tool_request_fails_before_spawning_when_capability_is_absent() {
         let provider = CodexAppServerProvider::with_command(
@@ -1066,14 +1272,14 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn rpc_and_turn_waits_are_bounded() {
-        let (_directory, _pid, command) = hanging_app_server(true, Duration::from_millis(50));
+        let (_directory, _pid, command) = hanging_app_server(true, Duration::from_millis(250));
         let error = match RpcClient::spawn(&command).await {
             Ok(_) => panic!("initialize unexpectedly completed"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("timed out during initialize"));
 
-        let (_directory, _pid, command) = hanging_app_server(false, Duration::from_millis(50));
+        let (_directory, _pid, command) = hanging_app_server(false, Duration::from_millis(250));
         let provider = CodexAppServerProvider::with_command(command, "test-model", false);
         let mut receiver = provider
             .send_message_stream(&ProviderRequest::new(vec![]))
@@ -1082,7 +1288,7 @@ for line in sys.stdin:
         let error = receiver.recv().await.unwrap().unwrap_err();
         assert_eq!(error.to_string(), "Codex app-server turn timed out");
 
-        let (_directory, _pid, command) = hanging_app_server(false, Duration::from_millis(50));
+        let (_directory, _pid, command) = hanging_app_server(false, Duration::from_millis(250));
         let client = RpcClient::spawn(&command).await.unwrap();
         let auth = CodexAppServerAuth::with_command(command);
         let login = ChatGptDeviceLogin {
