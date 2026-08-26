@@ -944,6 +944,12 @@ async fn main() -> Result<()> {
                         // Patch any empty API keys in the providers list with
                         // auto-detected values from environment variables.
                         let mut providers = result.providers;
+                        let needs_chatgpt_login = providers.iter().any(|provider| {
+                            matches!(
+                                provider,
+                                finch::config::ProviderEntry::ChatgptSubscription { .. }
+                            )
+                        });
                         let auto = build_teachers_from_env();
                         for p in &mut providers {
                             if let Some(key) = p.api_key() {
@@ -1015,6 +1021,9 @@ async fn main() -> Result<()> {
                             new_config.streaming_enabled = new_config.features.streaming_enabled;
                         }
                         new_config.save()?;
+                        if needs_chatgpt_login {
+                            ensure_chatgpt_setup_login().await?;
+                        }
                         use crossterm::style::Stylize as _;
                         eprintln!("\n{}\n", "✓ Configuration saved!".green().bold());
                         new_config
@@ -2603,11 +2612,33 @@ async fn run_setup() -> Result<()> {
     // Run the wizard
     let result = show_setup_wizard()?;
     finch::cli::setup_wizard::apply_and_save(&result)?;
+    if result.providers.iter().any(|provider| {
+        matches!(
+            provider,
+            finch::config::ProviderEntry::ChatgptSubscription { .. }
+        )
+    }) {
+        ensure_chatgpt_setup_login().await?;
+    }
 
     println!("\n✓ Configuration saved to ~/.finch/config.toml");
     println!("  You can now run: finch");
     println!("  Or start the daemon: finch daemon\n");
 
+    Ok(())
+}
+
+async fn ensure_chatgpt_setup_login() -> Result<()> {
+    use finch::providers::CodexAppServerAuth;
+    let auth = CodexAppServerAuth::new()?;
+    if auth.status(false).await?.signed_in {
+        return Ok(());
+    }
+    let login = auth.begin_device_login().await?;
+    println!("Open: {}", login.details.verification_url);
+    println!("Enter code: {}", login.details.user_code);
+    auth.finish_device_login(login).await?;
+    println!("ChatGPT subscription sign-in complete.");
     Ok(())
 }
 

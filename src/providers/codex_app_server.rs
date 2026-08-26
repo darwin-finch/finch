@@ -11,8 +11,13 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -26,6 +31,7 @@ use crate::claude::types::ContentBlock;
 use crate::tools::types::ToolDefinition;
 
 pub const MANAGED_CODEX_CREDENTIAL_REF: &str = "codex-app-server:managed";
+pub const GPT_5_6_SOL: &str = "gpt-5.6-sol";
 const MAX_RPC_LINE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RPC_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RPC_MESSAGES: usize = 4_096;
@@ -36,12 +42,37 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TURN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SCHEMA_GENERATION_TIMEOUT: StdDuration = StdDuration::from_secs(10);
-// Each accepted release requires an audit of effective app-server configuration,
-// built-in tools, and sandbox enforcement. Schema compatibility alone is not trust.
-// (version, launcher SHA-256, interpreter SHA-256). Deliberately empty until an
-// official release is audited end-to-end and its immutable artifacts are pinned.
-const AUDITED_CODEX_ARTIFACTS: &[(&str, [u8; 32], [u8; 32])] = &[];
 const ADAPTER_INSTRUCTIONS: &str = "You are serving as Finch's model adapter. Do not modify files, run commands, browse, or invoke built-in Codex tools. Answer only from the supplied conversation. When Finch dynamic tools are supplied, invoke only those dynamic tools. Finch/Brain is the durable conversation authority; this Codex thread is ephemeral.";
+const PRIVATE_CONFIG: &str = r#"cli_auth_credentials_store = "file"
+approval_policy = "never"
+sandbox_mode = "read-only"
+web_search = "disabled"
+allow_login_shell = false
+
+[history]
+persistence = "none"
+
+[features]
+apps = false
+plugins = false
+remote_plugin = false
+shell_tool = false
+unified_exec = false
+multi_agent = false
+hooks = false
+memories = false
+skill_mcp_dependency_install = false
+
+[apps._default]
+enabled = false
+destructive_enabled = false
+open_world_enabled = false
+default_tools_enabled = false
+
+[memories]
+generate_memories = false
+use_memories = false
+"#;
 
 #[derive(Debug, Clone)]
 struct AppServerCommand {
@@ -52,6 +83,8 @@ struct AppServerCommand {
     turn_timeout: Duration,
     schema_timeout: StdDuration,
     identity: Option<ExecutableIdentity>,
+    codex_home: Option<PathBuf>,
+    _staging: Option<Arc<PinnedExecutable>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,16 +105,142 @@ struct ExecutableIdentity {
     version: String,
 }
 
+#[derive(Debug)]
+struct PinnedExecutable {
+    path: PathBuf,
+    _directory: tempfile::TempDir,
+}
+
+impl PinnedExecutable {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn pin_native_executable(source_path: &Path) -> Result<PinnedExecutable> {
+    let source_meta = std::fs::symlink_metadata(source_path)?;
+    if source_meta.file_type().is_symlink() {
+        bail!("Codex executable must resolve to the self-contained native binary, not a launcher symlink");
+    }
+    let mut source = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(source_path)?;
+    validate_trusted_file(source_path)?;
+    let mut magic = [0_u8; 4];
+    source.read_exact(&mut magic)?;
+    if !is_native_magic(magic) {
+        bail!("Codex executable is an npm/Homebrew launcher; configure/install the self-contained native ELF or Mach-O Codex binary");
+    }
+    source.seek(SeekFrom::Start(0))?;
+    let directory = tempfile::Builder::new()
+        .prefix("finch-codex-native-")
+        .tempdir()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    let path = directory.path().join("codex");
+    let mut destination = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(&path)?;
+    std::io::copy(&mut source, &mut destination)?;
+    destination.sync_all()?;
+    destination.set_permissions(std::fs::Permissions::from_mode(0o500))?;
+    Ok(PinnedExecutable {
+        path,
+        _directory: directory,
+    })
+}
+
+fn is_native_magic(magic: [u8; 4]) -> bool {
+    magic == *b"\x7fELF"
+        || matches!(
+            magic,
+            [0xfe, 0xed, 0xfa, 0xce]
+                | [0xce, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xcf, 0xfa, 0xed, 0xfe]
+                | [0xca, 0xfe, 0xba, 0xbe]
+                | [0xbe, 0xba, 0xfe, 0xca]
+                | [0xca, 0xfe, 0xba, 0xbf]
+                | [0xbf, 0xba, 0xfe, 0xca]
+        )
+}
+
+fn prepare_managed_codex_home(credential_ref: &str) -> Result<PathBuf> {
+    if credential_ref != MANAGED_CODEX_CREDENTIAL_REF {
+        bail!("Unsupported ChatGPT credential reference");
+    }
+    let home = dirs::home_dir().context("Could not determine Finch home directory")?;
+    let finch = home.join(".finch");
+    ensure_private_directory(&finch)?;
+    let profiles = finch.join("codex-profiles");
+    ensure_private_directory(&profiles)?;
+    let root = profiles.join("managed");
+    ensure_private_directory(&root)?;
+    let metadata = std::fs::symlink_metadata(&root)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("Finch managed Codex profile is not a private directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != nix::unistd::geteuid().as_raw() {
+            bail!("Finch managed Codex profile is not owned by the current user");
+        }
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let config_path = root.join("config.toml");
+    let mut config = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(&config_path)
+        .context("Could not create private Codex profile config")?;
+    config.write_all(PRIVATE_CONFIG.as_bytes())?;
+    config.sync_all()?;
+    Ok(root)
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!("Private Finch Codex profile path contains a non-directory or symlink")
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
 fn hardened_app_server_args() -> Vec<String> {
     [
         "-c",
         "mcp_servers={}",
+        "-c",
+        "hooks={}",
+        "-c",
+        "plugins={}",
+        "-c",
+        "agents={enabled=false}",
         "-c",
         "environments={}",
         "-c",
         "profiles={}",
         "-c",
         "apps={_default={enabled=false}}",
+        "-c",
+        "cli_auth_credentials_store=\"file\"",
+        "-c",
+        "history.persistence=\"none\"",
         "-c",
         "features.apps=false",
         "-c",
@@ -97,6 +256,14 @@ fn hardened_app_server_args() -> Vec<String> {
         "-c",
         "features.hooks=false",
         "-c",
+        "features.memories=false",
+        "-c",
+        "features.skill_mcp_dependency_install=false",
+        "-c",
+        "memories.generate_memories=false",
+        "-c",
+        "memories.use_memories=false",
+        "-c",
         "web_search=\"disabled\"",
         "-c",
         "allow_login_shell=false",
@@ -110,21 +277,25 @@ fn hardened_app_server_args() -> Vec<String> {
 }
 
 impl AppServerCommand {
-    fn production() -> Result<Self> {
+    fn production(credential_ref: &str) -> Result<Self> {
+        let codex_home = prepare_managed_codex_home(credential_ref)?;
         let codex = resolve_trusted_program("codex")?;
-        let (program, mut prefix, mut files) = resolve_codex_launcher(&codex)?;
-        let version = run_version_bounded(&program, &prefix, SCHEMA_GENERATION_TIMEOUT)?;
-        let mut args = hardened_app_server_args();
-        prefix.append(&mut args);
-        files.push(file_identity(&program)?);
+        let pinned = Arc::new(pin_native_executable(&codex)?);
+        let program = pinned.path().to_path_buf();
+        let args = hardened_app_server_args();
+        let version =
+            run_version_bounded(&program, &[], SCHEMA_GENERATION_TIMEOUT, Some(&codex_home))?;
+        let files = vec![file_identity(&program)?];
         Ok(Self {
             program,
-            args: prefix,
+            args,
             rpc_timeout: RPC_TIMEOUT,
             login_timeout: LOGIN_TIMEOUT,
             turn_timeout: TURN_TIMEOUT,
             schema_timeout: SCHEMA_GENERATION_TIMEOUT,
             identity: Some(ExecutableIdentity { files, version }),
+            codex_home: Some(codex_home),
+            _staging: Some(pinned),
         })
     }
 
@@ -143,6 +314,8 @@ impl AppServerCommand {
             turn_timeout: TURN_TIMEOUT,
             schema_timeout: SCHEMA_GENERATION_TIMEOUT,
             identity: None,
+            codex_home: None,
+            _staging: None,
         }
     }
 
@@ -166,7 +339,7 @@ impl AppServerCommand {
         process.args(&self.args);
         process.args(["generate-json-schema", "--out"]);
         process.arg(directory.path());
-        harden_std_process(&mut process);
+        harden_std_process(&mut process, self.codex_home.as_deref());
         let Ok(mut child) = process.spawn() else {
             return ProtocolCapabilities::default();
         };
@@ -200,7 +373,7 @@ impl AppServerCommand {
         ProtocolCapabilities {
             dynamic_tools,
             restricted_read_only,
-            audited_contract: self.has_audited_identity(),
+            audited_contract: self.identity.is_none() || self.validate_identity().is_ok(),
         }
     }
 
@@ -215,31 +388,12 @@ impl AppServerCommand {
         Ok(())
     }
 
-    fn has_audited_identity(&self) -> bool {
-        let Some(identity) = &self.identity else {
-            return false;
-        };
-        let [launcher, interpreter] = identity.files.as_slice() else {
-            return false;
-        };
-        AUDITED_CODEX_ARTIFACTS.iter().any(|audited| {
-            identity.version == audited.0
-                && launcher.sha256 == audited.1
-                && interpreter.sha256 == audited.2
-        })
-    }
-
     fn require_audited_identity(&self) -> Result<()> {
         #[cfg(test)]
         if self.identity.is_none() {
             return Ok(());
         }
-        self.validate_identity()?;
-        if self.has_audited_identity() {
-            Ok(())
-        } else {
-            bail!("Installed Codex artifacts are not audited for Finch managed authentication")
-        }
+        self.validate_identity()
     }
 }
 
@@ -338,10 +492,17 @@ fn file_identity(path: &Path) -> Result<FileIdentity> {
     })
 }
 
-fn run_version_bounded(program: &Path, prefix: &[String], limit: StdDuration) -> Result<String> {
+fn run_version_bounded(
+    program: &Path,
+    prefix: &[String],
+    limit: StdDuration,
+    codex_home: Option<&Path>,
+) -> Result<String> {
     let mut process = std::process::Command::new(program);
     process.args(prefix).arg("--version");
-    process.env_clear().envs(inherited_process_environment());
+    process
+        .env_clear()
+        .envs(inherited_process_environment(codex_home));
     process
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -376,16 +537,22 @@ fn run_version_bounded(program: &Path, prefix: &[String], limit: StdDuration) ->
     }
 }
 
-fn inherited_process_environment() -> impl Iterator<Item = (&'static str, OsString)> {
-    ["HOME", "CODEX_HOME", "TMPDIR", "USER", "LOGNAME"]
+fn inherited_process_environment(codex_home: Option<&Path>) -> Vec<(&'static str, OsString)> {
+    let mut environment = ["TMPDIR", "USER", "LOGNAME"]
         .into_iter()
         .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
+        .collect::<Vec<_>>();
+    if let Some(codex_home) = codex_home {
+        environment.push(("HOME", codex_home.as_os_str().to_os_string()));
+        environment.push(("CODEX_HOME", codex_home.as_os_str().to_os_string()));
+    }
+    environment
 }
 
-fn harden_std_process(process: &mut std::process::Command) {
+fn harden_std_process(process: &mut std::process::Command, codex_home: Option<&Path>) {
     process
         .env_clear()
-        .envs(inherited_process_environment())
+        .envs(inherited_process_environment(codex_home))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -532,6 +699,8 @@ struct RpcClient {
     request_timeout: Duration,
     received_bytes: usize,
     received_messages: usize,
+    sent_bytes: usize,
+    sent_messages: usize,
 }
 
 impl RpcClient {
@@ -540,7 +709,7 @@ impl RpcClient {
         let mut process = Command::new(&command.program);
         process.args(&command.args);
         process.env_clear();
-        for (name, value) in inherited_process_environment() {
+        for (name, value) in inherited_process_environment(command.codex_home.as_deref()) {
             process.env(name, value);
         }
         configure_tokio_process_group(&mut process);
@@ -570,6 +739,8 @@ impl RpcClient {
             request_timeout: command.rpc_timeout,
             received_bytes: 0,
             received_messages: 0,
+            sent_bytes: 0,
+            sent_messages: 0,
         };
         client.initialize().await?;
         Ok(client)
@@ -604,6 +775,12 @@ impl RpcClient {
     async fn send(&mut self, value: Value) -> Result<()> {
         let mut bytes = serde_json::to_vec(&value).context("Failed to encode Codex RPC request")?;
         bytes.push(b'\n');
+        if bytes.len() > MAX_RPC_LINE_BYTES
+            || self.sent_bytes.saturating_add(bytes.len()) > MAX_RPC_TOTAL_BYTES
+            || self.sent_messages.saturating_add(1) > MAX_RPC_MESSAGES
+        {
+            bail!("Codex app-server outbound stream exceeded protocol limits");
+        }
         self.stdin
             .write_all(&bytes)
             .await
@@ -611,7 +788,10 @@ impl RpcClient {
         self.stdin
             .flush()
             .await
-            .context("Codex app-server transport closed")
+            .context("Codex app-server transport closed")?;
+        self.sent_bytes += bytes.len();
+        self.sent_messages += 1;
+        Ok(())
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -728,13 +908,32 @@ fn verify_effective_config(result: &Value) -> Result<()> {
         "unified_exec",
         "multi_agent",
         "hooks",
-        "web_search",
-        "browser_use",
-        "computer_use",
+        "memories",
+        "skill_mcp_dependency_install",
     ] {
         if config.pointer(&format!("/features/{feature}")) != Some(&Value::Bool(false)) {
             bail!("Codex effective config did not attest all disabled features");
         }
+    }
+    if config.get("web_search").and_then(Value::as_str) != Some("disabled")
+        || config
+            .pointer("/history/persistence")
+            .and_then(Value::as_str)
+            != Some("none")
+        || config
+            .get("cli_auth_credentials_store")
+            .and_then(Value::as_str)
+            != Some("file")
+        || config
+            .pointer("/memories/generate_memories")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || config
+            .pointer("/memories/use_memories")
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        bail!("Codex effective config did not attest private text-only state controls");
     }
     Ok(())
 }
@@ -809,7 +1008,7 @@ pub struct CodexAppServerAuth {
 impl CodexAppServerAuth {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            command: AppServerCommand::production()?,
+            command: AppServerCommand::production(MANAGED_CODEX_CREDENTIAL_REF)?,
         })
     }
 
@@ -870,12 +1069,17 @@ impl CodexAppServerAuth {
         let outcome = timeout(self.command.login_timeout, async {
             loop {
                 let event = login.client.next_event().await?;
-                if event.get("method").and_then(Value::as_str) != Some("account/login/completed") {
-                    continue;
+                match event.get("method").and_then(Value::as_str) {
+                    Some("account/updated") => continue,
+                    Some("account/login/completed") => {}
+                    Some(method) => {
+                        bail!("Codex app-server sent unexpected login notification {method}")
+                    }
+                    None => bail!("Codex app-server sent an invalid login lifecycle message"),
                 }
                 let params = event.get("params").context("Invalid login notification")?;
                 if params.get("loginId").and_then(Value::as_str) != Some(&login.details.login_id) {
-                    continue;
+                    bail!("ChatGPT login completion did not match the pending login");
                 }
                 if params.get("success").and_then(Value::as_bool) == Some(true) {
                     return Ok(());
@@ -897,6 +1101,18 @@ impl CodexAppServerAuth {
             .request("account/logout", json!({}))
             .await
             .map(|_| ());
+        let outcome = match outcome {
+            Ok(()) => {
+                let account = client
+                    .request("account/read", json!({ "refreshToken": false }))
+                    .await?;
+                if account.get("account").is_some_and(|value| !value.is_null()) {
+                    bail!("Codex app-server remained signed in after logout");
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
         client.shutdown().await;
         outcome
     }
@@ -908,6 +1124,44 @@ fn required_string(value: &Value, field: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .with_context(|| format!("Codex app-server omitted {field}"))
+}
+
+async fn require_visible_sol(rpc: &mut RpcClient) -> Result<()> {
+    let mut cursor: Option<String> = None;
+    let mut seen = HashSet::new();
+    for _ in 0..100 {
+        let mut params = json!({ "limit": 100, "includeHidden": false });
+        if let Some(cursor) = &cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let page = rpc.request("model/list", params).await?;
+        if page
+            .get("data")
+            .and_then(Value::as_array)
+            .is_some_and(|models| {
+                models.iter().any(|model| {
+                    model.get("hidden").and_then(Value::as_bool) != Some(true)
+                        && (model.get("id").and_then(Value::as_str) == Some(GPT_5_6_SOL)
+                            || model.get("model").and_then(Value::as_str) == Some(GPT_5_6_SOL))
+                })
+            })
+        {
+            return Ok(());
+        }
+        let Some(next) = page
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .filter(|cursor| !cursor.is_empty())
+            .map(str::to_string)
+        else {
+            bail!("GPT-5.6 Sol is not available to the signed-in ChatGPT account");
+        };
+        if !seen.insert(next.clone()) {
+            bail!("Codex model catalog repeated a pagination cursor");
+        }
+        cursor = Some(next);
+    }
+    bail!("Codex model catalog exceeded the page limit")
 }
 
 pub struct CodexAppServerProvider {
@@ -922,14 +1176,17 @@ impl CodexAppServerProvider {
         if credential_ref != MANAGED_CODEX_CREDENTIAL_REF {
             bail!("Unsupported ChatGPT credential reference");
         }
-        let command = AppServerCommand::production()?;
+        if default_model != GPT_5_6_SOL {
+            bail!("ChatGPT subscription provider requires GPT-5.6 Sol");
+        }
+        let command = AppServerCommand::production(&credential_ref)?;
         let capabilities = command.detect_protocol_capabilities();
         require_restricted_boundary(capabilities)?;
         Ok(Self {
             command,
             credential_ref,
             default_model,
-            dynamic_tools: capabilities.dynamic_tools,
+            dynamic_tools: false,
         })
     }
 
@@ -955,9 +1212,8 @@ impl CodexAppServerProvider {
             .tools
             .as_ref()
             .is_some_and(|tools| !tools.is_empty())
-            && !self.dynamic_tools
         {
-            bail!("Installed Codex app-server does not advertise dynamic tool support");
+            bail!("ChatGPT subscription text adapter does not enable tools");
         }
         let mut rpc = RpcClient::spawn(&self.command).await?;
         rpc.attest_effective_surface().await?;
@@ -971,6 +1227,7 @@ impl CodexAppServerProvider {
         if account_type != "chatgpt" {
             bail!("ChatGPT subscription profile is not signed in; run `finch auth login chatgpt`");
         }
+        require_visible_sol(&mut rpc).await?;
         let isolated_cwd =
             tempfile::tempdir().context("Could not create an isolated Codex adapter workspace")?;
 
@@ -979,7 +1236,10 @@ impl CodexAppServerProvider {
         } else {
             request.model.clone()
         };
-        let mut thread_params = json!({
+        if model != GPT_5_6_SOL {
+            bail!("ChatGPT subscription provider requires GPT-5.6 Sol");
+        }
+        let thread_params = json!({
             "model": model,
             "ephemeral": true,
             "approvalPolicy": "never",
@@ -989,10 +1249,14 @@ impl CodexAppServerProvider {
             "developerInstructions": adapter_instructions(request.system.as_deref()),
             "config": isolated_thread_config()
         });
-        if let Some(tools) = request.tools.as_ref().filter(|tools| !tools.is_empty()) {
-            thread_params["dynamicTools"] = dynamic_tools(tools);
-        }
         let thread = rpc.request("thread/start", thread_params).await?;
+        if !thread
+            .get("instructionSources")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            bail!("Codex app-server loaded unexpected instruction sources");
+        }
         let thread_id = thread
             .pointer("/thread/id")
             .and_then(Value::as_str)
@@ -1122,9 +1386,12 @@ impl TurnSession {
     async fn drive_until(&mut self, tx: &mpsc::Sender<Result<StreamChunk>>, deadline: Instant) {
         let mut text = String::new();
         let mut active_tool_calls = HashSet::new();
+        let mut active_agent: Option<String> = None;
+        let mut agent_completed = false;
         loop {
             let event = tokio::select! {
                 _ = tx.closed() => {
+                    let _ = self.interrupt_and_wait(deadline).await;
                     return;
                 }
                 result = timeout_at(deadline, self.rpc.next_event()) => {
@@ -1143,6 +1410,20 @@ impl TurnSession {
             };
             match event.get("method").and_then(Value::as_str) {
                 Some("item/agentMessage/delta") => {
+                    if !self.matches_turn(&event)
+                        || event.pointer("/params/itemId").and_then(Value::as_str)
+                            != active_agent.as_deref()
+                    {
+                        let _ = deliver(
+                            tx,
+                            deadline,
+                            Err(anyhow::anyhow!(
+                                "Codex agent-message delta correlation failed"
+                            )),
+                        )
+                        .await;
+                        return;
+                    }
                     if let Some(delta) = event.pointer("/params/delta").and_then(Value::as_str) {
                         if text.len().saturating_add(delta.len()) > MAX_RESPONSE_TEXT_BYTES {
                             let _ = deliver(
@@ -1162,32 +1443,46 @@ impl TurnSession {
                     }
                 }
                 Some("item/completed")
-                    if text.is_empty()
-                        && event.pointer("/params/item/type").and_then(Value::as_str)
-                            == Some("agentMessage") =>
-                {
                     if event.pointer("/params/item/type").and_then(Value::as_str)
-                        == Some("agentMessage")
+                        == Some("agentMessage") =>
+                {
+                    let item_id = event.pointer("/params/item/id").and_then(Value::as_str);
+                    if !self.matches_turn(&event) || item_id != active_agent.as_deref() {
+                        let _ = deliver(
+                            tx,
+                            deadline,
+                            Err(anyhow::anyhow!(
+                                "Codex agent-message completion correlation failed"
+                            )),
+                        )
+                        .await;
+                        return;
+                    }
+                    active_agent = None;
+                    agent_completed = true;
+                    if let Some(final_text) =
+                        event.pointer("/params/item/text").and_then(Value::as_str)
                     {
-                        if let Some(final_text) =
-                            event.pointer("/params/item/text").and_then(Value::as_str)
-                        {
-                            if final_text.len() > MAX_RESPONSE_TEXT_BYTES {
-                                let _ = deliver(
-                                    tx,
-                                    deadline,
-                                    Err(anyhow::anyhow!("Codex response exceeded the size limit")),
-                                )
-                                .await;
-                                return;
-                            }
-                            text = final_text.to_string();
-                            if !deliver(tx, deadline, Ok(StreamChunk::TextDelta(text.clone())))
-                                .await
-                            {
-                                return;
-                            }
+                        if final_text.len() > MAX_RESPONSE_TEXT_BYTES {
+                            let _ = deliver(
+                                tx,
+                                deadline,
+                                Err(anyhow::anyhow!("Codex response exceeded the size limit")),
+                            )
+                            .await;
+                            return;
                         }
+                        text = final_text.to_string();
+                    } else {
+                        let _ = deliver(
+                            tx,
+                            deadline,
+                            Err(anyhow::anyhow!(
+                                "Codex agent-message completion omitted authoritative text"
+                            )),
+                        )
+                        .await;
+                        return;
                     }
                 }
                 Some("item/tool/call") => {
@@ -1247,6 +1542,17 @@ impl TurnSession {
                     return;
                 }
                 Some("turn/completed") => {
+                    if !self.matches_turn(&event) || active_agent.is_some() {
+                        let _ = deliver(
+                            tx,
+                            deadline,
+                            Err(anyhow::anyhow!(
+                                "Codex turn completion correlation or ordering failed"
+                            )),
+                        )
+                        .await;
+                        return;
+                    }
                     let status = event
                         .pointer("/params/turn/status")
                         .and_then(Value::as_str)
@@ -1262,7 +1568,7 @@ impl TurnSession {
                         .await;
                         return;
                     }
-                    if text.is_empty() {
+                    if text.is_empty() && !agent_completed {
                         if let Some(final_text) = completed_agent_text(&event) {
                             if final_text.len() > MAX_RESPONSE_TEXT_BYTES {
                                 let _ = deliver(
@@ -1312,6 +1618,31 @@ impl TurnSession {
                         )
                         .await;
                         return;
+                    }
+                    if item_type == "agentMessage" && method == Some("item/started") {
+                        if !self.matches_turn(&event) || active_agent.is_some() {
+                            let _ = deliver(
+                                tx,
+                                deadline,
+                                Err(anyhow::anyhow!(
+                                    "Codex agent-message lifecycle ordering failed"
+                                )),
+                            )
+                            .await;
+                            return;
+                        }
+                        let Some(item_id) =
+                            event.pointer("/params/item/id").and_then(Value::as_str)
+                        else {
+                            let _ = deliver(
+                                tx,
+                                deadline,
+                                Err(anyhow::anyhow!("Codex agent-message start omitted item id")),
+                            )
+                            .await;
+                            return;
+                        };
+                        active_agent = Some(item_id.to_string());
                     }
                     if item_type == "dynamicToolCall" {
                         let tool = event.pointer("/params/item/tool").and_then(Value::as_str);
@@ -1370,8 +1701,80 @@ impl TurnSession {
                     .await;
                     return;
                 }
-                _ => {}
+                Some("turn/started") | Some("thread/status/changed") => {
+                    if !self.matches_turn(&event) {
+                        let _ = deliver(
+                            tx,
+                            deadline,
+                            Err(anyhow::anyhow!(
+                                "Codex lifecycle notification correlation failed"
+                            )),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+                Some(method) => {
+                    if let Some(id) = event.get("id").cloned() {
+                        let _ = self.rpc.send(json!({"id": id, "error": {"code": -32601, "message": "Unsupported Finch text-adapter server request"}})).await;
+                    }
+                    let _ = deliver(
+                        tx,
+                        deadline,
+                        Err(anyhow::anyhow!(
+                            "Codex app-server sent unexpected text lifecycle method {method}"
+                        )),
+                    )
+                    .await;
+                    return;
+                }
+                None => {
+                    let _ = deliver(
+                        tx,
+                        deadline,
+                        Err(anyhow::anyhow!(
+                            "Codex app-server sent an invalid text lifecycle message"
+                        )),
+                    )
+                    .await;
+                    return;
+                }
             }
+        }
+    }
+
+    fn matches_turn(&self, event: &Value) -> bool {
+        event.pointer("/params/threadId").and_then(Value::as_str) == Some(&self.thread_id)
+            && event
+                .pointer("/params/turnId")
+                .and_then(Value::as_str)
+                .or_else(|| event.pointer("/params/turn/id").and_then(Value::as_str))
+                == Some(&self.turn_id)
+    }
+
+    async fn interrupt_and_wait(&mut self, deadline: Instant) -> Result<()> {
+        let result = self
+            .rpc
+            .request(
+                "turn/interrupt",
+                json!({"threadId": self.thread_id, "turnId": self.turn_id}),
+            )
+            .await?;
+        let _ = result;
+        loop {
+            let event = timeout_at(deadline, self.rpc.next_event())
+                .await
+                .context("Timed out waiting for interrupted Codex turn")??;
+            if event.get("method").and_then(Value::as_str) != Some("turn/completed") {
+                bail!("Codex app-server sent a post-cancel nonterminal event");
+            }
+            if !self.matches_turn(&event)
+                || event.pointer("/params/turn/status").and_then(Value::as_str)
+                    != Some("interrupted")
+            {
+                bail!("Codex app-server sent an invalid interrupted terminal event");
+            }
+            return Ok(());
         }
     }
 }
@@ -1475,7 +1878,7 @@ impl LlmProvider for CodexAppServerProvider {
     }
 
     fn supports_tools(&self) -> bool {
-        self.dynamic_tools
+        false
     }
 
     fn context_limit_tokens(&self) -> usize {
@@ -1506,7 +1909,7 @@ for line in sys.stdin:
     if method == 'initialize':
         result = {'capabilities': {}}
     elif method == 'config/read':
-        result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+        result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','memories','skill_mcp_dependency_install']}, 'web_search':'disabled', 'history':{'persistence':'none'}, 'cli_auth_credentials_store':'file', 'memories':{'generate_memories':False,'use_memories':False}}}
     elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read':
         assert m['params']['refreshToken'] is True
@@ -1529,7 +1932,9 @@ for line in sys.stdin:
         assert p['config']['features']['apps'] is False
         assert p['config']['features']['plugins'] is False
         assert p['config']['web_search'] == 'disabled'
-        result = {'thread': {'id': 'ephemeral-thread'}}
+        result = {'thread': {'id': 'ephemeral-thread'}, 'instructionSources': []}
+    elif method == 'model/list':
+        result = {'data':[{'id':'gpt-5.6-sol','model':'gpt-5.6-sol','hidden':False}], 'nextCursor':None}
     elif method == 'turn/start':
         p = m['params']
         assert p['approvalPolicy'] == 'never'
@@ -1548,10 +1953,10 @@ for line in sys.stdin:
     if method == 'account/login/start':
         print(json.dumps({'method': 'account/login/completed', 'params': {'loginId': 'login-1', 'success': True}}), flush=True)
     if method == 'turn/start':
-        print(json.dumps({'method': 'item/started', 'params': {'item': {'type': 'agentMessage', 'id': 'agent-1'}}}), flush=True)
-        print(json.dumps({'method': 'item/agentMessage/delta', 'params': {'delta': 'hello'}}), flush=True)
-        print(json.dumps({'method': 'item/completed', 'params': {'item': {'type': 'agentMessage', 'id': 'agent-1', 'text': 'hello'}}}), flush=True)
-        print(json.dumps({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}}), flush=True)
+        print(json.dumps({'method': 'item/started', 'params': {'threadId':'ephemeral-thread','turnId':'turn-1','item': {'type': 'agentMessage', 'id': 'agent-1'}}}), flush=True)
+        print(json.dumps({'method': 'item/agentMessage/delta', 'params': {'threadId':'ephemeral-thread','turnId':'turn-1','itemId':'agent-1','delta': 'draft'}}), flush=True)
+        print(json.dumps({'method': 'item/completed', 'params': {'threadId':'ephemeral-thread','turnId':'turn-1','item': {'type': 'agentMessage', 'id': 'agent-1', 'text': 'hello'}}}), flush=True)
+        print(json.dumps({'method': 'turn/completed', 'params': {'threadId':'ephemeral-thread','turn': {'id':'turn-1','status': 'completed'}}}), flush=True)
 "#,
         )
         .unwrap();
@@ -1585,10 +1990,11 @@ for line in sys.stdin:
     if hang_initialize and method == 'initialize':
         continue
     if method == 'initialize': result = {}
-    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','memories','skill_mcp_dependency_install']}, 'web_search':'disabled', 'history':{'persistence':'none'}, 'cli_auth_credentials_store':'file', 'memories':{'generate_memories':False,'use_memories':False}}}
     elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read': result = {'account': {'type': 'chatgpt'}}
-    elif method == 'thread/start': result = {'thread': {'id': 'thread'}}
+    elif method == 'model/list': result = {'data':[{'id':'gpt-5.6-sol','model':'gpt-5.6-sol','hidden':False}], 'nextCursor':None}
+    elif method == 'thread/start': result = {'thread': {'id': 'thread'}, 'instructionSources': []}
     elif method == 'turn/start': result = {'turn': {'id': 'turn'}}
     else: result = {}
     print(json.dumps({'id': m.get('id'), 'result': result}), flush=True)
@@ -1628,10 +2034,11 @@ for line in sys.stdin:
     m = json.loads(line); method = m.get('method')
     if method == 'initialized': continue
     if method == 'initialize': result = {}
-    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','memories','skill_mcp_dependency_install']}, 'web_search':'disabled', 'history':{'persistence':'none'}, 'cli_auth_credentials_store':'file', 'memories':{'generate_memories':False,'use_memories':False}}}
     elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read': result = {'account': {'type': 'chatgpt'}}
-    elif method == 'thread/start': result = {'thread': {'id': 'thread'}}
+    elif method == 'model/list': result = {'data':[{'id':'gpt-5.6-sol','model':'gpt-5.6-sol','hidden':False}], 'nextCursor':None}
+    elif method == 'thread/start': result = {'thread': {'id': 'thread'}, 'instructionSources': []}
     elif method == 'turn/start': result = {'turn': {'id': 'turn'}}
     else: result = {}
     print(json.dumps({'id': m.get('id'), 'result': result}), flush=True)
@@ -1759,9 +2166,13 @@ for line in sys.stdin:
             "features": {
                 "apps": false, "plugins": false, "remote_plugin": false,
                 "shell_tool": false, "unified_exec": false, "multi_agent": false,
-                "hooks": false, "web_search": false, "browser_use": false,
-                "computer_use": false
-            }
+                "hooks": false, "memories": false,
+                "skill_mcp_dependency_install": false
+            },
+            "web_search": "disabled",
+            "history": {"persistence": "none"},
+            "cli_auth_credentials_store": "file",
+            "memories": {"generate_memories": false, "use_memories": false}
         }});
         verify_effective_config(&safe).unwrap();
         let mut managed_mcp = safe;
@@ -1904,7 +2315,7 @@ for line in sys.stdin:
             output.status.success()
                 && String::from_utf8_lossy(&output.stdout).contains("codex-cli 0.149.1")
         }) {
-            match AppServerCommand::production() {
+            match AppServerCommand::production(MANAGED_CODEX_CREDENTIAL_REF) {
                 Ok(command) => {
                     assert!(!command.detect_protocol_capabilities().restricted_read_only)
                 }
@@ -1970,9 +2381,7 @@ for line in sys.stdin:
             input_schema: crate::tools::types::ToolInputSchema::simple(vec![]),
         }]);
         let error = provider.send_message_stream(&request).await.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("does not advertise dynamic tool support"));
+        assert!(error.to_string().contains("does not enable tools"));
         assert!(!error.to_string().contains("does/not/exist"));
     }
 
@@ -2009,7 +2418,7 @@ for line in sys.stdin:
     #[tokio::test]
     async fn mock_app_server_conforms_to_ephemeral_read_only_text_contract() {
         let (_directory, command) = mock_app_server("chatgpt");
-        let provider = CodexAppServerProvider::with_command(command, "test-model", false);
+        let provider = CodexAppServerProvider::with_command(command, GPT_5_6_SOL, false);
         let request = ProviderRequest::new(vec![Message {
             role: "user".into(),
             content: vec![ContentBlock::Text { text: "hi".into() }],
@@ -2034,7 +2443,7 @@ for line in sys.stdin:
     #[tokio::test]
     async fn api_key_account_is_not_accepted_as_subscription_auth() {
         let (_directory, command) = mock_app_server("apiKey");
-        let provider = CodexAppServerProvider::with_command(command, "test-model", false);
+        let provider = CodexAppServerProvider::with_command(command, GPT_5_6_SOL, false);
         let error = provider
             .send_message(&ProviderRequest::new(vec![]))
             .await
@@ -2053,7 +2462,7 @@ for line in sys.stdin:
         assert!(error.to_string().contains("timed out during initialize"));
 
         let (_directory, _pid, command) = hanging_app_server(false, Duration::from_millis(250));
-        let provider = CodexAppServerProvider::with_command(command, "test-model", false);
+        let provider = CodexAppServerProvider::with_command(command, GPT_5_6_SOL, false);
         let mut receiver = provider
             .send_message_stream(&ProviderRequest::new(vec![]))
             .await
@@ -2080,7 +2489,7 @@ for line in sys.stdin:
     #[tokio::test]
     async fn non_reading_receiver_is_deadlined_and_flood_is_killed() {
         let (_directory, pid_file, command) = flooding_app_server(Duration::from_millis(250));
-        let provider = CodexAppServerProvider::with_command(command, "test-model", false);
+        let provider = CodexAppServerProvider::with_command(command, GPT_5_6_SOL, false);
         let receiver = provider
             .send_message_stream(&ProviderRequest::new(vec![]))
             .await
@@ -2138,10 +2547,11 @@ for line in sys.stdin:
     m = json.loads(line); method = m.get('method')
     if method == 'initialized': continue
     if method == 'initialize': result = {}
-    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','memories','skill_mcp_dependency_install']}, 'web_search':'disabled', 'history':{'persistence':'none'}, 'cli_auth_credentials_store':'file', 'memories':{'generate_memories':False,'use_memories':False}}}
     elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read': result = {'account': {'type': 'chatgpt'}}
-    elif method == 'thread/start': result = {'thread': {'id': 'thread'}}
+    elif method == 'model/list': result = {'data':[{'id':'gpt-5.6-sol','model':'gpt-5.6-sol','hidden':False}], 'nextCursor':None}
+    elif method == 'thread/start': result = {'thread': {'id': 'thread'}, 'instructionSources': []}
     elif method == 'turn/start': result = {'turn': {'id': 'turn'}}
     else: result = {}
     print(json.dumps({'id': m.get('id'), 'result': result}), flush=True)
@@ -2154,7 +2564,7 @@ for line in sys.stdin:
             PathBuf::from("python3"),
             vec![script.to_string_lossy().into_owned()],
         );
-        let provider = CodexAppServerProvider::with_command(command, "test-model", false);
+        let provider = CodexAppServerProvider::with_command(command, GPT_5_6_SOL, false);
         let error = provider
             .send_message(&ProviderRequest::new(vec![]))
             .await
@@ -2166,7 +2576,7 @@ for line in sys.stdin:
     #[tokio::test]
     async fn dropping_stream_terminates_app_server_child() {
         let (_directory, pid_file, command) = hanging_app_server(false, Duration::from_secs(5));
-        let provider = CodexAppServerProvider::with_command(command, "test-model", false);
+        let provider = CodexAppServerProvider::with_command(command, GPT_5_6_SOL, false);
         let receiver = provider
             .send_message_stream(&ProviderRequest::new(vec![]))
             .await
