@@ -8,6 +8,57 @@ use std::fs;
 use std::path::Path;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ToolRoundToken(Uuid);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRoundResult {
+    pub tool_id: String,
+    pub content: String,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolRoundError {
+    StageAlreadyExists,
+    InvalidAssistant(String),
+    NoActiveStage,
+    StaleToken,
+    UnknownTool(String),
+    DuplicateResult(String),
+    MissingResults(Vec<String>),
+}
+
+impl std::fmt::Display for ToolRoundError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StageAlreadyExists => write!(formatter, "a tool round is already staged"),
+            Self::InvalidAssistant(reason) => write!(formatter, "invalid tool assistant: {reason}"),
+            Self::NoActiveStage => write!(formatter, "no tool round is staged"),
+            Self::StaleToken => write!(formatter, "tool result belongs to a stale round"),
+            Self::UnknownTool(id) => write!(formatter, "unknown tool result id {id}"),
+            Self::DuplicateResult(id) => write!(formatter, "duplicate tool result id {id}"),
+            Self::MissingResults(ids) => {
+                write!(formatter, "missing tool results: {}", ids.join(", "))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolRoundProgress {
+    Pending,
+    Complete,
+}
+
+#[derive(Debug, Clone)]
+struct StagedToolRound {
+    token: ToolRoundToken,
+    assistant: Message,
+    expected_ids: Vec<String>,
+    results: HashMap<String, ToolRoundResult>,
+}
+
 /// Manages conversation history for multi-turn interactions with context window management
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationHistory {
@@ -15,7 +66,7 @@ pub struct ConversationHistory {
     /// Tool-bearing assistant turns are invisible until their matching results
     /// can be appended in the same mutation.
     #[serde(skip)]
-    staged_tool_rounds: HashMap<Uuid, Message>,
+    staged_tool_rounds: HashMap<Uuid, StagedToolRound>,
     #[serde(skip)]
     max_messages: usize,
     #[serde(skip)]
@@ -93,27 +144,151 @@ impl ConversationHistory {
 
     /// Stage a tool-bearing assistant message for `query_id` without exposing
     /// it through any committed-history read path.
-    pub fn stage_assistant(&mut self, query_id: Uuid, assistant: Message) {
-        debug_assert_eq!(assistant.role, "assistant");
-        debug_assert!(assistant
+    pub fn stage_assistant(
+        &mut self,
+        query_id: Uuid,
+        assistant: Message,
+    ) -> std::result::Result<ToolRoundToken, ToolRoundError> {
+        if self.staged_tool_rounds.contains_key(&query_id) {
+            return Err(ToolRoundError::StageAlreadyExists);
+        }
+        if assistant.role != "assistant" {
+            return Err(ToolRoundError::InvalidAssistant(
+                "role must be assistant".to_string(),
+            ));
+        }
+        let expected_ids = assistant
             .content
             .iter()
-            .any(|block| matches!(block, ContentBlock::ToolUse { .. })));
-        self.staged_tool_rounds.insert(query_id, assistant);
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if expected_ids.is_empty() {
+            return Err(ToolRoundError::InvalidAssistant(
+                "at least one tool_use is required".to_string(),
+            ));
+        }
+        let unique = expected_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+        if unique.len() != expected_ids.len() {
+            return Err(ToolRoundError::InvalidAssistant(
+                "tool_use ids must be unique".to_string(),
+            ));
+        }
+        let token = ToolRoundToken(Uuid::new_v4());
+        self.staged_tool_rounds.insert(
+            query_id,
+            StagedToolRound {
+                token,
+                assistant,
+                expected_ids,
+                results: HashMap::new(),
+            },
+        );
+        Ok(token)
     }
 
-    /// Atomically publish a staged assistant tool call and its user results.
-    /// Returns `false` when the stage was already aborted (for example because
-    /// a late tool result arrived after cancellation).
-    pub fn commit_tool_round(&mut self, query_id: Uuid, tool_results: Message) -> bool {
-        let Some(assistant) = self.staged_tool_rounds.remove(&query_id) else {
-            return false;
+    pub fn record_tool_result(
+        &mut self,
+        query_id: Uuid,
+        token: ToolRoundToken,
+        tool_id: &str,
+        result: &std::result::Result<String, anyhow::Error>,
+    ) -> std::result::Result<ToolRoundProgress, ToolRoundError> {
+        let stage = self
+            .staged_tool_rounds
+            .get_mut(&query_id)
+            .ok_or(ToolRoundError::NoActiveStage)?;
+        if stage.token != token {
+            return Err(ToolRoundError::StaleToken);
+        }
+        if !stage
+            .expected_ids
+            .iter()
+            .any(|expected| expected == tool_id)
+        {
+            return Err(ToolRoundError::UnknownTool(tool_id.to_string()));
+        }
+        if stage.results.contains_key(tool_id) {
+            return Err(ToolRoundError::DuplicateResult(tool_id.to_string()));
+        }
+        let (content, is_error) = match result {
+            Ok(content) => (content.clone(), false),
+            Err(error) => (error.to_string(), true),
         };
-        debug_assert_eq!(tool_results.role, "user");
-        self.messages.push(assistant);
+        stage.results.insert(
+            tool_id.to_string(),
+            ToolRoundResult {
+                tool_id: tool_id.to_string(),
+                content,
+                is_error,
+            },
+        );
+        Ok(if stage.results.len() == stage.expected_ids.len() {
+            ToolRoundProgress::Complete
+        } else {
+            ToolRoundProgress::Pending
+        })
+    }
+
+    pub fn completed_tool_results(
+        &self,
+        query_id: Uuid,
+        token: ToolRoundToken,
+    ) -> std::result::Result<Vec<ToolRoundResult>, ToolRoundError> {
+        let stage = self
+            .staged_tool_rounds
+            .get(&query_id)
+            .ok_or(ToolRoundError::NoActiveStage)?;
+        if stage.token != token {
+            return Err(ToolRoundError::StaleToken);
+        }
+        let missing = stage
+            .expected_ids
+            .iter()
+            .filter(|id| !stage.results.contains_key(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(ToolRoundError::MissingResults(missing));
+        }
+        Ok(stage
+            .expected_ids
+            .iter()
+            .map(|id| stage.results[id].clone())
+            .collect())
+    }
+
+    /// Atomically publish a staged assistant tool call and all its validated
+    /// results in assistant declaration order.
+    pub fn commit_tool_round(
+        &mut self,
+        query_id: Uuid,
+        token: ToolRoundToken,
+    ) -> std::result::Result<Vec<ToolRoundResult>, ToolRoundError> {
+        let ordered_results = self.completed_tool_results(query_id, token)?;
+        let stage = self
+            .staged_tool_rounds
+            .remove(&query_id)
+            .ok_or(ToolRoundError::NoActiveStage)?;
+        let tool_results = Message {
+            role: "user".to_string(),
+            content: ordered_results
+                .iter()
+                .map(|result| ContentBlock::ToolResult {
+                    tool_use_id: result.tool_id.clone(),
+                    content: result.content.clone(),
+                    is_error: result.is_error.then_some(true),
+                })
+                .collect(),
+        };
+        self.messages.push(stage.assistant);
         self.messages.push(tool_results);
         self.trim_if_needed();
-        true
+        Ok(ordered_results)
     }
 
     /// Drop a staged tool call without changing committed history.
@@ -489,25 +664,17 @@ impl<'a> ConversationCompactor<'a> {
 mod tests {
     use super::*;
 
-    fn tool_assistant(id: &str) -> Message {
+    fn tool_assistant(ids: &[&str]) -> Message {
         Message {
             role: "assistant".to_string(),
-            content: vec![ContentBlock::ToolUse {
-                id: id.to_string(),
-                name: "Read".to_string(),
-                input: serde_json::json!({"path": "README.md"}),
-            }],
-        }
-    }
-
-    fn tool_results(id: &str) -> Message {
-        Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: id.to_string(),
-                content: "contents".to_string(),
-                is_error: None,
-            }],
+            content: ids
+                .iter()
+                .map(|id| ContentBlock::ToolUse {
+                    id: (*id).to_string(),
+                    name: "Read".to_string(),
+                    input: serde_json::json!({"path": "README.md"}),
+                })
+                .collect(),
         }
     }
 
@@ -553,12 +720,18 @@ mod tests {
         conv.add_user_message("read it".to_string());
         let query_id = Uuid::new_v4();
 
-        conv.stage_assistant(query_id, tool_assistant("tool-1"));
+        let token = conv
+            .stage_assistant(query_id, tool_assistant(&["tool-1"]))
+            .unwrap();
         assert_eq!(conv.message_count(), 1);
         assert_eq!(conv.get_messages().len(), 1);
         assert_eq!(conv.snapshot().len(), 1);
 
-        assert!(conv.commit_tool_round(query_id, tool_results("tool-1")));
+        assert_eq!(
+            conv.record_tool_result(query_id, token, "tool-1", &Ok("contents".to_string())),
+            Ok(ToolRoundProgress::Complete)
+        );
+        conv.commit_tool_round(query_id, token).unwrap();
         let messages = conv.get_messages();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1].role, "assistant");
@@ -571,9 +744,18 @@ mod tests {
         conv.add_user_message("read it".to_string());
         let query_id = Uuid::new_v4();
 
-        conv.stage_assistant(query_id, tool_assistant("tool-1"));
+        let token = conv
+            .stage_assistant(query_id, tool_assistant(&["tool-1"]))
+            .unwrap();
         assert!(conv.abort_staged(query_id));
-        assert!(!conv.commit_tool_round(query_id, tool_results("tool-1")));
+        assert_eq!(
+            conv.record_tool_result(query_id, token, "tool-1", &Ok("late".to_string())),
+            Err(ToolRoundError::NoActiveStage)
+        );
+        assert_eq!(
+            conv.commit_tool_round(query_id, token),
+            Err(ToolRoundError::NoActiveStage)
+        );
 
         let messages = conv.get_messages();
         assert_eq!(messages.len(), 1);
@@ -585,7 +767,8 @@ mod tests {
         let mut conv = ConversationHistory::new();
         conv.add_user_message("first query".to_string());
         let cancelled_query = Uuid::new_v4();
-        conv.stage_assistant(cancelled_query, tool_assistant("cancelled-tool"));
+        conv.stage_assistant(cancelled_query, tool_assistant(&["cancelled-tool"]))
+            .unwrap();
         conv.abort_staged(cancelled_query);
         conv.add_user_message("retry query".to_string());
 
@@ -593,6 +776,100 @@ mod tests {
             .content
             .iter()
             .any(|block| matches!(block, ContentBlock::ToolUse { .. }))));
+    }
+
+    #[test]
+    fn duplicate_unknown_and_missing_results_cannot_complete_a_round() {
+        let mut conv = ConversationHistory::new();
+        let query_id = Uuid::new_v4();
+        let token = conv
+            .stage_assistant(query_id, tool_assistant(&["A", "B"]))
+            .unwrap();
+        let mut completions = 0;
+        let first = conv.record_tool_result(query_id, token, "A", &Ok("a".to_string()));
+        if first == Ok(ToolRoundProgress::Complete) {
+            completions += 1;
+        }
+        assert_eq!(first, Ok(ToolRoundProgress::Pending));
+        assert_eq!(
+            conv.record_tool_result(query_id, token, "A", &Ok("duplicate".to_string())),
+            Err(ToolRoundError::DuplicateResult("A".to_string()))
+        );
+        assert_eq!(
+            conv.record_tool_result(query_id, token, "X", &Ok("unknown".to_string())),
+            Err(ToolRoundError::UnknownTool("X".to_string()))
+        );
+        assert_eq!(
+            conv.commit_tool_round(query_id, token),
+            Err(ToolRoundError::MissingResults(vec!["B".to_string()]))
+        );
+        assert_eq!(completions, 0, "no provider continuation is ready");
+        assert!(conv.get_messages().is_empty());
+    }
+
+    #[test]
+    fn parallel_results_commit_in_assistant_declaration_order() {
+        let mut conv = ConversationHistory::new();
+        let query_id = Uuid::new_v4();
+        let token = conv
+            .stage_assistant(query_id, tool_assistant(&["A", "B"]))
+            .unwrap();
+        let progresses = [
+            conv.record_tool_result(query_id, token, "B", &Ok("b".to_string())),
+            conv.record_tool_result(query_id, token, "A", &Ok("a".to_string())),
+        ];
+        assert_eq!(progresses[0], Ok(ToolRoundProgress::Pending));
+        assert_eq!(progresses[1], Ok(ToolRoundProgress::Complete));
+        assert_eq!(
+            progresses
+                .iter()
+                .filter(|progress| **progress == Ok(ToolRoundProgress::Complete))
+                .count(),
+            1,
+            "exactly one provider continuation is ready"
+        );
+        conv.commit_tool_round(query_id, token).unwrap();
+        assert_eq!(
+            conv.record_tool_result(query_id, token, "A", &Ok("late".to_string())),
+            Err(ToolRoundError::NoActiveStage)
+        );
+        let messages = conv.get_messages();
+        let ids = messages[1]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn stale_prior_round_results_and_stage_collisions_are_rejected() {
+        let mut conv = ConversationHistory::new();
+        let query_id = Uuid::new_v4();
+        let first = conv
+            .stage_assistant(query_id, tool_assistant(&["A"]))
+            .unwrap();
+        assert_eq!(
+            conv.stage_assistant(query_id, tool_assistant(&["B"])),
+            Err(ToolRoundError::StageAlreadyExists)
+        );
+        conv.record_tool_result(query_id, first, "A", &Ok("a".to_string()))
+            .unwrap();
+        conv.commit_tool_round(query_id, first).unwrap();
+        let second = conv
+            .stage_assistant(query_id, tool_assistant(&["A"]))
+            .unwrap();
+        assert_eq!(
+            conv.record_tool_result(query_id, first, "A", &Ok("stale".to_string())),
+            Err(ToolRoundError::StaleToken)
+        );
+        assert_eq!(
+            conv.record_tool_result(query_id, second, "A", &Ok("current".to_string())),
+            Ok(ToolRoundProgress::Complete)
+        );
     }
 
     #[test]
