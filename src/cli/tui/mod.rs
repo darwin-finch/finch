@@ -2709,7 +2709,7 @@ fn wrap_prose(text: &str, width: usize) -> Vec<String> {
     for word in text.split_whitespace() {
         let word_width = word
             .chars()
-            .map(|ch| terminal_char_width(ch).min(width))
+            .map(|ch| fitted_terminal_char(ch, width).1)
             .sum::<usize>();
         if !current.is_empty() && columns.saturating_add(1).saturating_add(word_width) <= width {
             current.push(' ');
@@ -2722,7 +2722,7 @@ fn wrap_prose(text: &str, width: usize) -> Vec<String> {
             columns = 0;
         }
         for ch in word.chars() {
-            let char_width = terminal_char_width(ch).min(width);
+            let (ch, char_width) = fitted_terminal_char(ch, width);
             if columns > 0 && columns.saturating_add(char_width) > width {
                 out.push(std::mem::take(&mut current));
                 columns = 0;
@@ -2764,7 +2764,7 @@ fn wrap_preformatted(text: &str, width: usize) -> Vec<String> {
             current.push_str(&sequence);
             continue;
         }
-        let char_width = terminal_char_width(ch).min(width);
+        let (ch, char_width) = fitted_terminal_char(ch, width);
         if columns > 0 && columns.saturating_add(char_width) > width {
             if !active_sgr.is_empty() {
                 current.push_str(RESET_SGR);
@@ -2782,6 +2782,18 @@ fn wrap_preformatted(text: &str, width: usize) -> Vec<String> {
         out.push(current);
     }
     out
+}
+
+fn fitted_terminal_char(ch: char, width: usize) -> (char, usize) {
+    let char_width = terminal_char_width(ch);
+    if char_width > width {
+        // A wide glyph cannot be truthfully displayed in a one-column row.
+        // Use a visible single-column replacement instead of lying about its
+        // terminal width or relying on terminal-specific overflow behavior.
+        ('?', 1)
+    } else {
+        (ch, char_width)
+    }
 }
 
 fn terminal_char_width(ch: char) -> usize {
@@ -4155,6 +4167,24 @@ mod draw_dialog_tests {
 
     #[test]
     fn test_wrap_text_handles_cjk_at_one_column_without_empty_rows() {
-        assert_eq!(wrap_text("新規", 1), vec!["新", "規"]);
+        let wrapped = wrap_text("新規", 1);
+        assert_eq!(wrapped, vec!["?", "?"]);
+        assert!(wrapped
+            .iter()
+            .all(|line| { line.chars().map(terminal_char_width).sum::<usize>() <= 1 }));
+    }
+
+    #[test]
+    fn test_wrap_text_colored_cjk_at_one_column_is_width_safe_and_resets() {
+        let wrapped = wrap_text("\x1b[31m新規\x1b[0m", 1);
+        assert_eq!(wrapped.len(), 2);
+        assert!(wrapped.iter().all(|line| {
+            let visible = strip_ansi(line);
+            visible.chars().map(terminal_char_width).sum::<usize>() <= 1
+                && !visible.contains('新')
+                && !visible.contains('規')
+        }));
+        assert!(wrapped.iter().all(|line| line.starts_with("\x1b[31m")));
+        assert!(wrapped.iter().all(|line| line.ends_with("\x1b[0m")));
     }
 }
