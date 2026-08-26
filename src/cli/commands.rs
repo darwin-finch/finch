@@ -29,10 +29,10 @@ pub enum Command {
     // Plan mode commands
     PlanModeToggle, // Toggle plan mode on/off (Shift+Tab or /plan without args)
     Plan(String),
-    // Feedback commands for weighted LoRA training
-    FeedbackCritical(Option<String>), // High-weight (10x) - critical strategy errors
-    FeedbackMedium(Option<String>),   // Medium-weight (3x) - improvements
-    FeedbackGood(Option<String>),     // Normal-weight (1x) - good examples
+    // Private feedback commands with historical weight metadata
+    FeedbackCritical(Option<String>), // 10x stored weight - critical strategy errors
+    FeedbackMedium(Option<String>),   // 3x stored weight - improvements
+    FeedbackGood(Option<String>),     // 1x stored weight - good examples
     // Local model testing
     Local { query: String }, // Query local model directly (bypass routing)
     // MCP plugin management
@@ -699,7 +699,7 @@ pub fn format_help() -> String {
          {cyan}  /debug{reset}             Toggle debug output\n\
          {cyan}  /metrics{reset}           Display usage statistics\n\
          {cyan}  /memory{reset}            Show memory usage (system and process)\n\
-         {cyan}  /training{reset}          Show detailed training statistics\n\n\
+         {cyan}  /training{reset}          Show routing statistics and disabled training status\n\n\
          {yellow_bold}🤖 Provider Commands:{reset}\n\
          {cyan}  /model{reset}             Show current named model profile\n\
          {cyan}  /model list{reset}        List configured cloud and local profiles\n\
@@ -742,12 +742,15 @@ pub fn format_help() -> String {
          {gray}  Workflow:{reset} 1. Ask Claude to plan → 2. Claude explores (read-only) →\n\
          {gray}            3. Claude presents plan → 4. Dialog appears automatically →\n\
          {gray}            5. You approve/request changes/reject → 6. Execution\n\n\
-         {yellow_bold}🎓 Weighted Feedback (LoRA Fine-Tuning):{reset}\n\
-         {cyan}  /critical [note]{reset}   Mark response as {red}critical error{reset} (10x training weight)\n\
-         {cyan}  /medium [note]{reset}     Mark response {yellow}needs improvement{reset} (3x weight)\n\
-         {cyan}  /good [note]{reset}       Mark response as {green}good example{reset} (1x weight)\n\
+         {yellow_bold}🎓 Private Feedback:{reset}\n\
+         {cyan}  /critical [note]{reset}   Mark response as {red}critical error{reset} (10x stored weight)\n\
+         {cyan}  /medium [note]{reset}     Mark response {yellow}needs improvement{reset} (3x stored weight)\n\
+         {cyan}  /good [note]{reset}       Mark response as {green}good example{reset} (1x stored weight)\n\
          {reset}\n\
          {gray}  Aliases:{reset} /feedback critical|high|medium|good [note]\n\
+         {gray}  Feedback is stored privately and never starts training.{reset}\n\
+         {gray}  Weights are metadata only; Finch does not use them for prioritization or training.{reset}\n\
+         {gray}  Native training is not supported or enabled in this build.{reset}\n\
          {reset}\n\
          {gray}  Examples:{reset}\n\
          {gray}    /critical{reset} Never use .unwrap() in production code\n\
@@ -756,8 +759,8 @@ pub fn format_help() -> String {
          {yellow_bold}⌨️  Keyboard Shortcuts:{reset}\n\
          {cyan}  Ctrl+C{reset}             Cancel current query (interrupts generation)\n\
          {cyan}  Ctrl+D{reset}             Delete the character under the cursor\n\
-         {cyan}  Ctrl+G{reset}             Mark last response as {green}good{reset} (1x training weight)\n\
-         {cyan}  Ctrl+B{reset}             Mark last response as {red}bad{reset} (10x training weight)\n\
+         {cyan}  Ctrl+G{reset}             Mark last response as {green}good{reset} (1x stored weight)\n\
+         {cyan}  Ctrl+B{reset}             Mark last response as {red}bad{reset} (10x stored weight)\n\
          {cyan}  Ctrl+P{reset}             Pop top word off vocabulary stack (/pop)\n\
          {cyan}  Tab{reset}                Complete /command (accepts ghost text)\n\
          {cyan}  Shift+Tab{reset}          Toggle plan mode on/off\n\
@@ -928,8 +931,9 @@ pub fn format_training(
     validator: Option<&ThresholdValidator>,
 ) -> Result<String> {
     let mut output = String::new();
-    output.push_str("Training Statistics\n");
-    output.push_str("===================\n\n");
+    output.push_str("Routing and Quality Statistics\n");
+    output.push_str("==============================\n\n");
+    output.push_str("Model training: disabled (no supported native backend selected)\n\n");
 
     if let Some(router) = router {
         let router_stats = router.stats();
@@ -1048,6 +1052,29 @@ mod tests {
         assert!(help.contains("Delete the character under the cursor"));
         assert!(!help.contains("Exit REPL (same as /quit)"));
         assert!(!help.contains("Exit the REPL (also: Ctrl+D)"));
+    }
+
+    #[test]
+    fn test_help_truthfully_describes_private_feedback_and_disabled_training() {
+        let help = format_help();
+        assert!(help.contains("🎓 Private Feedback:"));
+        assert!(help.contains("Feedback is stored privately and never starts training."));
+        assert!(help.contains(
+            "Weights are metadata only; Finch does not use them for prioritization or training."
+        ));
+        assert!(help.contains("Native training is not supported or enabled in this build."));
+        assert!(help.contains("/training"));
+        assert!(help.contains("Show routing statistics and disabled training status"));
+        assert!(!help.contains("LoRA Fine-Tuning"));
+        assert!(!help.contains("training weight"));
+        assert!(!help.contains("detailed training statistics"));
+
+        let status = format_training(None, None).unwrap();
+        assert!(status.starts_with("Routing and Quality Statistics\n"));
+        assert!(status.contains(
+            "Model training: disabled (no supported native backend selected)"
+        ));
+        assert!(!status.contains("Training Statistics"));
     }
 
     #[test]

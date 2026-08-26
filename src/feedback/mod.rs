@@ -10,8 +10,17 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CString;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+compile_error!("secure feedback storage is currently supported only on Linux and macOS");
 
 /// Feedback rating for a response
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -174,7 +183,11 @@ impl FeedbackLogger {
 
     /// Log a feedback entry
     pub fn log(&self, entry: &FeedbackEntry) -> Result<()> {
-        let mut file = self.open_private(true)?;
+        let file = self.open_private(true)?;
+        self.append_to_open_file(file, entry)
+    }
+
+    fn append_to_open_file(&self, mut file: File, entry: &FeedbackEntry) -> Result<()> {
         file.lock_exclusive().with_context(|| {
             format!("Failed to lock feedback log: {}", self.file_path.display())
         })?;
@@ -239,15 +252,10 @@ impl FeedbackLogger {
             .file_path
             .parent()
             .context("Feedback log path has no parent directory")?;
-        let parent_existed = parent.exists();
-
-        if let Ok(metadata) = fs::symlink_metadata(parent) {
-            anyhow::ensure!(
-                metadata.is_dir() && !metadata.file_type().is_symlink(),
-                "Feedback directory must be a real directory: {}",
-                parent.display()
-            );
-        } else {
+        let parent_existed = parent.try_exists().with_context(|| {
+            format!("Failed to inspect feedback directory: {}", parent.display())
+        })?;
+        if !parent_existed {
             let mut builder = fs::DirBuilder::new();
             builder.recursive(true);
             #[cfg(unix)]
@@ -257,63 +265,227 @@ impl FeedbackLogger {
             })?;
         }
 
-        #[cfg(unix)]
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).with_context(|| {
-            format!(
-                "Failed to make feedback directory private: {}",
-                parent.display()
-            )
-        })?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let parent_directory = open_private_directory(parent)?;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let parent_directory = File::open(parent)
+            .with_context(|| format!("Failed to open feedback directory: {}", parent.display()))?;
+
+        make_object_private(&parent_directory, parent, 0o700)?;
 
         if !parent_existed {
             sync_directory(parent.parent().unwrap_or(parent))?;
         }
 
-        if let Ok(metadata) = fs::symlink_metadata(&self.file_path) {
-            anyhow::ensure!(
-                metadata.is_file() && !metadata.file_type().is_symlink(),
-                "Feedback log must be a regular file: {}",
-                self.file_path.display()
-            );
-        }
-
-        let file_existed = self.file_path.exists();
-        let file = self
-            .open_file_options(true)
-            .open(&self.file_path)
-            .with_context(|| {
-                format!("Failed to open feedback log: {}", self.file_path.display())
-            })?;
-        make_file_private(&file, &self.file_path)?;
+        let (file, file_created) = self.open_from(&parent_directory, OpenPurpose::Initialize)?;
+        validate_feedback_file(&file, &self.file_path)?;
+        make_object_private(&file, &self.file_path, 0o600)?;
         file.sync_all()?;
-        if !file_existed {
-            sync_directory(parent)?;
+        if file_created {
+            parent_directory.sync_all().with_context(|| {
+                format!("Failed to sync feedback directory: {}", parent.display())
+            })?;
         }
         Ok(())
     }
 
     fn open_private(&self, append: bool) -> Result<File> {
+        self.open_private_with_parent_hook(append, || {})
+    }
+
+    fn open_private_with_parent_hook(
+        &self,
+        append: bool,
+        after_parent_opened: impl FnOnce(),
+    ) -> Result<File> {
         self.ensure_private_storage()?;
-        let file = self
-            .open_file_options(append)
-            .open(&self.file_path)
-            .with_context(|| {
-                format!("Failed to open feedback log: {}", self.file_path.display())
-            })?;
-        make_file_private(&file, &self.file_path)?;
+        let parent = self
+            .file_path
+            .parent()
+            .context("Feedback log path has no parent directory")?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let parent_directory = open_private_directory(parent)?;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let parent_directory = File::open(parent)
+            .with_context(|| format!("Failed to open feedback directory: {}", parent.display()))?;
+        after_parent_opened();
+        let purpose = if append {
+            OpenPurpose::Append
+        } else {
+            OpenPurpose::Read
+        };
+        let (file, _) = self.open_from(&parent_directory, purpose)?;
+        validate_feedback_file(&file, &self.file_path)?;
+        make_object_private(&file, &self.file_path, 0o600)?;
         Ok(file)
     }
 
-    fn open_file_options(&self, append: bool) -> OpenOptions {
+    #[cfg(test)]
+    fn log_with_parent_hook(
+        &self,
+        entry: &FeedbackEntry,
+        after_parent_opened: impl FnOnce(),
+    ) -> Result<()> {
+        let file = self.open_private_with_parent_hook(true, after_parent_opened)?;
+        self.append_to_open_file(file, entry)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn open_from(&self, _parent: &File, purpose: OpenPurpose) -> Result<(File, bool)> {
         let mut options = OpenOptions::new();
         options.read(true);
-        if append {
-            options.append(true).create(true);
+        if purpose == OpenPurpose::Append {
+            options.append(true);
+        } else if purpose == OpenPurpose::Initialize {
+            options.write(true).create(true);
         }
-        #[cfg(unix)]
-        options.mode(0o600);
-        options
+        let existed = self.file_path.try_exists()?;
+        let file = options.open(&self.file_path).with_context(|| {
+            format!("Failed to open feedback log: {}", self.file_path.display())
+        })?;
+        Ok((file, !existed))
     }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn open_from(&self, parent: &File, purpose: OpenPurpose) -> Result<(File, bool)> {
+        let name = self
+            .file_path
+            .file_name()
+            .context("Feedback log path has no file name")?;
+        open_feedback_at(parent, name, purpose)
+            .with_context(|| format!("Failed to open feedback log: {}", self.file_path.display()))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenPurpose {
+    Initialize,
+    Read,
+    Append,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod unix_open {
+    #[cfg(target_os = "linux")]
+    use std::os::raw::c_uint;
+    use std::os::raw::{c_char, c_int};
+
+    #[cfg(target_os = "linux")]
+    pub(super) type OpenMode = c_uint;
+    // Darwin mode_t is u16, which C's default argument promotions pass as int.
+    #[cfg(target_os = "macos")]
+    pub(super) type OpenMode = c_int;
+
+    pub(super) const O_RDONLY: c_int = 0;
+    pub(super) const O_RDWR: c_int = 2;
+
+    #[cfg(target_os = "linux")]
+    pub(super) const O_APPEND: c_int = 0o2000;
+    #[cfg(target_os = "macos")]
+    pub(super) const O_APPEND: c_int = 0x0008;
+    #[cfg(target_os = "linux")]
+    pub(super) const O_CREAT: c_int = 0o100;
+    #[cfg(target_os = "macos")]
+    pub(super) const O_CREAT: c_int = 0x0200;
+    #[cfg(target_os = "linux")]
+    pub(super) const O_EXCL: c_int = 0o200;
+    #[cfg(target_os = "macos")]
+    pub(super) const O_EXCL: c_int = 0x0800;
+    #[cfg(target_os = "linux")]
+    pub(super) const O_DIRECTORY: c_int = 0o200000;
+    #[cfg(target_os = "macos")]
+    pub(super) const O_DIRECTORY: c_int = 0x100000;
+    #[cfg(target_os = "linux")]
+    pub(super) const O_NOFOLLOW: c_int = 0o400000;
+    #[cfg(target_os = "macos")]
+    pub(super) const O_NOFOLLOW: c_int = 0x0100;
+    #[cfg(target_os = "linux")]
+    pub(super) const O_CLOEXEC: c_int = 0o2000000;
+    #[cfg(target_os = "macos")]
+    pub(super) const O_CLOEXEC: c_int = 0x1000000;
+    #[cfg(target_os = "linux")]
+    pub(super) const O_NONBLOCK: c_int = 0o4000;
+    #[cfg(target_os = "macos")]
+    pub(super) const O_NONBLOCK: c_int = 0x0004;
+
+    unsafe extern "C" {
+        pub(super) fn openat(directory: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_private_directory(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(unix_open::O_DIRECTORY | unix_open::O_NOFOLLOW | unix_open::O_CLOEXEC);
+    let directory = options.open(path).with_context(|| {
+        format!(
+            "Feedback directory must be a real directory: {}",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        directory.metadata()?.is_dir(),
+        "Feedback directory must be a real directory: {}",
+        path.display()
+    );
+    Ok(directory)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_feedback_at(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    purpose: OpenPurpose,
+) -> Result<(File, bool)> {
+    let name = CString::new(name.as_bytes()).context("Feedback log name contains a NUL byte")?;
+    let common = unix_open::O_NOFOLLOW | unix_open::O_CLOEXEC | unix_open::O_NONBLOCK;
+    let open = |flags: std::os::raw::c_int, mode: unix_open::OpenMode| {
+        // SAFETY: `name` is NUL-terminated, `parent` remains open for the call,
+        // and a successful descriptor is immediately owned by `File`.
+        let descriptor =
+            unsafe { unix_open::openat(parent.as_raw_fd(), name.as_ptr(), flags, mode) };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new owned descriptor.
+        Ok(unsafe { File::from_raw_fd(descriptor as RawFd) })
+    };
+
+    if purpose == OpenPurpose::Initialize {
+        match open(
+            unix_open::O_RDONLY | common | unix_open::O_CREAT | unix_open::O_EXCL,
+            0o600,
+        ) {
+            Ok(file) => return Ok((file, true)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let access = if purpose == OpenPurpose::Append {
+        unix_open::O_RDWR | unix_open::O_APPEND
+    } else {
+        unix_open::O_RDONLY
+    };
+    Ok((open(access | common, 0)?, false))
+}
+
+fn validate_feedback_file(file: &File, path: &Path) -> Result<()> {
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "Feedback log must be a regular file: {}",
+        path.display()
+    );
+    #[cfg(unix)]
+    anyhow::ensure!(
+        metadata.nlink() == 1,
+        "Feedback log must not have multiple hard links: {}",
+        path.display()
+    );
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -329,18 +501,31 @@ fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn make_file_private(file: &File, path: &Path) -> Result<()> {
+fn make_object_private(file: &File, path: &Path, maximum_mode: u32) -> Result<()> {
     #[cfg(unix)]
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("Failed to make feedback log private: {}", path.display()))?;
+    {
+        let current = file.metadata()?.permissions().mode() & 0o777;
+        let tightened = current & maximum_mode;
+        if tightened != current {
+            file.set_permissions(fs::Permissions::from_mode(tightened))
+                .with_context(|| {
+                    format!(
+                        "Failed to make feedback storage private: {}",
+                        path.display()
+                    )
+                })?;
+        }
+    }
     #[cfg(not(unix))]
-    let _ = (file, path);
+    let _ = (file, path, maximum_mode);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::os::unix::fs::symlink;
     use std::process::Command;
 
     #[test]
@@ -457,7 +642,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn feedback_directory_and_file_are_private() {
+    fn test_feedback_storage_tightens_unsafe_permissions() {
         let temp = tempfile::tempdir().unwrap();
         let directory = temp.path().join(".finch");
         fs::create_dir(&directory).unwrap();
@@ -476,6 +661,125 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_private_storage_never_broadens_owner_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join(".finch");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("feedback.jsonl");
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
+
+        FeedbackLogger::at(&path).unwrap();
+
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_feedback_log_rejects_symlinks_and_hard_links() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join(".finch");
+        fs::create_dir(&directory).unwrap();
+        let victim = temp.path().join("victim");
+        fs::write(&victim, b"unchanged").unwrap();
+
+        let symlink_path = directory.join("feedback.jsonl");
+        symlink(&victim, &symlink_path).unwrap();
+        assert!(FeedbackLogger::at(&symlink_path).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"unchanged");
+
+        fs::remove_file(&symlink_path).unwrap();
+        fs::hard_link(&victim, &symlink_path).unwrap();
+        let error = FeedbackLogger::at(&symlink_path).unwrap_err();
+        assert!(error.to_string().contains("multiple hard links"));
+        assert_eq!(fs::read(&victim).unwrap(), b"unchanged");
+
+        let real_directory = temp.path().join("real-finch");
+        fs::create_dir(&real_directory).unwrap();
+        let linked_directory = temp.path().join("linked-finch");
+        symlink(&real_directory, &linked_directory).unwrap();
+        assert!(FeedbackLogger::at(linked_directory.join("feedback.jsonl")).is_err());
+        assert!(!real_directory.join("feedback.jsonl").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_feedback_log_rejects_directories_and_devices() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join(".finch");
+        fs::create_dir(&directory).unwrap();
+        let directory_target = directory.join("feedback.jsonl");
+        fs::create_dir(&directory_target).unwrap();
+        let error = FeedbackLogger::at(&directory_target).unwrap_err();
+        assert!(error.to_string().contains("regular file"));
+
+        let dev = File::open("/dev").unwrap();
+        let (device, _) =
+            open_feedback_at(&dev, std::ffi::OsStr::new("null"), OpenPurpose::Read).unwrap();
+        let error = validate_feedback_file(&device, Path::new("/dev/null")).unwrap_err();
+        assert!(error.to_string().contains("regular file"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_feedback_log_stays_bound_to_validated_parent_during_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join(".finch");
+        let path = directory.join("feedback.jsonl");
+        let logger = FeedbackLogger::at(&path).unwrap();
+        let moved = temp.path().join("original-finch");
+        let victim = temp.path().join("victim");
+        fs::write(&victim, b"victim").unwrap();
+        let entry = FeedbackEntry::new(
+            "descriptor-bound".into(),
+            "response".into(),
+            FeedbackRating::Good,
+        );
+
+        logger
+            .log_with_parent_hook(&entry, || {
+                fs::rename(&directory, &moved).unwrap();
+                fs::create_dir(&directory).unwrap();
+                symlink(&victim, directory.join("feedback.jsonl")).unwrap();
+            })
+            .unwrap();
+
+        let stored = fs::read_to_string(moved.join("feedback.jsonl")).unwrap();
+        assert!(stored.contains("\"query\":\"descriptor-bound\""));
+        assert_eq!(fs::read(&victim).unwrap(), b"victim");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_replacement_after_logger_creation_cannot_redirect_feedback() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".finch/feedback.jsonl");
+        let logger = FeedbackLogger::at(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        let victim = temp.path().join("victim");
+        fs::write(&victim, b"victim").unwrap();
+        symlink(&victim, &path).unwrap();
+
+        assert!(logger
+            .log(&FeedbackEntry::new(
+                "query".into(),
+                "response".into(),
+                FeedbackRating::Good,
+            ))
+            .is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"victim");
     }
 
     #[test]

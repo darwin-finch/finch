@@ -113,7 +113,7 @@ impl CommandRegistry {
                 CommandSpec {
                     name: "/training",
                     params: None,
-                    description: "Show detailed training statistics",
+                    description: "Show routing statistics and disabled training status",
                     category: CommandCategory::Basic,
                 },
 
@@ -259,53 +259,53 @@ impl CommandRegistry {
                     category: CommandCategory::Patterns,
                 },
 
-                // Feedback Commands (LoRA Training)
+                // Private feedback commands
                 CommandSpec {
                     name: "/critical",
                     params: Some("[note]"),
-                    description: "Mark response as critical error (10x training weight)",
+                    description: "Store a private critical-error rating (10x weight metadata)",
                     category: CommandCategory::Feedback,
                 },
                 CommandSpec {
                     name: "/medium",
                     params: Some("[note]"),
-                    description: "Mark response needs improvement (3x weight)",
+                    description: "Store a private needs-improvement rating (3x weight metadata)",
                     category: CommandCategory::Feedback,
                 },
                 CommandSpec {
                     name: "/good",
                     params: Some("[note]"),
-                    description: "Mark response as good example (1x weight)",
+                    description: "Store a private good-response rating (1x weight metadata)",
                     category: CommandCategory::Feedback,
                 },
                 CommandSpec {
                     name: "/feedback critical",
                     params: Some("[note]"),
-                    description: "Mark response as critical error (10x training weight)",
+                    description: "Store a private critical-error rating (10x weight metadata)",
                     category: CommandCategory::Feedback,
                 },
                 CommandSpec {
                     name: "/feedback high",
                     params: Some("[note]"),
-                    description: "Mark response as critical error (10x training weight)",
+                    description: "Store a private critical-error rating (10x weight metadata)",
                     category: CommandCategory::Feedback,
                 },
                 CommandSpec {
                     name: "/feedback medium",
                     params: Some("[note]"),
-                    description: "Mark response needs improvement (3x weight)",
+                    description: "Store a private needs-improvement rating (3x weight metadata)",
                     category: CommandCategory::Feedback,
                 },
                 CommandSpec {
                     name: "/feedback good",
                     params: Some("[note]"),
-                    description: "Mark response as good example (1x weight)",
+                    description: "Store a private good-response rating (1x weight metadata)",
                     category: CommandCategory::Feedback,
                 },
                 CommandSpec {
                     name: "/feedback normal",
                     params: Some("[note]"),
-                    description: "Mark response as good example (1x weight)",
+                    description: "Store a private good-response rating (1x weight metadata)",
                     category: CommandCategory::Feedback,
                 },
 
@@ -586,6 +586,29 @@ mod tests {
                     .any(|command| command.name == supported),
                 "supported command {supported} is missing from autocomplete"
             );
+        }
+    }
+
+    #[test]
+    fn test_autocomplete_truthfully_describes_feedback_without_training_claims() {
+        let registry = CommandRegistry::new();
+        let training = registry
+            .all_commands()
+            .iter()
+            .find(|command| command.name == "/training")
+            .unwrap();
+        assert_eq!(
+            training.description,
+            "Show routing statistics and disabled training status"
+        );
+
+        for command in registry.by_category(CommandCategory::Feedback) {
+            assert!(command.description.starts_with("Store a private "));
+            let description = command.description.to_ascii_lowercase();
+            assert!(description.contains("weight metadata"));
+            assert!(!description.contains("priority"));
+            assert!(!description.contains("training"));
+            assert!(!description.contains("lora"));
         }
     }
 }
