@@ -3518,13 +3518,7 @@ async fn handle_message(
         None, // confidence
         None, // forward_reason
         elapsed_ms,
-        ResponseComparison {
-            local_response: None,
-            claude_response: response_text.clone(),
-            quality_score: 1.0,
-            similarity_score: None,
-            divergence: None,
-        },
+        ResponseComparison::aggregates(1.0, None, None),
         None, // router_confidence
         None, // validator_confidence
     );

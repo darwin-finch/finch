@@ -3,12 +3,17 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Response comparison data for training effectiveness
+/// Source-free response comparison aggregates.
+///
+/// The response fields remain in memory only for API and legacy JSONL reading
+/// compatibility. New metrics JSONL records never serialize response text.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ResponseComparison {
-    /// Local response if a local attempt was made
+    /// Legacy local response, accepted when reading old metrics only.
+    #[serde(default, skip_serializing)]
     pub local_response: Option<String>,
-    /// Claude's response (either primary or fallback)
+    /// Legacy provider response, accepted when reading old metrics only.
+    #[serde(default, skip_serializing)]
     pub claude_response: String,
     /// Quality score from validator (0.0-1.0)
     pub quality_score: f64,
@@ -121,6 +126,23 @@ impl RequestMetric {
     }
 }
 
+impl ResponseComparison {
+    /// Construct the source-free aggregate shape used by new metric producers.
+    pub fn aggregates(
+        quality_score: f64,
+        similarity_score: Option<f64>,
+        divergence: Option<f64>,
+    ) -> Self {
+        Self {
+            local_response: None,
+            claude_response: String::new(),
+            quality_score,
+            similarity_score,
+            divergence,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn test_request_metric_serde_roundtrip() {
+    fn test_request_metric_serialization_is_source_free() {
         let comparison = make_comparison(None, "42", 1.0);
         let metric = RequestMetric::new(
             "hash_roundtrip".to_string(),
@@ -216,24 +238,74 @@ mod tests {
             None,
         );
         let json = serde_json::to_string(&metric).unwrap();
+        assert!(!json.contains("42"));
+        assert!(!json.contains("claude_response"));
+        assert!(!json.contains("local_response"));
         let decoded: RequestMetric = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.query_hash, metric.query_hash);
         assert_eq!(decoded.response_time_ms, metric.response_time_ms);
+        assert_eq!(decoded.comparison.quality_score, 1.0);
+        assert!(decoded.comparison.claude_response.is_empty());
+        assert!(decoded.comparison.local_response.is_none());
     }
 
     #[test]
-    fn test_response_comparison_serde_roundtrip() {
+    fn test_response_comparison_serializes_only_aggregates() {
         let c = ResponseComparison {
-            local_response: Some("local".to_string()),
-            claude_response: "claude".to_string(),
+            local_response: Some("LOCAL_SENSITIVE_SENTINEL".to_string()),
+            claude_response: "PROVIDER_SENSITIVE_SENTINEL".to_string(),
             quality_score: 0.75,
             similarity_score: Some(0.9),
             divergence: Some(0.1),
         };
         let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("LOCAL_SENSITIVE_SENTINEL"));
+        assert!(!json.contains("PROVIDER_SENSITIVE_SENTINEL"));
         let decoded: ResponseComparison = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.quality_score, 0.75);
         assert_eq!(decoded.similarity_score, Some(0.9));
+        assert!(decoded.local_response.is_none());
+        assert!(decoded.claude_response.is_empty());
+    }
+
+    #[test]
+    fn test_legacy_response_text_metrics_remain_readable_but_reserialize_source_free() {
+        let legacy = r#"{
+            "timestamp":"2026-02-14T12:00:00Z",
+            "query_hash":"legacy_hash",
+            "routing_decision":"local_attempted",
+            "pattern_id":null,
+            "confidence":0.8,
+            "forward_reason":"low_quality",
+            "response_time_ms":123,
+            "comparison":{
+                "local_response":"legacy local source",
+                "claude_response":"legacy provider source",
+                "quality_score":0.75,
+                "similarity_score":0.9,
+                "divergence":0.1
+            },
+            "router_confidence":0.8,
+            "validator_confidence":0.75
+        }"#;
+
+        let decoded: RequestMetric = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            decoded.comparison.local_response.as_deref(),
+            Some("legacy local source")
+        );
+        assert_eq!(decoded.comparison.claude_response, "legacy provider source");
+        assert_eq!(decoded.comparison.similarity_score, Some(0.9));
+        assert_eq!(decoded.routing_decision, "local_attempted");
+
+        let rewritten = serde_json::to_string(&decoded).unwrap();
+        assert!(!rewritten.contains("legacy local source"));
+        assert!(!rewritten.contains("legacy provider source"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rewritten).unwrap()["comparison"]
+                ["quality_score"],
+            0.75
+        );
     }
 
     #[test]

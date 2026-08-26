@@ -785,7 +785,8 @@ FINCH-<base64url(JSON payload)>.<base64url(Ed25519 signature over payload bytes)
 12. If tool_use blocks, execute on client side
 13. Send tool results back to daemon
 14. Repeat until final response
-15. Log metrics; retain feedback only after an explicit user rating
+15. Log source-free metric aggregates; when configured, retain the conversation
+    in canonical semantic memory; retain feedback only after an explicit rating
 ```
 
 ### Daemon Lifecycle
@@ -833,16 +834,26 @@ Every request logs:
 ```json
 {
   "timestamp": "2026-02-14T12:00:00Z",
-  "request_id": "abc123",
+  "query_hash": "sha256...",
   "routing_decision": "local",
+  "pattern_id": "threshold_based",
+  "confidence": 0.91,
+  "forward_reason": null,
   "response_time_ms": 650,
-  "tokens_generated": 127,
-  "tool_uses": 2,
-  "forward_reason": null
+  "comparison": {
+    "quality_score": 0.88,
+    "similarity_score": 0.82,
+    "divergence": 0.18
+  },
+  "router_confidence": 0.91,
+  "validator_confidence": 0.88
 }
 ```
 
-Stored in: `~/.finch/metrics/YYYY-MM-DD.jsonl`
+Stored in: `~/.finch/metrics/YYYY-MM-DD.jsonl`. Metrics contain a query hash and
+aggregate routing/quality data, never raw query, response, or tool content.
+Legacy metric records containing response fields remain readable, but new
+records do not serialize those fields.
 
 ### Explicit Feedback Format
 
@@ -952,8 +963,11 @@ executable training queue, and does not trigger training or adapter loading.
 ## Security & Privacy
 
 ### Data Protection
-- All metrics hashed (SHA256) for privacy
+- Metrics use a SHA256 query identifier and source-free aggregate fields; raw
+  query, response, and tool content is not written to metrics JSONL
 - Explicit feedback remains private metadata; Finch does not train on it or upload it
+- Canonical semantic memory is a separate configurable feature with its own
+  conversation-retention purpose; it is not a LoRA training collector
 - No telemetry, no cloud sync
 - Can delete `~/.finch/` anytime
 

@@ -78,6 +78,9 @@ mod disabled_training_tests {
 
     #[tokio::test]
     async fn fallback_repl_completion_does_not_mutate_legacy_conversation_or_training_logs() {
+        const SENSITIVE_QUERY: &str = "QUERY_PRIVATE_SENTINEL_139_7f94";
+        const SENSITIVE_RESPONSE: &str = "RESPONSE_PRIVATE_SENTINEL_139_b381";
+
         let temp = tempfile::tempdir().unwrap();
         let legacy_conversations = temp.path().join("conversations.jsonl");
         let legacy_training_queue = temp.path().join("training_queue.jsonl");
@@ -91,7 +94,9 @@ mod disabled_training_tests {
             .mock("POST", "/v1/messages")
             .with_status(200)
             .with_body(
-                r#"{"id":"msg-1","type":"message","role":"assistant","content":[{"type":"text","text":"fallback response"}],"model":"claude-test","stop_reason":"end_turn"}"#,
+                format!(
+                    r#"{{"id":"msg-1","type":"message","role":"assistant","content":[{{"type":"text","text":"{SENSITIVE_RESPONSE}"}}],"model":"claude-test","stop_reason":"end_turn"}}"#,
+                ),
             )
             .create_async()
             .await;
@@ -110,7 +115,10 @@ mod disabled_training_tests {
         {
             config.streaming_enabled = false;
         }
-        config.memory.enabled = false;
+        config.memory.enabled = true;
+        config.memory.db_path = temp.path().join("canonical-memory.db");
+        config.memory.use_neural_embeddings = false;
+        config.memory.embedding_cache_dir = temp.path().join("embedding-cache");
         let metrics = MetricsLogger::new(config.metrics_dir.clone()).unwrap();
         let client = ClaudeClient::new("sk-ant-unused-facade-key".into()).unwrap();
         let router = Router::new(crate::models::ThresholdRouter::default());
@@ -127,10 +135,36 @@ mod disabled_training_tests {
             crate::logging::ConversationLogger::new(legacy_conversations.clone()).unwrap(),
         ));
 
-        let actual = repl.process_query("ordinary fallback query").await.unwrap();
+        let actual = repl.process_query(SENSITIVE_QUERY).await.unwrap();
 
-        assert_eq!(actual, "fallback response");
+        assert_eq!(actual, SENSITIVE_RESPONSE);
         response.assert_async().await;
+
+        let metrics_path = config_metrics_path(temp.path());
+        let metrics_jsonl = std::fs::read_to_string(&metrics_path).unwrap();
+        assert!(!metrics_jsonl.contains(SENSITIVE_QUERY));
+        assert!(!metrics_jsonl.contains(SENSITIVE_RESPONSE));
+        let metric: RequestMetric = serde_json::from_str(metrics_jsonl.trim()).unwrap();
+        assert_eq!(
+            metric.query_hash,
+            MetricsLogger::hash_query(SENSITIVE_QUERY)
+        );
+        assert_eq!(metric.routing_decision, "forward");
+        assert!(metric.comparison.quality_score.is_finite());
+        assert!(metric.comparison.local_response.is_none());
+        assert!(metric.comparison.claude_response.is_empty());
+
+        let memory = repl
+            .memory_system
+            .as_ref()
+            .expect("configured canonical memory must remain enabled");
+        let recent = memory.get_recent_conversations(2).await.unwrap();
+        assert!(recent
+            .iter()
+            .any(|(role, content)| role == "user" && content == SENSITIVE_QUERY));
+        assert!(recent
+            .iter()
+            .any(|(role, content)| role == "assistant" && content == SENSITIVE_RESPONSE));
         assert_eq!(
             std::fs::read(&legacy_conversations).unwrap(),
             conversations_before
@@ -149,6 +183,11 @@ mod disabled_training_tests {
             std::fs::read(&legacy_training_queue).unwrap(),
             training_before
         );
+    }
+
+    fn config_metrics_path(root: &std::path::Path) -> std::path::PathBuf {
+        root.join("metrics")
+            .join(format!("{}.jsonl", chrono::Utc::now().format("%Y-%m-%d")))
     }
 }
 
@@ -3378,25 +3417,21 @@ impl Repl {
             self.output_status("✓");
         }
 
-        // Log metric with comparison data
+        // Log source-free metric comparison aggregates.
         let query_hash = MetricsLogger::hash_query(query);
         let response_time_ms = start_time.elapsed().as_millis() as u64;
 
-        let comparison = ResponseComparison {
-            local_response: local_response.clone(),
-            claude_response: claude_response.clone(),
-            quality_score,
-            similarity_score,
-            divergence,
-        };
+        let comparison =
+            ResponseComparison::aggregates(quality_score, similarity_score, divergence);
 
         let router_confidence = Some(router_stats.confidence_threshold);
         let validator_confidence = Some(quality_score);
 
         // Resolve the model label before creating the metric
         // (routing_decision_str is moved below). Ordinary completions are not
-        // persisted as conversation or training data; only explicit feedback
-        // submitted through handle_feedback reaches private storage.
+        // written to the disabled legacy conversation/training collector.
+        // Metrics persist source-free aggregates; when configured, canonical
+        // MemorySystem retention remains a distinct user-facing feature.
         let model_name = if routing_decision_str == "local" {
             "local".to_string()
         } else {
@@ -3442,7 +3477,8 @@ impl Repl {
             .await
             .add_assistant_message(claude_response.clone());
 
-        // Phase 4: Store conversation in memory automatically
+        // Phase 4: Store conversation in the separately configured canonical
+        // memory product. This is not the legacy LoRA collector.
         if let Some(ref memory) = self.memory_system {
             if let Err(e) = memory
                 .insert_conversation("user", query, Some(&model_name), None)
