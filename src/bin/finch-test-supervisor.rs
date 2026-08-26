@@ -1,0 +1,586 @@
+//! Test-only Finch process and filesystem isolation supervisor.
+
+#![cfg(unix)]
+
+use sha2::{Digest, Sha256};
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::net::TcpListener;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt as _;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::{Duration, Instant};
+
+use anyhow::Context as _;
+use nix::libc;
+
+static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
+static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
+
+unsafe fn errno_location() -> *mut libc::c_int {
+    #[cfg(target_os = "macos")]
+    {
+        libc::__error()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        libc::__errno_location()
+    }
+}
+
+extern "C" fn record_signal(signal: libc::c_int) {
+    let saved_errno = unsafe { *errno_location() };
+    PENDING_SIGNAL
+        .compare_exchange(0, signal, Ordering::Relaxed, Ordering::Relaxed)
+        .ok();
+    let fd = SIGNAL_PIPE.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = signal as u8;
+        loop {
+            let result = unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
+            if result == 1 {
+                break;
+            }
+            let error = unsafe { *errno_location() };
+            if error == libc::EINTR {
+                continue;
+            }
+            if error == libc::EAGAIN || error == libc::EWOULDBLOCK {
+                break;
+            }
+            break;
+        }
+    }
+    unsafe {
+        *errno_location() = saved_errno;
+    }
+}
+
+fn install_signal_handlers(write_fd: RawFd) -> io::Result<()> {
+    SIGNAL_PIPE.store(write_fd, Ordering::Relaxed);
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = record_signal as usize;
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn canonical_directory(label: &str, path: &Path) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(path.is_absolute(), "{label} must be absolute");
+    let metadata = fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "{label} must be a non-symlink directory"
+    );
+    let canonical = path.canonicalize()?;
+    anyhow::ensure!(
+        canonical.as_os_str() == path.as_os_str(),
+        "{label} must be canonical"
+    );
+    Ok(canonical)
+}
+
+fn resolve_real_store(home: &Path) -> anyhow::Result<PathBuf> {
+    let finch = home.join(".finch");
+    if let Ok(metadata) = fs::symlink_metadata(&finch) {
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "real Finch path must be a non-symlink directory"
+        );
+    }
+    let store = finch.join("brains");
+    if let Ok(metadata) = fs::symlink_metadata(&store) {
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "real Brain store must be a non-symlink directory"
+        );
+    }
+    Ok(store)
+}
+
+fn hash_node(path: &Path, relative: &Path, digest: &mut Sha256) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    digest.update(relative.as_os_str().as_encoded_bytes());
+    digest.update(metadata.mode().to_ne_bytes());
+    digest.update(metadata.uid().to_ne_bytes());
+    digest.update(metadata.gid().to_ne_bytes());
+    digest.update(metadata.nlink().to_ne_bytes());
+    digest.update(metadata.dev().to_ne_bytes());
+    digest.update(metadata.ino().to_ne_bytes());
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        digest.update(b"link");
+        digest.update(fs::read_link(path)?.as_os_str().as_encoded_bytes());
+    } else if file_type.is_file() {
+        digest.update(b"file");
+        let mut file = File::open(path)?;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+    } else if file_type.is_dir() {
+        digest.update(b"dir");
+        let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            hash_node(&entry.path(), &relative.join(entry.file_name()), digest)?;
+        }
+    } else if file_type.is_socket() {
+        digest.update(b"socket");
+    } else if file_type.is_fifo() {
+        digest.update(b"fifo");
+    } else if file_type.is_block_device() {
+        digest.update(b"block");
+    } else if file_type.is_char_device() {
+        digest.update(b"char");
+    } else {
+        digest.update(b"other");
+    }
+    Ok(())
+}
+
+fn manifest_digest(store: &Path) -> anyhow::Result<String> {
+    if !store.exists() {
+        return Ok(hex::encode(Sha256::digest(b"missing")));
+    }
+    let mut digest = Sha256::new();
+    hash_node(store, Path::new("."), &mut digest)?;
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn create_proof(
+    home: &Path,
+    brain_address: &str,
+    daemon_address: &str,
+    password: &str,
+) -> anyhow::Result<(File, String)> {
+    let root = home.join(".finch/brains");
+    let socket = home.join(".finch/daemon.sock");
+    let home_metadata = fs::metadata(home)?;
+    let root_metadata = fs::metadata(&root)?;
+    let token = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let path = home.join(format!(".proof-{token}"));
+    let mut writer = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)?;
+    writeln!(writer, "{token}")?;
+    writeln!(writer, "{}", home.display())?;
+    writeln!(writer, "{}", root.display())?;
+    writeln!(writer, "{}:{}", home_metadata.dev(), home_metadata.ino())?;
+    writeln!(writer, "{}:{}", root_metadata.dev(), root_metadata.ino())?;
+    writeln!(writer, "{brain_address}")?;
+    writeln!(writer, "{daemon_address}")?;
+    writeln!(
+        writer,
+        "{}",
+        hex::encode(Sha256::digest(password.as_bytes()))
+    )?;
+    writeln!(writer, "{}", socket.display())?;
+    writeln!(writer, "{}", std::process::id())?;
+    let supervisor_executable = std::env::current_exe()?.canonicalize()?;
+    let supervisor_metadata = fs::metadata(&supervisor_executable)?;
+    writeln!(writer, "{}", supervisor_executable.display())?;
+    writeln!(
+        writer,
+        "{}:{}",
+        supervisor_metadata.dev(),
+        supervisor_metadata.ino()
+    )?;
+    writer.sync_all()?;
+    writer.set_permissions(fs::Permissions::from_mode(0o400))?;
+    drop(writer);
+    let proof = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)?;
+    let flags = unsafe { libc::fcntl(proof.as_raw_fd(), libc::F_GETFL) };
+    anyhow::ensure!(
+        flags >= 0 && flags & libc::O_ACCMODE == libc::O_RDONLY,
+        "proof descriptor is not read-only"
+    );
+    fs::remove_file(path)?;
+    Ok((proof, token))
+}
+
+fn configure_supervised_child(
+    command: &mut Command,
+    proof_fd: RawFd,
+    brain_fd: RawFd,
+    daemon_fd: RawFd,
+) {
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if proof_fd != 9 && libc::dup2(proof_fd, 9) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(9, libc::F_SETFD, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            for (source, target) in [(brain_fd, 10), (daemon_fd, 11)] {
+                if source != target && libc::dup2(source, target) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::fcntl(target, libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
+fn duplicate_above_stdio(fd: RawFd) -> io::Result<File> {
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 20) };
+    if duplicate == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(duplicate) })
+}
+
+fn set_descriptor_flag(fd: RawFd, command: libc::c_int, value: libc::c_int) -> io::Result<()> {
+    if unsafe { libc::fcntl(fd, command, value) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn leader_exited(child: &Child) -> io::Result<bool> {
+    let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            &mut information,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { information.si_pid() } != 0)
+}
+
+fn process_group_members(group: libc::pid_t) -> anyhow::Result<Vec<libc::pid_t>> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,pgid="])
+        .output()
+        .context("inspect supervised process group")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "could not inspect supervised process group"
+    );
+    let mut members = Vec::new();
+    for line in String::from_utf8(output.stdout)?.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid): Option<libc::pid_t> = fields.next().and_then(|value| value.parse().ok())
+        else {
+            continue;
+        };
+        let Some(pgid): Option<libc::pid_t> = fields.next().and_then(|value| value.parse().ok())
+        else {
+            continue;
+        };
+        if pgid == group && pid != group {
+            members.push(pid);
+        }
+    }
+    Ok(members)
+}
+
+fn signal_process_group(group: libc::pid_t, signal: libc::c_int) -> anyhow::Result<()> {
+    let result = unsafe { libc::kill(-group, signal) };
+    if result == -1 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+fn drain_pipe(read_fd: RawFd) {
+    let mut buffer = [0_u8; 32];
+    unsafe {
+        libc::read(read_fd, buffer.as_mut_ptr().cast(), buffer.len());
+    }
+}
+
+fn wait_for_event(read_fd: RawFd, timeout_ms: i32) -> io::Result<()> {
+    let mut descriptor = libc::pollfd {
+        fd: read_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+    if result < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+        return Err(io::Error::last_os_error());
+    }
+    if result > 0 {
+        drain_pipe(read_fd);
+    }
+    Ok(())
+}
+
+fn terminate_and_reap(child: &mut Child, group: libc::pid_t) -> anyhow::Result<ExitStatus> {
+    // On macOS, signaling a group whose only member is an unreaped zombie
+    // leader can return EPERM. It is already quiescent, so retain the leader
+    // identity and proceed directly to the one final wait.
+    if leader_exited(child)? && process_group_members(group)?.is_empty() {
+        return Ok(child.wait()?);
+    }
+    signal_process_group(group, libc::SIGTERM)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if leader_exited(child)? && process_group_members(group)?.is_empty() {
+            break;
+        }
+        signal_process_group(group, libc::SIGTERM)?;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !leader_exited(child)? || !process_group_members(group)?.is_empty() {
+        signal_process_group(group, libc::SIGKILL)?;
+        let quiescence_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < quiescence_deadline {
+            if leader_exited(child)? && process_group_members(group)?.is_empty() {
+                break;
+            }
+            signal_process_group(group, libc::SIGKILL)?;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    anyhow::ensure!(
+        leader_exited(child)? && process_group_members(group)?.is_empty(),
+        "owned test process group did not become quiescent"
+    );
+    // Reaping is the final lifecycle operation. The unreaped leader pins the
+    // PGID throughout every group signal and membership check above, so the
+    // kernel cannot reuse it as an unrelated process group before this wait.
+    let status = child.wait()?;
+    Ok(status)
+}
+
+struct OwnedProcessGroup {
+    child: Child,
+    group: libc::pid_t,
+    reaped: bool,
+}
+
+impl OwnedProcessGroup {
+    fn new(child: Child) -> Self {
+        let group = child.id() as libc::pid_t;
+        Self {
+            child,
+            group,
+            reaped: false,
+        }
+    }
+
+    fn finish(&mut self) -> anyhow::Result<ExitStatus> {
+        let status = terminate_and_reap(&mut self.child, self.group)?;
+        self.reaped = true;
+        Ok(status)
+    }
+}
+
+impl Drop for OwnedProcessGroup {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        let _ = signal_process_group(self.group, libc::SIGTERM);
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = signal_process_group(self.group, libc::SIGKILL);
+        let mut quiescent = false;
+        for _ in 0..200 {
+            if leader_exited(&self.child).unwrap_or(false)
+                && process_group_members(self.group).is_ok_and(|members| members.is_empty())
+            {
+                quiescent = true;
+                break;
+            }
+            let _ = signal_process_group(self.group, libc::SIGKILL);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Never reap the leader while another member might remain: the zombie
+        // pins the PGID against reuse until this supervisor exits. Error paths
+        // preserve the isolated HOME rather than cleaning state under a live
+        // group.
+        if quiescent {
+            let _ = self.child.wait();
+        }
+    }
+}
+
+fn run() -> anyhow::Result<i32> {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    anyhow::ensure!(
+        !arguments.is_empty(),
+        "finch-test-supervisor requires a command"
+    );
+    let real_home = canonical_directory(
+        "real HOME",
+        &PathBuf::from(
+            std::env::var_os("FINCH_TEST_REAL_HOME")
+                .or_else(|| std::env::var_os("HOME"))
+                .ok_or_else(|| anyhow::anyhow!("HOME is unavailable"))?,
+        ),
+    )?;
+    let temp_parent = canonical_directory(
+        "temporary parent",
+        &PathBuf::from(
+            std::env::var_os("FINCH_TEST_TMP_PARENT").unwrap_or_else(|| OsString::from("/tmp")),
+        ),
+    )?;
+    anyhow::ensure!(
+        !matches!(real_home.as_path(), p if p == Path::new("/") || p == Path::new("/tmp") || p == Path::new("/var") || p == Path::new("/private")),
+        "real HOME is too broad"
+    );
+    let real_store = resolve_real_store(&real_home)?;
+    anyhow::ensure!(
+        !temp_parent.starts_with(&real_store) && !real_store.starts_with(&temp_parent),
+        "temporary parent overlaps the real Brain store"
+    );
+    let before = manifest_digest(&real_store)?;
+    let isolated = tempfile::Builder::new()
+        .prefix("finch-brain-test-home.")
+        .tempdir_in(&temp_parent)?;
+    fs::set_permissions(isolated.path(), fs::Permissions::from_mode(0o700))?;
+    fs::create_dir_all(isolated.path().join(".finch/brains"))?;
+    fs::set_permissions(
+        isolated.path().join(".finch"),
+        fs::Permissions::from_mode(0o700),
+    )?;
+    let brain_listener = TcpListener::bind("127.0.0.1:0")?;
+    let daemon_listener = TcpListener::bind("127.0.0.1:0")?;
+    let brain_address = brain_listener.local_addr()?.to_string();
+    let daemon_address = daemon_listener.local_addr()?.to_string();
+    let password = format!("test-{}", uuid::Uuid::new_v4().simple());
+    let (proof, token) = create_proof(isolated.path(), &brain_address, &daemon_address, &password)?;
+    let mut pipes = [0; 2];
+    if unsafe { libc::pipe(pipes.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    set_descriptor_flag(pipes[0], libc::F_SETFL, libc::O_NONBLOCK)?;
+    set_descriptor_flag(pipes[1], libc::F_SETFL, libc::O_NONBLOCK)?;
+    set_descriptor_flag(pipes[0], libc::F_SETFD, libc::FD_CLOEXEC)?;
+    set_descriptor_flag(pipes[1], libc::F_SETFD, libc::FD_CLOEXEC)?;
+    install_signal_handlers(pipes[1])?;
+    let mut command = Command::new(&arguments[0]);
+    command
+        .args(&arguments[1..])
+        .env("HOME", isolated.path())
+        .env("FINCH_BRAIN_TEST_HOME", isolated.path())
+        .env(
+            "FINCH_BRAIN_TEST_ROOT",
+            isolated.path().join(".finch/brains"),
+        )
+        .env(
+            "FINCH_TEST_IPC_SOCKET",
+            isolated.path().join(".finch/daemon.sock"),
+        )
+        .env("FINCH_BRAIN_TEST_ISOLATED", "1")
+        .env("FINCH_BRAIN_TEST_TOKEN", &token)
+        .env("FINCH_BRAIN_TEST_PROOF_FD", "9")
+        .env("FINCH_BRAIN_TEST_NO_AUTO_SPAWN", "1")
+        .env("FINCH_TEST_BRAIN_ADDR", &brain_address)
+        .env("FINCH_TEST_DAEMON_ADDR", &daemon_address)
+        .env("FINCH_TEST_BRAIN_PASSWORD", &password)
+        .env("FINCH_TEST_BRAIN_LISTENER_FD", "10")
+        .env("FINCH_TEST_DAEMON_LISTENER_FD", "11")
+        .env("FINCH_TEST_SUPERVISOR_PID", std::process::id().to_string())
+        .env("FINCH_TEST_SUPERVISOR_BIN", std::env::current_exe()?);
+    if std::env::var_os("CARGO_HOME").is_none() && real_home.join(".cargo").is_dir() {
+        command.env("CARGO_HOME", real_home.join(".cargo"));
+    }
+    if std::env::var_os("RUSTUP_HOME").is_none() && real_home.join(".rustup").is_dir() {
+        command.env("RUSTUP_HOME", real_home.join(".rustup"));
+    }
+    for name in [
+        "FINCH_TEST_REAL_HOME",
+        "FINCH_TEST_TMP_PARENT",
+        "FINCH_TEST_PROCESS_REGISTRY",
+        "FINCH_TEST_BOUND_ADDR_FILE",
+        "BRAIN_ADDR",
+        "DAEMON_ADDR",
+        "BRAIN_PASSWORD",
+    ] {
+        command.env_remove(name);
+    }
+    let proof_child = duplicate_above_stdio(proof.as_raw_fd())?;
+    let brain_child = duplicate_above_stdio(brain_listener.as_raw_fd())?;
+    let daemon_child = duplicate_above_stdio(daemon_listener.as_raw_fd())?;
+    configure_supervised_child(
+        &mut command,
+        proof_child.as_raw_fd(),
+        brain_child.as_raw_fd(),
+        daemon_child.as_raw_fd(),
+    );
+    let mut group = OwnedProcessGroup::new(command.spawn()?);
+    let observation = (|| -> anyhow::Result<()> {
+        while PENDING_SIGNAL.load(Ordering::Relaxed) == 0 && !leader_exited(&group.child)? {
+            wait_for_event(pipes[0], 25)?;
+        }
+        Ok(())
+    })();
+    let status = match group.finish() {
+        Ok(status) => status,
+        Err(error) => {
+            let preserved = isolated.keep();
+            return Err(error.context(format!(
+                "isolated HOME preserved at {} because the process group was not quiescent",
+                preserved.display()
+            )));
+        }
+    };
+    // Once the group is proven quiescent, always take the parent-held after
+    // snapshot before propagating an observation error or removing HOME.
+    let after = manifest_digest(&real_store)?;
+    anyhow::ensure!(
+        before == after,
+        "real Brain store manifest changed (sha256={before} -> sha256={after})"
+    );
+    observation?;
+    drop(proof);
+    drop(isolated);
+    // A signal arriving while TERM/KILL escalation was in progress must still
+    // control the wrapper's exit status.
+    let signal = PENDING_SIGNAL.load(Ordering::Relaxed);
+    if signal != 0 {
+        Ok(128 + signal)
+    } else {
+        Ok(status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
+    }
+}
+
+fn main() {
+    match run() {
+        Ok(status) => std::process::exit(status),
+        Err(error) => {
+            eprintln!("Brain test supervisor: {error:#}");
+            std::process::exit(70);
+        }
+    }
+}

@@ -1545,6 +1545,19 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
+    // An isolated daemon must authenticate the supervisor before logging,
+    // loading config, probing lifecycle state, or creating any Finch files.
+    let isolated_proof = finch::brain::isolated_test_proof_if_present()?;
+    let bind_address = if let Some(proof) = &isolated_proof {
+        anyhow::ensure!(
+            bind_address == proof.daemon_address(),
+            "isolated daemon CLI address does not match supervisor authority"
+        );
+        proof.daemon_address().to_owned()
+    } else {
+        bind_address
+    };
+
     // Check if debug logging is enabled in config (before setting up tracing)
     // This allows the debug_logging feature flag to control log verbosity
     if let Ok(temp_config) = load_config() {
@@ -1608,6 +1621,10 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     let mut config = load_config()?;
     config.server.enabled = true;
     config.server.bind_address = bind_address.clone();
+    if let Some(proof) = &isolated_proof {
+        config.server.brain_password = proof.brain_password()?;
+        config.server.advertise = false;
+    }
 
     // Load or create threshold router
     let models_dir = dirs::home_dir()

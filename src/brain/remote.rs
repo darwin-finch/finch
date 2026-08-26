@@ -2169,27 +2169,96 @@ fn unix_epoch_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    fn ensure_supervisor_live_fixture() {
+        static READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        READY.get_or_init(|| {
+            let proof = crate::brain::isolated_test_proof().unwrap();
+            let brain_listener = proof.duplicate_brain_listener().unwrap();
+            let daemon_listener = proof.duplicate_daemon_listener().unwrap();
+            brain_listener.set_nonblocking(true).unwrap();
+            daemon_listener.set_nonblocking(true).unwrap();
+            let state_root = proof.home.join(".finch/live-endpoint-fixture");
+            std::fs::create_dir_all(&state_root).unwrap();
+            let authority = super::super::credential::BrainCredentialAuthority::ephemeral([91; 32]);
+            let state = Arc::new(
+                crate::server::AgentServer::for_supervised_brain_http_test(
+                    "supervisor.local",
+                    &state_root,
+                    authority,
+                )
+                .unwrap(),
+            );
+            let ipc_state = Arc::clone(&state);
+            let ipc_path = proof.ipc_socket.clone();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime
+                    .block_on(crate::ipc::start_ipc_server(
+                        ipc_state,
+                        tokio_util::sync::CancellationToken::new(),
+                    ))
+                    .unwrap();
+            });
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let brain_listener = tokio::net::TcpListener::from_std(brain_listener).unwrap();
+                    let daemon_listener =
+                        tokio::net::TcpListener::from_std(daemon_listener).unwrap();
+                    let brain = axum::serve(
+                        brain_listener,
+                        crate::server::handlers::create_remote_brain_router(Arc::clone(&state))
+                            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    );
+                    let daemon = axum::serve(
+                        daemon_listener,
+                        crate::server::handlers::create_router(state).into_make_service(),
+                    );
+                    ready_tx.send(()).unwrap();
+                    let _ = tokio::join!(brain, daemon);
+                });
+            });
+            ready_rx.recv().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ipc_path.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "supervised IPC fixture did not bind"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+    }
 
     fn isolated_live_brain_target(brain: &str) -> RemoteBrainTarget {
-        assert_eq!(
-            std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref(),
-            Ok("1")
-        );
+        ensure_supervisor_live_fixture();
+        let proof = crate::brain::isolated_test_proof().unwrap();
         let address = std::env::var("FINCH_TEST_BRAIN_ADDR")
             .expect("FINCH_TEST_BRAIN_ADDR must name the owned ephemeral Brain listener");
+        assert_eq!(address, proof.brain_addr);
         let socket: std::net::SocketAddr = address.parse().expect("invalid test Brain address");
         assert!(socket.ip().is_loopback() && socket.port() != 0);
         assert_ne!(socket.port(), DEFAULT_BRAIN_PORT);
-        RemoteBrainTarget::parse(&format!("{brain}@{address}")).unwrap()
+        let mut target = RemoteBrainTarget::parse(&format!("{brain}@{address}")).unwrap();
+        target.secure = false;
+        target
     }
 
     fn isolated_live_daemon_address() -> String {
-        assert_eq!(
-            std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref(),
-            Ok("1")
-        );
+        ensure_supervisor_live_fixture();
+        let proof = crate::brain::isolated_test_proof().unwrap();
         let address = std::env::var("FINCH_TEST_DAEMON_ADDR")
             .expect("FINCH_TEST_DAEMON_ADDR must name the owned ephemeral daemon");
+        assert_eq!(address, proof.daemon_addr);
         let socket: std::net::SocketAddr = address.parse().expect("invalid test daemon address");
         assert!(socket.ip().is_loopback() && socket.port() != 0);
         assert_ne!(address, crate::config::constants::DEFAULT_DAEMON_ADDR);
@@ -2197,23 +2266,32 @@ mod tests {
     }
 
     fn isolated_live_password() -> String {
+        crate::brain::isolated_test_proof().unwrap();
         std::env::var("FINCH_TEST_BRAIN_PASSWORD")
             .expect("FINCH_TEST_BRAIN_PASSWORD must match the isolated daemon fixture")
     }
 
     async fn connect_isolated_live_ipc() -> crate::ipc::IpcClient {
+        let proof = crate::brain::isolated_test_proof().unwrap();
         let path = std::env::var_os("FINCH_TEST_IPC_SOCKET")
             .map(std::path::PathBuf::from)
             .expect("FINCH_TEST_IPC_SOCKET must name the owned daemon socket");
-        let home = std::env::var_os("FINCH_BRAIN_TEST_HOME")
-            .map(std::path::PathBuf::from)
-            .expect("FINCH_BRAIN_TEST_HOME is required");
-        let parent = path.parent().expect("test IPC socket has no parent");
-        assert!(parent
-            .canonicalize()
-            .unwrap()
-            .starts_with(home.canonicalize().unwrap()));
-        crate::ipc::IpcClient::connect_path(path).await.unwrap()
+        assert_eq!(path, proof.ipc_socket);
+        #[cfg(unix)]
+        let before = crate::brain::validate_isolated_test_socket(&proof, &path).unwrap();
+        let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+        #[cfg(unix)]
+        crate::brain::authenticate_isolated_test_peer(&stream).unwrap();
+        let client = crate::ipc::IpcClient::from_stream(stream).await.unwrap();
+        #[cfg(unix)]
+        {
+            let after = crate::brain::validate_isolated_test_socket(&proof, &path).unwrap();
+            assert_eq!(
+                before, after,
+                "test IPC socket identity changed during connect"
+            );
+        }
+        client
     }
 
     #[test]

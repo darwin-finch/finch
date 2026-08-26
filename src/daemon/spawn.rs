@@ -23,6 +23,27 @@ use crate::config::constants::DEFAULT_DAEMON_ADDR as DEFAULT_BIND;
 ///
 /// Returns Ok(()) if daemon is ready, error otherwise.
 pub async fn ensure_daemon_running(bind_address: Option<&str>) -> Result<()> {
+    ensure_daemon_access_allowed()?;
+    ensure_daemon_running_after_isolation_gate(bind_address).await
+}
+
+fn ensure_daemon_access_allowed() -> Result<()> {
+    let supervisor_marker = std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref() == Ok("1")
+        || std::env::var_os("FINCH_BRAIN_TEST_PROOF_FD").is_some();
+    let no_auto_spawn = std::env::var("FINCH_BRAIN_TEST_NO_AUTO_SPAWN").as_deref() == Ok("1");
+    if !supervisor_marker && !no_auto_spawn {
+        return Ok(());
+    }
+    if supervisor_marker {
+        crate::brain::isolated_test_proof()
+            .context("invalid Brain test supervisor authority at daemon lifecycle gate")?;
+    }
+    anyhow::bail!(
+        "daemon discovery, reuse, and auto-spawn are disabled by the Brain test supervisor"
+    );
+}
+
+async fn ensure_daemon_running_after_isolation_gate(bind_address: Option<&str>) -> Result<()> {
     let bind = bind_address.unwrap_or(DEFAULT_BIND);
     let base_url = format!("http://{}", bind);
 
@@ -94,6 +115,7 @@ pub async fn ensure_daemon_running(bind_address: Option<&str>) -> Result<()> {
 /// - Unix: Standard spawn with log file redirection
 /// - Windows: Uses CREATE_NO_WINDOW flag to avoid console
 pub fn spawn_daemon(bind_address: &str) -> Result<()> {
+    ensure_daemon_access_allowed()?;
     let exe_path =
         std::env::current_exe().context("Failed to determine current executable path")?;
 
@@ -126,7 +148,7 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
     #[cfg(target_family = "unix")]
     {
         use std::os::unix::process::CommandExt;
-        let child = Command::new(&exe_path)
+        Command::new(&exe_path)
             .arg("daemon")
             .arg("--bind")
             .arg(bind_address)
@@ -143,7 +165,6 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
             .process_group(0)
             .spawn()
             .with_context(|| format!("Failed to spawn daemon: {}", exe_path.display()))?;
-        register_isolated_child(child.id())?;
     }
 
     #[cfg(target_family = "windows")]
@@ -151,7 +172,7 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-        let child = Command::new(&exe_path)
+        Command::new(&exe_path)
             .arg("daemon")
             .arg("--bind")
             .arg(bind_address)
@@ -165,43 +186,10 @@ pub fn spawn_daemon(bind_address: &str) -> Result<()> {
             .stderr(Stdio::from(log_file))
             .spawn()
             .with_context(|| format!("Failed to spawn daemon: {}", exe_path.display()))?;
-        register_isolated_child(child.id())?;
     }
 
     debug!(log = %log_path.display(), "Daemon subprocess spawned, logs at {}", log_path.display());
     Ok(())
-}
-
-fn register_isolated_child(pid: u32) -> Result<()> {
-    let Some(path) = std::env::var_os("FINCH_TEST_PROCESS_REGISTRY").map(std::path::PathBuf::from)
-    else {
-        return Ok(());
-    };
-    anyhow::ensure!(
-        std::env::var_os("FINCH_BRAIN_TEST_ISOLATED").as_deref() == Some(std::ffi::OsStr::new("1")),
-        "test process registry requires the Brain isolation wrapper"
-    );
-    let home = dirs::home_dir()
-        .context("Cannot determine isolated HOME for process registration")?
-        .canonicalize()
-        .context("Cannot resolve isolated HOME for process registration")?;
-    let test_home = std::env::var_os("FINCH_BRAIN_TEST_HOME")
-        .map(std::path::PathBuf::from)
-        .context("Missing isolated HOME for process registration")?;
-    anyhow::ensure!(
-        test_home.canonicalize()? == home && path == home.join(".finch/owned-processes"),
-        "test process registry must be the wrapper-owned file"
-    );
-    anyhow::ensure!(
-        path.is_file() && !path.is_symlink(),
-        "test process registry must be an existing regular file"
-    );
-    use std::io::Write;
-    let mut registry = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .context("Failed to open isolated process registry")?;
-    writeln!(registry, "{pid} {pid}").context("Failed to register isolated daemon process")
 }
 
 /// Check if daemon health endpoint responds
@@ -238,5 +226,16 @@ mod tests {
         // Non-existent server should fail health check
         let result = health_check_succeeds("http://127.0.0.1:99999").await;
         assert!(!result);
+    }
+
+    #[test]
+    fn test_isolation_gate_denies_before_probe_reuse_or_spawn() {
+        let error = ensure_daemon_access_allowed().unwrap_err().to_string();
+        assert!(error.contains("discovery, reuse, and auto-spawn are disabled"));
+    }
+
+    #[test]
+    fn test_isolation_gate_also_denies_direct_detached_spawn() {
+        assert!(ensure_daemon_access_allowed().is_err());
     }
 }

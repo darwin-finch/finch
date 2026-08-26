@@ -17,20 +17,13 @@ address_file="$HOME/.finch/tool-passthrough.addr"
 daemon_pid=''
 cleanup() {
     trap - EXIT INT TERM HUP
-    if [[ -n "$daemon_pid" ]]; then
-        kill -TERM "$daemon_pid" 2>/dev/null || true
-        for _ in {1..40}; do kill -0 "$daemon_pid" 2>/dev/null || break; sleep 0.05; done
-        kill -KILL "$daemon_pid" 2>/dev/null || true
-        wait "$daemon_pid" 2>/dev/null || true
-    fi
     rm -rf -- "$TEST_DIR"
     rm -f -- "$address_file"
 }
 trap cleanup EXIT INT TERM HUP
 mkdir -p "$HOME/.finch"
 FINCH_TEST_BOUND_ADDR_FILE="$address_file" "$finch_bin" daemon --bind 127.0.0.1:0 & daemon_pid=$!
-brain_test_isolation_register_owned_pid "$daemon_pid"
-for _ in {1..100}; do [[ -s "$address_file" ]] && break; kill -0 "$daemon_pid" 2>/dev/null || break; sleep 0.05; done
+for _ in {1..100}; do [[ -s "$address_file" ]] && break; sleep 0.05; done
 [[ -s "$address_file" ]] || { echo 'Daemon did not publish its bound address' >&2; exit 1; }
 DAEMON_URL="http://$(cat "$address_file")"
 
