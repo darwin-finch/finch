@@ -14,9 +14,13 @@ finch setup
 ```
 
 Each Finch request starts an ephemeral Codex thread with `approvalPolicy: never`
-and the read-only sandbox. Finch sends the complete Brain conversation on every
-request, so an app-server thread is never durable conversation truth. The adapter
-does not expose Codex's built-in shell, filesystem, or browser tools.
+and a turn-level restricted read-only policy whose only readable root is a fresh
+empty temporary directory. Finch clears MCP configuration, disables inherited
+apps, plugins, shell, exec, web search, hooks, and subagents, and passes only a
+small environment allowlist to app-server. Finch sends an encoded copy of the
+complete Brain conversation on every request, so an app-server thread is never
+durable conversation truth. Finch refuses to construct the provider when the
+installed protocol schema cannot express the restricted read-only policy.
 
 This is an agent-protocol adapter, not raw Chat Completions or Responses API
 parity. Finch tool calls require the installed app-server schema to advertise the
