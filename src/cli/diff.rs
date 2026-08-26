@@ -7,6 +7,7 @@ use similar::TextDiff;
 pub const MAX_DIFF_INPUT_BYTES: usize = 1_048_576;
 pub const MAX_DIFF_LINES: usize = 400;
 pub const MAX_DIFF_FILES: usize = 64;
+pub const MAX_DIFF_LINE_CHARS: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileDiff {
@@ -100,6 +101,7 @@ impl FileDiff {
         let mut file: Option<Self> = None;
         let mut hunk: Option<DiffHunk> = None;
         let mut accepted_lines = 0usize;
+        let mut accepted_bytes = 0usize;
         fn flush_hunk(file: &mut Option<FileDiff>, hunk: &mut Option<DiffHunk>) {
             if let (Some(f), Some(h)) = (file.as_mut(), hunk.take()) {
                 f.hunks.push(h)
@@ -118,6 +120,12 @@ impl FileDiff {
             }
         }
         for raw in text.lines() {
+            accepted_bytes = accepted_bytes.saturating_add(raw.len());
+            if accepted_bytes > MAX_DIFF_INPUT_BYTES {
+                file.get_or_insert_with(empty_file).elided =
+                    Some("diff input exceeded display byte limit".into());
+                break;
+            }
             if files.len() >= MAX_DIFF_FILES {
                 break;
             }
@@ -458,8 +466,8 @@ fn encode_path(path: &str, prefix: char) -> String {
 }
 
 pub fn sanitize_terminal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut it = s.chars().peekable();
+    let mut out = String::with_capacity(s.len().min(MAX_DIFF_LINE_CHARS));
+    let mut it = s.chars().take(MAX_DIFF_LINE_CHARS).peekable();
     while let Some(c) = it.next() {
         if c == '\x1b' {
             match it.peek().copied() {
@@ -593,5 +601,20 @@ mod tests {
     fn large_diff_is_elided() {
         let x = "a".repeat(MAX_DIFF_INPUT_BYTES);
         assert!(FileDiff::from_texts("x", &x, &x).elided.is_some())
+    }
+
+    #[test]
+    fn external_diff_input_and_line_are_bounded() {
+        let hostile = format!(
+            "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-{}\n+ok\n",
+            "z".repeat(MAX_DIFF_INPUT_BYTES)
+        );
+        let parsed = FileDiff::parse(&hostile).unwrap();
+        assert!(parsed.elided.is_some());
+        assert!(parsed
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .all(|line| { line.text.chars().count() <= MAX_DIFF_LINE_CHARS }));
     }
 }
