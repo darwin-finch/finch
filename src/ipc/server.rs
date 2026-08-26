@@ -1866,6 +1866,15 @@ async fn forward_runner_request(
     }
 }
 
+#[cfg(test)]
+pub(crate) async fn forward_test_runner_request(
+    runner: finch_ipc_capnp::brain_runner::Client,
+    server: Arc<AgentServer>,
+    request: crate::server::RunnerRequest,
+) -> bool {
+    forward_runner_request(runner, server, request).await
+}
+
 fn decode_runner_program_result(
     result: capnp::Result<finch_ipc_capnp::brain_program_result::Reader<'_>>,
 ) -> Result<crate::server::RunnerProgramResult, crate::server::RunnerProgramError> {

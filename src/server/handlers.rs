@@ -1296,6 +1296,8 @@ async fn dispatch_named_brain_run(
         Err(error) => {
             let detail = error.to_string();
             if detail == "named Brain run cancelled" {
+                terminalizer.armed = false;
+                store.prune_run_publication(name, run.run_id)?;
                 return Ok(None);
             }
             let result = push_named_brain_run_result(
@@ -1722,7 +1724,6 @@ async fn dispatch_named_brain_program(
                 let publication = store.acquire_run_publication(name, run_id).await?;
                 if publication.cancel_requested() {
                     drop(publication);
-                    store.prune_run_publication(name, run_id)?;
                     anyhow::bail!("named Brain run cancelled");
                 }
                 persist_named_brain_effect_journal(
@@ -1756,7 +1757,6 @@ async fn dispatch_named_brain_program(
     let publication = store.acquire_run_publication(name, run_id).await?;
     if publication.cancel_requested() {
         drop(publication);
-        store.prune_run_publication(name, run_id)?;
         anyhow::bail!("named Brain run cancelled");
     }
     persist_named_brain_effect_journal(
@@ -1849,7 +1849,6 @@ async fn dispatch_named_brain_turn(
                 let publication = store.acquire_run_publication(name, run_id).await?;
                 if publication.cancel_requested() {
                     drop(publication);
-                    store.prune_run_publication(name, run_id)?;
                     anyhow::bail!("named Brain run cancelled");
                 }
                 persist_named_brain_turn_events(
@@ -1892,7 +1891,6 @@ async fn dispatch_named_brain_turn(
     let publication = store.acquire_run_publication(name, run_id).await?;
     if publication.cancel_requested() {
         drop(publication);
-        store.prune_run_publication(name, run_id)?;
         anyhow::bail!("named Brain run cancelled");
     }
     let commit_ack = outcome.commit_ack.clone();
@@ -3799,10 +3797,69 @@ mod handler_tests {
     };
     use crate::brain::tasks::{BrainTask, BrainTaskPriority, BrainTaskStatus};
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn websocket_teardown_is_bounded_and_connection_scoped() {
         use crate::brain::store::{BrainStore, ConnectionId};
         use crate::server::BrainLifecycleService;
+
+        struct RetainingTurnRunner {
+            control_tx: Option<tokio::sync::oneshot::Sender<
+                crate::finch_ipc_capnp::brain_turn_control::Client,
+            >>,
+            release_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+        }
+        impl crate::finch_ipc_capnp::brain_runner::Server for RetainingTurnRunner {
+            fn run_program(
+                &mut self,
+                _params: crate::finch_ipc_capnp::brain_runner::RunProgramParams,
+                _results: crate::finch_ipc_capnp::brain_runner::RunProgramResults,
+            ) -> capnp::capability::Promise<(), capnp::Error> {
+                capnp::capability::Promise::err(capnp::Error::unimplemented(
+                    "test runner accepts only turns".into(),
+                ))
+            }
+            fn run_turn(
+                &mut self,
+                params: crate::finch_ipc_capnp::brain_runner::RunTurnParams,
+                _results: crate::finch_ipc_capnp::brain_runner::RunTurnResults,
+            ) -> capnp::capability::Promise<(), capnp::Error> {
+                let control = match params.get()
+                    .and_then(|params| params.get_request())
+                    .and_then(|request| request.get_control())
+                {
+                    Ok(control) => control,
+                    Err(error) => return capnp::capability::Promise::err(error),
+                };
+                if self.control_tx.take().unwrap().send(control).is_err() {
+                    return capnp::capability::Promise::err(capnp::Error::failed(
+                        "test control receiver closed".into(),
+                    ));
+                }
+                let release = self.release_rx.take().unwrap();
+                capnp::capability::Promise::from_future(async move {
+                    let _ = release.await;
+                    Err(capnp::Error::disconnected("test runner released".into()))
+                })
+            }
+            fn cancel_run(
+                &mut self,
+                _params: crate::finch_ipc_capnp::brain_runner::CancelRunParams,
+                _results: crate::finch_ipc_capnp::brain_runner::CancelRunResults,
+            ) -> capnp::capability::Promise<(), capnp::Error> {
+                capnp::capability::Promise::err(capnp::Error::unimplemented(
+                    "test runner does not accept cancellation".into(),
+                ))
+            }
+            fn project_memory(
+                &mut self,
+                _params: crate::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
+                _results: crate::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
+            ) -> capnp::capability::Promise<(), capnp::Error> {
+                capnp::capability::Promise::err(capnp::Error::unimplemented(
+                    "test runner does not project memory".into(),
+                ))
+            }
+        }
 
         let temp = tempfile::tempdir().unwrap();
         let store = BrainStore::with_root("box.local", Some(temp.path().to_path_buf()));
@@ -3816,7 +3873,55 @@ mod handler_tests {
         let approvals = server.brain_approvals().clone();
         let attached = lifecycle.attach("shared", "alice", AttachmentRole::Driver, None).unwrap();
         let connection_id = attached.connection_id.unwrap();
-        let _events = lifecycle.watch("shared", attached.attachment_id, connection_id).unwrap();
+        let pending = lifecycle.snapshot("shared").unwrap();
+        let now = unix_epoch_millis();
+        let parent_token = server.brain_credentials().issue(
+            crate::brain::credential::BrainCredentialRequest {
+                issuer: "test".into(),
+                subject: attached.subject.clone(),
+                brain_id: pending.brain_id,
+                brain: "shared".into(),
+                environment_generation: pending.environment.generation,
+                role: attached.role,
+                scopes: crate::brain::credential::default_participant_scopes(attached.role),
+                delegation_chain: Vec::new(),
+                ttl_ms: 60_000,
+            },
+            now,
+        ).unwrap();
+        let parent_claims = server.brain_credentials().verify(&parent_token, now).unwrap();
+        let (bound_token, _) = server.brain_credentials().bind_attachment(
+            &parent_claims,
+            attached.attachment_id,
+            connection_id,
+            now,
+        ).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let http_agent = server.clone();
+        let http_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                create_remote_brain_router(http_agent)
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            ).await.unwrap();
+        });
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut websocket_request = format!(
+            "ws://{address}/v1/brains/named/shared/ws?attachment_id={}&connection_id={}",
+            attached.attachment_id.0,
+            connection_id.0,
+        ).into_client_request().unwrap();
+        websocket_request.headers_mut().insert(
+            tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+            tokio_tungstenite::tungstenite::http::HeaderValue::from_str(
+                &format!("Bearer {bound_token}"),
+            ).unwrap(),
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(websocket_request).await.unwrap();
+        let initial = socket.next().await.unwrap().unwrap();
+        assert!(initial.is_binary());
         let unrelated = lifecycle.attach("shared", "bob", AttachmentRole::Observer, None).unwrap();
         let unrelated_connection = unrelated.connection_id.unwrap();
         let _unrelated_events = lifecycle.watch(
@@ -3828,25 +3933,44 @@ mod handler_tests {
         ).unwrap();
         let (runner_tx, mut runner_rx) = tokio::sync::mpsc::unbounded_channel();
         lifecycle.register_test_runner("shared", lease.lease_id, runner_tx);
-        let submitting = lifecycle.clone();
-        let submitting_attachment_id = attached.attachment_id;
-        let worker = tokio::spawn(async move {
-            let _ = submitting.submit(
-                "shared", submitting_attachment_id, connection_id,
+        let current = lifecycle.snapshot("shared").unwrap();
+        let command = crate::ipc::brain_codec::BrainRemoteCommand {
+            request_id: 1,
+            mutation: Some(crate::ipc::brain_codec::BrainRemoteMutation {
+                brain_id: current.brain_id,
+                expected_revision: current.revision,
+                environment_generation: current.environment.generation,
+                idempotency_key: uuid::Uuid::new_v4(),
+            }),
+            kind: crate::ipc::brain_codec::BrainRemoteCommandKind::Submit(
                 BrainEventKind::Prompt { text: "disconnect mid-turn".into() },
-            ).await;
-        });
+            ),
+        };
+        let encoded = crate::ipc::brain_codec::encode_brain_remote_envelope(
+            &crate::ipc::brain_codec::BrainRemoteEnvelope::Command(command),
+        ).unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Binary(encoded)).await.unwrap();
         let crate::server::RunnerRequest::Turn(late_request) = runner_rx.recv().await.unwrap()
         else { panic!("expected a real dispatched turn") };
 
         let request_seq = late_request.request_seq;
-        let stale_control = crate::ipc::server::test_turn_control_client(
+        let approval_audience = late_request.approval_audience.clone();
+        let (control_tx, control_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let runner: crate::finch_ipc_capnp::brain_runner::Client =
+            capnp_rpc::new_client(RetainingTurnRunner {
+                control_tx: Some(control_tx),
+                release_rx: Some(release_rx),
+            });
+        let mut forwarding = Box::pin(crate::ipc::server::forward_test_runner_request(
+            runner,
             server.clone(),
-            "shared".into(),
-            request_seq,
-            late_request.approval_audience.clone(),
-            late_request.approval_connection_id,
-        );
+            crate::server::RunnerRequest::Turn(late_request),
+        ));
+        let stale_control = tokio::select! {
+            control = control_rx => control.unwrap(),
+            _ = &mut forwarding => panic!("runner forwarder ended before exposing control"),
+        };
         let approval_id = "disconnect-approval";
         let registration = approvals.register_for_connection(request_seq, approval_id, BrainApprovalAudience {
             brain_id: snapshot.brain_id,
@@ -3856,20 +3980,26 @@ mod handler_tests {
             role: attached.role,
             environment_generation: snapshot.environment.generation,
         }, connection_id).unwrap();
-        let approval_worker = tokio::spawn(async move {
+        let _approval_waiter = tokio::spawn(async move {
             let _ = registration.wait().await;
             std::future::pending::<()>().await;
         });
 
         tokio::time::timeout(
             std::time::Duration::from_millis(250),
-            teardown_remote_brain_connection(
-                &lifecycle, "shared", attached.attachment_id, connection_id,
-                worker, approval_worker,
-            ),
-        ).await.expect("connection teardown waited on suspended tool/approval work");
+            socket.close(None),
+        ).await.expect("WebSocket close was not bounded").unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            loop {
+                if lifecycle.connection(
+                    "shared", attached.attachment_id, connection_id,
+                ).is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("WebSocket close did not tear down its process lifecycle");
 
-        assert!(late_request.response_tx.send(Err("late completion".to_string().into())).is_err());
         assert!(lifecycle.connection("shared", attached.attachment_id, connection_id).is_err());
         assert!(lifecycle.connection(
             "shared", unrelated.attachment_id, unrelated_connection,
@@ -3903,7 +4033,7 @@ mod handler_tests {
                     approval_id: "late-stale-tool".into(),
                     approval_kind: "tool".into(),
                     subject: "bash".into(),
-                    audience: late_request.approval_audience.clone(),
+                    audience: approval_audience,
                     detail: serde_json::json!({"input": {"command": "true"}}),
                 },
             ),
@@ -3983,6 +4113,10 @@ mod handler_tests {
         let later_run = lifecycle.inspect_run("shared", later.run.unwrap().run_id).unwrap();
         assert_eq!(later_run.status, crate::brain::store::BrainRunStatus::Failed);
         assert_eq!(later_run.detail.as_deref(), Some("later prompt reached runner"));
+        release_tx.send(()).unwrap();
+        assert!(forwarding.await);
+        http_server.abort();
+        let _ = http_server.await;
         assert!(lifecycle.connection(
             "shared", unrelated.attachment_id, unrelated_connection,
         ).is_ok());

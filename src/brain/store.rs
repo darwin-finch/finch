@@ -928,6 +928,8 @@ pub struct BrainStore {
     execution_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     run_publication_gates:
         Arc<RwLock<HashMap<(String, RunId), Arc<tokio::sync::Mutex<RunPublicationGate>>>>>,
+    #[cfg(test)]
+    fail_next_event_batch: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -972,6 +974,8 @@ impl BrainStore {
             runtime_checkpoints: Arc::new(RwLock::new(HashMap::new())),
             execution_locks: Arc::new(RwLock::new(HashMap::new())),
             run_publication_gates: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            fail_next_event_batch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1847,6 +1851,13 @@ impl BrainStore {
         anyhow::ensure!(status.is_terminal(), "run terminalization requires a terminal status");
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let publication = match self.run_publication_gate(name, run_id)?.try_lock_owned() {
+            Ok(publication) => publication,
+            Err(_) => return Ok(None),
+        };
+        if publication.cancel_requested() {
+            return Ok(None);
+        }
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         let current = state.runs.get(&run_id)
@@ -1859,40 +1870,52 @@ impl BrainStore {
             event.run_id == Some(run_id)
                 && matches!(event.kind, BrainEventKind::Result { .. })
         }).cloned();
-        let result = match existing {
-            Some(result) => result,
-            None => self.push_locked_for_run(
-                name,
-                state,
-                sender,
-                Some(run_id),
-                BrainEventKind::Result {
-                    request_seq,
-                    output: String::new(),
-                    error: Some(detail.clone()),
-                },
-            )?,
-        };
-        self.push_locked_for_run(
-            name,
-            state,
-            sender,
-            Some(run_id),
-            BrainEventKind::RunStatusChanged {
+        let next_seq = state.events.last().map(|event| event.seq + 1).unwrap_or(1);
+        let now = unix_millis();
+        let result = existing.unwrap_or_else(|| BrainEvent {
+            schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+            brain_id: state.brain_id,
+            seq: next_seq,
+            environment_generation: self.environment.generation,
+            sender: sender.to_string(),
+            created_ms: now,
+            run_id: Some(run_id),
+            mutation: None,
+            kind: BrainEventKind::Result {
+                request_seq,
+                output: String::new(),
+                error: Some(detail.clone()),
+            },
+        });
+        let result_is_durable = state.events.iter().any(|event| event.seq == result.seq);
+        let terminal = BrainEvent {
+            schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+            brain_id: state.brain_id,
+            seq: next_seq + u64::from(!result_is_durable),
+            environment_generation: self.environment.generation,
+            sender: sender.to_string(),
+            created_ms: now,
+            run_id: Some(run_id),
+            mutation: None,
+            kind: BrainEventKind::RunStatusChanged {
                 run_id,
                 status,
                 detail: Some(detail),
             },
-        )?;
-        drop(brains);
-        let gate = self.run_publication_gates
-            .read().expect("shared Brain run-gate map poisoned")
-            .get(&(name.to_string(), run_id)).cloned();
-        let idle = gate.as_ref().and_then(|gate| gate.try_lock().ok())
-            .is_some_and(|gate| !gate.cancel_requested());
-        if idle {
-            self.prune_run_publication(name, run_id)?;
+        };
+        let events = if result_is_durable {
+            vec![terminal]
+        } else {
+            vec![result.clone(), terminal]
+        };
+        self.append_event_batch(name, &events)?;
+        for event in events {
+            state.apply(event.clone());
+            let _ = state.tx.send(event);
         }
+        drop(brains);
+        drop(publication);
+        self.prune_run_publication(name, run_id)?;
         Ok(Some(result))
     }
 
@@ -3865,9 +3888,18 @@ impl BrainStore {
 
     fn append_event_batch(&self, name: &str, events: &[BrainEvent]) -> Result<()> {
         anyhow::ensure!(!events.is_empty(), "Brain event batch cannot be empty");
+        #[cfg(test)]
+        if self.fail_next_event_batch.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("injected Brain event batch append failure");
+        }
         self.append_journal_value(name, &BrainJournalRecord::EventBatch {
             events: events.to_vec(),
         })
+    }
+
+    #[cfg(test)]
+    fn fail_next_event_batch_for_test(&self) {
+        self.fail_next_event_batch.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn append_journal_value<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
@@ -4751,6 +4783,111 @@ mod tests {
             event.run_id == Some(run_id)
                 && matches!(event.kind, BrainEventKind::Result { .. })
         }).count() <= 1);
+    }
+
+    #[test]
+    fn disconnect_terminal_batch_is_all_or_nothing_across_failure_and_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store.attach(
+            "shared", "alice", AttachmentRole::Driver, None,
+        ).unwrap();
+        let prompt = store.push(
+            "shared", "alice", BrainEventKind::Prompt { text: "crash".into() },
+        ).unwrap();
+        let run = store.start_run(
+            "shared", "alice", BrainRunKind::Interactive, prompt.seq,
+            attachment.attachment_id, BrainRunStatus::Running,
+        ).unwrap();
+        let before = store.snapshot("shared").unwrap().revision;
+        store.fail_next_event_batch_for_test();
+        assert!(store.terminalize_run_with_result_if_active(
+            "shared", "daemon", run.run_id, prompt.seq, BrainRunStatus::Failed,
+            "initiating Brain connection disconnected".into(),
+        ).is_err());
+        let failed_append = store.snapshot("shared").unwrap();
+        assert_eq!(failed_append.revision, before);
+        assert_eq!(failed_append.runs.iter().find(|candidate| {
+            candidate.run_id == run.run_id
+        }).unwrap().status, BrainRunStatus::Running);
+        assert!(!failed_append.events.iter().any(|event| {
+            event.run_id == Some(run.run_id)
+                && matches!(event.kind, BrainEventKind::Result { .. })
+        }));
+
+        drop(store);
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let interrupted = restarted.snapshot("shared").unwrap();
+        assert_eq!(interrupted.runs.iter().find(|candidate| {
+            candidate.run_id == run.run_id
+        }).unwrap().status, BrainRunStatus::Interrupted);
+        assert!(!interrupted.events.iter().any(|event| {
+            event.run_id == Some(run.run_id)
+                && matches!(event.kind, BrainEventKind::Result { .. })
+        }));
+
+        let next_seq = interrupted.revision + 1;
+        let result = BrainEvent {
+            schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+            brain_id: interrupted.brain_id,
+            seq: next_seq,
+            environment_generation: interrupted.environment.generation,
+            sender: "daemon".into(),
+            created_ms: unix_millis(),
+            run_id: Some(run.run_id),
+            mutation: None,
+            kind: BrainEventKind::Result {
+                request_seq: prompt.seq,
+                output: String::new(),
+                error: Some("torn disconnect".into()),
+            },
+        };
+        let terminal = BrainEvent {
+            seq: next_seq + 1,
+            kind: BrainEventKind::RunStatusChanged {
+                run_id: run.run_id,
+                status: BrainRunStatus::Failed,
+                detail: Some("torn disconnect".into()),
+            },
+            ..result.clone()
+        };
+        let encoded = serde_json::to_vec(&BrainJournalRecord::EventBatch {
+            events: vec![result, terminal],
+        }).unwrap();
+        OpenOptions::new().append(true)
+            .open(temp.path().join("shared/events.jsonl")).unwrap()
+            .write_all(&encoded[..encoded.len() / 2]).unwrap();
+        drop(restarted);
+
+        let recovered = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let recovered_snapshot = recovered.snapshot("shared").unwrap();
+        assert_eq!(recovered_snapshot.revision, interrupted.revision);
+        assert!(!recovered_snapshot.events.iter().any(|event| {
+            event.run_id == Some(run.run_id)
+                && matches!(event.kind, BrainEventKind::Result { .. })
+        }));
+        recovered.terminalize_run_with_result_if_active(
+            "shared", "daemon", run.run_id, prompt.seq, BrainRunStatus::Failed,
+            "initiating Brain connection disconnected".into(),
+        ).unwrap().unwrap();
+        drop(recovered);
+
+        let final_store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let final_snapshot = final_store.snapshot("shared").unwrap();
+        let result_seq = final_snapshot.events.iter().find_map(|event| {
+            (event.run_id == Some(run.run_id)
+                && matches!(event.kind, BrainEventKind::Result { .. })).then_some(event.seq)
+        }).unwrap();
+        let terminal_seq = final_snapshot.events.iter().find_map(|event| match event.kind {
+            BrainEventKind::RunStatusChanged { run_id: event_run_id, status, .. }
+                if event_run_id == run.run_id && status == BrainRunStatus::Failed =>
+                    Some(event.seq),
+            _ => None,
+        }).unwrap();
+        assert_eq!(terminal_seq, result_seq + 1);
+        assert_eq!(final_snapshot.runs.iter().find(|candidate| {
+            candidate.run_id == run.run_id
+        }).unwrap().status, BrainRunStatus::Failed);
     }
 
     #[tokio::test]

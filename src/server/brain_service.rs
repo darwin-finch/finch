@@ -1114,7 +1114,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn running_speculative_cancellation_suppresses_a_late_runner_result() {
+    async fn cancellation_reservation_owns_terminal_outcome_before_runner_cancel_reply() {
         let service = service();
         let driver = service
             .attach("shared", "alice", AttachmentRole::Driver, None)
@@ -1152,11 +1152,21 @@ mod tests {
         assert_eq!(run_id, accepted_run.run_id);
         assert_eq!(turn.prompt, "look ahead");
 
+        let receipt = crate::brain::store::BrainMutationReceipt {
+            mutation_id: uuid::Uuid::new_v4(),
+            attachment_id: driver_id,
+            expected_revision: service.snapshot("shared").unwrap().revision,
+            environment_generation: environment.generation,
+            command_sha256: "cancel-running-speculative".into(),
+        };
         let cancelling = {
             let service = service.clone();
+            let receipt = receipt.clone();
             tokio::spawn(async move {
                 service
-                    .cancel_run("shared", driver_id, connection_id, run_id)
+                    .cancel_run_with_receipt(
+                        "shared", driver_id, connection_id, run_id, Some(receipt),
+                    )
                     .await
             })
         };
@@ -1164,12 +1174,6 @@ mod tests {
             panic!("expected cancellation request")
         };
         assert_eq!(cancel.run_id, run_id);
-        cancel.response_tx.send(Ok(true)).unwrap();
-        assert_eq!(
-            cancelling.await.unwrap().unwrap().status,
-            BrainRunStatus::Cancelled
-        );
-
         let runtime = crate::runtime::ProgramRuntime::new();
         let checkpoint = runtime
             .revision_history()
@@ -1194,13 +1198,12 @@ mod tests {
                 commit_ack: None,
             }))
             .unwrap();
-        // Acquiring the same turn lane is a completion barrier for the
-        // detached supervisor; assertions below cannot pass vacuously before
-        // it has observed and rejected the late response.
-        service
-            .resume_queued_runs("shared".into(), lease.lease_id)
-            .await
-            .unwrap();
+        service.detach("shared", driver_id, connection_id).unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(service.inspect_run("shared", run_id).unwrap().status,
+            BrainRunStatus::Running);
+        cancel.response_tx.send(Ok(true)).unwrap();
+        assert_eq!(cancelling.await.unwrap().unwrap().status, BrainRunStatus::Cancelled);
         assert!(accepted.result.is_none());
         let snapshot = service.snapshot("shared").unwrap();
         assert_eq!(
@@ -1222,6 +1225,14 @@ mod tests {
                         | BrainEventKind::Result { .. }
                 )
         }));
+        assert_eq!(snapshot.events.iter().filter(|event| {
+            event.mutation.as_ref() == Some(&receipt)
+        }).count(), 1);
+        assert_eq!(snapshot.events.iter().filter(|event| matches!(
+            event.kind,
+            BrainEventKind::RunStatusChanged { run_id: event_run_id, status, .. }
+                if event_run_id == run_id && status.is_terminal()
+        )).count(), 1);
     }
 
     #[tokio::test]
