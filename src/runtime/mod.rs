@@ -849,11 +849,12 @@ impl ProgramRuntime {
     /// by the correlated pending request.
     pub fn issue_typed_capability(
         &self,
-        requirement: CapabilityRequirement,
+        mut requirement: CapabilityRequirement,
         scope: GrantScope,
         actor: impl Into<String>,
         expires_at_unix_ms: Option<u64>,
     ) -> Result<uuid::Uuid> {
+        normalize_process_grant(&mut requirement).map_err(anyhow::Error::msg)?;
         self.mutate_authority(|policy, ledger| {
             if !policy.permits(&requirement) {
                 bail!(
@@ -3601,10 +3602,47 @@ fn typed_agent_task_snapshot(
 }
 
 impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
+    fn prepare_awaited_effect(
+        &mut self,
+        effect: &mut VmSideEffect,
+    ) -> std::result::Result<(), VmDiagnostic> {
+        if effect.requirement.capability != CapabilityKind::ProcessRun {
+            return Ok(());
+        }
+        let binding = registered_host_binding(&effect.requirement, &effect.origin)?;
+        if binding != Some(CoreHostBinding::ProcessRun) {
+            return Err(host_binding_error(
+                &effect.origin,
+                "process execution requires the registered process-run host binding",
+            ));
+        }
+        let crate::vm::interpreter::HostSideEffect::Request { arguments } = &effect.event else {
+            return Err(host_binding_error(
+                &effect.origin,
+                "process-run requires a typed host request",
+            ));
+        };
+        let Some(TypedValue::String(command)) = arguments.first() else {
+            return Err(host_binding_error(
+                &effect.origin,
+                "process-run requires an executable string",
+            ));
+        };
+        let identity = resolve_process_executable(command)
+            .map_err(|message| host_binding_error(&effect.origin, message))?;
+        effect.requirement.selector = ResourceSelector::Process {
+            executables: vec![identity.encode()],
+        };
+        Ok(())
+    }
+
     fn authorize_awaited_effect(
         &mut self,
         effect: &VmSideEffect,
     ) -> std::result::Result<(), VmDiagnostic> {
+        if effect.requirement.capability == CapabilityKind::ProcessRun {
+            validate_process_effect(effect)?;
+        }
         let requested = EffectSet::from_requirement(effect.requirement.clone());
         if TypedRuntime::intrinsic_grants().grants(&requested) {
             return Ok(());
@@ -4453,8 +4491,8 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         "process-run requires a command and string arguments",
                     ));
                 };
-                validate_process_request(binding, requirement, command, origin)?;
-                let mut process = std::process::Command::new(command);
+                let executable = validate_process_request(binding, requirement, command, origin)?;
+                let mut process = std::process::Command::new(executable);
                 for value in values {
                     let TypedValue::String(value) = value else {
                         return Err(host_binding_error(
@@ -4841,7 +4879,7 @@ fn validate_process_request(
     requirement: &CapabilityRequirement,
     command: &str,
     origin: &crate::vm::SourceOrigin,
-) -> std::result::Result<(), VmDiagnostic> {
+) -> std::result::Result<PathBuf, VmDiagnostic> {
     if binding != Some(CoreHostBinding::ProcessRun) {
         return Err(host_binding_error(
             origin,
@@ -4854,13 +4892,132 @@ fn validate_process_request(
             "process-run reached the host without a concrete process selector",
         ));
     };
-    if executables.len() != 1 || executables.first().map(String::as_str) != Some(command) {
+    let [encoded] = executables.as_slice() else {
         return Err(host_binding_error(
             origin,
-            "process-run executable does not match the authorized process selector",
+            "process-run requires exactly one stable executable identity",
+        ));
+    };
+    let approved = ProcessExecutableIdentity::decode(encoded)
+        .map_err(|message| host_binding_error(origin, message))?;
+    let current = resolve_process_executable(command)
+        .map_err(|message| host_binding_error(origin, message))?;
+    if approved != current {
+        return Err(host_binding_error(
+            origin,
+            "process-run executable identity no longer matches the authorized selector",
         ));
     }
+    Ok(PathBuf::from(current.path))
+}
+
+const PROCESS_IDENTITY_PREFIX: &str = "finch-process-v1:";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ProcessExecutableIdentity {
+    path: String,
+    sha256: String,
+}
+
+impl ProcessExecutableIdentity {
+    fn encode(&self) -> String {
+        format!(
+            "{PROCESS_IDENTITY_PREFIX}{}",
+            serde_json::to_string(self).expect("process identity is serializable")
+        )
+    }
+
+    fn decode(encoded: &str) -> std::result::Result<Self, String> {
+        let json = encoded
+            .strip_prefix(PROCESS_IDENTITY_PREFIX)
+            .ok_or_else(|| "process selector is not a stable executable identity".to_string())?;
+        serde_json::from_str(json).map_err(|_| "process selector identity is malformed".into())
+    }
+}
+
+/// Resolve an executable to the authority identity persisted in grants and
+/// audit. Replacing the file with different bytes invalidates the grant;
+/// byte-identical replacement retains the same identity. The identity is
+/// checked again immediately before spawning the canonical absolute path.
+fn resolve_process_executable(
+    command: &str,
+) -> std::result::Result<ProcessExecutableIdentity, String> {
+    let supplied = Path::new(command);
+    if !supplied.is_absolute() {
+        return Err("process-run executable must be an absolute canonical path; PATH and relative lookup are forbidden".into());
+    }
+    #[cfg(windows)]
+    if supplied
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
+        })
+    {
+        return Err("process-run rejects .bat and .cmd because they require a command shell".into());
+    }
+    let canonical = std::fs::canonicalize(supplied)
+        .map_err(|error| format!("resolve process executable '{}': {error}", supplied.display()))?;
+    if canonical != supplied {
+        return Err("process-run executable must already be canonical and must not be a symlink".into());
+    }
+    let metadata = std::fs::metadata(&canonical)
+        .map_err(|error| format!("inspect process executable '{}': {error}", canonical.display()))?;
+    if !metadata.is_file() {
+        return Err("process-run executable must be a regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err("process-run executable is not marked executable".into());
+        }
+    }
+    let digest = sha256_file(&canonical)?;
+    Ok(ProcessExecutableIdentity {
+        path: canonical.to_string_lossy().into_owned(),
+        sha256: hex_digest(&digest),
+    })
+}
+
+fn normalize_process_grant(
+    requirement: &mut CapabilityRequirement,
+) -> std::result::Result<(), String> {
+    if requirement.capability != CapabilityKind::ProcessRun {
+        return Ok(());
+    }
+    let ResourceSelector::Process { executables } = &mut requirement.selector else {
+        return Ok(());
+    };
+    for executable in executables.iter_mut() {
+        if executable.starts_with(PROCESS_IDENTITY_PREFIX) {
+            let approved = ProcessExecutableIdentity::decode(executable)?;
+            let current = resolve_process_executable(&approved.path)?;
+            if approved != current {
+                return Err("process grant identity does not match the current executable".into());
+            }
+        } else {
+            *executable = resolve_process_executable(executable)?.encode();
+        }
+    }
     Ok(())
+}
+
+fn validate_process_effect(effect: &VmSideEffect) -> std::result::Result<(), VmDiagnostic> {
+    let binding = registered_host_binding(&effect.requirement, &effect.origin)?;
+    let crate::vm::interpreter::HostSideEffect::Request { arguments } = &effect.event else {
+        return Err(host_binding_error(
+            &effect.origin,
+            "process-run requires a typed host request",
+        ));
+    };
+    let Some(TypedValue::String(command)) = arguments.first() else {
+        return Err(host_binding_error(
+            &effect.origin,
+            "process-run requires an executable string",
+        ));
+    };
+    validate_process_request(binding, &effect.requirement, command, &effect.origin).map(|_| ())
 }
 
 /// Convert the statically admitted MCP input subset into JSON. Optional
@@ -5887,7 +6044,7 @@ mod tests {
         let process_requirement = CapabilityRequirement {
             capability: crate::vm::CapabilityKind::ProcessRun,
             selector: crate::vm::ResourceSelector::Process {
-                executables: vec!["/usr/bin/true".into()],
+                executables: vec![resolve_process_executable("/usr/bin/true").unwrap().encode()],
             },
         };
         assert_eq!(
@@ -5925,6 +6082,35 @@ mod tests {
             Some(CoreHostBinding::ProcessRun),
             &process_requirement,
             "/usr/bin/false",
+            &process_origin,
+        )
+        .is_err());
+        let empty = CapabilityRequirement {
+            capability: CapabilityKind::ProcessRun,
+            selector: ResourceSelector::Process {
+                executables: Vec::new(),
+            },
+        };
+        assert!(validate_process_request(
+            Some(CoreHostBinding::ProcessRun),
+            &empty,
+            "/usr/bin/true",
+            &process_origin,
+        )
+        .is_err());
+        let multiple = CapabilityRequirement {
+            capability: CapabilityKind::ProcessRun,
+            selector: ResourceSelector::Process {
+                executables: vec![
+                    resolve_process_executable("/usr/bin/true").unwrap().encode(),
+                    resolve_process_executable("/usr/bin/false").unwrap().encode(),
+                ],
+            },
+        };
+        assert!(validate_process_request(
+            Some(CoreHostBinding::ProcessRun),
+            &multiple,
+            "/usr/bin/true",
             &process_origin,
         )
         .is_err());
@@ -8317,6 +8503,13 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         );
         let pending = runtime.submit(request.clone()).await.unwrap();
         assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
+        let ResourceSelector::Process { executables } =
+            &pending.required_capabilities[0].selector
+        else {
+            panic!("process approval must expose a stable executable identity");
+        };
+        let approved_identity = ProcessExecutableIdentity::decode(&executables[0]).unwrap();
+        assert_eq!(approved_identity.path, "/usr/bin/printf");
         runtime
             .grant_typed_capability(crate::vm::CapabilityRequirement {
                 capability: crate::vm::CapabilityKind::ProcessRun,
@@ -8328,6 +8521,174 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         let approved = runtime.submit(request).await.unwrap();
         assert_eq!(approved.status, ExecutionStatus::Completed);
         assert_eq!(approved.values, vec![ProgramValue::String("ok".into())]);
+    }
+
+    #[tokio::test]
+    async fn process_run_rejects_bare_and_relative_commands_without_consulting_path() {
+        let runtime = ProgramRuntime::new();
+        for command in ["printf", "./printf"] {
+            let source = format!(
+                "(process-run {} (list \"unused\"))",
+                serde_json::to_string(command).unwrap()
+            );
+            let outcome = runtime
+                .submit(submission(
+                    ProgramLanguage::Lisp,
+                    &source,
+                    ExecutionEffect::ExternalWrite,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(outcome.status, ExecutionStatus::Failed);
+            assert!(outcome.required_capabilities.is_empty());
+            assert!(outcome
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("PATH and relative lookup are forbidden")));
+        }
+        assert!(runtime
+            .capability_ledger()
+            .unwrap()
+            .authorization_audit
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_run_rejects_symlinks_even_after_retargeting() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let link = directory.path().join("tool");
+        symlink("/usr/bin/true", &link).unwrap();
+        let source = format!(
+            "(process-run {} (list \"unused\"))",
+            serde_json::to_string(&link.to_string_lossy()).unwrap()
+        );
+        let runtime = ProgramRuntime::new();
+        let first = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                &source,
+                ExecutionEffect::ExternalWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status, ExecutionStatus::Failed);
+        std::fs::remove_file(&link).unwrap();
+        symlink("/usr/bin/false", &link).unwrap();
+        let second = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                &source,
+                ExecutionEffect::ExternalWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.status, ExecutionStatus::Failed);
+        assert!(runtime
+            .capability_ledger()
+            .unwrap()
+            .authorization_audit
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replaced_process_executable_does_not_consume_once_grant() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("tool");
+        std::fs::copy("/usr/bin/true", &executable).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = std::fs::canonicalize(executable).unwrap();
+        let source = format!(
+            "(process-run {} (list \"unused\"))",
+            serde_json::to_string(&executable.to_string_lossy()).unwrap()
+        );
+        let runtime = ProgramRuntime::new();
+        let pending = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                &source,
+                ExecutionEffect::ExternalWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.status,
+            ExecutionStatus::AuthorizationRequired,
+            "diagnostics: {:?}",
+            pending.diagnostics
+        );
+
+        std::fs::copy("/usr/bin/false", &executable).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let failed = runtime
+            .resolve_typed_approval(
+                &pending.approval_prompts[0],
+                ApprovalChoice::AllowOnce,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status, ExecutionStatus::Failed);
+        let ledger = runtime.capability_ledger().unwrap();
+        let once = ledger.grants.grants.last().expect("once grant was recorded");
+        assert!(matches!(once.scope, GrantScope::Once { .. }));
+        assert!(once.consumed_at_unix_ms.is_none());
+        assert!(ledger.authorization_audit.is_empty());
+        assert!(!ledger
+            .audit
+            .iter()
+            .any(|entry| entry.action == crate::vm::CapabilityAuditAction::Consumed));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wrong_process_origin_is_rejected_before_once_grant_issuance() {
+        let runtime = ProgramRuntime::new();
+        let pending = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(process-run \"/usr/bin/true\" (list \"unused\"))",
+                ExecutionEffect::ExternalWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
+        {
+            let mut pending_runs = runtime.pending_typed.lock().unwrap();
+            let saved = pending_runs.get_mut(&pending.execution_id).unwrap();
+            let forged = SourceOrigin::generated("legacy-process-run");
+            saved.suspension.pending_host_call.as_mut().unwrap().origin = forged.clone();
+            saved.suspension.event_journal.last_mut().unwrap().origin = forged;
+        }
+        let error = runtime
+            .resolve_typed_approval(
+                &pending.approval_prompts[0],
+                ApprovalChoice::AllowOnce,
+                "test-user",
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("stale or forged"));
+        let ledger = runtime.capability_ledger().unwrap();
+        assert!(ledger.grants.grants.is_empty());
+        assert!(ledger.authorization_audit.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_run_rejects_windows_batch_launchers() {
+        let directory = tempfile::tempdir().unwrap();
+        let batch = directory.path().join("tool.cmd");
+        std::fs::write(&batch, "@echo off\r\n").unwrap();
+        let canonical = std::fs::canonicalize(batch).unwrap();
+        assert!(resolve_process_executable(&canonical.to_string_lossy())
+            .unwrap_err()
+            .contains("command shell"));
     }
 
     #[tokio::test]
@@ -8771,11 +9132,17 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .unwrap();
         assert_eq!(outcome.status, ExecutionStatus::AuthorizationRequired);
         assert_eq!(outcome.required_capabilities.len(), 1);
-        assert!(matches!(
-            outcome.required_capabilities[0].selector,
-            crate::vm::ResourceSelector::Process { ref executables }
-                if executables == &["/usr/bin/true"]
-        ));
+        let ResourceSelector::Process { executables } =
+            &outcome.required_capabilities[0].selector
+        else {
+            panic!("process request must use a stable executable identity");
+        };
+        assert_eq!(
+            ProcessExecutableIdentity::decode(&executables[0])
+                .unwrap()
+                .path,
+            "/usr/bin/true"
+        );
     }
 
     #[tokio::test]

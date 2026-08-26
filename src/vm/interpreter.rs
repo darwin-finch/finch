@@ -133,6 +133,14 @@ pub trait CapabilityHandler {
         self.request(&effect.requirement, arguments.clone(), &effect.origin)
     }
 
+    /// Let the host refine a concrete awaited effect to a stable host identity
+    /// before the VM checks grants, journals it, or exposes it for approval.
+    /// Implementations must only narrow the requirement represented by the
+    /// already-typed arguments; they must never widen authority here.
+    fn prepare_awaited_effect(&mut self, _effect: &mut VmSideEffect) -> Result<(), VmDiagnostic> {
+        Ok(())
+    }
+
     /// Observe an awaited request as soon as it enters the portable effect
     /// journal. This lets a host event loop render, persist, or hand the
     /// effect to another process before approval/result handling. It is an
