@@ -603,7 +603,25 @@ pub struct BrainEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "journal_record", rename_all = "snake_case")]
 enum BrainJournalRecord {
-    EventBatch { events: Vec<BrainEvent> },
+    EventBatch {
+        /// New batches carry their logical framing inside the physical JSONL
+        /// record. Optional fields keep journals written by the first batch
+        /// implementation readable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_count: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload_sha256: Option<String>,
+        events: Vec<BrainEvent>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DisconnectTerminalizationIntent {
+    sender: String,
+    run_id: RunId,
+    request_seq: u64,
+    status: BrainRunStatus,
+    detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -928,11 +946,31 @@ pub struct BrainStore {
     execution_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     run_publication_gates:
         Arc<RwLock<HashMap<(String, RunId), Arc<tokio::sync::Mutex<RunPublicationGate>>>>>,
+    /// Ephemeral transport generation that currently supervises a live run.
+    /// This is deliberately not replayed: restored queued work is transport
+    /// independent until a new connection explicitly dispatches it.
+    run_connection_authority: Arc<RwLock<RunConnectionAuthority>>,
+    disconnect_retry_owners: Arc<std::sync::Mutex<HashSet<(String, RunId)>>>,
+    #[cfg(test)]
+    fail_event_batches: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    fail_cancellation_terminal_appends: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    cancellation_reservation_pause: Arc<std::sync::Mutex<Option<(
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>>>,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct RunPublicationGate {
     cancel_requested: bool,
+}
+
+#[derive(Debug, Default)]
+struct RunConnectionAuthority {
+    owners: HashMap<(String, RunId), ConnectionId>,
+    retired: HashSet<(String, AttachmentId, ConnectionId)>,
 }
 
 impl RunPublicationGate {
@@ -942,6 +980,139 @@ impl RunPublicationGate {
 }
 
 impl BrainStore {
+    fn state_has_run_cancellation_reservation(state: &BrainState, run_id: RunId) -> bool {
+        state.events.iter().any(|event| matches!(
+            event.kind,
+            BrainEventKind::MutationRecorded {
+                outcome: BrainMutationOutcome::RunCancellationReserved { run_id: recorded },
+            } if recorded == run_id
+        ))
+    }
+
+    /// Durable cancellation intent is itself the publication fence. The
+    /// volatile gate exists only to serialize competing publishers.
+    pub(crate) fn run_cancellation_reserved(&self, name: &str, run_id: RunId) -> Result<bool> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brains = self.brains.read().expect("shared brain lock poisoned");
+        let state = brains.get(name).context("Brain was removed concurrently")?;
+        Ok(Self::state_has_run_cancellation_reservation(state, run_id))
+    }
+
+    pub(crate) fn schedule_disconnect_terminalization_retry(
+        &self,
+        name: String,
+        sender: String,
+        run_id: RunId,
+        request_seq: u64,
+        status: BrainRunStatus,
+        detail: String,
+    ) {
+        let key = (name.clone(), run_id);
+        if !self.disconnect_retry_owners
+            .lock()
+            .expect("disconnect retry registry poisoned")
+            .insert(key.clone())
+        {
+            return;
+        }
+        let store = self.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.disconnect_retry_owners
+                .lock()
+                .expect("disconnect retry registry poisoned")
+                .remove(&key);
+            tracing::error!(brain = %name, run_id = %run_id.0,
+                "disconnect terminalization has durable intent but no live retry runtime");
+            return;
+        };
+        runtime.spawn(async move {
+            let mut delay = std::time::Duration::from_millis(10);
+            loop {
+                match store.terminalize_run_with_result_if_active(
+                    &name, &sender, run_id, request_seq, status, detail.clone(),
+                ) {
+                    Ok(_) => {
+                        let terminal = store.inspect_run(&name, run_id)
+                            .is_ok_and(|run| run.status.is_terminal());
+                        let intent_pending = store.disconnect_intent_path(&name, run_id)
+                            .is_some_and(|path| path.exists());
+                        if terminal && !intent_pending { break; }
+                    }
+                    Err(error) => {
+                        tracing::error!(brain = %name, run_id = %run_id.0, %error,
+                            retry_ms = delay.as_millis(),
+                            "disconnect terminalization remains pending");
+                    }
+                }
+                let jitter = u64::from(run_id.0.as_bytes()[0]) % 7;
+                tokio::time::sleep(delay + std::time::Duration::from_millis(jitter)).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(5));
+            }
+            store.disconnect_retry_owners
+                .lock()
+                .expect("disconnect retry registry poisoned")
+                .remove(&key);
+        });
+    }
+
+    pub(crate) fn schedule_reserved_cancellation_retry(
+        &self, name: String, sender: String, run_id: RunId,
+    ) {
+        let key = (name.clone(), run_id);
+        if !self.disconnect_retry_owners.lock()
+            .expect("terminalization retry registry poisoned").insert(key.clone()) { return; }
+        let store = self.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.disconnect_retry_owners.lock()
+                .expect("terminalization retry registry poisoned").remove(&key);
+            tracing::error!(brain = %name, run_id = %run_id.0,
+                "reserved cancellation has no live retry runtime");
+            return;
+        };
+        runtime.spawn(async move {
+            let mut delay = std::time::Duration::from_millis(10);
+            loop {
+                let publication = match store.acquire_run_publication(&name, run_id).await {
+                    Ok(publication) => publication,
+                    Err(error) => {
+                        tracing::error!(brain = %name, run_id = %run_id.0, %error,
+                            "reserved cancellation retry could not acquire publication gate");
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(std::time::Duration::from_secs(5));
+                        continue;
+                    }
+                };
+                let terminal = store.inspect_run(&name, run_id)
+                    .is_ok_and(|run| run.status.is_terminal());
+                let reserved = store.run_cancellation_reserved(&name, run_id).unwrap_or(false);
+                if terminal || !reserved { drop(publication); break; }
+                let result = store.complete_reserved_run_cancellation(&name, &sender, run_id);
+                drop(publication);
+                match result {
+                    Ok(_) => { let _ = store.prune_run_publication(&name, run_id); break; }
+                    Err(error) => tracing::error!(brain = %name, run_id = %run_id.0, %error,
+                        retry_ms = delay.as_millis(),
+                        "reserved cancellation terminalization remains pending"),
+                }
+                let jitter = u64::from(run_id.0.as_bytes()[1]) % 7;
+                tokio::time::sleep(delay + std::time::Duration::from_millis(jitter)).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(5));
+            }
+            store.disconnect_retry_owners.lock()
+                .expect("terminalization retry registry poisoned").remove(&key);
+        });
+    }
+
+    /// Number of disconnect terminalizations currently awaiting durable
+    /// publication. Health reporting uses this to expose persistent failures.
+    pub fn pending_disconnect_terminalization_retries(&self) -> usize {
+        self.disconnect_retry_owners
+            .lock()
+            .expect("disconnect retry registry poisoned")
+            .len()
+    }
+
     pub fn new(machine: impl Into<String>) -> Self {
         let root = dirs::home_dir().map(|p| p.join(".finch").join("brains"));
         Self::with_root(machine, root)
@@ -972,6 +1143,14 @@ impl BrainStore {
             runtime_checkpoints: Arc::new(RwLock::new(HashMap::new())),
             execution_locks: Arc::new(RwLock::new(HashMap::new())),
             run_publication_gates: Arc::new(RwLock::new(HashMap::new())),
+            run_connection_authority: Arc::new(RwLock::new(RunConnectionAuthority::default())),
+            disconnect_retry_owners: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            fail_event_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_cancellation_terminal_appends: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            cancellation_reservation_pause: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -1007,6 +1186,65 @@ impl BrainStore {
             .entry(name.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone())
+    }
+
+    pub(crate) fn bind_run_connection(
+        &self,
+        name: &str,
+        run_id: RunId,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+    ) -> Result<()> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brains = self.brains.read().expect("shared brain lock poisoned");
+        let state = brains.get(name).context("Brain was removed concurrently")?;
+        let attachment = state.attachments.get(&attachment_id).context("unknown Brain attachment")?;
+        anyhow::ensure!(
+            attachment.connected && attachment.connection_id == Some(connection_id),
+            "Brain attachment connection is no longer current"
+        );
+        anyhow::ensure!(
+            state.runs.get(&run_id).is_some_and(|run| !run.status.is_terminal()),
+            "terminal Brain run cannot acquire connection ownership"
+        );
+        let mut authority = self.run_connection_authority.write()
+            .expect("shared Brain run-authority map poisoned");
+        anyhow::ensure!(
+            !authority.retired.contains(&(name.to_string(), attachment_id, connection_id)),
+            "Brain attachment connection is no longer current"
+        );
+        authority.owners.insert((name.to_string(), run_id), connection_id);
+        Ok(())
+    }
+
+    pub(crate) fn retire_connection_and_owned_active_runs(
+        &self,
+        name: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+    ) -> Result<Vec<RunId>> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brains = self.brains.read().expect("shared brain lock poisoned");
+        let state = brains.get(name).context("Brain was removed concurrently")?;
+        let attachment = state.attachments.get(&attachment_id).context("unknown Brain attachment")?;
+        anyhow::ensure!(attachment.connected && attachment.connection_id == Some(connection_id),
+            "Brain attachment connection is no longer current");
+        let mut authority = self.run_connection_authority.write()
+            .expect("shared Brain run-authority map poisoned");
+        authority.retired.insert((name.to_string(), attachment_id, connection_id));
+        Ok(state.runs.values()
+            .filter(|run| {
+                run.initiating_attachment_id == attachment_id
+                    && matches!(
+                        run.status,
+                        BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
+                    )
+                    && authority.owners.get(&(name.to_string(), run.run_id)) == Some(&connection_id)
+            })
+            .map(|run| run.run_id)
+            .collect())
     }
 
     fn run_publication_gate(
@@ -1067,6 +1305,10 @@ impl BrainStore {
             .write()
             .expect("shared Brain run-gate map poisoned")
             .remove(&(name.to_string(), run_id));
+        self.run_connection_authority
+            .write()
+            .expect("shared Brain run-authority map poisoned")
+            .owners.remove(&(name.to_string(), run_id));
         Ok(())
     }
 
@@ -1835,7 +2077,161 @@ impl BrainStore {
         Ok(transitioned)
     }
 
-    pub fn reserve_run_cancellation(
+    pub(crate) fn terminalize_run_with_result_if_active(
+        &self,
+        name: &str,
+        sender: &str,
+        run_id: RunId,
+        request_seq: u64,
+        status: BrainRunStatus,
+        detail: String,
+    ) -> Result<Option<BrainEvent>> {
+        anyhow::ensure!(status.is_terminal(), "run terminalization requires a terminal status");
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let publication = match self.run_publication_gate(name, run_id)?.try_lock_owned() {
+            Ok(publication) => publication,
+            Err(_) => return Ok(None),
+        };
+        if publication.cancel_requested() || self.run_cancellation_reserved(name, run_id)? {
+            return Ok(None);
+        }
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        let current = state.runs.get(&run_id)
+            .with_context(|| format!("Brain run {} does not exist", run_id.0))?;
+        if current.status.is_terminal() {
+            self.clear_disconnect_intent(name, run_id)?;
+            return Ok(None);
+        }
+        validate_run_transition(current.status, status)?;
+        let intent = DisconnectTerminalizationIntent {
+            sender: sender.to_string(),
+            run_id,
+            request_seq,
+            status,
+            detail: detail.clone(),
+        };
+        self.persist_disconnect_intent(name, &intent)?;
+        let existing = state.events.iter().find(|event| {
+            event.run_id == Some(run_id)
+                && matches!(event.kind, BrainEventKind::Result { .. })
+        }).cloned();
+        let next_seq = state.events.last().map(|event| event.seq + 1).unwrap_or(1);
+        let now = unix_millis();
+        let result = existing.unwrap_or_else(|| BrainEvent {
+            schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+            brain_id: state.brain_id,
+            seq: next_seq,
+            environment_generation: self.environment.generation,
+            sender: sender.to_string(),
+            created_ms: now,
+            run_id: Some(run_id),
+            mutation: None,
+            kind: BrainEventKind::Result {
+                request_seq,
+                output: String::new(),
+                error: Some(detail.clone()),
+            },
+        });
+        let result_is_durable = state.events.iter().any(|event| event.seq == result.seq);
+        let terminal = BrainEvent {
+            schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+            brain_id: state.brain_id,
+            seq: next_seq + u64::from(!result_is_durable),
+            environment_generation: self.environment.generation,
+            sender: sender.to_string(),
+            created_ms: now,
+            run_id: Some(run_id),
+            mutation: None,
+            kind: BrainEventKind::RunStatusChanged {
+                run_id,
+                status,
+                detail: Some(detail),
+            },
+        };
+        let events = if result_is_durable {
+            vec![terminal]
+        } else {
+            vec![result.clone(), terminal]
+        };
+        self.append_event_batch(name, &events)?;
+        for event in events {
+            state.apply(event.clone());
+            let _ = state.tx.send(event);
+        }
+        self.clear_disconnect_intent(name, run_id)?;
+        drop(brains);
+        drop(publication);
+        self.prune_run_publication(name, run_id)?;
+        Ok(Some(result))
+    }
+
+    pub(crate) fn begin_run_approval_for_connection(
+        &self,
+        name: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        request_seq: u64,
+        approval_id: String,
+        approval_kind: String,
+        subject: String,
+        audience: BrainApprovalAudience,
+        detail: serde_json::Value,
+    ) -> Result<RunId> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        let attachment = state.attachments.get(&attachment_id)
+            .context("unknown Brain attachment")?;
+        anyhow::ensure!(
+            attachment.connected && attachment.connection_id == Some(connection_id),
+            "approval audience connection is no longer current"
+        );
+        let run_id = state.runs.values().find(|run| {
+            run.request_seq == request_seq && run.status == BrainRunStatus::Running
+        }).map(|run| run.run_id)
+            .context("approval request does not address a running Brain run")?;
+        anyhow::ensure!(
+            !Self::state_has_run_cancellation_reservation(state, run_id),
+            "named Brain run cancelled"
+        );
+        self.push_locked_for_run(
+            name, state, "daemon", Some(run_id),
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status: BrainRunStatus::AwaitingApproval,
+                detail: Some(format!("awaiting approval {approval_id}")),
+            },
+        )?;
+        if approval_kind == "tool" {
+            let input = detail.get("input").cloned().unwrap_or(serde_json::Value::Null);
+            self.push_locked_for_run(
+                name, state, "provider", Some(run_id),
+                BrainEventKind::ToolCall {
+                    request_seq,
+                    tool_id: approval_id.clone(),
+                    name: subject.clone(),
+                    input,
+                },
+            )?;
+        }
+        self.push_locked_for_run(
+            name, state, "runner", Some(run_id),
+            BrainEventKind::ApprovalRequested {
+                request_seq,
+                approval_id,
+                approval_kind,
+                subject,
+                audience: Some(audience),
+                detail,
+            },
+        )?;
+        Ok(run_id)
+    }
+
+    pub async fn reserve_run_cancellation(
         &self,
         name: &str,
         sender: &str,
@@ -1845,6 +2241,7 @@ impl BrainStore {
     ) -> Result<BrainRunCancellationReservation> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
+        let mut publication = self.acquire_run_publication(name, run_id).await?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains.get_mut(name).context("Brain was removed concurrently")?;
         if let Some(existing) = state.events.iter().find(|event| {
@@ -1917,9 +2314,34 @@ impl BrainStore {
             BrainEventKind::MutationRecorded {
                 outcome: BrainMutationOutcome::RunCancellationReserved { run_id },
             }, receipt)?;
+        #[cfg(test)]
+        let pause = self.cancellation_reservation_pause
+            .lock()
+            .expect("cancellation reservation test hook poisoned")
+            .take();
+        drop(brains);
+        #[cfg(test)]
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.recv();
+        }
+        publication.cancel_requested = true;
         Ok(BrainRunCancellationReservation {
             run, needs_runner_cancel: true, replayed: false,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_cancellation_reservation_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.cancellation_reservation_pause
+            .lock()
+            .expect("cancellation reservation test hook poisoned") =
+            Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
     }
 
     pub fn complete_reserved_run_cancellation(
@@ -1934,6 +2356,54 @@ impl BrainStore {
         }
         self.transition_run(name, sender, run_id, BrainRunStatus::Cancelled,
             Some("cancelled by initiating driver".into()))
+    }
+
+    pub(crate) fn pending_reserved_cancellations_for_attachment(
+        &self,
+        name: &str,
+        attachment_id: AttachmentId,
+    ) -> Result<Vec<RunId>> {
+        let snapshot = self.snapshot(name)?;
+        Ok(snapshot
+            .runs
+            .iter()
+            .filter(|run| {
+                run.initiating_attachment_id == attachment_id
+                    && !run.status.is_terminal()
+                    && snapshot.events.iter().any(|event| {
+                        matches!(
+                            event.kind,
+                            BrainEventKind::MutationRecorded {
+                                outcome: BrainMutationOutcome::RunCancellationReserved { run_id },
+                            } if run_id == run.run_id
+                        )
+                    })
+            })
+            .map(|run| run.run_id)
+            .collect())
+    }
+
+    pub(crate) fn complete_reserved_run_cancellation_on_disconnect(
+        &self,
+        name: &str,
+        sender: &str,
+        run_id: RunId,
+    ) -> Result<bool> {
+        let publication = match self.run_publication_gate(name, run_id)?.try_lock_owned() {
+            Ok(publication) => publication,
+            Err(_) => return Ok(false),
+        };
+        if !self.run_cancellation_reserved(name, run_id)? {
+            return Ok(false);
+        }
+        let current = self.inspect_run(name, run_id)?;
+        if current.status.is_terminal() {
+            return Ok(false);
+        }
+        self.complete_reserved_run_cancellation(name, sender, run_id)?;
+        drop(publication);
+        self.prune_run_publication(name, run_id)?;
+        Ok(true)
     }
 
     pub fn mark_run_cancellation_dispatching(
@@ -3481,6 +3951,9 @@ impl BrainStore {
         // valid runner lease. A run that was already executing or suspended
         // for approval has unknown external progress after daemon restart and
         // must never be replayed implicitly.
+        let mut disconnect_intents = self.read_disconnect_intents(name)?;
+        let mut retry_after_load = Vec::new();
+        let mut retry_cancellations_after_load = Vec::new();
         let orphaned_runs = state
             .runs
             .values()
@@ -3493,6 +3966,79 @@ impl BrainStore {
             .map(|run| run.run_id)
             .collect::<Vec<_>>();
         for run_id in orphaned_runs {
+            if Self::state_has_run_cancellation_reservation(&state, run_id) {
+                let event = BrainEvent {
+                    schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+                    brain_id: state.brain_id,
+                    seq: state.events.last().map(|event| event.seq + 1).unwrap_or(1),
+                    environment_generation: self.environment.generation,
+                    sender: "daemon".into(),
+                    created_ms: unix_millis(),
+                    run_id: Some(run_id),
+                    mutation: None,
+                    kind: BrainEventKind::RunStatusChanged {
+                        run_id,
+                        status: BrainRunStatus::Cancelled,
+                        detail: Some("cancelled by initiating driver".into()),
+                    },
+                };
+                match self.append_event(name, &event) {
+                    Ok(()) => state.apply(event),
+                    Err(error) => {
+                        tracing::error!(brain = %name, run_id = %run_id.0, %error,
+                            "restart could not complete reserved cancellation; requeueing");
+                        retry_cancellations_after_load.push(run_id);
+                    }
+                }
+                continue;
+            }
+            if let Some(intent) = disconnect_intents.remove(&run_id) {
+                let next_seq = state.events.last().map(|event| event.seq + 1).unwrap_or(1);
+                let now = unix_millis();
+                let result = BrainEvent {
+                    schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+                    brain_id: state.brain_id,
+                    seq: next_seq,
+                    environment_generation: self.environment.generation,
+                    sender: intent.sender.clone(),
+                    created_ms: now,
+                    run_id: Some(run_id),
+                    mutation: None,
+                    kind: BrainEventKind::Result {
+                        request_seq: intent.request_seq,
+                        output: String::new(),
+                        error: Some(intent.detail.clone()),
+                    },
+                };
+                let terminal = BrainEvent {
+                    schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+                    brain_id: state.brain_id,
+                    seq: next_seq + 1,
+                    environment_generation: self.environment.generation,
+                    sender: intent.sender.clone(),
+                    created_ms: now,
+                    run_id: Some(run_id),
+                    mutation: None,
+                    kind: BrainEventKind::RunStatusChanged {
+                        run_id,
+                        status: intent.status,
+                        detail: Some(intent.detail.clone()),
+                    },
+                };
+                match self.append_event_batch(name, &[result.clone(), terminal.clone()]) {
+                    Ok(()) => {
+                        state.apply(result);
+                        state.apply(terminal);
+                        self.clear_disconnect_intent(name, run_id)?;
+                    }
+                    Err(error) => {
+                        tracing::error!(brain = %name, run_id = %run_id.0, %error,
+                            "restart could not reconcile disconnect terminalization; requeueing");
+                        retry_after_load.push(intent);
+                    }
+                }
+                continue;
+            }
             let event = BrainEvent {
                 schema_version: BRAIN_EVENT_SCHEMA_VERSION,
                 brain_id: state.brain_id,
@@ -3511,6 +4057,11 @@ impl BrainStore {
             self.append_event(name, &event)?;
             state.apply(event);
         }
+        for run_id in disconnect_intents.keys().copied().collect::<Vec<_>>() {
+            if state.runs.get(&run_id).is_some_and(|run| run.status.is_terminal()) {
+                self.clear_disconnect_intent(name, run_id)?;
+            }
+        }
         self.initializations
             .write()
             .expect("shared Brain initialization lock poisoned")
@@ -3521,6 +4072,15 @@ impl BrainStore {
             .expect("shared brain lock poisoned")
             .entry(name.to_string())
             .or_insert(state);
+        for intent in retry_after_load {
+            self.schedule_disconnect_terminalization_retry(
+                name.to_string(), intent.sender, intent.run_id, intent.request_seq,
+                intent.status, intent.detail,
+            );
+        }
+        for run_id in retry_cancellations_after_load {
+            self.schedule_reserved_cancellation_retry(name.to_string(), "daemon".into(), run_id);
+        }
         Ok(())
     }
 
@@ -3696,6 +4256,61 @@ impl BrainStore {
             .map(|root| root.join(name).join("events.jsonl"))
     }
 
+    fn disconnect_intent_path(&self, name: &str, run_id: RunId) -> Option<PathBuf> {
+        self.root.as_ref().map(|root| {
+            root.join(name)
+                .join("disconnect-terminalizations")
+                .join(format!("{}.json", run_id.0))
+        })
+    }
+
+    fn persist_disconnect_intent(
+        &self,
+        name: &str,
+        intent: &DisconnectTerminalizationIntent,
+    ) -> Result<()> {
+        let Some(path) = self.disconnect_intent_path(name, intent.run_id) else {
+            return Ok(());
+        };
+        let directory = path.parent().expect("disconnect intent has a parent");
+        create_dir_all_durable(directory)?;
+        let temporary = directory.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&temporary, serde_json::to_vec(intent)?)?;
+        std::fs::File::open(&temporary)?.sync_all()?;
+        std::fs::rename(&temporary, &path)?;
+        sync_directory(directory)
+    }
+
+    fn clear_disconnect_intent(&self, name: &str, run_id: RunId) -> Result<()> {
+        let Some(path) = self.disconnect_intent_path(name, run_id) else {
+            return Ok(());
+        };
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+            if let Some(parent) = path.parent() {
+                sync_directory(parent)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_disconnect_intents(&self, name: &str) -> Result<HashMap<RunId, DisconnectTerminalizationIntent>> {
+        let Some(root) = &self.root else { return Ok(HashMap::new()) };
+        let directory = root.join(name).join("disconnect-terminalizations");
+        let Ok(entries) = std::fs::read_dir(directory) else { return Ok(HashMap::new()) };
+        let mut intents = HashMap::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let intent: DisconnectTerminalizationIntent =
+                serde_json::from_slice(&std::fs::read(entry.path())?)?;
+            intents.insert(intent.run_id, intent);
+        }
+        Ok(intents)
+    }
+
     fn read_events(&self, name: &str) -> Result<Vec<BrainEvent>> {
         let Some(path) = self.event_path(name) else {
             return Ok(Vec::new());
@@ -3715,7 +4330,9 @@ impl BrainStore {
                 .with_context(|| format!("sync recovered {}", path.display()))?;
         }
         let mut events = Vec::new();
-        for (line_no, terminated) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let records = bytes.split_inclusive(|byte| *byte == b'\n').collect::<Vec<_>>();
+        let mut committed_offset = 0usize;
+        for (line_no, terminated) in records.iter().enumerate() {
             // Committed records are newline-terminated. A torn final append
             // projects none of its logical events after restart.
             if terminated.last() != Some(&b'\n') {
@@ -3725,28 +4342,93 @@ impl BrainStore {
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            if let Ok(BrainJournalRecord::EventBatch { events: batch }) =
-                serde_json::from_slice::<BrainJournalRecord>(line)
-            {
+            let parsed = match serde_json::from_slice::<BrainJournalRecord>(line) {
+                Ok(BrainJournalRecord::EventBatch {
+                    event_count,
+                    payload_sha256,
+                    events: batch,
+                }) => {
+                    let valid_framing = match (event_count, payload_sha256) {
+                        (None, None) => true,
+                        (Some(count), Some(checksum)) => {
+                            count == batch.len()
+                                && serde_json::to_vec(&batch).is_ok_and(|payload| {
+                                    hex::encode(Sha256::digest(payload)) == checksum
+                                })
+                        }
+                        _ => false,
+                    };
+                    valid_framing.then_some(batch)
+                }
+                Err(_) => serde_json::from_slice::<BrainEvent>(line)
+                    .ok()
+                    .map(|event| vec![event]),
+            };
+            if let Some(batch) = parsed {
                 events.extend(batch);
-            } else {
-                events.push(serde_json::from_slice(line).with_context(|| {
-                    format!("parse {} line {}", path.display(), line_no + 1)
-                })?);
+                committed_offset += terminated.len();
+                continue;
             }
+            if line_no + 1 == records.len() {
+                let file = OpenOptions::new().write(true).open(&path)
+                    .with_context(|| format!("open {} for corrupt-tail recovery", path.display()))?;
+                file.set_len(committed_offset as u64)
+                    .with_context(|| format!("truncate corrupt tail in {}", path.display()))?;
+                file.sync_all()
+                    .with_context(|| format!("sync recovered {}", path.display()))?;
+                break;
+            }
+            anyhow::bail!("parse {} line {}", path.display(), line_no + 1);
         }
         Ok(events)
     }
 
     fn append_event(&self, name: &str, event: &BrainEvent) -> Result<()> {
+        #[cfg(test)]
+        if matches!(event.kind, BrainEventKind::RunStatusChanged {
+            status: BrainRunStatus::Cancelled, ..
+        }) && self.fail_cancellation_terminal_appends.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |remaining| if remaining > 0 { Some(remaining - 1) } else { None },
+        ).is_ok() {
+            anyhow::bail!("injected reserved cancellation terminal append failure");
+        }
         self.append_journal_value(name, event)
     }
 
     fn append_event_batch(&self, name: &str, events: &[BrainEvent]) -> Result<()> {
         anyhow::ensure!(!events.is_empty(), "Brain event batch cannot be empty");
+        #[cfg(test)]
+        if self.fail_event_batches.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |remaining| if remaining > 0 { Some(remaining - 1) } else { None },
+        ).is_ok() {
+            anyhow::bail!("injected Brain event batch append failure");
+        }
+        let payload = serde_json::to_vec(events)?;
         self.append_journal_value(name, &BrainJournalRecord::EventBatch {
+            event_count: Some(events.len()),
+            payload_sha256: Some(hex::encode(Sha256::digest(payload))),
             events: events.to_vec(),
         })
+    }
+
+    #[cfg(test)]
+    fn fail_next_event_batch_for_test(&self) {
+        self.fail_event_batches.store(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn fail_event_batches_for_test(&self, count: usize) {
+        self.fail_event_batches.store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_cancellation_terminal_appends_for_test(&self, count: usize) {
+        self.fail_cancellation_terminal_appends
+            .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn append_journal_value<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
@@ -4059,9 +4741,14 @@ mod tests {
         let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let id = store.snapshot("shared").unwrap().brain_id;
         store.append_event("shared", &journal_event(id, 1, "committed")).unwrap();
-        let encoded = serde_json::to_vec(&BrainJournalRecord::EventBatch { events: vec![
-            journal_event(id, 2, "hidden"), journal_event(id, 3, "hidden-too")
-        ]}).unwrap();
+        let encoded = serde_json::to_vec(&BrainJournalRecord::EventBatch {
+            event_count: None,
+            payload_sha256: None,
+            events: vec![
+                journal_event(id, 2, "hidden"),
+                journal_event(id, 3, "hidden-too"),
+            ],
+        }).unwrap();
         OpenOptions::new().append(true)
             .open(temp.path().join("shared/events.jsonl")).unwrap()
             .write_all(&encoded[..encoded.len() / 2]).unwrap();
@@ -4562,6 +5249,229 @@ mod tests {
         assert_eq!(restored.request_seq, prompt.seq);
         assert_eq!(restored.status, BrainRunStatus::Completed);
         assert!(restored.updated_ms >= restored.started_ms);
+    }
+
+    #[test]
+    fn explicit_cancel_racing_disconnect_never_publishes_result_after_terminal() {
+        let store = BrainStore::with_root("box.local", None);
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let prompt = store.push(
+            "shared",
+            "alice",
+            BrainEventKind::Prompt { text: "race".into() },
+        ).unwrap();
+        let run = store.start_run(
+            "shared",
+            "alice",
+            BrainRunKind::Interactive,
+            prompt.seq,
+            attachment.attachment_id,
+            BrainRunStatus::Running,
+        ).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let cancel_store = store.clone();
+        let cancel_barrier = barrier.clone();
+        let run_id = run.run_id;
+        let cancel = std::thread::spawn(move || {
+            cancel_barrier.wait();
+            cancel_store.transition_run(
+                "shared",
+                "alice",
+                run_id,
+                BrainRunStatus::Cancelled,
+                Some("cancelled by initiating driver".into()),
+            )
+        });
+        let disconnect_store = store.clone();
+        let disconnect_barrier = barrier.clone();
+        let disconnect = std::thread::spawn(move || {
+            disconnect_barrier.wait();
+            disconnect_store.terminalize_run_with_result_if_active(
+                "shared",
+                "daemon",
+                run_id,
+                prompt.seq,
+                BrainRunStatus::Failed,
+                "initiating Brain connection disconnected".into(),
+            )
+        });
+        barrier.wait();
+        let _ = cancel.join().unwrap();
+        disconnect.join().unwrap().unwrap();
+
+        let snapshot = store.snapshot("shared").unwrap();
+        let terminal = snapshot.events.iter().filter(|event| matches!(
+            event.kind,
+            BrainEventKind::RunStatusChanged { run_id: event_run_id, status, .. }
+                if event_run_id == run_id && status.is_terminal()
+        )).collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 1);
+        assert!(!snapshot.events.iter().any(|event| {
+            event.seq > terminal[0].seq
+                && event.run_id == Some(run_id)
+                && matches!(event.kind, BrainEventKind::Result { .. })
+        }));
+        assert!(snapshot.events.iter().filter(|event| {
+            event.run_id == Some(run_id)
+                && matches!(event.kind, BrainEventKind::Result { .. })
+        }).count() <= 1);
+    }
+
+    #[test]
+    fn disconnect_terminal_batch_is_all_or_nothing_across_failure_and_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store.attach(
+            "shared", "alice", AttachmentRole::Driver, None,
+        ).unwrap();
+        let prompt = store.push(
+            "shared", "alice", BrainEventKind::Prompt { text: "crash".into() },
+        ).unwrap();
+        let run = store.start_run(
+            "shared", "alice", BrainRunKind::Interactive, prompt.seq,
+            attachment.attachment_id, BrainRunStatus::Running,
+        ).unwrap();
+        let before = store.snapshot("shared").unwrap().revision;
+        store.fail_next_event_batch_for_test();
+        assert!(store.terminalize_run_with_result_if_active(
+            "shared", "daemon", run.run_id, prompt.seq, BrainRunStatus::Failed,
+            "initiating Brain connection disconnected".into(),
+        ).is_err());
+        let failed_append = store.snapshot("shared").unwrap();
+        assert_eq!(failed_append.revision, before);
+        assert_eq!(failed_append.runs.iter().find(|candidate| {
+            candidate.run_id == run.run_id
+        }).unwrap().status, BrainRunStatus::Running);
+        assert!(!failed_append.events.iter().any(|event| {
+            event.run_id == Some(run.run_id)
+                && matches!(event.kind, BrainEventKind::Result { .. })
+        }));
+
+        drop(store);
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let recovered = restarted.snapshot("shared").unwrap();
+        assert_eq!(recovered.runs.iter().find(|candidate| {
+            candidate.run_id == run.run_id
+        }).unwrap().status, BrainRunStatus::Failed);
+        assert_eq!(recovered.events.iter().filter(|event| {
+            event.run_id == Some(run.run_id)
+                && matches!(event.kind, BrainEventKind::Result { .. })
+        }).count(), 1);
+        assert_eq!(recovered.events.iter().filter(|event| matches!(
+            event.kind,
+            BrainEventKind::RunStatusChanged { run_id: event_run_id, status, .. }
+                if event_run_id == run.run_id && status.is_terminal()
+        )).count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_terminal_retry_owner_survives_extended_transient_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = store.attach(
+            "shared", "alice", AttachmentRole::Driver, None,
+        ).unwrap();
+        let prompt = store.push(
+            "shared", "alice", BrainEventKind::Prompt { text: "retry".into() },
+        ).unwrap();
+        let run = store.start_run(
+            "shared", "alice", BrainRunKind::Interactive, prompt.seq,
+            attachment.attachment_id, BrainRunStatus::Running,
+        ).unwrap();
+        store.fail_event_batches_for_test(12);
+        let detail = "initiating Brain connection disconnected".to_string();
+        assert!(store.terminalize_run_with_result_if_active(
+            "shared", "daemon", run.run_id, prompt.seq,
+            BrainRunStatus::Failed, detail.clone(),
+        ).is_err());
+        store.schedule_disconnect_terminalization_retry(
+            "shared".into(), "daemon".into(), run.run_id, prompt.seq,
+            BrainRunStatus::Failed, detail.clone(),
+        );
+        store.schedule_disconnect_terminalization_retry(
+            "shared".into(), "daemon".into(), run.run_id, prompt.seq,
+            BrainRunStatus::Failed, detail,
+        );
+        assert_eq!(store.pending_disconnect_terminalization_retries(), 1);
+        let publication = store.acquire_run_publication("shared", run.run_id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert_eq!(store.pending_disconnect_terminalization_retries(), 1);
+        assert_eq!(store.inspect_run("shared", run.run_id).unwrap().status,
+            BrainRunStatus::Running);
+        drop(publication);
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                if store.inspect_run("shared", run.run_id).unwrap().status
+                    == BrainRunStatus::Failed
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(store.pending_disconnect_terminalization_retries(), 0);
+        let snapshot = store.snapshot("shared").unwrap();
+        assert_eq!(snapshot.events.iter().filter(|event| {
+            event.run_id == Some(run.run_id)
+                && matches!(event.kind, BrainEventKind::Result { .. })
+        }).count(), 1);
+        assert_eq!(snapshot.events.iter().filter(|event| matches!(
+            event.kind,
+            BrainEventKind::RunStatusChanged { run_id: event_run_id, status, .. }
+                if event_run_id == run.run_id && status.is_terminal()
+        )).count(), 1);
+    }
+
+    #[test]
+    fn restart_ignores_newline_terminated_batch_with_invalid_checksum() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        store.push("shared", "alice", BrainEventKind::Prompt {
+            text: "committed".into(),
+        }).unwrap();
+        let snapshot = store.snapshot("shared").unwrap();
+        let next_seq = snapshot.revision + 1;
+        let run_id = RunId(uuid::Uuid::new_v4());
+        let result = BrainEvent {
+            schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+            brain_id: snapshot.brain_id,
+            seq: next_seq,
+            environment_generation: snapshot.environment.generation,
+            sender: "daemon".into(),
+            created_ms: unix_millis(),
+            run_id: Some(run_id),
+            mutation: None,
+            kind: BrainEventKind::Result {
+                request_seq: 1,
+                output: String::new(),
+                error: Some("torn disconnect".into()),
+            },
+        };
+        let terminal = BrainEvent {
+            seq: next_seq + 1,
+            kind: BrainEventKind::RunStatusChanged {
+                run_id,
+                status: BrainRunStatus::Failed,
+                detail: Some("torn disconnect".into()),
+            },
+            ..result.clone()
+        };
+        let encoded = serde_json::to_vec(&BrainJournalRecord::EventBatch {
+            event_count: Some(2),
+            payload_sha256: Some("invalid-checksum".into()),
+            events: vec![result, terminal],
+        }).unwrap();
+        OpenOptions::new().append(true)
+            .open(temp.path().join("shared/events.jsonl")).unwrap()
+            .write_all(&[encoded.as_slice(), b"\n"].concat()).unwrap();
+        drop(store);
+
+        let recovered = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let recovered_snapshot = recovered.snapshot("shared").unwrap();
+        assert_eq!(recovered_snapshot.revision, snapshot.revision);
+        assert!(recovered_snapshot.events.iter().all(|event| event.run_id != Some(run_id)));
     }
 
     #[tokio::test]
@@ -6351,8 +7261,8 @@ mod tests {
         assert!(restarted.snapshot("shared").unwrap().runner_handoff.is_none());
     }
 
-    #[test]
-    fn accepted_noop_mutations_consume_their_uuid_with_typed_outcomes() {
+    #[tokio::test]
+    async fn accepted_noop_mutations_consume_their_uuid_with_typed_outcomes() {
         let store = BrainStore::with_root("box.local", None);
         let attachment = AttachmentId::new();
         let schedule_id = ScheduleId::new();
@@ -6398,11 +7308,11 @@ mod tests {
         );
         let reserved = store.reserve_run_cancellation(
             "shared", "alice", attachment, run.run_id, run_receipt.clone(),
-        ).unwrap();
+        ).await.unwrap();
         assert!(!reserved.needs_runner_cancel);
         assert!(store.reserve_run_cancellation(
             "shared", "alice", attachment, run.run_id, run_receipt,
-        ).unwrap().replayed);
+        ).await.unwrap().replayed);
 
         let missing_run = RunId::new();
         let missing_receipt = mutation_receipt(
@@ -6411,19 +7321,19 @@ mod tests {
         );
         assert!(store.reserve_run_cancellation(
             "shared", "alice", attachment, missing_run, missing_receipt.clone(),
-        ).unwrap_err().to_string().contains("does not exist"));
+        ).await.unwrap_err().to_string().contains("does not exist"));
         assert!(store.reserve_run_cancellation(
             "shared", "alice", attachment, missing_run, missing_receipt.clone(),
-        ).unwrap_err().to_string().contains("does not exist or has already finished"));
+        ).await.unwrap_err().to_string().contains("does not exist or has already finished"));
         let mut changed = missing_receipt;
         changed.environment_generation += 1;
         assert!(store.reserve_run_cancellation(
             "shared", "alice", attachment, missing_run, changed,
-        ).unwrap_err().to_string().contains("different command or precondition"));
+        ).await.unwrap_err().to_string().contains("different command or precondition"));
     }
 
-    #[test]
-    fn run_cancellation_recovers_each_persisted_crash_boundary() {
+    #[tokio::test]
+    async fn run_cancellation_recovers_each_persisted_crash_boundary() {
         for boundary in 0..3 {
             let temp = tempfile::tempdir().unwrap();
             let store = BrainStore::with_root("box.local", Some(temp.path().into()));
@@ -6441,7 +7351,7 @@ mod tests {
             );
             store.reserve_run_cancellation(
                 "shared", "alice", attachment, run.run_id, receipt.clone(),
-            ).unwrap();
+            ).await.unwrap();
             if boundary >= 1 {
                 store.mark_run_cancellation_dispatching(
                     "shared", "alice", run.run_id, receipt.mutation_id,
@@ -6456,10 +7366,10 @@ mod tests {
 
             let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
             assert_eq!(restarted.inspect_run("shared", run.run_id).unwrap().status,
-                BrainRunStatus::Interrupted);
+                BrainRunStatus::Cancelled);
             let replay = restarted.reserve_run_cancellation(
                 "shared", "alice", attachment, run.run_id, receipt.clone(),
-            ).unwrap();
+            ).await.unwrap();
             assert!(replay.replayed);
             restarted.mark_run_cancellation_dispatching(
                 "shared", "alice", run.run_id, receipt.mutation_id,
@@ -6474,21 +7384,70 @@ mod tests {
                 BrainRunStatus::Cancelled);
             assert!(!restarted.reserve_run_cancellation(
                 "shared", "alice", attachment, run.run_id, receipt.clone(),
-            ).unwrap().needs_runner_cancel);
+            ).await.unwrap().needs_runner_cancel);
             let mut conflicting = receipt.clone();
             conflicting.expected_revision += 1;
             assert!(restarted.reserve_run_cancellation(
                 "shared", "alice", attachment, run.run_id, conflicting,
-            ).unwrap_err().to_string().contains("different command or precondition"));
+            ).await.unwrap_err().to_string().contains("different command or precondition"));
             let conflicting_uuid = BrainMutationReceipt {
                 mutation_id: uuid::Uuid::new_v4(),
                 ..receipt
             };
             let error = restarted.reserve_run_cancellation(
                 "shared", "alice", attachment, run.run_id, conflicting_uuid,
-            ).unwrap_err();
+            ).await.unwrap_err();
             assert!(error.to_string().contains("revision"), "{error:#}");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reserved_cancellation_restart_retries_until_durable_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let attachment = AttachmentId::new();
+        let accepted = store.push(
+            "shared", "alice", BrainEventKind::Prompt { text: "cancel me".into() },
+        ).unwrap();
+        let run = store.start_run(
+            "shared", "alice", BrainRunKind::Interactive, accepted.seq, attachment,
+            BrainRunStatus::Running,
+        ).unwrap();
+        let receipt = mutation_receipt(
+            &store, attachment, uuid::Uuid::new_v4(),
+            store.snapshot("shared").unwrap().revision, "cancel-run-restart-retry",
+        );
+        store.reserve_run_cancellation(
+            "shared", "alice", attachment, run.run_id, receipt.clone(),
+        ).await.unwrap();
+        drop(store);
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        restarted.fail_cancellation_terminal_appends_for_test(5);
+        restarted.list().unwrap();
+        assert_eq!(restarted.pending_disconnect_terminalization_retries(), 1);
+        assert_eq!(restarted.inspect_run("shared", run.run_id).unwrap().status,
+            BrainRunStatus::Running);
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                if restarted.inspect_run("shared", run.run_id).unwrap().status
+                    == BrainRunStatus::Cancelled { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(restarted.pending_disconnect_terminalization_retries(), 0);
+        let snapshot = restarted.snapshot("shared").unwrap();
+        assert_eq!(snapshot.events.iter().filter(|event| matches!(
+            event.kind,
+            BrainEventKind::RunStatusChanged { run_id: event_run_id, status, .. }
+                if event_run_id == run.run_id && status == BrainRunStatus::Cancelled
+        )).count(), 1);
+        assert!(!snapshot.events.iter().any(|event| {
+            event.run_id == Some(run.run_id) && matches!(event.kind, BrainEventKind::Result { .. })
+        }));
+        assert!(restarted.reserve_run_cancellation(
+            "shared", "alice", attachment, run.run_id, receipt,
+        ).await.unwrap().replayed);
     }
 
     #[test]

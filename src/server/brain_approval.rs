@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, Weak};
 use anyhow::{Context, Result};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::brain::store::{AttachmentId, BrainApprovalAudience, BrainId};
+use crate::brain::store::{AttachmentId, BrainApprovalAudience, BrainId, ConnectionId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ApprovalKey {
@@ -23,6 +23,7 @@ struct ApprovalKey {
 struct PendingApproval {
     request_seq: u64,
     audience: BrainApprovalAudience,
+    connection_id: Option<ConnectionId>,
     response_tx: Option<oneshot::Sender<Result<serde_json::Value, String>>>,
     delivered_decision: Option<serde_json::Value>,
 }
@@ -78,6 +79,61 @@ impl BrainApprovalBroker {
         approval_id: impl Into<String>,
         audience: BrainApprovalAudience,
     ) -> Result<ApprovalRegistration> {
+        self.register_inner(request_seq, approval_id, audience, None)
+    }
+
+    pub fn register_for_connection(
+        &self, request_seq: u64, approval_id: impl Into<String>,
+        audience: BrainApprovalAudience, connection_id: ConnectionId,
+    ) -> Result<ApprovalRegistration> {
+        self.register_inner(request_seq, approval_id, audience, Some(connection_id))
+    }
+
+    pub(crate) fn register_for_connection_with_authority<T>(
+        &self, request_seq: u64, approval_id: impl Into<String>,
+        audience: BrainApprovalAudience, connection_id: ConnectionId,
+        authorize: impl FnOnce() -> Result<T>,
+    ) -> Result<(ApprovalRegistration, T)> {
+        let key = ApprovalKey {
+            brain_id: audience.brain_id,
+            request_seq,
+            approval_id: approval_id.into(),
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        let mut pending = self.pending.lock().expect("approval broker lock poisoned");
+        anyhow::ensure!(
+            !pending.contains_key(&key),
+            "approval '{}' is already pending for Brain {} request {}",
+            key.approval_id,
+            key.brain_id.0,
+            key.request_seq
+        );
+        // The authority check and durable approval publication run while the
+        // same lock used by cancel_connection is held. Detach first revokes
+        // the canonical connection and then takes this lock, so registration
+        // is ordered wholly before its cancellation or fails wholly after it.
+        let authorized = authorize()?;
+        pending.insert(
+            key.clone(),
+            PendingApproval {
+                request_seq,
+                audience,
+                connection_id: Some(connection_id),
+                response_tx: Some(response_tx),
+                delivered_decision: None,
+            },
+        );
+        Ok((ApprovalRegistration {
+            broker: self.clone(),
+            key,
+            response_rx: Some(response_rx),
+        }, authorized))
+    }
+
+    fn register_inner(
+        &self, request_seq: u64, approval_id: impl Into<String>,
+        audience: BrainApprovalAudience, connection_id: Option<ConnectionId>,
+    ) -> Result<ApprovalRegistration> {
         let key = ApprovalKey {
             brain_id: audience.brain_id,
             request_seq,
@@ -97,6 +153,7 @@ impl BrainApprovalBroker {
             PendingApproval {
                 request_seq,
                 audience,
+                connection_id,
                 response_tx: Some(response_tx),
                 delivered_decision: None,
             },
@@ -106,6 +163,51 @@ impl BrainApprovalBroker {
             key,
             response_rx: Some(response_rx),
         })
+    }
+
+    pub fn inspect_connection(
+        &self, brain_id: BrainId, request_seq: u64, approval_id: &str,
+        attachment_id: AttachmentId, connection_id: ConnectionId,
+    ) -> Result<BrainApprovalAudience> {
+        let key = ApprovalKey { brain_id, request_seq, approval_id: approval_id.to_string() };
+        let pending = self.pending.lock().expect("approval broker lock poisoned");
+        let request = pending.get(&key).with_context(|| {
+            format!("approval '{approval_id}' is not pending for request {request_seq}")
+        })?;
+        anyhow::ensure!(request.audience.attachment_id == attachment_id,
+            "attachment is not the approval audience");
+        anyhow::ensure!(request.connection_id.is_none()
+            || request.connection_id == Some(connection_id),
+            "connection is not the approval audience generation");
+        Ok(request.audience.clone())
+    }
+
+    pub fn deliver_connection(
+        &self, brain_id: BrainId, request_seq: u64, approval_id: &str,
+        attachment_id: AttachmentId, connection_id: ConnectionId,
+        decision: serde_json::Value,
+    ) -> Result<()> {
+        let key = ApprovalKey { brain_id, request_seq, approval_id: approval_id.to_string() };
+        let mut pending = self.pending.lock().expect("approval broker lock poisoned");
+        let request = pending.get_mut(&key).with_context(|| {
+            format!("approval '{approval_id}' is not pending for request {request_seq}")
+        })?;
+        anyhow::ensure!(request.audience.attachment_id == attachment_id,
+            "attachment is not the approval audience");
+        anyhow::ensure!(request.connection_id.is_none()
+            || request.connection_id == Some(connection_id),
+            "connection is not the approval audience generation");
+        if let Some(delivered) = &request.delivered_decision {
+            anyhow::ensure!(delivered == &decision,
+                "approval was already delivered with a different decision");
+            return Ok(());
+        }
+        let response_tx = request.response_tx.take()
+            .context("approval continuation is no longer deliverable")?;
+        response_tx.send(Ok(decision.clone()))
+            .map_err(|_| anyhow::anyhow!("approval continuation closed before delivery"))?;
+        request.delivered_decision = Some(decision);
+        Ok(())
     }
 
     pub fn claim(
@@ -138,6 +240,25 @@ impl BrainApprovalBroker {
             audience: request.audience,
             response_tx: request.response_tx,
         })
+    }
+
+    pub fn claim_connection(
+        &self, brain_id: BrainId, request_seq: u64, approval_id: &str,
+        attachment_id: AttachmentId, connection_id: ConnectionId,
+    ) -> Result<ClaimedApproval> {
+        let key = ApprovalKey { brain_id, request_seq, approval_id: approval_id.to_string() };
+        let mut pending = self.pending.lock().expect("approval broker lock poisoned");
+        let request = pending.get(&key).with_context(|| {
+            format!("approval '{approval_id}' is not pending for request {request_seq}")
+        })?;
+        anyhow::ensure!(request.audience.attachment_id == attachment_id,
+            "attachment is not the approval audience");
+        anyhow::ensure!(request.connection_id.is_none()
+            || request.connection_id == Some(connection_id),
+            "connection is not the approval audience generation");
+        let request = pending.remove(&key).expect("pending approval disappeared while locked");
+        Ok(ClaimedApproval { request_seq: request.request_seq,
+            audience: request.audience, response_tx: request.response_tx })
     }
 
     pub fn inspect(
@@ -187,6 +308,24 @@ impl BrainApprovalBroker {
                     .then_some(key.clone())
             })
             .collect::<Vec<_>>();
+        for key in &keys {
+            if let Some(request) = pending.remove(key) {
+                if let Some(response_tx) = request.response_tx {
+                    let _ = response_tx.send(Err("approval audience disconnected".into()));
+                }
+            }
+        }
+        keys.len()
+    }
+
+    pub fn cancel_connection(
+        &self, brain_id: BrainId, attachment_id: AttachmentId, connection_id: ConnectionId,
+    ) -> usize {
+        let mut pending = self.pending.lock().expect("approval broker lock poisoned");
+        let keys = pending.iter().filter_map(|(key, request)| {
+            (key.brain_id == brain_id && request.audience.attachment_id == attachment_id
+                && request.connection_id == Some(connection_id)).then_some(key.clone())
+        }).collect::<Vec<_>>();
         for key in &keys {
             if let Some(request) = pending.remove(key) {
                 if let Some(response_tx) = request.response_tx {

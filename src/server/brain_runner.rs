@@ -117,6 +117,7 @@ pub struct RunnerTurnRequest {
     pub prompt: String,
     pub context: Vec<crate::claude::Message>,
     pub approval_audience: crate::brain::store::BrainApprovalAudience,
+    pub approval_connection_id: Option<crate::brain::store::ConnectionId>,
     /// Reverse approval bridge installed by the Cap'n Proto client adapter.
     /// Daemon-side broker requests leave this unset until they cross IPC.
     pub approval_tx: Option<mpsc::UnboundedSender<RunnerApprovalRequest>>,
@@ -246,9 +247,92 @@ struct ConnectionAuthority {
 pub struct BrainRunnerBroker {
     registrations: Arc<RwLock<HashMap<String, Registration>>>,
     connection_authority: Arc<Mutex<ConnectionAuthority>>,
+    inflight: Arc<Mutex<HashMap<(String, RunId), HashMap<uuid::Uuid, oneshot::Sender<()>>>>>,
+    cancelled_before_dispatch: Arc<Mutex<std::collections::HashSet<(String, RunId)>>>,
+}
+
+struct InflightRequest {
+    broker: BrainRunnerBroker,
+    key: (String, RunId),
+    id: uuid::Uuid,
+}
+
+impl Drop for InflightRequest {
+    fn drop(&mut self) {
+        let mut inflight = self.broker.inflight.lock().expect("runner inflight lock poisoned");
+        if let Some(requests) = inflight.get_mut(&self.key) {
+            requests.remove(&self.id);
+            if requests.is_empty() {
+                inflight.remove(&self.key);
+            }
+        }
+    }
 }
 
 impl BrainRunnerBroker {
+    fn track_inflight(&self, brain: &str, run_id: RunId) -> (oneshot::Receiver<()>, InflightRequest) {
+        let key = (brain.to_string(), run_id);
+        let id = uuid::Uuid::new_v4();
+        let (abort_tx, abort_rx) = oneshot::channel();
+        self.inflight
+            .lock()
+            .expect("runner inflight lock poisoned")
+            .entry(key.clone())
+            .or_default()
+            .insert(id, abort_tx);
+        (abort_rx, InflightRequest { broker: self.clone(), key, id })
+    }
+
+    /// Stop only daemon waits associated with one durable run. This never
+    /// revokes the runner lease or any other attachment's work.
+    pub(crate) fn abort_run(&self, brain: &str, run_id: RunId) {
+        let requests = self
+            .inflight
+            .lock()
+            .expect("runner inflight lock poisoned")
+            .remove(&(brain.to_string(), run_id));
+        drop(requests);
+    }
+
+    /// Tell the exact leased runner to cancel one run without making the
+    /// caller own the reply future. Connection teardown uses this before
+    /// aborting the daemon-side wait so process-local cleanup cannot silently
+    /// leave the frontend executing effects.
+    pub(crate) fn request_run_cancellation(
+        &self,
+        brain: &str,
+        lease_id: RunnerLeaseId,
+        run_id: RunId,
+    ) -> Result<()> {
+        self.fence_run_cancellation(brain, run_id);
+        let registration = self
+            .registrations
+            .read()
+            .expect("runner broker lock poisoned")
+            .get(brain)
+            .cloned()
+            .with_context(|| format!("named Brain '{brain}' has no connected runner callback"))?;
+        anyhow::ensure!(
+            registration.lease_id == lease_id,
+            "named Brain '{brain}' runner callback belongs to a stale lease"
+        );
+        let (response_tx, _response_rx) = oneshot::channel();
+        registration
+            .tx
+            .send(RunnerRequest::Cancel(RunnerCancelRequest {
+                brain: brain.to_string(),
+                run_id,
+                response_tx,
+            }))
+            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))
+    }
+
+    pub(crate) fn fence_run_cancellation(&self, brain: &str, run_id: RunId) {
+        self.cancelled_before_dispatch.lock()
+            .expect("runner cancellation-fence lock poisoned")
+            .insert((brain.to_string(), run_id));
+    }
+
     pub fn register(
         &self,
         brain: impl Into<String>,
@@ -539,9 +623,13 @@ impl BrainRunnerBroker {
             anyhow::bail!("named Brain '{brain}' runner callback belongs to a stale lease");
         }
         let (response_tx, response_rx) = oneshot::channel();
-        registration
-            .tx
-            .send(RunnerRequest::Program(RunnerProgramRequest {
+        let (abort_rx, _inflight) = self.track_inflight(brain, run_id);
+        {
+            let dispatch_fence = self.cancelled_before_dispatch.lock()
+                .expect("runner cancellation-fence lock poisoned");
+            anyhow::ensure!(!dispatch_fence.contains(&(brain.to_string(), run_id)),
+                "named Brain run cancelled before runner dispatch");
+            registration.tx.send(RunnerRequest::Program(RunnerProgramRequest {
                 brain: brain.to_string(),
                 run_id,
                 request_seq,
@@ -551,12 +639,14 @@ impl BrainRunnerBroker {
                 grant_ceiling,
                 control_tx: None,
                 response_tx,
-            }))
-            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
-        response_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
-            .map_err(anyhow::Error::new)
+            })).map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
+        }
+        tokio::select! {
+            response = response_rx => response
+                .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
+                .map_err(anyhow::Error::new),
+            _ = abort_rx => anyhow::bail!("named Brain run cancelled"),
+        }
     }
 
     pub async fn dispatch_turn(
@@ -568,6 +658,7 @@ impl BrainRunnerBroker {
         prompt: String,
         context: Vec<crate::claude::Message>,
         approval_audience: crate::brain::store::BrainApprovalAudience,
+        approval_connection_id: Option<crate::brain::store::ConnectionId>,
     ) -> Result<RunnerTurnResult> {
         let registration = self
             .registrations
@@ -580,23 +671,30 @@ impl BrainRunnerBroker {
             anyhow::bail!("named Brain '{brain}' runner callback belongs to a stale lease");
         }
         let (response_tx, response_rx) = oneshot::channel();
-        registration
-            .tx
-            .send(RunnerRequest::Turn(RunnerTurnRequest {
+        let (abort_rx, _inflight) = self.track_inflight(brain, run_id);
+        {
+            let dispatch_fence = self.cancelled_before_dispatch.lock()
+                .expect("runner cancellation-fence lock poisoned");
+            anyhow::ensure!(!dispatch_fence.contains(&(brain.to_string(), run_id)),
+                "named Brain run cancelled before runner dispatch");
+            registration.tx.send(RunnerRequest::Turn(RunnerTurnRequest {
                 brain: brain.to_string(),
                 run_id,
                 request_seq,
                 prompt,
                 context,
                 approval_audience,
+                approval_connection_id,
                 approval_tx: None,
                 response_tx,
-            }))
-            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
-        response_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
-            .map_err(anyhow::Error::new)
+            })).map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
+        }
+        tokio::select! {
+            response = response_rx => response
+                .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
+                .map_err(anyhow::Error::new),
+            _ = abort_rx => anyhow::bail!("named Brain run cancelled"),
+        }
     }
 
     pub async fn cancel_run(
@@ -616,6 +714,7 @@ impl BrainRunnerBroker {
             anyhow::bail!("named Brain '{brain}' runner callback belongs to a stale lease");
         }
         let (response_tx, response_rx) = oneshot::channel();
+        let (abort_rx, _inflight) = self.track_inflight(brain, run_id);
         registration
             .tx
             .send(RunnerRequest::Cancel(RunnerCancelRequest {
@@ -624,10 +723,12 @@ impl BrainRunnerBroker {
                 response_tx,
             }))
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
-        response_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped cancel response"))?
-            .map_err(anyhow::Error::msg)
+        tokio::select! {
+            response = response_rx => response
+                .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped cancel response"))?
+                .map_err(anyhow::Error::msg),
+            _ = abort_rx => anyhow::bail!("named Brain run cancelled"),
+        }
     }
 
     /// Ask the exact leased environment runner to project one already
@@ -949,6 +1050,7 @@ mod tests {
                 "double it".into(),
                 vec![crate::claude::Message::user("21")],
                 test_approval_audience(),
+                Some(crate::brain::store::ConnectionId(uuid::Uuid::new_v4())),
             )
             .await
             .unwrap();

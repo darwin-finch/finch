@@ -73,6 +73,21 @@ impl IpcClient {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn register_test_brain_runner_client(
+        &self,
+        brain: &str,
+        lease_id: crate::brain::store::RunnerLeaseId,
+        runner: brain_runner::Client,
+    ) -> Result<()> {
+        let mut request = self.client.register_brain_runner_request();
+        request.get().set_brain(brain);
+        request.get().set_lease_id(&lease_id.0.to_string());
+        request.get().set_runner(runner);
+        request.send().promise.await?;
+        Ok(())
+    }
+
     /// Connect to the daemon's Unix socket.
     pub async fn connect() -> Result<Self> {
         Self::connect_path(sock_path()).await
@@ -1085,6 +1100,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                     prompt,
                     context,
                     approval_audience,
+                    approval_connection_id: None,
                     approval_tx: Some(approval_tx),
                     response_tx,
                 },
@@ -1295,7 +1311,7 @@ fn encode_brain_turn_events(
     Ok(())
 }
 
-fn encode_brain_turn_event(
+pub(crate) fn encode_brain_turn_event(
     mut encoded: finch_ipc_capnp::brain_turn_event::Builder<'_>,
     event: &crate::server::RunnerTurnEvent,
 ) -> capnp::Result<()> {
