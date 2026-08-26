@@ -844,9 +844,23 @@ impl Tool for SubmitProgramTool {
                 live_output.vm_effect_envelope(envelope);
             });
             if defer_program_effects && self.caller.is_none() {
-                self.runtime
-                    .submit_with_deferred_program_effects(submission, effect_sink)
-                    .await?
+                if let Some(cancel) = context
+                    .live_output
+                    .as_ref()
+                    .and_then(|output| output.cancellation_token())
+                {
+                    self.runtime
+                        .submit_with_deferred_program_effects_cancelled(
+                            submission,
+                            effect_sink,
+                            cancel,
+                        )
+                        .await?
+                } else {
+                    self.runtime
+                        .submit_with_deferred_program_effects(submission, effect_sink)
+                        .await?
+                }
             } else {
                 self.runtime
                     .submit_as_typed_only_with_typed_effect_sink(

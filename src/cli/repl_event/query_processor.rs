@@ -811,12 +811,24 @@ pub(super) async fn dispatch_tool_uses(
             });
         } else {
             // Regular tool: run concurrently in a background task
-            tool_coordinator.spawn_tool_execution(
-                query_id,
-                tool_use,
-                Arc::clone(work_unit),
-                row_idx,
-            );
+            let cancel = query_states
+                .get_metadata(query_id)
+                .await
+                .map(|metadata| metadata.cancellation_token)
+                .unwrap_or_default();
+            if let Some(query_work) = query_states
+                .begin_cancellation_sensitive_work(query_id)
+                .await
+            {
+                tool_coordinator.spawn_tool_execution(
+                    query_id,
+                    tool_use,
+                    Arc::clone(work_unit),
+                    row_idx,
+                    cancel,
+                    query_work,
+                );
+            }
         }
     }
     drop(current_mode);

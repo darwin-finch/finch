@@ -56,6 +56,224 @@ pub struct ToolExecutionCoordinator {
     poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::registry::Tool;
+    use async_trait::async_trait;
+
+    struct UnusedTurnControl;
+    impl crate::finch_ipc_capnp::brain_turn_control::Server for UnusedTurnControl {}
+
+    struct BlockingReadTool {
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        committed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for BlockingReadTool {
+        fn name(&self) -> &str {
+            "read"
+        }
+
+        fn description(&self) -> &str {
+            "blocking cancellation regression tool"
+        }
+
+        fn input_schema(&self) -> crate::tools::types::ToolInputSchema {
+            crate::tools::types::ToolInputSchema::simple(vec![])
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: &crate::tools::types::ToolContext<'_>,
+        ) -> anyhow::Result<String> {
+            struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for DropFlag {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _drop_flag = DropFlag(Arc::clone(&self.dropped));
+            if let Some(started) = self.started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            std::future::pending::<()>().await;
+            self.committed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("late effect".into())
+        }
+    }
+
+    fn write_turn_request(
+        mut request: crate::finch_ipc_capnp::brain_turn_request::Builder<'_>,
+        run_id: crate::brain::store::RunId,
+        request_seq: u64,
+        prompt: &str,
+    ) {
+        request.set_brain("shared");
+        request.set_run_id(&run_id.0.to_string());
+        request.set_request_seq(request_seq);
+        request.set_prompt(prompt);
+        request.reborrow().init_context(0);
+        crate::ipc::brain_codec::encode_approval_audience(
+            request.reborrow().init_approval_audience(),
+            &crate::brain::store::BrainApprovalAudience {
+                brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
+                brain: "shared".into(),
+                attachment_id: crate::brain::store::AttachmentId(uuid::Uuid::new_v4()),
+                subject: "runner@box.local".into(),
+                role: crate::brain::store::AttachmentRole::Runner,
+                environment_generation: 3,
+            },
+        );
+        request.set_control(capnp_rpc::new_client(UnusedTurnControl));
+    }
+
+    #[test]
+    fn dropped_capnp_turn_cancels_real_tool_before_lane_reuse_and_reconnects() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let (runner_event_tx, mut runner_event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let runner = crate::ipc::client::test_brain_runner_client(runner_event_tx);
+            let mut call = runner.run_turn_request();
+            write_turn_request(
+                call.get().init_request(),
+                crate::brain::store::RunId(uuid::Uuid::new_v4()),
+                9,
+                "run the blocking tool",
+            );
+            let first_rpc = tokio::task::spawn_local(async move { call.send().promise.await });
+            let request = match runner_event_rx.recv().await.unwrap() {
+                ReplEvent::NamedBrainTurnRequested(request) => request,
+                _ => panic!("expected physical named-Brain Turn request"),
+            };
+
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let mut registry = crate::tools::registry::ToolRegistry::new();
+            registry.register(Box::new(BlockingReadTool {
+                started: std::sync::Mutex::new(Some(started_tx)),
+                dropped: Arc::clone(&dropped),
+                committed: Arc::clone(&committed),
+            }));
+            let permissions = crate::tools::permissions::PermissionManager::new()
+                .with_default_rule(crate::tools::permissions::PermissionRule::Allow);
+            let patterns = tempfile::tempdir().unwrap();
+            let executor = crate::tools::executor::ToolExecutor::new(
+                registry,
+                permissions,
+                patterns.path().join("patterns.json"),
+            )
+            .unwrap();
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let output = Arc::new(crate::cli::output_manager::OutputManager::default());
+            let coordinator = ToolExecutionCoordinator::new(
+                event_tx,
+                Arc::new(tokio::sync::Mutex::new(executor)),
+                Arc::clone(&output),
+                Arc::new(RwLock::new(
+                    crate::cli::conversation::ConversationHistory::new(),
+                )),
+                Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
+                Arc::new(crate::models::tokenizer::TextTokenizer::stub().unwrap()),
+                Arc::new(RwLock::new(crate::cli::ReplMode::Normal)),
+                Arc::new(RwLock::new(None)),
+            );
+            let query_states = Arc::new(super::super::query_state::QueryStateManager::new());
+            let query_id = query_states.create_query(Vec::new()).await;
+            let metadata = query_states.get_metadata(query_id).await.unwrap();
+            let query_work = query_states
+                .begin_cancellation_sensitive_work(query_id)
+                .await
+                .unwrap();
+            let work_unit = output.start_work_unit("tool cancellation");
+            let row = work_unit.add_row("blocking read");
+            coordinator.spawn_tool_execution(
+                query_id,
+                crate::tools::types::ToolUse {
+                    id: "blocking-read".into(),
+                    name: "read".into(),
+                    input: serde_json::json!({}),
+                },
+                work_unit,
+                row,
+                metadata.cancellation_token.clone(),
+                query_work,
+            );
+            started_rx.await.unwrap();
+
+            let callback_cancel = request.cancel.clone();
+            let cancellation_bridge = {
+                let query_states = Arc::clone(&query_states);
+                tokio::task::spawn_local(async move {
+                    callback_cancel.cancelled().await;
+                    let barrier = super::super::event_loop::cancel_query_at_callback_disconnect(
+                        query_states.as_ref(),
+                        query_id,
+                    )
+                    .await
+                    .expect("admitted turn must retain its exact work fence");
+                    barrier.wait().await;
+                })
+            };
+            first_rpc.abort();
+            let _ = first_rpc.await;
+            tokio::time::timeout(std::time::Duration::from_secs(1), cancellation_bridge)
+                .await
+                .expect("tool future must be dropped before the lane becomes reusable")
+                .unwrap();
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(!committed.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), event_rx.recv())
+                    .await
+                    .is_err()
+            );
+            assert!(request
+                .response_tx
+                .send(Err(crate::server::RunnerTurnError {
+                    message: "late completion".into(),
+                    turn_events: Vec::new(),
+                    effect_journal: Vec::new(),
+                }))
+                .is_err());
+
+            let mut replacement_call = runner.run_turn_request();
+            write_turn_request(
+                replacement_call.get().init_request(),
+                crate::brain::store::RunId(uuid::Uuid::new_v4()),
+                10,
+                "replacement",
+            );
+            let replacement_rpc =
+                tokio::task::spawn_local(async move { replacement_call.send().promise.await });
+            let replacement = match runner_event_rx.recv().await.unwrap() {
+                ReplEvent::NamedBrainTurnRequested(request) => request,
+                _ => panic!("expected replacement named-Brain Turn request"),
+            };
+            assert!(!replacement.cancel.is_cancelled());
+            replacement
+                .response_tx
+                .send(Err(crate::server::RunnerTurnError {
+                    message: "replacement completed".into(),
+                    turn_events: Vec::new(),
+                    effect_journal: Vec::new(),
+                }))
+                .unwrap();
+            replacement_rpc.await.unwrap().unwrap();
+            assert!(!replacement.cancel.is_cancelled());
+        }));
+    }
+}
+
 /// One tool's client-side presentation binding. It is intentionally created
 /// per invocation, so concurrent VM programs cannot share an ambient output
 /// target.
@@ -65,10 +283,17 @@ struct WorkUnitPresentation {
     program: bool,
     vm_output: Option<VmOutputProjection>,
     event_tx: mpsc::UnboundedSender<ReplEvent>,
+    cancel: tokio_util::sync::CancellationToken,
+    // A VM may finish on the blocking pool after its async caller is dropped.
+    // Keep the lane fenced until every sink clone owned by that VM is gone.
+    _query_work: super::query_state::QueryWorkGuard,
 }
 
 impl LiveOutputSink for WorkUnitPresentation {
     fn line(&self, text: String) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
         if self.program {
             self.work_unit.append_response(&text);
         } else {
@@ -77,12 +302,18 @@ impl LiveOutputSink for WorkUnitPresentation {
     }
 
     fn vm_side_effect(&self, effect: crate::vm::VmSideEffect) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
         if let Some(projection) = &self.vm_output {
             projection.project(&effect);
         }
     }
 
     fn vm_effect_envelope(&self, envelope: crate::runtime::VmEffectEnvelope) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
         if let Some(projection) = &self.vm_output {
             // Program tools execute away from the terminal task. Retain the
             // typed `(execution_id, sequence)` envelope and let the REPL
@@ -98,6 +329,10 @@ impl LiveOutputSink for WorkUnitPresentation {
 
     fn defer_program_effects(&self) -> bool {
         self.program
+    }
+
+    fn cancellation_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+        Some(self.cancel.clone())
     }
 }
 
@@ -154,6 +389,8 @@ impl ToolExecutionCoordinator {
         tool_use: ToolUse,
         work_unit: Arc<WorkUnit>,
         row_idx: usize,
+        cancel: tokio_util::sync::CancellationToken,
+        query_work: super::query_state::QueryWorkGuard,
     ) {
         let event_tx = self.event_tx.clone();
         let tool_executor = Arc::clone(&self.tool_executor);
@@ -170,18 +407,23 @@ impl ToolExecutionCoordinator {
         // append to the owning generation WorkUnit instead. Neither route uses a
         // process-global "current output" target.
         let program = tool_use.name == "submit_program";
-        let vm_output = program.then(|| {
-            VmOutputProjection::new(Arc::clone(&output_manager), Arc::clone(&work_unit))
-        });
+        let vm_output = program
+            .then(|| VmOutputProjection::new(Arc::clone(&output_manager), Arc::clone(&work_unit)));
         let live_output: LiveOutput = Arc::new(WorkUnitPresentation {
             work_unit: Arc::clone(&work_unit),
             row_idx,
             program,
             vm_output,
             event_tx: event_tx.clone(),
+            cancel: cancel.clone(),
+            _query_work: query_work.clone(),
         });
 
         tokio::spawn(async move {
+            let _query_work = query_work;
+            if cancel.is_cancelled() {
+                return;
+            }
             let mut tool_use = tool_use;
             // Generate tool signature for approval checking
             let signature = generate_tool_signature(&tool_use, std::path::Path::new("."));
@@ -217,7 +459,12 @@ impl ToolExecutionCoordinator {
                 }
 
                 // Wait for approval response (blocks only THIS task)
-                match response_rx.await {
+                let approval = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    approval = response_rx => approval,
+                };
+                match approval {
                     Ok(confirmation) => {
                         // Process approval result
                         match confirmation {
@@ -281,6 +528,10 @@ impl ToolExecutionCoordinator {
                 }
             }
 
+            if cancel.is_cancelled() {
+                return;
+            }
+
             // Tool approved (or doesn't need approval), execute it
             let conversation_snapshot = conversation.read().await.clone();
 
@@ -293,20 +544,31 @@ impl ToolExecutionCoordinator {
             let timeout_duration = tool_executor.lock().await.execution_timeout(&tool_use.name);
             let executor = tool_executor.lock().await;
             let execute = executor.execute_tool::<fn() -> anyhow::Result<()>>(
-                    &tool_use,
-                    Some(&conversation_snapshot),
-                    None, // save_fn (not needed in event loop)
-                    None, // router (for training)
-                    Some(Arc::clone(&local_generator)),
-                    Some(Arc::clone(&tokenizer)),
-                    Some(Arc::clone(&repl_mode)),
-                    Some(Arc::clone(&plan_content)),
-                    Some(Arc::clone(&live_output)),
-                );
-            let result = match timeout_duration {
-                Some(timeout) => tokio::time::timeout(timeout, execute).await,
-                None => Ok(execute.await),
+                &tool_use,
+                Some(&conversation_snapshot),
+                None, // save_fn (not needed in event loop)
+                None, // router (for training)
+                Some(Arc::clone(&local_generator)),
+                Some(Arc::clone(&tokenizer)),
+                Some(Arc::clone(&repl_mode)),
+                Some(Arc::clone(&plan_content)),
+                Some(Arc::clone(&live_output)),
+            );
+            let execution = async {
+                match timeout_duration {
+                    Some(timeout) => tokio::time::timeout(timeout, execute).await,
+                    None => Ok(execute.await),
+                }
             };
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                result = execution => result,
+            };
+
+            if cancel.is_cancelled() {
+                return;
+            }
 
             // Send result back to event loop
             match result {

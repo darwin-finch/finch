@@ -178,6 +178,13 @@ impl LlmLoop {
     /// `query = ""` for tool-continuation turns (graph is not reset).
     /// `no_tools = true` suppresses tool definitions for conversational turns.
     async fn spawn_query(&self, query_id: Uuid, query: String, no_tools: bool) {
+        let Some(query_work) = self
+            .query_states
+            .begin_cancellation_sensitive_work(query_id)
+            .await
+        else {
+            return;
+        };
         // Reset the execution graph on fresh queries (not tool continuations).
         if !query.is_empty() {
             let mut g = self.current_graph.lock().await;
@@ -233,6 +240,7 @@ impl LlmLoop {
             .unwrap_or_default();
 
         tokio::spawn(async move {
+            let _query_work = query_work;
             let processing = process_query_with_tools(
                 query_id,
                 query,

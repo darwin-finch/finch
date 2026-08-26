@@ -236,6 +236,11 @@ pub enum ReplEvent {
         query_id: uuid::Uuid,
         run_id: crate::brain::store::RunId,
     },
+    /// All provider/tool futures for a physically dropped callback are gone.
+    NamedBrainTurnCancellationSafe {
+        query_id: uuid::Uuid,
+        run_id: crate::brain::store::RunId,
+    },
     /// Project a daemon-committed successful turn into runner-owned memory.
     NamedBrainMemoryProjectionRequested(crate::server::RunnerMemoryProjectionRequest),
     /// Cancel one exact ProgramRun currently owned by this frontend.

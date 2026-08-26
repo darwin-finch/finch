@@ -106,6 +106,7 @@ impl EventHandler {
             | ReplEvent::NamedBrainProgramRequested(_)
             | ReplEvent::NamedBrainTurnRequested(_)
             | ReplEvent::NamedBrainTurnCallbackCancelled { .. }
+            | ReplEvent::NamedBrainTurnCancellationSafe { .. }
             | ReplEvent::NamedBrainMemoryProjectionRequested(_)
             | ReplEvent::NamedBrainRunCancelRequested(_)
             | ReplEvent::NamedBrainProgramFinished(_)

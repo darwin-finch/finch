@@ -7,6 +7,7 @@
 use crate::claude::Message;
 use crate::cli::messages::WorkUnit;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -61,6 +62,9 @@ pub struct QueryMetadata {
     /// Cancellation token for this query
     pub cancellation_token: CancellationToken,
 
+    /// Provider/tool futures which must be dropped before a cancelled lane is reusable.
+    cancellation_work: Arc<QueryCancellationWork>,
+
     /// When this query was created
     pub created_at: std::time::Instant,
 
@@ -72,6 +76,54 @@ pub struct QueryMetadata {
     /// publishes the correlated Result, EventLoop folds this into the run
     /// group and removes the transient unit without losing live updates.
     pub brain_output_work_unit: Option<Arc<WorkUnit>>,
+}
+
+#[derive(Debug, Default)]
+struct QueryCancellationWork {
+    active: AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+/// RAII proof that one provider or tool future still owns query-scoped work.
+#[derive(Debug)]
+pub struct QueryWorkGuard {
+    work: Arc<QueryCancellationWork>,
+}
+
+/// Stable cancellation fence captured before query metadata can be cleaned up.
+#[derive(Debug, Clone)]
+pub struct QueryWorkBarrier {
+    work: Arc<QueryCancellationWork>,
+}
+
+impl QueryWorkBarrier {
+    /// Wait until all provider/tool ownership for this exact query is gone.
+    pub async fn wait(self) {
+        loop {
+            let idle = self.work.idle.notified();
+            if self.work.active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+impl Clone for QueryWorkGuard {
+    fn clone(&self) -> Self {
+        self.work.active.fetch_add(1, Ordering::AcqRel);
+        Self {
+            work: Arc::clone(&self.work),
+        }
+    }
+}
+
+impl Drop for QueryWorkGuard {
+    fn drop(&mut self) {
+        if self.work.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.work.idle.notify_waiters();
+        }
+    }
 }
 
 /// Manages state for all in-flight queries
@@ -96,6 +148,7 @@ impl QueryStateManager {
             conversation_snapshot,
             brain_turn_provenance: None,
             cancellation_token: CancellationToken::new(),
+            cancellation_work: Arc::new(QueryCancellationWork::default()),
             created_at: std::time::Instant::now(),
             tool_work_unit: None,
             brain_output_work_unit: None,
@@ -103,6 +156,50 @@ impl QueryStateManager {
 
         self.states.write().await.insert(id, metadata);
         id
+    }
+
+    /// Register one cancellation-sensitive future. Once cancellation wins,
+    /// no new work may enter this query generation.
+    pub async fn begin_cancellation_sensitive_work(
+        &self,
+        query_id: Uuid,
+    ) -> Option<QueryWorkGuard> {
+        let metadata = self.states.read().await.get(&query_id).cloned()?;
+        if metadata.cancellation_token.is_cancelled() {
+            return None;
+        }
+        metadata
+            .cancellation_work
+            .active
+            .fetch_add(1, Ordering::AcqRel);
+        let guard = QueryWorkGuard {
+            work: Arc::clone(&metadata.cancellation_work),
+        };
+        if metadata.cancellation_token.is_cancelled() {
+            drop(guard);
+            return None;
+        }
+        Some(guard)
+    }
+
+    /// Wait until every provider/tool future registered before cancellation
+    /// has been dropped and performed its drop-based cleanup.
+    pub async fn wait_for_cancellation_safe(&self, query_id: Uuid) {
+        let Some(barrier) = self.cancellation_barrier(query_id).await else {
+            return;
+        };
+        barrier.wait().await;
+    }
+
+    /// Capture the exact query's work fence before cancellation/cleanup races.
+    pub async fn cancellation_barrier(&self, query_id: Uuid) -> Option<QueryWorkBarrier> {
+        self.states
+            .read()
+            .await
+            .get(&query_id)
+            .map(|metadata| QueryWorkBarrier {
+                work: Arc::clone(&metadata.cancellation_work),
+            })
     }
 
     /// Bind the query to its durable Brain/run before provider dispatch.

@@ -443,7 +443,7 @@ fn schedule_policy_kind_to_capnp(
     }
 }
 
-pub(super) fn encode_approval_audience(
+pub(crate) fn encode_approval_audience(
     mut builder: brain_approval_audience::Builder<'_>,
     audience: &BrainApprovalAudience,
 ) {

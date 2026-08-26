@@ -10,9 +10,9 @@ use crate::cli::ConversationHistory;
 use crate::cli::ReplMode;
 use crate::local::LocalGenerator;
 use crate::models::tokenizer::TextTokenizer;
+use crate::runtime::VmEffectEnvelope;
 use crate::training::batch_trainer::BatchTrainer;
 use crate::vm::VmSideEffect;
-use crate::runtime::VmEffectEnvelope;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -44,6 +44,11 @@ pub trait LiveOutputSink: Send + Sync {
     /// this false so compatibility editor behavior remains available.
     fn defer_program_effects(&self) -> bool {
         false
+    }
+
+    /// Exact query lifetime which owns this presentation and VM submission.
+    fn cancellation_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+        None
     }
 }
 

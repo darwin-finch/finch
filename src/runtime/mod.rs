@@ -2097,7 +2097,7 @@ impl ProgramRuntime {
 
         let completion_commit = if matches!(execution.status, TypedExecutionStatus::Completed) {
             Some(
-                self.commit_working_runtime(pending.input_revision, working_runtime)
+                self.commit_working_runtime(pending.input_revision, working_runtime, None)
                     .await,
             )
         } else {
@@ -2365,8 +2365,12 @@ impl ProgramRuntime {
         &self,
         input_revision: u64,
         mut working_runtime: TypedRuntime,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<u64> {
         let _submission = self.submission_gate.lock().await;
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            bail!("program submission cancelled before runtime commit");
+        }
         let current = self.revision();
         if current != input_revision {
             bail!(
@@ -2536,6 +2540,7 @@ impl ProgramRuntime {
             None,
             DeferredHostEffects::None,
             None,
+            None,
         )
             .await
     }
@@ -2554,6 +2559,7 @@ impl ProgramRuntime {
             None,
             DeferredHostEffects::None,
             Some(grant_ceiling),
+            None,
         )
         .await
     }
@@ -2574,6 +2580,7 @@ impl ProgramRuntime {
             Some(effect_sink),
             DeferredHostEffects::Schedules,
             grant_ceiling,
+            None,
         )
         .await
     }
@@ -2592,6 +2599,7 @@ impl ProgramRuntime {
             None,
             DeferredHostEffects::None,
             None,
+            None,
         )
             .await
     }
@@ -2609,6 +2617,7 @@ impl ProgramRuntime {
             caller,
             Some(effect_sink),
             DeferredHostEffects::None,
+            None,
             None,
         )
         .await
@@ -2642,6 +2651,26 @@ impl ProgramRuntime {
             Some(effect_sink),
             DeferredHostEffects::ProgramInvocations,
             None,
+            None,
+        )
+        .await
+    }
+
+    /// Submit a provider tool program whose private transaction cannot commit
+    /// after its exact query lifetime is cancelled.
+    pub async fn submit_with_deferred_program_effects_cancelled(
+        &self,
+        submission: ProgramSubmission,
+        effect_sink: TypedEffectSink,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ExecutionOutcome> {
+        self.submit_as_with_optional_typed_effect_sink(
+            submission,
+            None,
+            Some(effect_sink),
+            DeferredHostEffects::ProgramInvocations,
+            None,
+            Some(&cancel),
         )
         .await
     }
@@ -2661,6 +2690,7 @@ impl ProgramRuntime {
             None,
             Some(effect_sink),
             DeferredHostEffects::AllAwaited,
+            None,
             None,
         )
         .await
@@ -2693,7 +2723,11 @@ impl ProgramRuntime {
         effect_sink: Option<TypedEffectSink>,
         deferred_host_effects: DeferredHostEffects,
         grant_ceiling: Option<EffectSet>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<ExecutionOutcome> {
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            bail!("program submission cancelled before execution");
+        }
         // This is a per-session state transaction, not a process-wide
         // interpreter lock. Independent runtimes and child model loops remain
         // concurrent while revision checks and mutations of this VM are atomic.
@@ -2740,20 +2774,34 @@ impl ProgramRuntime {
             ProgramLanguage::Lisp => "provider-response.lisp".to_string(),
         });
         let started = Instant::now();
-        let (working_runtime, execution) = self
-            .execute_typed_program(
-                working_runtime,
-                submission.language,
-                &source_id,
-                &submission.source,
-                &submission.intent,
-                &context,
-                &submission.declared_capabilities,
-                caller.clone(),
-                effect_sink.clone(),
-                deferred_host_effects,
-            )
-            .await?;
+        let execution = self.execute_typed_program(
+            working_runtime,
+            submission.language,
+            &source_id,
+            &submission.source,
+            &submission.intent,
+            &context,
+            &submission.declared_capabilities,
+            caller.clone(),
+            effect_sink.clone(),
+            deferred_host_effects,
+        );
+        let (working_runtime, execution) = if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    self.release_output_handles(context.execution_id)?;
+                    bail!("program submission cancelled during execution");
+                }
+                result = execution => result?,
+            }
+        } else {
+            execution.await?
+        };
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            self.release_output_handles(context.execution_id)?;
+            bail!("program submission cancelled before outcome retention");
+        }
         let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let suspension = execution.suspension.clone();
         if let Some(suspension) = suspension.clone() {
@@ -2784,7 +2832,10 @@ impl ProgramRuntime {
             self.release_output_handles(context.execution_id)?;
         }
         let completion_commit = if matches!(execution.status, TypedExecutionStatus::Completed) {
-            Some(self.commit_working_runtime(input_revision, working_runtime).await)
+            Some(
+                self.commit_working_runtime(input_revision, working_runtime, cancel)
+                    .await,
+            )
         } else {
             None
         };
@@ -8294,6 +8345,29 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
                 value: Box::new(ProgramValue::String("print('ok')".into())),
             })))]
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_provider_tool_submission_cannot_commit_runtime_revision() {
+        let runtime = ProgramRuntime::new();
+        let before = runtime.revision();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let sink: TypedEffectSink = Arc::new(|_| {});
+        let error = runtime
+            .submit_with_deferred_program_effects_cancelled(
+                submission(
+                    ProgramLanguage::Lisp,
+                    "(begin (define late-commit 1) (say \"late\"))",
+                    ExecutionEffect::VmWrite,
+                ),
+                sink,
+                cancel,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(runtime.revision(), before);
     }
 
     #[tokio::test]

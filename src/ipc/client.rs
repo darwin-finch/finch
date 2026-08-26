@@ -760,6 +760,13 @@ struct BrainRunnerImpl {
     event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
 }
 
+#[cfg(test)]
+pub(crate) fn test_brain_runner_client(
+    event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
+) -> brain_runner::Client {
+    capnp_rpc::new_client(BrainRunnerImpl { event_tx })
+}
+
 struct RunnerCallbackCancellation {
     cancel: tokio_util::sync::CancellationToken,
     armed: bool,

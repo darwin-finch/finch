@@ -613,6 +613,8 @@ struct PendingNamedBrainTurn {
     cancellation_requested: bool,
     /// Exact callback lifetime token received from the physical runner RPC.
     callback_cancel: tokio_util::sync::CancellationToken,
+    /// Physical owner is gone; lane waits for provider/tool drop acknowledgements.
+    callback_disconnected: bool,
     approval_audience: crate::brain::store::BrainApprovalAudience,
     approval_tx: Option<
         tokio::sync::mpsc::UnboundedSender<crate::server::RunnerApprovalRequest>,
@@ -620,21 +622,21 @@ struct PendingNamedBrainTurn {
     restart: Option<crate::tools::implementations::restart::DeferredFrontendRestart>,
 }
 
-async fn take_cancelled_named_brain_turn(
-    query_states: &super::query_state::QueryStateManager,
+async fn take_cancellation_safe_named_brain_turn(
     active_query_id: &RwLock<Option<Uuid>>,
     pending_turns: &mut std::collections::HashMap<Uuid, PendingNamedBrainTurn>,
     query_id: Uuid,
     run_id: crate::brain::store::RunId,
 ) -> (Option<PendingNamedBrainTurn>, bool) {
     let matches = pending_turns.get(&query_id).is_some_and(|pending| {
-        pending.run_id == run_id && pending.callback_cancel.is_cancelled()
+        pending.run_id == run_id
+            && pending.callback_cancel.is_cancelled()
+            && pending.callback_disconnected
     });
     if !matches {
         return (None, false);
     }
 
-    query_states.cancel_query(query_id).await;
     let pending = pending_turns.remove(&query_id);
     let mut active = active_query_id.write().await;
     let released = *active == Some(query_id);
@@ -642,6 +644,17 @@ async fn take_cancelled_named_brain_turn(
         *active = None;
     }
     (pending, released)
+}
+
+pub(super) async fn cancel_query_at_callback_disconnect(
+    query_states: &super::query_state::QueryStateManager,
+    query_id: Uuid,
+) -> Option<super::query_state::QueryWorkBarrier> {
+    // Capture the fence before cancellation makes this metadata eligible for
+    // periodic cleanup. Releasing without this proof could overlap generations.
+    let barrier = query_states.cancellation_barrier(query_id).await?;
+    query_states.cancel_query(query_id).await;
+    Some(barrier)
 }
 
 async fn resume_named_brain_program_boundaries(
@@ -2192,6 +2205,9 @@ impl EventLoop {
                         ReplEvent::NamedBrainTurnRequested(_) => "NamedBrainTurnRequested",
                         ReplEvent::NamedBrainTurnCallbackCancelled { .. } => {
                             "NamedBrainTurnCallbackCancelled"
+                        }
+                        ReplEvent::NamedBrainTurnCancellationSafe { .. } => {
+                            "NamedBrainTurnCancellationSafe"
                         }
                         ReplEvent::NamedBrainMemoryProjectionRequested(_) => {
                             "NamedBrainMemoryProjectionRequested"
@@ -3858,6 +3874,13 @@ Rules:\n\
             }
 
             ReplEvent::QueryComplete { query_id, response } => {
+                if self
+                    .pending_named_brain_turns
+                    .get(&query_id)
+                    .is_some_and(|turn| turn.callback_disconnected)
+                {
+                    return Ok(());
+                }
                 // Add response to conversation
                 self.conversation
                     .write()
@@ -3882,6 +3905,13 @@ Rules:\n\
             }
 
             ReplEvent::QueryFailed { query_id, error } => {
+                if self
+                    .pending_named_brain_turns
+                    .get(&query_id)
+                    .is_some_and(|turn| turn.callback_disconnected)
+                {
+                    return Ok(());
+                }
                 // DON'T remove streaming message here - fallback providers need it!
                 // The message will be removed on StreamingComplete or stays for final error display
 
@@ -3944,6 +3974,14 @@ Rules:\n\
                 tool_id,
                 mut result,
             } => {
+                if self
+                    .pending_named_brain_turns
+                    .get(&query_id)
+                    .is_some_and(|turn| turn.callback_disconnected)
+                {
+                    self.active_tool_uses.write().await.remove(&tool_id);
+                    return Ok(());
+                }
                 if let Some(restart) =
                     crate::tools::implementations::restart::deferred_frontend_restart_from_tool_result(
                         &result,
@@ -3995,6 +4033,13 @@ Rules:\n\
                 query_id,
                 tool_uses,
             } => {
+                if self
+                    .pending_named_brain_turns
+                    .get(&query_id)
+                    .is_some_and(|turn| turn.callback_disconnected)
+                {
+                    return Ok(());
+                }
                 if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
                     turn.turn_events.extend(tool_uses.into_iter().map(|tool_use| {
                         crate::server::RunnerTurnEvent::Call {
@@ -4011,6 +4056,14 @@ Rules:\n\
                 tool_use,
                 response_tx,
             } => {
+                if self
+                    .pending_named_brain_turns
+                    .get(&query_id)
+                    .is_some_and(|turn| turn.callback_disconnected)
+                {
+                    let _ = response_tx.send(super::events::ConfirmationResult::Deny);
+                    return Ok(());
+                }
                 self.handle_tool_approval_request(query_id, tool_use, response_tx)
                     .await?;
             }
@@ -4097,6 +4150,13 @@ Rules:\n\
                 query_id,
                 full_response,
             } => {
+                if self
+                    .pending_named_brain_turns
+                    .get(&query_id)
+                    .is_some_and(|turn| turn.callback_disconnected)
+                {
+                    return Ok(());
+                }
                 tracing::debug!("[EVENT_LOOP] Handling StreamingComplete event");
 
                 // Check if this query is executing tools
@@ -4599,6 +4659,10 @@ Rules:\n\
             ReplEvent::NamedBrainTurnCallbackCancelled { query_id, run_id } => {
                 self.cancel_named_brain_turn_callback(query_id, run_id).await;
             }
+            ReplEvent::NamedBrainTurnCancellationSafe { query_id, run_id } => {
+                self.finish_cancelled_named_brain_turn_callback(query_id, run_id)
+                    .await;
+            }
             ReplEvent::NamedBrainMemoryProjectionRequested(request) => {
                 self.project_named_brain_memory(request).await;
             }
@@ -4846,6 +4910,7 @@ Rules:\n\
                 effect_journal: Vec::new(),
                 cancellation_requested: false,
                 callback_cancel: request.cancel,
+                callback_disconnected: false,
                 approval_audience: request.approval_audience,
                 approval_tx: request.approval_tx,
                 restart: None,
@@ -4895,8 +4960,38 @@ Rules:\n\
         query_id: Uuid,
         run_id: crate::brain::store::RunId,
     ) {
-        let (pending, lane_released) = take_cancelled_named_brain_turn(
-            self.query_states.as_ref(),
+        let matches = self.pending_named_brain_turns.get(&query_id).is_some_and(|pending| {
+            pending.run_id == run_id && pending.callback_cancel.is_cancelled()
+        });
+        if !matches {
+            return;
+        }
+        let Some(cancellation_barrier) =
+            cancel_query_at_callback_disconnect(self.query_states.as_ref(), query_id).await
+        else {
+            tracing::error!(
+                %query_id,
+                ?run_id,
+                "refusing to release named Brain lane without its cancellation work fence"
+            );
+            return;
+        };
+        if let Some(pending) = self.pending_named_brain_turns.get_mut(&query_id) {
+            pending.callback_disconnected = true;
+        }
+        let event_tx = self.event_tx.clone();
+        tokio::task::spawn_local(async move {
+            cancellation_barrier.wait().await;
+            let _ = event_tx.send(ReplEvent::NamedBrainTurnCancellationSafe { query_id, run_id });
+        });
+    }
+
+    async fn finish_cancelled_named_brain_turn_callback(
+        &mut self,
+        query_id: Uuid,
+        run_id: crate::brain::store::RunId,
+    ) {
+        let (pending, lane_released) = take_cancellation_safe_named_brain_turn(
             self.active_query_id.as_ref(),
             &mut self.pending_named_brain_turns,
             query_id,
@@ -8403,6 +8498,7 @@ mod tests {
                 effect_journal: Vec::new(),
                 cancellation_requested: false,
                 callback_cancel: cancel.clone(),
+                callback_disconnected: true,
                 approval_audience: crate::brain::store::BrainApprovalAudience {
                     brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
                     brain: "shared".into(),
@@ -8416,9 +8512,22 @@ mod tests {
             },
         )]);
 
+        let work = query_states
+            .begin_cancellation_sensitive_work(first_query)
+            .await
+            .unwrap();
         cancel.cancel();
-        let (cancelled, released) = super::take_cancelled_named_brain_turn(
-            &query_states,
+        query_states.cancel_query(first_query).await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            query_states.wait_for_cancellation_safe(first_query),
+        )
+        .await
+        .is_err());
+        assert_eq!(*active_query_id.read().await, Some(first_query));
+        drop(work);
+        query_states.wait_for_cancellation_safe(first_query).await;
+        let (cancelled, released) = super::take_cancellation_safe_named_brain_turn(
             &active_query_id,
             &mut pending,
             first_query,
@@ -8436,8 +8545,7 @@ mod tests {
         assert!(response_rx.await.is_err());
 
         *active_query_id.write().await = Some(next_query);
-        let (stale, released) = super::take_cancelled_named_brain_turn(
-            &query_states,
+        let (stale, released) = super::take_cancellation_safe_named_brain_turn(
             &active_query_id,
             &mut pending,
             first_query,
