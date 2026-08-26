@@ -275,6 +275,46 @@ impl Repl {
                 false
             }
         }));
+        #[cfg(target_os = "macos")]
+        if config.features.gui_automation && is_interactive {
+            use crate::runtime::automation::{
+                permission_context_key, permission_target_description, AutomationState,
+            };
+
+            let permission_context_matches =
+                config.features.gui_automation_permission_context == permission_context_key();
+
+            match program_runtime.automation().availability().state {
+                AutomationState::Available => output_status!(
+                    "✓ GUI automation configured; macOS Accessibility is granted to {}. Finch capability approval still applies.",
+                    permission_target_description()
+                ),
+                AutomationState::PermissionRequired => {
+                    if permission_context_matches
+                        && config.features.gui_automation_last_known_available
+                    {
+                        output_status!(
+                            "⚠️  GUI automation is configured, but the previously observed macOS Accessibility grant is no longer present (revoked or identity changed) for {}.",
+                            permission_target_description()
+                        );
+                    } else if permission_context_matches && config.features.gui_automation_prompted {
+                        output_status!(
+                            "⚠️  GUI automation is configured, but macOS Accessibility remains ungranted after an earlier request for {}.",
+                            permission_target_description()
+                        );
+                    } else {
+                        output_status!(
+                            "⚠️  GUI automation is configured, but macOS Accessibility is not granted to {}.",
+                            permission_target_description()
+                        );
+                    }
+                    output_status!(
+                        "   Run /setup and press R to retry or O to open System Settings → Privacy & Security → Accessibility."
+                    );
+                }
+                AutomationState::Disabled | AutomationState::Unsupported => {}
+            }
+        }
         tool_registry.register(Box::new(ReadTool));
         tool_registry.register(Box::new(GlobTool));
         tool_registry.register(Box::new(GrepTool));

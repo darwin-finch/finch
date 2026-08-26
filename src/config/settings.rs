@@ -55,10 +55,29 @@ pub struct FeaturesConfig {
     #[serde(default)]
     pub auto_compact_enabled: bool,
 
-    /// Enable GUI automation tools (macOS only)
+    /// Finch's explicit consent gate for GUI automation tools (macOS only).
+    /// This does not represent or imply the separate macOS Accessibility grant.
     #[cfg(target_os = "macos")]
     #[serde(default)]
     pub gui_automation: bool,
+
+    /// Whether Finch has explicitly invoked the native Accessibility prompt.
+    /// This is UI history only, not evidence of an operating-system grant.
+    #[cfg(target_os = "macos")]
+    #[serde(default)]
+    pub gui_automation_prompted: bool,
+
+    /// Whether a wizard check previously observed Accessibility as available.
+    /// Current native state always wins; this only lets the UI explain revocation.
+    #[cfg(target_os = "macos")]
+    #[serde(default)]
+    pub gui_automation_last_known_available: bool,
+
+    /// Executable/launcher context associated with the prompt/grant history.
+    /// This is not a TCC identity and is used only to avoid cross-context claims.
+    #[cfg(target_os = "macos")]
+    #[serde(default)]
+    pub gui_automation_permission_context: String,
 }
 
 impl Default for FeaturesConfig {
@@ -74,6 +93,12 @@ impl Default for FeaturesConfig {
             auto_compact_enabled: false,
             #[cfg(target_os = "macos")]
             gui_automation: false,
+            #[cfg(target_os = "macos")]
+            gui_automation_prompted: false,
+            #[cfg(target_os = "macos")]
+            gui_automation_last_known_available: false,
+            #[cfg(target_os = "macos")]
+            gui_automation_permission_context: String::new(),
         }
     }
 }
@@ -863,7 +888,12 @@ mod tests {
             "auto_compact_enabled must default to false (MemTree + summarization are primary)"
         );
         #[cfg(target_os = "macos")]
-        assert!(!f.gui_automation, "gui automation should be off by default");
+        {
+            assert!(!f.gui_automation, "gui automation should be off by default");
+            assert!(!f.gui_automation_prompted);
+            assert!(!f.gui_automation_last_known_available);
+            assert!(f.gui_automation_permission_context.is_empty());
+        }
     }
 
     #[test]
@@ -874,6 +904,24 @@ mod tests {
         assert_eq!(decoded.auto_approve_tools, original.auto_approve_tools);
         assert_eq!(decoded.streaming_enabled, original.streaming_enabled);
         assert_eq!(decoded.debug_logging, original.debug_logging);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_gui_automation_consent_history_roundtrip() {
+        let original = FeaturesConfig {
+            gui_automation: true,
+            gui_automation_prompted: true,
+            gui_automation_last_known_available: true,
+            gui_automation_permission_context: "test-context".to_string(),
+            ..FeaturesConfig::default()
+        };
+        let encoded = toml::to_string(&original).unwrap();
+        let decoded: FeaturesConfig = toml::from_str(&encoded).unwrap();
+        assert!(decoded.gui_automation);
+        assert!(decoded.gui_automation_prompted);
+        assert!(decoded.gui_automation_last_known_available);
+        assert_eq!(decoded.gui_automation_permission_context, "test-context");
     }
 
     #[test]

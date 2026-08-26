@@ -93,6 +93,12 @@ use crate::providers::model_catalog::{
 };
 use chrono::{DateTime, Utc};
 
+#[cfg(target_os = "macos")]
+use crate::runtime::automation::{
+    permission_context_key, AutomationAvailability, AutomationBroker, AutomationPermissionResult,
+    AutomationPromptContext, AutomationPromptDisposition, AutomationState,
+};
+
 type CatalogRefreshResult = Option<(ModelCatalog, Option<String>)>;
 
 #[derive(Debug, Clone)]
@@ -336,6 +342,16 @@ enum SectionState {
         editing_finch_api_key: bool,
         #[cfg(target_os = "macos")]
         gui_automation: bool,
+        #[cfg(target_os = "macos")]
+        gui_automation_availability: AutomationAvailability,
+        #[cfg(target_os = "macos")]
+        gui_automation_prompt: AutomationPromptDisposition,
+        #[cfg(target_os = "macos")]
+        gui_automation_prompted: bool,
+        #[cfg(target_os = "macos")]
+        gui_automation_last_known_available: bool,
+        #[cfg(target_os = "macos")]
+        gui_automation_permission_context: String,
         daemon_only_mode: bool,
         mdns_discovery: bool,
         auto_discover: bool,
@@ -716,6 +732,34 @@ impl WizardState {
         );
 
         // Features section
+        #[cfg(target_os = "macos")]
+        let configured_gui_automation = existing_config
+            .map(|c| c.features.gui_automation)
+            .unwrap_or(false);
+        #[cfg(target_os = "macos")]
+        let current_gui_automation_context = permission_context_key();
+        #[cfg(target_os = "macos")]
+        let gui_automation_context_matches = existing_config.is_some_and(|config| {
+            config.features.gui_automation_permission_context == current_gui_automation_context
+        });
+        #[cfg(target_os = "macos")]
+        let native_gui_automation_available = AutomationBroker::new(configured_gui_automation)
+            .availability()
+            .state
+            == AutomationState::Available;
+        #[cfg(target_os = "macos")]
+        let (gui_automation_prompted, gui_automation_last_known_available) =
+            scoped_permission_history(
+                existing_config
+                    .map(|config| config.features.gui_automation_prompted)
+                    .unwrap_or(false),
+                existing_config
+                    .map(|config| config.features.gui_automation_last_known_available)
+                    .unwrap_or(false),
+                gui_automation_context_matches,
+                native_gui_automation_available,
+            );
+
         sections.insert(
             WizardSection::Features,
             SectionState::Features {
@@ -737,9 +781,18 @@ impl WizardState {
                     .unwrap_or_default(),
                 editing_finch_api_key: false,
                 #[cfg(target_os = "macos")]
-                gui_automation: existing_config
-                    .map(|c| c.features.gui_automation)
-                    .unwrap_or(false),
+                gui_automation: configured_gui_automation,
+                #[cfg(target_os = "macos")]
+                gui_automation_availability: AutomationBroker::new(configured_gui_automation)
+                    .availability(),
+                #[cfg(target_os = "macos")]
+                gui_automation_prompt: AutomationPromptDisposition::NotNeeded,
+                #[cfg(target_os = "macos")]
+                gui_automation_prompted,
+                #[cfg(target_os = "macos")]
+                gui_automation_last_known_available,
+                #[cfg(target_os = "macos")]
+                gui_automation_permission_context: current_gui_automation_context,
                 daemon_only_mode: existing_config
                     .map(|c| c.server.mode == "daemon-only")
                     .unwrap_or(false),
@@ -792,6 +845,19 @@ impl WizardState {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn scoped_permission_history(
+    prompted: bool,
+    last_known_available: bool,
+    context_matches: bool,
+    native_available: bool,
+) -> (bool, bool) {
+    (
+        prompted && context_matches,
+        (last_known_available && context_matches) || native_available,
+    )
+}
+
 /// Check if a model family is compatible with an execution target
 /// Setup wizard result containing all collected configuration
 pub struct SetupResult {
@@ -831,6 +897,12 @@ pub struct SetupResult {
     pub debug_logging: bool,
     #[cfg(target_os = "macos")]
     pub gui_automation: bool,
+    #[cfg(target_os = "macos")]
+    pub gui_automation_prompted: bool,
+    #[cfg(target_os = "macos")]
+    pub gui_automation_last_known_available: bool,
+    #[cfg(target_os = "macos")]
+    pub gui_automation_permission_context: String,
     pub daemon_only_mode: bool,
     pub mdns_discovery: bool,
     pub auto_discover: bool,
@@ -959,6 +1031,12 @@ fn config_from_setup_result(result: &SetupResult) -> crate::config::Config {
         debug_logging: result.debug_logging,
         #[cfg(target_os = "macos")]
         gui_automation: result.gui_automation,
+        #[cfg(target_os = "macos")]
+        gui_automation_prompted: result.gui_automation_prompted,
+        #[cfg(target_os = "macos")]
+        gui_automation_last_known_available: result.gui_automation_last_known_available,
+        #[cfg(target_os = "macos")]
+        gui_automation_permission_context: result.gui_automation_permission_context.clone(),
         memory_context_lines: result.memory_context_lines,
         max_verbatim_messages: new_config.features.max_verbatim_messages,
         context_recall_k: new_config.features.context_recall_k,
@@ -2379,6 +2457,16 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
         editing_finch_api_key,
         #[cfg(target_os = "macos")]
         gui_automation,
+        #[cfg(target_os = "macos")]
+        gui_automation_availability,
+        #[cfg(target_os = "macos")]
+        gui_automation_prompt,
+        #[cfg(target_os = "macos")]
+        gui_automation_prompted,
+        #[cfg(target_os = "macos")]
+        gui_automation_last_known_available,
+        #[cfg(target_os = "macos")]
+        gui_automation_permission_context,
         daemon_only_mode,
         mdns_discovery,
         auto_discover,
@@ -2449,7 +2537,19 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                     0 => *streaming = !*streaming,
                     1 => *auto_approve = !*auto_approve,
                     2 => *debug = !*debug,
-                    3 => *gui_automation = !*gui_automation,
+                    3 => toggle_gui_automation_with(
+                        gui_automation,
+                        gui_automation_availability,
+                        gui_automation_prompt,
+                        gui_automation_prompted,
+                        gui_automation_last_known_available,
+                        gui_automation_permission_context,
+                        || {
+                            AutomationBroker::new(true).request_permission(
+                                AutomationPromptContext::for_current_session(true),
+                            )
+                        },
+                    ),
                     SETTINGS_DAEMON_ONLY_IDX => *daemon_only_mode = !*daemon_only_mode,
                     SETTINGS_MDNS_IDX => *mdns_discovery = !*mdns_discovery,
                     SETTINGS_AUTO_DISCOVER_IDX => *auto_discover = !*auto_discover,
@@ -2475,6 +2575,32 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                     *editing_finch_api_key = true;
                 }
             }
+            #[cfg(target_os = "macos")]
+            KeyCode::Char('r') | KeyCode::Char('R') if *selected_idx == 3 && *gui_automation => {
+                let result = AutomationBroker::new(true)
+                    .request_permission(AutomationPromptContext::for_current_session(true));
+                if result.prompt == AutomationPromptDisposition::Requested {
+                    *gui_automation_prompted = true;
+                }
+                if result.availability.state == AutomationState::Available {
+                    *gui_automation_last_known_available = true;
+                }
+                if result.prompt == AutomationPromptDisposition::Requested
+                    || result.availability.state == AutomationState::Available
+                {
+                    *gui_automation_permission_context = permission_context_key();
+                }
+                *gui_automation_availability = result.availability;
+                *gui_automation_prompt = result.prompt;
+            }
+            #[cfg(target_os = "macos")]
+            KeyCode::Char('o') | KeyCode::Char('O') if *selected_idx == 3 && *gui_automation => {
+                if let Err(error) = AutomationBroker::new(true)
+                    .open_permission_settings(AutomationPromptContext::for_current_session(true))
+                {
+                    tracing::warn!("Could not open macOS Accessibility settings: {error}");
+                }
+            }
             KeyCode::Enter => {
                 state.mark_completed(WizardSection::Features);
                 state.next_section();
@@ -2486,6 +2612,41 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
         }
     }
     Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn toggle_gui_automation_with(
+    configured: &mut bool,
+    availability: &mut AutomationAvailability,
+    prompt: &mut AutomationPromptDisposition,
+    prompted: &mut bool,
+    last_known_available: &mut bool,
+    permission_context: &mut String,
+    request_permission: impl FnOnce() -> AutomationPermissionResult,
+) {
+    if *configured {
+        *configured = false;
+        *availability = AutomationBroker::new(false).availability();
+        *prompt = AutomationPromptDisposition::NotNeeded;
+    } else {
+        // Persist Finch's explicit capability consent independently from the
+        // result of the native macOS permission request.
+        *configured = true;
+        let result = request_permission();
+        if result.prompt == AutomationPromptDisposition::Requested {
+            *prompted = true;
+        }
+        if result.availability.state == AutomationState::Available {
+            *last_known_available = true;
+        }
+        if result.prompt == AutomationPromptDisposition::Requested
+            || result.availability.state == AutomationState::Available
+        {
+            *permission_context = permission_context_key();
+        }
+        *availability = result.availability;
+        *prompt = result.prompt;
+    }
 }
 
 /// Handle input for Review section
@@ -2612,6 +2773,27 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         *gui_automation
     } else {
         false
+    };
+
+    #[cfg(target_os = "macos")]
+    let (
+        gui_automation_prompted,
+        gui_automation_last_known_available,
+        gui_automation_permission_context,
+    ) = if let Some(SectionState::Features {
+        gui_automation_prompted,
+        gui_automation_last_known_available,
+        gui_automation_permission_context,
+        ..
+    }) = state.sections.get(&WizardSection::Features)
+    {
+        (
+            *gui_automation_prompted,
+            *gui_automation_last_known_available,
+            gui_automation_permission_context.clone(),
+        )
+    } else {
+        (false, false, String::new())
     };
 
     // Map to backward-compatible fields
@@ -2806,6 +2988,12 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         debug_logging: debug,
         #[cfg(target_os = "macos")]
         gui_automation,
+        #[cfg(target_os = "macos")]
+        gui_automation_prompted,
+        #[cfg(target_os = "macos")]
+        gui_automation_last_known_available,
+        #[cfg(target_os = "macos")]
+        gui_automation_permission_context,
         daemon_only_mode: daemon_only,
         mdns_discovery: mdns,
         auto_discover: auto_disc,
@@ -2978,6 +3166,16 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             editing_finch_api_key,
             #[cfg(target_os = "macos")]
             gui_automation,
+            #[cfg(target_os = "macos")]
+            gui_automation_availability,
+            #[cfg(target_os = "macos")]
+            gui_automation_prompt,
+            #[cfg(target_os = "macos")]
+            gui_automation_prompted,
+            #[cfg(target_os = "macos")]
+            gui_automation_last_known_available,
+            #[cfg(target_os = "macos")]
+                gui_automation_permission_context: _,
             daemon_only_mode,
             mdns_discovery,
             auto_discover,
@@ -2995,6 +3193,14 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState) {
             *editing_finch_api_key,
             #[cfg(target_os = "macos")]
             *gui_automation,
+            #[cfg(target_os = "macos")]
+            gui_automation_availability,
+            #[cfg(target_os = "macos")]
+            *gui_automation_prompt,
+            #[cfg(target_os = "macos")]
+            *gui_automation_prompted,
+            #[cfg(target_os = "macos")]
+            *gui_automation_last_known_available,
             *daemon_only_mode,
             *mdns_discovery,
             *auto_discover,
@@ -3963,6 +4169,10 @@ fn render_features_section(
     finch_api_key: &str,
     editing_finch_api_key: bool,
     #[cfg(target_os = "macos")] gui_automation: bool,
+    #[cfg(target_os = "macos")] gui_automation_availability: &AutomationAvailability,
+    #[cfg(target_os = "macos")] gui_automation_prompt: AutomationPromptDisposition,
+    #[cfg(target_os = "macos")] gui_automation_prompted: bool,
+    #[cfg(target_os = "macos")] gui_automation_last_known_available: bool,
     daemon_only_mode: bool,
     mdns_discovery: bool,
     auto_discover: bool,
@@ -3988,6 +4198,37 @@ fn render_features_section(
     f.render_widget(title, chunks[0]);
 
     // Build feature list: toggle-able booleans, editable credentials, and a spinner.
+
+    #[cfg(target_os = "macos")]
+    let gui_automation_description = match (
+        gui_automation_availability.state,
+        gui_automation_prompt,
+    ) {
+        (AutomationState::Disabled, _) => "Finch capability consent is disabled",
+        (AutomationState::Unsupported, _) => "Configured, but unsupported on this launch",
+        (AutomationState::Available, _) => {
+            "Configured; macOS Accessibility granted; Finch still approves each effect"
+        }
+        (AutomationState::PermissionRequired, AutomationPromptDisposition::SuppressedRemote) => {
+            "Configured; permission required (prompt suppressed over SSH); press R locally"
+        }
+        (
+            AutomationState::PermissionRequired,
+            AutomationPromptDisposition::SuppressedNonInteractive,
+        ) => "Configured; permission required (headless prompt suppressed); retry interactively",
+        (AutomationState::PermissionRequired, _) if gui_automation_last_known_available => {
+            "Configured; prior grant not observed (revoked/identity changed); press R"
+        }
+        (AutomationState::PermissionRequired, AutomationPromptDisposition::Requested) => {
+            "Configured; macOS prompt requested, but access is not granted yet; press R to verify"
+        }
+        (AutomationState::PermissionRequired, _) if gui_automation_prompted => {
+            "Configured; permission remains ungranted after an earlier request; press R to retry"
+        }
+        (AutomationState::PermissionRequired, _) => {
+            "Configured; macOS Accessibility permission required; press R to request/check"
+        }
+    };
 
     #[cfg(not(target_os = "macos"))]
     let bool_features: Vec<(&str, bool, &str)> = vec![
@@ -4040,11 +4281,7 @@ fn render_features_section(
             debug,
             "Write verbose logs to ~/.finch/debug.log",
         ),
-        (
-            "GUI automation",
-            gui_automation,
-            "Allow tools to click/type in macOS apps",
-        ),
+        ("GUI automation", gui_automation, gui_automation_description),
         // index 4 = HF token (handled separately)
         (
             "Daemon-only mode",
@@ -4285,7 +4522,14 @@ fn render_features_section(
     } else if editing_finch_api_key {
         "Type Finch client key | Enter/Esc: Done"
     } else {
-        "↑/↓: Move | Space: Toggle | ◀/▶: Context lines | E: Edit selected key/token | Enter: Continue"
+        #[cfg(target_os = "macos")]
+        {
+            "↑/↓: Move | Space: Toggle | R: Retry GUI permission | O: Open Accessibility settings | E: Edit | Enter: Continue"
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            "↑/↓: Move | Space: Toggle | ◀/▶: Context lines | E: Edit selected key/token | Enter: Continue"
+        }
     };
     let instructions = Paragraph::new(instructions_text)
         .style(
@@ -4627,6 +4871,12 @@ mod tests {
             auto_approve,
             #[cfg(target_os = "macos")]
             gui_automation,
+            #[cfg(target_os = "macos")]
+            gui_automation_prompted,
+            #[cfg(target_os = "macos")]
+            gui_automation_last_known_available,
+            #[cfg(target_os = "macos")]
+            gui_automation_permission_context,
             daemon_only_mode,
             mdns_discovery,
             auto_discover,
@@ -4637,6 +4887,9 @@ mod tests {
             #[cfg(target_os = "macos")]
             {
                 *gui_automation = true;
+                *gui_automation_prompted = true;
+                *gui_automation_last_known_available = true;
+                *gui_automation_permission_context = permission_context_key();
             }
             *daemon_only_mode = true;
             *mdns_discovery = true;
@@ -4650,6 +4903,15 @@ mod tests {
         assert!(config.features.auto_approve_tools);
         #[cfg(target_os = "macos")]
         assert!(config.features.gui_automation);
+        #[cfg(target_os = "macos")]
+        assert!(config.features.gui_automation_prompted);
+        #[cfg(target_os = "macos")]
+        assert!(config.features.gui_automation_last_known_available);
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            config.features.gui_automation_permission_context,
+            permission_context_key()
+        );
         assert_eq!(config.server.mode, "daemon-only");
         assert!(config.server.advertise);
         assert!(config.client.auto_discover);
@@ -4659,6 +4921,12 @@ mod tests {
             auto_approve,
             #[cfg(target_os = "macos")]
             gui_automation,
+            #[cfg(target_os = "macos")]
+            gui_automation_prompted,
+            #[cfg(target_os = "macos")]
+            gui_automation_last_known_available,
+            #[cfg(target_os = "macos")]
+            gui_automation_permission_context,
             daemon_only_mode,
             mdns_discovery,
             auto_discover,
@@ -4668,12 +4936,90 @@ mod tests {
             assert!(*auto_approve);
             #[cfg(target_os = "macos")]
             assert!(*gui_automation);
+            #[cfg(target_os = "macos")]
+            assert!(*gui_automation_prompted);
+            #[cfg(target_os = "macos")]
+            assert!(*gui_automation_last_known_available);
+            #[cfg(target_os = "macos")]
+            assert_eq!(gui_automation_permission_context, &permission_context_key());
             assert!(*daemon_only_mode);
             assert!(*mdns_discovery);
             assert!(*auto_discover);
         } else {
             panic!("expected settings section");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gui_toggle_persists_consent_without_claiming_prompt_granted_access() {
+        use crate::runtime::automation::{
+            AutomationAvailability, AutomationPermissionResult, AutomationPromptDisposition,
+            AutomationState,
+        };
+
+        let mut configured = false;
+        let mut availability = AutomationBroker::new(false).availability();
+        let mut prompt = AutomationPromptDisposition::NotNeeded;
+        let mut prompted = false;
+        let mut last_known_available = false;
+        let mut permission_context = String::new();
+
+        toggle_gui_automation_with(
+            &mut configured,
+            &mut availability,
+            &mut prompt,
+            &mut prompted,
+            &mut last_known_available,
+            &mut permission_context,
+            || AutomationPermissionResult {
+                availability: AutomationAvailability {
+                    state: AutomationState::PermissionRequired,
+                    backend: "test-native",
+                    operations: vec!["click", "type"],
+                },
+                prompt: AutomationPromptDisposition::Requested,
+            },
+        );
+
+        assert!(configured, "Finch consent should be persisted separately");
+        assert_eq!(availability.state, AutomationState::PermissionRequired);
+        assert_eq!(prompt, AutomationPromptDisposition::Requested);
+        assert!(prompted);
+        assert!(!last_known_available);
+        assert_eq!(permission_context, permission_context_key());
+
+        toggle_gui_automation_with(
+            &mut configured,
+            &mut availability,
+            &mut prompt,
+            &mut prompted,
+            &mut last_known_available,
+            &mut permission_context,
+            || panic!("disabling must not invoke the native prompt"),
+        );
+        assert!(!configured);
+        assert_eq!(availability.state, AutomationState::Disabled);
+        assert_eq!(prompt, AutomationPromptDisposition::NotNeeded);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gui_permission_history_is_scoped_and_current_native_state_wins() {
+        assert_eq!(
+            scoped_permission_history(true, true, true, false),
+            (true, true)
+        );
+        assert_eq!(
+            scoped_permission_history(true, true, false, false),
+            (false, false),
+            "history from a different executable/launcher context must not imply denial or revocation"
+        );
+        assert_eq!(
+            scoped_permission_history(false, false, false, true),
+            (false, true),
+            "a current native grant must be reported regardless of stale history"
+        );
     }
 
     #[test]
