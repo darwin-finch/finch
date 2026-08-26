@@ -64,7 +64,7 @@ REPL appears instantly (<100ms)
     ┌──────────────────────────────────┐
     │ ONNX Runtime Inference           │
     │ (Qwen 1.5B/3B/7B/14B)           │
-    │ + LoRA Adapters (optional)       │
+    │ (pre-trained base model only)    │
     │ Device: CoreML/CPU               │
     └──────────┬───────────────────────┘
            │
@@ -782,7 +782,7 @@ FINCH-<base64url(JSON payload)>.<base64url(Ed25519 signature over payload bytes)
 12. If tool_use blocks, execute on client side
 13. Send tool results back to daemon
 14. Repeat until final response
-15. Log metrics and feedback
+15. Log metrics; retain feedback only after an explicit user rating
 ```
 
 ### Daemon Lifecycle
@@ -792,7 +792,7 @@ FINCH-<base64url(JSON payload)>.<base64url(Ed25519 signature over payload bytes)
 2. Load ONNX model (if backend enabled)
    - Download from HuggingFace Hub (first run)
    - Initialize KV cache
-   - Load LoRA adapter (if exists)
+   - Do not scan for or load LoRA adapters (unsupported by the default runtime)
 3. Start HTTP server (port 11435)
 4. Write PID file (~/.finch/daemon.pid)
 5. Accept client connections
@@ -930,13 +930,13 @@ executable training queue.
 
 **Response Time:**
 - Local generation: 500ms-2s (depending on model size)
-- With LoRA adapter: +50-100ms overhead
+- LoRA adapter overhead: not applicable; adapter loading is disabled
 - Teacher API: Standard API latency (1-3s)
 - Tool execution: ~50-200ms per tool
 
 **Resource Usage:**
 - RAM: 3-28GB (depending on model size)
-- Disk: 1.5-14GB for base model + ~5MB per adapter
+- Disk: 1.5-14GB for the pre-trained base model; preserved legacy adapters are not loaded
 - CPU (idle): <5%
 
 **Daemon:**
@@ -949,7 +949,7 @@ executable training queue.
 
 ### Data Protection
 - All metrics hashed (SHA256) for privacy
-- Models train only on YOUR data
+- Explicit feedback remains private metadata; Finch does not train on it or upload it
 - No telemetry, no cloud sync
 - Can delete `~/.finch/` anytime
 

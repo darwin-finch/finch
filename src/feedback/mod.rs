@@ -19,9 +19,6 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-compile_error!("secure feedback storage is currently supported only on Linux and macOS");
-
 /// Maximum retained feedback size. Sixteen MiB permits thousands of ordinary
 /// ratings while placing a conservative, deterministic ceiling on local disk
 /// and read-buffer use. Finch never deletes existing feedback to enforce it.
@@ -37,6 +34,20 @@ impl std::fmt::Display for FeedbackQuotaExceeded {
 }
 
 impl std::error::Error for FeedbackQuotaExceeded {}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[derive(Debug)]
+struct UnsupportedFeedbackStorage;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl std::fmt::Display for UnsupportedFeedbackStorage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Private feedback persistence is supported only on Linux and macOS")
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl std::error::Error for UnsupportedFeedbackStorage {}
 
 fn feedback_quota_error() -> anyhow::Error {
     FeedbackQuotaExceeded.into()
@@ -338,7 +349,7 @@ impl FeedbackLogger {
     fn ensure_private_storage(&self) -> Result<()> {
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            return ensure_fallback_private_storage(&self.file_path);
+            return Err(UnsupportedFeedbackStorage.into());
         }
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -375,15 +386,8 @@ impl FeedbackLogger {
         self.ensure_private_storage()?;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            after_parent_opened();
-            let purpose = if append {
-                OpenPurpose::Append
-            } else {
-                OpenPurpose::Read
-            };
-            let file = self.open_fallback(purpose)?;
-            validate_feedback_file_for_use(&file)?;
-            return Ok(file);
+            let _ = (append, after_parent_opened);
+            return Err(UnsupportedFeedbackStorage.into());
         }
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -416,21 +420,6 @@ impl FeedbackLogger {
     fn log_with_lock_hook(&self, entry: &FeedbackEntry, after_lock: impl FnOnce()) -> Result<()> {
         let file = self.open_private(true)?;
         self.append_to_open_file(file, entry, after_lock)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn open_fallback(&self, purpose: OpenPurpose) -> Result<File> {
-        let mut options = OpenOptions::new();
-        options.read(true);
-        if purpose == OpenPurpose::Append {
-            options.append(true);
-        } else if purpose == OpenPurpose::Initialize {
-            options.write(true).create(true);
-        }
-        let file = options
-            .open(&self.file_path)
-            .context("Failed to open private feedback log")?;
-        Ok(file)
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -578,25 +567,6 @@ fn trusted_storage_root(parent: &Path) -> Result<(PathBuf, PathBuf)> {
         .strip_prefix(Path::new("/"))
         .context("Failed to resolve private feedback storage root")?;
     Ok((PathBuf::from("/"), relative.to_path_buf()))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn ensure_fallback_private_storage(file_path: &Path) -> Result<()> {
-    let parent = file_path
-        .parent()
-        .context("Private feedback log has no parent directory")?;
-    fs::create_dir_all(parent).context("Failed to create private feedback directory")?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(file_path)
-        .context("Failed to open private feedback log")?;
-    validate_feedback_file(&file)?;
-    make_object_private(&file, "private feedback log", 0o600)?;
-    validate_feedback_file_for_use(&file)?;
-    file.sync_all()
-        .context("Failed to sync private feedback log")
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -838,6 +808,21 @@ mod tests {
     fn test_feedback_rating_weights() {
         assert_eq!(FeedbackRating::Good.training_weight(), 1.0);
         assert_eq!(FeedbackRating::Bad.training_weight(), 10.0);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn test_feedback_persistence_fails_closed_without_creating_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("must-not-exist");
+        let path = directory.join("feedback.jsonl");
+
+        let error = FeedbackLogger::at(&path).unwrap_err();
+
+        assert!(error.downcast_ref::<UnsupportedFeedbackStorage>().is_some());
+        assert!(!directory.exists());
+        assert!(!path.exists());
+        assert!(!format!("{error:#}").contains(temp.path().to_string_lossy().as_ref()));
     }
 
     #[test]
