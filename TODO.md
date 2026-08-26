@@ -8,15 +8,48 @@ remaining unchecked backlog is being triaged under
 [`docs/SHARED_PROGRAM_RUNTIME_PLAN.md`](docs/SHARED_PROGRAM_RUNTIME_PLAN.md), and
 [`docs/BRAIN_CONVERGENCE_PLAN.md`](docs/BRAIN_CONVERGENCE_PLAN.md).
 
+Issues describe reviewable outcomes rather than every implementation step. While pursuing an issue,
+agents may create smaller independently testable sub-issues, must link their parent and dependency
+edges, and may close them only with commit and verification evidence. Do not leave discovered work
+only in this file or in an unpushed worktree.
+
+## Authoritative issue map (2026-08-25 audit)
+
+- Brain task/plan posets and explicit subagent joins: [#60](https://github.com/darwin-finch/finch/issues/60),
+  [#61](https://github.com/darwin-finch/finch/issues/61), and
+  [#62](https://github.com/darwin-finch/finch/issues/62).
+- IDE and standards-based clients: [#63](https://github.com/darwin-finch/finch/issues/63) and
+  [#64](https://github.com/darwin-finch/finch/issues/64).
+- Compiler and language work: [#65](https://github.com/darwin-finch/finch/issues/65) through
+  [#68](https://github.com/darwin-finch/finch/issues/68), and
+  [#78](https://github.com/darwin-finch/finch/issues/78) through
+  [#86](https://github.com/darwin-finch/finch/issues/86).
+- Provider, setup, authentication, instructions, and model catalogs:
+  [#70](https://github.com/darwin-finch/finch/issues/70) through
+  [#77](https://github.com/darwin-finch/finch/issues/77), plus focused setup issues
+  [#104](https://github.com/darwin-finch/finch/issues/104) and
+  [#105](https://github.com/darwin-finch/finch/issues/105).
+- Runtime, proposals, portable ABI, AOT, and self-hosting:
+  [#87](https://github.com/darwin-finch/finch/issues/87) through
+  [#103](https://github.com/darwin-finch/finch/issues/103).
+- Brain convergence, collaboration, transcript, and review UX:
+  [#69](https://github.com/darwin-finch/finch/issues/69) and
+  [#106](https://github.com/darwin-finch/finch/issues/106) through
+  [#118](https://github.com/darwin-finch/finch/issues/118).
+- Release, documentation, enterprise, privacy, routing, and distributed execution:
+  [#119](https://github.com/darwin-finch/finch/issues/119) through
+  [#129](https://github.com/darwin-finch/finch/issues/129).
+
 ## Setup wizard persistence and navigation
 
 - [x] Preserve the ordered unified provider list when reopening and saving setup, including local
   models such as Qwen used as non-primary/tool providers; never reconstruct the screen from the
   cloud-only legacy `teachers` projection.
-- [ ] Persist edited persona boot/system prompts as user overrides, reload them in the wizard, and
+- [x] Persist edited persona boot/system prompts as user overrides, reload them in the wizard, and
   make the live REPL honor the selected override. Keep the system-prompt behavior distinct from a
   merely cosmetic response style.
-- [ ] Use one setup-result-to-config mapping for first-run setup, `finch setup`, and `/setup`; cover
+- [ ] Use one setup-result-to-config mapping for first-run setup, `finch setup`, and `/setup`
+  ([#75](https://github.com/darwin-finch/finch/issues/75)); cover
   GUI automation, daemon-only mode, network advertisement, LAN discovery, persona, and memory
   status-line count with round-trip tests. The mapping now round-trips the displayed values and the
   active event loop honors disabled response streaming, but persistence is not completion: make
@@ -24,10 +57,12 @@ remaining unchecked backlog is being triaged under
   `client.auto_discover` through the correct Brain transport rather than treating advertised TLS as
   an HTTP daemon, make configured debug logging control the interactive output layer and document
   its real destination, and add behavioral tests for each runtime path.
-- [ ] Allow saving the accumulated settings from every wizard screen instead of only the final
-  screen. Make Escape unwind the current editor/dialog/screen first; cancelling the entire wizard
+- [ ] Saving the accumulated settings from every top-level wizard screen is implemented. Finish the
+  remaining navigation behavior in [#75](https://github.com/darwin-finch/finch/issues/75): make
+  Escape unwind the current editor/dialog/screen first; cancelling the entire wizard
   must be a distinct action and must confirm before discarding unsaved changes.
-- [ ] Keep ordinary Brain/REPL startup read-only with respect to global configuration. The weekly
+- [ ] Keep ordinary Brain/REPL startup read-only with respect to global configuration
+  ([#76](https://github.com/darwin-finch/finch/issues/76)). The weekly
   noncommercial notice currently advances `license.notice_suppress_until` by rewriting
   `~/.finch/config.toml` during `EventLoop::run`, which also leaks a misleading
   `[config::settings] Configuration saved` line into first-start output. Store notice-delivery
@@ -35,7 +70,9 @@ remaining unchecked backlog is being triaged under
   atomically only when needed, and keep persistence diagnostics out of conversation/startup rows.
   Add a startup test proving Brain creation/attachment alone leaves the config bytes and mtime
   unchanged.
-- [ ] Dogfood Finch with the ChatGPT Sol profile after the wizard fixes land; verify provider
+- [ ] Dogfood Finch with the ChatGPT Sol profile under
+  [#51](https://github.com/darwin-finch/finch/issues/51) and the release gate
+  [#55](https://github.com/darwin-finch/finch/issues/55) after the wizard fixes land; verify provider
   selection, prompt override, settings reload, and visible memory status lines.
 
 ## Typed Lisp/Co-Forth VM — working substrate and ongoing language evolution
@@ -1085,11 +1122,11 @@ still blocks the corresponding Brain phase until it is unified.
   leases cannot publish, and child ancestry/outcome reconstructs from the event log after restart.
   B3 remains open for speculative helpers and any other background activity that still lacks the
   same canonical lifecycle.
-- [ ] Make every externally addressable remote Brain mutation crash-safe and idempotent
+- [x] Make every externally addressable remote Brain mutation crash-safe and idempotent
   ([#49](https://github.com/darwin-finch/finch/issues/49)). Cancellation, runner handoff, schedule
-  cancellation, initialization, and approval decisions need durable reservations and replayable
+  cancellation, initialization, and approval decisions now use durable reservations and replayable
   receipts across retries, response loss, restart, and concurrent identical requests; approval
-  delivery must not deadlock against the originating turn lane.
+  delivery is reconciled without deadlocking against the originating turn lane.
 - [x] Complete Brain control and approval ownership above that substrate. Put the role and approval
   audience on every permission/proposal view. ProgramRuns
   now execute on the leased frontend. Each approval request now carries the daemon-selected
@@ -1184,7 +1221,8 @@ still blocks the corresponding Brain phase until it is unified.
   sibling-connection replay, and approval-audience substitution matrix now passes. mDNS carries
   only stable authority-free identity/reachability metadata; dynamic node/model availability is
   queried with `brain:read` and checked against the credential and invited node identity.
-- [ ] Simplify the Brain invitation cryptographic envelope after the current transport stabilizes.
+- [ ] Simplify and version the Brain invitation cryptographic envelope under
+  [#128](https://github.com/darwin-finch/finch/issues/128) after the current transport stabilizes.
   Use the persistent Ed25519 node key as the single portable issuer identity, but allow a rotated or
   ephemeral TLS key whose SPKI is bound by the signed compact invitation claims alongside the
   recipient endpoint, Brain audience/generation, role/scopes, invitation ID, validity, and
@@ -1199,13 +1237,13 @@ still blocks the corresponding Brain phase until it is unified.
   rotation. Keep consumption, retry identity, revocation, attenuation, and attachment binding as
   durable capability state. Version both envelope forms and test downgrade, key rotation, endpoint
   substitution, invite theft/racing, and cross-node replay.
-- [ ] Make `/brain invite` publish the actual certificate-valid TLS collaboration endpoint, not the
-  loopback plaintext daemon address used to mint the invitation. Include the configured TLS port,
-  prefer the daemon's `.local` machine identity (or another hostname covered by the embedded
-  certificate), and refuse to print a recipient command when remote collaboration/listener
-  configuration is disabled or unreachable. Keep hostname verification enabled, surface safe
-  connect/TLS diagnostics from `/brain join`, and cover the generated command plus live-style
-  redemption with regression tests. Keep `/brain attach NAME` on the existing local Cap'n Proto
+- [x] Make `/brain invite` publish the actual certificate-valid TLS collaboration endpoint, not the
+  loopback plaintext daemon address used to mint the invitation. It includes the configured TLS
+  port, prefers the daemon's certificate-valid machine identity, and refuses to print a recipient
+  command when remote collaboration/listener configuration is disabled or unreachable. Hostname
+  verification remains enabled, safe connect/TLS diagnostics surface from `/brain join`, and
+  regression tests cover the generated command plus live-style redemption. `/brain attach NAME`
+  remains on the existing local Cap'n Proto
   socket (never loopback HTTP/password bootstrap), reserve remote attachment for
   `/brain join NAME@MACHINE[:PORT] INVITE`, and show that specific usage for incomplete joins.
 - [ ] Enforce least privilege independently for event visibility, prompt/program submission,
@@ -1322,7 +1360,7 @@ still blocks the corresponding Brain phase until it is unified.
   residency as durable Brain state. BOOT is an invocation contract rather than remembered dialogue:
   attach the current BOOT/instruction capsule on every inference for APIs whose continuation cursor
   does not inherit instructions, and start a new chain whenever its package hash changes.
-- [ ] Keep the ordinary OpenAI-compatible API client-managed and stateless with respect to named
+- [x] Keep the ordinary OpenAI-compatible API client-managed and stateless with respect to named
   brains: Cline/Roo own their conversation and tool loop while Finch supplies model inference.
 - [ ] Optionally add an explicit brain-scoped OpenAI mode (for example a `finch/brain/<name>` model
   ID) for clients that deliberately want to join a Finch event log. Never infer that attachment
