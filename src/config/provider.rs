@@ -77,6 +77,15 @@ fn default_model_size() -> ModelSize {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ProviderEntry {
+    /// Finch-native ChatGPT subscription access. `credential_ref` is opaque;
+    /// OAuth credentials never belong in config.toml.
+    Chatgpt {
+        credential_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
     Claude {
         api_key: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -199,13 +208,31 @@ pub enum ProviderEntry {
 }
 
 impl ProviderEntry {
+    /// Named account record used by this profile, if any. Multiple profiles
+    /// may share one reference; profile deletion never removes the record.
+    pub fn credential_ref(&self) -> Option<&str> {
+        match self {
+            Self::Chatgpt { credential_ref, .. } => Some(credential_ref),
+            _ => None,
+        }
+    }
+
+    /// Normalized audience required by this profile's credential.
+    pub fn credential_audience(&self) -> Option<&'static str> {
+        match self {
+            Self::Chatgpt { .. } => Some("https://chatgpt.com/backend-api/codex"),
+            _ => None,
+        }
+    }
+
     /// Stable, user-facing selector for this configured provider profile.
     ///
     /// Explicit `name` values win. Older configs without names remain usable by
     /// falling back to the configured model, then to a provider-specific label.
     pub fn profile_name(&self) -> String {
         let explicit_name = match self {
-            Self::Claude { name, .. }
+            Self::Chatgpt { name, .. }
+            | Self::Claude { name, .. }
             | Self::Openai { name, .. }
             | Self::Grok { name, .. }
             | Self::Gemini { name, .. }
@@ -245,6 +272,7 @@ impl ProviderEntry {
     /// Human-readable name for UI display.
     pub fn display_name(&self) -> &str {
         match self {
+            Self::Chatgpt { name, .. } => name.as_deref().unwrap_or("ChatGPT subscription"),
             Self::Claude { name, .. } => name.as_deref().unwrap_or("Claude"),
             Self::Openai { name, .. } => name.as_deref().unwrap_or("OpenAI"),
             Self::Grok { name, .. } => name.as_deref().unwrap_or("Grok"),
@@ -260,6 +288,7 @@ impl ProviderEntry {
     /// Short provider-type tag (e.g. "claude", "grok", "local").
     pub fn provider_type(&self) -> &'static str {
         match self {
+            Self::Chatgpt { .. } => "chatgpt",
             Self::Claude { .. } => "claude",
             Self::Openai { .. } => "openai",
             Self::Grok { .. } => "grok",
@@ -280,6 +309,7 @@ impl ProviderEntry {
     /// API key for cloud variants; `None` for Local, Ollama, and RemoteDaemon.
     pub fn api_key(&self) -> Option<&str> {
         match self {
+            Self::Chatgpt { .. } => None,
             Self::Claude { api_key, .. } => Some(api_key.as_str()),
             Self::Openai { api_key, .. } => Some(api_key.as_str()),
             Self::Grok { api_key, .. } => Some(api_key.as_str()),
@@ -293,6 +323,7 @@ impl ProviderEntry {
     /// Optional model override (cloud providers only).
     pub fn model(&self) -> Option<&str> {
         match self {
+            Self::Chatgpt { model, .. } => model.as_deref(),
             Self::Claude { model, .. } => model.as_deref(),
             Self::Openai { model, .. } => model.as_deref(),
             Self::Grok { model, .. } => model.as_deref(),
@@ -322,6 +353,23 @@ mod tests {
         let toml = toml::to_string(&entry).unwrap();
         let decoded: ProviderEntry = toml::from_str(&toml).unwrap();
         assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn test_chatgpt_config_contains_only_opaque_account_reference() {
+        let entry = ProviderEntry::Chatgpt {
+            credential_ref: "chatgpt:personal".to_string(),
+            model: Some("gpt-5.6-sol".to_string()),
+            name: Some("deep".to_string()),
+        };
+        let encoded = toml::to_string(&entry).unwrap();
+        assert!(encoded.contains("type = \"chatgpt\""));
+        assert!(encoded.contains("credential_ref = \"chatgpt:personal\""));
+        assert!(!encoded.contains("access_token"));
+        assert!(!encoded.contains("refresh_token"));
+        assert_eq!(entry.api_key(), None);
+        assert_eq!(entry.credential_ref(), Some("chatgpt:personal"));
+        assert_eq!(toml::from_str::<ProviderEntry>(&encoded).unwrap(), entry);
     }
 
     #[test]

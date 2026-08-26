@@ -39,6 +39,14 @@ enum AddProviderStep {
         execution: ExecutionTarget,
         focused_field: usize, // 0=Backend, 1=Family, 2=Size, 3=Device
     },
+    // Finch-owned ChatGPT device authorization and direct transport check.
+    ChatGptLogin {
+        credential_ref: String,
+        profile_name: String,
+        editing_idx: Option<usize>,
+        progress: Arc<Mutex<ChatGptWizardProgress>>,
+        cancellation: Arc<Mutex<Option<tokio_util::sync::CancellationToken>>>,
+    },
     // Network scan path
     Scanning {
         results: Arc<Mutex<Option<Vec<DiscoveredService>>>>,
@@ -47,6 +55,20 @@ enum AddProviderStep {
         agents: Vec<DiscoveredService>,
         selected: usize,
     },
+}
+
+#[derive(Debug, Clone)]
+enum ChatGptWizardProgress {
+    Starting,
+    Validating,
+    Pending {
+        verification_url: String,
+        user_code: String,
+    },
+    Complete {
+        preferred_model: String,
+    },
+    Failed(String),
 }
 
 /// Cloud provider options shown in the add-provider overlay
@@ -82,7 +104,27 @@ const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
         "llama-3.3-70b-versatile",
         "get key at console.groq.com",
     ),
+    (
+        "chatgpt",
+        "ChatGPT subscription",
+        "gpt-5.6-sol",
+        "sign in with a one-time device code; no API key or Codex process",
+    ),
 ];
+
+fn next_api_key_provider_index(current: usize, forward: bool) -> usize {
+    let mut candidate = current;
+    loop {
+        candidate = if forward {
+            (candidate + 1) % CLOUD_PROVIDERS.len()
+        } else {
+            (candidate + CLOUD_PROVIDERS.len() - 1) % CLOUD_PROVIDERS.len()
+        };
+        if CLOUD_PROVIDERS[candidate].0 != "chatgpt" {
+            return candidate;
+        }
+    }
+}
 
 use crate::config::{ExecutionTarget, ProviderEntry, TeacherEntry};
 use crate::models::compatibility;
@@ -158,6 +200,9 @@ fn detect_xai_api_key() -> Option<String> {
 
 /// Known model names for cloud providers (used for cycling in ConfigureRemote dialog)
 fn known_models_for(provider: &str) -> Vec<String> {
+    if provider.eq_ignore_ascii_case("chatgpt") {
+        return vec!["gpt-5.6-sol".to_string()];
+    }
     model_catalog::static_fallback(provider)
 }
 
@@ -473,6 +518,24 @@ impl ModelConfig {
 /// `teachers` projection.
 fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
     match provider {
+        ProviderEntry::Chatgpt {
+            credential_ref,
+            model,
+            name,
+        } => Some(ModelConfig::Remote {
+            provider: "chatgpt".to_string(),
+            name: name
+                .clone()
+                .unwrap_or_else(|| "ChatGPT subscription".to_string()),
+            api_key: String::new(),
+            model: model.clone().unwrap_or_else(|| "gpt-5.6-sol".to_string()),
+            enabled: true,
+            persisted: Some(ProviderEntry::Chatgpt {
+                credential_ref: credential_ref.clone(),
+                model: model.clone(),
+                name: name.clone(),
+            }),
+        }),
         ProviderEntry::Local {
             inference_provider,
             execution_target,
@@ -530,6 +593,11 @@ fn provider_entry_from_remote_model(
     let model = (!model.is_empty()).then(|| model.to_string());
     let name = Some(name.to_string());
     match persisted {
+        Some(ProviderEntry::Chatgpt { credential_ref, .. }) => ProviderEntry::Chatgpt {
+            credential_ref: credential_ref.clone(),
+            model,
+            name,
+        },
         Some(ProviderEntry::Claude {
             base_url,
             chat_path,
@@ -601,6 +669,11 @@ fn provider_entry_from_remote_model(
         },
         Some(ProviderEntry::RemoteDaemon { .. }) => ProviderEntry::RemoteDaemon {
             address: model.unwrap_or_default(),
+            name,
+        },
+        _ if provider.eq_ignore_ascii_case("chatgpt") => ProviderEntry::Chatgpt {
+            credential_ref: "chatgpt:default".to_string(),
+            model,
             name,
         },
         _ if provider.eq_ignore_ascii_case("finch") => ProviderEntry::RemoteDaemon {
@@ -1122,16 +1195,108 @@ fn is_scanning_state(state: &WizardState) -> bool {
         adding_provider, ..
     }) = state.sections.get(&WizardSection::Models)
     {
-        matches!(adding_provider, Some(AddProviderStep::Scanning { .. }))
-            || matches!(
-                state.sections.get(&WizardSection::Models),
-                Some(SectionState::Models {
-                    catalog_refresh: Some(_),
-                    ..
-                })
-            )
+        matches!(
+            adding_provider,
+            Some(AddProviderStep::Scanning { .. } | AddProviderStep::ChatGptLogin { .. })
+        ) || matches!(
+            state.sections.get(&WizardSection::Models),
+            Some(SectionState::Models {
+                catalog_refresh: Some(_),
+                ..
+            })
+        )
     } else {
         false
+    }
+}
+
+fn start_chatgpt_login(
+    credential_ref: String,
+    profile_name: String,
+    editing_idx: Option<usize>,
+) -> AddProviderStep {
+    let progress = Arc::new(Mutex::new(ChatGptWizardProgress::Starting));
+    let startup_cancellation = tokio_util::sync::CancellationToken::new();
+    let cancellation = Arc::new(Mutex::new(Some(startup_cancellation)));
+    let task_progress = Arc::clone(&progress);
+    let task_cancellation = Arc::clone(&cancellation);
+    let task_credential_ref = credential_ref.clone();
+    std::thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(anyhow::Error::from)
+            .and_then(|runtime| {
+                runtime.block_on(async {
+                    let flow =
+                        crate::providers::ChatGptSetupFlow::begin(task_credential_ref).await?;
+                    let pending = flow.pending();
+                    *task_progress.lock().unwrap() = ChatGptWizardProgress::Pending {
+                        verification_url: pending.verification_url.clone(),
+                        user_code: pending.user_code.clone(),
+                    };
+                    let flow_cancellation = flow.cancellation_handle();
+                    let mut cancellation = task_cancellation.lock().unwrap();
+                    if cancellation
+                        .as_ref()
+                        .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+                    {
+                        flow_cancellation.cancel();
+                    }
+                    *cancellation = Some(flow_cancellation);
+                    drop(cancellation);
+                    flow.finish().await
+                })
+            });
+        *task_cancellation.lock().unwrap() = None;
+        *task_progress.lock().unwrap() = match result {
+            Ok(outcome) => ChatGptWizardProgress::Complete {
+                preferred_model: outcome.preferred_model,
+            },
+            Err(error) => ChatGptWizardProgress::Failed(error.to_string()),
+        };
+    });
+    AddProviderStep::ChatGptLogin {
+        credential_ref,
+        profile_name,
+        editing_idx,
+        progress,
+        cancellation,
+    }
+}
+
+fn start_chatgpt_validation(
+    credential_ref: String,
+    profile_name: String,
+    editing_idx: usize,
+) -> AddProviderStep {
+    let progress = Arc::new(Mutex::new(ChatGptWizardProgress::Validating));
+    let cancellation = Arc::new(Mutex::new(None));
+    let task_progress = Arc::clone(&progress);
+    let task_credential_ref = credential_ref.clone();
+    std::thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(anyhow::Error::from)
+            .and_then(|runtime| {
+                runtime.block_on(async {
+                    crate::providers::ChatGptProvider::new(task_credential_ref)?
+                        .preferred_account_model()
+                        .await
+                })
+            });
+        *task_progress.lock().unwrap() = match result {
+            Ok(preferred_model) => ChatGptWizardProgress::Complete { preferred_model },
+            Err(error) => ChatGptWizardProgress::Failed(error.to_string()),
+        };
+    });
+    AddProviderStep::ChatGptLogin {
+        credential_ref,
+        profile_name,
+        editing_idx: Some(editing_idx),
+        progress,
+        cancellation,
     }
 }
 
@@ -1523,6 +1688,13 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
 
             match key.code {
                 KeyCode::Esc => {
+                    if let Some(AddProviderStep::ChatGptLogin { cancellation, .. }) =
+                        adding_provider.as_ref()
+                    {
+                        if let Some(cancel) = cancellation.lock().unwrap().as_ref() {
+                            cancel.cancel();
+                        }
+                    }
                     *adding_provider = None;
                     *catalog_generation = catalog_generation.wrapping_add(1);
                     *catalog_refresh = None;
@@ -1628,8 +1800,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         }) => {
                             match *focused_field {
                                 0 => {
-                                    let new_idx = (*provider_idx + CLOUD_PROVIDERS.len() - 1)
-                                        % CLOUD_PROVIDERS.len();
+                                    let new_idx = next_api_key_provider_index(*provider_idx, false);
                                     *provider_idx = new_idx;
                                     // Reset model to default for new provider
                                     let default = CLOUD_PROVIDERS[new_idx].2;
@@ -1720,7 +1891,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         }) => {
                             match *focused_field {
                                 0 => {
-                                    let new_idx = (*provider_idx + 1) % CLOUD_PROVIDERS.len();
+                                    let new_idx = next_api_key_provider_index(*provider_idx, true);
                                     *provider_idx = new_idx;
                                     // Reset model to default for new provider
                                     let default = CLOUD_PROVIDERS[new_idx].2;
@@ -1906,6 +2077,17 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         Some(AddProviderStep::SelectAddType { selected }) => {
                             let n_cloud = CLOUD_PROVIDERS.len();
                             if selected < n_cloud {
+                                if CLOUD_PROVIDERS[selected].0 == "chatgpt" {
+                                    *catalog_error = None;
+                                    return {
+                                        *adding_provider = Some(start_chatgpt_login(
+                                            "chatgpt:default".to_string(),
+                                            "ChatGPT subscription".to_string(),
+                                            None,
+                                        ));
+                                        Ok(false)
+                                    };
+                                }
                                 // Open single-screen remote dialog pre-selected to this provider
                                 let default_model = CLOUD_PROVIDERS[selected].2.to_string();
                                 *catalog_model_provenance = if default_model.is_empty() {
@@ -2109,6 +2291,60 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             }
                             None
                         }
+                        Some(AddProviderStep::ChatGptLogin {
+                            credential_ref,
+                            profile_name,
+                            editing_idx,
+                            progress,
+                            cancellation,
+                        }) => match progress.lock().unwrap().clone() {
+                            ChatGptWizardProgress::Complete { preferred_model } => {
+                                let edited = ModelConfig::Remote {
+                                    provider: "chatgpt".to_string(),
+                                    name: profile_name.clone(),
+                                    api_key: String::new(),
+                                    model: preferred_model.clone(),
+                                    enabled: true,
+                                    persisted: Some(ProviderEntry::Chatgpt {
+                                        credential_ref,
+                                        model: Some(preferred_model),
+                                        name: Some(profile_name),
+                                    }),
+                                };
+                                if let Some(editing_idx) = editing_idx {
+                                    if editing_idx == 0 {
+                                        *primary_model = edited;
+                                        *selected_idx = 0;
+                                    } else if let Some(slot) = tool_models.get_mut(editing_idx - 1)
+                                    {
+                                        *slot = edited;
+                                        *selected_idx = editing_idx;
+                                    }
+                                } else if matches!(
+                                    primary_model,
+                                    ModelConfig::Remote { api_key, .. } if api_key.is_empty()
+                                ) && tool_models.is_empty()
+                                {
+                                    *primary_model = edited;
+                                    *selected_idx = 0;
+                                } else {
+                                    tool_models.push(edited);
+                                    *selected_idx = tool_models.len();
+                                }
+                                None
+                            }
+                            ChatGptWizardProgress::Failed(message) => {
+                                *catalog_error = Some(message);
+                                None
+                            }
+                            _ => Some(AddProviderStep::ChatGptLogin {
+                                credential_ref,
+                                profile_name,
+                                editing_idx,
+                                progress,
+                                cancellation,
+                            }),
+                        },
                         None => None,
                         // Scanning handled above with early return
                         Some(AddProviderStep::Scanning { .. }) => None,
@@ -2223,6 +2459,36 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         ..
                     }) = selected
                     {
+                        if provider == "chatgpt" {
+                            let credential_ref = persisted
+                                .as_ref()
+                                .and_then(ProviderEntry::credential_ref)
+                                .unwrap_or("chatgpt:default");
+                            match crate::providers::ChatGptAuth::new(credential_ref.to_string())
+                                .and_then(|auth| auth.account_status())
+                            {
+                                Ok(Some(_)) => {
+                                    *adding_provider = Some(start_chatgpt_validation(
+                                        credential_ref.to_string(),
+                                        name.clone(),
+                                        *selected_idx,
+                                    ));
+                                }
+                                Ok(None) => {
+                                    *adding_provider = Some(start_chatgpt_login(
+                                        credential_ref.to_string(),
+                                        name.clone(),
+                                        Some(*selected_idx),
+                                    ));
+                                }
+                                Err(auth_error) => {
+                                    *error = Some(format!(
+                                        "ChatGPT account status could not be verified: {auth_error}"
+                                    ));
+                                }
+                            }
+                            return Ok(false);
+                        }
                         let provider_idx = CLOUD_PROVIDERS
                             .iter()
                             .position(|(id, ..)| *id == provider)
@@ -3963,6 +4229,83 @@ fn render_add_provider_overlay(
                 *focused_field,
             );
         }
+        AddProviderStep::ChatGptLogin { progress, .. } => {
+            let progress = progress.lock().unwrap().clone();
+            let mut lines = vec![Line::from("")];
+            match progress {
+                ChatGptWizardProgress::Starting => {
+                    lines.push(Line::from(Span::styled(
+                        "Starting Finch-owned ChatGPT device authorization…",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from("No Codex process or API key is used."));
+                }
+                ChatGptWizardProgress::Validating => {
+                    lines.push(Line::from(Span::styled(
+                        "Validating the saved ChatGPT account and GPT-5.6 Sol access…",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from("No Codex process or API key is used."));
+                }
+                ChatGptWizardProgress::Pending {
+                    verification_url,
+                    user_code,
+                } => {
+                    lines.push(Line::from(Span::styled(
+                        "Open this address in a browser:",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(verification_url));
+                    lines.push(Line::from(""));
+                    lines.push(Line::from("Enter this one-time code:"));
+                    lines.push(Line::from(Span::styled(
+                        user_code,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(
+                        "Waiting for authorization and model validation…",
+                    ));
+                }
+                ChatGptWizardProgress::Complete { preferred_model } => {
+                    lines.push(Line::from(Span::styled(
+                        "ChatGPT subscription connected",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(format!("Validated model: {preferred_model}")));
+                    lines.push(Line::from("Press Enter to add this provider."));
+                }
+                ChatGptWizardProgress::Failed(message) => {
+                    lines.push(Line::from(Span::styled(
+                        "ChatGPT authorization failed",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(message));
+                    lines.push(Line::from(
+                        "Press Enter to close, then choose another provider.",
+                    ));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Esc: Cancel",
+                Style::default().fg(Color::Yellow),
+            )));
+            let paragraph = Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: false });
+            f.render_widget(paragraph, inner);
+        }
         // ── network scan path ─────────────────────────────────────────────────────────
         AddProviderStep::Scanning { .. } => {
             let lines = vec![
@@ -4952,6 +5295,9 @@ fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
         state.sections.get(&WizardSection::Models)
     {
         let ai_label = match primary_model {
+            ModelConfig::Remote { provider, .. } if provider == "chatgpt" => {
+                "ChatGPT subscription (Finch-managed sign-in)"
+            }
             ModelConfig::Remote { api_key, .. } if !api_key.is_empty() => {
                 "Claude (API key configured)"
             }
@@ -5905,6 +6251,110 @@ mod tests {
         state
     }
 
+    #[test]
+    fn completed_chatgpt_device_flow_adds_only_named_reference_and_validated_model() {
+        let mut state = state_with_step(AddProviderStep::ChatGptLogin {
+            credential_ref: "chatgpt:work".to_string(),
+            profile_name: "work-sol".to_string(),
+            editing_idx: None,
+            progress: Arc::new(Mutex::new(ChatGptWizardProgress::Complete {
+                preferred_model: "gpt-5.6-sol".to_string(),
+            })),
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+        handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+        let ModelConfig::Remote {
+            provider,
+            name,
+            api_key,
+            model,
+            persisted: Some(ProviderEntry::Chatgpt { credential_ref, .. }),
+            ..
+        } = get_primary(&state).unwrap()
+        else {
+            panic!("expected ChatGPT subscription profile")
+        };
+        assert_eq!(provider, "chatgpt");
+        assert_eq!(name, "work-sol");
+        assert!(api_key.is_empty());
+        assert_eq!(model, "gpt-5.6-sol");
+        assert_eq!(credential_ref, "chatgpt:work");
+    }
+
+    #[test]
+    fn completed_chatgpt_resume_replaces_the_selected_profile() {
+        let mut state = state_with_step(AddProviderStep::ChatGptLogin {
+            credential_ref: "chatgpt:work".to_string(),
+            profile_name: "work-sol".to_string(),
+            editing_idx: Some(0),
+            progress: Arc::new(Mutex::new(ChatGptWizardProgress::Complete {
+                preferred_model: "gpt-5.6-sol".to_string(),
+            })),
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+        if let Some(SectionState::Models { primary_model, .. }) =
+            state.sections.get_mut(&WizardSection::Models)
+        {
+            *primary_model = ModelConfig::Remote {
+                provider: "chatgpt".to_string(),
+                name: "stale-name".to_string(),
+                api_key: String::new(),
+                model: "stale-model".to_string(),
+                enabled: true,
+                persisted: None,
+            };
+        }
+
+        handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+        let ModelConfig::Remote {
+            provider,
+            name,
+            model,
+            persisted: Some(ProviderEntry::Chatgpt { credential_ref, .. }),
+            ..
+        } = get_primary(&state).unwrap()
+        else {
+            panic!("expected replaced ChatGPT subscription profile")
+        };
+        assert_eq!(provider, "chatgpt");
+        assert_eq!(name, "work-sol");
+        assert_eq!(model, "gpt-5.6-sol");
+        assert_eq!(credential_ref, "chatgpt:work");
+        assert!(get_tool_models(&state).is_empty());
+    }
+
+    #[test]
+    fn chatgpt_profile_round_trip_preserves_shared_credential_reference() {
+        let entry = ProviderEntry::Chatgpt {
+            credential_ref: "chatgpt:personal".to_string(),
+            model: Some("gpt-5.6-sol".to_string()),
+            name: Some("personal-sol".to_string()),
+        };
+        let model = model_config_from_provider(&entry).unwrap();
+        let ModelConfig::Remote {
+            provider,
+            name,
+            api_key,
+            model,
+            persisted,
+            ..
+        } = model
+        else {
+            panic!("expected remote ChatGPT profile")
+        };
+        assert_eq!(
+            provider_entry_from_remote_model(
+                &provider,
+                &name,
+                &api_key,
+                &model,
+                persisted.as_ref(),
+            ),
+            entry
+        );
+    }
+
     fn set_catalog_model_provenance(state: &mut WizardState, provenance: ModelSelectionProvenance) {
         if let Some(SectionState::Models {
             catalog_model_provenance,
@@ -6800,8 +7250,9 @@ mod tests {
             ..
         }) = get_step(&state)
         {
-            assert_eq!(*provider_idx, CLOUD_PROVIDERS.len() - 1);
-            let expected_model = CLOUD_PROVIDERS[CLOUD_PROVIDERS.len() - 1].2;
+            let expected_idx = CLOUD_PROVIDERS.len() - 2;
+            assert_eq!(*provider_idx, expected_idx);
+            let expected_model = CLOUD_PROVIDERS[expected_idx].2;
             assert_eq!(model.as_str(), expected_model);
             assert_eq!(
                 catalog_model_provenance(&state),

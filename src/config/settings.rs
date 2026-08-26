@@ -326,6 +326,7 @@ impl ProviderEntry {
     /// Returns `None` for `Local` variants.
     pub fn to_teacher_entry(&self) -> Option<TeacherEntry> {
         match self {
+            Self::Chatgpt { .. } => None,
             Self::Claude {
                 api_key,
                 model,
@@ -723,6 +724,15 @@ impl Config {
     /// Get the active provider (first in the unified providers list).
     pub fn active_provider(&self) -> Option<&ProviderEntry> {
         self.providers.first()
+    }
+
+    /// Number of model/behavior profiles sharing a named account credential.
+    /// Removing a profile changes this count but never deletes credentials.
+    pub fn credential_ref_count(&self, credential_ref: &str) -> usize {
+        self.providers
+            .iter()
+            .filter(|provider| provider.credential_ref() == Some(credential_ref))
+            .count()
     }
 
     /// Get the active teacher (first cloud provider in priority list).

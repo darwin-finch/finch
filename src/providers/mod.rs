@@ -13,6 +13,8 @@ pub mod model_catalog;
 pub mod types;
 
 // Provider implementations
+pub mod chatgpt;
+pub mod chatgpt_auth;
 pub mod claude;
 pub mod gemini;
 pub mod openai;
@@ -31,6 +33,13 @@ pub mod alignment;
 pub use alignment::{with_alignment, UNIVERSAL_ALIGNMENT_PROMPT};
 
 // Re-export commonly used types
+pub use chatgpt::{ChatGptProvider, ChatGptSetupFlow, ChatGptSetupOutcome};
+#[cfg(target_os = "macos")]
+pub use chatgpt_auth::KeychainCredentialStore;
+pub use chatgpt_auth::{
+    ChatGptAccountStatus, ChatGptAuth, CredentialIdentity, CredentialRef, CredentialStore,
+    FileCredentialStore, PendingDeviceLogin, CHATGPT_PROTOCOL_REVISION,
+};
 pub use factory::{
     create_provider, create_provider_from_entries, create_provider_from_entry,
     create_provider_from_teacher, create_providers, create_providers_from_entries,

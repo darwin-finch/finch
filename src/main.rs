@@ -85,6 +85,11 @@ struct Args {
 
 #[derive(Parser, Debug)]
 enum Command {
+    /// Manage Finch-owned provider credentials
+    Auth {
+        #[command(subcommand)]
+        auth_command: AuthCommand,
+    },
     /// Run interactive setup wizard
     Setup,
     /// Run HTTP daemon server
@@ -176,6 +181,43 @@ enum Command {
     Sessions {
         #[command(subcommand)]
         sessions_command: SessionsCommand,
+    },
+}
+
+#[derive(Parser, Debug)]
+enum AuthCommand {
+    /// Sign in to a provider
+    Login {
+        /// Credential provider (currently: chatgpt)
+        provider: String,
+        /// Opaque credential reference persisted in provider configuration
+        #[arg(long, default_value = "chatgpt:default")]
+        credential_ref: String,
+        /// Explicitly replace an existing named account record
+        #[arg(long)]
+        replace: bool,
+        /// Emit machine-readable JSON Lines state events
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show provider account status without printing credentials
+    Status {
+        provider: String,
+        #[arg(long, default_value = "chatgpt:default")]
+        credential_ref: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke and remove provider credentials
+    Logout {
+        provider: String,
+        #[arg(long, default_value = "chatgpt:default")]
+        credential_ref: String,
+        /// Confirm invalidation of every dependent profile
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -308,7 +350,12 @@ fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
 /// This function creates a provider based on the teacher configuration
 /// and wraps it in a ClaudeClient for backwards compatibility.
 fn create_claude_client_with_provider(config: &Config) -> Result<ClaudeClient> {
-    let provider = create_provider(&config.teachers)?;
+    let has_cloud_profile = config.providers.iter().any(|provider| !provider.is_local());
+    let provider = if has_cloud_profile {
+        finch::providers::create_provider_from_entries(&config.providers)?
+    } else {
+        create_provider(&config.teachers)?
+    };
     Ok(ClaudeClient::with_provider(provider))
 }
 
@@ -729,6 +776,9 @@ async fn main() -> Result<()> {
 
     // Dispatch based on command
     match args.command {
+        Some(Command::Auth { auth_command }) => {
+            return run_auth_command(auth_command).await;
+        }
         Some(Command::Setup) => {
             return run_setup().await;
         }
@@ -1209,6 +1259,149 @@ async fn main() -> Result<()> {
 
     if std::env::var("SHAMMAH_DEBUG").is_ok() {
         eprintln!("[DEBUG] REPL exited, returning from main");
+    }
+    Ok(())
+}
+
+async fn run_auth_command(command: AuthCommand) -> Result<()> {
+    use finch::providers::ChatGptAuth;
+    use tokio_util::sync::CancellationToken;
+
+    let (provider, credential_ref) = match &command {
+        AuthCommand::Login {
+            provider,
+            credential_ref,
+            ..
+        }
+        | AuthCommand::Status {
+            provider,
+            credential_ref,
+            ..
+        }
+        | AuthCommand::Logout {
+            provider,
+            credential_ref,
+            ..
+        } => (provider, credential_ref),
+    };
+    if !provider.eq_ignore_ascii_case("chatgpt") {
+        anyhow::bail!(
+            "Unsupported auth provider `{provider}`; ChatGPT subscription uses `chatgpt`, while API-key providers remain configured separately"
+        );
+    }
+    let auth = ChatGptAuth::new(credential_ref.clone())?;
+    let dependent_profiles = load_config()?.credential_ref_count(credential_ref);
+    match command {
+        AuthCommand::Login { replace, json, .. } => {
+            if auth.account_status()?.is_some() && !replace {
+                anyhow::bail!(
+                    "Credential reference already names an account; pass --replace to start an explicit replacement login"
+                );
+            }
+            let pending = auth.begin_device_login().await?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "authorization_pending",
+                        "verification_url": &pending.verification_url,
+                        "user_code": &pending.user_code,
+                    })
+                );
+            } else {
+                println!("Open this URL in a browser:\n{}", pending.verification_url);
+                println!("Enter this one-time code:\n{}", pending.user_code);
+                println!("Waiting for authorization (Ctrl-C to cancel)...");
+            }
+            let cancel = CancellationToken::new();
+            let signal_cancel = cancel.clone();
+            let signal = tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    signal_cancel.cancel();
+                }
+            });
+            let result = auth.finish_device_login(&pending, cancel).await;
+            signal.abort();
+            result?;
+            let provider = finch::providers::ChatGptProvider::new(credential_ref.clone())?;
+            let models = match provider.available_models().await {
+                Ok(models) => models,
+                Err(error) => {
+                    let cleanup = auth.logout().await;
+                    anyhow::bail!(
+                        "ChatGPT direct transport conformance failed after authorization ({error}); newly issued credentials were revoked and tombstoned: {}",
+                        if cleanup.is_ok() { "yes" } else { "cleanup also failed" }
+                    );
+                }
+            };
+            if let Err(error) = provider.preferred_account_model().await {
+                let cleanup = auth.logout().await;
+                anyhow::bail!(
+                    "ChatGPT GPT-5.6 Sol validation failed after authorization ({error}); newly issued credentials were revoked and tombstoned: {}",
+                    if cleanup.is_ok() {
+                        "yes"
+                    } else {
+                        "cleanup also failed"
+                    }
+                );
+            }
+            let status = auth
+                .account_status()?
+                .context("ChatGPT login completed without stored account status")?;
+            if json {
+                println!("{}", serde_json::json!({
+                    "status": "connected",
+                    "account_id_suffix": status.account_id_suffix,
+                    "dependent_profiles": dependent_profiles,
+                    "models": models,
+                }));
+            } else {
+                println!(
+                    "ChatGPT subscription connected (account …{}; shared by {} configured profile(s); {} model(s) advertised).",
+                    status.account_id_suffix, dependent_profiles, models.len()
+                );
+            }
+        }
+        AuthCommand::Status { json, .. } => match auth.account_status()? {
+            Some(status) if json => println!("{}", serde_json::json!({
+                "status": "connected",
+                "account_id_suffix": status.account_id_suffix,
+                "expires_at": status.expires_at,
+                "needs_refresh": status.needs_refresh,
+                "dependent_profiles": dependent_profiles,
+            })),
+            Some(status) => println!(
+                "ChatGPT subscription connected (account …{}; expires at Unix {}; refresh required: {}; dependent profiles: {}).",
+                status.account_id_suffix, status.expires_at, status.needs_refresh, dependent_profiles
+            ),
+            None if json => println!("{}", serde_json::json!({
+                "status": "disconnected",
+                "dependent_profiles": dependent_profiles,
+            })),
+            None => println!("ChatGPT subscription is not connected (dependent profiles: {}).", dependent_profiles),
+        },
+        AuthCommand::Logout { yes, json, .. } => {
+            if dependent_profiles > 0 && !yes {
+                anyhow::bail!(
+                    "Logout would invalidate {dependent_profiles} configured profile(s); pass --yes to confirm"
+                );
+            }
+            if dependent_profiles > 0 && !json {
+                println!(
+                    "Revoking this named account will invalidate {} configured profile(s).",
+                    dependent_profiles
+                );
+            }
+            auth.logout().await?;
+            if json {
+                println!("{}", serde_json::json!({
+                    "status": "logged_out",
+                    "invalidated_profiles": dependent_profiles,
+                }));
+            } else {
+                println!("ChatGPT subscription credentials revoked and tombstoned in Finch.");
+            }
+        }
     }
     Ok(())
 }
@@ -2250,12 +2443,22 @@ async fn run_query_teacher_only(
 
     let claude_client = create_claude_client_with_provider(config)?;
     let model = config
-        .active_teacher()
-        .and_then(|t| t.model.clone())
+        .active_provider()
+        .and_then(|provider| provider.model().map(str::to_string))
+        .or_else(|| {
+            config
+                .active_teacher()
+                .and_then(|teacher| teacher.model.clone())
+        })
         .unwrap_or_else(|| finch::config::constants::DEFAULT_CLAUDE_MODEL.to_string());
     let provider = config
-        .active_teacher()
-        .map(|teacher| teacher.provider.clone())
+        .active_provider()
+        .map(|provider| provider.provider_type().to_string())
+        .or_else(|| {
+            config
+                .active_teacher()
+                .map(|teacher| teacher.provider.clone())
+        })
         .unwrap_or_else(|| "teacher".to_string());
     let wire_metrics = default_wire_metrics_logger();
     let mut wire_metric =
@@ -2279,6 +2482,7 @@ async fn run_query_teacher_only(
         };
 
         let response = claude_client.send_message(&request).await?;
+        wire_metric.model = response.model.clone();
 
         // A text-only reply is the same raw Lisp/Co-Forth wire program used
         // by the interactive client. Execute it rather than displaying source
@@ -3096,7 +3300,7 @@ fn run_sessions_command(cmd: SessionsCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{register_query_vm_tools, Args};
+    use super::{register_query_vm_tools, Args, AuthCommand, Command};
     use clap::Parser;
     use std::sync::Arc;
 
@@ -3108,6 +3312,25 @@ mod tests {
         assert!(Args::try_parse_from(["finch", "library", "verify"]).is_err());
         assert!(Args::try_parse_from(["finch", "library", "heal"]).is_err());
         assert!(Args::try_parse_from(["finch", "library", "build", "--all"]).is_err());
+    }
+
+    #[test]
+    fn chatgpt_auth_cli_parses_named_account_reference() {
+        let args = Args::try_parse_from([
+            "finch",
+            "auth",
+            "login",
+            "chatgpt",
+            "--credential-ref",
+            "chatgpt:work",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Login { provider, credential_ref, .. }
+            }) if provider == "chatgpt" && credential_ref == "chatgpt:work"
+        ));
     }
 
     #[test]

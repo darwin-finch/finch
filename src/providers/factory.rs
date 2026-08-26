@@ -4,6 +4,7 @@
 
 use anyhow::{bail, Context, Result};
 
+use super::chatgpt::ChatGptProvider;
 use super::claude::ClaudeProvider;
 use super::gemini::GeminiProvider;
 use super::openai::OpenAIProvider;
@@ -20,6 +21,17 @@ use crate::config::{ProviderEntry, TeacherEntry};
 /// (`create_local_generator`).
 pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmProvider>> {
     match entry {
+        ProviderEntry::Chatgpt {
+            credential_ref,
+            model,
+            ..
+        } => {
+            let mut provider = ChatGptProvider::new(credential_ref.clone())?;
+            if let Some(model) = model {
+                provider = provider.with_model(model.clone());
+            }
+            Ok(Box::new(provider))
+        }
         ProviderEntry::Claude {
             api_key,
             model,
@@ -216,7 +228,10 @@ pub fn create_provider_from_teacher(entry: &TeacherEntry) -> Result<Box<dyn LlmP
         "claude" => {
             let mut provider = ClaudeProvider::new_with_endpoints(
                 entry.api_key.clone(),
-                entry.base_url.as_deref().unwrap_or("https://api.anthropic.com"),
+                entry
+                    .base_url
+                    .as_deref()
+                    .unwrap_or("https://api.anthropic.com"),
                 "/v1/messages",
                 "/v1/models",
             )?;
@@ -491,6 +506,23 @@ mod tests {
         });
         let provider = create_provider_from_entry(&p).unwrap();
         assert_eq!(provider.name(), "claude");
+    }
+
+    #[test]
+    fn test_provider_entry_chatgpt_is_distinct_from_platform_openai() {
+        let entry = ProviderEntry::Chatgpt {
+            credential_ref: "chatgpt:personal".to_string(),
+            model: Some("gpt-5.6-sol".to_string()),
+            name: Some("personal-sol".to_string()),
+        };
+        let provider = create_provider_from_entry(&entry).unwrap();
+        assert_eq!(provider.name(), "chatgpt_subscription");
+        assert_eq!(provider.default_model(), "gpt-5.6-sol");
+        assert_eq!(entry.api_key(), None);
+        assert_eq!(
+            entry.credential_audience(),
+            Some("https://chatgpt.com/backend-api/codex")
+        );
     }
 
     #[test]
