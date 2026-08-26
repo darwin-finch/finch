@@ -9,7 +9,8 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::thread;
 use std::time::Duration as StdDuration;
@@ -25,11 +26,18 @@ use crate::tools::types::ToolDefinition;
 
 pub const MANAGED_CODEX_CREDENTIAL_REF: &str = "codex-app-server:managed";
 const MAX_RPC_LINE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_RPC_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RPC_MESSAGES: usize = 4_096;
+const MAX_QUEUED_MESSAGES: usize = 256;
+const MAX_RESPONSE_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TURN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SCHEMA_GENERATION_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+// Each accepted release requires an audit of effective app-server configuration,
+// built-in tools, and sandbox enforcement. Schema compatibility alone is not trust.
+const AUDITED_CODEX_VERSIONS: &[&str] = &[];
 const ADAPTER_INSTRUCTIONS: &str = "You are serving as Finch's model adapter. Do not modify files, run commands, browse, or invoke built-in Codex tools. Answer only from the supplied conversation. When Finch dynamic tools are supplied, invoke only those dynamic tools. Finch/Brain is the durable conversation authority; this Codex thread is ephemeral.";
 
 #[derive(Debug, Clone)]
@@ -40,48 +48,82 @@ struct AppServerCommand {
     login_timeout: Duration,
     turn_timeout: Duration,
     schema_timeout: StdDuration,
+    identity: Option<ExecutableIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecutableIdentity {
+    files: Vec<FileIdentity>,
+    version: String,
 }
 
 impl AppServerCommand {
-    fn production() -> Self {
-        Self {
-            program: PathBuf::from("codex"),
-            args: vec![
-                "-c".into(),
-                "mcp_servers={}".into(),
-                "-c".into(),
-                "apps={_default={enabled=false}}".into(),
-                "-c".into(),
-                "features.apps=false".into(),
-                "-c".into(),
-                "features.plugins=false".into(),
-                "-c".into(),
-                "features.remote_plugin=false".into(),
-                "-c".into(),
-                "features.shell_tool=false".into(),
-                "-c".into(),
-                "features.unified_exec=false".into(),
-                "-c".into(),
-                "features.multi_agent=false".into(),
-                "-c".into(),
-                "features.hooks=false".into(),
-                "-c".into(),
-                "web_search=\"disabled\"".into(),
-                "-c".into(),
-                "allow_login_shell=false".into(),
-                "-c".into(),
-                "shell_environment_policy.inherit=\"none\"".into(),
-                "app-server".into(),
-            ],
+    fn production() -> Result<Self> {
+        let codex = resolve_trusted_program("codex")?;
+        let (program, mut prefix, mut files) = resolve_codex_launcher(&codex)?;
+        let version = run_version_bounded(&program, &prefix, SCHEMA_GENERATION_TIMEOUT)?;
+        let mut args = vec![
+            "-c".into(),
+            "mcp_servers={}".into(),
+            "-c".into(),
+            "environments={}".into(),
+            "-c".into(),
+            "profiles={}".into(),
+            "-c".into(),
+            "apps={_default={enabled=false}}".into(),
+            "-c".into(),
+            "features.apps=false".into(),
+            "-c".into(),
+            "features.plugins=false".into(),
+            "-c".into(),
+            "features.remote_plugin=false".into(),
+            "-c".into(),
+            "features.shell_tool=false".into(),
+            "-c".into(),
+            "features.unified_exec=false".into(),
+            "-c".into(),
+            "features.multi_agent=false".into(),
+            "-c".into(),
+            "features.hooks=false".into(),
+            "-c".into(),
+            "web_search=\"disabled\"".into(),
+            "-c".into(),
+            "allow_login_shell=false".into(),
+            "-c".into(),
+            "shell_environment_policy.inherit=\"none\"".into(),
+            "app-server".into(),
+        ];
+        prefix.append(&mut args);
+        files.push(file_identity(&program)?);
+        Ok(Self {
+            program,
+            args: prefix,
             rpc_timeout: RPC_TIMEOUT,
             login_timeout: LOGIN_TIMEOUT,
             turn_timeout: TURN_TIMEOUT,
             schema_timeout: SCHEMA_GENERATION_TIMEOUT,
-        }
+            identity: Some(ExecutableIdentity { files, version }),
+        })
     }
 
     #[cfg(test)]
     fn test(program: PathBuf, args: Vec<String>) -> Self {
+        let program = if program.components().count() == 1 {
+            resolve_trusted_program(program.to_string_lossy().as_ref()).unwrap_or(program)
+        } else {
+            program
+        };
         Self {
             program,
             args,
@@ -89,6 +131,7 @@ impl AppServerCommand {
             login_timeout: LOGIN_TIMEOUT,
             turn_timeout: TURN_TIMEOUT,
             schema_timeout: SCHEMA_GENERATION_TIMEOUT,
+            identity: None,
         }
     }
 
@@ -102,7 +145,7 @@ impl AppServerCommand {
     }
 
     fn detect_protocol_capabilities(&self) -> ProtocolCapabilities {
-        if self.program.file_name().and_then(|name| name.to_str()) != Some("codex") {
+        if self.identity.is_some() && self.validate_identity().is_err() {
             return ProtocolCapabilities::default();
         }
         let Ok(directory) = tempfile::tempdir() else {
@@ -124,8 +167,7 @@ impl AppServerCommand {
                     thread::sleep(StdDuration::from_millis(10));
                 }
                 _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_std_process_group(&mut child);
                     break false;
                 }
             }
@@ -147,12 +189,141 @@ impl AppServerCommand {
         ProtocolCapabilities {
             dynamic_tools,
             restricted_read_only,
+            audited_contract: self.identity.as_ref().is_some_and(|identity| {
+                AUDITED_CODEX_VERSIONS.contains(&identity.version.as_str())
+            }),
+        }
+    }
+
+    fn validate_identity(&self) -> Result<()> {
+        if let Some(identity) = &self.identity {
+            for expected in &identity.files {
+                if &file_identity(&expected.path)? != expected {
+                    bail!("Trusted Codex installation changed after validation");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn resolve_trusted_program(name: &str) -> Result<PathBuf> {
+    let path = std::env::var_os("PATH").context("PATH is unavailable")?;
+    resolve_program_in_path(name, &path)
+}
+
+fn resolve_program_in_path(name: &str, path: &std::ffi::OsStr) -> Result<PathBuf> {
+    for directory in std::env::split_paths(path) {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            let canonical = std::fs::canonicalize(&candidate)
+                .context("Could not canonicalize the Codex installation")?;
+            validate_trusted_install_location(&canonical)?;
+            validate_trusted_file(&canonical)?;
+            return Ok(canonical);
+        }
+    }
+    bail!("Could not locate a trusted Codex CLI installation")
+}
+
+fn validate_trusted_install_location(path: &Path) -> Result<()> {
+    const ROOTS: &[&str] = &["/usr", "/usr/local", "/opt/homebrew", "/Applications"];
+    if ROOTS.iter().any(|root| path.starts_with(root)) {
+        Ok(())
+    } else {
+        bail!("Codex executable is outside Finch's trusted installation roots")
+    }
+}
+
+fn resolve_codex_launcher(codex: &Path) -> Result<(PathBuf, Vec<String>, Vec<FileIdentity>)> {
+    let bytes = std::fs::read(codex).context("Could not inspect the Codex launcher")?;
+    let first = bytes
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let files = vec![file_identity(codex)?];
+    if first == b"#!/usr/bin/env node" {
+        let node = resolve_trusted_program("node")?;
+        return Ok((node, vec![codex.to_string_lossy().into_owned()], files));
+    }
+    Ok((codex.to_path_buf(), Vec::new(), files))
+}
+
+fn validate_trusted_file(path: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(path).context("Could not inspect executable metadata")?;
+    if !metadata.is_file() {
+        bail!("Codex executable is not a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let owner = metadata.uid();
+        if owner != 0 && owner != nix::unistd::geteuid().as_raw() {
+            bail!("Codex executable is not owned by the current user or root");
+        }
+        if metadata.permissions().mode() & 0o022 != 0 {
+            bail!("Codex executable is group/world writable");
+        }
+    }
+    Ok(())
+}
+
+fn file_identity(path: &Path) -> Result<FileIdentity> {
+    validate_trusted_file(path)?;
+    let metadata = std::fs::metadata(path)?;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Ok(FileIdentity {
+        path: path.to_path_buf(),
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    })
+}
+
+fn run_version_bounded(program: &Path, prefix: &[String], limit: StdDuration) -> Result<String> {
+    let mut process = std::process::Command::new(program);
+    process.args(prefix).arg("--version");
+    process.env_clear().envs(inherited_process_environment());
+    process
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped());
+    configure_std_process_group(&mut process);
+    let mut child = process
+        .spawn()
+        .context("Could not start trusted Codex CLI")?;
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                child
+                    .stdout
+                    .take()
+                    .context("Codex version output unavailable")?
+                    .take(4096)
+                    .read_to_end(&mut bytes)?;
+                return Ok(String::from_utf8_lossy(&bytes).trim().to_string());
+            }
+            Ok(Some(_)) => bail!("Trusted Codex CLI version check failed"),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                thread::sleep(StdDuration::from_millis(10))
+            }
+            _ => {
+                kill_std_process_group(&mut child);
+                bail!("Trusted Codex CLI version check timed out")
+            }
         }
     }
 }
 
-fn inherited_process_environment() -> impl Iterator<Item = (&'static str, std::ffi::OsString)> {
-    ["HOME", "CODEX_HOME", "PATH", "TMPDIR", "USER", "LOGNAME"]
+fn inherited_process_environment() -> impl Iterator<Item = (&'static str, OsString)> {
+    ["HOME", "CODEX_HOME", "TMPDIR", "USER", "LOGNAME"]
         .into_iter()
         .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
 }
@@ -164,6 +335,39 @@ fn harden_std_process(process: &mut std::process::Command) {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    configure_std_process_group(process);
+}
+
+#[cfg(unix)]
+fn configure_std_process_group(process: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        process.pre_exec(|| {
+            nix::unistd::setsid().map_err(std::io::Error::other)?;
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_std_process_group(_process: &mut std::process::Command) {}
+
+#[cfg(unix)]
+fn kill_std_process_group(child: &mut std::process::Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn kill_std_process_group(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn resolve_schema<'a>(root: &'a Value, schema: &'a Value) -> Option<&'a Value> {
@@ -252,13 +456,16 @@ fn schema_supports_restricted_read_only(root: &Value) -> bool {
 struct ProtocolCapabilities {
     dynamic_tools: bool,
     restricted_read_only: bool,
+    audited_contract: bool,
 }
 
 fn require_restricted_boundary(capabilities: ProtocolCapabilities) -> Result<()> {
-    if capabilities.restricted_read_only {
+    if capabilities.restricted_read_only && capabilities.audited_contract {
         Ok(())
     } else {
-        bail!("Installed Codex app-server cannot express Finch's restricted read-only boundary")
+        bail!(
+            "Installed Codex app-server is not audited for Finch's restricted capability boundary"
+        )
     }
 }
 
@@ -269,16 +476,20 @@ struct RpcClient {
     queued: VecDeque<Value>,
     next_id: u64,
     request_timeout: Duration,
+    received_bytes: usize,
+    received_messages: usize,
 }
 
 impl RpcClient {
     async fn spawn(command: &AppServerCommand) -> Result<Self> {
+        command.validate_identity()?;
         let mut process = Command::new(&command.program);
         process.args(&command.args);
         process.env_clear();
         for (name, value) in inherited_process_environment() {
             process.env(name, value);
         }
+        configure_tokio_process_group(&mut process);
         let mut child = process
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -303,6 +514,8 @@ impl RpcClient {
             queued: VecDeque::new(),
             next_id: 1,
             request_timeout: command.rpc_timeout,
+            received_bytes: 0,
+            received_messages: 0,
         };
         client.initialize().await?;
         Ok(client)
@@ -361,6 +574,9 @@ impl RpcClient {
                     .cloned()
                     .context("Codex app-server returned an invalid response");
             }
+            if self.queued.len() >= MAX_QUEUED_MESSAGES {
+                bail!("Codex app-server sent too many unmatched messages");
+            }
             self.queued.push_back(message);
         }
     }
@@ -396,13 +612,54 @@ impl RpcClient {
                 break;
             }
         }
+        self.received_bytes = self.received_bytes.saturating_add(bytes.len());
+        self.received_messages = self.received_messages.saturating_add(1);
+        if self.received_bytes > MAX_RPC_TOTAL_BYTES || self.received_messages > MAX_RPC_MESSAGES {
+            bail!("Codex app-server response stream exceeded the aggregate limit");
+        }
         serde_json::from_slice(&bytes).context("Codex app-server returned invalid JSON")
     }
 
     async fn shutdown(&mut self) {
         let _ = self.stdin.shutdown().await;
-        let _ = self.child.start_kill();
+        kill_tokio_process_group(&mut self.child);
         let _ = timeout(CHILD_EXIT_TIMEOUT, self.child.wait()).await;
+    }
+}
+
+#[cfg(unix)]
+fn configure_tokio_process_group(process: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        process.as_std_mut().pre_exec(|| {
+            nix::unistd::setsid().map_err(std::io::Error::other)?;
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_tokio_process_group(_process: &mut Command) {}
+
+#[cfg(unix)]
+fn kill_tokio_process_group(child: &mut Child) {
+    if let Some(id) = child.id().and_then(|id| i32::try_from(id).ok()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(id),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    let _ = child.start_kill();
+}
+
+#[cfg(not(unix))]
+fn kill_tokio_process_group(child: &mut Child) {
+    let _ = child.start_kill();
+}
+
+impl Drop for RpcClient {
+    fn drop(&mut self) {
+        kill_tokio_process_group(&mut self.child);
     }
 }
 
@@ -430,10 +687,10 @@ pub struct CodexAppServerAuth {
 }
 
 impl CodexAppServerAuth {
-    pub fn new() -> Self {
-        Self {
-            command: AppServerCommand::production(),
-        }
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            command: AppServerCommand::production()?,
+        })
     }
 
     #[cfg(test)]
@@ -539,7 +796,7 @@ impl CodexAppServerProvider {
         if credential_ref != MANAGED_CODEX_CREDENTIAL_REF {
             bail!("Unsupported ChatGPT credential reference");
         }
-        let command = AppServerCommand::production();
+        let command = AppServerCommand::production()?;
         let capabilities = command.detect_protocol_capabilities();
         require_restricted_boundary(capabilities)?;
         Ok(Self {
@@ -656,6 +913,8 @@ fn isolated_thread_config() -> Value {
         "web_search": "disabled",
         "shell_environment_policy": { "inherit": "none" },
         "agents": { "enabled": false },
+        "environments": {},
+        "profiles": {},
         "apps": { "_default": { "enabled": false } },
         "mcp_servers": {},
         "features": {
@@ -720,26 +979,27 @@ struct TurnSession {
 
 impl TurnSession {
     async fn drive(mut self, tx: mpsc::Sender<Result<StreamChunk>>) {
-        let mut text = String::new();
         let deadline = Instant::now() + self.turn_timeout;
+        self.drive_until(&tx, deadline).await;
+        self.rpc.shutdown().await;
+    }
+
+    async fn drive_until(&mut self, tx: &mpsc::Sender<Result<StreamChunk>>, deadline: Instant) {
+        let mut text = String::new();
         loop {
             let event = tokio::select! {
                 _ = tx.closed() => {
-                    self.rpc.shutdown().await;
                     return;
                 }
                 result = timeout_at(deadline, self.rpc.next_event()) => {
                     match result {
                         Ok(Ok(event)) => event,
                         Ok(Err(error)) => {
-                            let _ = tx.send(Err(error)).await;
+                            let _ = deliver(tx, deadline, Err(error)).await;
                             return;
                         }
                         Err(_) => {
-                            let _ = tx
-                                .send(Err(anyhow::anyhow!("Codex app-server turn timed out")))
-                                .await;
-                            self.rpc.shutdown().await;
+                            let _ = deliver(tx, deadline, Err(anyhow::anyhow!("Codex app-server turn timed out"))).await;
                             return;
                         }
                     }
@@ -748,11 +1008,18 @@ impl TurnSession {
             match event.get("method").and_then(Value::as_str) {
                 Some("item/agentMessage/delta") => {
                     if let Some(delta) = event.pointer("/params/delta").and_then(Value::as_str) {
+                        if text.len().saturating_add(delta.len()) > MAX_RESPONSE_TEXT_BYTES {
+                            let _ = deliver(
+                                tx,
+                                deadline,
+                                Err(anyhow::anyhow!("Codex response exceeded the size limit")),
+                            )
+                            .await;
+                            return;
+                        }
                         text.push_str(delta);
-                        if tx
-                            .send(Ok(StreamChunk::TextDelta(delta.to_string())))
+                        if !deliver(tx, deadline, Ok(StreamChunk::TextDelta(delta.to_string())))
                             .await
-                            .is_err()
                         {
                             return;
                         }
@@ -765,11 +1032,18 @@ impl TurnSession {
                         if let Some(final_text) =
                             event.pointer("/params/item/text").and_then(Value::as_str)
                         {
+                            if final_text.len() > MAX_RESPONSE_TEXT_BYTES {
+                                let _ = deliver(
+                                    tx,
+                                    deadline,
+                                    Err(anyhow::anyhow!("Codex response exceeded the size limit")),
+                                )
+                                .await;
+                                return;
+                            }
                             text = final_text.to_string();
-                            if tx
-                                .send(Ok(StreamChunk::TextDelta(text.clone())))
+                            if !deliver(tx, deadline, Ok(StreamChunk::TextDelta(text.clone())))
                                 .await
-                                .is_err()
                             {
                                 return;
                             }
@@ -778,9 +1052,12 @@ impl TurnSession {
                 }
                 Some("item/tool/call") => {
                     let Some(params) = event.get("params") else {
-                        let _ = tx
-                            .send(Err(anyhow::anyhow!("Invalid Codex dynamic-tool request")))
-                            .await;
+                        let _ = deliver(
+                            tx,
+                            deadline,
+                            Err(anyhow::anyhow!("Invalid Codex dynamic-tool request")),
+                        )
+                        .await;
                         return;
                     };
                     let id = params
@@ -799,26 +1076,35 @@ impl TurnSession {
                         .unwrap_or_else(|| json!({}));
                     let interrupt_id = self.rpc.next_id;
                     self.rpc.next_id = self.rpc.next_id.saturating_add(1);
-                    let _ = self
-                        .rpc
-                        .send(json!({
+                    let _ = timeout_at(
+                        deadline,
+                        self.rpc.send(json!({
                             "method": "turn/interrupt",
                             "id": interrupt_id,
                             "params": { "threadId": self.thread_id, "turnId": self.turn_id }
-                        }))
-                        .await;
+                        })),
+                    )
+                    .await;
                     if !text.is_empty() {
-                        let _ = tx
-                            .send(Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text {
+                        let _ = deliver(
+                            tx,
+                            deadline,
+                            Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text {
                                 text: text.clone(),
-                            })))
-                            .await;
-                    }
-                    let _ = tx
-                        .send(Ok(StreamChunk::ContentBlockComplete(
-                            ContentBlock::ToolUse { id, name, input },
-                        )))
+                            })),
+                        )
                         .await;
+                    }
+                    let _ = deliver(
+                        tx,
+                        deadline,
+                        Ok(StreamChunk::ContentBlockComplete(ContentBlock::ToolUse {
+                            id,
+                            name,
+                            input,
+                        })),
+                    )
+                    .await;
                     return;
                 }
                 Some("turn/completed") => {
@@ -827,32 +1113,72 @@ impl TurnSession {
                         .and_then(Value::as_str)
                         .unwrap_or("failed");
                     if status != "completed" {
-                        let _ = tx
-                            .send(Err(anyhow::anyhow!(
+                        let _ = deliver(
+                            tx,
+                            deadline,
+                            Err(anyhow::anyhow!(
                                 "Codex app-server turn ended with status {status}"
-                            )))
-                            .await;
+                            )),
+                        )
+                        .await;
                         return;
                     }
                     if text.is_empty() {
                         if let Some(final_text) = completed_agent_text(&event) {
+                            if final_text.len() > MAX_RESPONSE_TEXT_BYTES {
+                                let _ = deliver(
+                                    tx,
+                                    deadline,
+                                    Err(anyhow::anyhow!("Codex response exceeded the size limit")),
+                                )
+                                .await;
+                                return;
+                            }
                             text = final_text;
-                            let _ = tx.send(Ok(StreamChunk::TextDelta(text.clone()))).await;
+                            let _ = deliver(tx, deadline, Ok(StreamChunk::TextDelta(text.clone())))
+                                .await;
                         }
                     }
                     if !text.is_empty() {
-                        let _ = tx
-                            .send(Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text {
+                        let _ = deliver(
+                            tx,
+                            deadline,
+                            Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text {
                                 text,
-                            })))
-                            .await;
+                            })),
+                        )
+                        .await;
                     }
+                    return;
+                }
+                Some(method)
+                    if method.starts_with("item/")
+                        || method.starts_with("tool/")
+                        || method.starts_with("mcp/")
+                        || method.starts_with("app/") =>
+                {
+                    let _ = deliver(
+                        tx,
+                        deadline,
+                        Err(anyhow::anyhow!(
+                            "Codex app-server exposed an unaudited built-in capability"
+                        )),
+                    )
+                    .await;
                     return;
                 }
                 _ => {}
             }
         }
     }
+}
+
+async fn deliver(
+    tx: &mpsc::Sender<Result<StreamChunk>>,
+    deadline: Instant,
+    item: Result<StreamChunk>,
+) -> bool {
+    matches!(timeout_at(deadline, tx.send(item)).await, Ok(Ok(())))
 }
 
 fn completed_agent_text(event: &Value) -> Option<String> {
@@ -1046,6 +1372,44 @@ for line in sys.stdin:
         (directory, pid_file, command)
     }
 
+    fn flooding_app_server(timeout: Duration) -> (tempfile::TempDir, PathBuf, AppServerCommand) {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("flooding_app_server.py");
+        let pid_file = directory.path().join("pid");
+        std::fs::write(
+            &script,
+            r#"import json, os, sys, time
+open(sys.argv[1], 'w').write(str(os.getpid()))
+child = os.fork()
+if child == 0:
+    open(sys.argv[1] + '-child', 'w').write(str(os.getpid()))
+    while True: time.sleep(1)
+for line in sys.stdin:
+    m = json.loads(line); method = m.get('method')
+    if method == 'initialized': continue
+    if method == 'initialize': result = {}
+    elif method == 'account/read': result = {'account': {'type': 'chatgpt'}}
+    elif method == 'thread/start': result = {'thread': {'id': 'thread'}}
+    elif method == 'turn/start': result = {'turn': {'id': 'turn'}}
+    else: result = {}
+    print(json.dumps({'id': m.get('id'), 'result': result}), flush=True)
+    if method == 'turn/start':
+        for _ in range(10000):
+            print(json.dumps({'method': 'item/agentMessage/delta', 'params': {'delta': 'x'}}), flush=True)
+"#,
+        )
+        .unwrap();
+        let command = AppServerCommand::test(
+            PathBuf::from("python3"),
+            vec![
+                script.to_string_lossy().into_owned(),
+                pid_file.to_string_lossy().into_owned(),
+            ],
+        )
+        .with_test_timeouts(timeout);
+        (directory, pid_file, command)
+    }
+
     #[test]
     fn rejects_non_managed_credential_references() {
         let error = CodexAppServerProvider::new("raw-oauth-token".into(), "model".into())
@@ -1059,10 +1423,12 @@ for line in sys.stdin:
 
     #[test]
     fn production_process_clears_inherited_capabilities() {
-        let command = AppServerCommand::production();
+        let command = AppServerCommand::production().unwrap();
         let args = command.args.join(" ");
         for required in [
             "mcp_servers={}",
+            "environments={}",
+            "profiles={}",
             "apps={_default={enabled=false}}",
             "features.apps=false",
             "features.plugins=false",
@@ -1079,14 +1445,80 @@ for line in sys.stdin:
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn trusted_resolution_pins_path_and_detects_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let first = tempfile::tempdir().unwrap();
+        let shadow = tempfile::tempdir().unwrap();
+        for directory in [first.path(), shadow.path()] {
+            let executable = directory.join("codex");
+            std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&executable, permissions).unwrap();
+        }
+        let search = std::env::join_paths([first.path(), shadow.path()]).unwrap();
+        let error = resolve_program_in_path("codex", &search).unwrap_err();
+        assert!(error.to_string().contains("trusted installation roots"));
+        let resolved = std::fs::canonicalize(first.path().join("codex")).unwrap();
+        let links = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(shadow.path().join("codex"), links.path().join("codex"))
+            .unwrap();
+        let link_search = std::env::join_paths([links.path()]).unwrap();
+        assert!(resolve_program_in_path("codex", &link_search).is_err());
+        assert_eq!(
+            std::fs::canonicalize(links.path().join("codex")).unwrap(),
+            std::fs::canonicalize(shadow.path().join("codex")).unwrap()
+        );
+
+        let expected = file_identity(&resolved).unwrap();
+        let replacement = first.path().join("replacement");
+        std::fs::write(&replacement, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = std::fs::metadata(&replacement).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&replacement, permissions).unwrap();
+        std::fs::rename(replacement, &resolved).unwrap();
+        let mut command = AppServerCommand::test(resolved.clone(), vec![]);
+        command.identity = Some(ExecutableIdentity {
+            files: vec![expected],
+            version: "test".into(),
+        });
+        assert!(command.validate_identity().is_err());
+        assert_ne!(
+            resolved,
+            std::fs::canonicalize(shadow.path().join("codex")).unwrap()
+        );
+    }
+
+    #[test]
+    fn schema_compatibility_without_audited_contract_fails_closed() {
+        let error = require_restricted_boundary(ProtocolCapabilities {
+            dynamic_tools: true,
+            restricted_read_only: true,
+            audited_contract: false,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("not audited"));
+        let config = isolated_thread_config();
+        assert_eq!(config.pointer("/environments"), Some(&json!({})));
+        assert_eq!(config.pointer("/mcp_servers"), Some(&json!({})));
+        assert_eq!(
+            config.pointer("/apps/_default/enabled"),
+            Some(&json!(false))
+        );
+    }
+
     #[test]
     fn missing_restricted_read_roots_fail_closed() {
         let error = require_restricted_boundary(ProtocolCapabilities {
             dynamic_tools: true,
             restricted_read_only: false,
+            audited_contract: false,
         })
         .unwrap_err();
-        assert!(error.to_string().contains("restricted read-only boundary"));
+        assert!(error.to_string().contains("restricted capability boundary"));
     }
 
     #[test]
@@ -1136,7 +1568,9 @@ for line in sys.stdin:
             output.status.success()
                 && String::from_utf8_lossy(&output.stdout).contains("codex-cli 0.149.1")
         }) {
-            let capabilities = AppServerCommand::production().detect_protocol_capabilities();
+            let capabilities = AppServerCommand::production()
+                .unwrap()
+                .detect_protocol_capabilities();
             assert!(
                 !capabilities.restricted_read_only,
                 "update this regression when the installed production schema gains restricted readable roots"
@@ -1157,9 +1591,10 @@ for line in sys.stdin:
         std::os::unix::fs::symlink(python.trim(), &program).unwrap();
         let script = directory.path().join("generator.py");
         let pid_file = directory.path().join("pid");
+        let descendant_pid_file = directory.path().join("descendant-pid");
         std::fs::write(
             &script,
-            "import os, sys, time\nassert 'CARGO_HOME' not in os.environ\nopen(sys.argv[1], 'w').write(str(os.getpid()))\nwhile True: time.sleep(1)\n",
+            "import os, sys, time\nassert 'CARGO_HOME' not in os.environ\nopen(sys.argv[1], 'w').write(str(os.getpid()))\nchild = os.fork()\nif child == 0:\n open(sys.argv[2], 'w').write(str(os.getpid()))\nwhile True: time.sleep(1)\n",
         )
         .unwrap();
         let command = AppServerCommand::test(
@@ -1167,6 +1602,7 @@ for line in sys.stdin:
             vec![
                 script.to_string_lossy().into_owned(),
                 pid_file.to_string_lossy().into_owned(),
+                descendant_pid_file.to_string_lossy().into_owned(),
             ],
         )
         .with_test_timeouts(Duration::from_millis(250));
@@ -1174,14 +1610,16 @@ for line in sys.stdin:
         let capabilities = command.detect_protocol_capabilities();
         assert!(!capabilities.restricted_read_only);
         assert!(started.elapsed() < StdDuration::from_secs(2));
-        let pid = std::fs::read_to_string(pid_file).unwrap();
-        let alive = std::process::Command::new("/bin/kill")
-            .args(["-0", pid.trim()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        assert!(!alive, "hung schema generator was not reaped");
+        for pid_file in [pid_file, descendant_pid_file] {
+            let pid = std::fs::read_to_string(pid_file).unwrap();
+            let alive = std::process::Command::new("/bin/kill")
+                .args(["-0", pid.trim()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            assert!(!alive, "hung schema generator process tree survived");
+        }
     }
 
     #[tokio::test]
@@ -1301,6 +1739,90 @@ for line in sys.stdin:
         };
         let error = auth.finish_device_login(login).await.unwrap_err();
         assert_eq!(error.to_string(), "ChatGPT device login timed out");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_reading_receiver_is_deadlined_and_flood_is_killed() {
+        let (_directory, pid_file, command) = flooding_app_server(Duration::from_millis(250));
+        let provider = CodexAppServerProvider::with_command(command, "test-model", false);
+        let receiver = provider
+            .send_message_stream(&ProviderRequest::new(vec![]))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(receiver);
+        let descendant = PathBuf::from(format!("{}-child", pid_file.display()));
+        for pid_file in [pid_file, descendant] {
+            let pid = std::fs::read_to_string(pid_file).unwrap();
+            let alive = std::process::Command::new("/bin/kill")
+                .args(["-0", pid.trim()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            assert!(!alive, "blocked event delivery retained the process tree");
+        }
+    }
+
+    #[tokio::test]
+    async fn unmatched_rpc_flood_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("unmatched_flood.py");
+        std::fs::write(
+            &script,
+            r#"import json, sys
+for line in sys.stdin:
+    m = json.loads(line)
+    if m.get('method') == 'initialize':
+        for _ in range(300):
+            print(json.dumps({'method': 'unknown/event', 'params': {}}), flush=True)
+        print(json.dumps({'id': m.get('id'), 'result': {}}), flush=True)
+"#,
+        )
+        .unwrap();
+        let command = AppServerCommand::test(
+            PathBuf::from("python3"),
+            vec![script.to_string_lossy().into_owned()],
+        );
+        let error = match RpcClient::spawn(&command).await {
+            Ok(_) => panic!("unmatched flood unexpectedly initialized"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("too many unmatched messages"));
+    }
+
+    #[tokio::test]
+    async fn newly_exposed_builtin_event_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("builtin_event.py");
+        std::fs::write(
+            &script,
+            r#"import json, sys
+for line in sys.stdin:
+    m = json.loads(line); method = m.get('method')
+    if method == 'initialized': continue
+    if method == 'initialize': result = {}
+    elif method == 'account/read': result = {'account': {'type': 'chatgpt'}}
+    elif method == 'thread/start': result = {'thread': {'id': 'thread'}}
+    elif method == 'turn/start': result = {'turn': {'id': 'turn'}}
+    else: result = {}
+    print(json.dumps({'id': m.get('id'), 'result': result}), flush=True)
+    if method == 'turn/start':
+        print(json.dumps({'method': 'item/commandExecution', 'params': {}}), flush=True)
+"#,
+        )
+        .unwrap();
+        let command = AppServerCommand::test(
+            PathBuf::from("python3"),
+            vec![script.to_string_lossy().into_owned()],
+        );
+        let provider = CodexAppServerProvider::with_command(command, "test-model", false);
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unaudited built-in capability"));
     }
 
     #[cfg(unix)]

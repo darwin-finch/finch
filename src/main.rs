@@ -1231,7 +1231,7 @@ async fn main() -> Result<()> {
 async fn run_auth_command(command: AuthCommand) -> Result<()> {
     use finch::providers::CodexAppServerAuth;
 
-    let auth = CodexAppServerAuth::new();
+    let auth = CodexAppServerAuth::new()?;
     match command {
         AuthCommand::Login {
             provider: AuthProvider::Chatgpt,

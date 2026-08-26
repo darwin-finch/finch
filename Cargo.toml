@@ -150,7 +150,7 @@ core-foundation = "0.10"  # Foundation types (required by core-graphics)
 
 # Unix signal handling (for daemon process checks)
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["signal"] }
+nix = { version = "0.29", features = ["process", "signal", "user"] }
 
 # Cap'n Proto IPC (CLI ↔ daemon over Unix socket)
 capnp = "0.20"
