@@ -4,6 +4,7 @@
 //! the named Brain service. There is deliberately no second client-local
 //! "Brain session" or hidden context-injection path here.
 
+pub mod authority;
 pub mod credential;
 pub mod names;
 pub mod remote;

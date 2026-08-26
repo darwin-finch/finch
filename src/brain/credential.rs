@@ -950,6 +950,9 @@ fn persist_consumed_invitations(path: &Path, consumed: &ConsumedInvitations) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::brain::authority::{
+        BrainAuthorityRequirement, BrainTransport, BRAIN_AUTHORITY_MATRIX,
+    };
 
     fn request(ttl_ms: u64) -> BrainCredentialRequest {
         BrainCredentialRequest {
@@ -967,6 +970,99 @@ mod tests {
             .collect(),
             delegation_chain: Vec::new(),
             ttl_ms,
+        }
+    }
+
+    #[test]
+    fn authority_matrix_generates_remote_credential_conformance_cases() {
+        let now = 10_000;
+        for (index, case) in BRAIN_AUTHORITY_MATRIX.iter().enumerate() {
+            let BrainAuthorityRequirement::Participant {
+                scope,
+                attachment_bound,
+            } = case.requirement
+            else {
+                continue;
+            };
+            assert!(matches!(
+                case.transport,
+                BrainTransport::RemoteHttp | BrainTransport::RemoteWebSocket
+            ));
+
+            let authority = BrainCredentialAuthority::ephemeral([index as u8 + 30; 32]);
+            let mut credential_request = request(1_000);
+            credential_request.scopes = [scope].into_iter().collect();
+            if attachment_bound {
+                credential_request
+                    .scopes
+                    .insert(BrainCredentialScope::BrainAttach);
+            }
+            let parent_token = authority.issue(credential_request, now).unwrap();
+            let parent = authority.verify(&parent_token, now).unwrap();
+            let (token, claims) = if attachment_bound {
+                authority
+                    .bind_attachment(
+                        &parent,
+                        AttachmentId(uuid::Uuid::new_v4()),
+                        ConnectionId(uuid::Uuid::new_v4()),
+                        now + 1,
+                    )
+                    .unwrap()
+            } else {
+                (parent_token, parent)
+            };
+
+            assert!(
+                claims
+                    .require_audience(claims.brain_id, &claims.brain, 7, scope)
+                    .is_ok(),
+                "matrix row {} rejected its exact authority",
+                case.operation
+            );
+            assert!(
+                claims
+                    .require_audience(BrainId(uuid::Uuid::new_v4()), &claims.brain, 7, scope)
+                    .is_err(),
+                "matrix row {} accepted a cross-Brain reference",
+                case.operation
+            );
+            assert!(
+                claims
+                    .require_audience(claims.brain_id, &claims.brain, 8, scope)
+                    .is_err(),
+                "matrix row {} survived policy/environment replacement",
+                case.operation
+            );
+            assert!(
+                authority.verify(&token, now + 1_000).is_err(),
+                "matrix row {} accepted an expired credential",
+                case.operation
+            );
+
+            authority.revoke(claims.credential_id).unwrap();
+            assert!(
+                authority.verify(&token, now + 2).is_err(),
+                "matrix row {} accepted revoked authority",
+                case.operation
+            );
+        }
+    }
+
+    #[test]
+    fn possession_of_identifiers_never_satisfies_local_or_remote_matrix_rows() {
+        for case in BRAIN_AUTHORITY_MATRIX {
+            assert_ne!(
+                case.requirement,
+                BrainAuthorityRequirement::Participant {
+                    scope: BrainCredentialScope::BrainRead,
+                    attachment_bound: false,
+                },
+                "{} accidentally treats a readable reference as ambient authority",
+                case.operation
+            );
+            if case.transport == BrainTransport::LocalIpc {
+                assert_eq!(case.requirement, BrainAuthorityRequirement::Connection);
+            }
         }
     }
 
