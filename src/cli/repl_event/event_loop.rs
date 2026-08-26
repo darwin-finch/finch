@@ -3970,6 +3970,20 @@ Rules:\n\
                 tool_id,
                 mut result,
             } => {
+                if let Err(error) = self
+                    .conversation
+                    .read()
+                    .await
+                    .validate_tool_result(query_id, round_token, &tool_id)
+                {
+                    tracing::warn!(
+                        "Ignoring fenced tool event for query {} tool {}: {}",
+                        query_id,
+                        tool_id,
+                        error
+                    );
+                    return Ok(());
+                }
                 if let Some(restart) =
                     crate::tools::implementations::restart::deferred_frontend_restart_from_tool_result(
                         &result,
@@ -4006,13 +4020,28 @@ Rules:\n\
                         tool_id,
                         proposal,
                         approval_audience,
+                        self.query_states
+                            .get_metadata(query_id)
+                            .await
+                            .map(|metadata| metadata.cancellation_token)
+                            .unwrap_or_default(),
                     );
                 } else if let Some(approval) = deferred_vm_approval_from_tool_result(&result) {
                     self.output_manager.write_status(format!(
                         "VM capability request {} is awaiting approval",
                         approval.prompt.request.id
                     ));
-                    self.spawn_deferred_vm_approval(query_id, round_token, tool_id, approval);
+                    self.spawn_deferred_vm_approval(
+                        query_id,
+                        round_token,
+                        tool_id,
+                        approval,
+                        self.query_states
+                            .get_metadata(query_id)
+                            .await
+                            .map(|metadata| metadata.cancellation_token)
+                            .unwrap_or_default(),
+                    );
                 } else {
                     self.handle_tool_result(query_id, round_token, tool_id, result)
                         .await?;
@@ -4039,14 +4068,31 @@ Rules:\n\
                 tool_use,
                 response_tx,
             } => {
+                if matches!(
+                    self.query_states.get_state(query_id).await,
+                    Some(QueryState::Cancelled)
+                ) {
+                    let _ = response_tx.send(super::events::ConfirmationResult::Deny);
+                    return Ok(());
+                }
                 self.handle_tool_approval_request(query_id, tool_use, response_tx)
                     .await?;
             }
 
             ReplEvent::VmApprovalNeeded {
+                query_id,
                 prompt,
                 response_tx,
             } => {
+                if let Some(query_id) = query_id {
+                    if matches!(
+                        self.query_states.get_state(query_id).await,
+                        Some(QueryState::Cancelled)
+                    ) {
+                        let _ = response_tx.send(crate::vm::ApprovalChoice::Deny);
+                        return Ok(());
+                    }
+                }
                 self.handle_vm_approval_request(prompt, response_tx).await?;
             }
 
@@ -4943,7 +4989,42 @@ Rules:\n\
     /// tool result, while returning the collected events/effects lets the
     /// daemon publish the canonical cancellation outcome.
     async fn terminate_cancelled_named_brain_turn(&mut self, query_id: Uuid) -> bool {
-        self.conversation.write().await.abort_staged(query_id);
+        let aborted_round = self
+            .conversation
+            .write()
+            .await
+            .abort_staged_round(query_id);
+        if self
+            .pending_vm_approval
+            .as_ref()
+            .is_some_and(|approval| approval.query_id == Some(query_id))
+        {
+            if let Some(approval) = self.pending_vm_approval.take() {
+                let _ = approval.response_tx.send(crate::vm::ApprovalChoice::Deny);
+            }
+            let mut tui = self.tui_renderer.lock().await;
+            tui.active_dialog = None;
+            tui.pending_dialog_result = None;
+        }
+        if let Some((_tool_use, response_tx)) =
+            self.pending_approvals.write().await.remove(&query_id)
+        {
+            let _ = response_tx.send(super::events::ConfirmationResult::Deny);
+            let mut tui = self.tui_renderer.lock().await;
+            tui.active_dialog = None;
+            tui.pending_dialog_result = None;
+        }
+        if let Some((round_token, tool_ids)) = aborted_round {
+            {
+                let mut active = self.active_tool_uses.write().await;
+                for tool_id in tool_ids {
+                    active.remove(&tool_id);
+                }
+            }
+            self.tool_coordinator
+                .wait_for_round(query_id, round_token)
+                .await;
+        }
         if let Some(unit) = self.query_states.tool_work_unit(query_id).await {
             unit.set_failed();
         }
@@ -5216,31 +5297,50 @@ Rules:\n\
         tool_id: String,
         proposal: DeferredProposal,
         approval_audience: Option<crate::brain::store::BrainApprovalAudience>,
+        cancellation_token: tokio_util::sync::CancellationToken,
     ) {
         let event_tx = self.event_tx.clone();
         let runtime = Arc::clone(&self.program_runtime);
-        tokio::spawn(async move {
-            let result = async {
-                let intent = approval_audience
-                    .as_ref()
-                    .map(|audience| {
-                        format!(
-                            "{}\n\n{}",
-                            proposal.intent,
-                            approval_audience_summary(audience)
-                        )
-                    })
-                    .unwrap_or_else(|| proposal.intent.clone());
-                let decision = crate::tools::implementations::propose::propose_artifact_with_decision(
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = start_rx.await;
+            if cancellation_token.is_cancelled() {
+                return;
+            }
+            let intent = approval_audience
+                .as_ref()
+                .map(|audience| {
+                    format!(
+                        "{}\n\n{}",
+                        proposal.intent,
+                        approval_audience_summary(audience)
+                    )
+                })
+                .unwrap_or_else(|| proposal.intent.clone());
+            // Once the editor is open, keep this task live until it exits. A
+            // dropped child wait does not guarantee that the editor process
+            // stopped, so terminal cancellation joins it before publishing.
+            let decision =
+                crate::tools::implementations::propose::propose_artifact_with_decision(
                     &proposal.language,
                     &intent,
                     &proposal.source,
                 )
-                .await?;
-                let outcome = resume_deferred_proposal(runtime.as_ref(), &proposal, decision).await?;
-                Ok::<_, anyhow::Error>(serde_json::to_string(&outcome)?)
+                .await;
+            let result = match decision {
+                Ok(decision) if !cancellation_token.is_cancelled() => {
+                    resume_deferred_proposal(runtime.as_ref(), &proposal, decision)
+                        .await
+                        .and_then(|outcome| {
+                            serde_json::to_string(&outcome).map_err(anyhow::Error::from)
+                        })
+                }
+                Ok(_) => return,
+                Err(error) => Err(error),
+            };
+            if cancellation_token.is_cancelled() {
+                return;
             }
-            .await;
             let _ = event_tx.send(ReplEvent::ToolResult {
                 query_id,
                 round_token,
@@ -5248,6 +5348,9 @@ Rules:\n\
                 result,
             });
         });
+        self.tool_coordinator
+            .track_round_task(query_id, round_token, handle);
+        let _ = start_tx.send(());
     }
 
     /// Resolve a capability prompt emitted through provider-native
@@ -5260,31 +5363,48 @@ Rules:\n\
         round_token: ToolRoundToken,
         tool_id: String,
         approval: DeferredVmApproval,
+        cancellation_token: tokio_util::sync::CancellationToken,
     ) {
         let event_tx = self.event_tx.clone();
         let runtime = Arc::clone(&self.program_runtime);
-        tokio::spawn(async move {
-            let result = async {
-                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-                event_tx
-                    .send(ReplEvent::VmApprovalNeeded {
-                        prompt: approval.prompt.clone(),
-                        response_tx,
-                    })
-                    .map_err(|_| anyhow::anyhow!("VM approval UI is unavailable"))?;
-                let choice = response_rx
-                    .await
-                    .map_err(|_| anyhow::anyhow!("VM approval dialog was cancelled"))?;
-                let outcome = runtime
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = start_rx.await;
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            if event_tx
+                .send(ReplEvent::VmApprovalNeeded {
+                    query_id: Some(query_id),
+                    prompt: approval.prompt.clone(),
+                    response_tx,
+                })
+                .is_err()
+            {
+                return;
+            }
+            let choice = tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => return,
+                choice = response_rx => match choice {
+                    Ok(choice) => choice,
+                    Err(_) => return,
+                },
+            };
+            if cancellation_token.is_cancelled() {
+                return;
+            }
+            let result = runtime
                     .resolve_typed_approval(
                         &approval.prompt,
                         choice,
                         "interactive-tool-user",
                     )
-                    .await?;
-                Ok::<_, anyhow::Error>(serde_json::to_string(&outcome)?)
+                    .await
+                    .and_then(|outcome| {
+                        serde_json::to_string(&outcome).map_err(anyhow::Error::from)
+                    });
+            if cancellation_token.is_cancelled() {
+                return;
             }
-            .await;
             let _ = event_tx.send(ReplEvent::ToolResult {
                 query_id,
                 round_token,
@@ -5292,6 +5412,9 @@ Rules:\n\
                 result,
             });
         });
+        self.tool_coordinator
+            .track_round_task(query_id, round_token, handle);
+        let _ = start_tx.send(());
     }
 
     // ── Diff proposal rendering ───────────────────────────────────────────────
@@ -6658,6 +6781,9 @@ Rules:\n\
             if matches!(meta.state, QueryState::ExecutingTools { .. })
                 && progress == ToolRoundProgress::Complete
             {
+                self.tool_coordinator
+                    .wait_for_round(query_id, round_token)
+                    .await;
                 // Keep the query-level Tools unit live while the provider
                 // consumes these results. A later tool round appends rows
                 // to the same unit; a final wire program closes it before
@@ -8434,6 +8560,8 @@ mod tests {
         };
         use crate::claude::{ContentBlock, Message};
         use crate::cli::conversation::ToolRoundError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
         for cancel_after_partial_result in [false, true] {
             let query_id = uuid::Uuid::new_v4();
@@ -8494,7 +8622,52 @@ mod tests {
             );
             let mut active = Some(query_id);
 
+            // Exercise the same round-task registry used by real tool,
+            // proposal, and VM continuations. One task is still awaiting
+            // approval while another effect has already begun. Cancellation
+            // must fence the former and join the latter before the terminal
+            // callback is published.
+            let tasks = super::super::tool_execution::ToolRoundTasks::default();
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let approved_after_cancel = Arc::new(AtomicUsize::new(0));
+            let effect_finished = Arc::new(AtomicUsize::new(0));
+            let (approval_tx, approval_rx) = tokio::sync::oneshot::channel::<()>();
+            let approval_cancellation = cancellation.clone();
+            let approval_counter = Arc::clone(&approved_after_cancel);
+            tasks.track(
+                query_id,
+                token,
+                tokio::spawn(async move {
+                    tokio::select! {
+                        biased;
+                        _ = approval_cancellation.cancelled() => {}
+                        result = approval_rx => if result.is_ok() {
+                            approval_counter.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }),
+            );
+            let (effect_started_tx, effect_started_rx) = tokio::sync::oneshot::channel();
+            let effect_counter = Arc::clone(&effect_finished);
+            tasks.track(
+                query_id,
+                token,
+                tokio::spawn(async move {
+                    let _ = effect_started_tx.send(());
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    effect_counter.fetch_add(1, Ordering::SeqCst);
+                }),
+            );
+            effect_started_rx.await.unwrap();
+            assert!(tasks.contains(query_id, token));
+            cancellation.cancel();
+
             assert!(conversation.abort_staged(query_id));
+            let _ = approval_tx.send(());
+            tasks.wait(query_id, token).await;
+            assert_eq!(approved_after_cancel.load(Ordering::SeqCst), 0);
+            assert_eq!(effect_finished.load(Ordering::SeqCst), 1);
+            assert!(!tasks.contains(query_id, token));
             assert!(super::clear_matching_active_query(&mut active, query_id));
             let cancelled =
                 super::take_cancelled_named_brain_turn(&mut pending, query_id).unwrap();

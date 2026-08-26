@@ -86,6 +86,7 @@ pub enum ReplEvent {
     /// boundary. The dialog returns a structured scope choice; the provider
     /// source is never replayed after approval.
     VmApprovalNeeded {
+        query_id: Option<Uuid>,
         prompt: crate::vm::ApprovalPrompt,
         response_tx: oneshot::Sender<crate::vm::ApprovalChoice>,
     },

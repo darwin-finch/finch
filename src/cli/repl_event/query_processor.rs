@@ -121,6 +121,7 @@ pub(super) async fn resume_interactive_boundaries(
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         event_tx
             .send(ReplEvent::VmApprovalNeeded {
+                query_id: None,
                 prompt: prompt.clone(),
                 response_tx,
             })
@@ -819,6 +820,11 @@ pub(super) async fn dispatch_tool_uses(
             tool_coordinator.spawn_tool_execution(
                 query_id,
                 round_token,
+                query_states
+                    .get_metadata(query_id)
+                    .await
+                    .map(|metadata| metadata.cancellation_token)
+                    .unwrap_or_default(),
                 tool_use,
                 Arc::clone(work_unit),
                 row_idx,
@@ -2149,7 +2155,7 @@ mod tests {
                     panic!("execution completed before requesting approval: {result:?}")
                 }
                 event = event_rx.recv() => match event.expect("interactive VM event") {
-                    ReplEvent::VmApprovalNeeded { prompt, response_tx } => {
+                    ReplEvent::VmApprovalNeeded { prompt, response_tx, .. } => {
                         assert_eq!(prompt.exact.capability, crate::vm::CapabilityKind::FileRead);
                         response_tx.send(crate::vm::ApprovalChoice::AllowOnce).unwrap();
                         break;
