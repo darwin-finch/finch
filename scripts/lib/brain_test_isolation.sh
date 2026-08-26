@@ -15,6 +15,22 @@ brain_isolation_canonical_dir() {
 
 brain_isolation_path_contains() { [[ "$2" == "$1" || "$2" == "$1"/* ]]; }
 
+brain_isolation_resolve_store() {
+  local real_home="$1" finch_dir="$1/.finch" store
+  if [[ -L "$finch_dir" ]]; then echo 'Brain test isolation rejects a symlinked real Finch directory' >&2; return 64; fi
+  if [[ -e "$finch_dir" ]]; then
+    [[ -d "$finch_dir" ]] || { echo 'Brain test isolation rejects a non-directory real Finch path' >&2; return 64; }
+    finch_dir="$(brain_isolation_canonical_dir 'the real Finch directory' "$finch_dir")" || return $?
+  fi
+  store="$finch_dir/brains"
+  if [[ -L "$store" ]]; then echo 'Brain test isolation rejects a symlinked real Brain store' >&2; return 64; fi
+  if [[ -e "$store" ]]; then
+    [[ -d "$store" ]] || { echo 'Brain test isolation rejects a non-directory real Brain store' >&2; return 64; }
+    store="$(brain_isolation_canonical_dir 'the real Brain store' "$store")" || return $?
+  fi
+  printf '%s\n' "$store"
+}
+
 brain_store_manifest() {
   local root="$1"
   if [[ ! -e "$root" ]]; then printf '%s\n' '<missing>'; return; fi
@@ -22,15 +38,19 @@ brain_store_manifest() {
   (
     set -euo pipefail
     cd "$root" || exit 1
-    find . -type f -print0 | LC_ALL=C sort -z | while IFS= read -r -d '' file; do
-      local_hash="$(shasum -a 256 "$file")" || exit 1
-      printf 'f\0%s\0%s\n' "$file" "${local_hash%% *}"
+    find . -print0 | LC_ALL=C sort -z | while IFS= read -r -d '' entry; do
+      if [[ -L "$entry" ]]; then
+        local_target="$(readlink "$entry")" || exit 1; printf 'l\0%s\0%s\0' "$entry" "$local_target"
+      elif [[ -f "$entry" ]]; then
+        local_hash="$(shasum -a 256 "$entry")" || exit 1; printf 'f\0%s\0%s\n' "$entry" "${local_hash%% *}"
+      elif [[ -d "$entry" ]]; then printf 'd\0%s\0' "$entry"
+      elif [[ -p "$entry" ]]; then printf 'p\0%s\0' "$entry"
+      elif [[ -S "$entry" ]]; then printf 's\0%s\0' "$entry"
+      elif [[ -b "$entry" ]]; then printf 'b\0%s\0' "$entry"
+      elif [[ -c "$entry" ]]; then printf 'c\0%s\0' "$entry"
+      else printf 'o\0%s\0' "$entry"
+      fi
     done || exit 1
-    find . -type l -print0 | LC_ALL=C sort -z | while IFS= read -r -d '' link; do
-      local_target="$(readlink "$link")" || exit 1
-      printf 'l\0%s\0%s\0' "$link" "$local_target"
-    done || exit 1
-    find . -type d -print0 | LC_ALL=C sort -z | while IFS= read -r -d '' directory; do printf 'd\0%s\0' "$directory"; done || exit 1
   )
 }
 
@@ -60,7 +80,8 @@ brain_test_isolation_run() (
   temp_parent="$(brain_isolation_canonical_dir 'the temporary-home parent' "$requested_temp_parent")" || exit $?
   [[ "$temp_parent" != / && "$temp_parent" != /var && "$temp_parent" != /private ]] || { echo 'Brain test isolation rejects a broad temporary-home parent' >&2; exit 64; }
 
-  local real_store="$real_home/.finch/brains"
+  local real_store
+  real_store="$(brain_isolation_resolve_store "$real_home")" || exit $?
   if brain_isolation_path_contains "$temp_parent" "$real_store" || brain_isolation_path_contains "$real_store" "$temp_parent"; then
     echo 'Brain test isolation rejects a temporary parent related to the real Brain store' >&2; exit 64
   fi
@@ -85,10 +106,14 @@ brain_test_isolation_run() (
   mkdir -p "$isolated_home/.finch/brains" || {
     rm -rf -- "$isolated_home"; rm -f -- "$before_manifest" "$after_manifest"; exit 74
   }
+  local isolation_token="${RANDOM:-0}:$$:$(basename "$isolated_home")"
+  printf '%s\n' "$isolation_token" >"$isolated_home/.finch-brain-test-isolation" || {
+    rm -rf -- "$isolated_home"; rm -f -- "$before_manifest" "$after_manifest"; exit 74
+  }
   if [[ -z "${RUSTUP_HOME:-}" && -d "$real_home/.rustup" ]]; then export RUSTUP_HOME="$real_home/.rustup"; fi
   if [[ -z "${CARGO_HOME:-}" && -d "$real_home/.cargo" ]]; then export CARGO_HOME="$real_home/.cargo"; fi
   export HOME="$isolated_home" FINCH_BRAIN_TEST_HOME="$isolated_home" FINCH_BRAIN_TEST_ROOT="$isolated_home/.finch/brains"
-  export FINCH_BRAIN_TEST_ISOLATED=1 FINCH_TEST_REAL_HOME="$real_home"
+  export FINCH_BRAIN_TEST_ISOLATED=1 FINCH_BRAIN_TEST_TOKEN="$isolation_token" FINCH_TEST_TMP_PARENT="$temp_parent" FINCH_TEST_REAL_HOME="$real_home"
 
   set -m; "$@" & child_pid=$!; set +m
   local command_status=0
@@ -117,9 +142,23 @@ brain_test_isolation_run() (
   exit "$command_status"
 )
 
+brain_test_isolation_is_active() {
+  [[ "${FINCH_BRAIN_TEST_ISOLATED:-}" == 1 ]] || return 1
+  [[ -n "${HOME:-}" && "$HOME" == "${FINCH_BRAIN_TEST_HOME:-}" ]] || return 1
+  [[ "${FINCH_BRAIN_TEST_ROOT:-}" == "$HOME/.finch/brains" ]] || return 1
+  [[ "$HOME" == "${FINCH_TEST_TMP_PARENT:-}"/finch-brain-test-home.* ]] || return 1
+  [[ -d "$FINCH_BRAIN_TEST_ROOT" && ! -L "$FINCH_BRAIN_TEST_ROOT" ]] || return 1
+  [[ -f "$HOME/.finch-brain-test-isolation" && ! -L "$HOME/.finch-brain-test-isolation" ]] || return 1
+  [[ "$(cat "$HOME/.finch-brain-test-isolation" 2>/dev/null)" == "${FINCH_BRAIN_TEST_TOKEN:-}" ]] || return 1
+  [[ "$(cd "$HOME" 2>/dev/null && pwd -P)" == "$HOME" ]] || return 1
+}
+
 brain_test_isolation_reexec_launcher() {
   local launcher="$1" repo_root; shift
-  [[ "${FINCH_BRAIN_TEST_ISOLATED:-}" == 1 ]] && return 0
+  if brain_test_isolation_is_active; then
+    if [[ -n "${FINCH_TEST_LAUNCHER_PROBE_FILE:-}" ]]; then printf '%s\n' "$HOME" >"$FINCH_TEST_LAUNCHER_PROBE_FILE"; fi
+    return 0
+  fi
   repo_root="$(cd "$(dirname "$launcher")/.." && pwd -P)" || exit 64
   exec "$repo_root/scripts/test_brains.sh" "$launcher" "$@"
 }
