@@ -94,13 +94,13 @@ Binary at: `target/release/finch`
 ### Run Without Building
 
 ```bash
-cargo run
+./scripts/test_brains.sh cargo run
 ```
 
 With arguments:
 
 ```bash
-cargo run -- daemon --port 8080
+./scripts/test_server.sh
 ```
 
 ## Testing
@@ -132,7 +132,7 @@ cargo run -- daemon --port 8080
 ### Run Tests in Watch Mode
 
 ```bash
-cargo watch -x test
+cargo watch -s './scripts/test_brains.sh cargo test'
 ```
 
 ## Code Quality
@@ -190,8 +190,8 @@ git checkout -b feature/add-router-logic
 # 2. Make changes
 # ... edit src/router/mod.rs ...
 
-# 3. Auto-rebuild on save
-cargo watch -x 'run'
+# 3. Auto-run inside a disposable Finch HOME on save
+cargo watch -s './scripts/test_brains.sh cargo run'
 
 # 4. Write tests
 # ... edit tests/router_tests.rs ...
@@ -220,13 +220,13 @@ Use `cargo-watch` for automatic rebuilds:
 cargo watch -x build
 
 # Rebuild and run
-cargo watch -x run
+cargo watch -s './scripts/test_brains.sh cargo run'
 
 # Rebuild and test
-cargo watch -x test
+cargo watch -s './scripts/test_brains.sh cargo test'
 
 # Run specific binary
-cargo watch -x 'run --bin finch'
+cargo watch -s './scripts/test_brains.sh cargo run --bin finch'
 ```
 
 ## Project Structure
@@ -417,13 +417,13 @@ mod tests {
 ### Enable Debug Logging
 
 ```bash
-RUST_LOG=debug cargo run
+RUST_LOG=debug ./scripts/test_brains.sh cargo run
 ```
 
 More granular:
 
 ```bash
-RUST_LOG=finch=debug,finch::router=trace cargo run
+RUST_LOG=finch=debug,finch::router=trace ./scripts/test_brains.sh cargo run
 ```
 
 ### Use Debugger
@@ -521,10 +521,10 @@ cargo outdated
 
 ```bash
 # Run example
-cargo run --example simple_query
+./scripts/test_brains.sh cargo run --example simple_query
 
 # With arguments
-cargo run --example simple_query -- "What is Rust?"
+./scripts/test_brains.sh cargo run --example simple_query -- "What is Rust?"
 ```
 
 ## Continuous Integration

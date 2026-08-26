@@ -1,12 +1,38 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Test script for tool pass-through in daemon architecture
 #
 # This script tests that tools work correctly through the daemon API.
 
-set -e
+set -euo pipefail
 
-DAEMON_URL="${DAEMON_URL:-http://127.0.0.1:11434}"
-TEST_DIR=$(mktemp -d)
+script_path="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+source "$(dirname "$script_path")/lib/brain_test_isolation.sh"
+brain_test_isolation_reexec_launcher "$script_path" "$@"
+
+finch_bin="${FINCH_BIN:-target/release/finch}"
+[[ -x "$finch_bin" ]] || { echo "Error: Binary not found. Run 'cargo build --release' first." >&2; exit 1; }
+[[ -n "${ANTHROPIC_API_KEY:-}" ]] || { echo 'ANTHROPIC_API_KEY is required for this live pass-through smoke' >&2; exit 1; }
+TEST_DIR=$(mktemp -d "$HOME/finch-tool-passthrough.XXXXXX")
+address_file="$HOME/.finch/tool-passthrough.addr"
+daemon_pid=''
+cleanup() {
+    trap - EXIT INT TERM HUP
+    if [[ -n "$daemon_pid" ]]; then
+        kill -TERM "$daemon_pid" 2>/dev/null || true
+        for _ in {1..40}; do kill -0 "$daemon_pid" 2>/dev/null || break; sleep 0.05; done
+        kill -KILL "$daemon_pid" 2>/dev/null || true
+        wait "$daemon_pid" 2>/dev/null || true
+    fi
+    rm -rf -- "$TEST_DIR"
+    rm -f -- "$address_file"
+}
+trap cleanup EXIT INT TERM HUP
+mkdir -p "$HOME/.finch"
+FINCH_TEST_BOUND_ADDR_FILE="$address_file" "$finch_bin" daemon --bind 127.0.0.1:0 & daemon_pid=$!
+brain_test_isolation_register_owned_pid "$daemon_pid"
+for _ in {1..100}; do [[ -s "$address_file" ]] && break; kill -0 "$daemon_pid" 2>/dev/null || break; sleep 0.05; done
+[[ -s "$address_file" ]] || { echo 'Daemon did not publish its bound address' >&2; exit 1; }
+DAEMON_URL="http://$(cat "$address_file")"
 
 echo "🧪 Testing Tool Pass-Through in Daemon Architecture"
 echo "=================================================="
@@ -27,7 +53,7 @@ echo ""
 # Test 1: Check daemon is running
 echo "Test 1: Check daemon health"
 echo "----------------------------"
-if curl -s "$DAEMON_URL/health" > /dev/null; then
+if curl --fail --show-error --silent "$DAEMON_URL/health" > /dev/null; then
     echo "✅ Daemon is running"
 else
     echo "❌ Daemon is not running. Start it with: finch daemon"
@@ -38,10 +64,10 @@ echo ""
 # Test 2: Send query with tools (should receive tool_calls)
 echo "Test 2: Request with tools (expect tool_calls)"
 echo "----------------------------------------------"
-RESPONSE=$(curl -s -X POST "$DAEMON_URL/v1/chat/completions" \
+RESPONSE=$(curl --fail --show-error --silent -X POST "$DAEMON_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen-local",
+    "model": "claude",
     "messages": [{"role": "user", "content": "List all files in the current directory"}],
     "tools": [{
       "type": "function",
@@ -67,8 +93,8 @@ echo "$RESPONSE" | jq .
 if echo "$RESPONSE" | jq -e '.choices[0].message.tool_calls' > /dev/null 2>&1; then
     echo "✅ Received tool_calls from daemon"
 else
-    echo "⚠️  No tool_calls in response (may have returned text instead)"
-    echo "This is expected if using Claude API fallback"
+    echo "No tool_calls in response" >&2
+    exit 1
 fi
 echo ""
 
@@ -90,44 +116,24 @@ echo "Tool result (from local execution):"
 echo "$TOOL_RESULT"
 echo ""
 
-# Send tool result back
-RESPONSE2=$(curl -s -X POST "$DAEMON_URL/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"model\": \"qwen-local\",
-    \"messages\": [
-      {\"role\": \"user\", \"content\": \"List all files in the current directory\"},
-      {
-        \"role\": \"assistant\",
-        \"tool_calls\": [{
-          \"id\": \"$TOOL_CALL_ID\",
-          \"type\": \"function\",
-          \"function\": {
-            \"name\": \"bash\",
-            \"arguments\": \"$COMMAND\"
-          }
-        }]
-      },
-      {
-        \"role\": \"tool\",
-        \"tool_call_id\": \"$TOOL_CALL_ID\",
-        \"content\": \"$TOOL_RESULT\"
-      }
+# Send tool result back. jq performs all JSON escaping so model-supplied
+# arguments and multiline tool output cannot corrupt the request body.
+REQUEST2=$(jq -n \
+  --arg id "$TOOL_CALL_ID" \
+  --arg arguments "$COMMAND" \
+  --arg result "$TOOL_RESULT" \
+  '{
+    model: "claude",
+    messages: [
+      {role: "user", content: "List all files in the current directory"},
+      {role: "assistant", tool_calls: [{id: $id, type: "function", function: {name: "bash", arguments: $arguments}}]},
+      {role: "tool", tool_call_id: $id, content: $result}
     ],
-    \"tools\": [{
-      \"type\": \"function\",
-      \"function\": {
-        \"name\": \"bash\",
-        \"description\": \"Execute bash command\",
-        \"parameters\": {
-          \"type\": \"object\",
-          \"properties\": {
-            \"command\": {\"type\": \"string\"}
-          }
-        }
-      }
-    }]
-  }")
+    tools: [{type: "function", function: {name: "bash", description: "Execute bash command", parameters: {type: "object", properties: {command: {type: "string"}}}}}]
+  }')
+RESPONSE2=$(curl --fail --show-error --silent -X POST "$DAEMON_URL/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d "$REQUEST2")
 
 echo "Response after tool execution:"
 echo "$RESPONSE2" | jq .
@@ -137,14 +143,14 @@ if [ -n "$FINAL_CONTENT" ]; then
     echo "✅ Received final answer with tool results"
     echo "Final answer: $FINAL_CONTENT"
 else
-    echo "⚠️  No content in final response"
+    echo "No content in final response" >&2
+    exit 1
 fi
 echo ""
 
 # Cleanup
-cd /
-rm -rf "$TEST_DIR"
-echo "🧹 Cleaned up test directory"
+cd "$HOME"
+echo "🧹 Test directory will be removed by the ownership trap"
 echo ""
 
 echo "=================================================="
@@ -154,7 +160,3 @@ echo "Summary:"
 echo "- Daemon responded to health check"
 echo "- Tool calls can be sent/received through API"
 echo "- Multi-turn conversation with tool results works"
-echo ""
-echo "Note: If tests showed warnings, the system may have"
-echo "fallen back to Claude API (local model not ready)."
-echo "This is expected behavior (graceful degradation)."

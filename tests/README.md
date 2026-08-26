@@ -44,8 +44,18 @@ Run the isolation harness's own regression checks with:
 
 **Requirements:**
 - Daemon binary built (`cargo build --release`)
-- Ports 11440-11441 available
-- Network access (localhost only)
+- Loopback networking
+- A live teacher credential only for the ignored query smoke
+
+Each test daemon owns a temporary HOME, per-test Unix socket, and
+kernel-assigned loopback port. Its RAII guard stops and reaps only the child it
+spawned. The tests never discover or reuse an ambient daemon.
+
+Ignored in-crate IPC/remote Brain smokes fail closed unless their owned fixture
+is supplied explicitly with `FINCH_TEST_IPC_SOCKET`, `FINCH_TEST_DAEMON_ADDR`,
+`FINCH_TEST_BRAIN_ADDR`, and `FINCH_TEST_BRAIN_PASSWORD` as applicable. Those
+values must identify the disposable daemon launched inside the same wrapper;
+the tests never fall back to standard Finch sockets, ports, or config.
 
 ### TUI Integration Tests
 ```bash
@@ -62,14 +72,16 @@ Run the isolation harness's own regression checks with:
 ./scripts/test_brains.sh cargo test --test tui_integration_test -- --ignored
 ```
 
+Use `./scripts/test_tui_debug.sh` for the executable smoke. It owns the exact
+Finch child PID and never sends a signal by process name.
+
 ## Test Categories
 
 ### Daemon Tests (`daemon_integration_test.rs`)
 
 1. **`test_daemon_spawn_and_health`** - Verifies daemon can start and health endpoint responds
 2. **`test_daemon_query`** - Tests full query flow through daemon
-3. **`test_fallback_without_daemon`** - Verifies CLI falls back to teacher API when daemon is down
-4. **`test_daemon_config_parsing`** - Validates config file parsing
+3. **`test_daemon_config_parsing`** - Validates isolated endpoint configuration
 
 ### TUI Tests (`tui_integration_test.rs`)
 
@@ -85,8 +97,7 @@ Run the isolation harness's own regression checks with:
 | Test | Status | Notes |
 |------|--------|-------|
 | Daemon spawn/health | ✅ Works | Requires daemon binary |
-| Daemon query | ⚠️ Partial | Needs config management |
-| Daemon fallback | ✅ Works | |
+| Daemon query | 🔒 Ignored live smoke | Requires a teacher credential |
 | Config parsing | ✅ Works | Unit test |
 | TUI initialization | ⚠️ Limited | Needs PTY for full test |
 | Shadow buffer | ✅ Works | Unit test |
@@ -102,80 +113,30 @@ Run the isolation harness's own regression checks with:
 - **Manual Testing**: Complex TUI flows should be tested manually
 - **Escape Codes**: Automated tests can't verify visual rendering
 
-**Solutions:**
-1. Use `expect` for scripted TUI interactions (see below)
-2. Manual testing in real terminal
-3. Unit tests for individual components (shadow buffer, wrapping, etc.)
+Use the repository PTY integration harness for scripted interaction and unit
+tests for individual components such as shadow-buffering and wrapping. Do not
+start an unowned interactive Finch process from a test.
 
 ### Daemon Testing
-- **Port Conflicts**: Tests use ports 11440-11441 to avoid conflicts
-- **Timing**: Some tests have sleep() for daemon startup
-- **Config**: Tests need proper config file management
+- **Endpoints**: daemon tests bind `127.0.0.1:0` and receive the actual address
+  through an isolated test-only address file
+- **Readiness**: tests poll their owned endpoint and fail on early child exit
+- **Config**: each test writes config only under its disposable HOME
 
-## Manual Testing Checklist
+## Safe executable smoke checklist
 
 ### Daemon Mode
 ```bash
-# 1. Start daemon
-finch daemon --bind 127.0.0.1:11435 &
-
-# 2. Run CLI (should connect to daemon)
-finch
-# Expected: "✓ Connected to daemon"
-
-# 3. Run query
-> What is 2+2?
-# Expected: "→ Using daemon for query"
-
-# 4. Stop daemon
-pkill -f "finch daemon"
-
-# 5. Try query again
-> What is 3+3?
-# Expected: "⚠️ Daemon failed" → "→ Falling back to teacher API"
+./scripts/test_server.sh
 ```
+
+The launcher selects an ephemeral endpoint, waits for readiness, fails on HTTP
+errors, and reaps only its own daemon. For the live provider/tool path, set the
+required credential and run `./scripts/test_tool_passthrough.sh`.
 
 ### TUI Mode
 ```bash
-# 1. Run interactive REPL
-finch
-
-# 2. Verify TUI elements visible:
-#    - Input area (bottom)
-#    - Status bar
-#    - Scrollback (Shift+PgUp)
-
-# 3. Test commands
-> /help
-> /history
-> /exit
-
-# 4. Test streaming
-> Write a haiku
-# Verify: Text appears gradually (streaming)
-
-# 5. Test shadow buffer
-> Very long message that wraps across multiple lines...
-# Verify: Text wraps cleanly, no overflow
-```
-
-## Using Expect for TUI Tests
-
-Example expect script:
-```tcl
-#!/usr/bin/expect -f
-set timeout 10
-
-spawn finch
-
-expect ">" { send "test query\r" }
-expect ">" { send "/exit\r" }
-expect eof
-```
-
-Run with:
-```bash
-./test_tui.exp
+./scripts/test_tui_debug.sh
 ```
 
 ## CI/CD Integration
@@ -200,8 +161,7 @@ For automated testing in CI:
 
 ## Future Improvements
 
-- [ ] Add expect-based TUI interaction tests
-- [ ] Add config file fixture management
+- [ ] Expand PTY-based TUI interaction tests
 - [ ] Add performance/stress tests for daemon
 - [ ] Add multi-client daemon tests
 - [ ] Add TUI regression tests (screenshots?)
