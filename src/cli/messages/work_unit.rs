@@ -710,10 +710,24 @@ fn format_row_themed(row: &WorkRow, colors: &ColorScheme) -> String {
                 )
             };
             // Render body lines (diff, bash output, grep matches, etc.) indented below
-            if let Some(diff) = FileDiff::parse(&row.body_lines.join("\n")) {
-                for line in diff.render(colors, DiffColorMode::Theme).lines() {
+            let diffs = FileDiff::parse_all(&row.body_lines.join("\n"));
+            if !diffs.is_empty() {
+                for line in row
+                    .body_lines
+                    .iter()
+                    .take_while(|line| !line.starts_with("--- "))
+                {
                     out.push('\n');
-                    out.push_str(&format!("    {line}"));
+                    out.push_str(&format!(
+                        "    {}",
+                        crate::cli::diff::sanitize_terminal(line)
+                    ));
+                }
+                for diff in diffs {
+                    for line in diff.render(colors, DiffColorMode::NoColor).lines() {
+                        out.push('\n');
+                        out.push_str(&format!("    {line}"));
+                    }
                 }
             } else {
                 for line in &row.body_lines {
@@ -759,10 +773,24 @@ fn format_row_collapsed(row: &WorkRow, colors: &ColorScheme) -> String {
                     GRAY, RESET, row.label, GRAY_DIM, summary, RESET, timing
                 )
             };
-            if let Some(diff) = FileDiff::parse(&row.body_lines.join("\n")) {
-                for line in diff.render(colors, DiffColorMode::Theme).lines() {
+            let diffs = FileDiff::parse_all(&row.body_lines.join("\n"));
+            if !diffs.is_empty() {
+                for line in row
+                    .body_lines
+                    .iter()
+                    .take_while(|line| !line.starts_with("--- "))
+                {
                     out.push('\n');
-                    out.push_str(&format!("    {line}"));
+                    out.push_str(&format!(
+                        "    {}",
+                        crate::cli::diff::sanitize_terminal(line)
+                    ));
+                }
+                for diff in diffs {
+                    for line in diff.render(colors, DiffColorMode::NoColor).lines() {
+                        out.push('\n');
+                        out.push_str(&format!("    {line}"));
+                    }
                 }
             } else {
                 for line in &row.body_lines {
@@ -828,7 +856,7 @@ mod tests {
     fn test_structured_diff_direct_and_retained_render_match() {
         let diff = FileDiff::parse("--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n")
             .unwrap();
-        let direct = diff.render(&colors(), DiffColorMode::Theme);
+        let direct = diff.render(&colors(), DiffColorMode::NoColor);
         let wu = WorkUnit::new("Tools");
         let row = wu.add_row("edit(src/a.rs)");
         wu.complete_row_with_diff(row, diff);
@@ -839,6 +867,24 @@ mod tests {
                 retained.contains(line),
                 "missing retained diff line: {line:?}\n{retained}"
             );
+        }
+    }
+
+    #[test]
+    fn test_edit_and_write_tool_display_payloads_survive_retained_work_unit() {
+        for tool in ["edit", "write"] {
+            let raw = FileDiff::from_texts("src/file.txt", "old\n", "new\nmore\n").to_unified();
+            let (summary, body) =
+                crate::cli::repl_event::tool_display::tool_result_to_display(tool, &raw);
+            let wu = WorkUnit::new("Tools");
+            let row = wu.add_row(format!("{tool}(src/file.txt)"));
+            wu.complete_row_with_body(row, summary, body);
+            wu.set_complete();
+            let rendered = wu.format(&colors());
+            assert!(rendered.contains("src/file.txt  +2 -1"), "{rendered}");
+            assert!(rendered.contains("- old"), "{rendered}");
+            assert!(rendered.contains("+ new"), "{rendered}");
+            assert!(!rendered.contains("\x1b]"), "{rendered}");
         }
     }
 

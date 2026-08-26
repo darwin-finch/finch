@@ -96,7 +96,14 @@ impl Tool for WriteTool {
 
         // Interactive: propose the script in $EDITOR before writing.
         if std::io::stdin().is_terminal() {
-            let original = fs::read_to_string(file_path).unwrap_or_default();
+            let original = match fs::read_to_string(file_path) {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to read existing file: {}", file_path))
+                }
+            };
             let line_count = content.lines().count();
             let description = format!("Write {} ({} lines)", file_path, line_count);
             let code = build_write_code(file_path, content);
@@ -104,12 +111,16 @@ impl Tool for WriteTool {
             let Some(script) = approved else {
                 return Ok("Write aborted by user.".to_string());
             };
-            run_script_async(&script).await?;
+            let script_stdout = run_script_async(&script).await?;
             let updated = fs::read_to_string(file_path)
                 .with_context(|| format!("Failed to read written file: {}", file_path))?;
-            return Ok(
-                crate::cli::diff::FileDiff::from_texts(file_path, &original, &updated).to_unified(),
-            );
+            let diff =
+                crate::cli::diff::FileDiff::from_texts(file_path, &original, &updated).to_unified();
+            return Ok(if script_stdout.trim().is_empty() {
+                diff
+            } else {
+                format!("{}\n{}", script_stdout.trim_end(), diff)
+            });
         }
 
         // Non-interactive (tests, daemon): write directly.

@@ -16,8 +16,8 @@
 //! Also contains `format_elapsed` and `format_token_count` used in the status
 //! bar and in tests.
 
-use serde_json::Value;
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
+use serde_json::Value;
 
 const CYAN: SetForegroundColor = SetForegroundColor(Color::Cyan);
 const GRAY: SetForegroundColor = SetForegroundColor(Color::DarkGrey);
@@ -144,10 +144,10 @@ pub fn shorten_path(path: &str) -> String {
 
 /// Truncate a string to max_len chars, adding "…" if needed
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}…", &s[..max_len])
+        format!("{}…", s.chars().take(max_len).collect::<String>())
     }
 }
 
@@ -177,6 +177,29 @@ pub(crate) fn tool_result_to_display(tool_name: &str, content: &str) -> (String,
     }
 
     match tool_name.to_lowercase().as_str() {
+        "edit" | "write" if !crate::cli::diff::FileDiff::parse_all(trimmed).is_empty() => {
+            let files = crate::cli::diff::FileDiff::parse_all(trimmed);
+            let added: usize = files.iter().map(|d| d.added()).sum();
+            let removed: usize = files.iter().map(|d| d.removed()).sum();
+            let summary = if files.len() == 1 {
+                format!("{}  +{} -{}", files[0].display_path(), added, removed)
+            } else {
+                format!("{} files  +{} -{}", files.len(), added, removed)
+            };
+            // Keep the complete bounded unified representation. WorkUnit owns
+            // final rendering and must be able to re-render retained rows.
+            let first_header = trimmed.lines().position(|line| line.starts_with("--- "));
+            let mut body: Vec<String> = first_header
+                .into_iter()
+                .flat_map(|end| trimmed.lines().take(end).take(20))
+                .map(crate::cli::diff::sanitize_terminal)
+                .collect();
+            for file in files {
+                body.extend(file.to_unified().lines().map(str::to_owned));
+            }
+            (summary, body)
+        }
+
         "edit" => {
             let mut lines_iter = trimmed.lines();
             let summary = lines_iter.next().unwrap_or("").trim().to_string();
@@ -831,6 +854,32 @@ mod tests {
         let (summary, body) = tool_result_to_display("write", content);
         assert!(summary.contains("Updated"), "got: {}", summary);
         assert!(body.is_empty());
+    }
+
+    #[test]
+    fn test_tool_result_edit_structured_diff_reaches_direct_display_untruncated() {
+        let diff =
+            crate::cli::diff::FileDiff::from_texts("src/é.rs", "old\n", "new\nmore\n").to_unified();
+        let (summary, body) = tool_result_to_display("edit", &diff);
+        assert_eq!(summary, "src/é.rs  +2 -1");
+        assert!(body.iter().any(|line| line == "+more"));
+        assert!(!body.iter().any(|line| line.contains("ctrl+o")));
+    }
+
+    #[test]
+    fn test_tool_result_write_structured_diff_keeps_body_and_sanitizes_preamble() {
+        let diff = crate::cli::diff::FileDiff::from_texts("out.txt", "", "hello\n").to_unified();
+        let content = format!("\x1b]8;;bad\x07Created\n{diff}");
+        let (summary, body) = tool_result_to_display("write", &content);
+        assert_eq!(summary, "out.txt  +1 -0");
+        assert_eq!(body.first().map(String::as_str), Some("Created"));
+        assert!(body.iter().any(|line| line == "+hello"));
+    }
+
+    #[test]
+    fn test_format_tool_label_non_ascii_truncation_does_not_panic() {
+        let label = format_tool_label("bash", &serde_json::json!({"command": "é".repeat(80)}));
+        assert!(label.contains('…'));
     }
 
     #[test]

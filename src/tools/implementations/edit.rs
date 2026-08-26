@@ -147,12 +147,16 @@ impl Tool for EditTool {
             let Some(script) = approved else {
                 return Ok("Edit aborted by user.".to_string());
             };
-            run_script_async(&script).await?;
+            let script_stdout = run_script_async(&script).await?;
             let updated = fs::read_to_string(file_path)
                 .with_context(|| format!("Failed to read edited file: {}", file_path))?;
-            return Ok(
-                crate::cli::diff::FileDiff::from_texts(file_path, &original, &updated).to_unified(),
-            );
+            let diff =
+                crate::cli::diff::FileDiff::from_texts(file_path, &original, &updated).to_unified();
+            return Ok(if script_stdout.trim().is_empty() {
+                diff
+            } else {
+                format!("{}\n{}", script_stdout.trim_end(), diff)
+            });
         }
 
         // Non-interactive (tests, daemon): apply in Rust.
