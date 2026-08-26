@@ -198,23 +198,11 @@ impl ConversationHistory {
         tool_id: &str,
         result: &std::result::Result<String, anyhow::Error>,
     ) -> std::result::Result<ToolRoundProgress, ToolRoundError> {
+        self.validate_tool_result(query_id, token, tool_id)?;
         let stage = self
             .staged_tool_rounds
             .get_mut(&query_id)
             .ok_or(ToolRoundError::NoActiveStage)?;
-        if stage.token != token {
-            return Err(ToolRoundError::StaleToken);
-        }
-        if !stage
-            .expected_ids
-            .iter()
-            .any(|expected| expected == tool_id)
-        {
-            return Err(ToolRoundError::UnknownTool(tool_id.to_string()));
-        }
-        if stage.results.contains_key(tool_id) {
-            return Err(ToolRoundError::DuplicateResult(tool_id.to_string()));
-        }
         let (content, is_error) = match result {
             Ok(content) => (content.clone(), false),
             Err(error) => (error.to_string(), true),
@@ -232,6 +220,32 @@ impl ConversationHistory {
         } else {
             ToolRoundProgress::Pending
         })
+    }
+
+    pub fn validate_tool_result(
+        &self,
+        query_id: Uuid,
+        token: ToolRoundToken,
+        tool_id: &str,
+    ) -> std::result::Result<(), ToolRoundError> {
+        let stage = self
+            .staged_tool_rounds
+            .get(&query_id)
+            .ok_or(ToolRoundError::NoActiveStage)?;
+        if stage.token != token {
+            return Err(ToolRoundError::StaleToken);
+        }
+        if !stage
+            .expected_ids
+            .iter()
+            .any(|expected| expected == tool_id)
+        {
+            return Err(ToolRoundError::UnknownTool(tool_id.to_string()));
+        }
+        if stage.results.contains_key(tool_id) {
+            return Err(ToolRoundError::DuplicateResult(tool_id.to_string()));
+        }
+        Ok(())
     }
 
     pub fn completed_tool_results(
@@ -293,7 +307,13 @@ impl ConversationHistory {
 
     /// Drop a staged tool call without changing committed history.
     pub fn abort_staged(&mut self, query_id: Uuid) -> bool {
-        self.staged_tool_rounds.remove(&query_id).is_some()
+        self.abort_staged_round(query_id).is_some()
+    }
+
+    pub fn abort_staged_round(&mut self, query_id: Uuid) -> Option<(ToolRoundToken, Vec<String>)> {
+        self.staged_tool_rounds
+            .remove(&query_id)
+            .map(|stage| (stage.token, stage.expected_ids))
     }
 
     /// Get all messages for API request

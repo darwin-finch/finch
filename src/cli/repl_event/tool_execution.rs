@@ -9,6 +9,7 @@
 //! 3. Executes the tool (with a bounded subprocess timeout, but never timing a
 //!    human editor review) and sends the result back as `ReplEvent::ToolResult`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use uuid::Uuid;
@@ -54,6 +55,49 @@ pub struct ToolExecutionCoordinator {
 
     /// Co-Forth poset — each tool call auto-pushes a trace node here.
     poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
+    tasks: ToolRoundTasks,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct ToolRoundTasks {
+    handles:
+        Arc<std::sync::Mutex<HashMap<(Uuid, ToolRoundToken), Vec<tokio::task::JoinHandle<()>>>>>,
+}
+
+impl ToolRoundTasks {
+    pub(super) fn track(
+        &self,
+        query_id: Uuid,
+        round_token: ToolRoundToken,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        self.handles
+            .lock()
+            .expect("tool task registry lock poisoned")
+            .entry((query_id, round_token))
+            .or_default()
+            .push(handle);
+    }
+
+    pub(super) async fn wait(&self, query_id: Uuid, round_token: ToolRoundToken) {
+        let handles = self
+            .handles
+            .lock()
+            .expect("tool task registry lock poisoned")
+            .remove(&(query_id, round_token))
+            .unwrap_or_default();
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains(&self, query_id: Uuid, round_token: ToolRoundToken) -> bool {
+        self.handles
+            .lock()
+            .expect("tool task registry lock poisoned")
+            .contains_key(&(query_id, round_token))
+    }
 }
 
 /// One tool's client-side presentation binding. It is intentionally created
@@ -123,6 +167,7 @@ impl ToolExecutionCoordinator {
             repl_mode,
             plan_content,
             poset: None,
+            tasks: ToolRoundTasks::default(),
         }
     }
 
@@ -152,6 +197,7 @@ impl ToolExecutionCoordinator {
         &self,
         query_id: Uuid,
         round_token: ToolRoundToken,
+        cancellation_token: tokio_util::sync::CancellationToken,
         tool_use: ToolUse,
         work_unit: Arc<WorkUnit>,
         row_idx: usize,
@@ -182,7 +228,9 @@ impl ToolExecutionCoordinator {
             event_tx: event_tx.clone(),
         });
 
-        tokio::spawn(async move {
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = start_rx.await;
             let mut tool_use = tool_use;
             // Generate tool signature for approval checking
             let signature = generate_tool_signature(&tool_use, std::path::Path::new("."));
@@ -218,7 +266,12 @@ impl ToolExecutionCoordinator {
                 }
 
                 // Wait for approval response (blocks only THIS task)
-                match response_rx.await {
+                let confirmation = tokio::select! {
+                    biased;
+                    _ = cancellation_token.cancelled() => return,
+                    confirmation = response_rx => confirmation,
+                };
+                match confirmation {
                     Ok(confirmation) => {
                         // Process approval result
                         match confirmation {
@@ -285,6 +338,9 @@ impl ToolExecutionCoordinator {
             }
 
             // Tool approved (or doesn't need approval), execute it
+            if cancellation_token.is_cancelled() {
+                return;
+            }
             let conversation_snapshot = conversation.read().await.clone();
 
             // Wire the poset into the executor so tool calls auto-record trace nodes.
@@ -310,6 +366,14 @@ impl ToolExecutionCoordinator {
                 Some(timeout) => tokio::time::timeout(timeout, execute).await,
                 None => Ok(execute.await),
             };
+
+            // Once execution has begun, cancellation waits for this task at the
+            // round boundary instead of dropping the future and assuming its
+            // underlying effect stopped. The stage is already fenced, so no
+            // result from a cancelled round is published back to the event loop.
+            if cancellation_token.is_cancelled() {
+                return;
+            }
 
             // Send result back to event loop
             match result {
@@ -361,5 +425,20 @@ impl ToolExecutionCoordinator {
                 }
             }
         });
+        self.tasks.track(query_id, round_token, handle);
+        let _ = start_tx.send(());
+    }
+
+    pub async fn wait_for_round(&self, query_id: Uuid, round_token: ToolRoundToken) {
+        self.tasks.wait(query_id, round_token).await;
+    }
+
+    pub fn track_round_task(
+        &self,
+        query_id: Uuid,
+        round_token: ToolRoundToken,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        self.tasks.track(query_id, round_token, handle);
     }
 }
