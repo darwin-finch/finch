@@ -71,7 +71,10 @@ pub async fn handle_feedback(
     );
 
     if let Err(error) = feedback_store.log(&entry) {
-        warn!(%error, "Failed to persist feedback");
+        warn!(
+            error_category = feedback_error_category(&error),
+            "Failed to persist private feedback"
+        );
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(FeedbackResponse {
@@ -82,12 +85,28 @@ pub async fn handle_feedback(
             .into_response());
     }
 
-    info!(path = %feedback_store.path().display(), "Feedback recorded; training is disabled");
+    info!("Feedback recorded; training is disabled");
 
     Ok(Json(FeedbackResponse {
         status: "recorded".to_string(),
         message: Some("Feedback saved; automatic training is disabled".to_string()),
     }))
+}
+
+fn feedback_error_category(error: &anyhow::Error) -> &'static str {
+    let Some(io_error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+    else {
+        return "storage-error";
+    };
+    match io_error.kind() {
+        std::io::ErrorKind::AlreadyExists => "already-exists",
+        std::io::ErrorKind::InvalidInput => "invalid-input",
+        std::io::ErrorKind::NotFound => "not-found",
+        std::io::ErrorKind::PermissionDenied => "permission-denied",
+        _ => "io-error",
+    }
 }
 
 /// Training status information
@@ -133,6 +152,19 @@ mod tests {
         let request: FeedbackRequest = serde_json::from_str(json).unwrap();
         assert_eq!(request.query, "What is 2+2?");
         assert_eq!(request.weight, 10.0);
+    }
+
+    #[test]
+    fn test_feedback_log_category_redacts_sensitive_error_details() {
+        let error =
+            anyhow::anyhow!("failed at /Users/customer/secret-project/.finch/feedback.jsonl");
+        assert_eq!(feedback_error_category(&error), "storage-error");
+
+        let io_error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "/Users/customer/secret-project",
+        ));
+        assert_eq!(feedback_error_category(&io_error), "permission-denied");
     }
 
     #[tokio::test(start_paused = true)]

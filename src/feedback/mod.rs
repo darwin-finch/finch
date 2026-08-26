@@ -8,16 +8,16 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 compile_error!("secure feedback storage is currently supported only on Linux and macOS");
@@ -160,6 +160,8 @@ impl FeedbackEntry {
 #[derive(Debug, Clone)]
 pub struct FeedbackLogger {
     file_path: PathBuf,
+    #[cfg(test)]
+    injected_log_error: Option<String>,
 }
 
 impl FeedbackLogger {
@@ -174,23 +176,49 @@ impl FeedbackLogger {
     /// Create a logger at an explicit path. Used by isolated tests and server
     /// fixtures so they never touch the user's Finch state.
     pub fn at(file_path: impl Into<PathBuf>) -> Result<Self> {
+        let file_path = file_path.into();
+        let file_path = if file_path.is_absolute() {
+            file_path
+        } else {
+            std::env::current_dir()
+                .context("Failed to resolve private feedback storage root")?
+                .join(file_path)
+        };
         let logger = Self {
-            file_path: file_path.into(),
+            file_path,
+            #[cfg(test)]
+            injected_log_error: None,
         };
         logger.ensure_private_storage()?;
         Ok(logger)
     }
 
-    /// Log a feedback entry
-    pub fn log(&self, entry: &FeedbackEntry) -> Result<()> {
-        let file = self.open_private(true)?;
-        self.append_to_open_file(file, entry)
+    #[cfg(test)]
+    pub(crate) fn with_injected_log_error(mut self, error: impl Into<String>) -> Self {
+        self.injected_log_error = Some(error.into());
+        self
     }
 
-    fn append_to_open_file(&self, mut file: File, entry: &FeedbackEntry) -> Result<()> {
-        file.lock_exclusive().with_context(|| {
-            format!("Failed to lock feedback log: {}", self.file_path.display())
-        })?;
+    /// Log a feedback entry
+    pub fn log(&self, entry: &FeedbackEntry) -> Result<()> {
+        #[cfg(test)]
+        if let Some(error) = &self.injected_log_error {
+            anyhow::bail!(error.clone());
+        }
+        let file = self.open_private(true)?;
+        self.append_to_open_file(file, entry, || {})
+    }
+
+    fn append_to_open_file(
+        &self,
+        mut file: File,
+        entry: &FeedbackEntry,
+        after_lock: impl FnOnce(),
+    ) -> Result<()> {
+        file.lock_exclusive()
+            .context("Failed to lock private feedback log")?;
+        after_lock();
+        validate_feedback_file_for_use(&file)?;
 
         let len = file.metadata()?.len();
         if len > 0 {
@@ -200,12 +228,14 @@ impl FeedbackLogger {
             if last[0] != b'\n' {
                 // Preserve a complete legacy line or torn bytes verbatim, but
                 // ensure the next canonical record starts on a fresh line.
+                validate_feedback_file_for_use(&file)?;
                 file.write_all(b"\n")?;
             }
         }
 
         let mut json = serde_json::to_vec(entry).context("Failed to serialize feedback entry")?;
         json.push(b'\n');
+        validate_feedback_file_for_use(&file)?;
         file.write_all(&json)
             .context("Failed to write feedback entry")?;
         file.sync_all().context("Failed to sync feedback entry")?;
@@ -225,9 +255,9 @@ impl FeedbackLogger {
     /// Load all feedback entries
     pub fn load_all(&self) -> Result<Vec<FeedbackEntry>> {
         let file = self.open_private(false)?;
-        file.lock_shared().with_context(|| {
-            format!("Failed to lock feedback log: {}", self.file_path.display())
-        })?;
+        file.lock_shared()
+            .context("Failed to lock private feedback log")?;
+        validate_feedback_file_for_use(&file)?;
         let mut entries = Vec::new();
         for line in BufReader::new(&file).split(b'\n') {
             let line = line.context("Failed to read feedback log")?;
@@ -237,7 +267,6 @@ impl FeedbackLogger {
             match serde_json::from_slice::<FeedbackEntry>(&line) {
                 Ok(entry) => entries.push(entry),
                 Err(error) => tracing::warn!(
-                    path = %self.file_path.display(),
                     %error,
                     "Skipping malformed or torn feedback record"
                 ),
@@ -248,43 +277,24 @@ impl FeedbackLogger {
     }
 
     fn ensure_private_storage(&self) -> Result<()> {
-        let parent = self
-            .file_path
-            .parent()
-            .context("Feedback log path has no parent directory")?;
-        let parent_existed = parent.try_exists().with_context(|| {
-            format!("Failed to inspect feedback directory: {}", parent.display())
-        })?;
-        if !parent_existed {
-            let mut builder = fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            builder.mode(0o700);
-            builder.create(parent).with_context(|| {
-                format!("Failed to create feedback directory: {}", parent.display())
-            })?;
-        }
-
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let parent_directory = open_private_directory(parent)?;
+        let parent_directory = open_or_create_storage_parent(&self.file_path)?;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let parent_directory = File::open(parent)
-            .with_context(|| format!("Failed to open feedback directory: {}", parent.display()))?;
+        let parent_directory = open_fallback_storage_parent(&self.file_path)?;
 
-        make_object_private(&parent_directory, parent, 0o700)?;
-
-        if !parent_existed {
-            sync_directory(parent.parent().unwrap_or(parent))?;
-        }
+        validate_storage_directory(&parent_directory)?;
+        make_object_private(&parent_directory, "private feedback directory", 0o700)?;
+        validate_storage_directory_for_use(&parent_directory)?;
 
         let (file, file_created) = self.open_from(&parent_directory, OpenPurpose::Initialize)?;
-        validate_feedback_file(&file, &self.file_path)?;
-        make_object_private(&file, &self.file_path, 0o600)?;
+        validate_feedback_file(&file)?;
+        make_object_private(&file, "private feedback log", 0o600)?;
+        validate_feedback_file_for_use(&file)?;
         file.sync_all()?;
         if file_created {
-            parent_directory.sync_all().with_context(|| {
-                format!("Failed to sync feedback directory: {}", parent.display())
-            })?;
+            parent_directory
+                .sync_all()
+                .context("Failed to sync private feedback directory")?;
         }
         Ok(())
     }
@@ -299,15 +309,11 @@ impl FeedbackLogger {
         after_parent_opened: impl FnOnce(),
     ) -> Result<File> {
         self.ensure_private_storage()?;
-        let parent = self
-            .file_path
-            .parent()
-            .context("Feedback log path has no parent directory")?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let parent_directory = open_private_directory(parent)?;
+        let parent_directory = open_or_create_storage_parent(&self.file_path)?;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let parent_directory = File::open(parent)
-            .with_context(|| format!("Failed to open feedback directory: {}", parent.display()))?;
+        let parent_directory = open_fallback_storage_parent(&self.file_path)?;
+        validate_storage_directory_for_use(&parent_directory)?;
         after_parent_opened();
         let purpose = if append {
             OpenPurpose::Append
@@ -315,8 +321,7 @@ impl FeedbackLogger {
             OpenPurpose::Read
         };
         let (file, _) = self.open_from(&parent_directory, purpose)?;
-        validate_feedback_file(&file, &self.file_path)?;
-        make_object_private(&file, &self.file_path, 0o600)?;
+        validate_feedback_file_for_use(&file)?;
         Ok(file)
     }
 
@@ -327,7 +332,13 @@ impl FeedbackLogger {
         after_parent_opened: impl FnOnce(),
     ) -> Result<()> {
         let file = self.open_private_with_parent_hook(true, after_parent_opened)?;
-        self.append_to_open_file(file, entry)
+        self.append_to_open_file(file, entry, || {})
+    }
+
+    #[cfg(test)]
+    fn log_with_lock_hook(&self, entry: &FeedbackEntry, after_lock: impl FnOnce()) -> Result<()> {
+        let file = self.open_private(true)?;
+        self.append_to_open_file(file, entry, after_lock)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -340,9 +351,9 @@ impl FeedbackLogger {
             options.write(true).create(true);
         }
         let existed = self.file_path.try_exists()?;
-        let file = options.open(&self.file_path).with_context(|| {
-            format!("Failed to open feedback log: {}", self.file_path.display())
-        })?;
+        let file = options
+            .open(&self.file_path)
+            .context("Failed to open private feedback log")?;
         Ok((file, !existed))
     }
 
@@ -351,9 +362,8 @@ impl FeedbackLogger {
         let name = self
             .file_path
             .file_name()
-            .context("Feedback log path has no file name")?;
-        open_feedback_at(parent, name, purpose)
-            .with_context(|| format!("Failed to open feedback log: {}", self.file_path.display()))
+            .context("Private feedback log has no file name")?;
+        open_feedback_at(parent, name, purpose).context("Failed to open private feedback log")
     }
 }
 
@@ -368,13 +378,19 @@ enum OpenPurpose {
 mod unix_open {
     #[cfg(target_os = "linux")]
     use std::os::raw::c_uint;
-    use std::os::raw::{c_char, c_int};
+    #[cfg(target_os = "macos")]
+    use std::os::raw::c_ushort;
+    use std::os::raw::{c_char, c_int, c_uint as uid_t};
 
     #[cfg(target_os = "linux")]
     pub(super) type OpenMode = c_uint;
     // Darwin mode_t is u16, which C's default argument promotions pass as int.
     #[cfg(target_os = "macos")]
     pub(super) type OpenMode = c_int;
+    #[cfg(target_os = "linux")]
+    pub(super) type RawMode = c_uint;
+    #[cfg(target_os = "macos")]
+    pub(super) type RawMode = c_ushort;
 
     pub(super) const O_RDONLY: c_int = 0;
     pub(super) const O_RDWR: c_int = 2;
@@ -410,27 +426,145 @@ mod unix_open {
 
     unsafe extern "C" {
         pub(super) fn openat(directory: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
+        pub(super) fn mkdirat(directory: c_int, path: *const c_char, mode: RawMode) -> c_int;
+        pub(super) fn geteuid() -> uid_t;
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn open_private_directory(path: &Path) -> Result<File> {
+fn open_or_create_storage_parent(file_path: &Path) -> Result<File> {
+    let parent = file_path
+        .parent()
+        .context("Private feedback log has no parent directory")?;
+    let (trusted_root, relative_parent) = trusted_storage_root(parent)?;
+    anyhow::ensure!(
+        !relative_parent.as_os_str().is_empty(),
+        "Private feedback storage must be below its trusted root"
+    );
+
+    let mut directory = open_trusted_root(&trusted_root)?;
+    validate_traversal_directory(&directory)?;
+    let components: Vec<_> = relative_parent.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!("Private feedback storage contains an unsafe path component");
+        };
+        let next = match open_directory_at(&directory, name) {
+            Ok(next) => next,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                create_directory_at(&directory, name)?;
+                directory
+                    .sync_all()
+                    .context("Failed to sync private feedback directory parent")?;
+                open_directory_at(&directory, name)
+                    .context("Failed to open newly created private feedback directory component")?
+            }
+            Err(error) => {
+                return Err(error).context("Failed to open private feedback directory component")
+            }
+        };
+        if index + 1 == components.len() {
+            validate_storage_directory(&next)?;
+        } else {
+            validate_traversal_directory(&next)?;
+        }
+        directory = next;
+    }
+    Ok(directory)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn trusted_storage_root(parent: &Path) -> Result<(PathBuf, PathBuf)> {
+    anyhow::ensure!(
+        parent.is_absolute(),
+        "Private feedback storage path must be absolute"
+    );
+
+    // Walk from the filesystem root so HOME, TMPDIR, and every user-controlled
+    // ancestor receive the same descriptor-bound checks. Darwin exposes /var,
+    // /tmp, and /etc as platform-managed symlinks into /private; translate
+    // those documented aliases lexically before traversal rather than
+    // resolving an attacker-replaceable path with canonicalize().
+    #[cfg(target_os = "macos")]
+    let parent = if let Ok(relative) = parent.strip_prefix("/var") {
+        Path::new("/private/var").join(relative)
+    } else if let Ok(relative) = parent.strip_prefix("/tmp") {
+        Path::new("/private/tmp").join(relative)
+    } else if let Ok(relative) = parent.strip_prefix("/etc") {
+        Path::new("/private/etc").join(relative)
+    } else {
+        parent.to_path_buf()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let parent = parent.to_path_buf();
+
+    let relative = parent
+        .strip_prefix(Path::new("/"))
+        .context("Failed to resolve private feedback storage root")?;
+    Ok((PathBuf::from("/"), relative.to_path_buf()))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn open_fallback_storage_parent(file_path: &Path) -> Result<File> {
+    let parent = file_path
+        .parent()
+        .context("Private feedback log has no parent directory")?;
+    fs::create_dir_all(parent).context("Failed to create private feedback directory")?;
+    File::open(parent).context("Failed to open private feedback directory")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_trusted_root(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options
         .read(true)
         .custom_flags(unix_open::O_DIRECTORY | unix_open::O_NOFOLLOW | unix_open::O_CLOEXEC);
-    let directory = options.open(path).with_context(|| {
-        format!(
-            "Feedback directory must be a real directory: {}",
-            path.display()
+    options
+        .open(path)
+        .context("Failed to open trusted private feedback storage root")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_directory_at(parent: &File, name: &OsStr) -> std::io::Result<File> {
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private feedback directory name contains a NUL byte",
         )
     })?;
-    anyhow::ensure!(
-        directory.metadata()?.is_dir(),
-        "Feedback directory must be a real directory: {}",
-        path.display()
-    );
-    Ok(directory)
+    let flags =
+        unix_open::O_RDONLY | unix_open::O_DIRECTORY | unix_open::O_NOFOLLOW | unix_open::O_CLOEXEC;
+    // SAFETY: name is NUL-terminated and parent stays open for the call. The
+    // mode argument is ignored because O_CREAT is absent.
+    let descriptor = unsafe { unix_open::openat(parent.as_raw_fd(), name.as_ptr(), flags, 0) };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(descriptor as RawFd) })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn create_directory_at(parent: &File, name: &OsStr) -> Result<()> {
+    let name = CString::new(name.as_bytes())
+        .context("Private feedback directory name contains a NUL byte")?;
+    // SAFETY: name is NUL-terminated, parent remains open, and 0700 is valid
+    // for each platform's fixed (non-variadic) mode_t.
+    let result = unsafe {
+        unix_open::mkdirat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            0o700 as unix_open::RawMode,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        return Ok(());
+    }
+    Err(error).context("Failed to create private feedback directory component")
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -472,52 +606,117 @@ fn open_feedback_at(
     Ok((open(access | common, 0)?, false))
 }
 
-fn validate_feedback_file(file: &File, path: &Path) -> Result<()> {
-    let metadata = file.metadata()?;
-    anyhow::ensure!(
-        metadata.is_file(),
-        "Feedback log must be a regular file: {}",
-        path.display()
-    );
-    #[cfg(unix)]
-    anyhow::ensure!(
-        metadata.nlink() == 1,
-        "Feedback log must not have multiple hard links: {}",
-        path.display()
-    );
-    Ok(())
+fn effective_uid() -> u32 {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // SAFETY: geteuid has no arguments and no failure mode.
+        unsafe { unix_open::geteuid() as u32 }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        0
+    }
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)
-        .with_context(|| format!("Failed to open directory for sync: {}", path.display()))?
-        .sync_all()
-        .with_context(|| format!("Failed to sync directory: {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<()> {
+fn validate_trusted_owner_and_mode(owner: u32, mode: u32) -> Result<()> {
+    let current = effective_uid();
+    anyhow::ensure!(
+        owner == current || owner == 0,
+        "Private feedback storage ancestor has unsafe ownership"
+    );
+    let writable_by_others = mode & 0o022 != 0;
+    let protected_root_directory = owner == 0 && mode & 0o1000 != 0;
+    anyhow::ensure!(
+        !writable_by_others || protected_root_directory,
+        "Private feedback storage ancestor has unsafe permissions"
+    );
     Ok(())
 }
 
-fn make_object_private(file: &File, path: &Path, maximum_mode: u32) -> Result<()> {
+fn validate_directory_type_and_links(directory: &File) -> Result<std::fs::Metadata> {
+    let metadata = directory.metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "Private feedback storage ancestor is not a directory"
+    );
+    #[cfg(unix)]
+    anyhow::ensure!(
+        metadata.nlink() > 0,
+        "Private feedback storage ancestor has invalid link metadata"
+    );
+    Ok(metadata)
+}
+
+fn validate_traversal_directory(directory: &File) -> Result<()> {
+    let metadata = validate_directory_type_and_links(directory)?;
+    #[cfg(unix)]
+    validate_trusted_owner_and_mode(metadata.uid(), metadata.mode())?;
+    Ok(())
+}
+
+fn validate_storage_directory(directory: &File) -> Result<()> {
+    let metadata = validate_directory_type_and_links(directory)?;
+    #[cfg(unix)]
+    anyhow::ensure!(
+        metadata.uid() == effective_uid(),
+        "Private feedback directory has unsafe ownership"
+    );
+    Ok(())
+}
+
+fn validate_storage_directory_for_use(directory: &File) -> Result<()> {
+    validate_storage_directory(directory)?;
+    #[cfg(unix)]
+    anyhow::ensure!(
+        directory.metadata()?.mode() & 0o077 == 0,
+        "Private feedback directory has unsafe permissions"
+    );
+    Ok(())
+}
+
+fn validate_feedback_file(file: &File) -> Result<()> {
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "Private feedback log is not a regular file"
+    );
+    #[cfg(unix)]
+    {
+        anyhow::ensure!(
+            metadata.uid() == effective_uid(),
+            "Private feedback log has unsafe ownership"
+        );
+        anyhow::ensure!(
+            metadata.nlink() == 1,
+            "Private feedback log must not have multiple hard links"
+        );
+    }
+    Ok(())
+}
+
+fn validate_feedback_file_for_use(file: &File) -> Result<()> {
+    validate_feedback_file(file)?;
+    #[cfg(unix)]
+    anyhow::ensure!(
+        file.metadata()?.mode() & 0o077 == 0,
+        "Private feedback log has unsafe permissions"
+    );
+    Ok(())
+}
+
+fn make_object_private(file: &File, label: &'static str, maximum_mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
         let current = file.metadata()?.permissions().mode() & 0o777;
         let tightened = current & maximum_mode;
         if tightened != current {
             file.set_permissions(fs::Permissions::from_mode(tightened))
-                .with_context(|| {
-                    format!(
-                        "Failed to make feedback storage private: {}",
-                        path.display()
-                    )
-                })?;
+                .with_context(|| format!("Failed to make {label} private"))?;
         }
     }
     #[cfg(not(unix))]
-    let _ = (file, path, maximum_mode);
+    let _ = (file, label, maximum_mode);
     Ok(())
 }
 
@@ -728,8 +927,70 @@ mod tests {
         let dev = File::open("/dev").unwrap();
         let (device, _) =
             open_feedback_at(&dev, std::ffi::OsStr::new("null"), OpenPurpose::Read).unwrap();
-        let error = validate_feedback_file(&device, Path::new("/dev/null")).unwrap_err();
+        let error = validate_feedback_file(&device).unwrap_err();
         assert!(error.to_string().contains("regular file"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_feedback_log_rejects_ancestor_symlink_substitution() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_ancestor = temp.path().join("real-ancestor");
+        fs::create_dir(&real_ancestor).unwrap();
+        let linked_ancestor = temp.path().join("linked-ancestor");
+        symlink(&real_ancestor, &linked_ancestor).unwrap();
+        let path = linked_ancestor.join("nested/feedback.jsonl");
+
+        assert!(FeedbackLogger::at(&path).is_err());
+        assert!(!real_ancestor.join("nested").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_feedback_storage_rejects_injected_untrusted_ownership() {
+        let current = effective_uid();
+        let untrusted = if current == 1 { 2 } else { 1 };
+        let error = validate_trusted_owner_and_mode(untrusted, 0o700).unwrap_err();
+        assert!(error.to_string().contains("unsafe ownership"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_feedback_log_revalidates_hardlinks_after_lock_before_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".finch/feedback.jsonl");
+        let alias = temp.path().join("feedback-alias.jsonl");
+        let logger = FeedbackLogger::at(&path).unwrap();
+        let entry = FeedbackEntry::new(
+            "must-not-write".into(),
+            "response".into(),
+            FeedbackRating::Good,
+        );
+
+        let error = logger
+            .log_with_lock_hook(&entry, || fs::hard_link(&path, &alias).unwrap())
+            .unwrap_err();
+
+        assert!(error.to_string().contains("multiple hard links"));
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+        assert_eq!(fs::metadata(&alias).unwrap().len(), 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn test_feedback_storage_errors_redact_absolute_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let sensitive = temp.path().join("customer-secret-project");
+        let target = temp.path().join("safe-target");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &sensitive).unwrap();
+        let path = sensitive.join("feedback.jsonl");
+
+        let error = FeedbackLogger::at(&path).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(!rendered.contains("customer-secret-project"));
+        assert!(!rendered.contains(temp.path().to_string_lossy().as_ref()));
+        assert!(rendered.contains("private feedback"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

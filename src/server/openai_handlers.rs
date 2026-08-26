@@ -1054,16 +1054,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openai_requests_have_no_automatic_training_producer() {
-        let handler_source = include_str!("openai_handlers.rs");
-        let weighted_example = ["Weighted", "Example"].concat();
-        let training_sender = ["training", "_tx"].concat();
-
-        assert!(!handler_source.contains(&weighted_example));
-        assert!(!handler_source.contains(&training_sender));
-    }
-
-    #[test]
     fn model_id_selects_provider_profile() {
         assert_eq!(provider_profile_name("work-grok"), Ok("work-grok"));
         assert_eq!(provider_profile_name("  Claude Code  "), Ok("Claude Code"));

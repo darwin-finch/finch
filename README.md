@@ -170,8 +170,8 @@ To use the local model, run `finch` without `--cloud-only`. The REPL starts imme
 | `/help`              | Show available commands                                |
 | `spawn_task`         | (tool) Delegate a subtask to an isolated subagent loop |
 | `Ctrl+C`             | Cancel the current query                               |
-| `Ctrl+G`             | Mark the last response as good (training signal)       |
-| `Ctrl+B`             | Mark the last response as bad (training signal)        |
+| `Ctrl+G`             | Save a private good-response feedback rating            |
+| `Ctrl+B`             | Save a private bad-response feedback rating             |
 | **In dialogs:** ↑↓   | Navigate between options                               |
 | **In dialogs:** Space | Toggle selection (MultiSelect)                        |
 | **In dialogs:** o/O  | Jump to "Other" row and start typing                   |

@@ -13,10 +13,10 @@ pub mod openai_types; // Public for client access
 pub use brain_approval::BrainApprovalBroker;
 pub use brain_runner::{
     BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerEffectRecord,
-    RunnerMemoryProjectionRequest, RunnerProgramError, RunnerProgramInteraction,
-    RunnerProgramControlRequest, RunnerProgramRequest, RunnerProgramResult,
-    RunnerRegistrationId, RunnerRequest, RunnerTurnError, RunnerTurnEvent, RunnerTurnRequest,
-    RunnerTurnCommitAck, RunnerTurnCommitNotice, RunnerTurnResult,
+    RunnerMemoryProjectionRequest, RunnerProgramControlRequest, RunnerProgramError,
+    RunnerProgramInteraction, RunnerProgramRequest, RunnerProgramResult, RunnerRegistrationId,
+    RunnerRequest, RunnerTurnCommitAck, RunnerTurnCommitNotice, RunnerTurnError, RunnerTurnEvent,
+    RunnerTurnRequest, RunnerTurnResult,
 };
 pub use brain_service::{
     BrainLifecycleService, BrainSubmissionError, BrainSubmissionOutcome, BrainWatch,
@@ -47,6 +47,16 @@ use crate::router::Router;
 struct ProviderSlot {
     profile_name: String,
     provider: Arc<dyn LlmProvider>,
+}
+
+struct ServerBackgroundTasks(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for ServerBackgroundTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 /// Configuration for the HTTP server
@@ -131,10 +141,7 @@ impl AgentServer {
             metrics_logger: Arc::new(MetricsLogger::new(state_root.join("metrics"))?),
             config: ServerConfig::default(),
             local_generator: Arc::new(RwLock::new(LocalGenerator::new())),
-            bootstrap_loader: Arc::new(BootstrapLoader::new(
-                Arc::clone(&generator_state),
-                None,
-            )),
+            bootstrap_loader: Arc::new(BootstrapLoader::new(Arc::clone(&generator_state), None)),
             generator_state,
             feedback_store: Arc::new(FeedbackLogger::at(state_root.join("feedback.jsonl"))?),
             brain_store: crate::brain::store::BrainStore::with_root(
@@ -166,7 +173,10 @@ impl AgentServer {
                 crate::models::ThresholdRouter::default(),
             ))),
             metrics_logger: Arc::new(MetricsLogger::new(state_root.join("metrics"))?),
-            config: ServerConfig { brain_password: password.clone(), ..ServerConfig::default() },
+            config: ServerConfig {
+                brain_password: password.clone(),
+                ..ServerConfig::default()
+            },
             local_generator: Arc::new(RwLock::new(LocalGenerator::default())),
             bootstrap_loader,
             generator_state,
@@ -253,12 +263,18 @@ impl AgentServer {
     /// Cap'n Proto IPC server that runs concurrently.
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         let addr: SocketAddr = self.config.bind_address.parse()?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        self.serve_on_listener(listener).await
+    }
+
+    async fn serve_on_listener(self: Arc<Self>, listener: tokio::net::TcpListener) -> Result<()> {
+        let addr = listener.local_addr()?;
 
         // The daemon owns only due-time calculation and durable queueing.
         // Actual ProgramRuns remain on each Brain's leased environment runner.
         let schedule_store = self.brain_store.clone();
         let schedule_runners = self.brain_runners.clone();
-        tokio::spawn(async move {
+        let schedule_task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(1));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -288,7 +304,7 @@ impl AgentServer {
         // Monitor generator state and inject model when ready
         let local_gen_clone = Arc::clone(&self.local_generator);
         let state_monitor = Arc::clone(&self.generator_state);
-        tokio::spawn(async move {
+        let model_monitor_task = tokio::spawn(async move {
             tracing::info!("Model monitor task started");
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -336,6 +352,7 @@ impl AgentServer {
             }
             tracing::info!("Model monitor task exiting");
         });
+        let _background_tasks = ServerBackgroundTasks(vec![schedule_task, model_monitor_task]);
 
         let auth = DaemonAuth::new(self.config.auth_enabled, self.config.api_keys.clone());
 
@@ -353,7 +370,6 @@ impl AgentServer {
 
         // Start server — ConnectInfo requires into_make_service_with_connect_info
         // so handlers can read the peer's IP for auth logging.
-        let listener = tokio::net::TcpListener::bind(addr).await?;
         let local_server = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -527,17 +543,183 @@ impl AgentServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[test]
-    fn default_server_has_no_trainer_lifecycle() {
-        let server_source = include_str!("mod.rs");
-        let worker_type = ["Training", "Worker"].concat();
-        let worker_module = ["training", "_worker"].concat();
-        let python_trainer = ["LoRATraining", "Subprocess"].concat();
+    #[derive(Clone)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
 
-        assert!(!server_source.contains(&worker_type));
-        assert!(!server_source.contains(&worker_module));
-        assert!(!server_source.contains(&python_trainer));
+    impl Write for CapturedLogs {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn submit_feedback_to_daemon(address: SocketAddr, query: &str) {
+        let client = reqwest::Client::new();
+        let endpoint = format!("http://{address}/v1/feedback");
+        for _ in 0..20 {
+            match client
+                .post(&endpoint)
+                .json(&serde_json::json!({
+                    "query": query,
+                    "response": "metadata-only response",
+                    "weight": 3.0,
+                    "feedback": "retain privately"
+                }))
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    assert_eq!(response.status(), reqwest::StatusCode::OK);
+                    let status: serde_json::Value = client
+                        .post(format!("http://{address}/v1/training/status"))
+                        .send()
+                        .await
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    assert_eq!(status["training_active"], false);
+                    assert_eq!(status["queue_length"], 0);
+                    return;
+                }
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+        panic!("feedback daemon did not accept a local request");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_daemon_feedback_timeout_and_restart_never_request_training_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let feedback_path = temp.path().join("feedback.jsonl");
+        let legacy_queue = temp.path().join("training_queue.jsonl");
+        let adapter = temp.path().join("adapters/latest.safetensors");
+        let legacy_queue_contents = "legacy queued Python training example\n";
+        std::fs::write(&legacy_queue, legacy_queue_contents).unwrap();
+        let observed_launches = Arc::clone(&launches);
+        let _launch_observer = crate::training::lora_subprocess::observe_training_process_launches(
+            Arc::new(move || {
+                observed_launches.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        for (cycle, query) in ["before restart", "after restart"].into_iter().enumerate() {
+            let authority = crate::brain::credential::BrainCredentialAuthority::ephemeral(
+                [cycle as u8 + 1; 32],
+            );
+            let server =
+                AgentServer::for_brain_http_test("feedback-fixture.local", temp.path(), authority)
+                    .unwrap();
+            let server = Arc::new(server);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener));
+
+            submit_feedback_to_daemon(address, query).await;
+            tokio::time::advance(tokio::time::Duration::from_secs(10 * 60)).await;
+            tokio::task::yield_now().await;
+
+            assert_eq!(launches.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                std::fs::read_to_string(&legacy_queue).unwrap(),
+                legacy_queue_contents
+            );
+            assert!(!adapter.exists());
+            serving.abort();
+            let _ = serving.await;
+        }
+
+        let entries = FeedbackLogger::at(&feedback_path)
+            .unwrap()
+            .load_all()
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].query, "before restart");
+        assert_eq!(entries[1].query, "after restart");
+        assert_eq!(entries[0].weight, 3.0);
+        assert_eq!(entries[1].weight, 3.0);
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_daemon_feedback_storage_failure_redacts_private_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("customer-secret-project");
+        let authority = crate::brain::credential::BrainCredentialAuthority::ephemeral([7; 32]);
+        let mut server =
+            AgentServer::for_brain_http_test("feedback-fixture.local", &state_root, authority)
+                .unwrap();
+        let feedback_path = state_root.join("feedback.jsonl");
+        server.feedback_store = Arc::new(
+            FeedbackLogger::at(&feedback_path)
+                .unwrap()
+                .with_injected_log_error(format!("failed at {}", feedback_path.display())),
+        );
+        let server = Arc::new(server);
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_writer = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || CapturedLogs(Arc::clone(&captured_writer)))
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener));
+
+        let client = reqwest::Client::new();
+        let mut response = None;
+        for _ in 0..20 {
+            match client
+                .post(format!("http://{address}/v1/feedback"))
+                .json(&serde_json::json!({
+                    "query": "redact storage location",
+                    "response": "metadata only",
+                    "weight": 1.0
+                }))
+                .send()
+                .await
+            {
+                Ok(result) => {
+                    response = Some(result);
+                    break;
+                }
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+        let response = response.expect("feedback daemon did not accept a local request");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = response.text().await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "status": "error",
+                "message": "Could not persist feedback"
+            })
+        );
+        assert!(!body.contains("customer-secret-project"));
+        assert!(!body.contains(temp.path().to_string_lossy().as_ref()));
+
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("Failed to persist private feedback"));
+        assert!(logs.contains("storage-error"));
+        assert!(!logs.contains("customer-secret-project"));
+        assert!(!logs.contains(temp.path().to_string_lossy().as_ref()));
+
+        serving.abort();
+        let _ = serving.await;
     }
 
     #[test]
