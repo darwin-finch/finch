@@ -85,6 +85,7 @@ struct BrainTurnControlImpl {
     brain: String,
     request_seq: u64,
     expected_audience: crate::brain::store::BrainApprovalAudience,
+    expected_connection_id: crate::brain::store::ConnectionId,
 }
 
 /// Reverse capability scoped to one daemon-authenticated ProgramRun. The
@@ -363,10 +364,11 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
             )));
         }
 
-        let registration = match self.server.brain_approvals().register(
+        let registration = match self.server.brain_approvals().register_for_connection(
             self.request_seq,
             approval_id.clone(),
             audience.clone(),
+            self.expected_connection_id,
         ) {
             Ok(registration) => registration,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -1776,6 +1778,8 @@ async fn forward_runner_request(
                                 brain: request.brain.clone(),
                                 request_seq: request.request_seq,
                                 expected_audience: request.approval_audience.clone(),
+                                expected_connection_id: request.approval_connection_id
+                                    .expect("daemon runner request omitted approval connection"),
                             });
                         payload.set_control(control);
                     }

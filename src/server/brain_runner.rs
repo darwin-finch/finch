@@ -117,6 +117,7 @@ pub struct RunnerTurnRequest {
     pub prompt: String,
     pub context: Vec<crate::claude::Message>,
     pub approval_audience: crate::brain::store::BrainApprovalAudience,
+    pub approval_connection_id: Option<crate::brain::store::ConnectionId>,
     /// Reverse approval bridge installed by the Cap'n Proto client adapter.
     /// Daemon-side broker requests leave this unset until they cross IPC.
     pub approval_tx: Option<mpsc::UnboundedSender<RunnerApprovalRequest>>,
@@ -568,6 +569,7 @@ impl BrainRunnerBroker {
         prompt: String,
         context: Vec<crate::claude::Message>,
         approval_audience: crate::brain::store::BrainApprovalAudience,
+        approval_connection_id: crate::brain::store::ConnectionId,
     ) -> Result<RunnerTurnResult> {
         let registration = self
             .registrations
@@ -589,6 +591,7 @@ impl BrainRunnerBroker {
                 prompt,
                 context,
                 approval_audience,
+                approval_connection_id: Some(approval_connection_id),
                 approval_tx: None,
                 response_tx,
             }))
@@ -949,6 +952,7 @@ mod tests {
                 "double it".into(),
                 vec![crate::claude::Message::user("21")],
                 test_approval_audience(),
+                crate::brain::store::ConnectionId(uuid::Uuid::new_v4()),
             )
             .await
             .unwrap();

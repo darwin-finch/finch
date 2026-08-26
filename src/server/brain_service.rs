@@ -534,7 +534,8 @@ impl BrainLifecycleService {
     ) -> Result<()> {
         let brain_id = self.store.snapshot(brain)?.brain_id;
         self.store.detach(brain, attachment_id, connection_id)?;
-        self.approvals.cancel_attachment(brain_id, attachment_id);
+        self.approvals
+            .cancel_connection(brain_id, attachment_id, connection_id);
         self.store.remove_if_unused(brain)?;
         Ok(())
     }

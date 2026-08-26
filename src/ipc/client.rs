@@ -1085,6 +1085,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                     prompt,
                     context,
                     approval_audience,
+                    approval_connection_id: None,
                     approval_tx: Some(approval_tx),
                     response_tx,
                 },
