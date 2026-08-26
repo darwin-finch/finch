@@ -64,6 +64,9 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all -- --check
 
+    - name: Verify Brain test isolation harness
+      run: ./scripts/test_brain_isolation.sh
+
     - name: Run clippy (binary only, warnings allowed for now)
       run: cargo clippy --bin finch --all-features
       continue-on-error: true

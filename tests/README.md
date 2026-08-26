@@ -32,12 +32,12 @@ Run the isolation harness's own regression checks with:
 
 ### All Tests (excluding ignored)
 ```bash
-cargo test --test '*'
+./scripts/test_brains.sh cargo test --test '*'
 ```
 
 ### Daemon Integration Tests
 ```bash
-cargo test --test daemon_integration_test -- --ignored
+./scripts/test_brains.sh cargo test --test daemon_integration_test -- --ignored
 ```
 
 **Requirements:**
@@ -47,17 +47,17 @@ cargo test --test daemon_integration_test -- --ignored
 
 ### TUI Integration Tests
 ```bash
-cargo test --test tui_integration_test
+./scripts/test_brains.sh cargo test --test tui_integration_test
 ```
 
 **Unit tests** (don't require daemon):
 ```bash
-cargo test --test tui_integration_test --lib
+./scripts/test_brains.sh cargo test --test tui_integration_test --lib
 ```
 
 **Full TUI tests** (require PTY):
 ```bash
-cargo test --test tui_integration_test -- --ignored
+./scripts/test_brains.sh cargo test --test tui_integration_test -- --ignored
 ```
 
 ## Test Categories
@@ -182,16 +182,18 @@ For automated testing in CI:
 
 ```yaml
 # .github/workflows/test.yml
+- name: Verify Brain isolation harness
+  run: ./scripts/test_brain_isolation.sh
 - name: Run unit tests
-  run: cargo test --lib
+  run: ./scripts/test_brains.sh cargo test --lib
 
 - name: Run integration tests (non-ignored)
-  run: cargo test --test '*'
+  run: ./scripts/test_brains.sh cargo test --test '*'
 
 - name: Run daemon tests
   run: |
     cargo build --release
-    cargo test --test daemon_integration_test -- --ignored
+    ./scripts/test_brains.sh cargo test --test daemon_integration_test -- --ignored
 ```
 
 ## Future Improvements
