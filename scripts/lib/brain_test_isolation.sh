@@ -33,22 +33,33 @@ brain_isolation_resolve_store() {
 
 brain_store_manifest() {
   local root="$1"
+  if [[ -L "$root" ]]; then
+    local dangling_target
+    dangling_target="$(readlink "$root")" || return 1
+    printf 'root-link\0%s\0' "$dangling_target"
+    return
+  fi
   if [[ ! -e "$root" ]]; then printf '%s\n' '<missing>'; return; fi
   [[ -d "$root" && ! -L "$root" ]] || return 1
   (
     set -euo pipefail
     cd "$root" || exit 1
     find . -print0 | LC_ALL=C sort -z | while IFS= read -r -d '' entry; do
+      if stat -f '%p:%u:%g:%l:%i' "$entry" >/dev/null 2>&1; then
+        local_metadata="$(stat -f '%p:%u:%g:%l:%i' "$entry")" || exit 1
+      else
+        local_metadata="$(stat -c '%f:%u:%g:%h:%i' "$entry")" || exit 1
+      fi
       if [[ -L "$entry" ]]; then
-        local_target="$(readlink "$entry")" || exit 1; printf 'l\0%s\0%s\0' "$entry" "$local_target"
+        local_target="$(readlink "$entry")" || exit 1; printf 'l\0%s\0%s\0%s\0' "$entry" "$local_metadata" "$local_target"
       elif [[ -f "$entry" ]]; then
-        local_hash="$(shasum -a 256 "$entry")" || exit 1; printf 'f\0%s\0%s\n' "$entry" "${local_hash%% *}"
-      elif [[ -d "$entry" ]]; then printf 'd\0%s\0' "$entry"
-      elif [[ -p "$entry" ]]; then printf 'p\0%s\0' "$entry"
-      elif [[ -S "$entry" ]]; then printf 's\0%s\0' "$entry"
-      elif [[ -b "$entry" ]]; then printf 'b\0%s\0' "$entry"
-      elif [[ -c "$entry" ]]; then printf 'c\0%s\0' "$entry"
-      else printf 'o\0%s\0' "$entry"
+        local_hash="$(shasum -a 256 "$entry")" || exit 1; printf 'f\0%s\0%s\0%s\n' "$entry" "$local_metadata" "${local_hash%% *}"
+      elif [[ -d "$entry" ]]; then printf 'd\0%s\0%s\0' "$entry" "$local_metadata"
+      elif [[ -p "$entry" ]]; then printf 'p\0%s\0%s\0' "$entry" "$local_metadata"
+      elif [[ -S "$entry" ]]; then printf 's\0%s\0%s\0' "$entry" "$local_metadata"
+      elif [[ -b "$entry" ]]; then printf 'b\0%s\0%s\0' "$entry" "$local_metadata"
+      elif [[ -c "$entry" ]]; then printf 'c\0%s\0%s\0' "$entry" "$local_metadata"
+      else printf 'o\0%s\0%s\0' "$entry" "$local_metadata"
       fi
     done || exit 1
   )
@@ -88,6 +99,18 @@ brain_test_isolation_run() (
 
   local before_manifest after_manifest isolated_home child_pid='' pending_signal=''
   before_manifest="$(mktemp "$temp_parent/finch-brain-manifest-before.XXXXXX")" || exit 74
+  early_cleanup() {
+    local status="$1"
+    trap - EXIT INT TERM HUP
+    [[ -z "${isolated_home:-}" ]] || rm -rf -- "$isolated_home"
+    [[ -z "${before_manifest:-}" ]] || rm -f -- "$before_manifest"
+    [[ -z "${after_manifest:-}" ]] || rm -f -- "$after_manifest"
+    exit "$status"
+  }
+  trap 'early_cleanup $?' EXIT
+  trap 'early_cleanup 130' INT
+  trap 'early_cleanup 143' TERM
+  trap 'early_cleanup 129' HUP
   after_manifest="$(mktemp "$temp_parent/finch-brain-manifest-after.XXXXXX")" || { rm -f -- "$before_manifest"; exit 74; }
   isolated_home="$(mktemp -d "$temp_parent/finch-brain-test-home.XXXXXX")" || { rm -f -- "$before_manifest" "$after_manifest"; exit 74; }
 
@@ -95,8 +118,8 @@ brain_test_isolation_run() (
     pending_signal="$1"
     if [[ -n "$child_pid" ]]; then kill -"$1" -- "-$child_pid" 2>/dev/null || kill -"$1" "$child_pid" 2>/dev/null || true; fi
   }
+  trap - EXIT
   trap 'forward_signal INT' INT; trap 'forward_signal TERM' TERM; trap 'forward_signal HUP' HUP
-  if [[ -n "${FINCH_TEST_WRAPPER_PID_FILE:-}" ]]; then sh -c 'echo "$PPID"' >"$FINCH_TEST_WRAPPER_PID_FILE"; fi
 
   if ! brain_store_manifest "$real_store" >"$before_manifest"; then
     rm -rf -- "$isolated_home"; rm -f -- "$before_manifest" "$after_manifest"
@@ -107,17 +130,16 @@ brain_test_isolation_run() (
     rm -rf -- "$isolated_home"; rm -f -- "$before_manifest" "$after_manifest"; exit 74
   }
   local isolation_token="${RANDOM:-0}:$$:$(basename "$isolated_home")"
-  printf '%s\n' "$isolation_token" >"$isolated_home/.finch-brain-test-isolation" || {
-    rm -rf -- "$isolated_home"; rm -f -- "$before_manifest" "$after_manifest"; exit 74
-  }
   if [[ -z "${RUSTUP_HOME:-}" && -d "$real_home/.rustup" ]]; then export RUSTUP_HOME="$real_home/.rustup"; fi
   if [[ -z "${CARGO_HOME:-}" && -d "$real_home/.cargo" ]]; then export CARGO_HOME="$real_home/.cargo"; fi
   export HOME="$isolated_home" FINCH_BRAIN_TEST_HOME="$isolated_home" FINCH_BRAIN_TEST_ROOT="$isolated_home/.finch/brains"
-  export FINCH_BRAIN_TEST_ISOLATED=1 FINCH_BRAIN_TEST_TOKEN="$isolation_token" FINCH_TEST_TMP_PARENT="$temp_parent" FINCH_TEST_REAL_HOME="$real_home"
+  export FINCH_BRAIN_TEST_ISOLATED=1 FINCH_BRAIN_TEST_TOKEN="$isolation_token" FINCH_BRAIN_TEST_PROOF_FD=9 FINCH_TEST_TMP_PARENT="$temp_parent" FINCH_TEST_REAL_HOME="$real_home"
+  exec 9< <(printf '%s\n' "$isolation_token")
 
   set -m; "$@" & child_pid=$!; set +m
   local command_status=0
   wait "$child_pid" || command_status=$?
+  exec 9<&-
   if [[ -n "$pending_signal" ]]; then
     local attempts=0
     while kill -0 -- "-$child_pid" 2>/dev/null && [[ "$attempts" -lt 20 ]]; do sleep 0.1; attempts=$((attempts + 1)); done
@@ -148,8 +170,11 @@ brain_test_isolation_is_active() {
   [[ "${FINCH_BRAIN_TEST_ROOT:-}" == "$HOME/.finch/brains" ]] || return 1
   [[ "$HOME" == "${FINCH_TEST_TMP_PARENT:-}"/finch-brain-test-home.* ]] || return 1
   [[ -d "$FINCH_BRAIN_TEST_ROOT" && ! -L "$FINCH_BRAIN_TEST_ROOT" ]] || return 1
-  [[ -f "$HOME/.finch-brain-test-isolation" && ! -L "$HOME/.finch-brain-test-isolation" ]] || return 1
-  [[ "$(cat "$HOME/.finch-brain-test-isolation" 2>/dev/null)" == "${FINCH_BRAIN_TEST_TOKEN:-}" ]] || return 1
+  [[ "$(brain_isolation_resolve_store "$HOME" 2>/dev/null)" == "$FINCH_BRAIN_TEST_ROOT" ]] || return 1
+  [[ "${FINCH_BRAIN_TEST_PROOF_FD:-}" == 9 ]] || return 1
+  local proof
+  IFS= read -r proof <&9 2>/dev/null || return 1
+  [[ "$proof" == "${FINCH_BRAIN_TEST_TOKEN:-}" ]] || return 1
   [[ "$(cd "$HOME" 2>/dev/null && pwd -P)" == "$HOME" ]] || return 1
 }
 

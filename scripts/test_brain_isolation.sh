@@ -47,12 +47,12 @@ test "$(cat "$hostile_target/brains/sentinel")" = 'production sentinel'
 test -z "$(find "$scratch/hostile-temp" -mindepth 1 -print -quit)"
 
 FINCH_BRAIN_TEST_ISOLATED=1 FINCH_BRAIN_TEST_HOME="$fake_home" FINCH_BRAIN_TEST_ROOT="$fake_home/.finch/brains" \
-  FINCH_BRAIN_TEST_TOKEN=forged FINCH_TEST_TMP_PARENT="$scratch" HOME="$fake_home" \
+  FINCH_BRAIN_TEST_TOKEN=forged FINCH_BRAIN_TEST_PROOF_FD=9 FINCH_TEST_TMP_PARENT="$scratch" HOME="$fake_home" \
   bash -c 'source "$1"; ! brain_test_isolation_is_active' _ "$repo_root/scripts/lib/brain_test_isolation.sh"
 launcher_probe="$scratch/launcher-home"
 if FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" FINCH_TEST_LAUNCHER_PROBE_FILE="$launcher_probe" \
   FINCH_BRAIN_TEST_ISOLATED=1 FINCH_BRAIN_TEST_HOME="$fake_home" FINCH_BRAIN_TEST_ROOT="$fake_home/.finch/brains" \
-  FINCH_BRAIN_TEST_TOKEN=forged HOME="$fake_home" FINCH_BIN="$scratch/missing-finch" \
+  FINCH_BRAIN_TEST_TOKEN=forged FINCH_BRAIN_TEST_PROOF_FD=9 HOME="$fake_home" FINCH_BIN="$scratch/missing-finch" \
   "$repo_root/scripts/smoke_vm_wire_provider.sh" >/dev/null 2>&1; then
   exit 1
 fi
@@ -68,6 +68,14 @@ rmdir "$fake_home/.finch/brains/secret-directory"
 if run_isolated bash -c 'ln -s /private/secret-target "$FINCH_TEST_REAL_HOME/.finch/brains/secret-link"' 2>"$diagnostic"; then exit 1; else test "$?" -eq 70; fi
 ! rg -q 'secret-link|secret-target|existing|events.jsonl' "$diagnostic"
 rm "$fake_home/.finch/brains/secret-link"
+
+if stat -f '%Lp' "$fake_home/.finch/brains/existing/events.jsonl" >/dev/null 2>&1; then
+  original_mode="$(stat -f '%Lp' "$fake_home/.finch/brains/existing/events.jsonl")"
+else
+  original_mode="$(stat -c '%a' "$fake_home/.finch/brains/existing/events.jsonl")"
+fi
+if run_isolated chmod 600 "$fake_home/.finch/brains/existing/events.jsonl" 2>"$diagnostic"; then exit 1; else test "$?" -eq 70; fi
+chmod "$original_mode" "$fake_home/.finch/brains/existing/events.jsonl"
 
 if run_isolated bash -c 'mkfifo "$FINCH_TEST_REAL_HOME/.finch/brains/secret-fifo"' 2>"$diagnostic"; then exit 1; else test "$?" -eq 70; fi
 ! rg -q 'secret-fifo|existing|events.jsonl' "$diagnostic"
@@ -88,10 +96,9 @@ test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 rm "$scratch/fail-manifest"
 
 child_pid_file="$scratch/child.pid"
-wrapper_pid_file="$scratch/wrapper.pid"
-if FINCH_TEST_WRAPPER_PID_FILE="$wrapper_pid_file" FINCH_SIGNAL_PID_FILE="$child_pid_file" run_isolated bash -c '
+if FINCH_SIGNAL_PID_FILE="$child_pid_file" run_isolated bash -c '
   sleep 30 & echo $! >"$FINCH_SIGNAL_PID_FILE"
-  (sleep 0.2; kill -TERM "$(cat "$FINCH_TEST_WRAPPER_PID_FILE")") &
+  (sleep 0.2; kill -TERM "$PPID") &
   wait
 ' 2>"$scratch/signal.err"; then
   exit 1
@@ -100,6 +107,32 @@ else
 fi
 child_pid="$(cat "$child_pid_file")"
 ! kill -0 "$child_pid" 2>/dev/null
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+hostile_pid_file="$fake_home/.finch/brains/pid-file-sentinel"
+printf 'unchanged\n' >"$hostile_pid_file"
+FINCH_TEST_WRAPPER_PID_FILE="$hostile_pid_file" run_isolated true
+test "$(cat "$hostile_pid_file")" = unchanged
+rm "$hostile_pid_file"
+
+dangling_root="$scratch/dangling-store"
+ln -s "$scratch/no-such-store" "$dangling_root"
+dangling_manifest="$(brain_store_manifest "$dangling_root")"
+[[ "$dangling_manifest" == root-link* && "$dangling_manifest" != '<missing>' ]]
+
+allocation_bin="$scratch/allocation-bin"; mkdir "$allocation_bin"
+real_mktemp="$(command -v mktemp)"
+printf '%s\n' '#!/bin/bash' \
+  'count=0; [[ ! -f "$FINCH_ALLOCATION_COUNT" ]] || count=$(cat "$FINCH_ALLOCATION_COUNT")' \
+  'count=$((count + 1)); printf "%s\n" "$count" >"$FINCH_ALLOCATION_COUNT"' \
+  'if [[ "$count" -eq 2 ]]; then kill -TERM "$PPID"; sleep 0.2; fi' \
+  'exec "$FINCH_REAL_MKTEMP" "$@"' >"$allocation_bin/mktemp"
+chmod +x "$allocation_bin/mktemp"
+if PATH="$allocation_bin:$PATH" FINCH_ALLOCATION_COUNT="$scratch/allocation-count" FINCH_REAL_MKTEMP="$real_mktemp" run_isolated true 2>"$scratch/allocation-signal.err"; then
+  exit 1
+else
+  test "$?" -eq 143
+fi
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 launchers=(demo_boot.sh smoke_vm_wire_provider.sh stress_test.sh test_persistence.sh test_server.sh test_tui_debug.sh)
