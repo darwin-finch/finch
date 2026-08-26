@@ -1052,10 +1052,19 @@ impl TypedRuntime {
                     trampoline.run(continuation)
                 }
                 VmStep::Await {
-                    effect,
+                    mut effect,
                     output,
                     continuation,
                 } => {
+                    if let Err(diagnostic) = handler.prepare_awaited_effect(&mut effect) {
+                        return self.failed_from_drive(
+                            effects,
+                            diagnostic,
+                            event_journal,
+                            effect_journal,
+                            handler,
+                        );
+                    }
                     let HostSideEffect::Request { arguments } = &effect.event else {
                         return self.failed_from_drive(
                             effects,
