@@ -1111,15 +1111,18 @@ pub(crate) async fn process_query_with_tools(
                         )
                         .await;
 
-                    tracing::debug!("[EVENT_LOOP] Query state updated, adding assistant message");
-                    // Add assistant message with ALL content blocks (text + tool uses)
-                    // This is critical for proper conversation structure
+                    tracing::debug!("[EVENT_LOOP] Query state updated, staging assistant message");
+                    // Keep the tool-bearing assistant message invisible until
+                    // all matching results can be committed atomically.
                     let assistant_message = crate::claude::Message {
                         role: "assistant".to_string(),
                         content: blocks.clone(),
                     };
                     tracing::debug!("[EVENT_LOOP] Acquiring conversation write lock...");
-                    conversation.write().await.add_message(assistant_message);
+                    conversation
+                        .write()
+                        .await
+                        .stage_assistant(query_id, assistant_message);
                     tracing::debug!(
                         "[EVENT_LOOP] Assistant message added, spawning tool executions"
                     );
@@ -1305,13 +1308,16 @@ pub(crate) async fn process_query_with_tools(
                     )
                     .await;
 
-                // Add assistant message with ALL content blocks (text + tool uses)
-                // This is critical for proper conversation structure
+                // Keep the tool-bearing assistant message invisible until
+                // all matching results can be committed atomically.
                 let assistant_message = crate::claude::Message {
                     role: "assistant".to_string(),
                     content: response.content_blocks.clone(),
                 };
-                conversation.write().await.add_message(assistant_message);
+                conversation
+                    .write()
+                    .await
+                    .stage_assistant(query_id, assistant_message);
 
                 // Dispatch tools (loop detection, mode gating, inline handlers, spawn)
                 dispatch_tool_uses(

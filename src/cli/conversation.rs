@@ -3,13 +3,19 @@
 use crate::claude::{ContentBlock, Message};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use uuid::Uuid;
 
 /// Manages conversation history for multi-turn interactions with context window management
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationHistory {
     messages: Vec<Message>,
+    /// Tool-bearing assistant turns are invisible until their matching results
+    /// can be appended in the same mutation.
+    #[serde(skip)]
+    staged_tool_rounds: HashMap<Uuid, Message>,
     #[serde(skip)]
     max_messages: usize,
     #[serde(skip)]
@@ -25,6 +31,7 @@ impl ConversationHistory {
     pub fn new() -> Self {
         Self {
             messages: Vec::new(),
+            staged_tool_rounds: HashMap::new(),
             max_messages: 500, // ~250 turns — plenty for a full coding session
             max_tokens_estimate: 600_000, // ~150k tokens * 4 chars/token (Claude: 200k context)
             compaction_threshold_percent: 0.9, // Compact at 90% of max
@@ -36,6 +43,7 @@ impl ConversationHistory {
     pub fn with_limits(max_messages: usize, max_tokens_estimate: usize) -> Self {
         Self {
             messages: Vec::new(),
+            staged_tool_rounds: HashMap::new(),
             max_messages,
             max_tokens_estimate,
             compaction_threshold_percent: 0.8,
@@ -83,6 +91,36 @@ impl ConversationHistory {
         self.trim_if_needed();
     }
 
+    /// Stage a tool-bearing assistant message for `query_id` without exposing
+    /// it through any committed-history read path.
+    pub fn stage_assistant(&mut self, query_id: Uuid, assistant: Message) {
+        debug_assert_eq!(assistant.role, "assistant");
+        debug_assert!(assistant
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. })));
+        self.staged_tool_rounds.insert(query_id, assistant);
+    }
+
+    /// Atomically publish a staged assistant tool call and its user results.
+    /// Returns `false` when the stage was already aborted (for example because
+    /// a late tool result arrived after cancellation).
+    pub fn commit_tool_round(&mut self, query_id: Uuid, tool_results: Message) -> bool {
+        let Some(assistant) = self.staged_tool_rounds.remove(&query_id) else {
+            return false;
+        };
+        debug_assert_eq!(tool_results.role, "user");
+        self.messages.push(assistant);
+        self.messages.push(tool_results);
+        self.trim_if_needed();
+        true
+    }
+
+    /// Drop a staged tool call without changing committed history.
+    pub fn abort_staged(&mut self, query_id: Uuid) -> bool {
+        self.staged_tool_rounds.remove(&query_id).is_some()
+    }
+
     /// Get all messages for API request
     pub fn get_messages(&self) -> Vec<Message> {
         self.messages.clone()
@@ -91,6 +129,7 @@ impl ConversationHistory {
     /// Clear conversation history (start fresh)
     pub fn clear(&mut self) {
         self.messages.clear();
+        self.staged_tool_rounds.clear();
     }
 
     /// Check if conversation has any messages
@@ -117,6 +156,7 @@ impl ConversationHistory {
     /// Restore conversation from a snapshot
     pub fn restore_snapshot(&mut self, snapshot: Vec<Message>) {
         self.messages = snapshot;
+        self.staged_tool_rounds.clear();
     }
 
     /// Trim old messages if context exceeds limits
@@ -449,6 +489,28 @@ impl<'a> ConversationCompactor<'a> {
 mod tests {
     use super::*;
 
+    fn tool_assistant(id: &str) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: "Read".to_string(),
+                input: serde_json::json!({"path": "README.md"}),
+            }],
+        }
+    }
+
+    fn tool_results(id: &str) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: "contents".to_string(),
+                is_error: None,
+            }],
+        }
+    }
+
     #[test]
     fn test_conversation_creation() {
         let conv = ConversationHistory::new();
@@ -483,6 +545,54 @@ mod tests {
         assert_eq!(messages[0].text_content(), "What is 2+2?");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].text_content(), "4");
+    }
+
+    #[test]
+    fn staged_tool_round_is_invisible_until_atomic_commit() {
+        let mut conv = ConversationHistory::new();
+        conv.add_user_message("read it".to_string());
+        let query_id = Uuid::new_v4();
+
+        conv.stage_assistant(query_id, tool_assistant("tool-1"));
+        assert_eq!(conv.message_count(), 1);
+        assert_eq!(conv.get_messages().len(), 1);
+        assert_eq!(conv.snapshot().len(), 1);
+
+        assert!(conv.commit_tool_round(query_id, tool_results("tool-1")));
+        let messages = conv.get_messages();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[2].role, "user");
+    }
+
+    #[test]
+    fn aborted_tool_round_never_becomes_visible_and_rejects_late_commit() {
+        let mut conv = ConversationHistory::new();
+        conv.add_user_message("read it".to_string());
+        let query_id = Uuid::new_v4();
+
+        conv.stage_assistant(query_id, tool_assistant("tool-1"));
+        assert!(conv.abort_staged(query_id));
+        assert!(!conv.commit_tool_round(query_id, tool_results("tool-1")));
+
+        let messages = conv.get_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text(), "read it");
+    }
+
+    #[test]
+    fn next_query_after_aborted_tool_round_has_valid_committed_history() {
+        let mut conv = ConversationHistory::new();
+        conv.add_user_message("first query".to_string());
+        let cancelled_query = Uuid::new_v4();
+        conv.stage_assistant(cancelled_query, tool_assistant("cancelled-tool"));
+        conv.abort_staged(cancelled_query);
+        conv.add_user_message("retry query".to_string());
+
+        assert!(conv.get_messages().iter().all(|message| !message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))));
     }
 
     #[test]
