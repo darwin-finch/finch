@@ -55,7 +55,7 @@ pub fn random_spinner_verb() -> &'static str {
 }
 
 use super::{Message, MessageId, MessageStatus};
-use crate::cli::diff::{render_files, summarize_files, DiffColorMode, FileDiff};
+use crate::cli::diff::{render_files, DiffColorMode, FileDiff, MAX_DIFF_PREVIEW_LINES};
 use crate::config::{ColorScheme, MessageBand};
 
 // Animation frames: small → large → small (creates a "throb" pulse effect)
@@ -131,6 +131,9 @@ pub struct WorkRow {
     pub body_lines: Vec<String>,
     /// Parsed once when a completed body is installed; retained rows reuse it.
     diffs: Option<Vec<FileDiff>>,
+    /// Local expansion state for retained diffs; independent of the future
+    /// multi-row accordion interaction.
+    diff_expanded: bool,
 }
 
 // ============================================================================
@@ -316,6 +319,7 @@ impl WorkUnit {
             elapsed_at_finish: None,
             body_lines: Vec::new(),
             diffs: None,
+            diff_expanded: false,
         });
         idx
     }
@@ -381,28 +385,37 @@ impl WorkUnit {
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if let Some(row) = inner.rows.get_mut(idx) {
             row.elapsed_at_finish = Some(row.started_at.elapsed());
-            row.status = WorkRowStatus::Complete(if summary_starts_diff {
-                parsed
-                    .as_deref()
-                    .map(summarize_files)
-                    .unwrap_or_else(|| crate::cli::diff::sanitize_terminal(&summary))
+            // The structured renderer owns the path/count header. Suppress the
+            // producer's equivalent summary so each semantic header appears once.
+            row.status = WorkRowStatus::Complete(if parsed.is_some() {
+                String::new()
             } else {
                 crate::cli::diff::sanitize_terminal(&summary)
             });
             row.diffs = parsed;
+            row.diff_expanded = false;
             row.body_lines = display_body_lines;
         }
     }
 
     /// Complete a tool row with a structured, theme-independent file diff.
     pub fn complete_row_with_diff(&self, idx: usize, diff: FileDiff) {
-        let summary = format!("+{} -{}", diff.added(), diff.removed());
         let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if let Some(row) = inner.rows.get_mut(idx) {
             row.elapsed_at_finish = Some(row.started_at.elapsed());
-            row.status = WorkRowStatus::Complete(summary);
+            row.status = WorkRowStatus::Complete(String::new());
             row.body_lines = Vec::new();
             row.diffs = Some(vec![diff]);
+            row.diff_expanded = false;
+        }
+    }
+
+    /// Expand or collapse a retained structured diff without relying on the
+    /// pending aggregate accordion state machine.
+    pub fn set_row_diff_expanded(&self, idx: usize, expanded: bool) {
+        let mut inner = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(row) = inner.rows.get_mut(idx) {
+            row.diff_expanded = expanded;
         }
     }
 
@@ -841,9 +854,22 @@ fn format_row_collapsed(row: &WorkRow, colors: &ColorScheme, diff_mode: DiffColo
                         crate::cli::diff::sanitize_terminal(line)
                     ));
                 }
-                for line in render_files(diffs, colors, diff_mode).lines() {
+                let rendered = render_files(diffs, colors, diff_mode);
+                let lines: Vec<_> = rendered.lines().collect();
+                let visible = if row.diff_expanded {
+                    lines.len()
+                } else {
+                    lines.len().min(MAX_DIFF_PREVIEW_LINES)
+                };
+                for line in &lines[..visible] {
                     out.push('\n');
                     out.push_str(&format!("    {line}"));
+                }
+                if visible < lines.len() {
+                    out.push_str(&format!(
+                        "\n    … {} more diff lines (expand diff)",
+                        lines.len() - visible
+                    ));
                 }
             } else {
                 for line in &row.body_lines {
@@ -965,7 +991,7 @@ mod tests {
             .any(|line| line.kind == crate::cli::diff::DiffLineKind::NoNewline));
         assert!(matches!(
             &inner.rows[row].status,
-            WorkRowStatus::Complete(summary) if summary == "src/replayed.txt  +1 -1"
+            WorkRowStatus::Complete(summary) if summary.is_empty()
         ));
     }
 
@@ -1001,6 +1027,7 @@ mod tests {
             elapsed_at_finish: None,
             body_lines: Vec::new(),
             diffs: Some(vec![diff]),
+            diff_expanded: false,
         };
         let dark = format_row_collapsed(
             &row,
@@ -1017,6 +1044,30 @@ mod tests {
         assert!(dark.contains("38;2;126;231;135"));
         assert!(light.contains("38;2;0;92;38"));
         assert!(!plain.contains("38;2;"));
+    }
+
+    #[test]
+    fn test_completed_diff_has_one_header_and_bounded_expandable_preview() {
+        let old = (0..80).map(|i| format!("old {i}\n")).collect::<String>();
+        let new = (0..80).map(|i| format!("new {i}\n")).collect::<String>();
+        let wu = WorkUnit::new("Tools");
+        let row = wu.add_row("edit(src/large.rs)");
+        wu.complete_row_with_diff(row, FileDiff::from_texts("src/large.rs", &old, &new));
+        wu.set_complete();
+
+        let preview = wu.format(&colors());
+        assert_eq!(preview.matches("src/large.rs  +80 -80").count(), 1);
+        assert!(preview.contains("more diff lines (expand diff)"));
+        assert!(
+            !preview.contains("new 79"),
+            "collapsed retained rows must not leak the full patch: {preview}"
+        );
+
+        wu.set_row_diff_expanded(row, true);
+        let expanded = wu.format(&colors());
+        assert!(!expanded.contains("more diff lines (expand diff)"));
+        assert!(expanded.lines().count() > preview.lines().count());
+        assert!(expanded.contains("new 79"));
     }
 
     #[test]
@@ -1358,6 +1409,7 @@ mod tests {
             elapsed_at_finish: None,
             body_lines: Vec::new(),
             diffs: None,
+            diff_expanded: false,
         };
         let f = format_row(&row);
         assert!(f.contains("⎿"));
@@ -1374,6 +1426,7 @@ mod tests {
             elapsed_at_finish: None,
             body_lines: Vec::new(),
             diffs: None,
+            diff_expanded: false,
         };
         let f = format_row(&row);
         assert!(f.contains("⎿"));
@@ -1390,6 +1443,7 @@ mod tests {
             elapsed_at_finish: None,
             body_lines: Vec::new(),
             diffs: None,
+            diff_expanded: false,
         };
         let f = format_row(&row);
         assert!(f.contains("⎿"));
@@ -1407,6 +1461,7 @@ mod tests {
             elapsed_at_finish: None,
             body_lines: Vec::new(),
             diffs: None,
+            diff_expanded: false,
         };
         let f = format_row(&row);
         assert!(f.contains("⎿"));
@@ -1568,6 +1623,7 @@ mod tests {
             elapsed_at_finish: Some(std::time::Duration::from_millis(800)),
             body_lines: Vec::new(),
             diffs: None,
+            diff_expanded: false,
         };
         let f = format_row(&row);
         // The label contains "(true)" but timing should NOT appear as "(0s)" pattern
@@ -1593,6 +1649,7 @@ mod tests {
             elapsed_at_finish: Some(std::time::Duration::from_secs(3)),
             body_lines: Vec::new(),
             diffs: None,
+            diff_expanded: false,
         };
         let f = format_row(&row);
         assert!(f.contains("3s"), "3-second row should show timing: {}", f);

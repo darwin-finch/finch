@@ -2023,9 +2023,7 @@ impl TuiRenderer {
             let mut all_body_lines: Vec<String> = Vec::new();
             for line in body.lines() {
                 for wrapped in wrap_text(line, inner) {
-                    // Hard-truncate any single word longer than inner (e.g. long URLs).
-                    let truncated: String = wrapped.chars().take(inner).collect();
-                    all_body_lines.push(truncated);
+                    all_body_lines.push(wrapped);
                 }
             }
 
@@ -2675,22 +2673,51 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
             continue;
         }
         let mut cur = String::new();
-        for word in para.split_whitespace() {
-            if cur.is_empty() {
-                cur.push_str(word);
-            } else if cur.len() + 1 + word.len() <= width {
-                cur.push(' ');
-                cur.push_str(word);
-            } else {
-                out.push(cur.clone());
-                cur = word.to_string();
+        let mut columns = 0usize;
+        let mut chars = para.chars().peekable();
+        while let Some(ch) = chars.next() {
+            // SGR/CSI is trusted presentation metadata in structured dialog
+            // bodies and consumes no terminal columns.
+            if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+                cur.push(ch);
+                cur.push(chars.next().expect("peeked CSI introducer"));
+                for control in chars.by_ref() {
+                    cur.push(control);
+                    if ('@'..='~').contains(&control) {
+                        break;
+                    }
+                }
+                continue;
             }
+            let char_width = terminal_char_width(ch);
+            if columns > 0 && columns.saturating_add(char_width) > width {
+                out.push(std::mem::take(&mut cur));
+                columns = 0;
+            }
+            cur.push(ch);
+            columns = columns.saturating_add(char_width);
         }
         if !cur.is_empty() {
             out.push(cur);
         }
     }
     out
+}
+
+fn terminal_char_width(ch: char) -> usize {
+    if ch.is_control() || matches!(ch, '\u{0300}'..='\u{036f}') {
+        0
+    } else if matches!(ch,
+        '\u{1100}'..='\u{115f}' | '\u{2329}'..='\u{232a}' |
+        '\u{2e80}'..='\u{a4cf}' | '\u{ac00}'..='\u{d7a3}' |
+        '\u{f900}'..='\u{faff}' | '\u{fe10}'..='\u{fe19}' |
+        '\u{fe30}'..='\u{fe6f}' | '\u{ff00}'..='\u{ff60}' |
+        '\u{ffe0}'..='\u{ffe6}' | '\u{1f300}'..='\u{1faff}'
+    ) {
+        2
+    } else {
+        1
+    }
 }
 
 // ─── Unit tests ───────────────────────────────────────────────────────────────
@@ -4007,5 +4034,31 @@ mod draw_dialog_tests {
             scrolled_text.contains("Line 10"),
             "scrolled view should show Line 10"
         );
+    }
+
+    #[test]
+    fn test_drawn_dialog_preserves_diff_whitespace_and_cjk_width() {
+        let dialog = Dialog::select("Approve", vec![DialogOption::new("Yes")])
+            .with_body("  1   1   unchanged spacing\n  2       + 新規\n    indented");
+        let lines = render_lines(&dialog);
+        let text = lines
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("  1   1   unchanged spacing"), "{text}");
+        assert!(text.contains("    indented"), "{text}");
+        check_widths(&lines, 72);
+    }
+
+    #[test]
+    fn test_wrap_text_ignores_sgr_columns_and_clips_long_unicode_lines() {
+        let wrapped = wrap_text("\x1b[31m  + 新規abcdef\x1b[0m", 8);
+        assert_eq!(wrapped.len(), 2);
+        assert!(wrapped[0].starts_with("\x1b[31m  + 新規"));
+        assert!(wrapped.iter().all(|line| {
+            let visible = strip_ansi(line);
+            visible.chars().map(terminal_char_width).sum::<usize>() <= 8
+        }));
     }
 }

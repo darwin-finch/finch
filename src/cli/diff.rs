@@ -5,7 +5,10 @@ use ratatui::style::Color;
 use similar::TextDiff;
 
 pub const MAX_DIFF_INPUT_BYTES: usize = 1_048_576;
-pub const MAX_DIFF_LINES: usize = 400;
+/// Maximum semantic lines retained for an expandable diff. This is separate
+/// from the much smaller transcript preview limit.
+pub const MAX_DIFF_LINES: usize = 1024;
+pub const MAX_DIFF_PREVIEW_LINES: usize = 16;
 pub const MAX_DIFF_FILES: usize = 64;
 pub const MAX_DIFF_LINE_CHARS: usize = 512;
 pub const MAX_DIFF_HUNKS: usize = 128;
@@ -19,6 +22,9 @@ pub struct FileDiff {
     pub binary: bool,
     pub elided: Option<String>,
     pub hunks: Vec<DiffHunk>,
+    total_added: usize,
+    total_removed: usize,
+    totals_exact: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +81,9 @@ impl FileDiff {
                 binary: true,
                 elided: Some("binary content omitted".into()),
                 hunks: vec![],
+                total_added: 0,
+                total_removed: 0,
+                totals_exact: true,
             };
         }
         if old.len().saturating_add(new.len()) > MAX_DIFF_INPUT_BYTES {
@@ -87,6 +96,9 @@ impl FileDiff {
                     old.len().saturating_add(new.len())
                 )),
                 hunks: vec![],
+                total_added: 0,
+                total_removed: 0,
+                totals_exact: false,
             };
         }
         let unified = TextDiff::from_lines(old, new)
@@ -100,6 +112,9 @@ impl FileDiff {
             binary: false,
             elided: None,
             hunks: vec![],
+            total_added: 0,
+            total_removed: 0,
+            totals_exact: true,
         });
         let old_ending = line_ending(old);
         let new_ending = line_ending(new);
@@ -149,8 +164,9 @@ impl FileDiff {
         for raw in text.lines() {
             structural_lines += 1;
             if structural_lines > MAX_DIFF_STRUCTURAL_LINES {
-                file.get_or_insert_with(empty_file).elided =
-                    Some("diff exceeded structural line limit".into());
+                let current = file.get_or_insert_with(empty_file);
+                current.elided = Some("diff exceeded structural line limit".into());
+                current.totals_exact = false;
                 break;
             }
             if files.len() >= MAX_DIFF_FILES {
@@ -212,8 +228,9 @@ impl FileDiff {
             }
             if line.starts_with("@@") {
                 if accepted_hunks >= MAX_DIFF_HUNKS {
-                    file.get_or_insert_with(empty_file).elided =
-                        Some("diff exceeded hunk limit".into());
+                    let current = file.get_or_insert_with(empty_file);
+                    current.elided = Some("diff exceeded hunk limit".into());
+                    current.totals_exact = false;
                     break;
                 }
                 flush_hunk(&mut file, &mut hunk);
@@ -224,7 +241,12 @@ impl FileDiff {
                 continue;
             }
             if let Some(note) = line.strip_prefix("# finch: ") {
-                file.get_or_insert_with(empty_file).elided = Some(sanitize_terminal(note));
+                let current = file.get_or_insert_with(empty_file);
+                current.elided = Some(sanitize_terminal(note));
+                // Canonical Finch markers describe presentation that was
+                // omitted before this payload reached the replay parser. The
+                // retained counts can therefore only be lower bounds.
+                current.totals_exact = false;
                 continue;
             }
             if let Some(h) = hunk.as_mut() {
@@ -239,6 +261,17 @@ impl FileDiff {
                 } else {
                     continue;
                 };
+                if let Some(current) = file.as_mut() {
+                    match kind {
+                        DiffLineKind::Add => {
+                            current.total_added = current.total_added.saturating_add(1)
+                        }
+                        DiffLineKind::Remove => {
+                            current.total_removed = current.total_removed.saturating_add(1)
+                        }
+                        _ => {}
+                    }
+                }
                 if accepted_lines < MAX_DIFF_LINES {
                     h.lines.push(DiffLine {
                         kind,
@@ -246,8 +279,9 @@ impl FileDiff {
                     });
                     accepted_lines += 1;
                 } else {
-                    file.get_or_insert_with(empty_file).elided =
-                        Some(format!("diff truncated at {MAX_DIFF_LINES} lines"))
+                    let current = file.get_or_insert_with(empty_file);
+                    current.elided = Some(format!("diff truncated at {MAX_DIFF_LINES} lines"));
+                    current.totals_exact = false;
                 }
             }
         }
@@ -321,10 +355,13 @@ impl FileDiff {
         bound_rendered(out, "# finch: diff rendering truncated")
     }
     pub fn added(&self) -> usize {
-        count(self, DiffLineKind::Add)
+        self.total_added
     }
     pub fn removed(&self) -> usize {
-        count(self, DiffLineKind::Remove)
+        self.total_removed
+    }
+    pub fn counts_are_exact(&self) -> bool {
+        self.totals_exact
     }
     pub fn display_path(&self) -> &str {
         if self.new_path != "/dev/null" && !self.new_path.is_empty() {
@@ -347,8 +384,8 @@ impl FileDiff {
         let mut out = format!(
             "{}  +{} -{}",
             sanitize_terminal(&meta),
-            self.added(),
-            self.removed()
+            self.count_label(self.added()),
+            self.count_label(self.removed())
         );
         if self.binary {
             out.push_str("  binary")
@@ -429,12 +466,31 @@ impl FileDiff {
         }
         bound_rendered(out, "… [diff rendering truncated]")
     }
+
+    fn count_label(&self, value: usize) -> String {
+        if self.totals_exact {
+            value.to_string()
+        } else {
+            format!("≥{value}")
+        }
+    }
 }
 
 /// Build the stable path and aggregate line-count summary for parsed files.
 pub fn summarize_files(files: &[FileDiff]) -> String {
     let added: usize = files.iter().map(FileDiff::added).sum();
     let removed: usize = files.iter().map(FileDiff::removed).sum();
+    let exact = files.iter().all(FileDiff::counts_are_exact);
+    let added = if exact {
+        added.to_string()
+    } else {
+        format!("≥{added}")
+    };
+    let removed = if exact {
+        removed.to_string()
+    } else {
+        format!("≥{removed}")
+    };
     if files.len() == 1 {
         format!("{}  +{} -{}", files[0].display_path(), added, removed)
     } else {
@@ -461,6 +517,9 @@ fn empty_file() -> FileDiff {
         binary: false,
         elided: None,
         hunks: vec![],
+        total_added: 0,
+        total_removed: 0,
+        totals_exact: true,
     }
 }
 
@@ -471,6 +530,9 @@ fn elided_input(reason: &str) -> FileDiff {
         binary: false,
         elided: Some(reason.into()),
         hunks: vec![],
+        total_added: 0,
+        total_removed: 0,
+        totals_exact: false,
     }
 }
 fn line_ending(value: &str) -> Option<&'static str> {
@@ -481,13 +543,6 @@ fn line_ending(value: &str) -> Option<&'static str> {
     } else {
         None
     }
-}
-fn count(d: &FileDiff, k: DiffLineKind) -> usize {
-    d.hunks
-        .iter()
-        .flat_map(|h| &h.lines)
-        .filter(|l| l.kind == k)
-        .count()
 }
 fn parse_hunk_header(line: &str) -> Option<DiffHunk> {
     let end = line.get(2..)?.find("@@")? + 2;
@@ -923,5 +978,40 @@ mod tests {
         let rendered = render_files(&files, &ColorScheme::default(), DiffColorMode::NoColor);
         assert!(rendered.chars().count() <= MAX_RENDER_CHARS + 40);
         assert!(rendered.contains("rendering truncated"));
+    }
+
+    #[test]
+    fn totals_remain_truthful_beyond_the_transcript_preview() {
+        let patch = format!(
+            "--- a/x\n+++ b/x\n@@ -1,500 +1,500 @@\n{}",
+            (0..500)
+                .map(|index| format!("-old {index}\n+new {index}\n"))
+                .collect::<String>()
+        );
+        let parsed = FileDiff::parse(&patch).unwrap();
+        assert_eq!((parsed.added(), parsed.removed()), (500, 500));
+        assert!(parsed.counts_are_exact());
+        assert!(parsed.hunks[0].lines.len() > MAX_DIFF_PREVIEW_LINES);
+    }
+
+    #[test]
+    fn bounded_input_labels_totals_as_lower_bounds() {
+        let parsed = FileDiff::parse(&"\n".repeat(MAX_DIFF_INPUT_BYTES + 1)).unwrap();
+        assert!(!parsed.counts_are_exact());
+        assert!(parsed
+            .render(&ColorScheme::default(), DiffColorMode::NoColor)
+            .contains("+≥0 -≥0"));
+    }
+
+    #[test]
+    fn inexact_totals_survive_canonical_roundtrip() {
+        let bounded = FileDiff::from_texts("x", &"a".repeat(MAX_DIFF_INPUT_BYTES), "new");
+        assert!(!bounded.counts_are_exact());
+
+        let replayed = FileDiff::parse(&bounded.to_unified()).unwrap();
+        assert!(!replayed.counts_are_exact());
+        assert!(replayed
+            .render(&ColorScheme::default(), DiffColorMode::NoColor)
+            .contains("+≥0 -≥0"));
     }
 }
