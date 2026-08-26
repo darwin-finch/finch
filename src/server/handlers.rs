@@ -4442,24 +4442,31 @@ mod handler_tests {
                     .all(|run| run.initiating_attachment_id == attachment.attachment_id)
         }));
 
-        let lease = restarted
-            .acquire_runner_lease(
-                "shared",
-                "runner@box.local",
-                restarted.environment().generation,
-                None,
-                60_000,
-            )
-            .unwrap();
-        let runners = crate::server::BrainRunnerBroker::default();
+        let server = Arc::new(crate::server::AgentServer::for_brain_protocol_test(
+            restarted.clone(),
+            crate::brain::credential::BrainCredentialAuthority::ephemeral([59; 32]),
+            "test-password".into(),
+            temp.path(),
+        ).unwrap());
+        let lifecycle = crate::server::BrainLifecycleService::from_server(&server);
+        let lease = lifecycle.acquire_runner(
+            "shared", "runner@box.local", restarted.environment(), None, 60_000,
+        ).unwrap();
+        let runners = server.brain_runners().clone();
         let (runner_tx, mut runner_rx) = tokio::sync::mpsc::unbounded_channel();
         runners.register("shared", lease.lease_id, runner_tx);
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            for _ in 0..2 {
-                let crate::server::RunnerRequest::Turn(request) = runner_rx.recv().await.unwrap()
-                else {
-                    panic!("expected queued turn request")
+        let approval_server = server.clone();
+        let queued_runner = async move {
+            let mut index = 0;
+            while index < 2 {
+                let request = match runner_rx.recv().await.unwrap() {
+                    crate::server::RunnerRequest::Turn(request) => request,
+                    crate::server::RunnerRequest::ProjectMemory(request) => {
+                        request.response_tx.send(Ok(0)).unwrap();
+                        continue;
+                    }
+                    other => panic!("expected queued turn request, got {other:?}"),
                 };
                 let context = request
                     .context
@@ -4468,28 +4475,69 @@ mod handler_tests {
                     .collect::<Vec<_>>()
                     .join("\n");
                 seen_tx.send((request.request_seq, context)).unwrap();
-                request
-                    .response_tx
-                    .send(Err(crate::server::RunnerTurnError {
-                        message: "intentional context-capture failure".into(),
+                if index == 0 {
+                    let runtime = crate::runtime::ProgramRuntime::new();
+                    let outcome = runtime.submit_typed_only(crate::runtime::ProgramSubmission {
+                        language: crate::programs::ProgramLanguage::Lisp,
+                        source_id: Some("restored-no-tool".into()),
+                        source: "(define (restored) : int 1)".into(),
+                        intent: "complete restored turn".into(),
+                        effect: crate::programs::ExecutionEffect::Pure,
+                        declared_capabilities: Vec::new(),
+                        manifest_generation: runtime.manifest_generation(),
+                        expected_revision: Some(runtime.revision()),
+                        budget: None,
+                    }).await.unwrap();
+                    let checkpoint = runtime.revision_history().unwrap().into_iter()
+                        .find(|snapshot| snapshot.revision == outcome.output_revision)
+                        .and_then(|snapshot| snapshot.checkpoint).unwrap();
+                    request.response_tx.send(Ok(crate::server::RunnerTurnResult {
+                        source: "(define (restored) : int 1)".into(),
+                        language: ProgramLanguage::Lisp,
+                        output: "restored without tools".into(),
                         turn_events: Vec::new(),
+                        runtime_revision: outcome.output_revision,
+                        checkpoint,
                         effect_journal: Vec::new(),
-                    }))
-                    .unwrap();
+                        commit_ack: None,
+                    })).unwrap();
+                    index += 1;
+                    continue;
+                }
+                assert!(request.approval_connection_id.is_none());
+                let approval = crate::ipc::server::request_test_turn_approval(
+                    approval_server.clone(), request.brain.clone(), request.request_seq,
+                    request.approval_audience.clone(), request.approval_connection_id,
+                    crate::server::RunnerTurnEvent::ApprovalRequested {
+                        approval_id: "restored-tool".into(),
+                        approval_kind: "tool".into(),
+                        subject: "bash".into(),
+                        audience: request.approval_audience.clone(),
+                        detail: serde_json::json!({"input": {"command": "true"}}),
+                    },
+                ).await.unwrap_err();
+                assert!(approval.to_string().contains(
+                    "approval audience has no live connection generation"
+                ));
+                request.response_tx.send(Err(crate::server::RunnerTurnError {
+                    message: approval.to_string(),
+                    turn_events: Vec::new(),
+                    effect_journal: Vec::new(),
+                })).unwrap();
+                index += 1;
             }
-        });
+        };
 
-        assert_eq!(
+        let (resumed, ()) = tokio::join!(
             resume_queued_named_brain_runs(
                 restarted.clone(),
-                runners,
+                runners.clone(),
                 "shared".into(),
                 lease.lease_id,
-            )
-            .await
-            .unwrap(),
-            2
+            ),
+            queued_runner,
         );
+        assert_eq!(resumed.unwrap(), 2);
 
         let (seen_old_seq, older_text) = seen_rx.recv().await.unwrap();
         assert_eq!(seen_old_seq, old_seq);
@@ -4502,10 +4550,71 @@ mod handler_tests {
         assert_eq!(seen_new_seq, new_seq);
         assert!(newer_text.contains("future-task"));
         assert!(newer_text.contains("newer queued prompt"));
-        assert!(restarted.snapshot("shared").unwrap().runs.iter().all(|run| {
-            run.status == crate::brain::store::BrainRunStatus::Failed
-                && run.detail.as_deref() == Some("intentional context-capture failure")
+        let after_restart = restarted.snapshot("shared").unwrap();
+        let old_run = after_restart.runs.iter().find(|run| run.request_seq == old_seq).unwrap();
+        let new_run = after_restart.runs.iter().find(|run| run.request_seq == new_seq).unwrap();
+        assert_eq!(old_run.status, crate::brain::store::BrainRunStatus::Completed);
+        assert_eq!(new_run.status, crate::brain::store::BrainRunStatus::Failed);
+        assert_eq!(after_restart.events.iter().filter(|event| {
+            event.run_id == Some(new_run.run_id)
+                && matches!(event.kind, BrainEventKind::Result { .. })
+        }).count(), 1);
+        assert!(!after_restart.events.iter().any(|event| {
+            event.run_id == Some(new_run.run_id)
+                && matches!(event.kind, BrainEventKind::EffectRecorded { .. })
         }));
+
+        let restored_attachment = after_restart.attachments.iter().find(|attachment| {
+            attachment.subject == "alice@box.local"
+        }).unwrap();
+        let replacement = lifecycle.attach(
+            "shared", "alice@box.local", AttachmentRole::Driver,
+            Some(restored_attachment.attachment_id),
+        ).unwrap();
+        let replacement_connection = replacement.connection_id.unwrap();
+        let _replacement_events = lifecycle.watch(
+            "shared", replacement.attachment_id, replacement_connection,
+        ).unwrap();
+        let unrelated = lifecycle.attach(
+            "shared", "observer@box.local", AttachmentRole::Observer, None,
+        ).unwrap();
+        let unrelated_connection = unrelated.connection_id.unwrap();
+        let _unrelated_events = lifecycle.watch(
+            "shared", unrelated.attachment_id, unrelated_connection,
+        ).unwrap();
+        let (later_tx, mut later_rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, later_tx);
+        tokio::spawn(async move {
+            let request = loop {
+                match later_rx.recv().await.unwrap() {
+                    crate::server::RunnerRequest::Turn(request) => break request,
+                    crate::server::RunnerRequest::ProjectMemory(request) => {
+                        request.response_tx.send(Ok(0)).unwrap();
+                    }
+                    other => panic!("expected later turn, got {other:?}"),
+                }
+            };
+            request.response_tx.send(Err(crate::server::RunnerTurnError {
+                message: "later prompt reached runner".into(),
+                turn_events: Vec::new(),
+                effect_journal: Vec::new(),
+            })).unwrap();
+        });
+        let later = lifecycle.submit(
+            "shared", replacement.attachment_id, replacement_connection,
+            BrainEventKind::Prompt { text: "later prompt".into() },
+        ).await.unwrap();
+        assert_eq!(later.run.unwrap().status, crate::brain::store::BrainRunStatus::Running);
+        let final_snapshot = lifecycle.snapshot("shared").unwrap();
+        assert!(final_snapshot.runs.iter().any(|run| {
+            run.request_seq == later.accepted.seq
+                && run.status == crate::brain::store::BrainRunStatus::Failed
+                && run.detail.as_deref() == Some("later prompt reached runner")
+        }));
+        assert!(lifecycle.connection(
+            "shared", unrelated.attachment_id, unrelated_connection,
+        ).is_ok());
+        assert_eq!(final_snapshot.runner_lease, Some(lease));
     }
 
     #[test]

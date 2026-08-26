@@ -94,6 +94,41 @@ fn require_approval_connection(
     connection_id.context("approval audience has no live connection generation")
 }
 
+#[cfg(test)]
+pub(crate) async fn request_test_turn_approval(
+    server: Arc<AgentServer>,
+    brain: String,
+    request_seq: u64,
+    expected_audience: crate::brain::store::BrainApprovalAudience,
+    expected_connection_id: Option<crate::brain::store::ConnectionId>,
+    event: crate::server::RunnerTurnEvent,
+) -> Result<serde_json::Value> {
+    let control: finch_ipc_capnp::brain_turn_control::Client = capnp_rpc::new_client(
+        BrainTurnControlImpl {
+            server,
+            brain,
+            request_seq,
+            expected_audience,
+            expected_connection_id,
+        },
+    );
+    let mut call = control.request_approval_request();
+    let crate::server::RunnerTurnEvent::ApprovalRequested {
+        approval_id, approval_kind, subject, audience, detail,
+    } = event else {
+        anyhow::bail!("test reverse control accepts only approval requests");
+    };
+    let mut encoded = call.get().init_event();
+    encoded.set_kind(finch_ipc_capnp::BrainTurnEventKind::ApprovalRequested);
+    encoded.set_approval_id(&approval_id);
+    encoded.set_approval_kind(&approval_kind);
+    encoded.set_subject(&subject);
+    encode_approval_audience(encoded.reborrow().init_approval_audience(), &audience);
+    crate::ipc::brain_codec::encode_json_value(encoded.reborrow().init_detail(), &detail)?;
+    let response = call.send().promise.await?;
+    crate::ipc::brain_codec::decode_json_value(response.get()?.get_decision()?)
+}
+
 /// Reverse capability scoped to one daemon-authenticated ProgramRun. The
 /// frontend may request durable schedule operations, but it never receives
 /// participant attachment credentials and cannot substitute another run.
