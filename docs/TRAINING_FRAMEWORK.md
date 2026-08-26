@@ -1,5 +1,9 @@
 # Training Framework Design
 
+> Historical design document. It does not describe an enabled LoRA training
+> path. Automatic Python/bulk training and adapter loading are disabled under
+> Issue #139; explicit feedback is retained but never triggers this framework.
+
 ## Overview
 
 This document specifies the complete training framework for Shammah's 3-model ensemble. All models use **online learning** - updating weights after individual examples, not batch training.

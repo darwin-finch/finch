@@ -1431,6 +1431,14 @@ async fn run_train_setup() -> Result<()> {
             .cyan()
             .bold()
     );
+    println!(
+        "Legacy experiment only: this installs Python, PyTorch, Transformers, and PEFT.\n\
+         It does not enable daemon training or adapter loading. The manual script reads only the\n\
+         JSONL path you pass it, may download/load a full base model, and can consume substantial\n\
+         compute, memory, disk, and network bandwidth. Cancel a manual run by interrupting that\n\
+         process. Input queues, the virtual environment, downloads, logs, and adapter outputs are\n\
+         retained until you remove them; Finch will not process, migrate, or delete them.\n"
+    );
 
     // Determine paths
     let home =
@@ -1535,7 +1543,9 @@ async fn run_train_setup() -> Result<()> {
             .cyan()
             .bold()
     );
-    println!("\nTraining will run automatically when you provide feedback.");
+    println!(
+        "\nAutomatic training remains disabled; explicit feedback is retained separately and does not run this script."
+    );
 
     Ok(())
 }
@@ -1543,7 +1553,7 @@ async fn run_train_setup() -> Result<()> {
 async fn run_daemon(bind_address: String) -> Result<()> {
     use finch::daemon::DaemonLifecycle;
     use finch::local::LocalGenerator;
-    use finch::models::{BootstrapLoader, GeneratorState, TrainingCoordinator};
+    use finch::models::{BootstrapLoader, GeneratorState};
     use finch::server::{AgentServer, ServerConfig};
     use finch::{output_progress, output_status};
     use std::sync::Arc;
@@ -1713,14 +1723,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         }
     });
 
-    // Initialize LoRA fine-tuning system
-    let training_coordinator = Arc::new(TrainingCoordinator::new(
-        100,  // buffer_size: keep last 100 examples
-        10,   // threshold: train after 10 examples
-        true, // auto_train: enabled
-    ));
-
-    output_status!("✓ LoRA fine-tuning enabled (weighted training)");
+    output_status!("LoRA training disabled (native training support is not available)");
 
     // Create server configuration
     let server_config = ServerConfig {
@@ -1751,7 +1754,6 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         local_generator,
         bootstrap_loader,
         generator_state,
-        training_coordinator,
         providers,
     )?;
 

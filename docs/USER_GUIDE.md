@@ -24,14 +24,14 @@ Shammah is a **local-first AI coding assistant** that combines the power of:
 - **Pre-trained local models** (Qwen via ONNX Runtime) - works offline, preserves privacy
 - **Teacher APIs** (Claude, GPT-4, Gemini, Grok) - high-quality fallback when needed
 - **Tool execution** - can read files, run commands, search code
-- **Continuous learning** - adapts to your coding style via LoRA fine-tuning
+- **Explicit feedback** - privately retain ratings for future supported learning
 
 ### Key Benefits
 
 ✅ **Works offline** - Local model runs on your machine
 ✅ **Privacy-first** - Code stays on your device
 ✅ **Instant startup** - <100ms to REPL (progressive loading)
-✅ **Adaptive** - Learns from your feedback
+✅ **Feedback-aware** - Retains only feedback you explicitly submit
 ✅ **Multi-provider** - Configure multiple teacher APIs
 ✅ **Tool-enabled** - Can execute commands with your approval
 
@@ -187,8 +187,8 @@ Runs a single query and exits - useful for scripts.
 - **Enter:** Submit query
 - **Shift+Enter:** New line (multi-line input)
 - **Ctrl+C:** Cancel in-progress query
-- **Ctrl+G:** Mark response as good (for training)
-- **Ctrl+B:** Mark response as bad (for training)
+- **Ctrl+G:** Privately record a good response
+- **Ctrl+B:** Privately record a bad response
 - **Up/Down:** Navigate command history
 
 **In dialogs (tool confirmations, plan approval, etc.):**
@@ -268,16 +268,18 @@ History is saved to `~/.finch/history.txt` (last 1000 commands).
 
 ### Feedback System
 
-Help Shammah learn from your preferences:
+Record explicit feedback about a response:
 
-- **Ctrl+G** - Good response (saves as training example)
-- **Ctrl+B** - Bad response (saves as high-priority training data)
+- **Ctrl+G** - Good response
+- **Ctrl+B** - Bad response
 
-Feedback is weighted:
+Feedback retains historical weights:
 - Good: 1x weight
-- Bad: 10x weight (learns faster from mistakes)
+- Bad: 10x weight
 
-Data saved to `~/.finch/feedback.jsonl` for LoRA training.
+Data is saved privately to `~/.finch/feedback.jsonl`. It is not collected from
+ordinary requests and does not trigger training, Python, queue processing, or
+adapter loading.
 
 ### Status Bar
 
@@ -378,15 +380,7 @@ execution_provider = "CoreML"  # or "CPU"
 bind_address = "127.0.0.1:8000"
 auto_spawn = true
 
-# LoRA training configuration
-[lora]
-rank = 16
-alpha = 32.0
-auto_train = true
-auto_train_threshold = 10
-high_weight = 10.0
-medium_weight = 3.0
-normal_weight = 1.0
+# Automatic LoRA training is disabled; there are no active auto_train settings.
 
 # Tool permissions
 [tools]
@@ -480,7 +474,9 @@ finch daemon-start
 This is normal during:
 - Model loading (first query)
 - Model inference (generating responses)
-- LoRA training (background, after feedback)
+
+Feedback does not start background training. Unexpected Python or sustained
+training activity should be treated as a bug.
 
 ### Tool Execution Issues
 
@@ -538,7 +534,8 @@ cmd:"cargo test" args:"*" dir:"/home/user/*"
 - **Ctrl+G (Good):** When response is exactly what you wanted
 - **Ctrl+B (Bad):** When response has wrong approach or strategy
 
-This helps LoRA training adapt to your preferences.
+This privately records your preference for a future supported learning path.
+It does not train or alter the current model.
 
 ### 4. Multi-Provider Fallback
 
@@ -578,9 +575,9 @@ Remove overly permissive patterns for security.
 ## What's Next?
 
 - **Explore tools:** Let Shammah read your code, run tests, search files
-- **Provide feedback:** Help it learn your preferences
+- **Provide feedback:** Privately record your preferences without triggering training
 - **Configure multiple providers:** Set up fallback APIs
-- **Experiment with LoRA:** Train custom adapters for your domain
+- **Track LoRA feasibility:** Training and adapter loading remain blocked on Issues #1, #7, and #74
 
 **Happy coding!** 🚀
 

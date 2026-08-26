@@ -1,7 +1,11 @@
 # Model Backend Status
 
-**Last Updated**: 2026-02-22
+**Last Updated**: 2026-08-25
 **Purpose**: Document what works, what doesn't, and why — for both local inference and LoRA fine-tuning.
+
+> LoRA training and adapter loading are disabled under Issue #139. The training
+> notes below document feasibility constraints only; no feedback or request path
+> invokes them.
 
 ---
 
@@ -78,7 +82,9 @@ The dispatch is **per-operation**, not whole-model. CoreML decides which device 
 
 **Candle LoRA on macOS:** Candle does support in-process LoRA training in Rust, but Candle Metal has the same missing-op problems as inference. Candle CPU on macOS works but is too slow for practical training runs. Candle is not the LoRA path on macOS.
 
-This is the core of **Issue #1**: wire up the MLX training pipeline and the adapter conversion + loading flow.
+This historical investigation informs **Issues #1, #7, and #74**. It is not an
+enabled pipeline; any future path requires verified native feasibility and
+explicit privacy, resource, cancellation, recovery, and retention controls.
 
 ---
 

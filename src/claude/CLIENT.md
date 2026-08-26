@@ -1,13 +1,13 @@
 # Claude Client
 
-**Purpose:** Forward queries to Claude API; collect training examples for LoRA.
+**Purpose:** Forward queries to the Claude API.
 
 ## Features
 
 - HTTP client with retry logic
 - Streaming support (SSE parsing)
 - Tool definitions sent with requests
-- Logs (query, response) to `~/.finch/training_queue.jsonl` for future LoRA training
+- Does not collect requests or responses for training
 - Graceful fallback when streaming unavailable
 
 ## Key files

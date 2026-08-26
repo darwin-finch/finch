@@ -17,13 +17,12 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::claude::{ClaudeClient, MessageRequest};
 use crate::config::Config;
+use crate::feedback::{FeedbackEntry, FeedbackLogger};
 use crate::local::LocalGenerator;
 use crate::metrics::{MetricsLogger, RequestMetric, ResponseComparison, TrainingTrends};
 use crate::models::tokenizer::TextTokenizer;
 use crate::models::ThresholdValidator;
-use crate::models::{
-    BootstrapLoader, GeneratorState, Sampler, SamplingConfig, TrainingCoordinator, WeightedExample,
-};
+use crate::models::{BootstrapLoader, GeneratorState, Sampler, SamplingConfig};
 use crate::providers::{TeacherContextConfig, TeacherSession};
 use crate::router::{ForwardReason, RouteDecision, Router};
 #[cfg(target_os = "macos")]
@@ -33,8 +32,7 @@ use crate::runtime::automation::{
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
 use crate::tools::implementations::{
     AnsibleTool, AskUserQuestionTool, BashTool, EditTool, EnterPlanModeTool, GlobTool, GrepTool,
-    HashCompareTool, PatchTool, PresentPlanTool, ReadTool, RestartTool,
-    WebFetchTool, WriteTool,
+    HashCompareTool, PatchTool, PresentPlanTool, ReadTool, RestartTool, WebFetchTool, WriteTool,
 };
 #[cfg(target_os = "macos")]
 use crate::tools::implementations::{GuiClickTool, GuiInspectTool, GuiTypeTool};
@@ -53,7 +51,7 @@ use super::status_bar::StatusBar;
 use super::tui::TuiRenderer;
 
 // Phase 3.5: Import output macros for global output routing
-use crate::{output_error, output_status};
+use crate::output_status;
 
 /// User's menu choice for tool confirmation
 #[derive(Debug, Clone)]
@@ -64,6 +62,137 @@ enum ConfirmationChoice {
     ApproveExactPersistent,
     ApprovePatternPersistent,
     Deny,
+}
+
+#[cfg(test)]
+mod disabled_training_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_repl_has_no_automatic_training_queue_producer() {
+        let source = include_str!("repl.rs");
+        let disabled_flag = ["auto", "_train"].concat();
+        let queue_writer = ["write_training", "_queue"].concat();
+        let python_script = ["train", "_lora.py"].concat();
+
+        assert!(!source.contains(&disabled_flag));
+        assert!(!source.contains(&queue_writer));
+        assert!(!source.contains(&python_script));
+    }
+
+    #[tokio::test]
+    async fn fallback_repl_completion_does_not_mutate_legacy_conversation_or_training_logs() {
+        const SENSITIVE_QUERY: &str = "QUERY_PRIVATE_SENTINEL_139_7f94";
+        const SENSITIVE_RESPONSE: &str = "RESPONSE_PRIVATE_SENTINEL_139_b381";
+
+        let temp = tempfile::tempdir().unwrap();
+        let legacy_conversations = temp.path().join("conversations.jsonl");
+        let legacy_training_queue = temp.path().join("training_queue.jsonl");
+        std::fs::write(&legacy_conversations, "preserved conversation data\n").unwrap();
+        std::fs::write(&legacy_training_queue, "preserved training data\n").unwrap();
+        let conversations_before = std::fs::read(&legacy_conversations).unwrap();
+        let training_before = std::fs::read(&legacy_training_queue).unwrap();
+
+        let mut upstream = mockito::Server::new_async().await;
+        let response = upstream
+            .mock("POST", "/v1/messages")
+            .with_status(200)
+            .with_body(
+                format!(
+                    r#"{{"id":"msg-1","type":"message","role":"assistant","content":[{{"type":"text","text":"{SENSITIVE_RESPONSE}"}}],"model":"claude-test","stop_reason":"end_turn"}}"#,
+                ),
+            )
+            .create_async()
+            .await;
+        let teacher = crate::config::TeacherEntry {
+            provider: "claude".into(),
+            api_key: "sk-ant-test-key-for-fallback-boundary".into(),
+            model: Some("claude-test".into()),
+            base_url: Some(upstream.url()),
+            name: Some("fallback-test".into()),
+        };
+        let mut config = Config::new(vec![teacher]);
+        config.metrics_dir = temp.path().join("metrics");
+        config.tui_enabled = false;
+        config.features.streaming_enabled = false;
+        #[allow(deprecated)]
+        {
+            config.streaming_enabled = false;
+        }
+        config.memory.enabled = true;
+        config.memory.db_path = temp.path().join("canonical-memory.db");
+        config.memory.use_neural_embeddings = false;
+        config.memory.embedding_cache_dir = temp.path().join("embedding-cache");
+        let metrics = MetricsLogger::new(config.metrics_dir.clone()).unwrap();
+        let client = ClaudeClient::new("sk-ant-unused-facade-key".into()).unwrap();
+        let router = Router::new(crate::models::ThresholdRouter::default());
+        let mut repl = Repl::new(
+            config,
+            client,
+            router,
+            metrics,
+            None,
+            "fallback-boundary".into(),
+        )
+        .await;
+        repl.conversation_logger = Arc::new(tokio::sync::Mutex::new(
+            crate::logging::ConversationLogger::new(legacy_conversations.clone()).unwrap(),
+        ));
+
+        let actual = repl.process_query(SENSITIVE_QUERY).await.unwrap();
+
+        assert_eq!(actual, SENSITIVE_RESPONSE);
+        response.assert_async().await;
+
+        let metrics_path = config_metrics_path(temp.path());
+        let metrics_jsonl = std::fs::read_to_string(&metrics_path).unwrap();
+        assert!(!metrics_jsonl.contains(SENSITIVE_QUERY));
+        assert!(!metrics_jsonl.contains(SENSITIVE_RESPONSE));
+        let metric: RequestMetric = serde_json::from_str(metrics_jsonl.trim()).unwrap();
+        assert_eq!(
+            metric.query_hash,
+            MetricsLogger::hash_query(SENSITIVE_QUERY)
+        );
+        assert_eq!(metric.routing_decision, "forward");
+        assert!(metric.comparison.quality_score.is_finite());
+        assert!(metric.comparison.local_response.is_none());
+        assert!(metric.comparison.claude_response.is_empty());
+
+        let memory = repl
+            .memory_system
+            .as_ref()
+            .expect("configured canonical memory must remain enabled");
+        let recent = memory.get_recent_conversations(2).await.unwrap();
+        assert!(recent
+            .iter()
+            .any(|(role, content)| role == "user" && content == SENSITIVE_QUERY));
+        assert!(recent
+            .iter()
+            .any(|(role, content)| role == "assistant" && content == SENSITIVE_RESPONSE));
+        assert_eq!(
+            std::fs::read(&legacy_conversations).unwrap(),
+            conversations_before
+        );
+        assert_eq!(
+            std::fs::read(&legacy_training_queue).unwrap(),
+            training_before
+        );
+        assert!(repl.feedback_logger.is_none());
+        drop(repl);
+        assert_eq!(
+            std::fs::read(&legacy_conversations).unwrap(),
+            conversations_before
+        );
+        assert_eq!(
+            std::fs::read(&legacy_training_queue).unwrap(),
+            training_before
+        );
+    }
+
+    fn config_metrics_path(root: &std::path::Path) -> std::path::PathBuf {
+        root.join("metrics")
+            .join(format!("{}.jsonl", chrono::Utc::now().format("%Y-%m-%d")))
+    }
 }
 
 // Use ConfirmationResult from event loop module
@@ -257,8 +386,8 @@ pub struct Repl {
     conversation: Arc<RwLock<ConversationHistory>>,
     // REPL mode (normal, planning, executing)
     mode: ReplMode,
-    // LoRA fine-tuning (NEW)
-    training_coordinator: Arc<TrainingCoordinator>,
+    // Durable explicit feedback; never a training trigger.
+    feedback_logger: Option<FeedbackLogger>,
     sampler: Arc<RwLock<Sampler>>,
     // Track last exchange for feedback
     last_query: Option<String>,
@@ -271,6 +400,8 @@ pub struct Repl {
 
     // Phase 1: Multi-LLM system
     llm_registry: Option<Arc<crate::llms::LLMRegistry>>,
+    // Legacy automatic conversation collector. Its persistence API is
+    // fail-closed; retained only for compatibility with explicit callers.
     conversation_logger: Arc<tokio::sync::Mutex<crate::logging::ConversationLogger>>,
 
     // Phase 2: Persona system
@@ -301,12 +432,6 @@ pub struct Repl {
 
     // Enable sliding-window auto-compaction (from config.features.auto_compact_enabled)
     auto_compact_enabled: bool,
-}
-
-/// Background training statistics
-struct BackgroundTrainingStats {
-    examples_trained: usize,
-    queue_path: String,
 }
 
 #[allow(dead_code)]
@@ -720,12 +845,9 @@ impl Repl {
         ));
         let local_generator = Arc::new(RwLock::new(LocalGenerator::new()));
 
-        // Initialize LoRA fine-tuning system
-        let training_coordinator = Arc::new(TrainingCoordinator::new(
-            100,  // buffer_size: keep last 100 examples
-            10,   // threshold: train after 10 examples
-            true, // auto_train: enabled
-        ));
+        // Explicit feedback storage is opened lazily by handle_feedback. An
+        // ordinary query must not create or mutate any feedback/training file.
+        let feedback_logger = None;
 
         let sampling_config = SamplingConfig::default(); // 5% baseline, 3x arch, 5x security
         let sampler = Arc::new(RwLock::new(Sampler::new(sampling_config)));
@@ -789,7 +911,8 @@ impl Repl {
         // The direct-provider fallback is normal standalone operation.  Do not
         // render configuration chatter before the first user-visible turn.
 
-        // Phase 1: Initialize conversation logger
+        // Legacy collector construction is side-effect free and persistence is
+        // disabled. Keep the value only for API compatibility.
         let log_path = dirs::home_dir()
             .map(|home| home.join(".finch").join("conversations.jsonl"))
             .unwrap_or_else(|| PathBuf::from(".finch/conversations.jsonl"));
@@ -842,8 +965,7 @@ impl Repl {
             input_handler,
             conversation: Arc::new(RwLock::new(ConversationHistory::new())),
             mode: ReplMode::Normal,
-            // LoRA fine-tuning
-            training_coordinator,
+            feedback_logger,
             sampler,
             last_query: None,
             last_response: None,
@@ -3430,38 +3552,26 @@ impl Repl {
             self.output_status("✓");
         }
 
-        // Log metric with comparison data
+        // Log source-free metric comparison aggregates.
         let query_hash = MetricsLogger::hash_query(query);
         let response_time_ms = start_time.elapsed().as_millis() as u64;
 
-        let comparison = ResponseComparison {
-            local_response: local_response.clone(),
-            claude_response: claude_response.clone(),
-            quality_score,
-            similarity_score,
-            divergence,
-        };
+        let comparison =
+            ResponseComparison::aggregates(quality_score, similarity_score, divergence);
 
         let router_confidence = Some(router_stats.confidence_threshold);
         let validator_confidence = Some(quality_score);
 
-        // Phase 1: Log conversation BEFORE creating metric (routing_decision_str is moved)
+        // Resolve the model label before creating the metric
+        // (routing_decision_str is moved below). Ordinary completions are not
+        // written to the disabled legacy conversation/training collector.
+        // Metrics persist source-free aggregates; when configured, canonical
+        // MemorySystem retention remains a distinct user-facing feature.
         let model_name = if routing_decision_str == "local" {
             "local".to_string()
         } else {
             "teacher".to_string()
         };
-        let tools_used = vec![]; // TODO: Track tools used during execution
-        if let Err(e) = self
-            .conversation_logger
-            .lock()
-            .await
-            .log_interaction(query, &claude_response, &model_name, &tools_used)
-            .await
-        {
-            tracing::warn!("Failed to log conversation: {}", e);
-        }
-
         let metric = RequestMetric::new(
             query_hash,
             routing_decision_str,
@@ -3502,7 +3612,8 @@ impl Repl {
             .await
             .add_assistant_message(claude_response.clone());
 
-        // Phase 4: Store conversation in memory automatically
+        // Phase 4: Store conversation in the separately configured canonical
+        // memory product. This is not the legacy LoRA collector.
         if let Some(ref memory) = self.memory_system {
             if let Err(e) = memory
                 .insert_conversation("user", query, Some(&model_name), None)
@@ -3554,24 +3665,15 @@ impl Repl {
             _ => "User feedback".to_string(),
         });
 
-        // Create weighted example
-        let example = match weight as i32 {
-            10 => WeightedExample::critical(query.clone(), response.clone(), feedback.clone()),
-            3 => WeightedExample::improvement(query.clone(), response.clone(), feedback.clone()),
-            1 => WeightedExample::normal(query.clone(), response.clone(), feedback.clone()),
-            _ => WeightedExample::with_weight(
-                query.clone(),
-                response.clone(),
-                feedback.clone(),
-                weight,
-            ),
-        };
-
-        // Add to training coordinator
-        let should_train = self
-            .training_coordinator
-            .add_example(example)
-            .context("Failed to add training example")?;
+        let entry = FeedbackEntry::weighted(query, response, weight, Some(feedback.clone()));
+        if self.feedback_logger.is_none() {
+            self.feedback_logger = Some(FeedbackLogger::new()?);
+        }
+        let logger = self
+            .feedback_logger
+            .as_ref()
+            .context("Private feedback persistence is unavailable on this platform")?;
+        logger.log(&entry).context("Failed to persist feedback")?;
 
         // Display confirmation
         let weight_emoji = match weight as i32 {
@@ -3589,49 +3691,7 @@ impl Repl {
             self.output_status(format!("   Note: {}", note_text));
         }
 
-        // Get buffer stats
-        let buffer = self.training_coordinator.buffer()?;
-        let example_count = buffer.examples().len();
-        let total_weight = buffer.total_weight();
-        drop(buffer); // Release lock
-
-        self.output_status(format!(
-            "   Training buffer: {} examples ({:.1} weighted)",
-            example_count, total_weight
-        ));
-
-        // Trigger training if threshold reached
-        if should_train {
-            self.output_status("\n🔄 Training threshold reached, starting background training...");
-            self.output_status("   (Training runs in background, you can continue querying)");
-
-            // Spawn background training task
-            let coordinator = Arc::clone(&self.training_coordinator);
-            let models_dir = self.models_dir.clone();
-
-            tokio::spawn(async move {
-                match Self::run_background_training(coordinator, models_dir).await {
-                    Ok(stats) => {
-                        output_status!(
-                            "\n✓ {} examples queued for offline training",
-                            stats.examples_trained
-                        );
-                        output_status!("   Queue: {}", stats.queue_path);
-                        output_status!(
-                            "   To train: python3 scripts/train_lora.py {} \\",
-                            stats.queue_path
-                        );
-                        output_status!("             ~/.finch/adapters/latest.safetensors");
-                        output_status!("   (See GitHub Issue #1 for adapter re-loading into ONNX)");
-                    }
-                    Err(e) => {
-                        output_error!("\n⚠️  Training queue export failed: {}", e);
-                    }
-                }
-            });
-
-            self.output_status("   Training started in background...");
-        }
+        self.output_status("   Saved privately; automatic training is disabled.");
 
         Ok(())
     }
@@ -4088,52 +4148,6 @@ impl Repl {
         }
 
         Ok(())
-    }
-
-    /// Export training examples to the offline queue (JSONL) for later Python-based LoRA training.
-    ///
-    /// In-process Rust LoRA training is not implemented because ONNX Runtime is inference-only
-    /// and cannot be used for gradient-based weight updates. The full training pipeline uses a
-    /// separate Python script (`scripts/train_lora.py`) that loads the base model via PyTorch +
-    /// PEFT, trains LoRA adapters, and exports them as safetensors.
-    ///
-    /// Adapter re-loading back into ONNX after training is tracked in:
-    ///   GitHub Issue #1 — https://github.com/darwin-finch/finch/issues/1
-    async fn run_background_training(
-        coordinator: Arc<TrainingCoordinator>,
-        _models_dir: Option<PathBuf>,
-    ) -> Result<BackgroundTrainingStats> {
-        tracing::info!("Exporting training examples to offline queue");
-
-        // Verify the buffer has examples before writing
-        let num_examples = {
-            let buffer = coordinator.buffer()?;
-            let n = buffer.examples().len();
-            if n == 0 {
-                anyhow::bail!("No training examples in buffer");
-            }
-            n
-        };
-
-        // Write examples to ~/.finch/training_queue.jsonl for the Python training pipeline.
-        // This is the only part of the training flow that works end-to-end in Rust today.
-        coordinator.write_training_queue()?;
-
-        let queue_path = dirs::home_dir()
-            .map(|h| {
-                h.join(".finch")
-                    .join("training_queue.jsonl")
-                    .display()
-                    .to_string()
-            })
-            .unwrap_or_else(|| "~/.finch/training_queue.jsonl".to_string());
-
-        tracing::info!("Queued {} examples → {}", num_examples, queue_path);
-
-        Ok(BackgroundTrainingStats {
-            examples_trained: num_examples,
-            queue_path,
-        })
     }
 
     /// Handle /plan command - enter planning mode

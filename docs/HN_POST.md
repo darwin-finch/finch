@@ -27,7 +27,7 @@ The reason we started this: X Premium+ includes free Grok API credits at console
 - Background daemon with OpenAI-compatible API + mDNS/Bonjour discovery
 
 **What's not working yet (being honest):**
-- LoRA fine-tuning: the weighted feedback collection (Ctrl+G/Ctrl+B) is wired and writing to ~/.finch/training_queue.jsonl, but training and adapter loading aren't implemented. The planned pipeline is MLX training → Olive conversion → onnxruntime-genai Adapters API at inference time (Issue #1).
+- LoRA fine-tuning: explicit Ctrl+G/Ctrl+B feedback is retained privately in `~/.finch/feedback.jsonl`, but it does not trigger training. Automatic collection, Python training, and adapter hot-loading are disabled while native feasibility remains blocked on Issues #1, #7, and #74.
 - MemTree persistence: the hierarchical memory tree data structure is there and REPL-wired, but SQLite persistence and the TUI tree view aren't done yet.
 - MCP plugin system: config layer is in, connection layer is partial.
 
@@ -56,4 +56,3 @@ We're actively looking for contributors — especially around LoRA adapter loadi
 - Post on a weekday morning US time (9–11am ET)
 - Do not cross-post to HN and Reddit simultaneously; wait for one to settle
 - Respond to every comment in the first 2 hours — HN rewards engagement
-

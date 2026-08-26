@@ -1,11 +1,79 @@
-// LoRA training subprocess spawner
+// Legacy manual LoRA training subprocess spawner
 //
-// Triggers Python training script in background (non-blocking)
+// Not connected to daemon startup, request handling, or feedback. Automatic
+// Python training is disabled under GitHub issue #139.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::process::Command;
+
+trait TrainingCommandFactory: Send + Sync {
+    fn command(&self, program: &str) -> Result<Command>;
+}
+
+struct SystemTrainingCommandFactory;
+
+impl TrainingCommandFactory for SystemTrainingCommandFactory {
+    fn command(&self, program: &str) -> Result<Command> {
+        Ok(Command::new(program))
+    }
+}
+
+#[cfg(test)]
+struct ObservingTrainingCommandFactory {
+    observer: Arc<dyn Fn() + Send + Sync>,
+}
+
+#[cfg(test)]
+impl TrainingCommandFactory for ObservingTrainingCommandFactory {
+    fn command(&self, _program: &str) -> Result<Command> {
+        (self.observer)();
+        anyhow::bail!("training command intercepted by test observer")
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_COMMAND_FACTORY: std::cell::RefCell<Option<Arc<dyn TrainingCommandFactory>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) struct TrainingCommandFactoryGuard;
+
+#[cfg(test)]
+pub(crate) fn observe_training_process_launches(
+    observer: Arc<dyn Fn() + Send + Sync>,
+) -> TrainingCommandFactoryGuard {
+    TEST_COMMAND_FACTORY.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        assert!(
+            slot.is_none(),
+            "training command observer already installed"
+        );
+        *slot = Some(Arc::new(ObservingTrainingCommandFactory { observer }));
+    });
+    TrainingCommandFactoryGuard
+}
+
+#[cfg(test)]
+impl Drop for TrainingCommandFactoryGuard {
+    fn drop(&mut self) {
+        TEST_COMMAND_FACTORY.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+fn default_command_factory() -> Arc<dyn TrainingCommandFactory> {
+    #[cfg(test)]
+    if let Some(factory) = TEST_COMMAND_FACTORY.with(|slot| slot.borrow().clone()) {
+        return factory;
+    }
+    Arc::new(SystemTrainingCommandFactory)
+}
 
 /// Configuration for LoRA training subprocess
 #[derive(Debug, Clone)]
@@ -73,12 +141,16 @@ impl Default for LoRATrainingConfig {
 /// LoRA training subprocess manager
 pub struct LoRATrainingSubprocess {
     config: LoRATrainingConfig,
+    command_factory: Arc<dyn TrainingCommandFactory>,
 }
 
 impl LoRATrainingSubprocess {
     /// Create new subprocess manager with configuration
     pub fn new(config: LoRATrainingConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            command_factory: default_command_factory(),
+        }
     }
 
     /// Create with default configuration
@@ -86,7 +158,7 @@ impl LoRATrainingSubprocess {
         Self::new(LoRATrainingConfig::default())
     }
 
-    /// Trigger background training (non-blocking)
+    /// Explicitly invoke the legacy manual training experiment (non-blocking).
     ///
     /// Spawns Python training script as a detached subprocess.
     /// Does not block - training runs in background.
@@ -117,7 +189,7 @@ impl LoRATrainingSubprocess {
         );
 
         // Build command
-        let mut cmd = Command::new("python3");
+        let mut cmd = self.command_factory.command("python3")?;
         cmd.arg(&self.config.script_path)
             .arg(queue_path)
             .arg(output_adapter)
@@ -195,7 +267,8 @@ impl LoRATrainingSubprocess {
 
     /// Check if Python dependencies are installed
     pub async fn check_dependencies(&self) -> Result<bool> {
-        let output = Command::new("python3")
+        let mut command = self.command_factory.command("python3")?;
+        let output = command
             .arg("-c")
             .arg("import torch, transformers, peft, safetensors; print('OK')")
             .output()
@@ -232,6 +305,7 @@ fn archive_training_queue(queue_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn test_default_config() {
@@ -253,5 +327,19 @@ mod tests {
         let subprocess = LoRATrainingSubprocess::with_defaults();
         // Just check that the function runs (may fail if Python not installed)
         let _ = subprocess.check_dependencies().await;
+    }
+
+    #[tokio::test]
+    async fn test_observing_factory_intercepts_python_command_construction() {
+        let launches = Arc::new(AtomicUsize::new(0));
+        let observed_launches = Arc::clone(&launches);
+        let _guard = observe_training_process_launches(Arc::new(move || {
+            observed_launches.fetch_add(1, Ordering::SeqCst);
+        }));
+        let subprocess = LoRATrainingSubprocess::with_defaults();
+
+        let error = subprocess.check_dependencies().await.unwrap_err();
+        assert!(error.to_string().contains("intercepted"));
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
     }
 }

@@ -1,10 +1,10 @@
 # Architecture
 
-This document describes the technical architecture of Shammah, a local-first AI coding assistant that uses pre-trained ONNX models with LoRA fine-tuning.
+This document describes the technical architecture of Shammah, a local-first AI coding assistant that uses pre-trained ONNX models and cloud fallback.
 
 ## Overview
 
-Shammah provides **immediate, high-quality AI assistance** using pre-trained local models (Qwen via ONNX Runtime) or cloud fallback (Claude, GPT-4, Gemini, Grok), then continuously improves through weighted LoRA fine-tuning to adapt to your specific coding patterns.
+Shammah provides **immediate, high-quality AI assistance** using pre-trained local models (Qwen via ONNX Runtime) or cloud fallback (Claude, GPT-4, Gemini, Grok). Explicit weighted feedback is retained privately, but training is disabled.
 
 **Current State (v0.7.0):**
 - ✅ ONNX Runtime with KV cache support
@@ -13,7 +13,7 @@ Shammah provides **immediate, high-quality AI assistance** using pre-trained loc
 - ✅ OpenAI-compatible HTTP API (VS Code / Continue.dev integration)
 - ✅ Tool execution with pass-through (Read, Glob, Grep, Bash, WebFetch, Edit, Write, Patch)
 - ✅ SSE streaming for local and remote
-- ✅ LoRA fine-tuning infrastructure (feedback collection + JSONL queue)
+- ✅ Private explicit feedback collection (no automatic training trigger)
 - ✅ Multi-provider teacher support (6 providers: Claude, GPT-4, Gemini, Grok, Mistral, Groq)
 - ✅ Unified `[[providers]]` config with transparent migration from `[[teachers]]`
 - ✅ Tabbed setup wizard with ONNX model selection and markdown preview dialogs
@@ -28,9 +28,9 @@ Shammah provides **immediate, high-quality AI assistance** using pre-trained loc
 - ✅ Sliding window context (configurable, default 20 messages) with optional summarization
 - ✅ Input token count in status bar (`↑ N.Nk`)
 - 🚧 MCP plugin system (partial)
-- 🚧 LoRA adapter loading at inference time (Issue #1)
+- ⛔ LoRA training and adapter loading blocked on Issues #1, #7, and #74
 
-**Key Innovation:** Pre-trained models + weighted LoRA fine-tuning = immediate quality + continuous improvement.
+**Learning boundary:** Pre-trained models provide immediate quality. Explicit feedback is retained, but does not alter a model.
 
 ## Architecture Overview
 
@@ -64,7 +64,7 @@ REPL appears instantly (<100ms)
     ┌──────────────────────────────────┐
     │ ONNX Runtime Inference           │
     │ (Qwen 1.5B/3B/7B/14B)           │
-    │ + LoRA Adapters (optional)       │
+    │ (pre-trained base model only)    │
     │ Device: CoreML/CPU               │
     └──────────┬───────────────────────┘
            │
@@ -77,16 +77,16 @@ REPL appears instantly (<100ms)
            v
     User Feedback?
            │
-    ├─ 🔴 Critical issue → High-weight training (10x)
-    ├─ 🟡 Could improve → Medium-weight training (3x)
-    └─ 🟢 Looks good → Normal-weight training (1x)
+    ├─ 🔴 Critical issue → Retained weight 10x
+    ├─ 🟡 Could improve → Retained weight 3x
+    └─ 🟢 Looks good → Retained weight 1x
            │
            v
     ┌──────────────────────────────────┐
-    │  Background LoRA Fine-Tuning     │
-    │  (Python script, non-blocking)   │
-    │  - Weighted sampling             │
-    │  - Saves to safetensors          │
+    │  Private feedback.jsonl          │
+    │  - Locked and synced             │
+    │  - No worker or subprocess       │
+    │  - No adapter generation/loading │
     └──────────────────────────────────┘
 ```
 
@@ -123,12 +123,15 @@ REPL appears instantly (<100ms)
 │   - Session cleanup                 │
 └───────────┬─────────────────────────┘
             │
-      ┌─────┴─────┬─────────┬─────────┐
-      v           v         v         v
-┌─────────┐ ┌─────────┐ ┌──────┐ ┌──────┐
-│ ONNX    │ │ Teacher │ │ Tool │ │ LoRA │
-│ Runtime │ │ APIs    │ │ Exec │ │Train │
-└─────────┘ └─────────┘ └──────┘ └──────┘
+      ┌─────┴─────┬─────────┐
+      v           v         v
+┌─────────┐ ┌─────────┐ ┌──────┐
+│ ONNX    │ │ Teacher │ │ Tool │
+│ Runtime │ │ APIs    │ │ Exec │
+└─────────┘ └─────────┘ └──────┘
+
+Legacy LoRA training and adapter loading are disabled and are not daemon
+components.
 ```
 
 **Key Files:**
@@ -362,11 +365,11 @@ Different providers (Claude vs. Gemini vs. Groq vs. Grok) have subtly different 
 ```
 User Feedback (10x/3x/1x weight)
     ↓
-Feedback logged with weight to JSONL
+Feedback logged with weight to append-only JSONL
     ↓
-~/.finch/training_queue.jsonl
+~/.finch/feedback.jsonl
     ↓
-[Pending] External training step:
+[Blocked; not invoked by Finch] External training step:
   macOS  → MLX (mlx-lm, Apple Silicon native)
   Linux  → PyTorch + PEFT (transformers)
     ↓
@@ -375,19 +378,23 @@ Feedback logged with weight to JSONL
 [Pending] Load via onnxruntime-genai Adapters API at inference
 ```
 
-**Weighted Training:**
+**Weighted Feedback:**
 - **High-weight (10x)**: Critical issues (strategy errors)
   - Example: "Never use .unwrap() in production"
-  - Impact: Model strongly learns to avoid this
+  - Meaning: Retained as a critical user rating
 - **Medium-weight (3x)**: Style preferences
   - Example: "Prefer iterator chains over manual loops"
-  - Impact: Model learns your preferred approach
+  - Meaning: Retained as an improvement request
 - **Normal-weight (1x)**: Good examples
   - Example: "This is exactly right"
-  - Impact: Model learns normally
+  - Meaning: Retained as a positive rating
 
 **Current Status:**
-The feedback collection pipeline works; training and adapter loading are not yet implemented (see Issue #1). Key clarifications:
+Explicit feedback collection works, but it does not enqueue or trigger training.
+The daemon's former Python worker and automatic OpenAI request collection are
+disabled (see Issue #139). Existing `training_queue.jsonl` data is retained
+untouched. Training and adapter loading remain blocked on Issues #1, #7, and
+#74. Key clarifications:
 - ONNX Runtime itself has no training API. The training step uses an external tool: **MLX** on macOS (Apple Silicon) or **PyTorch/PEFT** on Linux/CUDA.
 - `onnxruntime-genai` *does* support loading pre-trained adapters at inference time via `.onnx_adapter` format — this is not blocked by ONNX's lack of training API.
 - `candle-metal` cannot be used for LoRA training on macOS — same missing ops (layer norm) that break inference also break training.
@@ -778,7 +785,8 @@ FINCH-<base64url(JSON payload)>.<base64url(Ed25519 signature over payload bytes)
 12. If tool_use blocks, execute on client side
 13. Send tool results back to daemon
 14. Repeat until final response
-15. Log metrics and feedback
+15. Log source-free metric aggregates; when configured, retain the conversation
+    in canonical semantic memory; retain feedback only after an explicit rating
 ```
 
 ### Daemon Lifecycle
@@ -788,7 +796,7 @@ FINCH-<base64url(JSON payload)>.<base64url(Ed25519 signature over payload bytes)
 2. Load ONNX model (if backend enabled)
    - Download from HuggingFace Hub (first run)
    - Initialize KV cache
-   - Load LoRA adapter (if exists)
+   - Do not scan for or load LoRA adapters (unsupported by the default runtime)
 3. Start HTTP server (port 11435)
 4. Write PID file (~/.finch/daemon.pid)
 5. Accept client connections
@@ -826,32 +834,44 @@ Every request logs:
 ```json
 {
   "timestamp": "2026-02-14T12:00:00Z",
-  "request_id": "abc123",
+  "query_hash": "sha256...",
   "routing_decision": "local",
+  "pattern_id": "threshold_based",
+  "confidence": 0.91,
+  "forward_reason": null,
   "response_time_ms": 650,
-  "tokens_generated": 127,
-  "tool_uses": 2,
-  "forward_reason": null
+  "comparison": {
+    "quality_score": 0.88,
+    "similarity_score": 0.82,
+    "divergence": 0.18
+  },
+  "router_confidence": 0.91,
+  "validator_confidence": 0.88
 }
 ```
 
-Stored in: `~/.finch/metrics/YYYY-MM-DD.jsonl`
+Stored in: `~/.finch/metrics/YYYY-MM-DD.jsonl`. Metrics contain a query hash and
+aggregate routing/quality data, never raw query, response, or tool content.
+Legacy metric records containing response fields remain readable, but new
+records do not serialize those fields.
 
-### Training Data Format
+### Explicit Feedback Format
 
 ```json
 {
-  "id": "uuid",
-  "timestamp": "2026-02-14T12:00:00Z",
+  "timestamp": 1771099200,
   "query": "What is the golden rule?",
   "response": "The golden rule refers to...",
-  "feedback_weight": 1.0,
-  "feedback_type": "normal",
-  "used_for_training": true
+  "rating": "good",
+  "weight": 1.0,
+  "note": "Helpful answer"
 }
 ```
 
-Stored in: `~/.finch/training_queue.jsonl`
+Stored in: `~/.finch/feedback.jsonl` on supported platforms, with private
+permissions, descriptor-bound locking, and a 16 MiB append ceiling. Feedback is
+written only after an explicit rating. It is retained metadata, not an
+executable training queue, and does not trigger training or adapter loading.
 
 ## File Structure
 
@@ -865,7 +885,8 @@ Stored in: `~/.finch/training_queue.jsonl`
 │   └── rust_advanced.safetensors
 ├── metrics/                 # Daily JSONL logs
 │   └── 2026-02-14.jsonl
-├── training_queue.jsonl     # Pending training examples
+├── feedback.jsonl           # Explicit feedback; does not trigger training
+├── training_queue.jsonl     # Preserved legacy queue; not processed by daemon
 └── tool_patterns.json       # Approved tool patterns
 
 ~/.cache/huggingface/hub/    # Base models (HF standard)
@@ -892,7 +913,7 @@ Stored in: `~/.finch/training_queue.jsonl`
 **Models:**
 - Base: Qwen-2.5-1.5B/3B/7B/14B (ONNX format, pre-trained)
 - Source: onnx-community on HuggingFace
-- Adapters: LoRA (domain-specific, ~5MB each, via Python training)
+- Adapters: legacy LoRA files are preserved but not loaded by Finch
 
 **HTTP Server:** Axum
 - Tokio async runtime
@@ -924,13 +945,13 @@ Stored in: `~/.finch/training_queue.jsonl`
 
 **Response Time:**
 - Local generation: 500ms-2s (depending on model size)
-- With LoRA adapter: +50-100ms overhead
+- LoRA adapter overhead: not applicable; adapter loading is disabled
 - Teacher API: Standard API latency (1-3s)
 - Tool execution: ~50-200ms per tool
 
 **Resource Usage:**
 - RAM: 3-28GB (depending on model size)
-- Disk: 1.5-14GB for base model + ~5MB per adapter
+- Disk: 1.5-14GB for the pre-trained base model; preserved legacy adapters are not loaded
 - CPU (idle): <5%
 
 **Daemon:**
@@ -942,8 +963,11 @@ Stored in: `~/.finch/training_queue.jsonl`
 ## Security & Privacy
 
 ### Data Protection
-- All metrics hashed (SHA256) for privacy
-- Models train only on YOUR data
+- Metrics use a SHA256 query identifier and source-free aggregate fields; raw
+  query, response, and tool content is not written to metrics JSONL
+- Explicit feedback remains private metadata; Finch does not train on it or upload it
+- Canonical semantic memory is a separate configurable feature with its own
+  conversation-retention purpose; it is not a LoRA training collector
 - No telemetry, no cloud sync
 - Can delete `~/.finch/` anytime
 
@@ -967,13 +991,13 @@ Stored in: `~/.finch/training_queue.jsonl`
 
 ## Future Optimizations
 
-### Pure Rust LoRA Training
-- Current: Python-based training (2x memory overhead)
-- Future: Custom Rust implementation compatible with ONNX Runtime
-- Options: burn.rs, custom ONNX graph mods, or wait for ONNX Training support
+### Native LoRA Feasibility
+- Current: training is disabled; the Python path is not connected to runtime
+- Future work is gated by Issues #1, #7, and #74
+- Any proposal needs measured native feasibility and explicit resource/privacy controls
 
-### Adapter Loading at Runtime
-- Load trained LoRA adapters during ONNX inference
+### Adapter Loading at Runtime (Blocked)
+- The default runtime does not scan for or load LoRA adapters
 - Requires weight merging or dynamic ONNX graph modification
 - Enables instant domain switching without reloading base model
 

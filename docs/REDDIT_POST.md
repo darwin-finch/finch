@@ -32,7 +32,7 @@ For local inference, we use the `ort` crate (ONNX Runtime bindings). On macOS/Ap
 - Progressive bootstrap: REPL in <100ms, model loads in background
 
 **What's not done yet (being honest with r/rust):**
-- LoRA adapter loading at inference: plan is MLX train → Olive convert → `onnxruntime-genai` Adapters API (Issue #1, 40–80h)
+- LoRA training and adapter loading are disabled while native feasibility remains blocked on Issues #1, #7, and #74
 - MemTree TUI rendering + SQLite persistence
 - MCP connection layer (config is in; JSON-RPC 2.0 over STDIO is the implementation path)
 
@@ -62,7 +62,7 @@ The reason we care about provider flexibility: X Premium+ includes free Grok API
 **New in v0.5.2 — `/plan` command:**
 Type `/plan implement X` and it runs 3 rounds of critique by 7 adversarial personas (Regression Analyst, Edge Case Hunter, Security Auditor, etc.) before presenting a plan for approval. Must-address issues block convergence. Because of a universal alignment prompt, this works on any of the 6 supported cloud providers — the structured JSON output is normalised regardless of which LLM you're on.
 
-**What's not there yet:** LoRA fine-tuning (feedback collection is wired; training and adapter loading aren't), MemTree TUI persistence, MCP connection layer.
+**What's not there yet:** LoRA training and adapter loading (explicit private feedback does not trigger either), MemTree TUI persistence, MCP connection layer.
 
 **Quickstart** (Grok, cloud-only, no model download needed):
 ```
@@ -88,4 +88,3 @@ Source + issue tracker: https://github.com/darwin-finch/finch
 - r/rust: any weekday is fine; technical audience is active throughout the week
 - r/programming: Monday–Wednesday mornings get more traction
 - r/LocalLLaMA: engagement is high any time; lead with the local model angle, not the cloud fallback angle
-

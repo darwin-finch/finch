@@ -174,12 +174,17 @@ To use the local model, run `finch` without `--cloud-only`. The REPL starts imme
 | `/help`              | Show available commands                                |
 | `spawn_task`         | (tool) Delegate a subtask to an isolated subagent loop |
 | `Ctrl+C`             | Cancel the current query                               |
-| `Ctrl+G`             | Mark the last response as good (training signal)       |
-| `Ctrl+B`             | Mark the last response as bad (training signal)        |
+| `Ctrl+G`             | Save a private good-response feedback rating            |
+| `Ctrl+B`             | Save a private bad-response feedback rating             |
 | **In dialogs:** ↑↓   | Navigate between options                               |
 | **In dialogs:** Space | Toggle selection (MultiSelect)                        |
 | **In dialogs:** o/O  | Jump to "Other" row and start typing                   |
 | **In dialogs:** Shift+Enter | Insert newline in custom text field             |
+
+Explicit feedback is private metadata, not an automatic training signal. Finch
+stops appending to `~/.finch/feedback.jsonl` at 16 MiB; at the limit, new
+ratings are rejected without deleting or rotating existing feedback. A legacy
+file already over the ceiling is preserved unchanged and rejects new ratings.
 
 ---
 

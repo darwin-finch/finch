@@ -115,7 +115,7 @@ impl BatchTrainer {
         self.training_queue.lock().await.len()
     }
 
-    /// Check if should trigger automatic training
+    /// Legacy threshold check. No production runtime wires this to training.
     pub async fn should_train_automatically(&self) -> bool {
         self.queue_size().await >= self.batch_size
     }
@@ -141,7 +141,7 @@ impl BatchTrainer {
         let batch_size = self.batch_size;
         let learning_rate = self.learning_rate;
 
-        // Spawn background training task
+        // Legacy library API only; automatic runtime training is disabled.
         tokio::spawn(async move {
             match Self::train_batch_internal(
                 training_queue,
@@ -215,9 +215,9 @@ impl BatchTrainer {
         // GitHub Issue #1. Until that is resolved, in-process batch training
         // has no effect on the served model.
         //
-        // Feedback is collected (src/models/lora.rs, ~/.finch/training_queue.jsonl)
-        // and a Python-based offline training pipeline is available via
-        // src/training/lora_subprocess.rs.
+        // Explicit feedback is retained separately in ~/.finch/feedback.jsonl.
+        // Legacy queue and Python APIs remain compiled but have no automatic
+        // runtime producers (GitHub Issue #139).
         anyhow::bail!(
             "Batch training not yet implemented (see GitHub Issue #1). \
              {} examples were collected but not trained on. \

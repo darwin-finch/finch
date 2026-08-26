@@ -45,9 +45,6 @@ cat > ~/.claude-proxy/config.toml <<EOF
 [router]
 confidence_threshold = 0.85
 target_forward_rate = 0.05
-
-[storage]
-max_training_size = "5GB"
 EOF
 
 # 3. Run daemon mode
@@ -117,11 +114,10 @@ cpu_fallback = true
 # Base directory for Shammah data
 data_dir = "~/.claude-proxy"
 
-# Training data directory
-training_data = "~/.claude-proxy/training"
-
-# Maximum training data size (will prune oldest when exceeded)
-max_training_size = "5GB"
+# Explicit feedback is stored separately in ~/.finch/feedback.jsonl.
+# Finch appends only while the file stays at or below 16 MiB. At the ceiling it
+# rejects new ratings without changing the existing file. An already-oversized
+# legacy file is preserved. Finch never prunes, trains on, or uploads feedback.
 
 # Statistics file
 stats_file = "~/.claude-proxy/stats.json"
@@ -141,20 +137,7 @@ https = false
 # tls_cert = "/path/to/cert.pem"
 # tls_key = "/path/to/key.pem"
 
-# Learning Configuration
-[learning]
-# Enable continuous learning
-enabled = true
-
-# Training frequency (seconds between training runs)
-# 0 = manual training only
-training_interval = 86400  # 24 hours
-
-# Minimum samples before training
-min_samples = 100
-
-# Maximum training time (minutes)
-max_training_time = 60
+# Automatic training is disabled. There is no active [learning] configuration.
 
 # Logging Configuration
 [logging]
@@ -372,20 +355,17 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 **Not recommended**: Plain text in config file
 
-### Training Data Privacy
+### Feedback Privacy
 
-By default, Shammah logs all forwarded requests for training. To disable:
+Finch does not log ordinary forwarded requests for training. Only explicit
+ratings are retained, in `~/.finch/feedback.jsonl`, with private permissions on
+Unix. Appends are capped at a 16 MiB file size: once an append would cross that
+limit, Finch rejects the rating without deleting, rotating, or migrating data.
+An already-oversized legacy file is preserved unchanged and also rejects new
+ratings. Ratings do not launch Python, process a queue, or alter the model.
 
-```toml
-[learning]
-enabled = false
-```
-
-To clear training data:
-
-```bash
-rm -rf ~/.claude-proxy/training/
-```
+Existing legacy queues and adapters are preserved until the user chooses a
+supported disposition; Finch does not delete or migrate them automatically.
 
 ### Network Security
 
@@ -418,18 +398,10 @@ For systems with limited RAM:
 generator = "~/.claude-proxy/models/generator-3b.mlmodel"
 ```
 
-### Training Frequency
+### Training
 
-Adjust based on usage patterns:
-
-```toml
-[learning]
-# High usage: train more often
-training_interval = 3600  # 1 hour
-
-# Low usage: train less often
-training_interval = 604800  # 1 week
-```
+Automatic training has no configurable frequency because it is disabled.
+Native feasibility remains blocked on Issues #1, #7, and #74.
 
 ### Aggressive Local Processing
 
@@ -465,7 +437,7 @@ Shammah tracks metrics in `~/.claude-proxy/stats.json`:
   "avg_forward_latency_ms": 834,
   "local_accuracy": 0.921,
   "cost_savings_usd": 24.35,
-  "last_training": "2026-01-28T14:30:00Z",
+  "training_status": "disabled",
   "model_version": "v1.2.0"
 }
 ```
@@ -519,15 +491,11 @@ finch models download
 finch daemon --port 8001
 ```
 
-**Out of disk space**:
-```bash
-# Reduce training data limit
-[storage]
-max_training_size = "1GB"
-
-# Or clean old data
-finch clean --keep-recent 30d
-```
+**Feedback retention**: Finch stops appending explicit feedback when the file
+reaches 16 MiB. At the limit it rejects new ratings and leaves the existing file
+untouched; an already-oversized legacy file is likewise preserved unchanged.
+Finch does not silently prune or rotate feedback, and does not prune legacy
+training data. Review files manually before choosing any disposition.
 
 ## Advanced Configuration
 
@@ -566,16 +534,9 @@ Use profile:
 finch --profile conservative
 ```
 
-### Federation (Future)
+### Federation
 
-Share anonymized training data (opt-in):
-
-```toml
-[federation]
-enabled = false
-server = "https://federation.finch.ai"
-anonymous_id = "uuid-generated-locally"
-```
+Feedback federation is not implemented. Finch does not upload feedback.
 
 ## See Also
 

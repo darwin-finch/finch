@@ -18,18 +18,12 @@ model_family = "qwen2"
 model_size = "medium"         # small=1.5B medium=3B large=7B xlarge=14B
 enabled = true
 
-[lora]
-rank = 16
-alpha = 32.0
-learning_rate = 1e-4
-batch_size = 4
-auto_train = true
-auto_train_threshold = 10
-high_weight = 10.0
-medium_weight = 3.0
-normal_weight = 1.0
-adapters_dir = "~/.finch/adapters"
 ```
+
+Automatic training is disabled and there are no active `auto_train` settings.
+Explicit feedback is retained privately in `~/.finch/feedback.jsonl` without
+triggering training. Existing legacy training queues and adapters are left
+untouched.
 
 **Supported `type` values:** `claude`, `openai`, `grok`, `gemini`, `mistral`, `groq`, `local`
 

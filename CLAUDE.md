@@ -6,7 +6,7 @@ This document orients AI assistants working on the Finch project. Implementation
 
 **Project Name**: Shammah (שָׁמָה - "watchman/guardian")
 **Binary**: `finch`
-**Purpose**: Local-first AI coding assistant with continuous improvement
+**Purpose**: Local-first AI coding assistant with explicit private feedback
 **Core Innovation**: Local ONNX inference across 6 model families; Apple Silicon acceleration via CoreML EP; cloud fallback during bootstrap
 
 **The Problem:** Traditional AI assistants require constant internet, incur API costs per query, and can't learn your patterns.
@@ -94,11 +94,11 @@ Behaviors that **must always be true**. If a test doesn't exist for a claim belo
 
 ### Pre-trained models (not training from scratch)
 
-Using pre-trained Qwen models gives immediate quality from day 1 with no cold-start period. LoRA fine-tuning on user feedback is planned (Issue #1) for domain adaptation without full retraining.
+Using pre-trained Qwen models gives immediate quality from day 1 with no cold-start period. LoRA training and adapter loading remain blocked on Issues #1, #7, and #74.
 
-### Weighted LoRA training
+### Weighted feedback
 
-Three tiers: high (10x), medium (3x), normal (1x). Critical feedback (strategy errors) has 10x more impact during training. `Ctrl+G` = good, `Ctrl+B` = bad.
+Three historical weight tiers are retained for explicit feedback: high (10x), medium (3x), normal (1x). `Ctrl+G` = good, `Ctrl+B` = bad. Feedback is private durable data; it does not trigger training.
 
 ### Progressive Bootstrap
 
@@ -113,8 +113,9 @@ REPL appears in <100ms; model loads in the background. Queries forward to teache
 ```
 ~/.finch/
 ├── config.toml          # User config
-├── adapters/            # LoRA adapters (planned)
-├── training_queue.jsonl # Feedback for training
+├── adapters/            # Preserved legacy adapters; not loaded automatically
+├── feedback.jsonl       # Private explicit feedback; never a training trigger
+├── training_queue.jsonl # Preserved legacy queue; not processed automatically
 ├── metrics/             # Usage metrics
 └── tool_patterns.json   # Approved tool patterns
 
@@ -244,8 +245,8 @@ GitHub Actions builds `finch-macos-arm64.tar.gz` (macOS 14 runner) and `finch-li
 | TUI with scrollback/streaming | ✅ |
 | Daemon (OpenAI-compatible API) | ✅ |
 | mDNS discovery | ✅ |
-| LoRA feedback collection | ✅ |
-| LoRA training + adapter loading | ⏳ Issue #1 |
+| Private explicit feedback collection | ✅ |
+| LoRA training + adapter loading | Blocked: Issues #1/#7/#74 |
 | Mistral ONNX | ⏳ Issue #2 |
 
 ### Open Issues
@@ -269,8 +270,8 @@ See **https://github.com/darwin-finch/finch/issues**
 ## Key Principles
 
 1. **Immediate Quality** — pre-trained models work day 1
-2. **Continuous Improvement** — LoRA fine-tuning adapts to user
-3. **User Control** — weighted feedback, manual overrides
+2. **Explicit Feedback** — user ratings are retained privately
+3. **User Control** — feedback never implies consent to train
 4. **Privacy First** — local inference, offline capability
 5. **Professional UX** — instant startup, graceful degradation
 6. **Rust Best Practices** — safe, idiomatic, performant code

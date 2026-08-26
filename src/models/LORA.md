@@ -1,14 +1,15 @@
-# LoRA Fine-Tuning Infrastructure
+# LoRA Placeholders and Retained Feedback
 
-**Status: Feedback collection works. Training not yet implemented.**
+**Status: Automatic training and adapter loading are disabled (Issue #139).**
 
 ## What works today
 
-- `Ctrl+G` (good) / `Ctrl+B` (bad) on any response records a weighted example
-- Examples written to `~/.finch/training_queue.jsonl` as JSONL
+- `Ctrl+G` (good) / `Ctrl+B` (bad) records explicit feedback
+- Feedback is written privately to `~/.finch/feedback.jsonl`
 - Three weight tiers: **high (10x)**, **medium (3x)**, **normal (1x)**
 - `LoRAConfig` and `LoRAAdapter` structs exist as infrastructure placeholders
 - `train()` returns `anyhow::bail!("LoRA fine-tuning not yet implemented")` — tracked as **Issue #1** (40-80h)
+- Existing `training_queue.jsonl` and adapter files are preserved but not processed
 
 ## What is not yet implemented
 
@@ -16,7 +17,7 @@
 - Adapter saving to `~/.finch/adapters/`
 - Adapter loading at ONNX inference time
 
-## Planned training pipeline (Issue #1)
+## Blocked training investigation (Issues #1, #7, and #74)
 
 **Training (external tool):**
 - macOS: [MLX](https://github.com/ml-explore/mlx-lm) — community standard for LoRA on Apple Silicon
