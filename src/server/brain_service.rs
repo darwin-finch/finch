@@ -544,46 +544,14 @@ impl BrainLifecycleService {
         // generation disconnects, finish its reserved terminal outcome and
         // release only waits for that run, even if the runner never replies.
         for run_id in reserved {
-            if self.store.complete_reserved_run_cancellation_on_disconnect(
-                brain,
-                "daemon",
-                run_id,
-            )? {
-                self.runners.abort_run(brain, run_id);
-            } else {
-                let store = self.store.clone();
-                let runners = self.runners.clone();
-                let brain = brain.to_string();
-                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    runtime.spawn(async move {
-                        let publication = match store.acquire_run_publication(&brain, run_id).await {
-                            Ok(publication) => publication,
-                            Err(error) => {
-                                tracing::error!(brain = %brain, run_id = %run_id.0, %error,
-                                    "could not acquire reserved cancellation publication owner");
-                                return;
-                            }
-                        };
-                        let pending = store.run_cancellation_reserved(&brain, run_id)
-                            .unwrap_or(false)
-                            && store.inspect_run(&brain, run_id)
-                                .is_ok_and(|run| !run.status.is_terminal());
-                        if pending {
-                            if let Err(error) = store.complete_reserved_run_cancellation(
-                                &brain, "daemon", run_id,
-                            ) {
-                                tracing::error!(brain = %brain, run_id = %run_id.0, %error,
-                                    "could not publish reserved disconnect cancellation");
-                            }
-                        }
-                        drop(publication);
-                        let _ = store.prune_run_publication(&brain, run_id);
-                        runners.abort_run(&brain, run_id);
-                    });
-                } else {
-                    tracing::error!(brain = %brain, run_id = %run_id.0,
-                        "durable cancellation reservation awaits daemon runtime reconciliation");
-                }
+            self.runners.abort_run(brain, run_id);
+            match self.store.complete_reserved_run_cancellation_on_disconnect(
+                brain, "daemon", run_id,
+            ) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => self.store.schedule_reserved_cancellation_retry(
+                    brain.to_string(), "daemon".into(), run_id,
+                ),
             }
         }
         self.store.remove_if_unused(brain)?;

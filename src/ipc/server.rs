@@ -475,13 +475,7 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
                     decision
                 }
                 Err(error) => {
-                    let _ = store.transition_run(
-                        &brain,
-                        "daemon",
-                        run_id,
-                        crate::brain::store::BrainRunStatus::Interrupted,
-                        Some(error.to_string()),
-                    );
+                    // The run supervisor exclusively publishes terminal outcomes.
                     return Err(capnp::Error::failed(error.to_string()));
                 }
             };

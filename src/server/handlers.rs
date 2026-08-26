@@ -3731,6 +3731,7 @@ pub async fn health_check(
     State(server): State<Arc<AgentServer>>,
 ) -> Result<Json<HealthStatus>, AppError> {
     // TODO: Track actual uptime
+    let named_brains = server.brain_store().list()?.len();
     let pending_brain_terminalizations = server
         .brain_store()
         .pending_disconnect_terminalization_retries();
@@ -3741,7 +3742,7 @@ pub async fn health_check(
             "degraded"
         }.to_string(),
         uptime_seconds: 0, // Placeholder
-        named_brains: server.brain_store().list()?.len(),
+        named_brains,
         pending_brain_terminalizations,
     };
 
@@ -4057,6 +4058,7 @@ mod handler_tests {
             }
         }).await.expect("WebSocket CancelRun did not reach the runner");
         assert_eq!(withheld_cancel.run_id, run_id);
+        server.brain_store().fail_cancellation_terminal_appends_for_test(3);
 
         let mut close = Box::pin(socket.close(None));
         tokio::time::timeout(std::time::Duration::from_millis(250), async {
@@ -4095,6 +4097,15 @@ mod handler_tests {
         }).await.expect("pre-disconnect reverse approval did not fail closed").unwrap_err();
         assert!(approval_error.to_string().contains("approval audience disconnected"),
             "unexpected approval failure: {approval_error}");
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                if lifecycle.snapshot("shared").unwrap().runs.iter().any(|run| {
+                    run.request_seq == request_seq
+                        && run.status == crate::brain::store::BrainRunStatus::Cancelled
+                }) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("reserved cancellation retry did not terminalize the run");
         let disconnected = lifecycle.snapshot("shared").unwrap();
         let run = disconnected.runs.iter().find(|run| run.request_seq == request_seq).unwrap();
         assert_eq!(run.status, crate::brain::store::BrainRunStatus::Cancelled);
