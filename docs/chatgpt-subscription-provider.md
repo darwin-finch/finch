@@ -25,12 +25,16 @@ Codex CLI 0.149.1 does not expose the required readable-root controls, so Finch
 rejects that version for all ChatGPT subscription turns; install a newer Codex
 release whose generated schema includes the restricted `readOnly` access variant.
 Finch additionally pins one canonical, owner-controlled Codex launcher/interpreter
-identity for schema inspection and runtime, and accepts only explicitly audited CLI
+identity and SHA-256 artifact pair for schema inspection and runtime, rejects any
+writable installation ancestor, and accepts only explicitly audited CLI
 versions. No Codex release is currently on that allowlist: a release must be audited
 for effective built-in tools, managed configuration precedence, environments, and
 sandbox enforcement before this provider becomes available. This deliberate fail-
 closed compatibility limit prevents a future schema-compatible release from being
 trusted automatically.
+
+The profile default is `gpt-5.6-sol`; the official `gpt-5.6` alias currently routes
+to that model. Finch does not substitute the lower-cost Terra tier implicitly.
 
 This is an agent-protocol adapter, not raw Chat Completions or Responses API
 parity. Finch tool calls require the installed app-server schema to advertise the
@@ -49,3 +53,4 @@ Official references:
 
 - [Codex app-server](https://developers.openai.com/codex/app-server)
 - [Codex authentication](https://developers.openai.com/codex/auth)
+- [GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
