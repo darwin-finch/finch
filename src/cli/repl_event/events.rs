@@ -231,6 +231,11 @@ pub enum ReplEvent {
     /// A complete provider/tool/VM turn routed to the frontend holding the
     /// named Brain's environment-runner lease.
     NamedBrainTurnRequested(crate::server::RunnerTurnRequest),
+    /// The physical callback owner stopped waiting for one exact delegated turn.
+    NamedBrainTurnCallbackCancelled {
+        query_id: uuid::Uuid,
+        run_id: crate::brain::store::RunId,
+    },
     /// Project a daemon-committed successful turn into runner-owned memory.
     NamedBrainMemoryProjectionRequested(crate::server::RunnerMemoryProjectionRequest),
     /// Cancel one exact ProgramRun currently owned by this frontend.

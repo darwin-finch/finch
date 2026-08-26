@@ -53,6 +53,15 @@ impl ApprovalDeadline {
             instant: now + std::time::Duration::from_millis(remaining_ms),
         })
     }
+
+    fn is_expired(self) -> bool {
+        tokio::time::Instant::now() >= self.instant
+            || crate::brain::store::unix_millis() >= self.expires_ms
+    }
+
+    fn expired_message(self) -> String {
+        format!("approval request expired at {} ms", self.expires_ms)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -66,6 +75,7 @@ struct PendingApproval {
     request_seq: u64,
     audience: BrainApprovalAudience,
     connection_id: Option<ConnectionId>,
+    deadline: ApprovalDeadline,
     response_tx: Option<oneshot::Sender<Result<serde_json::Value, String>>>,
     delivered_decision: Option<serde_json::Value>,
 }
@@ -90,6 +100,25 @@ pub struct ClaimedApproval {
 }
 
 impl BrainApprovalBroker {
+    fn reject_expired(
+        pending: &mut HashMap<ApprovalKey, PendingApproval>,
+        key: &ApprovalKey,
+    ) -> Result<()> {
+        let Some(deadline) = pending.get(key).map(|request| request.deadline) else {
+            return Ok(());
+        };
+        if !deadline.is_expired() {
+            return Ok(());
+        }
+        let message = deadline.expired_message();
+        if let Some(request) = pending.remove(key) {
+            if let Some(response_tx) = request.response_tx {
+                let _ = response_tx.send(Err(message.clone()));
+            }
+        }
+        anyhow::bail!(message)
+    }
+
     /// Serialize durable decisions for one approval without taking the Brain's
     /// turn lane. The originating turn intentionally holds that lane while its
     /// runner waits for this decision.
@@ -129,6 +158,17 @@ impl BrainApprovalBroker {
             None,
             ApprovalDeadline::full_window(),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_with_deadline(
+        &self,
+        request_seq: u64,
+        approval_id: impl Into<String>,
+        audience: BrainApprovalAudience,
+        deadline: ApprovalDeadline,
+    ) -> Result<ApprovalRegistration> {
+        self.register_inner(request_seq, approval_id, audience, None, deadline)
     }
 
     pub fn register_for_connection(
@@ -181,6 +221,7 @@ impl BrainApprovalBroker {
                 request_seq,
                 audience,
                 connection_id: Some(connection_id),
+                deadline,
                 response_tx: Some(response_tx),
                 delivered_decision: None,
             },
@@ -224,6 +265,7 @@ impl BrainApprovalBroker {
                 request_seq,
                 audience,
                 connection_id,
+                deadline,
                 response_tx: Some(response_tx),
                 delivered_decision: None,
             },
@@ -241,7 +283,8 @@ impl BrainApprovalBroker {
         attachment_id: AttachmentId, connection_id: ConnectionId,
     ) -> Result<BrainApprovalAudience> {
         let key = ApprovalKey { brain_id, request_seq, approval_id: approval_id.to_string() };
-        let pending = self.pending.lock().expect("approval broker lock poisoned");
+        let mut pending = self.pending.lock().expect("approval broker lock poisoned");
+        Self::reject_expired(&mut pending, &key)?;
         let request = pending.get(&key).with_context(|| {
             format!("approval '{approval_id}' is not pending for request {request_seq}")
         })?;
@@ -253,6 +296,36 @@ impl BrainApprovalBroker {
         Ok(request.audience.clone())
     }
 
+    pub(crate) fn authorize_connection<T>(
+        &self,
+        brain_id: BrainId,
+        request_seq: u64,
+        approval_id: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        authorize: impl FnOnce(&BrainApprovalAudience) -> Result<T>,
+    ) -> Result<T> {
+        let key = ApprovalKey {
+            brain_id,
+            request_seq,
+            approval_id: approval_id.to_string(),
+        };
+        let mut pending = self.pending.lock().expect("approval broker lock poisoned");
+        Self::reject_expired(&mut pending, &key)?;
+        let request = pending.get(&key).with_context(|| {
+            format!("approval '{approval_id}' is not pending for request {request_seq}")
+        })?;
+        anyhow::ensure!(
+            request.audience.attachment_id == attachment_id,
+            "attachment is not the approval audience"
+        );
+        anyhow::ensure!(
+            request.connection_id.is_none() || request.connection_id == Some(connection_id),
+            "connection is not the approval audience generation"
+        );
+        authorize(&request.audience)
+    }
+
     pub fn deliver_connection(
         &self, brain_id: BrainId, request_seq: u64, approval_id: &str,
         attachment_id: AttachmentId, connection_id: ConnectionId,
@@ -260,6 +333,7 @@ impl BrainApprovalBroker {
     ) -> Result<()> {
         let key = ApprovalKey { brain_id, request_seq, approval_id: approval_id.to_string() };
         let mut pending = self.pending.lock().expect("approval broker lock poisoned");
+        Self::reject_expired(&mut pending, &key)?;
         let request = pending.get_mut(&key).with_context(|| {
             format!("approval '{approval_id}' is not pending for request {request_seq}")
         })?;
@@ -294,6 +368,7 @@ impl BrainApprovalBroker {
             approval_id: approval_id.to_string(),
         };
         let mut pending = self.pending.lock().expect("approval broker lock poisoned");
+        Self::reject_expired(&mut pending, &key)?;
         let request = pending
             .get(&key)
             .with_context(|| {
@@ -319,6 +394,7 @@ impl BrainApprovalBroker {
     ) -> Result<ClaimedApproval> {
         let key = ApprovalKey { brain_id, request_seq, approval_id: approval_id.to_string() };
         let mut pending = self.pending.lock().expect("approval broker lock poisoned");
+        Self::reject_expired(&mut pending, &key)?;
         let request = pending.get(&key).with_context(|| {
             format!("approval '{approval_id}' is not pending for request {request_seq}")
         })?;
@@ -337,7 +413,8 @@ impl BrainApprovalBroker {
         attachment_id: AttachmentId,
     ) -> Result<BrainApprovalAudience> {
         let key = ApprovalKey { brain_id, request_seq, approval_id: approval_id.to_string() };
-        let pending = self.pending.lock().expect("approval broker lock poisoned");
+        let mut pending = self.pending.lock().expect("approval broker lock poisoned");
+        Self::reject_expired(&mut pending, &key)?;
         let request = pending.get(&key).with_context(|| {
             format!("approval '{approval_id}' is not pending for request {request_seq}")
         })?;
@@ -346,12 +423,38 @@ impl BrainApprovalBroker {
         Ok(request.audience.clone())
     }
 
+    pub(crate) fn authorize<T>(
+        &self,
+        brain_id: BrainId,
+        request_seq: u64,
+        approval_id: &str,
+        attachment_id: AttachmentId,
+        authorize: impl FnOnce(&BrainApprovalAudience) -> Result<T>,
+    ) -> Result<T> {
+        let key = ApprovalKey {
+            brain_id,
+            request_seq,
+            approval_id: approval_id.to_string(),
+        };
+        let mut pending = self.pending.lock().expect("approval broker lock poisoned");
+        Self::reject_expired(&mut pending, &key)?;
+        let request = pending.get(&key).with_context(|| {
+            format!("approval '{approval_id}' is not pending for request {request_seq}")
+        })?;
+        anyhow::ensure!(
+            request.audience.attachment_id == attachment_id,
+            "attachment is not the approval audience"
+        );
+        authorize(&request.audience)
+    }
+
     pub fn deliver(
         &self, brain_id: BrainId, request_seq: u64, approval_id: &str,
         attachment_id: AttachmentId, decision: serde_json::Value,
     ) -> Result<()> {
         let key = ApprovalKey { brain_id, request_seq, approval_id: approval_id.to_string() };
         let mut pending = self.pending.lock().expect("approval broker lock poisoned");
+        Self::reject_expired(&mut pending, &key)?;
         let request = pending.get_mut(&key).with_context(|| {
             format!("approval '{approval_id}' is not pending for request {request_seq}")
         })?;

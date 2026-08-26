@@ -27,6 +27,16 @@ use super::events::{LlmRequest, ReplEvent};
 use super::model_selection::GeneratorPins;
 use super::query_processor::{process_query_with_tools, ActiveToolUsesMap};
 use super::query_state::{QueryState, QueryStateManager};
+
+async fn run_query_until_cancelled(
+    cancel: tokio_util::sync::CancellationToken,
+    processing: impl std::future::Future<Output = ()>,
+) {
+    tokio::select! {
+        _ = cancel.cancelled() => {}
+        _ = processing => {}
+    }
+}
 use super::tool_execution::ToolExecutionCoordinator;
 
 /// LLM worker loop — owns AI generation concerns, runs as its own Tokio task.
@@ -216,9 +226,14 @@ impl LlmLoop {
         let tool_call_history = Arc::clone(&self.tool_call_history);
         let pinned_generators = Arc::clone(&self.pinned_generators);
         let terminal_query_states = Arc::clone(&query_states);
+        let query_cancel = query_states
+            .get_metadata(query_id)
+            .await
+            .map(|metadata| metadata.cancellation_token)
+            .unwrap_or_default();
 
         tokio::spawn(async move {
-            process_query_with_tools(
+            let processing = process_query_with_tools(
                 query_id,
                 query,
                 event_tx,
@@ -249,8 +264,8 @@ impl LlmLoop {
                 tool_call_history,
                 wire_metrics_logger,
                 persona_system_prompt,
-            )
-            .await;
+            );
+            run_query_until_cancelled(query_cancel, processing).await;
 
             // Returning in ExecutingTools means another turn with the same ID
             // is imminent. Every other return is terminal (including transport
@@ -262,5 +277,36 @@ impl LlmLoop {
                 pinned_generators.release(query_id).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn query_cancellation_drops_inflight_provider_generation() {
+        struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = {
+            let dropped = std::sync::Arc::clone(&dropped);
+            async move {
+                let _drop_flag = DropFlag(dropped);
+                std::future::pending::<()>().await;
+            }
+        };
+        let task = tokio::spawn(super::run_query_until_cancelled(cancel.clone(), provider));
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("cancelled provider generation must terminate")
+            .unwrap();
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

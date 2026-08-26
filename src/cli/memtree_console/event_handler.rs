@@ -105,6 +105,7 @@ impl EventHandler {
             | ReplEvent::RunnerLeaseStatus { .. }
             | ReplEvent::NamedBrainProgramRequested(_)
             | ReplEvent::NamedBrainTurnRequested(_)
+            | ReplEvent::NamedBrainTurnCallbackCancelled { .. }
             | ReplEvent::NamedBrainMemoryProjectionRequested(_)
             | ReplEvent::NamedBrainRunCancelRequested(_)
             | ReplEvent::NamedBrainProgramFinished(_)

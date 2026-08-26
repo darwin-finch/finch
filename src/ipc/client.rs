@@ -974,6 +974,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                 }
             }
         });
+        let cancel = tokio_util::sync::CancellationToken::new();
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if self
             .event_tx
@@ -1009,7 +1010,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                             None
                         },
                         control_tx: Some(control_tx),
-                        cancel: tokio_util::sync::CancellationToken::new(),
+                        cancel: cancel.clone(),
                         response_tx,
                     },
                 ),
@@ -1018,10 +1019,13 @@ impl brain_runner::Server for BrainRunnerImpl {
         {
             return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));
         }
+        let callback_cancellation = RunnerCallbackCancellation::new(cancel);
         Promise::from_future(async move {
+            let mut callback_cancellation = callback_cancellation;
             let response = response_rx
                 .await
                 .map_err(|_| capnp::Error::failed("frontend dropped runner response".into()))?;
+            callback_cancellation.disarm();
             let mut result = results.get().init_result();
             let effect_journal = match &response {
                 Ok(response) => &response.effect_journal,
@@ -1113,6 +1117,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                 let _ = request.response_tx.send(result);
             }
         });
+        let cancel = tokio_util::sync::CancellationToken::new();
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if self
             .event_tx
@@ -1131,7 +1136,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                     hard_deadline: tokio::time::Instant::now(),
                     hard_deadline_ms: crate::brain::store::unix_millis(),
                     approval_tx: Some(approval_tx),
-                    cancel: tokio_util::sync::CancellationToken::new(),
+                    cancel: cancel.clone(),
                     response_tx,
                 },
             ))
@@ -1139,10 +1144,13 @@ impl brain_runner::Server for BrainRunnerImpl {
         {
             return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));
         }
+        let callback_cancellation = RunnerCallbackCancellation::new(cancel);
         Promise::from_future(async move {
+            let mut callback_cancellation = callback_cancellation;
             let response = response_rx
                 .await
                 .map_err(|_| capnp::Error::failed("frontend dropped runner response".into()))?;
+            callback_cancellation.disarm();
             let mut result = results.get().init_result();
             let turn_events = match &response {
                 Ok(response) => &response.turn_events,
@@ -1618,6 +1626,23 @@ fn read_query_response(
 mod tests {
     use super::*;
 
+    struct UnusedProgramControl;
+    impl finch_ipc_capnp::brain_program_control::Server for UnusedProgramControl {}
+
+    struct UnusedTurnControl;
+    impl finch_ipc_capnp::brain_turn_control::Server for UnusedTurnControl {}
+
+    fn test_approval_audience() -> crate::brain::store::BrainApprovalAudience {
+        crate::brain::store::BrainApprovalAudience {
+            brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
+            brain: "shared".into(),
+            attachment_id: crate::brain::store::AttachmentId(uuid::Uuid::new_v4()),
+            subject: "alice@box.local".into(),
+            role: crate::brain::store::AttachmentRole::Driver,
+            environment_generation: 3,
+        }
+    }
+
     #[test]
     fn ipc_protocol_handshake_accepts_only_the_current_generation() {
         ensure_compatible_protocol(crate::ipc::IPC_PROTOCOL_VERSION).unwrap();
@@ -1662,6 +1687,93 @@ mod tests {
             tokio::task::yield_now().await;
             assert!(request.cancel.is_cancelled());
             assert!(request.response_tx.send(Ok(2)).is_err());
+        }));
+    }
+
+    #[test]
+    fn dropped_program_rpc_cancels_the_exact_enqueued_frontend_request() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl { event_tx });
+            let run_id = uuid::Uuid::new_v4();
+            let mut call = runner.run_program_request();
+            {
+                let mut request = call.get().init_request();
+                request.set_brain("shared");
+                request.set_run_id(&run_id.to_string());
+                request.set_request_seq(7);
+                request.set_language(finch_ipc_capnp::ProgramLanguage::Forth);
+                request.set_source("1 2 +");
+                request.set_interaction(finch_ipc_capnp::BrainProgramInteraction::Noninteractive);
+                request.set_has_grant_ceiling(false);
+                request.set_control(capnp_rpc::new_client(UnusedProgramControl));
+            }
+            let rpc = tokio::task::spawn_local(async move { call.send().promise.await });
+            let event = event_rx.recv().await.unwrap();
+            let crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(request) = event
+            else {
+                panic!("expected program request")
+            };
+
+            rpc.abort();
+            let _ = rpc.await;
+            tokio::task::yield_now().await;
+            assert!(request.cancel.is_cancelled());
+            assert!(request
+                .response_tx
+                .send(Err("late completion".to_string().into()))
+                .is_err());
+        }));
+    }
+
+    #[test]
+    fn dropped_turn_rpc_cancels_the_exact_enqueued_frontend_query_request() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl { event_tx });
+            let run_id = uuid::Uuid::new_v4();
+            let mut call = runner.run_turn_request();
+            {
+                let mut request = call.get().init_request();
+                request.set_brain("shared");
+                request.set_run_id(&run_id.to_string());
+                request.set_request_seq(9);
+                request.set_prompt("work");
+                request.reborrow().init_context(0);
+                encode_approval_audience(
+                    request.reborrow().init_approval_audience(),
+                    &test_approval_audience(),
+                );
+                request.set_control(capnp_rpc::new_client(UnusedTurnControl));
+            }
+            let rpc = tokio::task::spawn_local(async move { call.send().promise.await });
+            let event = event_rx.recv().await.unwrap();
+            let crate::cli::repl_event::ReplEvent::NamedBrainTurnRequested(request) = event else {
+                panic!("expected turn request")
+            };
+
+            rpc.abort();
+            let _ = rpc.await;
+            tokio::task::yield_now().await;
+            assert!(request.cancel.is_cancelled());
+            assert!(request
+                .response_tx
+                .send(Err(crate::server::RunnerTurnError {
+                    message: "late completion".into(),
+                    turn_events: Vec::new(),
+                    effect_journal: Vec::new(),
+                }))
+                .is_err());
         }));
     }
 

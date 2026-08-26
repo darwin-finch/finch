@@ -611,11 +611,37 @@ struct PendingNamedBrainTurn {
     /// Keep the correlation record until cancellation reaches a terminal VM
     /// boundary and all execute-once effects have been collected.
     cancellation_requested: bool,
+    /// Exact callback lifetime token received from the physical runner RPC.
+    callback_cancel: tokio_util::sync::CancellationToken,
     approval_audience: crate::brain::store::BrainApprovalAudience,
     approval_tx: Option<
         tokio::sync::mpsc::UnboundedSender<crate::server::RunnerApprovalRequest>,
     >,
     restart: Option<crate::tools::implementations::restart::DeferredFrontendRestart>,
+}
+
+async fn take_cancelled_named_brain_turn(
+    query_states: &super::query_state::QueryStateManager,
+    active_query_id: &RwLock<Option<Uuid>>,
+    pending_turns: &mut std::collections::HashMap<Uuid, PendingNamedBrainTurn>,
+    query_id: Uuid,
+    run_id: crate::brain::store::RunId,
+) -> (Option<PendingNamedBrainTurn>, bool) {
+    let matches = pending_turns.get(&query_id).is_some_and(|pending| {
+        pending.run_id == run_id && pending.callback_cancel.is_cancelled()
+    });
+    if !matches {
+        return (None, false);
+    }
+
+    query_states.cancel_query(query_id).await;
+    let pending = pending_turns.remove(&query_id);
+    let mut active = active_query_id.write().await;
+    let released = *active == Some(query_id);
+    if released {
+        *active = None;
+    }
+    (pending, released)
 }
 
 async fn resume_named_brain_program_boundaries(
@@ -2164,6 +2190,9 @@ impl EventLoop {
                         ReplEvent::RunnerLeaseStatus { .. } => "RunnerLeaseStatus",
                         ReplEvent::NamedBrainProgramRequested(_) => "NamedBrainProgramRequested",
                         ReplEvent::NamedBrainTurnRequested(_) => "NamedBrainTurnRequested",
+                        ReplEvent::NamedBrainTurnCallbackCancelled { .. } => {
+                            "NamedBrainTurnCallbackCancelled"
+                        }
                         ReplEvent::NamedBrainMemoryProjectionRequested(_) => {
                             "NamedBrainMemoryProjectionRequested"
                         }
@@ -4567,6 +4596,9 @@ Rules:\n\
             ReplEvent::NamedBrainTurnRequested(request) => {
                 self.dispatch_named_brain_turn(request).await?;
             }
+            ReplEvent::NamedBrainTurnCallbackCancelled { query_id, run_id } => {
+                self.cancel_named_brain_turn_callback(query_id, run_id).await;
+            }
             ReplEvent::NamedBrainMemoryProjectionRequested(request) => {
                 self.project_named_brain_memory(request).await;
             }
@@ -4621,7 +4653,7 @@ Rules:\n\
         let event_tx = self.event_tx.clone();
         let run_id = request.run_id;
         let request_seq = request.request_seq;
-        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel = request.cancel.clone();
         self.pending_named_brain_programs
             .insert(run_id, cancel.clone());
         tokio::task::spawn_local(async move {
@@ -4781,6 +4813,7 @@ Rules:\n\
             .await
             .restore_snapshot(context.clone());
         let query_id = self.query_states.create_query(context).await;
+        let callback_cancel = request.cancel.clone();
         self.query_states
             .bind_brain_turn_provenance(
                 query_id,
@@ -4812,6 +4845,7 @@ Rules:\n\
                 turn_events: Vec::new(),
                 effect_journal: Vec::new(),
                 cancellation_requested: false,
+                callback_cancel: request.cancel,
                 approval_audience: request.approval_audience,
                 approval_tx: request.approval_tx,
                 restart: None,
@@ -4825,6 +4859,14 @@ Rules:\n\
                 },
             ))
             .await;
+        let event_tx = self.event_tx.clone();
+        tokio::task::spawn_local(async move {
+            callback_cancel.cancelled().await;
+            let _ = event_tx.send(ReplEvent::NamedBrainTurnCallbackCancelled {
+                query_id,
+                run_id: request.run_id,
+            });
+        });
         self.update_compaction_status().await;
         if self
             .llm_tx
@@ -4846,6 +4888,31 @@ Rules:\n\
             }
         }
         Ok(())
+    }
+
+    async fn cancel_named_brain_turn_callback(
+        &mut self,
+        query_id: Uuid,
+        run_id: crate::brain::store::RunId,
+    ) {
+        let (pending, lane_released) = take_cancelled_named_brain_turn(
+            self.query_states.as_ref(),
+            self.active_query_id.as_ref(),
+            &mut self.pending_named_brain_turns,
+            query_id,
+            run_id,
+        )
+        .await;
+        if let Some(pending) = pending {
+            let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
+                message: "named Brain runner callback disconnected".into(),
+                turn_events: pending.turn_events,
+                effect_journal: pending.effect_journal,
+            }));
+        }
+        if lane_released {
+            self.agent_scheduler.set_active_brain_parent(None).await;
+        }
     }
 
     async fn cancel_named_brain_run(&mut self, request: crate::server::RunnerCancelRequest) {
@@ -4950,7 +5017,9 @@ Rules:\n\
         let Some(pending) = self.pending_named_brain_turns.remove(&query_id) else {
             return;
         };
-        self.agent_scheduler.set_active_brain_parent(None).await;
+        if *self.active_query_id.read().await == Some(query_id) {
+            self.agent_scheduler.set_active_brain_parent(None).await;
+        }
         let PendingNamedBrainTurn {
             brain,
             run_id,
@@ -8315,6 +8384,71 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn dropped_turn_callback_releases_exact_lane_and_stale_cancel_cannot_clear_reconnect() {
+        let query_states = super::super::query_state::QueryStateManager::new();
+        let first_query = query_states.create_query(Vec::new()).await;
+        let next_query = query_states.create_query(Vec::new()).await;
+        let active_query_id = tokio::sync::RwLock::new(Some(first_query));
+        let run_id = crate::brain::store::RunId(uuid::Uuid::new_v4());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let mut pending = std::collections::HashMap::from([(
+            first_query,
+            super::PendingNamedBrainTurn {
+                brain: "shared".into(),
+                run_id,
+                response_tx,
+                turn_events: Vec::new(),
+                effect_journal: Vec::new(),
+                cancellation_requested: false,
+                callback_cancel: cancel.clone(),
+                approval_audience: crate::brain::store::BrainApprovalAudience {
+                    brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
+                    brain: "shared".into(),
+                    attachment_id: crate::brain::store::AttachmentId(uuid::Uuid::new_v4()),
+                    subject: "runner@box.local".into(),
+                    role: crate::brain::store::AttachmentRole::Runner,
+                    environment_generation: 3,
+                },
+                approval_tx: None,
+                restart: None,
+            },
+        )]);
+
+        cancel.cancel();
+        let (cancelled, released) = super::take_cancelled_named_brain_turn(
+            &query_states,
+            &active_query_id,
+            &mut pending,
+            first_query,
+            run_id,
+        )
+        .await;
+        assert!(cancelled.is_some());
+        assert!(released);
+        assert_eq!(*active_query_id.read().await, None);
+        assert!(matches!(
+            query_states.get_state(first_query).await,
+            Some(super::super::query_state::QueryState::Cancelled)
+        ));
+        drop(cancelled);
+        assert!(response_rx.await.is_err());
+
+        *active_query_id.write().await = Some(next_query);
+        let (stale, released) = super::take_cancelled_named_brain_turn(
+            &query_states,
+            &active_query_id,
+            &mut pending,
+            first_query,
+            run_id,
+        )
+        .await;
+        assert!(stale.is_none());
+        assert!(!released);
+        assert_eq!(*active_query_id.read().await, Some(next_query));
+    }
+
     #[test]
     fn bare_brain_attach_routes_only_to_local_ipc() {
         assert_eq!(

@@ -1654,6 +1654,17 @@ fn commit_named_brain_approval_decision(
 ) -> anyhow::Result<crate::brain::store::BrainEvent> {
     let snapshot = store.snapshot(name)?;
     let connection_id = attachment.connection_id;
+    let validate_audience =
+        |audience: &crate::brain::store::BrainApprovalAudience| -> anyhow::Result<()> {
+            anyhow::ensure!(audience.brain_id == snapshot.brain_id
+                && audience.brain == name
+                && audience.attachment_id == attachment.attachment_id
+                && audience.subject == attachment.subject
+                && audience.role == attachment.role
+                && audience.environment_generation == snapshot.environment.generation,
+                "approval decision no longer matches its addressed attachment");
+            Ok(())
+        };
     let validate_pending = || -> anyhow::Result<()> {
         let audience = match connection_id {
             Some(connection_id) => approvals.inspect_connection(
@@ -1664,14 +1675,7 @@ fn commit_named_brain_approval_decision(
                 snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
             )?,
         };
-        anyhow::ensure!(audience.brain_id == snapshot.brain_id
-            && audience.brain == name
-            && audience.attachment_id == attachment.attachment_id
-            && audience.subject == attachment.subject
-            && audience.role == attachment.role
-            && audience.environment_generation == snapshot.environment.generation,
-            "approval decision no longer matches its addressed attachment");
-        Ok(())
+        validate_audience(&audience)
     };
     if let Some(receipt) = mutation {
         let mutation_id = receipt.mutation_id;
@@ -1701,10 +1705,34 @@ fn commit_named_brain_approval_decision(
             )?;
             return Ok(event);
         }
-        validate_pending()?;
-        let reservation = store.reserve_approval_decision(
-            name, &attachment.subject, request_seq, approval_id, decision.clone(), receipt,
-        )?;
+        let reserve = |audience: &crate::brain::store::BrainApprovalAudience| {
+            validate_audience(audience)?;
+            store.reserve_approval_decision(
+                name,
+                &attachment.subject,
+                request_seq,
+                approval_id,
+                decision.clone(),
+                receipt,
+            )
+        };
+        let reservation = match connection_id {
+            Some(connection_id) => approvals.authorize_connection(
+                snapshot.brain_id,
+                request_seq,
+                approval_id,
+                attachment.attachment_id,
+                connection_id,
+                reserve,
+            )?,
+            None => approvals.authorize(
+                snapshot.brain_id,
+                request_seq,
+                approval_id,
+                attachment.attachment_id,
+                reserve,
+            )?,
+        };
         if reservation.delivered {
             return Ok(reservation.event);
         }
@@ -5912,6 +5940,71 @@ mod handler_tests {
                     )
             }));
         assert_eq!(registration.wait().await.unwrap(), decision);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_approval_remote_mutation_cannot_reserve_or_append_before_waiter_poll() {
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let request_seq = store
+            .push(
+                "shared",
+                "alice@box.local",
+                BrainEventKind::Prompt {
+                    text: "approve it".into(),
+                },
+            )
+            .unwrap()
+            .seq;
+        let snapshot = store.snapshot("shared").unwrap();
+        let attachment = driver_attachment("alice@box.local");
+        let audience = BrainApprovalAudience {
+            brain_id: snapshot.brain_id,
+            brain: snapshot.name.clone(),
+            attachment_id: attachment.attachment_id,
+            subject: attachment.subject.clone(),
+            role: attachment.role,
+            environment_generation: snapshot.environment.generation,
+        };
+        let approvals = crate::server::BrainApprovalBroker::default();
+        let deadline = crate::server::ApprovalDeadline::clamped_to_turn(
+            tokio::time::Instant::now() + std::time::Duration::from_millis(10),
+            crate::brain::store::unix_millis().saturating_add(10),
+        )
+        .unwrap();
+        let registration = approvals
+            .register_with_deadline(request_seq, "approval-1", audience, deadline)
+            .unwrap();
+        let receipt = crate::brain::store::BrainMutationReceipt {
+            mutation_id: uuid::Uuid::new_v4(),
+            attachment_id: attachment.attachment_id,
+            expected_revision: snapshot.revision,
+            environment_generation: snapshot.environment.generation,
+            command_sha256: "expired-approval".into(),
+        };
+
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        let error = commit_named_brain_approval_decision(
+            &store,
+            &approvals,
+            "shared",
+            &attachment,
+            request_seq,
+            "approval-1",
+            serde_json::json!({"choice": "approve_once"}),
+            Some(receipt.clone()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("expired"), "{error:#}");
+        let after = store.snapshot("shared").unwrap();
+        assert_eq!(after.revision, snapshot.revision);
+        assert_eq!(after.events, snapshot.events);
+        assert!(store.replay_mutation("shared", &receipt).unwrap().is_none());
+        assert!(registration
+            .wait()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("expired"));
     }
 
     #[tokio::test]
