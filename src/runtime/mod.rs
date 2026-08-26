@@ -7579,10 +7579,14 @@ mod tests {
             .resume_typed_execution(suspended.execution_id)
             .await
             .unwrap();
-        assert_eq!(resumed.status, ExecutionStatus::Failed);
-        assert!(resumed.diagnostics.iter().any(
-            |diagnostic| diagnostic.contains("revoked, expired, or outside its approved scope")
-        ));
+        assert_eq!(resumed.status, ExecutionStatus::AuthorizationRequired);
+        assert_eq!(
+            resumed.required_capabilities,
+            vec![crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+            )]
+        );
         let ledger = runtime.capability_ledger().unwrap();
         let audit = ledger
             .authorization_audit
@@ -9444,7 +9448,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             CapabilityAvailability::Unsupported
         );
         let outcome = runtime
-            .submit(submission(
+            .submit_typed_only(submission(
                 ProgramLanguage::Lisp,
                 "(process-run \"/usr/bin/true\" (list))",
                 ExecutionEffect::ExternalWrite,
@@ -10058,10 +10062,17 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             ))
             .await
             .unwrap();
-        assert_eq!(sent.status, ExecutionStatus::Failed);
-        assert!(sent.diagnostics.iter().any(
-            |diagnostic| diagnostic.contains("revoked, expired, or outside its approved scope")
-        ));
+        assert_eq!(sent.status, ExecutionStatus::AuthorizationRequired);
+        assert_eq!(
+            sent.required_capabilities,
+            vec![CapabilityRequirement {
+                capability: CapabilityKind::NetworkConnect,
+                selector: ResourceSelector::Network {
+                    host: "127.0.0.1".into(),
+                    ports: vec![port],
+                },
+            }]
+        );
         let ledger = runtime.capability_ledger().unwrap();
         let audit = ledger
             .authorization_audit
