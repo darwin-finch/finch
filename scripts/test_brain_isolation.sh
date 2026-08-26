@@ -37,6 +37,29 @@ expect_64 env FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$scratch"
 expect_64 env FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$fake_home" bash -c 'source "$1"; brain_test_isolation_run true' _ "$repo_root/scripts/lib/brain_test_isolation.sh"
 expect_64 env FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$fake_home/.finch/brains" bash -c 'source "$1"; brain_test_isolation_run true' _ "$repo_root/scripts/lib/brain_test_isolation.sh"
 
+hostile_home="$scratch/hostile-home"
+hostile_target="$scratch/effective-production-finch"
+mkdir -p "$hostile_home" "$hostile_target/brains" "$scratch/hostile-temp"
+printf 'production sentinel\n' >"$hostile_target/brains/sentinel"
+ln -s "$hostile_target" "$hostile_home/.finch"
+expect_64 env FINCH_TEST_REAL_HOME="$hostile_home" FINCH_TEST_TMP_PARENT="$hostile_target/brains" bash -c 'source "$1"; brain_test_isolation_run true' _ "$repo_root/scripts/lib/brain_test_isolation.sh"
+test "$(cat "$hostile_target/brains/sentinel")" = 'production sentinel'
+test -z "$(find "$scratch/hostile-temp" -mindepth 1 -print -quit)"
+
+FINCH_BRAIN_TEST_ISOLATED=1 FINCH_BRAIN_TEST_HOME="$fake_home" FINCH_BRAIN_TEST_ROOT="$fake_home/.finch/brains" \
+  FINCH_BRAIN_TEST_TOKEN=forged FINCH_TEST_TMP_PARENT="$scratch" HOME="$fake_home" \
+  bash -c 'source "$1"; ! brain_test_isolation_is_active' _ "$repo_root/scripts/lib/brain_test_isolation.sh"
+launcher_probe="$scratch/launcher-home"
+if FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" FINCH_TEST_LAUNCHER_PROBE_FILE="$launcher_probe" \
+  FINCH_BRAIN_TEST_ISOLATED=1 FINCH_BRAIN_TEST_HOME="$fake_home" FINCH_BRAIN_TEST_ROOT="$fake_home/.finch/brains" \
+  FINCH_BRAIN_TEST_TOKEN=forged HOME="$fake_home" FINCH_BIN="$scratch/missing-finch" \
+  "$repo_root/scripts/smoke_vm_wire_provider.sh" >/dev/null 2>&1; then
+  exit 1
+fi
+probed_home="$(cat "$launcher_probe")"
+[[ "$probed_home" == "$temp_parent"/finch-brain-test-home.* && "$probed_home" != "$fake_home" ]]
+test ! -e "$probed_home"
+
 diagnostic="$scratch/diagnostic"
 if run_isolated bash -c 'mkdir "$FINCH_TEST_REAL_HOME/.finch/brains/secret-directory"' 2>"$diagnostic"; then exit 1; else test "$?" -eq 70; fi
 ! rg -q 'secret-directory|existing|events.jsonl' "$diagnostic"
@@ -45,6 +68,17 @@ rmdir "$fake_home/.finch/brains/secret-directory"
 if run_isolated bash -c 'ln -s /private/secret-target "$FINCH_TEST_REAL_HOME/.finch/brains/secret-link"' 2>"$diagnostic"; then exit 1; else test "$?" -eq 70; fi
 ! rg -q 'secret-link|secret-target|existing|events.jsonl' "$diagnostic"
 rm "$fake_home/.finch/brains/secret-link"
+
+if run_isolated bash -c 'mkfifo "$FINCH_TEST_REAL_HOME/.finch/brains/secret-fifo"' 2>"$diagnostic"; then exit 1; else test "$?" -eq 70; fi
+! rg -q 'secret-fifo|existing|events.jsonl' "$diagnostic"
+rm "$fake_home/.finch/brains/secret-fifo"
+
+socket_path="$fake_home/.finch/brains/secret-socket"
+if command -v python3 >/dev/null 2>&1 && [[ "${#socket_path}" -lt 100 ]]; then
+  if run_isolated python3 -c 'import os,socket; p=os.environ["FINCH_TEST_REAL_HOME"]+"/.finch/brains/secret-socket"; s=socket.socket(socket.AF_UNIX); s.bind(p); s.close()' 2>"$diagnostic"; then exit 1; else test "$?" -eq 70; fi
+  ! rg -q 'secret-socket|existing|events.jsonl' "$diagnostic"
+  rm "$fake_home/.finch/brains/secret-socket"
+fi
 
 fake_bin="$scratch/bin"; mkdir "$fake_bin"
 printf '%s\n' '#!/bin/bash' 'if [[ -e "$FINCH_MANIFEST_FAIL_MARKER" ]]; then exit 9; fi' 'exec /usr/bin/shasum "$@"' >"$fake_bin/shasum"
