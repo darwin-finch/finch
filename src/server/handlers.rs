@@ -1844,6 +1844,24 @@ async fn dispatch_named_brain_program(
                 )?;
                 drop(publication);
                 store.prune_run_publication(name, run_id)?;
+            } else {
+                // Broker failures (deadline, dropped response, generation
+                // loss) carry no frontend journal. Publish their fail-closed
+                // Result + Failed transition atomically so the execution
+                // lane cannot be released with a durable `running` run.
+                let terminalized = store.terminalize_run_with_result_if_active(
+                    name,
+                    "daemon",
+                    run_id,
+                    request_seq,
+                    crate::brain::store::BrainRunStatus::Failed,
+                    error.to_string(),
+                )?;
+                if terminalized.is_none()
+                    && !store.inspect_run(name, run_id)?.status.is_terminal()
+                {
+                    anyhow::bail!("named Brain run cancelled");
+                }
             }
             return Err(error);
         }
@@ -1980,6 +1998,23 @@ async fn dispatch_named_brain_turn(
                 )?;
                 drop(publication);
                 store.prune_run_publication(name, run_id)?;
+            } else {
+                // Infrastructure failures have no trustworthy turn/effect
+                // journal to preserve. Terminalize atomically before the
+                // caller releases the per-Brain execution lane.
+                let terminalized = store.terminalize_run_with_result_if_active(
+                    name,
+                    "daemon",
+                    run_id,
+                    request_seq,
+                    crate::brain::store::BrainRunStatus::Failed,
+                    error.to_string(),
+                )?;
+                if terminalized.is_none()
+                    && !store.inspect_run(name, run_id)?.status.is_terminal()
+                {
+                    anyhow::bail!("named Brain run cancelled");
+                }
             }
             return Err(error);
         }
@@ -4227,7 +4262,7 @@ mod handler_tests {
         }).await.expect("pre-disconnect reverse approval did not fail closed").unwrap_err();
         assert!(approval_error.to_string().contains("approval audience disconnected"),
             "unexpected approval failure: {approval_error}");
-        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        let terminalized = tokio::time::timeout(std::time::Duration::from_millis(500), async {
             loop {
                 if lifecycle.snapshot("shared").unwrap().runs.iter().any(|run| {
                     run.request_seq == request_seq
@@ -4235,7 +4270,17 @@ mod handler_tests {
                 }) { break; }
                 tokio::task::yield_now().await;
             }
-        }).await.expect("reserved cancellation retry did not terminalize the run");
+        }).await;
+        if terminalized.is_err() {
+            let stalled = lifecycle.inspect_run("shared", run_id).unwrap();
+            panic!(
+                "reserved cancellation retry did not terminalize the run: status={:?}, detail={:?}, reserved={}, pending_retries={}",
+                stalled.status,
+                stalled.detail,
+                server.brain_store().run_cancellation_reserved("shared", run_id).unwrap(),
+                server.brain_store().pending_disconnect_terminalization_retries(),
+            );
+        }
         let disconnected = lifecycle.snapshot("shared").unwrap();
         let run = disconnected.runs.iter().find(|run| run.request_seq == request_seq).unwrap();
         assert_eq!(run.status, crate::brain::store::BrainRunStatus::Cancelled);
@@ -4344,7 +4389,8 @@ mod handler_tests {
         assert_eq!(later_run.status, crate::brain::store::BrainRunStatus::Failed);
         assert_eq!(later_run.detail.as_deref(), Some("later prompt reached runner"));
         release_tx.send(()).unwrap();
-        assert!(forwarding.await);
+        assert!(!forwarding.await,
+            "exact-run cancellation must not invalidate the runner registration");
         http_server.abort();
         let _ = http_server.await;
         assert!(lifecycle.connection(
@@ -4523,7 +4569,9 @@ mod handler_tests {
             && event.seq > terminal_seq));
         assert!(tokio::time::timeout(std::time::Duration::from_millis(250), &mut approval)
             .await.unwrap().is_err());
-        assert!(forwarding.await);
+        assert!(!forwarding.await,
+            "initiator disconnect must cancel only its run, not the runner registration");
+        assert!(server.brain_runners().has_registration("shared", lease.lease_id));
 
         let replacement = lifecycle.attach(
             "shared", "alice", AttachmentRole::Driver, Some(driver.attachment_id),
@@ -4889,6 +4937,22 @@ mod handler_tests {
                 },
                 state: crate::vm::EffectJournalState::Acknowledged { values: Vec::new() },
             },
+        }
+    }
+
+    fn runner_program_result(output: &str) -> crate::server::RunnerProgramResult {
+        let checkpoint = crate::runtime::ProgramRuntime::new()
+            .revision_history()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        crate::server::RunnerProgramResult {
+            output: output.into(),
+            runtime_revision: 1,
+            checkpoint,
+            effect_journal: Vec::new(),
         }
     }
 
@@ -7501,6 +7565,143 @@ mod handler_tests {
                         && state == &expected_effect.entry.state
                 )
             }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runner_timeout_terminalizes_exactly_once_and_a_later_run_uses_the_same_lane() {
+        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let attachment = store
+            .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
+            .unwrap();
+        let lease = store
+            .acquire_runner_lease(
+                "shared",
+                "runner@box.local",
+                store.environment().generation,
+                None,
+                60_000,
+            )
+            .unwrap();
+        let runners = crate::server::BrainRunnerBroker::with_deadlines(
+            crate::server::RunnerDeadlines {
+                program: std::time::Duration::from_secs(5),
+                turn: std::time::Duration::from_secs(30),
+                cancel: std::time::Duration::from_secs(2),
+                project_memory: std::time::Duration::from_secs(5),
+            },
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, tx);
+
+        let first_request = store
+            .push(
+                "shared",
+                &attachment.subject,
+                BrainEventKind::Program {
+                    language: ProgramLanguage::Lisp,
+                    source: "(say \"stuck\")".into(),
+                },
+            )
+            .unwrap();
+        let first_run = store
+            .start_run(
+                "shared",
+                &attachment.subject,
+                crate::brain::store::BrainRunKind::Interactive,
+                first_request.seq,
+                attachment.attachment_id,
+                crate::brain::store::BrainRunStatus::Running,
+            )
+            .unwrap();
+        let first_store = store.clone();
+        let first_runners = runners.clone();
+        let first_run_id = first_run.run_id;
+        let first = tokio::spawn(async move {
+            dispatch_named_brain_run(&first_store, &first_runners, "shared", &first_run).await
+        });
+        let crate::server::RunnerRequest::Program(stuck) = rx.recv().await.unwrap() else {
+            panic!("expected stuck program callback")
+        };
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        let terminal_result = first.await.unwrap().unwrap().unwrap();
+        assert!(matches!(
+            terminal_result.kind,
+            BrainEventKind::Result {
+                request_seq,
+                error: Some(_),
+                ..
+            } if request_seq == first_request.seq
+        ));
+        assert!(stuck.cancel.is_cancelled());
+        assert!(stuck.response_tx.send(Ok(runner_program_result("late"))).is_err());
+        let first_snapshot = store.snapshot("shared").unwrap();
+        assert_eq!(
+            first_snapshot
+                .runs
+                .iter()
+                .find(|run| run.run_id == first_run_id)
+                .unwrap()
+                .status,
+            crate::brain::store::BrainRunStatus::Failed
+        );
+        assert_eq!(
+            first_snapshot
+                .events
+                .iter()
+                .filter(|event| {
+                    event.run_id == Some(first_run_id)
+                        && matches!(
+                            event.kind,
+                            BrainEventKind::RunStatusChanged { status, .. }
+                                if status.is_terminal()
+                        )
+                })
+                .count(),
+            1
+        );
+
+        let second_request = store
+            .push(
+                "shared",
+                &attachment.subject,
+                BrainEventKind::Program {
+                    language: ProgramLanguage::Lisp,
+                    source: "(say \"healthy\")".into(),
+                },
+            )
+            .unwrap();
+        let second_run = store
+            .start_run(
+                "shared",
+                &attachment.subject,
+                crate::brain::store::BrainRunKind::Interactive,
+                second_request.seq,
+                attachment.attachment_id,
+                crate::brain::store::BrainRunStatus::Running,
+            )
+            .unwrap();
+        let second_store = store.clone();
+        let second_runners = runners.clone();
+        let second = tokio::spawn(async move {
+            dispatch_named_brain_run(&second_store, &second_runners, "shared", &second_run).await
+        });
+        let crate::server::RunnerRequest::Program(healthy) = rx.recv().await.unwrap() else {
+            panic!("expected healthy program callback")
+        };
+        healthy
+            .response_tx
+            .send(Ok(runner_program_result("healthy")))
+            .unwrap();
+        let healthy_result = second.await.unwrap().unwrap().unwrap();
+        assert!(matches!(
+            healthy_result.kind,
+            BrainEventKind::Result {
+                ref output,
+                error: None,
+                ..
+            } if output == "healthy"
+        ));
+        assert!(runners.has_registration("shared", lease.lease_id));
     }
 
     #[tokio::test]

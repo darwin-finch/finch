@@ -4872,7 +4872,11 @@ Rules:\n\
         &self,
         request: crate::server::RunnerMemoryProjectionRequest,
     ) {
+        let cancel = request.cancel.clone();
         let result = async {
+            if cancel.is_cancelled() {
+                anyhow::bail!("named Brain memory projection cancelled");
+            }
             if self.runner_brain.as_deref() != Some(request.brain.as_str())
                 || !self.home_runner_lease_active
             {
@@ -4895,19 +4899,31 @@ Rules:\n\
                 ("user", request.prompt.as_str()),
                 ("assistant", request.source.as_str()),
             ] {
-                if !content.trim().is_empty()
-                    && memory
-                        .insert_brain_conversation(
+                if cancel.is_cancelled() {
+                    anyhow::bail!("named Brain memory projection cancelled");
+                }
+                if content.trim().is_empty() {
+                    continue;
+                }
+                let newly_inserted = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        anyhow::bail!("named Brain memory projection cancelled");
+                    }
+                    inserted = memory.insert_brain_conversation(
                             role,
                             content,
                             None,
                             Some(&request.brain),
                             &provenance,
-                        )
-                        .await?
-                {
+                        ) => inserted?,
+                };
+                if newly_inserted {
                     inserted += 1;
                 }
+            }
+            if cancel.is_cancelled() {
+                anyhow::bail!("named Brain memory projection cancelled");
             }
             Ok::<usize, anyhow::Error>(inserted)
         }

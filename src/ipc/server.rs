@@ -1701,6 +1701,46 @@ fn decode_schedule_policy(
     }
 }
 
+async fn await_runner_rpc<T, F>(
+    response_tx: &mut tokio::sync::oneshot::Sender<T>,
+    cancel: &tokio_util::sync::CancellationToken,
+    rpc: F,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        _ = response_tx.closed() => None,
+        reply = rpc => Some(reply),
+    }
+}
+
+async fn cancel_frontend_run(
+    runner: &finch_ipc_capnp::brain_runner::Client,
+    brain: &str,
+    run_id: crate::brain::store::RunId,
+) {
+    let mut cancel = runner.cancel_run_request();
+    cancel.get().set_brain(brain);
+    cancel.get().set_run_id(&run_id.0.to_string());
+    match tokio::time::timeout(std::time::Duration::from_secs(10), cancel.send().promise).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::warn!(brain = %brain, run_id = %run_id.0, %error,
+            "could not cancel abandoned runner callback"),
+        Err(_) => tracing::warn!(brain = %brain, run_id = %run_id.0,
+            "timed out cancelling abandoned runner callback"),
+    }
+}
+
+async fn settle_cancelled_frontend_rpc<F>(rpc: &mut std::pin::Pin<Box<F>>)
+where
+    F: std::future::Future,
+{
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), rpc).await;
+}
+
 async fn forward_runner_request(
     runner: finch_ipc_capnp::brain_runner::Client,
     server: Arc<AgentServer>,
@@ -1708,6 +1748,9 @@ async fn forward_runner_request(
 ) -> bool {
     match request {
         crate::server::RunnerRequest::Program(request) => {
+            let request_cancel = request.cancel.clone();
+            let brain = request.brain.clone();
+            let run_id = request.run_id;
             let mut call = runner.run_program_request();
             {
                 let mut payload = call.get().init_request();
@@ -1743,17 +1786,30 @@ async fn forward_runner_request(
                     });
                 payload.set_control(control);
             }
-            let (result, disconnected) = match call.send().promise.await {
+            let mut response_tx = request.response_tx;
+            let mut rpc = Box::pin(call.send().promise);
+            let Some(reply) = await_runner_rpc(
+                &mut response_tx, &request_cancel, &mut rpc,
+            ).await else {
+                cancel_frontend_run(&runner, &brain, run_id).await;
+                settle_cancelled_frontend_rpc(&mut rpc).await;
+                return false;
+            };
+            let (result, disconnected) = match reply {
                 Ok(reply) => (
                     decode_runner_program_result(reply.get().and_then(|r| r.get_result())),
                     false,
                 ),
                 Err(error) => (Err(error.to_string().into()), true),
             };
-            let _ = request.response_tx.send(result);
+            let _ = response_tx.send(result);
             disconnected
         }
         crate::server::RunnerRequest::Turn(request) => {
+            let request_cancel = request.cancel.clone();
+            let brain = request.brain.clone();
+            let run_id = request.run_id;
+            let mut response_tx = request.response_tx;
             let (result, disconnected) = {
                 let mut call = runner.run_turn_request();
                 let encoded = {
@@ -1787,20 +1843,31 @@ async fn forward_runner_request(
                     encoded
                 };
                 match encoded {
-                    Ok(()) => match call.send().promise.await {
-                        Ok(reply) => (
+                    Ok(()) => {
+                        let mut rpc = Box::pin(call.send().promise);
+                        match await_runner_rpc(
+                            &mut response_tx, &request_cancel, &mut rpc,
+                    ).await {
+                        None => {
+                            cancel_frontend_run(&runner, &brain, run_id).await;
+                            settle_cancelled_frontend_rpc(&mut rpc).await;
+                            return false;
+                        }
+                        Some(Ok(reply)) => (
                             decode_runner_turn_result(reply.get().and_then(|r| r.get_result())),
                             false,
                         ),
-                        Err(error) => (Err(error.to_string().into()), true),
-                    },
+                        Some(Err(error)) => (Err(error.to_string().into()), true),
+                        }
+                    }
                     Err(error) => (Err(error.into()), false),
                 }
             };
-            let _ = request.response_tx.send(result);
+            let _ = response_tx.send(result);
             disconnected
         }
         crate::server::RunnerRequest::ProjectMemory(request) => {
+            let request_cancel = request.cancel.clone();
             let mut call = runner.project_memory_request();
             {
                 let mut payload = call.get().init_request();
@@ -1811,7 +1878,13 @@ async fn forward_runner_request(
                 payload.set_prompt(&request.prompt);
                 payload.set_source(&request.source);
             }
-            let (result, disconnected) = match call.send().promise.await {
+            let mut response_tx = request.response_tx;
+            let Some(reply) = await_runner_rpc(
+                &mut response_tx, &request_cancel, call.send().promise,
+            ).await else {
+                return false;
+            };
+            let (result, disconnected) = match reply {
                 Ok(reply) => match reply.get() {
                     Ok(reply) => {
                         let error = reply
@@ -1829,14 +1902,20 @@ async fn forward_runner_request(
                 },
                 Err(error) => (Err(error.to_string()), true),
             };
-            let _ = request.response_tx.send(result);
+            let _ = response_tx.send(result);
             disconnected
         }
         crate::server::RunnerRequest::Cancel(request) => {
+            let request_cancel = request.cancel.clone();
             let mut call = runner.cancel_run_request();
             call.get().set_brain(&request.brain);
             call.get().set_run_id(&request.run_id.0.to_string());
-            let (result, disconnected) = match call.send().promise.await {
+            let reply = tokio::select! {
+                biased;
+                _ = request_cancel.cancelled() => return false,
+                reply = call.send().promise => reply,
+            };
+            let (result, disconnected) = match reply {
                 Ok(reply) => match reply.get() {
                     Ok(reply) => {
                         let error = reply
@@ -2055,9 +2134,192 @@ fn decode_runner_turn_event(
 mod tests {
     use super::{
         decode_runner_program_result, decode_runner_turn_result, execute_typed_forth_ipc,
-        require_approval_connection, BrainRpcService, BrainRunnerControlImpl,
+        forward_test_runner_request, require_approval_connection, BrainRpcService,
+        BrainRunnerControlImpl,
     };
     use crate::ipc::brain_codec::encode_approval_audience;
+
+    struct CancellationAwareRunner {
+        started_tx: Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>,
+        cancelled_tx: Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>,
+    }
+
+    impl super::finch_ipc_capnp::brain_runner::Server for CancellationAwareRunner {
+        fn run_program(
+            &mut self,
+            params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            let request = match params.get().and_then(|params| params.get_request()) {
+                Ok(request) => request,
+                Err(error) => return capnp::capability::Promise::err(error),
+            };
+            let run_id = match request
+                .get_run_id()
+                .ok()
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            {
+                Some(run_id) => crate::brain::store::RunId(run_id),
+                None => return capnp::capability::Promise::err(capnp::Error::failed(
+                    "invalid test run id".into(),
+                )),
+            };
+            let started_tx = self.started_tx.take().expect("program started twice");
+            capnp::capability::Promise::from_future(async move {
+                let _ = started_tx.send(run_id);
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        }
+
+        fn run_turn(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented(
+                "test runner accepts only programs".into(),
+            ))
+        }
+
+        fn cancel_run(
+            &mut self,
+            params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
+            mut results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            let params = match params.get() {
+                Ok(params) => params,
+                Err(error) => return capnp::capability::Promise::err(error),
+            };
+            let run_id = match params
+                .get_run_id()
+                .ok()
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            {
+                Some(run_id) => crate::brain::store::RunId(run_id),
+                None => return capnp::capability::Promise::err(capnp::Error::failed(
+                    "invalid cancellation run id".into(),
+                )),
+            };
+            let cancelled_tx = self.cancelled_tx.take().expect("run cancelled twice");
+            let mut result = results.get();
+            result.set_cancelled(true);
+            result.set_error("");
+            let _ = cancelled_tx.send(run_id);
+            capnp::capability::Promise::ok(())
+        }
+
+        fn project_memory(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
+            _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented(
+                "test runner does not project memory".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn abandoned_program_rpc_cancels_the_exact_frontend_run() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = crate::brain::store::BrainStore::with_root(
+                "box.local", Some(temp.path().join("brains")),
+            );
+            let server = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    store,
+                    crate::brain::credential::BrainCredentialAuthority::ephemeral([92; 32]),
+                    "test-password".into(),
+                    temp.path(),
+                ).unwrap(),
+            );
+            let run_id = crate::brain::store::RunId(uuid::Uuid::new_v4());
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+            let runner: super::finch_ipc_capnp::brain_runner::Client =
+                capnp_rpc::new_client(CancellationAwareRunner {
+                    started_tx: Some(started_tx),
+                    cancelled_tx: Some(cancelled_tx),
+                });
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            let request = crate::server::RunnerRequest::Program(
+                crate::server::RunnerProgramRequest {
+                    brain: "shared".into(),
+                    run_id,
+                    request_seq: 7,
+                    language: crate::brain::store::ProgramLanguage::Lisp,
+                    source: "(say \"pending\")".into(),
+                    interaction: crate::server::RunnerProgramInteraction::Interactive,
+                    grant_ceiling: None,
+                    control_tx: None,
+                    cancel: cancel.clone(),
+                    response_tx,
+                },
+            );
+            let bridge = tokio::task::spawn_local(forward_test_runner_request(
+                runner, server, request,
+            ));
+            assert_eq!(started_rx.await.unwrap(), run_id);
+            cancel.cancel();
+            assert_eq!(cancelled_rx.await.unwrap(), run_id);
+            assert!(!bridge.await.unwrap());
+            assert!(response_rx.await.is_err());
+        }));
+    }
+
+    #[test]
+    fn fire_and_forget_disconnect_cancellation_still_reaches_the_frontend() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = crate::brain::store::BrainStore::with_root(
+                "box.local", Some(temp.path().join("brains")),
+            );
+            let server = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    store,
+                    crate::brain::credential::BrainCredentialAuthority::ephemeral([93; 32]),
+                    "test-password".into(),
+                    temp.path(),
+                ).unwrap(),
+            );
+            let run_id = crate::brain::store::RunId(uuid::Uuid::new_v4());
+            let (unused_started_tx, _unused_started_rx) = tokio::sync::oneshot::channel();
+            let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+            let runner: super::finch_ipc_capnp::brain_runner::Client =
+                capnp_rpc::new_client(CancellationAwareRunner {
+                    started_tx: Some(unused_started_tx),
+                    cancelled_tx: Some(cancelled_tx),
+                });
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            drop(response_rx);
+            let request = crate::server::RunnerRequest::Cancel(
+                crate::server::RunnerCancelRequest {
+                    brain: "shared".into(),
+                    run_id,
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                    response_tx,
+                },
+            );
+
+            assert!(!forward_test_runner_request(runner, server, request).await);
+            assert_eq!(cancelled_rx.await.unwrap(), run_id);
+        }));
+    }
 
     struct SocketApprovalRunner {
         failed_tx: Option<tokio::sync::oneshot::Sender<String>>,
