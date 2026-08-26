@@ -15,8 +15,10 @@ fail-closed isolation wrapper:
 
 The wrapper assigns an explicit disposable `HOME`, exposes its Brain root as
 `FINCH_BRAIN_TEST_ROOT`, removes it whether the command succeeds or fails, and
-compares a content manifest of the caller's real `~/.finch/brains` before and
-after the suite. It refuses to run if it cannot distinguish the disposable
+compares the caller's real `~/.finch/brains` tree, file contents, node types,
+symlink targets, and portable POSIX mode/owner/link/inode metadata before and
+after the suite. ACLs, filesystem flags, and extended attributes are outside
+this portable guard. It refuses to run if it cannot distinguish the disposable
 home from the production home. To wrap a narrower test command, pass it as
 arguments, for example:
 

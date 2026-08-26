@@ -105,25 +105,25 @@ cargo run -- daemon --port 8080
 ### Run All Tests
 
 ```bash
-cargo test
+./scripts/test_brains.sh cargo test
 ```
 
 ### Run Specific Test
 
 ```bash
-cargo test test_router_decision
+./scripts/test_brains.sh cargo test test_router_decision
 ```
 
 ### Run Tests with Output
 
 ```bash
-cargo test -- --nocapture
+./scripts/test_brains.sh cargo test -- --nocapture
 ```
 
 ### Integration Tests Only
 
 ```bash
-cargo test --test '*'
+./scripts/test_brains.sh cargo test --test '*'
 ```
 
 ### Run Tests in Watch Mode
@@ -194,7 +194,7 @@ cargo watch -x 'run'
 # ... edit tests/router_tests.rs ...
 
 # 5. Run tests
-cargo test
+./scripts/test_brains.sh cargo test
 
 # 6. Format and lint
 cargo fmt
@@ -542,7 +542,7 @@ jobs:
       - uses: actions/checkout@v3
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - run: cargo build --verbose
-      - run: cargo test --verbose
+      - run: ./scripts/test_brains.sh cargo test --verbose
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
 ```
@@ -648,7 +648,7 @@ kill <PID>
 3. Make your changes
 4. Add tests
 5. Run `cargo fmt` and `cargo clippy`
-6. Ensure `cargo test` passes
+6. Ensure `./scripts/test_brains.sh cargo test` passes
 7. Commit with conventional commit messages
 8. Push to your fork
 9. Open a pull request

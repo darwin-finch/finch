@@ -20,7 +20,7 @@ Core infrastructure is complete and production-ready.
 - Professional TUI — scrollback, streaming, ghost text, plan mode, Ctrl+G/B feedback
 - IMPCPD iterative planning loop (`/plan <task>`) with 7 adversarial personas
 - Universal alignment prompt — JSON normalization across all 6 providers
-- Live LLM test suite (`FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_`)
+- Live LLM test suite (`./scripts/test_brains.sh env FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_`)
 - Private explicit feedback collection (automatic training and adapter loading disabled)
 - Progressive bootstrap — instant REPL startup, background model load
 - CLAUDE.md / FINCH.md context injection (matches Claude Code behaviour)
