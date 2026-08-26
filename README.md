@@ -107,6 +107,17 @@ separate operating-system Accessibility grant. See the
 
 ## Shared brains (experimental)
 
+Tests and live smokes involving Brains must not be invoked directly. Give the
+process a disposable Finch home with the guarded wrapper (credentials needed
+by a live smoke should be supplied explicitly through environment variables):
+
+```bash
+./scripts/test_brains.sh env FINCH_LIVE_TESTS=1 cargo test --test live -- --ignored
+```
+
+The wrapper deletes the temporary store on success or failure and fails if the
+real `~/.finch/brains` manifest changes.
+
 A named Brain keeps one ordered conversation and one persistent typed Lisp/Co-Forth VM across
 multiple terminals and daemon restarts. Start the daemon, open Finch in two terminals, and attach
 both to the same local name:

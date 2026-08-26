@@ -4,6 +4,32 @@ This directory contains integration tests for Shammah's daemon and TUI features.
 
 ## Running Tests
 
+### Brain-safe unit suite
+
+Any test or smoke that can construct a named Brain must run through the
+fail-closed isolation wrapper:
+
+```bash
+./scripts/test_brains.sh
+```
+
+The wrapper assigns an explicit disposable `HOME`, exposes its Brain root as
+`FINCH_BRAIN_TEST_ROOT`, removes it whether the command succeeds or fails, and
+compares a content manifest of the caller's real `~/.finch/brains` before and
+after the suite. It refuses to run if it cannot distinguish the disposable
+home from the production home. To wrap a narrower test command, pass it as
+arguments, for example:
+
+```bash
+./scripts/test_brains.sh cargo test --lib brain::store
+```
+
+Run the isolation harness's own regression checks with:
+
+```bash
+./scripts/test_brain_isolation.sh
+```
+
 ### All Tests (excluding ignored)
 ```bash
 cargo test --test '*'
