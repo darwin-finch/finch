@@ -95,15 +95,14 @@ fn require_approval_connection(
 }
 
 #[cfg(test)]
-pub(crate) async fn request_test_turn_approval(
+pub(crate) fn test_turn_control_client(
     server: Arc<AgentServer>,
     brain: String,
     request_seq: u64,
     expected_audience: crate::brain::store::BrainApprovalAudience,
     expected_connection_id: Option<crate::brain::store::ConnectionId>,
-    event: crate::server::RunnerTurnEvent,
-) -> Result<serde_json::Value> {
-    let control: finch_ipc_capnp::brain_turn_control::Client = capnp_rpc::new_client(
+) -> finch_ipc_capnp::brain_turn_control::Client {
+    capnp_rpc::new_client(
         BrainTurnControlImpl {
             server,
             brain,
@@ -111,7 +110,14 @@ pub(crate) async fn request_test_turn_approval(
             expected_audience,
             expected_connection_id,
         },
-    );
+    )
+}
+
+#[cfg(test)]
+pub(crate) async fn request_test_turn_approval_with_client(
+    control: finch_ipc_capnp::brain_turn_control::Client,
+    event: crate::server::RunnerTurnEvent,
+) -> Result<serde_json::Value> {
     let mut call = control.request_approval_request();
     let crate::server::RunnerTurnEvent::ApprovalRequested {
         approval_id, approval_kind, subject, audience, detail,
@@ -127,6 +133,27 @@ pub(crate) async fn request_test_turn_approval(
     crate::ipc::brain_codec::encode_json_value(encoded.reborrow().init_detail(), &detail)?;
     let response = call.send().promise.await?;
     crate::ipc::brain_codec::decode_json_value(response.get()?.get_decision()?)
+}
+
+#[cfg(test)]
+pub(crate) async fn request_test_turn_approval(
+    server: Arc<AgentServer>,
+    brain: String,
+    request_seq: u64,
+    expected_audience: crate::brain::store::BrainApprovalAudience,
+    expected_connection_id: Option<crate::brain::store::ConnectionId>,
+    event: crate::server::RunnerTurnEvent,
+) -> Result<serde_json::Value> {
+    request_test_turn_approval_with_client(
+        test_turn_control_client(
+            server,
+            brain,
+            request_seq,
+            expected_audience,
+            expected_connection_id,
+        ),
+        event,
+    ).await
 }
 
 /// Reverse capability scoped to one daemon-authenticated ProgramRun. The
@@ -409,116 +436,52 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
             Ok(connection_id) => connection_id,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        let registration = match self.server.brain_approvals().register_for_connection(
+        let registration = match self.server.brain_approvals().register_for_connection_with_authority(
             self.request_seq,
             approval_id.clone(),
             audience.clone(),
             connection_id,
+            || self.server.brain_store().begin_run_approval_for_connection(
+                &self.brain,
+                audience.attachment_id,
+                connection_id,
+                self.request_seq,
+                approval_id.clone(),
+                approval_kind.clone(),
+                subject.clone(),
+                audience.clone(),
+                detail.clone(),
+            ),
         ) {
             Ok(registration) => registration,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        let run_id = match self.server.brain_store().snapshot(&self.brain) {
-            Ok(snapshot) => snapshot
-                .runs
-                .into_iter()
-                .find(|run| {
-                    run.request_seq == self.request_seq
-                        && run.status == crate::brain::store::BrainRunStatus::Running
-                })
-                .map(|run| run.run_id),
-            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
-        };
-        if let Some(run_id) = run_id {
-            if let Err(error) = self.server.brain_store().transition_run(
-                &self.brain,
-                "daemon",
-                run_id,
-                crate::brain::store::BrainRunStatus::AwaitingApproval,
-                Some(format!("awaiting approval {approval_id}")),
-            ) {
-                return Promise::err(capnp::Error::failed(error.to_string()));
-            }
-        }
-        if approval_kind == "tool" {
-            let input = detail
-                .get("input")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            if let Err(error) = self.server.brain_store().push(
-                &self.brain,
-                "provider",
-                crate::brain::store::BrainEventKind::ToolCall {
-                    request_seq: self.request_seq,
-                    tool_id: approval_id.clone(),
-                    name: subject.clone(),
-                    input,
-                },
-            ) {
-                if let Some(run_id) = run_id {
-                    let _ = self.server.brain_store().transition_run(
-                        &self.brain,
-                        "daemon",
-                        run_id,
-                        crate::brain::store::BrainRunStatus::Interrupted,
-                        Some(error.to_string()),
-                    );
-                }
-                return Promise::err(capnp::Error::failed(error.to_string()));
-            }
-        }
-        if let Err(error) = self.server.brain_store().push(
-            &self.brain,
-            "runner",
-            crate::brain::store::BrainEventKind::ApprovalRequested {
-                request_seq: self.request_seq,
-                approval_id,
-                approval_kind,
-                subject,
-                audience: Some(audience),
-                detail,
-            },
-        ) {
-            if let Some(run_id) = run_id {
-                let _ = self.server.brain_store().transition_run(
-                    &self.brain,
-                    "daemon",
-                    run_id,
-                    crate::brain::store::BrainRunStatus::Interrupted,
-                    Some(error.to_string()),
-                );
-            }
-            return Promise::err(capnp::Error::failed(error.to_string()));
-        }
+        let (registration, run_id) = registration;
 
         let store = self.server.brain_store().clone();
         let brain = self.brain.clone();
         Promise::from_future(async move {
             let decision = match registration.wait().await {
                 Ok(decision) => {
-                    if let Some(run_id) = run_id {
-                        store
-                            .transition_run(
-                                &brain,
-                                "daemon",
-                                run_id,
-                                crate::brain::store::BrainRunStatus::Running,
-                                None,
-                            )
-                            .map_err(|error| capnp::Error::failed(error.to_string()))?;
-                    }
-                    decision
-                }
-                Err(error) => {
-                    if let Some(run_id) = run_id {
-                        let _ = store.transition_run(
+                    store
+                        .transition_run(
                             &brain,
                             "daemon",
                             run_id,
-                            crate::brain::store::BrainRunStatus::Interrupted,
-                            Some(error.to_string()),
-                        );
-                    }
+                            crate::brain::store::BrainRunStatus::Running,
+                            None,
+                        )
+                        .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                    decision
+                }
+                Err(error) => {
+                    let _ = store.transition_run(
+                        &brain,
+                        "daemon",
+                        run_id,
+                        crate::brain::store::BrainRunStatus::Interrupted,
+                        Some(error.to_string()),
+                    );
                     return Err(capnp::Error::failed(error.to_string()));
                 }
             };

@@ -1146,23 +1146,10 @@ async fn dispatch_named_brain_run(
     impl Drop for DisconnectTerminalizer {
         fn drop(&mut self) {
             if !self.armed { return; }
-            let Ok(run) = self.store.inspect_run(&self.brain, self.run_id) else { return; };
-            if run.status.is_terminal() { return; }
             let detail = "initiating Brain connection disconnected".to_string();
-            let has_result = self.store.snapshot(&self.brain).ok().is_some_and(|snapshot| {
-                snapshot.events.iter().any(|event| {
-                    event.run_id == Some(self.run_id)
-                        && matches!(event.kind, BrainEventKind::Result { .. })
-                })
-            });
-            if !has_result {
-                let _ = push_named_brain_run_result(
-                    &self.store, &self.brain, self.run_id, self.request_seq,
-                    Err(anyhow::anyhow!(detail.clone())),
-                );
-            }
-            let _ = self.store.transition_run(
-                &self.brain, "daemon", self.run_id, BrainRunStatus::Failed, Some(detail),
+            let _ = self.store.terminalize_run_with_result_if_active(
+                &self.brain, "daemon", self.run_id, self.request_seq,
+                BrainRunStatus::Failed, detail,
             );
         }
     }
@@ -3815,13 +3802,18 @@ mod handler_tests {
     #[tokio::test]
     async fn websocket_teardown_is_bounded_and_connection_scoped() {
         use crate::brain::store::{BrainStore, ConnectionId};
-        use crate::server::{BrainApprovalBroker, BrainLifecycleService, BrainRunnerBroker};
+        use crate::server::BrainLifecycleService;
 
-        let approvals = BrainApprovalBroker::default();
-        let lifecycle = BrainLifecycleService::new(
-            BrainStore::with_root("box.local", Some(tempfile::tempdir().unwrap().keep())),
-            BrainRunnerBroker::default(), approvals.clone(),
-        );
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().to_path_buf()));
+        let server = Arc::new(crate::server::AgentServer::for_brain_protocol_test(
+            store,
+            crate::brain::credential::BrainCredentialAuthority::ephemeral([59; 32]),
+            "test-password".into(),
+            temp.path(),
+        ).unwrap());
+        let lifecycle = BrainLifecycleService::from_server(&server);
+        let approvals = server.brain_approvals().clone();
         let attached = lifecycle.attach("shared", "alice", AttachmentRole::Driver, None).unwrap();
         let connection_id = attached.connection_id.unwrap();
         let _events = lifecycle.watch("shared", attached.attachment_id, connection_id).unwrap();
@@ -3848,6 +3840,13 @@ mod handler_tests {
         else { panic!("expected a real dispatched turn") };
 
         let request_seq = late_request.request_seq;
+        let stale_control = crate::ipc::server::test_turn_control_client(
+            server.clone(),
+            "shared".into(),
+            request_seq,
+            late_request.approval_audience.clone(),
+            late_request.approval_connection_id,
+        );
         let approval_id = "disconnect-approval";
         let registration = approvals.register_for_connection(request_seq, approval_id, BrainApprovalAudience {
             brain_id: snapshot.brain_id,
@@ -3890,6 +3889,44 @@ mod handler_tests {
             event.kind, BrainEventKind::RunStatusChanged { run_id, status, .. }
                 if run_id == run.run_id && status.is_terminal()
         )).count(), 1);
+        let terminal_seq = disconnected.events.iter().find_map(|event| match event.kind {
+            BrainEventKind::RunStatusChanged { run_id, status, .. }
+                if run_id == run.run_id && status.is_terminal() => Some(event.seq),
+            _ => None,
+        }).unwrap();
+
+        let stale_error = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            crate::ipc::server::request_test_turn_approval_with_client(
+                stale_control,
+                crate::server::RunnerTurnEvent::ApprovalRequested {
+                    approval_id: "late-stale-tool".into(),
+                    approval_kind: "tool".into(),
+                    subject: "bash".into(),
+                    audience: late_request.approval_audience.clone(),
+                    detail: serde_json::json!({"input": {"command": "true"}}),
+                },
+            ),
+        ).await.expect("stale reverse approval waited after teardown").unwrap_err();
+        assert!(stale_error.to_string().contains(
+            "approval audience connection is no longer current"
+        ));
+        assert!(approvals.inspect_connection(
+            snapshot.brain_id,
+            request_seq,
+            "late-stale-tool",
+            attached.attachment_id,
+            connection_id,
+        ).is_err());
+        let after_stale = lifecycle.snapshot("shared").unwrap();
+        assert!(!after_stale.events.iter().any(|event| {
+            event.seq > terminal_seq && matches!(
+                event.kind,
+                BrainEventKind::ToolCall { .. }
+                    | BrainEventKind::ApprovalRequested { .. }
+                    | BrainEventKind::Result { .. }
+            )
+        }));
 
         let replacement = lifecycle.attach(
             "shared", "alice", AttachmentRole::Driver, Some(attached.attachment_id),
@@ -3918,6 +3955,34 @@ mod handler_tests {
         ).expect("stale teardown revoked replacement approval");
         replacement_claim.fail("test complete");
         drop(replacement_registration);
+        let later_worker = tokio::spawn(async move {
+            loop {
+                match runner_rx.recv().await.unwrap() {
+                    crate::server::RunnerRequest::Turn(request) => {
+                        request.response_tx.send(Err(crate::server::RunnerTurnError {
+                            message: "later prompt reached runner".into(),
+                            turn_events: Vec::new(),
+                            effect_journal: Vec::new(),
+                        })).unwrap();
+                        break;
+                    }
+                    crate::server::RunnerRequest::ProjectMemory(request) => {
+                        request.response_tx.send(Ok(0)).unwrap();
+                    }
+                    other => panic!("expected later turn, got {other:?}"),
+                }
+            }
+        });
+        let later = lifecycle.submit(
+            "shared",
+            replacement.attachment_id,
+            replacement_connection,
+            BrainEventKind::Prompt { text: "later prompt".into() },
+        ).await.unwrap();
+        later_worker.await.unwrap();
+        let later_run = lifecycle.inspect_run("shared", later.run.unwrap().run_id).unwrap();
+        assert_eq!(later_run.status, crate::brain::store::BrainRunStatus::Failed);
+        assert_eq!(later_run.detail.as_deref(), Some("later prompt reached runner"));
         assert!(lifecycle.connection(
             "shared", unrelated.attachment_id, unrelated_connection,
         ).is_ok());

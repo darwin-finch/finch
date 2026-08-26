@@ -1835,6 +1835,127 @@ impl BrainStore {
         Ok(transitioned)
     }
 
+    pub(crate) fn terminalize_run_with_result_if_active(
+        &self,
+        name: &str,
+        sender: &str,
+        run_id: RunId,
+        request_seq: u64,
+        status: BrainRunStatus,
+        detail: String,
+    ) -> Result<Option<BrainEvent>> {
+        anyhow::ensure!(status.is_terminal(), "run terminalization requires a terminal status");
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        let current = state.runs.get(&run_id)
+            .with_context(|| format!("Brain run {} does not exist", run_id.0))?;
+        if current.status.is_terminal() {
+            return Ok(None);
+        }
+        validate_run_transition(current.status, status)?;
+        let existing = state.events.iter().find(|event| {
+            event.run_id == Some(run_id)
+                && matches!(event.kind, BrainEventKind::Result { .. })
+        }).cloned();
+        let result = match existing {
+            Some(result) => result,
+            None => self.push_locked_for_run(
+                name,
+                state,
+                sender,
+                Some(run_id),
+                BrainEventKind::Result {
+                    request_seq,
+                    output: String::new(),
+                    error: Some(detail.clone()),
+                },
+            )?,
+        };
+        self.push_locked_for_run(
+            name,
+            state,
+            sender,
+            Some(run_id),
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status,
+                detail: Some(detail),
+            },
+        )?;
+        drop(brains);
+        let gate = self.run_publication_gates
+            .read().expect("shared Brain run-gate map poisoned")
+            .get(&(name.to_string(), run_id)).cloned();
+        let idle = gate.as_ref().and_then(|gate| gate.try_lock().ok())
+            .is_some_and(|gate| !gate.cancel_requested());
+        if idle {
+            self.prune_run_publication(name, run_id)?;
+        }
+        Ok(Some(result))
+    }
+
+    pub(crate) fn begin_run_approval_for_connection(
+        &self,
+        name: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        request_seq: u64,
+        approval_id: String,
+        approval_kind: String,
+        subject: String,
+        audience: BrainApprovalAudience,
+        detail: serde_json::Value,
+    ) -> Result<RunId> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        let attachment = state.attachments.get(&attachment_id)
+            .context("unknown Brain attachment")?;
+        anyhow::ensure!(
+            attachment.connected && attachment.connection_id == Some(connection_id),
+            "approval audience connection is no longer current"
+        );
+        let run_id = state.runs.values().find(|run| {
+            run.request_seq == request_seq && run.status == BrainRunStatus::Running
+        }).map(|run| run.run_id)
+            .context("approval request does not address a running Brain run")?;
+        self.push_locked_for_run(
+            name, state, "daemon", Some(run_id),
+            BrainEventKind::RunStatusChanged {
+                run_id,
+                status: BrainRunStatus::AwaitingApproval,
+                detail: Some(format!("awaiting approval {approval_id}")),
+            },
+        )?;
+        if approval_kind == "tool" {
+            let input = detail.get("input").cloned().unwrap_or(serde_json::Value::Null);
+            self.push_locked_for_run(
+                name, state, "provider", Some(run_id),
+                BrainEventKind::ToolCall {
+                    request_seq,
+                    tool_id: approval_id.clone(),
+                    name: subject.clone(),
+                    input,
+                },
+            )?;
+        }
+        self.push_locked_for_run(
+            name, state, "runner", Some(run_id),
+            BrainEventKind::ApprovalRequested {
+                request_seq,
+                approval_id,
+                approval_kind,
+                subject,
+                audience: Some(audience),
+                detail,
+            },
+        )?;
+        Ok(run_id)
+    }
+
     pub fn reserve_run_cancellation(
         &self,
         name: &str,
@@ -4562,6 +4683,74 @@ mod tests {
         assert_eq!(restored.request_seq, prompt.seq);
         assert_eq!(restored.status, BrainRunStatus::Completed);
         assert!(restored.updated_ms >= restored.started_ms);
+    }
+
+    #[test]
+    fn explicit_cancel_racing_disconnect_never_publishes_result_after_terminal() {
+        let store = BrainStore::with_root("box.local", None);
+        let attachment = store
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let prompt = store.push(
+            "shared",
+            "alice",
+            BrainEventKind::Prompt { text: "race".into() },
+        ).unwrap();
+        let run = store.start_run(
+            "shared",
+            "alice",
+            BrainRunKind::Interactive,
+            prompt.seq,
+            attachment.attachment_id,
+            BrainRunStatus::Running,
+        ).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let cancel_store = store.clone();
+        let cancel_barrier = barrier.clone();
+        let run_id = run.run_id;
+        let cancel = std::thread::spawn(move || {
+            cancel_barrier.wait();
+            cancel_store.transition_run(
+                "shared",
+                "alice",
+                run_id,
+                BrainRunStatus::Cancelled,
+                Some("cancelled by initiating driver".into()),
+            )
+        });
+        let disconnect_store = store.clone();
+        let disconnect_barrier = barrier.clone();
+        let disconnect = std::thread::spawn(move || {
+            disconnect_barrier.wait();
+            disconnect_store.terminalize_run_with_result_if_active(
+                "shared",
+                "daemon",
+                run_id,
+                prompt.seq,
+                BrainRunStatus::Failed,
+                "initiating Brain connection disconnected".into(),
+            )
+        });
+        barrier.wait();
+        let _ = cancel.join().unwrap();
+        disconnect.join().unwrap().unwrap();
+
+        let snapshot = store.snapshot("shared").unwrap();
+        let terminal = snapshot.events.iter().filter(|event| matches!(
+            event.kind,
+            BrainEventKind::RunStatusChanged { run_id: event_run_id, status, .. }
+                if event_run_id == run_id && status.is_terminal()
+        )).collect::<Vec<_>>();
+        assert_eq!(terminal.len(), 1);
+        assert!(!snapshot.events.iter().any(|event| {
+            event.seq > terminal[0].seq
+                && event.run_id == Some(run_id)
+                && matches!(event.kind, BrainEventKind::Result { .. })
+        }));
+        assert!(snapshot.events.iter().filter(|event| {
+            event.run_id == Some(run_id)
+                && matches!(event.kind, BrainEventKind::Result { .. })
+        }).count() <= 1);
     }
 
     #[tokio::test]

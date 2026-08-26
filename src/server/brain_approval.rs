@@ -89,6 +89,47 @@ impl BrainApprovalBroker {
         self.register_inner(request_seq, approval_id, audience, Some(connection_id))
     }
 
+    pub(crate) fn register_for_connection_with_authority<T>(
+        &self, request_seq: u64, approval_id: impl Into<String>,
+        audience: BrainApprovalAudience, connection_id: ConnectionId,
+        authorize: impl FnOnce() -> Result<T>,
+    ) -> Result<(ApprovalRegistration, T)> {
+        let key = ApprovalKey {
+            brain_id: audience.brain_id,
+            request_seq,
+            approval_id: approval_id.into(),
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        let mut pending = self.pending.lock().expect("approval broker lock poisoned");
+        anyhow::ensure!(
+            !pending.contains_key(&key),
+            "approval '{}' is already pending for Brain {} request {}",
+            key.approval_id,
+            key.brain_id.0,
+            key.request_seq
+        );
+        // The authority check and durable approval publication run while the
+        // same lock used by cancel_connection is held. Detach first revokes
+        // the canonical connection and then takes this lock, so registration
+        // is ordered wholly before its cancellation or fails wholly after it.
+        let authorized = authorize()?;
+        pending.insert(
+            key.clone(),
+            PendingApproval {
+                request_seq,
+                audience,
+                connection_id: Some(connection_id),
+                response_tx: Some(response_tx),
+                delivered_decision: None,
+            },
+        );
+        Ok((ApprovalRegistration {
+            broker: self.clone(),
+            key,
+            response_rx: Some(response_rx),
+        }, authorized))
+    }
+
     fn register_inner(
         &self, request_seq: u64, approval_id: impl Into<String>,
         audience: BrainApprovalAudience, connection_id: Option<ConnectionId>,
