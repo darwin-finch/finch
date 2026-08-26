@@ -21,12 +21,16 @@ small environment allowlist to app-server. Finch sends an encoded copy of the
 complete Brain conversation on every request, so an app-server thread is never
 durable conversation truth. Finch refuses to construct the provider when the
 installed protocol schema cannot express the restricted read-only policy.
+Codex CLI 0.149.1 does not expose the required readable-root controls, so Finch
+rejects that version for all ChatGPT subscription turns; install a newer Codex
+release whose generated schema includes the restricted `readOnly` access variant.
 
 This is an agent-protocol adapter, not raw Chat Completions or Responses API
 parity. Finch tool calls require the installed app-server schema to advertise the
 experimental `dynamicTools` thread capability. If it does not, Finch rejects that
 provider before starting the turn and proceeds to the next configured provider
-(for example Grok). Plain text turns remain usable.
+(for example Grok). Text-only turns require the same restricted sandbox boundary
+and therefore also fall back when it is unavailable.
 
 The ignored live smoke test is opt-in:
 
