@@ -26,6 +26,22 @@ arguments, for example:
 ./scripts/test_brains.sh cargo test --lib brain::store
 ```
 
+The Rust supervisor creates and owns one OS process group, retains its leader
+until group termination, escalates TERM to KILL within a bound, proves the
+group quiescent, and only then reaps and removes HOME. Launchers never signal
+PIDs. Isolated commands reject daemon discovery, reuse, and auto-spawn. Test
+code is trusted not to enable job control or call `setsid`, `setpgid`, or
+`CommandExt::process_group`. The isolation self-test mechanically scans the
+supervised launchers and daemon integration paths for those escape APIs.
+Deliberately hostile same-UID code that evades that source contract is outside
+this harness's boundary.
+
+The disposable HOME is an unguessable mode-0700 directory and production
+constructors receive its canonical path through the sealed proof. Path-based
+Brain storage therefore relies on the trusted-child contract; it does not claim
+resistance to a malicious same-UID child replacing ancestors. A parent-held
+before/after digest still guards the real Brain store.
+
 Run the isolation harness's own regression checks with:
 
 ```bash
@@ -47,15 +63,18 @@ Run the isolation harness's own regression checks with:
 - Loopback networking
 - A live teacher credential only for the ignored query smoke
 
-Each test daemon owns a temporary HOME, per-test Unix socket, and
-kernel-assigned loopback port. Its RAII guard stops and reaps only the child it
-spawned. The tests never discover or reuse an ambient daemon.
+Each test daemon uses the supervisor's disposable HOME, per-suite Unix socket,
+inherited port-zero listener, and sealed random Brain password. Its RAII guard
+stops and reaps only the direct child on ordinary returns; the process-group
+supervisor remains authoritative for signal and failure teardown. The tests
+never discover, probe, or reuse an ambient daemon.
 
-Ignored in-crate IPC/remote Brain smokes fail closed unless their owned fixture
-is supplied explicitly with `FINCH_TEST_IPC_SOCKET`, `FINCH_TEST_DAEMON_ADDR`,
-`FINCH_TEST_BRAIN_ADDR`, and `FINCH_TEST_BRAIN_PASSWORD` as applicable. Those
-values must identify the disposable daemon launched inside the same wrapper;
-the tests never fall back to standard Finch sockets, ports, or config.
+Ignored remote Brain smokes consume the supervisor's inherited port-zero
+listeners and sealed random credential; they never accept a caller-supplied
+loopback endpoint. Ignored IPC smokes use the supervised daemon inside the
+sealed HOME. The supervisor scrubs every ambient TCP endpoint and password.
+Unix IPC validates the socket path before and after connect and authenticates
+the connected peer as a member of the supervisor-owned process group.
 
 ### TUI Integration Tests
 ```bash

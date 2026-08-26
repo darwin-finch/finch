@@ -4,11 +4,10 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
 
 struct TestDaemon {
     _child: OwnedChild,
-    _home: TempDir,
+    _serial: tokio::sync::OwnedMutexGuard<()>,
     home_path: PathBuf,
     address: String,
 }
@@ -24,34 +23,31 @@ impl Drop for OwnedChild {
 
 impl TestDaemon {
     async fn start(api_key: &str) -> Result<Self> {
-        anyhow::ensure!(
-            std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref() == Ok("1"),
-            "daemon integration tests require scripts/test_brains.sh"
-        );
-        let suite_home = std::env::var_os("FINCH_BRAIN_TEST_HOME")
-            .map(PathBuf::from)
-            .context("missing isolated suite HOME")?;
-        let home = tempfile::Builder::new()
-            .prefix("daemon-case-")
-            .tempdir_in(suite_home)
-            .context("create isolated daemon HOME")?;
-        let finch_dir = home.path().join(".finch");
-        std::fs::create_dir_all(&finch_dir)?;
-        write_config(home.path(), "127.0.0.1:0", api_key)?;
-        let address_file = finch_dir.join("bound.addr");
-        let child = Command::new(env!("CARGO_BIN_EXE_finch"))
+        static SERIAL: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
+            std::sync::OnceLock::new();
+        let serial = SERIAL
+            .get_or_init(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+            .lock_owned()
+            .await;
+        let proof = finch::brain::isolated_test_proof()
+            .context("daemon integration tests require supervisor authority")?;
+        let daemon_address = proof.daemon_address().to_owned();
+        let brain_password = proof.brain_password()?;
+        let home = proof.home;
+        let finch_dir = home.join(".finch");
+        std::fs::create_dir_all(finch_dir.join("brains"))?;
+        write_config(&home, &daemon_address, api_key, &brain_password)?;
+        let address_file = finch_dir.join(format!("bound-{}.addr", uuid::Uuid::new_v4().simple()));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_finch"));
+        command
             .arg("daemon")
             .arg("--bind")
-            .arg("127.0.0.1:0")
-            .env("HOME", home.path())
-            .env("FINCH_BRAIN_TEST_ISOLATED", "1")
-            .env("FINCH_BRAIN_TEST_HOME", home.path())
-            .env("FINCH_BRAIN_TEST_ROOT", finch_dir.join("brains"))
+            .arg(&daemon_address)
             .env("FINCH_TEST_BOUND_ADDR_FILE", &address_file)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("spawn isolated Finch daemon")?;
+            .stderr(Stdio::null());
+        let child = command.spawn().context("spawn isolated Finch daemon")?;
         let mut child = OwnedChild(child);
 
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -67,14 +63,17 @@ impl TestDaemon {
             }
             std::thread::sleep(Duration::from_millis(25));
         };
-        anyhow::ensure!(address.starts_with("127.0.0.1:") && !address.ends_with(":0"));
+        anyhow::ensure!(
+            address == daemon_address,
+            "daemon published an address outside supervisor authority"
+        );
         wait_for_health(&address).await?;
-        write_config(home.path(), &address, api_key)?;
+        write_config(&home, &address, api_key, &brain_password)?;
 
         Ok(Self {
             _child: child,
-            home_path: home.path().to_path_buf(),
-            _home: home,
+            _serial: serial,
+            home_path: home,
             address,
         })
     }
@@ -84,7 +83,12 @@ impl TestDaemon {
     }
 }
 
-fn write_config(home: &Path, daemon_address: &str, api_key: &str) -> Result<()> {
+fn write_config(
+    home: &Path,
+    daemon_address: &str,
+    api_key: &str,
+    brain_password: &str,
+) -> Result<()> {
     let config = format!(
         r#"[[providers]]
 type = "claude"
@@ -108,7 +112,7 @@ mode = "daemon-only"
 advertise = false
 service_name = "finch-isolated-test"
 service_description = "isolated test"
-brain_password = "isolated-test-password"
+brain_password = {brain_password:?}
 "#
     );
     std::fs::write(home.join(".finch/config.toml"), config)?;

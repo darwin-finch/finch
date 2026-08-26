@@ -135,6 +135,15 @@ With arguments:
 cargo watch -s './scripts/test_brains.sh cargo test'
 ```
 
+The Rust Brain test supervisor owns one OS process group for the runner and all
+of its test daemons. Launchers must not detach or signal PIDs themselves; they
+leave group termination, bounded escalation, quiescence, and reaping to the
+supervisor. Isolated tests disable daemon discovery, reuse, and auto-spawn.
+Supervised launchers and daemons must not enable job control or call `setsid`,
+`setpgid`, or `CommandExt::process_group`; the isolation self-test scans those
+production test paths for violations. Deliberately hostile same-UID code that
+evades that contract is outside this trusted-test boundary.
+
 ## Code Quality
 
 ### Format Code
@@ -619,11 +628,9 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 **Port already in use**:
 ```bash
-# Find process using port
+# Inspect the owner, then stop it through the service or supervisor that
+# launched it. Do not signal a PID copied from process-list output.
 lsof -i :8000
-
-# Kill process
-kill <PID>
 ```
 
 ## Getting Help

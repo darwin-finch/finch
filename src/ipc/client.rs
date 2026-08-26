@@ -100,6 +100,10 @@ impl IpcClient {
             .await
             .with_context(|| format!("IPC connect failed: {}", path.display()))?;
 
+        Self::from_stream(stream).await
+    }
+
+    pub(crate) async fn from_stream(stream: tokio::net::UnixStream) -> Result<Self> {
         let (reader, writer) = stream.into_split();
         let network = twoparty::VatNetwork::new(
             reader.compat(),
@@ -1653,27 +1657,33 @@ mod tests {
     }
 
     async fn connect_isolated_live_socket() -> Result<IpcClient> {
-        anyhow::ensure!(
-            std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref() == Ok("1"),
-            "live IPC tests require scripts/test_brains.sh"
-        );
+        let proof = crate::brain::isolated_test_proof()?;
         let path = std::env::var_os("FINCH_TEST_IPC_SOCKET")
             .map(std::path::PathBuf::from)
             .ok_or_else(|| {
                 anyhow::anyhow!("FINCH_TEST_IPC_SOCKET must name the owned test daemon socket")
             })?;
-        anyhow::ensure!(path.is_absolute(), "FINCH_TEST_IPC_SOCKET must be absolute");
-        let home = std::env::var_os("FINCH_BRAIN_TEST_HOME")
-            .map(std::path::PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("FINCH_BRAIN_TEST_HOME is required"))?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("FINCH_TEST_IPC_SOCKET has no parent"))?;
         anyhow::ensure!(
-            parent.canonicalize()?.starts_with(home.canonicalize()?),
-            "FINCH_TEST_IPC_SOCKET must be inside the isolated HOME"
+            path == proof.ipc_socket,
+            "IPC path is not parent-authorized"
         );
-        IpcClient::connect_path(path).await
+        #[cfg(unix)]
+        let before = crate::brain::validate_isolated_test_socket(&proof, &path)?;
+        let stream = tokio::net::UnixStream::connect(&path)
+            .await
+            .with_context(|| format!("IPC connect failed: {}", path.display()))?;
+        #[cfg(unix)]
+        crate::brain::authenticate_isolated_test_peer(&stream)?;
+        let client = IpcClient::from_stream(stream).await?;
+        #[cfg(unix)]
+        {
+            let after = crate::brain::validate_isolated_test_socket(&proof, &path)?;
+            anyhow::ensure!(
+                before == after,
+                "test IPC socket identity changed during connect"
+            );
+        }
+        Ok(client)
     }
 
     #[test]

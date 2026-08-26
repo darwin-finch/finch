@@ -10,4 +10,8 @@ if [[ "$#" -eq 0 ]]; then
 fi
 
 cd "$repo_root"
-brain_test_isolation_run "$@"
+supervisor="${FINCH_TEST_SUPERVISOR_BIN:-$repo_root/target/debug/finch-test-supervisor}"
+if [[ -x "$supervisor" ]]; then
+  exec "$supervisor" "$@"
+fi
+exec cargo run --quiet --bin finch-test-supervisor -- "$@"
