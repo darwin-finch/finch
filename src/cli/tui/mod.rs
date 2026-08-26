@@ -2672,34 +2672,114 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
             out.push(String::new());
             continue;
         }
-        let mut cur = String::new();
-        let mut columns = 0usize;
-        let mut chars = para.chars().peekable();
-        while let Some(ch) = chars.next() {
-            // SGR/CSI is trusted presentation metadata in structured dialog
-            // bodies and consumes no terminal columns.
-            if ch == '\u{1b}' && chars.peek() == Some(&'[') {
-                cur.push(ch);
-                cur.push(chars.next().expect("peeked CSI introducer"));
-                for control in chars.by_ref() {
-                    cur.push(control);
-                    if ('@'..='~').contains(&control) {
-                        break;
-                    }
-                }
-                continue;
-            }
-            let char_width = terminal_char_width(ch);
+        if is_preformatted_dialog_line(para) {
+            out.extend(wrap_preformatted(para, width));
+        } else {
+            out.extend(wrap_prose(para, width));
+        }
+    }
+    out
+}
+
+fn is_preformatted_dialog_line(line: &str) -> bool {
+    if line.starts_with(char::is_whitespace)
+        || line.contains('\u{1b}')
+        || line.starts_with("@@")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("diff --git ")
+        || (line.contains("  +") && line.contains(" -"))
+    {
+        return true;
+    }
+    let mut fields = line.split_whitespace();
+    fields
+        .next()
+        .is_some_and(|value| value.parse::<usize>().is_ok())
+        && fields
+            .next()
+            .is_some_and(|value| value.parse::<usize>().is_ok())
+        && line.contains("   ")
+}
+
+fn wrap_prose(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut columns = 0usize;
+    for word in text.split_whitespace() {
+        let word_width = word
+            .chars()
+            .map(|ch| terminal_char_width(ch).min(width))
+            .sum::<usize>();
+        if !current.is_empty() && columns.saturating_add(1).saturating_add(word_width) <= width {
+            current.push(' ');
+            current.push_str(word);
+            columns = columns.saturating_add(1).saturating_add(word_width);
+            continue;
+        }
+        if !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+            columns = 0;
+        }
+        for ch in word.chars() {
+            let char_width = terminal_char_width(ch).min(width);
             if columns > 0 && columns.saturating_add(char_width) > width {
-                out.push(std::mem::take(&mut cur));
+                out.push(std::mem::take(&mut current));
                 columns = 0;
             }
-            cur.push(ch);
+            current.push(ch);
             columns = columns.saturating_add(char_width);
         }
-        if !cur.is_empty() {
-            out.push(cur);
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+fn wrap_preformatted(text: &str, width: usize) -> Vec<String> {
+    const RESET_SGR: &str = "\x1b[0m";
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut active_sgr = String::new();
+    let mut columns = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            let mut sequence = String::from("\x1b[");
+            chars.next();
+            for control in chars.by_ref() {
+                sequence.push(control);
+                if ('@'..='~').contains(&control) {
+                    break;
+                }
+            }
+            if sequence.ends_with('m') {
+                if sequence == RESET_SGR || sequence == "\x1b[m" {
+                    active_sgr.clear();
+                } else {
+                    active_sgr = sequence.clone();
+                }
+            }
+            current.push_str(&sequence);
+            continue;
         }
+        let char_width = terminal_char_width(ch).min(width);
+        if columns > 0 && columns.saturating_add(char_width) > width {
+            if !active_sgr.is_empty() {
+                current.push_str(RESET_SGR);
+            }
+            out.push(std::mem::take(&mut current));
+            if !active_sgr.is_empty() {
+                current.push_str(&active_sgr);
+            }
+            columns = 0;
+        }
+        current.push(ch);
+        columns = columns.saturating_add(char_width);
+    }
+    if !current.is_empty() {
+        out.push(current);
     }
     out
 }
@@ -4056,9 +4136,25 @@ mod draw_dialog_tests {
         let wrapped = wrap_text("\x1b[31m  + 新規abcdef\x1b[0m", 8);
         assert_eq!(wrapped.len(), 2);
         assert!(wrapped[0].starts_with("\x1b[31m  + 新規"));
+        assert!(wrapped[0].ends_with("\x1b[0m"));
+        assert!(wrapped[1].starts_with("\x1b[31m"));
+        assert!(wrapped[1].ends_with("\x1b[0m"));
         assert!(wrapped.iter().all(|line| {
             let visible = strip_ansi(line);
             visible.chars().map(terminal_char_width).sum::<usize>() <= 8
         }));
+    }
+
+    #[test]
+    fn test_wrap_text_keeps_ordinary_prose_on_word_boundaries() {
+        assert_eq!(
+            wrap_text("alpha beta gamma", 10),
+            vec!["alpha beta", "gamma"]
+        );
+    }
+
+    #[test]
+    fn test_wrap_text_handles_cjk_at_one_column_without_empty_rows() {
+        assert_eq!(wrap_text("新規", 1), vec!["新", "規"]);
     }
 }

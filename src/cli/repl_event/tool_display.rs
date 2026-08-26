@@ -299,12 +299,16 @@ pub(crate) fn tool_approval_diff_preview(
     let diff = match tool_use.name.to_lowercase().as_str() {
         "write" => {
             let after = tool_use.input.get("content")?.as_str()?;
-            let before = match std::fs::read_to_string(path) {
-                Ok(value) => value,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            let (before, was_missing) = match std::fs::read_to_string(path) {
+                Ok(value) => (value, false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), true),
                 Err(_) => return None,
             };
-            crate::cli::diff::FileDiff::from_texts(path, &before, after)
+            if was_missing {
+                crate::cli::diff::FileDiff::from_created(path, after)
+            } else {
+                crate::cli::diff::FileDiff::from_texts(path, &before, after)
+            }
         }
         "edit" => {
             let old_string = tool_use.input.get("old_string")?.as_str()?;
@@ -917,11 +921,17 @@ mod tests {
 
     #[test]
     fn test_tool_result_write_structured_diff_keeps_body_and_sanitizes_preamble() {
-        let diff = crate::cli::diff::FileDiff::from_texts("out.txt", "", "hello\n").to_unified();
+        let diff = crate::cli::diff::FileDiff::from_created("out.txt", "hello\n").to_unified();
         let content = format!("\x1b]8;;bad\x07Created\n{diff}");
         let (summary, body) = tool_result_to_display("write", &content);
         assert_eq!(summary, "out.txt  +1 -0");
         assert_eq!(body.first().map(String::as_str), Some("Created"));
+        assert_eq!(
+            body.iter()
+                .find(|line| line.starts_with("--- "))
+                .map(String::as_str),
+            Some("--- /dev/null")
+        );
         assert!(body.iter().any(|line| line == "+hello"));
     }
 
@@ -970,6 +980,27 @@ mod tests {
             crate::cli::diff::DiffColorMode::NoColor,
         )
         .is_none());
+    }
+
+    #[test]
+    fn test_write_approval_preview_marks_missing_file_as_created() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new.txt");
+        let tool = crate::tools::types::ToolUse::new(
+            "write".into(),
+            serde_json::json!({
+                "file_path": path,
+                "content": "created\n"
+            }),
+        );
+        let rendered = tool_approval_diff_preview(
+            &tool,
+            &crate::config::ColorScheme::default(),
+            crate::cli::diff::DiffColorMode::NoColor,
+        )
+        .unwrap();
+        assert!(rendered.contains("created"), "{rendered}");
+        assert!(!rendered.contains("renamed"), "{rendered}");
     }
 
     #[test]

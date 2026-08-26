@@ -96,9 +96,9 @@ impl Tool for WriteTool {
 
         // Interactive: propose the script in $EDITOR before writing.
         if std::io::stdin().is_terminal() {
-            let original = match fs::read_to_string(file_path) {
-                Ok(value) => value,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            let (original, was_missing) = match fs::read_to_string(file_path) {
+                Ok(value) => (value, false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), true),
                 Err(error) => {
                     return Err(error)
                         .with_context(|| format!("Failed to read existing file: {}", file_path))
@@ -114,8 +114,12 @@ impl Tool for WriteTool {
             let script_stdout = run_script_async(&script).await?;
             let updated = fs::read_to_string(file_path)
                 .with_context(|| format!("Failed to read written file: {}", file_path))?;
-            let diff =
-                crate::cli::diff::FileDiff::from_texts(file_path, &original, &updated).to_unified();
+            let diff = if was_missing {
+                crate::cli::diff::FileDiff::from_created(file_path, &updated)
+            } else {
+                crate::cli::diff::FileDiff::from_texts(file_path, &original, &updated)
+            }
+            .to_unified();
             return Ok(if script_stdout.trim().is_empty() {
                 diff
             } else {
@@ -141,7 +145,7 @@ impl Tool for WriteTool {
                 .with_context(|| format!("Failed to write file: {}", file_path))?;
             run_post_save_hook(file_path);
 
-            Ok(crate::cli::diff::FileDiff::from_texts(file_path, "", content).to_unified())
+            Ok(crate::cli::diff::FileDiff::from_created(file_path, content).to_unified())
         } else {
             // Existing file: read original, write new, show stats
             let original = fs::read_to_string(file_path)
@@ -187,6 +191,8 @@ mod tests {
         let result = tool.execute(input, &context).await.unwrap();
         let diff = crate::cli::diff::FileDiff::parse(&result).unwrap();
         assert_eq!(diff.display_path(), path);
+        assert_eq!(diff.old_path, "/dev/null");
+        assert!(diff.is_created());
         assert_eq!((diff.added(), diff.removed()), (3, 0));
     }
 }
