@@ -24,14 +24,19 @@ installed protocol schema cannot express the restricted read-only policy.
 Codex CLI 0.149.1 does not expose the required readable-root controls, so Finch
 rejects that version for all ChatGPT subscription turns; install a newer Codex
 release whose generated schema includes the restricted `readOnly` access variant.
-Finch additionally pins one canonical, owner-controlled Codex launcher/interpreter
-identity and SHA-256 artifact pair for schema inspection and runtime, rejects any
-writable installation ancestor, and accepts only explicitly audited CLI
-versions. No Codex release is currently on that allowlist: a release must be audited
-for effective built-in tools, managed configuration precedence, environments, and
-sandbox enforcement before this provider becomes available. This deliberate fail-
-closed compatibility limit prevents a future schema-compatible release from being
-trusted automatically.
+Finch resolves the npm launcher only as package metadata and never executes it.
+Before schema inspection, authentication, config reads, or a turn, Finch resolves
+the packaged native binary and checks the launcher, both package manifests, package
+provenance record, and native binary against one immutable audit tuple. That tuple
+includes the package version, package and native SHA-256 digests, and (on macOS) the
+signing Team ID and designated requirement. Runtime invokes that exact native binary
+directly. Finch also rejects writable installation ancestors and revalidates every
+pinned file before spawn. No Codex release is currently on the allowlist: a release
+must be audited end-to-end for per-thread merged config semantics, effective built-in
+tools, managed configuration precedence, environments, process environment, and
+sandbox enforcement before this provider becomes available. This deliberate
+fail-closed compatibility limit prevents a future schema-compatible release from
+being trusted automatically.
 
 The profile default is `gpt-5.6-sol`; the official `gpt-5.6` alias currently routes
 to that model. Finch does not substitute the lower-cost Terra tier implicitly.

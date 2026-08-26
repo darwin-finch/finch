@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -38,9 +38,18 @@ const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SCHEMA_GENERATION_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 // Each accepted release requires an audit of effective app-server configuration,
 // built-in tools, and sandbox enforcement. Schema compatibility alone is not trust.
-// (version, launcher SHA-256, interpreter SHA-256). Deliberately empty until an
-// official release is audited end-to-end and its immutable artifacts are pinned.
-const AUDITED_CODEX_ARTIFACTS: &[(&str, [u8; 32], [u8; 32])] = &[];
+#[derive(Debug)]
+struct AuditedArtifact {
+    package_version: &'static str,
+    package_digest: [u8; 32],
+    native_digest: [u8; 32],
+    team_id: &'static str,
+    designated_requirement: &'static str,
+}
+
+// Deliberately empty until an official release is audited end-to-end and its
+// immutable npm package/native artifact/signing requirement are pinned.
+const AUDITED_CODEX_ARTIFACTS: &[AuditedArtifact] = &[];
 const ADAPTER_INSTRUCTIONS: &str = "You are serving as Finch's model adapter. Do not modify files, run commands, browse, or invoke built-in Codex tools. Answer only from the supplied conversation. When Finch dynamic tools are supplied, invoke only those dynamic tools. Finch/Brain is the durable conversation authority; this Codex thread is ephemeral.";
 
 #[derive(Debug, Clone)]
@@ -69,7 +78,11 @@ struct FileIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecutableIdentity {
     files: Vec<FileIdentity>,
-    version: String,
+    package_version: String,
+    package_digest: [u8; 32],
+    native_digest: [u8; 32],
+    team_id: Option<String>,
+    designated_requirement: Option<String>,
 }
 
 fn hardened_app_server_args() -> Vec<String> {
@@ -111,21 +124,22 @@ fn hardened_app_server_args() -> Vec<String> {
 
 impl AppServerCommand {
     fn production() -> Result<Self> {
-        let codex = resolve_trusted_program("codex")?;
-        let (program, mut prefix, mut files) = resolve_codex_launcher(&codex)?;
-        let version = run_version_bounded(&program, &prefix, SCHEMA_GENERATION_TIMEOUT)?;
-        let mut args = hardened_app_server_args();
-        prefix.append(&mut args);
-        files.push(file_identity(&program)?);
-        Ok(Self {
+        let launcher = resolve_trusted_program("codex")?;
+        let (program, identity) = resolve_codex_native_identity(&launcher)?;
+        let command = Self {
             program,
-            args: prefix,
+            args: hardened_app_server_args(),
             rpc_timeout: RPC_TIMEOUT,
             login_timeout: LOGIN_TIMEOUT,
             turn_timeout: TURN_TIMEOUT,
             schema_timeout: SCHEMA_GENERATION_TIMEOUT,
-            identity: Some(ExecutableIdentity { files, version }),
-        })
+            identity: Some(identity),
+        };
+        // Nothing from the package executes before the immutable audit tuple
+        // matches. In particular, do not run the JS launcher, native --version,
+        // schema generation, auth, or config RPCs before this gate.
+        command.require_audited_identity()?;
+        Ok(command)
     }
 
     #[cfg(test)]
@@ -219,13 +233,17 @@ impl AppServerCommand {
         let Some(identity) = &self.identity else {
             return false;
         };
-        let [launcher, interpreter] = identity.files.as_slice() else {
-            return false;
-        };
         AUDITED_CODEX_ARTIFACTS.iter().any(|audited| {
-            identity.version == audited.0
-                && launcher.sha256 == audited.1
-                && interpreter.sha256 == audited.2
+            identity.package_version == audited.package_version
+                && identity.package_digest == audited.package_digest
+                && identity.native_digest == audited.native_digest
+                && identity.team_id.as_deref() == Some(audited.team_id)
+                && identity.designated_requirement.as_deref()
+                    == Some(audited.designated_requirement)
+                && identity
+                    .files
+                    .iter()
+                    .any(|file| file.sha256 == identity.native_digest)
         })
     }
 
@@ -271,18 +289,106 @@ fn validate_trusted_install_location(path: &Path) -> Result<()> {
     }
 }
 
-fn resolve_codex_launcher(codex: &Path) -> Result<(PathBuf, Vec<String>, Vec<FileIdentity>)> {
-    let bytes = std::fs::read(codex).context("Could not inspect the Codex launcher")?;
-    let first = bytes
-        .split(|byte| *byte == b'\n')
-        .next()
-        .unwrap_or_default();
-    let files = vec![file_identity(codex)?];
-    if first == b"#!/usr/bin/env node" {
-        let node = resolve_trusted_program("node")?;
-        return Ok((node, vec![codex.to_string_lossy().into_owned()], files));
+fn resolve_codex_native_identity(launcher: &Path) -> Result<(PathBuf, ExecutableIdentity)> {
+    let package_root = launcher
+        .parent()
+        .and_then(Path::parent)
+        .context("Codex launcher is outside an npm package")?;
+    let package_json = package_root.join("package.json");
+    let package: Value = serde_json::from_slice(&std::fs::read(&package_json)?)
+        .context("Codex package metadata is invalid")?;
+    let package_version = required_string(&package, "version")?;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let (platform_package, target) = ("codex-darwin-arm64", "aarch64-apple-darwin");
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    let (platform_package, target) = ("codex-darwin-x64", "x86_64-apple-darwin");
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    let (platform_package, target) = ("codex-linux-arm64", "aarch64-unknown-linux-musl");
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let (platform_package, target) = ("codex-linux-x64", "x86_64-unknown-linux-musl");
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )))]
+    bail!("This platform has no audited Codex native package layout");
+
+    let platform_root = package_root
+        .join("node_modules/@openai")
+        .join(platform_package);
+    let platform_json = platform_root.join("package.json");
+    let provenance = platform_root
+        .join("vendor")
+        .join(target)
+        .join("codex-package.json");
+    let native = platform_root.join("vendor").join(target).join("bin/codex");
+    let native = std::fs::canonicalize(native).context("Codex native binary is unavailable")?;
+    validate_trusted_install_location(&native)?;
+
+    let files = [
+        launcher.to_path_buf(),
+        package_json,
+        platform_json,
+        provenance,
+        native.clone(),
+    ]
+    .into_iter()
+    .map(|path| file_identity(&path))
+    .collect::<Result<Vec<_>>>()?;
+    let mut package_hasher = Sha256::new();
+    for file in &files[..files.len() - 1] {
+        package_hasher.update(file.sha256);
     }
-    Ok((codex.to_path_buf(), Vec::new(), files))
+    let package_digest = package_hasher.finalize().into();
+    let native_digest = files
+        .last()
+        .context("Codex native identity missing")?
+        .sha256;
+    let (team_id, designated_requirement) = inspect_code_signature(&native)?;
+    Ok((
+        native,
+        ExecutableIdentity {
+            files,
+            package_version,
+            package_digest,
+            native_digest,
+            team_id,
+            designated_requirement,
+        },
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_code_signature(path: &Path) -> Result<(Option<String>, Option<String>)> {
+    let details = std::process::Command::new("/usr/bin/codesign")
+        .args(["-d", "--verbose=4"])
+        .arg(path)
+        .output()
+        .context("Could not inspect Codex code signature")?;
+    let detail_text = String::from_utf8_lossy(&details.stderr);
+    let team_id = detail_text
+        .lines()
+        .find_map(|line| line.strip_prefix("TeamIdentifier="))
+        .filter(|value| *value != "not set")
+        .map(str::to_string);
+    let requirement = std::process::Command::new("/usr/bin/codesign")
+        .args(["-d", "-r-"])
+        .arg(path)
+        .output()
+        .context("Could not inspect Codex designated requirement")?;
+    let requirement_text = String::from_utf8_lossy(&requirement.stderr);
+    let designated = requirement_text
+        .lines()
+        .find_map(|line| line.strip_prefix("designated => "))
+        .map(str::to_string);
+    Ok((team_id, designated))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn inspect_code_signature(_path: &Path) -> Result<(Option<String>, Option<String>)> {
+    Ok((None, None))
 }
 
 fn validate_trusted_file(path: &Path) -> Result<()> {
@@ -336,44 +442,6 @@ fn file_identity(path: &Path) -> Result<FileIdentity> {
         #[cfg(unix)]
         inode: metadata.ino(),
     })
-}
-
-fn run_version_bounded(program: &Path, prefix: &[String], limit: StdDuration) -> Result<String> {
-    let mut process = std::process::Command::new(program);
-    process.args(prefix).arg("--version");
-    process.env_clear().envs(inherited_process_environment());
-    process
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .stdout(Stdio::piped());
-    configure_std_process_group(&mut process);
-    let mut child = process
-        .spawn()
-        .context("Could not start trusted Codex CLI")?;
-    let deadline = std::time::Instant::now() + limit;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                use std::io::Read;
-                let mut bytes = Vec::new();
-                child
-                    .stdout
-                    .take()
-                    .context("Codex version output unavailable")?
-                    .take(4096)
-                    .read_to_end(&mut bytes)?;
-                return Ok(String::from_utf8_lossy(&bytes).trim().to_string());
-            }
-            Ok(Some(_)) => bail!("Trusted Codex CLI version check failed"),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                thread::sleep(StdDuration::from_millis(10))
-            }
-            _ => {
-                kill_std_process_group(&mut child);
-                bail!("Trusted Codex CLI version check timed out")
-            }
-        }
-    }
 }
 
 fn inherited_process_environment() -> impl Iterator<Item = (&'static str, OsString)> {
@@ -694,7 +762,13 @@ fn verify_effective_config(result: &Value) -> Result<()> {
     let config = result
         .get("config")
         .context("Codex app-server omitted effective config")?;
-    for field in ["mcp_servers", "plugins", "environments", "hooks"] {
+    for field in [
+        "mcp_servers",
+        "plugins",
+        "environments",
+        "hooks",
+        "profiles",
+    ] {
         if !config
             .get(field)
             .and_then(Value::as_object)
@@ -702,6 +776,16 @@ fn verify_effective_config(result: &Value) -> Result<()> {
         {
             bail!("Codex effective config retains an unaudited capability");
         }
+    }
+    if config.get("web_search").and_then(Value::as_str) != Some("disabled")
+        || config.get("allow_login_shell").and_then(Value::as_bool) != Some(false)
+        || config
+            .pointer("/shell_environment_policy/inherit")
+            .and_then(Value::as_str)
+            != Some("none")
+        || config.pointer("/agents/enabled").and_then(Value::as_bool) != Some(false)
+    {
+        bail!("Codex effective config did not attest process and web isolation");
     }
     let apps = config
         .get("apps")
@@ -1112,6 +1196,12 @@ struct TurnSession {
     allowed_tools: HashSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ActiveDynamicCall {
+    tool: String,
+    arguments: Value,
+}
+
 impl TurnSession {
     async fn drive(mut self, tx: mpsc::Sender<Result<StreamChunk>>) {
         let deadline = Instant::now() + self.turn_timeout;
@@ -1121,7 +1211,9 @@ impl TurnSession {
 
     async fn drive_until(&mut self, tx: &mpsc::Sender<Result<StreamChunk>>, deadline: Instant) {
         let mut text = String::new();
-        let mut active_tool_calls = HashSet::new();
+        let mut active_tool_calls = HashMap::new();
+        let mut active_agent_items = HashSet::new();
+        let mut agent_deltas: HashMap<String, String> = HashMap::new();
         loop {
             let event = tokio::select! {
                 _ = tx.closed() => {
@@ -1141,9 +1233,33 @@ impl TurnSession {
                     }
                 }
             };
+            let method = event
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let correlation =
+                match validate_event_correlation(&event, method, &self.thread_id, &self.turn_id) {
+                    Ok(correlation) => correlation,
+                    Err(error) => {
+                        let _ = deliver(tx, deadline, Err(error)).await;
+                        return;
+                    }
+                };
             match event.get("method").and_then(Value::as_str) {
                 Some("item/agentMessage/delta") => {
                     if let Some(delta) = event.pointer("/params/delta").and_then(Value::as_str) {
+                        let item_id = correlation.item_id.as_deref().unwrap_or_default();
+                        if !active_agent_items.contains(item_id) {
+                            let _ = deliver(
+                                tx,
+                                deadline,
+                                Err(anyhow::anyhow!(
+                                    "Codex agent delta lacked a correlated item lifecycle"
+                                )),
+                            )
+                            .await;
+                            return;
+                        }
                         if text.len().saturating_add(delta.len()) > MAX_RESPONSE_TEXT_BYTES {
                             let _ = deliver(
                                 tx,
@@ -1154,6 +1270,10 @@ impl TurnSession {
                             return;
                         }
                         text.push_str(delta);
+                        agent_deltas
+                            .entry(item_id.to_string())
+                            .or_default()
+                            .push_str(delta);
                         if !deliver(tx, deadline, Ok(StreamChunk::TextDelta(delta.to_string())))
                             .await
                         {
@@ -1162,10 +1282,21 @@ impl TurnSession {
                     }
                 }
                 Some("item/completed")
-                    if text.is_empty()
-                        && event.pointer("/params/item/type").and_then(Value::as_str)
-                            == Some("agentMessage") =>
+                    if event.pointer("/params/item/type").and_then(Value::as_str)
+                        == Some("agentMessage") =>
                 {
+                    let item_id = correlation.item_id.as_deref().unwrap_or_default();
+                    if !active_agent_items.remove(item_id) {
+                        let _ = deliver(
+                            tx,
+                            deadline,
+                            Err(anyhow::anyhow!(
+                                "Codex agent completion lacked a correlated lifecycle"
+                            )),
+                        )
+                        .await;
+                        return;
+                    }
                     if event.pointer("/params/item/type").and_then(Value::as_str)
                         == Some("agentMessage")
                     {
@@ -1181,11 +1312,16 @@ impl TurnSession {
                                 .await;
                                 return;
                             }
+                            let had_deltas = agent_deltas
+                                .get(item_id)
+                                .is_some_and(|value| !value.is_empty());
                             text = final_text.to_string();
-                            if !deliver(tx, deadline, Ok(StreamChunk::TextDelta(text.clone())))
-                                .await
-                            {
-                                return;
+                            if !had_deltas {
+                                if !deliver(tx, deadline, Ok(StreamChunk::TextDelta(text.clone())))
+                                    .await
+                                {
+                                    return;
+                                }
                             }
                         }
                     }
@@ -1313,6 +1449,9 @@ impl TurnSession {
                         .await;
                         return;
                     }
+                    if item_type == "agentMessage" && method == Some("item/started") {
+                        active_agent_items.insert(correlation.item_id.clone().unwrap_or_default());
+                    }
                     if item_type == "dynamicToolCall" {
                         let tool = event.pointer("/params/item/tool").and_then(Value::as_str);
                         if !tool.is_some_and(|tool| self.allowed_tools.contains(tool)) {
@@ -1339,9 +1478,17 @@ impl TurnSession {
                             .await;
                             return;
                         };
+                        let arguments = event
+                            .pointer("/params/item/arguments")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        let call = ActiveDynamicCall {
+                            tool: tool.unwrap().to_string(),
+                            arguments,
+                        };
                         if method == Some("item/started") {
-                            active_tool_calls.insert(call_id.to_string());
-                        } else if !active_tool_calls.remove(call_id) {
+                            active_tool_calls.insert(call_id.to_string(), call);
+                        } else if active_tool_calls.remove(call_id).as_ref() != Some(&call) {
                             let _ = deliver(
                                 tx,
                                 deadline,
@@ -1389,7 +1536,7 @@ fn validate_dynamic_tool_request(
     thread_id: &str,
     turn_id: &str,
     allowed_tools: &HashSet<String>,
-    active_calls: &HashSet<String>,
+    active_calls: &HashMap<String, ActiveDynamicCall>,
 ) -> Result<(String, String, Value)> {
     if params.get("threadId").and_then(Value::as_str) != Some(thread_id)
         || params.get("turnId").and_then(Value::as_str) != Some(turn_id)
@@ -1397,21 +1544,67 @@ fn validate_dynamic_tool_request(
         bail!("Codex dynamic-tool request correlation failed");
     }
     let id = required_string(params, "callId")?;
+    let item_id = required_string(params, "itemId")?;
     let name = required_string(params, "tool")?;
     if !allowed_tools.contains(&name) {
         bail!("Codex requested an unadvertised dynamic tool");
     }
-    if !active_calls.contains(&id) {
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if id != item_id
+        || active_calls.get(&item_id)
+            != Some(&ActiveDynamicCall {
+                tool: name.clone(),
+                arguments: arguments.clone(),
+            })
+    {
         bail!("Codex dynamic-tool call lacked a correlated lifecycle");
     }
-    Ok((
-        id,
-        name,
-        params
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({})),
-    ))
+    Ok((id, name, arguments))
+}
+
+#[derive(Debug, Default)]
+struct EventCorrelation {
+    item_id: Option<String>,
+}
+
+fn validate_event_correlation(
+    event: &Value,
+    method: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<EventCorrelation> {
+    if !(method.starts_with("item/") || method.starts_with("turn/")) {
+        return Ok(EventCorrelation::default());
+    }
+    let params = event
+        .get("params")
+        .context("Codex event omitted correlation parameters")?;
+    if params.get("threadId").and_then(Value::as_str) != Some(thread_id) {
+        bail!("Codex event thread correlation failed");
+    }
+    let event_turn = params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .or_else(|| params.pointer("/turn/id").and_then(Value::as_str));
+    if event_turn != Some(turn_id) {
+        bail!("Codex event turn correlation failed");
+    }
+    let item_id = if method.starts_with("item/") {
+        Some(
+            params
+                .get("itemId")
+                .and_then(Value::as_str)
+                .or_else(|| params.pointer("/item/id").and_then(Value::as_str))
+                .context("Codex item event omitted item correlation")?
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    Ok(EventCorrelation { item_id })
 }
 
 fn completed_agent_text(event: &Value) -> Option<String> {
@@ -1506,7 +1699,7 @@ for line in sys.stdin:
     if method == 'initialize':
         result = {'capabilities': {}}
     elif method == 'config/read':
-        result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+        result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'profiles': {}, 'apps': {'_default': {'enabled': False}}, 'web_search': 'disabled', 'allow_login_shell': False, 'shell_environment_policy': {'inherit': 'none'}, 'agents': {'enabled': False}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
     elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read':
         assert m['params']['refreshToken'] is True
@@ -1548,10 +1741,10 @@ for line in sys.stdin:
     if method == 'account/login/start':
         print(json.dumps({'method': 'account/login/completed', 'params': {'loginId': 'login-1', 'success': True}}), flush=True)
     if method == 'turn/start':
-        print(json.dumps({'method': 'item/started', 'params': {'item': {'type': 'agentMessage', 'id': 'agent-1'}}}), flush=True)
-        print(json.dumps({'method': 'item/agentMessage/delta', 'params': {'delta': 'hello'}}), flush=True)
-        print(json.dumps({'method': 'item/completed', 'params': {'item': {'type': 'agentMessage', 'id': 'agent-1', 'text': 'hello'}}}), flush=True)
-        print(json.dumps({'method': 'turn/completed', 'params': {'turn': {'status': 'completed'}}}), flush=True)
+        print(json.dumps({'method': 'item/started', 'params': {'threadId': 'ephemeral-thread', 'turnId': 'turn-1', 'item': {'type': 'agentMessage', 'id': 'agent-1'}}}), flush=True)
+        print(json.dumps({'method': 'item/agentMessage/delta', 'params': {'threadId': 'ephemeral-thread', 'turnId': 'turn-1', 'itemId': 'agent-1', 'delta': 'draft'}}), flush=True)
+        print(json.dumps({'method': 'item/completed', 'params': {'threadId': 'ephemeral-thread', 'turnId': 'turn-1', 'item': {'type': 'agentMessage', 'id': 'agent-1', 'text': 'hello'}}}), flush=True)
+        print(json.dumps({'method': 'turn/completed', 'params': {'threadId': 'ephemeral-thread', 'turn': {'id': 'turn-1', 'status': 'completed'}}}), flush=True)
 "#,
         )
         .unwrap();
@@ -1585,7 +1778,7 @@ for line in sys.stdin:
     if hang_initialize and method == 'initialize':
         continue
     if method == 'initialize': result = {}
-    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'profiles': {}, 'apps': {'_default': {'enabled': False}}, 'web_search': 'disabled', 'allow_login_shell': False, 'shell_environment_policy': {'inherit': 'none'}, 'agents': {'enabled': False}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
     elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read': result = {'account': {'type': 'chatgpt'}}
     elif method == 'thread/start': result = {'thread': {'id': 'thread'}}
@@ -1628,7 +1821,7 @@ for line in sys.stdin:
     m = json.loads(line); method = m.get('method')
     if method == 'initialized': continue
     if method == 'initialize': result = {}
-    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'profiles': {}, 'apps': {'_default': {'enabled': False}}, 'web_search': 'disabled', 'allow_login_shell': False, 'shell_environment_policy': {'inherit': 'none'}, 'agents': {'enabled': False}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
     elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read': result = {'account': {'type': 'chatgpt'}}
     elif method == 'thread/start': result = {'thread': {'id': 'thread'}}
@@ -1636,8 +1829,9 @@ for line in sys.stdin:
     else: result = {}
     print(json.dumps({'id': m.get('id'), 'result': result}), flush=True)
     if method == 'turn/start':
+        print(json.dumps({'method': 'item/started', 'params': {'threadId': 'thread', 'turnId': 'turn', 'item': {'type': 'agentMessage', 'id': 'agent-1'}}}), flush=True)
         for _ in range(10000):
-            print(json.dumps({'method': 'item/agentMessage/delta', 'params': {'delta': 'x'}}), flush=True)
+            print(json.dumps({'method': 'item/agentMessage/delta', 'params': {'threadId': 'thread', 'turnId': 'turn', 'itemId': 'agent-1', 'delta': 'x'}}), flush=True)
 "#,
         )
         .unwrap();
@@ -1724,7 +1918,11 @@ for line in sys.stdin:
         let mut command = AppServerCommand::test(resolved.clone(), vec![]);
         command.identity = Some(ExecutableIdentity {
             files: vec![expected],
-            version: "test".into(),
+            package_version: "test".into(),
+            package_digest: [1; 32],
+            native_digest: [2; 32],
+            team_id: Some("TEAM".into()),
+            designated_requirement: Some("requirement".into()),
         });
         assert!(command.validate_identity().is_err());
         assert_ne!(
@@ -1752,10 +1950,13 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn effective_managed_config_must_attest_empty_capabilities() {
+    fn test_effective_managed_config_must_attest_empty_capabilities() {
         let safe = json!({"config": {
-            "mcp_servers": {}, "plugins": {}, "environments": {}, "hooks": {},
+            "mcp_servers": {}, "plugins": {}, "environments": {}, "hooks": {}, "profiles": {},
             "apps": {"_default": {"enabled": false}},
+            "web_search": "disabled", "allow_login_shell": false,
+            "shell_environment_policy": {"inherit": "none"},
+            "agents": {"enabled": false},
             "features": {
                 "apps": false, "plugins": false, "remote_plugin": false,
                 "shell_tool": false, "unified_exec": false, "multi_agent": false,
@@ -1764,9 +1965,25 @@ for line in sys.stdin:
             }
         }});
         verify_effective_config(&safe).unwrap();
-        let mut managed_mcp = safe;
+        let mut managed_mcp = safe.clone();
         managed_mcp["config"]["mcp_servers"]["managed"] = json!({"enabled": true});
         assert!(verify_effective_config(&managed_mcp).is_err());
+        for pointer in [
+            "/config/web_search",
+            "/config/allow_login_shell",
+            "/config/shell_environment_policy/inherit",
+            "/config/agents/enabled",
+        ] {
+            let mut unsafe_config = safe.clone();
+            *unsafe_config.pointer_mut(pointer).unwrap() = json!(null);
+            assert!(
+                verify_effective_config(&unsafe_config).is_err(),
+                "{pointer}"
+            );
+        }
+        let mut managed_profile = safe.clone();
+        managed_profile["config"]["profiles"]["managed"] = json!({"web_search": "live"});
+        assert!(verify_effective_config(&managed_profile).is_err());
         verify_effective_requirements(&json!({"requirements": null})).unwrap();
         assert!(verify_effective_requirements(&json!({
             "requirements": {"features": {"apps": true}}
@@ -1775,11 +1992,18 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn dynamic_tool_requests_require_allowlist_and_exact_correlation() {
+    fn test_dynamic_tool_requests_require_allowlist_and_exact_correlation() {
         let allowed = HashSet::from(["lookup".to_string()]);
-        let active = HashSet::from(["call-1".to_string()]);
+        let active = HashMap::from([(
+            "call-1".to_string(),
+            ActiveDynamicCall {
+                tool: "lookup".to_string(),
+                arguments: json!({"query": "safe"}),
+            },
+        )]);
         let valid = json!({
             "threadId": "thread-1", "turnId": "turn-1", "callId": "call-1",
+            "itemId": "call-1",
             "tool": "lookup", "arguments": {"query": "safe"}
         });
         validate_dynamic_tool_request(&valid, "thread-1", "turn-1", &allowed, &active).unwrap();
@@ -1787,6 +2011,26 @@ for line in sys.stdin:
         unadvertised["tool"] = json!("shell");
         assert!(validate_dynamic_tool_request(
             &unadvertised,
+            "thread-1",
+            "turn-1",
+            &allowed,
+            &active
+        )
+        .is_err());
+        let mut wrong_arguments = valid.clone();
+        wrong_arguments["arguments"] = json!({"query": "changed"});
+        assert!(validate_dynamic_tool_request(
+            &wrong_arguments,
+            "thread-1",
+            "turn-1",
+            &allowed,
+            &active
+        )
+        .is_err());
+        let mut wrong_item = valid.clone();
+        wrong_item["itemId"] = json!("other");
+        assert!(validate_dynamic_tool_request(
+            &wrong_item,
             "thread-1",
             "turn-1",
             &allowed,
@@ -1805,6 +2049,32 @@ for line in sys.stdin:
         .is_err());
     }
 
+    #[test]
+    fn test_item_and_turn_events_require_exact_correlation() {
+        let valid = json!({"params": {
+            "threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1"
+        }});
+        let correlation =
+            validate_event_correlation(&valid, "item/agentMessage/delta", "thread-1", "turn-1")
+                .unwrap();
+        assert_eq!(correlation.item_id.as_deref(), Some("item-1"));
+        for (pointer, value) in [
+            ("/params/threadId", "other-thread"),
+            ("/params/turnId", "other-turn"),
+            ("/params/itemId", "other-item"),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid.pointer_mut(pointer).unwrap() = json!(value);
+            assert!(validate_event_correlation(
+                &invalid,
+                "item/agentMessage/delta",
+                "thread-1",
+                "turn-1",
+            )
+            .is_err());
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn auth_rejects_same_length_artifact_replacement_before_spawn() {
@@ -1820,7 +2090,11 @@ for line in sys.stdin:
         let mut command = AppServerCommand::test(executable.clone(), vec![]);
         command.identity = Some(ExecutableIdentity {
             files: vec![expected.clone(), expected],
-            version: "codex-cli 0.149.1".into(),
+            package_version: "0.149.1".into(),
+            package_digest: [1; 32],
+            native_digest: [2; 32],
+            team_id: Some("TEAM".into()),
+            designated_requirement: Some("requirement".into()),
         });
         std::fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
         let auth = CodexAppServerAuth::with_command(command);
@@ -2138,7 +2412,7 @@ for line in sys.stdin:
     m = json.loads(line); method = m.get('method')
     if method == 'initialized': continue
     if method == 'initialize': result = {}
-    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'apps': {'_default': {'enabled': False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'profiles': {}, 'apps': {'_default': {'enabled': False}}, 'web_search': 'disabled', 'allow_login_shell': False, 'shell_environment_policy': {'inherit': 'none'}, 'agents': {'enabled': False}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
     elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read': result = {'account': {'type': 'chatgpt'}}
     elif method == 'thread/start': result = {'thread': {'id': 'thread'}}
@@ -2146,7 +2420,7 @@ for line in sys.stdin:
     else: result = {}
     print(json.dumps({'id': m.get('id'), 'result': result}), flush=True)
     if method == 'turn/start':
-        print(json.dumps({'method': 'item/commandExecution', 'params': {}}), flush=True)
+        print(json.dumps({'method': 'item/commandExecution', 'params': {'threadId': 'thread', 'turnId': 'turn', 'itemId': 'builtin-1'}}), flush=True)
 "#,
         )
         .unwrap();
