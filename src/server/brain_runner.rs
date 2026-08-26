@@ -569,7 +569,7 @@ impl BrainRunnerBroker {
         prompt: String,
         context: Vec<crate::claude::Message>,
         approval_audience: crate::brain::store::BrainApprovalAudience,
-        approval_connection_id: crate::brain::store::ConnectionId,
+        approval_connection_id: Option<crate::brain::store::ConnectionId>,
     ) -> Result<RunnerTurnResult> {
         let registration = self
             .registrations
@@ -591,7 +591,7 @@ impl BrainRunnerBroker {
                 prompt,
                 context,
                 approval_audience,
-                approval_connection_id: Some(approval_connection_id),
+                approval_connection_id,
                 approval_tx: None,
                 response_tx,
             }))
@@ -952,7 +952,7 @@ mod tests {
                 "double it".into(),
                 vec![crate::claude::Message::user("21")],
                 test_approval_audience(),
-                crate::brain::store::ConnectionId(uuid::Uuid::new_v4()),
+                Some(crate::brain::store::ConnectionId(uuid::Uuid::new_v4())),
             )
             .await
             .unwrap();

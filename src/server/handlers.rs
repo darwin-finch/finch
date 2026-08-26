@@ -1572,13 +1572,17 @@ fn commit_named_brain_approval_decision(
     mutation: Option<crate::brain::store::BrainMutationReceipt>,
 ) -> anyhow::Result<crate::brain::store::BrainEvent> {
     let snapshot = store.snapshot(name)?;
-    let connection_id = attachment.connection_id
-        .context("approval attachment has no active connection generation")?;
+    let connection_id = attachment.connection_id;
     let validate_pending = || -> anyhow::Result<()> {
-        let audience = approvals.inspect_connection(
-            snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
-            connection_id,
-        )?;
+        let audience = match connection_id {
+            Some(connection_id) => approvals.inspect_connection(
+                snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
+                connection_id,
+            )?,
+            None => approvals.inspect(
+                snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
+            )?,
+        };
         anyhow::ensure!(audience.brain_id == snapshot.brain_id
             && audience.brain == name
             && audience.attachment_id == attachment.attachment_id
@@ -1601,11 +1605,16 @@ fn commit_named_brain_approval_decision(
                 return Ok(event);
             }
             validate_pending()?;
-            approvals.deliver_connection(
-                snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
-                connection_id,
-                decision,
-            )?;
+            match connection_id {
+                Some(connection_id) => approvals.deliver_connection(
+                    snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
+                    connection_id, decision,
+                )?,
+                None => approvals.deliver(
+                    snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
+                    decision,
+                )?,
+            }
             store.complete_approval_decision_delivery(
                 name, &attachment.subject, request_seq, approval_id, mutation_id,
             )?;
@@ -1618,11 +1627,16 @@ fn commit_named_brain_approval_decision(
         if reservation.delivered {
             return Ok(reservation.event);
         }
-        approvals.deliver_connection(
-            snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
-            connection_id,
-            decision,
-        )?;
+        match connection_id {
+            Some(connection_id) => approvals.deliver_connection(
+                snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
+                connection_id, decision,
+            )?,
+            None => approvals.deliver(
+                snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
+                decision,
+            )?,
+        }
         store.complete_approval_decision_delivery(
             name, &attachment.subject, request_seq, approval_id, mutation_id,
         )?;
@@ -1632,10 +1646,15 @@ fn commit_named_brain_approval_decision(
     // In-process callers without a durable mutation envelope retain the
     // legacy one-shot path. Remote decisions always carry a receipt.
     validate_pending()?;
-    let claimed = approvals.claim_connection(
-        snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
-        connection_id,
-    )?;
+    let claimed = match connection_id {
+        Some(connection_id) => approvals.claim_connection(
+            snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
+            connection_id,
+        )?,
+        None => approvals.claim(
+            snapshot.brain_id, request_seq, approval_id, attachment.attachment_id,
+        )?,
+    };
     let accepted = store.push(name, &attachment.subject,
         crate::brain::store::BrainEventKind::ApprovalDecided {
             request_seq, approval_id: approval_id.to_string(), decision: decision.clone(),
@@ -1811,8 +1830,11 @@ async fn dispatch_named_brain_turn(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("named Brain '{name}' has no live environment runner"))?;
     let lease_id = lease.lease_id;
-    let approval_connection_id = requester.connection_id
-        .context("initiating approval attachment has no active connection generation")?;
+    // Queued runs survive daemon restart independently of the transport which
+    // initiated them. Preserve a live connection generation when present, but
+    // allow a restored connectionless turn to execute; its reverse approval
+    // control will fail closed if it later requires an addressed decision.
+    let approval_connection_id = requester.connection_id;
     let approval_audience = crate::brain::store::BrainApprovalAudience {
         brain_id: snapshot.brain_id,
         brain: name.to_string(),

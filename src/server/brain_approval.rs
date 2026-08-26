@@ -135,7 +135,8 @@ impl BrainApprovalBroker {
         })?;
         anyhow::ensure!(request.audience.attachment_id == attachment_id,
             "attachment is not the approval audience");
-        anyhow::ensure!(request.connection_id == Some(connection_id),
+        anyhow::ensure!(request.connection_id.is_none()
+            || request.connection_id == Some(connection_id),
             "connection is not the approval audience generation");
         Ok(request.audience.clone())
     }
@@ -152,7 +153,8 @@ impl BrainApprovalBroker {
         })?;
         anyhow::ensure!(request.audience.attachment_id == attachment_id,
             "attachment is not the approval audience");
-        anyhow::ensure!(request.connection_id == Some(connection_id),
+        anyhow::ensure!(request.connection_id.is_none()
+            || request.connection_id == Some(connection_id),
             "connection is not the approval audience generation");
         if let Some(delivered) = &request.delivered_decision {
             anyhow::ensure!(delivered == &decision,
@@ -210,7 +212,8 @@ impl BrainApprovalBroker {
         })?;
         anyhow::ensure!(request.audience.attachment_id == attachment_id,
             "attachment is not the approval audience");
-        anyhow::ensure!(request.connection_id == Some(connection_id),
+        anyhow::ensure!(request.connection_id.is_none()
+            || request.connection_id == Some(connection_id),
             "connection is not the approval audience generation");
         let request = pending.remove(&key).expect("pending approval disappeared while locked");
         Ok(ClaimedApproval { request_seq: request.request_seq,

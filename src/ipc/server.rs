@@ -85,7 +85,13 @@ struct BrainTurnControlImpl {
     brain: String,
     request_seq: u64,
     expected_audience: crate::brain::store::BrainApprovalAudience,
-    expected_connection_id: crate::brain::store::ConnectionId,
+    expected_connection_id: Option<crate::brain::store::ConnectionId>,
+}
+
+fn require_approval_connection(
+    connection_id: Option<crate::brain::store::ConnectionId>,
+) -> anyhow::Result<crate::brain::store::ConnectionId> {
+    connection_id.context("approval audience has no live connection generation")
 }
 
 /// Reverse capability scoped to one daemon-authenticated ProgramRun. The
@@ -364,11 +370,15 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
             )));
         }
 
+        let connection_id = match require_approval_connection(self.expected_connection_id) {
+            Ok(connection_id) => connection_id,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
         let registration = match self.server.brain_approvals().register_for_connection(
             self.request_seq,
             approval_id.clone(),
             audience.clone(),
-            self.expected_connection_id,
+            connection_id,
         ) {
             Ok(registration) => registration,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
@@ -1778,8 +1788,7 @@ async fn forward_runner_request(
                                 brain: request.brain.clone(),
                                 request_seq: request.request_seq,
                                 expected_audience: request.approval_audience.clone(),
-                                expected_connection_id: request.approval_connection_id
-                                    .expect("daemon runner request omitted approval connection"),
+                                expected_connection_id: request.approval_connection_id,
                             });
                         payload.set_control(control);
                     }
@@ -2045,9 +2054,21 @@ fn decode_runner_turn_event(
 mod tests {
     use super::{
         decode_runner_program_result, decode_runner_turn_result, execute_typed_forth_ipc,
-        BrainRpcService, BrainRunnerControlImpl,
+        require_approval_connection, BrainRpcService, BrainRunnerControlImpl,
     };
     use crate::ipc::brain_codec::encode_approval_audience;
+
+    #[test]
+    fn restored_connectionless_turn_fails_closed_if_it_requests_approval() {
+        let result = require_approval_connection(None);
+        let error = match result {
+            Ok(_) => panic!("connectionless restored turn registered an approval"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(
+            "approval audience has no live connection generation"
+        ));
+    }
 
     struct BrainTestDaemon {
         lifecycle: crate::server::BrainLifecycleService,
