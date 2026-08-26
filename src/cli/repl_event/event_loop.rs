@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::claude::ContentBlock;
 use crate::cli::commands::{format_help, Command};
-use crate::cli::conversation::ConversationHistory;
+use crate::cli::conversation::{ConversationHistory, ToolRoundProgress, ToolRoundToken};
 use crate::cli::output_manager::{OutputManager, VmOutputProjection};
 use crate::cli::repl::ReplMode;
 use crate::cli::status_bar::StatusBar;
@@ -50,7 +50,6 @@ use super::tool_execution::ToolExecutionCoordinator;
 // refresh_context_strip, dispatch_tool_uses, process_query_with_tools,
 // ActiveToolUsesMap, and apply_sliding_window live in query_processor.rs.
 
-type ToolResultsMap = Arc<RwLock<std::collections::HashMap<Uuid, Vec<(String, Result<String>)>>>>;
 type PendingApprovalsMap = Arc<
     RwLock<
         std::collections::HashMap<
@@ -62,6 +61,21 @@ type PendingApprovalsMap = Arc<
         >,
     >,
 >;
+
+fn commit_tool_round_and_continue(
+    conversation: &mut ConversationHistory,
+    query_id: Uuid,
+    round_token: ToolRoundToken,
+    llm_tx: &mpsc::UnboundedSender<LlmRequest>,
+) -> std::result::Result<(), crate::cli::conversation::ToolRoundError> {
+    conversation.commit_tool_round(query_id, round_token)?;
+    let _ = llm_tx.send(LlmRequest::Query {
+        id: query_id,
+        text: String::new(),
+        no_tools: false,
+    });
+    Ok(())
+}
 
 pub(crate) fn resolve_provider_profile(
     providers: &[crate::config::ProviderEntry],
@@ -213,9 +227,6 @@ pub struct EventLoop {
     /// through this field.
     program_runtime: Arc<crate::runtime::ProgramRuntime>,
     agent_scheduler: Arc<crate::runtime::scheduler::AgentScheduler>,
-
-    /// Tool results collected per query (query_id -> Vec<(tool_id, result)>)
-    tool_results: ToolResultsMap,
 
     /// Currently active query ID (for cancellation)
     active_query_id: Arc<RwLock<Option<Uuid>>>,
@@ -1793,7 +1804,6 @@ impl EventLoop {
             tool_coordinator,
             program_runtime,
             agent_scheduler,
-            tool_results: Arc::new(RwLock::new(std::collections::HashMap::new())),
             active_query_id: Arc::new(RwLock::new(None)),
             pending_queries: std::collections::VecDeque::new(),
             pending_named_brain_turns: std::collections::HashMap::new(),
@@ -3903,6 +3913,7 @@ Rules:\n\
 
             ReplEvent::ToolResult {
                 query_id,
+                round_token,
                 tool_id,
                 mut result,
             } => {
@@ -3938,6 +3949,7 @@ Rules:\n\
                         .map(|turn| turn.approval_audience.clone());
                     self.spawn_deferred_proposal(
                         query_id,
+                        round_token,
                         tool_id,
                         proposal,
                         approval_audience,
@@ -3947,9 +3959,10 @@ Rules:\n\
                         "VM capability request {} is awaiting approval",
                         approval.prompt.request.id
                     ));
-                    self.spawn_deferred_vm_approval(query_id, tool_id, approval);
+                    self.spawn_deferred_vm_approval(query_id, round_token, tool_id, approval);
                 } else {
-                    self.handle_tool_result(query_id, tool_id, result).await?;
+                    self.handle_tool_result(query_id, round_token, tool_id, result)
+                        .await?;
                 }
             }
 
@@ -5108,6 +5121,7 @@ Rules:\n\
     fn spawn_deferred_proposal(
         &self,
         query_id: Uuid,
+        round_token: ToolRoundToken,
         tool_id: String,
         proposal: DeferredProposal,
         approval_audience: Option<crate::brain::store::BrainApprovalAudience>,
@@ -5138,6 +5152,7 @@ Rules:\n\
             .await;
             let _ = event_tx.send(ReplEvent::ToolResult {
                 query_id,
+                round_token,
                 tool_id,
                 result,
             });
@@ -5151,6 +5166,7 @@ Rules:\n\
     fn spawn_deferred_vm_approval(
         &self,
         query_id: Uuid,
+        round_token: ToolRoundToken,
         tool_id: String,
         approval: DeferredVmApproval,
     ) {
@@ -5180,6 +5196,7 @@ Rules:\n\
             .await;
             let _ = event_tx.send(ReplEvent::ToolResult {
                 query_id,
+                round_token,
                 tool_id,
                 result,
             });
@@ -6426,9 +6443,28 @@ Rules:\n\
     async fn handle_tool_result(
         &mut self,
         query_id: Uuid,
+        round_token: ToolRoundToken,
         tool_id: String,
         result: Result<String>,
     ) -> Result<()> {
+        let progress = match self.conversation.write().await.record_tool_result(
+            query_id,
+            round_token,
+            &tool_id,
+            &result,
+        ) {
+            Ok(progress) => progress,
+            Err(error) => {
+                tracing::warn!(
+                    "Ignoring rejected tool result for query {} tool {}: {}",
+                    query_id,
+                    tool_id,
+                    error
+                );
+                return Ok(());
+            }
+        };
+
         // Look up the tool's WorkUnit and row index
         let (tool_name, tool_input, work_unit, row_idx) = {
             let mut map = self.active_tool_uses.write().await;
@@ -6525,33 +6561,17 @@ Rules:\n\
         let current_mode = self.mode.read().await.clone();
         self.update_plan_mode_indicator(&current_mode);
 
-        // Store tool result
-        self.tool_results
-            .write()
-            .await
-            .entry(query_id)
-            .or_insert_with(Vec::new)
-            .push((tool_id, result));
-
         // Check if all tools for this query have completed
         let metadata = self.query_states.get_metadata(query_id).await;
         if let Some(meta) = metadata {
-            if let QueryState::ExecutingTools { tools_pending, .. } = meta.state {
-                let results_count = self
-                    .tool_results
-                    .read()
-                    .await
-                    .get(&query_id)
-                    .map(|v| v.len())
-                    .unwrap_or(0);
-
-                if results_count >= tools_pending {
-                    // Keep the query-level Tools unit live while the provider
-                    // consumes these results. A later tool round appends rows
-                    // to the same unit; a final wire program closes it before
-                    // opening the distinct program-source unit.
-                    self.finalize_tool_execution(query_id).await?;
-                }
+            if matches!(meta.state, QueryState::ExecutingTools { .. })
+                && progress == ToolRoundProgress::Complete
+            {
+                // Keep the query-level Tools unit live while the provider
+                // consumes these results. A later tool round appends rows
+                // to the same unit; a final wire program closes it before
+                // opening the distinct program-source unit.
+                self.finalize_tool_execution(query_id, round_token).await?;
             }
         }
 
@@ -6559,14 +6579,23 @@ Rules:\n\
     }
 
     /// Finalize tool execution (all tools complete, re-invoke Claude)
-    async fn finalize_tool_execution(&mut self, query_id: Uuid) -> Result<()> {
-        // Get all tool results for this query
-        let results = self
-            .tool_results
-            .write()
+    async fn finalize_tool_execution(
+        &mut self,
+        query_id: Uuid,
+        round_token: ToolRoundToken,
+    ) -> Result<()> {
+        let results = match self
+            .conversation
+            .read()
             .await
-            .remove(&query_id)
-            .unwrap_or_default();
+            .completed_tool_results(query_id, round_token)
+        {
+            Ok(results) => results,
+            Err(error) => {
+                tracing::warn!("Tool round {} was not ready to finalize: {}", query_id, error);
+                return Ok(());
+            }
+        };
 
         // Sync the plan mode status bar.  handle_present_plan() updates the mode Arc
         // but is a free function without &self access, so the indicator update happens here.
@@ -6579,13 +6608,9 @@ Rules:\n\
         // task and re-explores instead of implementing). Reset to a clean context
         // with just the execution directive.
         if matches!(current_mode, ReplMode::Executing { .. }) {
-            let plan_directive = results.iter().find_map(|(_, r)| {
-                if let Ok(content) = r {
-                    if content.starts_with("Plan approved by user.") {
-                        Some(content.clone())
-                    } else {
-                        None
-                    }
+            let plan_directive = results.iter().find_map(|result| {
+                if !result.is_error && result.content.starts_with("Plan approved by user.") {
+                    Some(result.content.clone())
                 } else {
                     None
                 }
@@ -6612,53 +6637,19 @@ Rules:\n\
             }
         }
 
-        // ── Normal path: build ToolResult message and continue ────────────────
-        // Create a user message with proper ToolResult content blocks
-        let mut content_blocks = Vec::new();
-        for (tool_id, result) in results {
-            match result {
-                Ok(content) => {
-                    content_blocks.push(ContentBlock::ToolResult {
-                        tool_use_id: tool_id,
-                        content,
-                        is_error: None,
-                    });
-                }
-                Err(e) => {
-                    content_blocks.push(ContentBlock::ToolResult {
-                        tool_use_id: tool_id,
-                        content: e.to_string(),
-                        is_error: Some(true),
-                    });
-                }
-            }
-        }
-
-        // Add tool results to conversation as a proper message
-        let tool_result_message = crate::claude::Message {
-            role: "user".to_string(),
-            content: content_blocks,
+        let committed = {
+            let mut conversation = self.conversation.write().await;
+            commit_tool_round_and_continue(
+                &mut conversation,
+                query_id,
+                round_token,
+                &self.llm_tx,
+            )
         };
-
-        let committed = self
-            .conversation
-            .write()
-            .await
-            .commit_tool_round(query_id, tool_result_message);
-        if !committed {
-            tracing::debug!(
-                "Ignoring tool-round commit for query {} because its stage was aborted",
-                query_id
-            );
+        if let Err(error) = committed {
+            tracing::warn!("Ignoring rejected tool-round commit for query {}: {}", query_id, error);
             return Ok(());
         }
-
-        // Send tool-continuation turn to the LLM worker loop
-        let _ = self.llm_tx.send(LlmRequest::Query {
-            id: query_id,
-            text: String::new(),
-            no_tools: false,
-        });
 
         Ok(())
     }
@@ -8286,6 +8277,65 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn continuation_is_sent_exactly_once_for_one_complete_validated_round() {
+        use crate::claude::{ContentBlock, Message};
+        use crate::cli::conversation::ToolRoundProgress;
+
+        let query_id = uuid::Uuid::new_v4();
+        let mut conversation = crate::cli::conversation::ConversationHistory::new();
+        let token = conversation
+            .stage_assistant(
+                query_id,
+                Message {
+                    role: "assistant".into(),
+                    content: ["A", "B"]
+                        .into_iter()
+                        .map(|id| ContentBlock::ToolUse {
+                            id: id.into(),
+                            name: "Read".into(),
+                            input: serde_json::json!({}),
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+        let (llm_tx, mut llm_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        conversation
+            .record_tool_result(query_id, token, "A", &Ok("a".into()))
+            .unwrap();
+        assert!(super::commit_tool_round_and_continue(
+            &mut conversation,
+            query_id,
+            token,
+            &llm_tx
+        )
+        .is_err());
+        assert!(llm_rx.try_recv().is_err(), "incomplete round must send zero continuations");
+
+        assert_eq!(
+            conversation
+                .record_tool_result(query_id, token, "B", &Ok("b".into()))
+                .unwrap(),
+            ToolRoundProgress::Complete
+        );
+        super::commit_tool_round_and_continue(&mut conversation, query_id, token, &llm_tx)
+            .unwrap();
+        assert!(matches!(
+            llm_rx.try_recv(),
+            Ok(super::LlmRequest::Query { id, .. }) if id == query_id
+        ));
+        assert!(super::commit_tool_round_and_continue(
+            &mut conversation,
+            query_id,
+            token,
+            &llm_tx
+        )
+        .is_err());
+        assert!(llm_rx.try_recv().is_err(), "completed round must send only one continuation");
+    }
+
     #[test]
     fn bare_brain_attach_routes_only_to_local_ipc() {
         assert_eq!(

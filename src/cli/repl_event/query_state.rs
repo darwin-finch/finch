@@ -123,6 +123,23 @@ impl QueryStateManager {
         }
     }
 
+    /// Enter tool execution unless cancellation already won the race with a
+    /// provider completion.
+    pub async fn begin_tool_execution(&self, query_id: Uuid, tools_pending: usize) -> bool {
+        let mut states = self.states.write().await;
+        let Some(metadata) = states.get_mut(&query_id) else {
+            return false;
+        };
+        if matches!(metadata.state, QueryState::Cancelled) {
+            return false;
+        }
+        metadata.state = QueryState::ExecutingTools {
+            tools_pending,
+            tools_completed: 0,
+        };
+        true
+    }
+
     /// Get the current state of a query
     pub async fn get_state(&self, query_id: Uuid) -> Option<QueryState> {
         self.states
@@ -151,11 +168,7 @@ impl QueryStateManager {
             .and_then(|metadata| metadata.tool_work_unit.clone())
     }
 
-    pub async fn set_brain_output_work_unit(
-        &self,
-        query_id: Uuid,
-        unit: Option<Arc<WorkUnit>>,
-    ) {
+    pub async fn set_brain_output_work_unit(&self, query_id: Uuid, unit: Option<Arc<WorkUnit>>) {
         if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
             metadata.brain_output_work_unit = unit;
         }
@@ -330,6 +343,19 @@ mod tests {
         assert!(matches!(
             manager.get_state(id).await.unwrap(),
             QueryState::Cancelled
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_query_cannot_reenter_tool_execution() {
+        let manager = QueryStateManager::new();
+        let id = manager.create_query(vec![]).await;
+        manager.cancel_query(id).await;
+
+        assert!(!manager.begin_tool_execution(id, 2).await);
+        assert!(matches!(
+            manager.get_state(id).await,
+            Some(QueryState::Cancelled)
         ));
     }
 

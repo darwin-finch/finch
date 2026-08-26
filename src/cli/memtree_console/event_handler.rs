@@ -56,6 +56,7 @@ impl EventHandler {
                 query_id,
                 tool_id,
                 result,
+                ..
             } => {
                 self.handle_tool_result(console, *query_id, tool_id, result)?;
             }

@@ -671,6 +671,7 @@ async fn persist_completed_turn_memory(
 pub(super) async fn dispatch_tool_uses(
     tool_uses: Vec<crate::tools::types::ToolUse>,
     query_id: Uuid,
+    round_token: crate::cli::conversation::ToolRoundToken,
     work_unit: &Arc<crate::cli::messages::WorkUnit>,
     mode: &Arc<RwLock<ReplMode>>,
     tool_call_history: &Arc<
@@ -732,6 +733,7 @@ pub(super) async fn dispatch_tool_uses(
             );
             let _ = event_tx.send(ReplEvent::ToolResult {
                 query_id,
+                round_token,
                 tool_id: tool_use.id.clone(),
                 result: Err(anyhow::anyhow!("{}", error_msg)),
             });
@@ -752,6 +754,7 @@ pub(super) async fn dispatch_tool_uses(
             );
             let _ = event_tx.send(ReplEvent::ToolResult {
                 query_id,
+                round_token,
                 tool_id: tool_use.id.clone(),
                 result: Err(anyhow::anyhow!("{}", error_msg)),
             });
@@ -786,6 +789,7 @@ pub(super) async fn dispatch_tool_uses(
         {
             let _ = event_tx.send(ReplEvent::ToolResult {
                 query_id,
+                round_token,
                 tool_id: tool_use.id.clone(),
                 result,
             });
@@ -806,6 +810,7 @@ pub(super) async fn dispatch_tool_uses(
         {
             let _ = event_tx.send(ReplEvent::ToolResult {
                 query_id,
+                round_token,
                 tool_id: tool_use.id.clone(),
                 result,
             });
@@ -813,6 +818,7 @@ pub(super) async fn dispatch_tool_uses(
             // Regular tool: run concurrently in a background task
             tool_coordinator.spawn_tool_execution(
                 query_id,
+                round_token,
                 tool_use,
                 Arc::clone(work_unit),
                 row_idx,
@@ -1100,17 +1106,6 @@ pub(crate) async fn process_query_with_tools(
                     query_states
                         .set_tool_work_unit(query_id, Some(Arc::clone(&work_unit)))
                         .await;
-                    // Update state: executing tools
-                    query_states
-                        .update_state(
-                            query_id,
-                            QueryState::ExecutingTools {
-                                tools_pending: tool_uses.len(),
-                                tools_completed: 0,
-                            },
-                        )
-                        .await;
-
                     tracing::debug!("[EVENT_LOOP] Query state updated, staging assistant message");
                     // Keep the tool-bearing assistant message invisible until
                     // all matching results can be committed atomically.
@@ -1119,10 +1114,36 @@ pub(crate) async fn process_query_with_tools(
                         content: blocks.clone(),
                     };
                     tracing::debug!("[EVENT_LOOP] Acquiring conversation write lock...");
-                    conversation
+                    let round_token = match conversation
                         .write()
                         .await
-                        .stage_assistant(query_id, assistant_message);
+                        .stage_assistant(query_id, assistant_message)
+                    {
+                        Ok(token) => token,
+                        Err(crate::cli::conversation::ToolRoundError::StageAlreadyExists) => {
+                            tracing::warn!(
+                                "Ignoring duplicate provider tool completion for query {}",
+                                query_id
+                            );
+                            work_unit.set_complete();
+                            return;
+                        }
+                        Err(error) => {
+                            work_unit.set_failed();
+                            let _ = event_tx.send(ReplEvent::QueryFailed {
+                                query_id,
+                                error: format!("Could not stage tool round: {error}"),
+                            });
+                            return;
+                        }
+                    };
+                    if !query_states
+                        .begin_tool_execution(query_id, tool_uses.len())
+                        .await
+                    {
+                        conversation.write().await.abort_staged(query_id);
+                        return;
+                    }
                     tracing::debug!(
                         "[EVENT_LOOP] Assistant message added, spawning tool executions"
                     );
@@ -1131,6 +1152,7 @@ pub(crate) async fn process_query_with_tools(
                     dispatch_tool_uses(
                         tool_uses,
                         query_id,
+                        round_token,
                         &work_unit,
                         &mode,
                         &tool_call_history,
@@ -1297,32 +1319,48 @@ pub(crate) async fn process_query_with_tools(
                 query_states
                     .set_tool_work_unit(query_id, Some(Arc::clone(&work_unit)))
                     .await;
-                // Update state: executing tools
-                query_states
-                    .update_state(
-                        query_id,
-                        QueryState::ExecutingTools {
-                            tools_pending: tool_uses.len(),
-                            tools_completed: 0,
-                        },
-                    )
-                    .await;
-
                 // Keep the tool-bearing assistant message invisible until
                 // all matching results can be committed atomically.
                 let assistant_message = crate::claude::Message {
                     role: "assistant".to_string(),
                     content: response.content_blocks.clone(),
                 };
-                conversation
+                let round_token = match conversation
                     .write()
                     .await
-                    .stage_assistant(query_id, assistant_message);
+                    .stage_assistant(query_id, assistant_message)
+                {
+                    Ok(token) => token,
+                    Err(crate::cli::conversation::ToolRoundError::StageAlreadyExists) => {
+                        tracing::warn!(
+                            "Ignoring duplicate provider tool completion for query {}",
+                            query_id
+                        );
+                        work_unit.set_complete();
+                        return;
+                    }
+                    Err(error) => {
+                        work_unit.set_failed();
+                        let _ = event_tx.send(ReplEvent::QueryFailed {
+                            query_id,
+                            error: format!("Could not stage tool round: {error}"),
+                        });
+                        return;
+                    }
+                };
+                if !query_states
+                    .begin_tool_execution(query_id, tool_uses.len())
+                    .await
+                {
+                    conversation.write().await.abort_staged(query_id);
+                    return;
+                }
 
                 // Dispatch tools (loop detection, mode gating, inline handlers, spawn)
                 dispatch_tool_uses(
                     tool_uses,
                     query_id,
+                    round_token,
                     &work_unit,
                     &mode,
                     &tool_call_history,
