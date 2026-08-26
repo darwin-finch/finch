@@ -11,8 +11,11 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -55,12 +58,15 @@ const ADAPTER_INSTRUCTIONS: &str = "You are serving as Finch's model adapter. Do
 #[derive(Debug, Clone)]
 struct AppServerCommand {
     program: PathBuf,
+    bound_executable: Option<Arc<File>>,
     args: Vec<String>,
     rpc_timeout: Duration,
     login_timeout: Duration,
     turn_timeout: Duration,
     schema_timeout: StdDuration,
     identity: Option<ExecutableIdentity>,
+    #[cfg(test)]
+    audit_override: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +116,14 @@ fn hardened_app_server_args() -> Vec<String> {
         "-c",
         "features.hooks=false",
         "-c",
+        "features.skill_mcp_dependency_install=false",
+        "-c",
+        "features.web_search=false",
+        "-c",
+        "features.browser_use=false",
+        "-c",
+        "features.computer_use=false",
+        "-c",
         "web_search=\"disabled\"",
         "-c",
         "allow_login_shell=false",
@@ -125,15 +139,18 @@ fn hardened_app_server_args() -> Vec<String> {
 impl AppServerCommand {
     fn production() -> Result<Self> {
         let launcher = resolve_trusted_program("codex")?;
-        let (program, identity) = resolve_codex_native_identity(&launcher)?;
+        let (program, executable, identity) = resolve_codex_native_identity(&launcher)?;
         let command = Self {
             program,
+            bound_executable: Some(Arc::new(executable)),
             args: hardened_app_server_args(),
             rpc_timeout: RPC_TIMEOUT,
             login_timeout: LOGIN_TIMEOUT,
             turn_timeout: TURN_TIMEOUT,
             schema_timeout: SCHEMA_GENERATION_TIMEOUT,
             identity: Some(identity),
+            #[cfg(test)]
+            audit_override: false,
         };
         // Nothing from the package executes before the immutable audit tuple
         // matches. In particular, do not run the JS launcher, native --version,
@@ -151,12 +168,14 @@ impl AppServerCommand {
         };
         Self {
             program,
+            bound_executable: None,
             args,
             rpc_timeout: RPC_TIMEOUT,
             login_timeout: LOGIN_TIMEOUT,
             turn_timeout: TURN_TIMEOUT,
             schema_timeout: SCHEMA_GENERATION_TIMEOUT,
             identity: None,
+            audit_override: false,
         }
     }
 
@@ -170,13 +189,12 @@ impl AppServerCommand {
     }
 
     fn detect_protocol_capabilities(&self) -> ProtocolCapabilities {
-        if self.identity.is_some() && self.validate_identity().is_err() {
-            return ProtocolCapabilities::default();
-        }
         let Ok(directory) = tempfile::tempdir() else {
             return ProtocolCapabilities::default();
         };
-        let mut process = std::process::Command::new(&self.program);
+        let Ok(mut process) = self.std_command() else {
+            return ProtocolCapabilities::default();
+        };
         process.args(&self.args);
         process.args(["generate-json-schema", "--out"]);
         process.arg(directory.path());
@@ -221,12 +239,41 @@ impl AppServerCommand {
     fn validate_identity(&self) -> Result<()> {
         if let Some(identity) = &self.identity {
             for expected in &identity.files {
-                if &file_identity(&expected.path)? != expected {
+                let actual = if expected.path == self.program {
+                    match &self.bound_executable {
+                        Some(executable) => {
+                            let descriptor =
+                                file_identity_from_open_file(&expected.path, executable)?;
+                            if &descriptor != expected
+                                || file_identity(&expected.path)? != descriptor
+                            {
+                                bail!("Trusted Codex installation changed after validation");
+                            }
+                            descriptor
+                        }
+                        None => file_identity(&expected.path)?,
+                    }
+                } else {
+                    file_identity(&expected.path)?
+                };
+                if &actual != expected {
                     bail!("Trusted Codex installation changed after validation");
                 }
             }
         }
         Ok(())
+    }
+
+    fn std_command(&self) -> Result<std::process::Command> {
+        self.validate_identity()?;
+        let process = std::process::Command::new(&self.program);
+        Ok(process)
+    }
+
+    fn tokio_command(&self) -> Result<Command> {
+        self.validate_identity()?;
+        let process = Command::new(&self.program);
+        Ok(process)
     }
 
     fn has_audited_identity(&self) -> bool {
@@ -249,8 +296,13 @@ impl AppServerCommand {
 
     fn require_audited_identity(&self) -> Result<()> {
         #[cfg(test)]
-        if self.identity.is_none() {
-            return Ok(());
+        {
+            if self.identity.is_none() {
+                return Ok(());
+            }
+            if self.audit_override {
+                return self.validate_identity();
+            }
         }
         self.validate_identity()?;
         if self.has_audited_identity() {
@@ -289,7 +341,7 @@ fn validate_trusted_install_location(path: &Path) -> Result<()> {
     }
 }
 
-fn resolve_codex_native_identity(launcher: &Path) -> Result<(PathBuf, ExecutableIdentity)> {
+fn resolve_codex_native_identity(launcher: &Path) -> Result<(PathBuf, File, ExecutableIdentity)> {
     let package_root = launcher
         .parent()
         .and_then(Path::parent)
@@ -326,17 +378,19 @@ fn resolve_codex_native_identity(launcher: &Path) -> Result<(PathBuf, Executable
     let native = platform_root.join("vendor").join(target).join("bin/codex");
     let native = std::fs::canonicalize(native).context("Codex native binary is unavailable")?;
     validate_trusted_install_location(&native)?;
+    let executable = File::open(&native).context("Could not open the Codex native binary")?;
+    validate_immutable_executable(&native, &executable)?;
 
-    let files = [
+    let mut files = [
         launcher.to_path_buf(),
         package_json,
         platform_json,
         provenance,
-        native.clone(),
     ]
     .into_iter()
     .map(|path| file_identity(&path))
     .collect::<Result<Vec<_>>>()?;
+    files.push(file_identity_from_open_file(&native, &executable)?);
     let mut package_hasher = Sha256::new();
     for file in &files[..files.len() - 1] {
         package_hasher.update(file.sha256);
@@ -346,9 +400,10 @@ fn resolve_codex_native_identity(launcher: &Path) -> Result<(PathBuf, Executable
         .last()
         .context("Codex native identity missing")?
         .sha256;
-    let (team_id, designated_requirement) = inspect_code_signature(&native)?;
+    let (team_id, designated_requirement) = inspect_code_signature(&executable)?;
     Ok((
         native,
+        executable,
         ExecutableIdentity {
             files,
             package_version,
@@ -361,33 +416,51 @@ fn resolve_codex_native_identity(launcher: &Path) -> Result<(PathBuf, Executable
 }
 
 #[cfg(target_os = "macos")]
-fn inspect_code_signature(path: &Path) -> Result<(Option<String>, Option<String>)> {
-    let details = std::process::Command::new("/usr/bin/codesign")
-        .args(["-d", "--verbose=4"])
-        .arg(path)
+fn inspect_code_signature(executable: &File) -> Result<(Option<String>, Option<String>)> {
+    let mut details = std::process::Command::new("/usr/bin/codesign");
+    details.args(["-d", "--verbose=4"]);
+    expose_file_to_std_child(&mut details, executable)?;
+    let details = details
         .output()
         .context("Could not inspect Codex code signature")?;
+    if !details.status.success() {
+        bail!("Codex native binary has no valid inspectable code signature");
+    }
     let detail_text = String::from_utf8_lossy(&details.stderr);
     let team_id = detail_text
         .lines()
         .find_map(|line| line.strip_prefix("TeamIdentifier="))
         .filter(|value| *value != "not set")
         .map(str::to_string);
-    let requirement = std::process::Command::new("/usr/bin/codesign")
-        .args(["-d", "-r-"])
-        .arg(path)
+    let mut requirement = std::process::Command::new("/usr/bin/codesign");
+    requirement.args(["-d", "-r-"]);
+    expose_file_to_std_child(&mut requirement, executable)?;
+    let requirement = requirement
         .output()
         .context("Could not inspect Codex designated requirement")?;
+    if !requirement.status.success() {
+        bail!("Codex native binary omitted its designated signing requirement");
+    }
     let requirement_text = String::from_utf8_lossy(&requirement.stderr);
     let designated = requirement_text
         .lines()
         .find_map(|line| line.strip_prefix("designated => "))
         .map(str::to_string);
+    let mut verify = std::process::Command::new("/usr/bin/codesign");
+    verify.args(["--verify", "--strict", "--verbose=2"]);
+    expose_file_to_std_child(&mut verify, executable)?;
+    if !verify
+        .status()
+        .context("Could not verify Codex code signature")?
+        .success()
+    {
+        bail!("Codex native binary failed strict code-signature verification");
+    }
     Ok((team_id, designated))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn inspect_code_signature(_path: &Path) -> Result<(Option<String>, Option<String>)> {
+fn inspect_code_signature(_executable: &File) -> Result<(Option<String>, Option<String>)> {
     Ok((None, None))
 }
 
@@ -427,16 +500,47 @@ fn validate_trusted_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn validate_immutable_executable(path: &Path, executable: &File) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = executable.metadata()?;
+    if nix::unistd::geteuid().as_raw() == 0 || metadata.uid() != 0 {
+        bail!("Audited Codex native binary must be immutable to the invoking user");
+    }
+    let path_metadata = std::fs::metadata(path)?;
+    if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
+        bail!("Codex native binary changed while its audit descriptor was opened");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_immutable_executable(_path: &Path, _executable: &File) -> Result<()> {
+    bail!("This platform cannot prove Codex native artifact immutability")
+}
+
 fn file_identity(path: &Path) -> Result<FileIdentity> {
     validate_trusted_file(path)?;
-    let metadata = std::fs::metadata(path)?;
+    let file = File::open(path)?;
+    file_identity_from_open_file(path, &file)
+}
+
+fn file_identity_from_open_file(path: &Path, file: &File) -> Result<FileIdentity> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        bail!("Codex executable is not a regular file");
+    }
+    let mut reader = file.try_clone()?;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     Ok(FileIdentity {
         path: path.to_path_buf(),
         len: metadata.len(),
         modified: metadata.modified().ok(),
-        sha256: Sha256::digest(std::fs::read(path)?).into(),
+        sha256: Sha256::digest(bytes).into(),
         #[cfg(unix)]
         device: metadata.dev(),
         #[cfg(unix)]
@@ -448,6 +552,55 @@ fn inherited_process_environment() -> impl Iterator<Item = (&'static str, OsStri
     ["HOME", "CODEX_HOME", "TMPDIR", "USER", "LOGNAME"]
         .into_iter()
         .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
+}
+
+#[cfg(unix)]
+const TRUSTED_EXECUTABLE_FD: std::os::fd::RawFd = 198;
+
+#[cfg(target_os = "linux")]
+fn trusted_executable_fd_path() -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{TRUSTED_EXECUTABLE_FD}"))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn trusted_executable_fd_path() -> PathBuf {
+    PathBuf::from(format!("/dev/fd/{TRUSTED_EXECUTABLE_FD}"))
+}
+
+#[cfg(unix)]
+fn inherit_executable_fd(process: &mut std::process::Command, executable: &File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let source_fd = executable.as_raw_fd();
+    unsafe {
+        process.pre_exec(move || {
+            let result = if source_fd == TRUSTED_EXECUTABLE_FD {
+                nix::libc::fcntl(TRUSTED_EXECUTABLE_FD, nix::libc::F_SETFD, 0)
+            } else {
+                nix::libc::dup2(source_fd, TRUSTED_EXECUTABLE_FD)
+            };
+            if result == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn expose_file_to_std_child(process: &mut std::process::Command, executable: &File) -> Result<()> {
+    inherit_executable_fd(process, executable)?;
+    process.arg(trusted_executable_fd_path());
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn expose_file_to_std_child(
+    _process: &mut std::process::Command,
+    _executable: &File,
+) -> Result<()> {
+    bail!("This platform cannot inspect an audited Codex file descriptor")
 }
 
 fn harden_std_process(process: &mut std::process::Command) {
@@ -604,8 +757,7 @@ struct RpcClient {
 
 impl RpcClient {
     async fn spawn(command: &AppServerCommand) -> Result<Self> {
-        command.validate_identity()?;
-        let mut process = Command::new(&command.program);
+        let mut process = command.tokio_command()?;
         process.args(&command.args);
         process.env_clear();
         for (name, value) in inherited_process_environment() {
@@ -791,17 +943,23 @@ fn verify_effective_config(result: &Value) -> Result<()> {
         .get("apps")
         .and_then(Value::as_object)
         .context("Codex effective config omitted app controls")?;
-    if apps.values().any(|app| {
-        app.get("enabled").and_then(Value::as_bool) != Some(false)
-            || app
-                .get("destructive_enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            || app
-                .get("open_world_enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-    }) {
+    if apps
+        .get("_default")
+        .and_then(|app| app.get("enabled"))
+        .and_then(Value::as_bool)
+        != Some(false)
+        || apps.values().any(|app| {
+            app.get("enabled").and_then(Value::as_bool) != Some(false)
+                || app
+                    .get("destructive_enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                || app
+                    .get("open_world_enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        })
+    {
         bail!("Codex effective config retains an enabled app capability");
     }
     for feature in [
@@ -812,6 +970,7 @@ fn verify_effective_config(result: &Value) -> Result<()> {
         "unified_exec",
         "multi_agent",
         "hooks",
+        "skill_mcp_dependency_install",
         "web_search",
         "browser_use",
         "computer_use",
@@ -1210,7 +1369,8 @@ impl TurnSession {
     }
 
     async fn drive_until(&mut self, tx: &mpsc::Sender<Result<StreamChunk>>, deadline: Instant) {
-        let mut text = String::new();
+        let mut authoritative_text: Option<String> = None;
+        let mut streamed_text_bytes = 0usize;
         let mut active_tool_calls = HashMap::new();
         let mut active_agent_items = HashSet::new();
         let mut agent_deltas: HashMap<String, String> = HashMap::new();
@@ -1260,7 +1420,8 @@ impl TurnSession {
                             .await;
                             return;
                         }
-                        if text.len().saturating_add(delta.len()) > MAX_RESPONSE_TEXT_BYTES {
+                        streamed_text_bytes = streamed_text_bytes.saturating_add(delta.len());
+                        if streamed_text_bytes > MAX_RESPONSE_TEXT_BYTES {
                             let _ = deliver(
                                 tx,
                                 deadline,
@@ -1269,7 +1430,6 @@ impl TurnSession {
                             .await;
                             return;
                         }
-                        text.push_str(delta);
                         agent_deltas
                             .entry(item_id.to_string())
                             .or_default()
@@ -1300,33 +1460,57 @@ impl TurnSession {
                     if event.pointer("/params/item/type").and_then(Value::as_str)
                         == Some("agentMessage")
                     {
-                        if let Some(final_text) =
+                        let Some(final_text) =
                             event.pointer("/params/item/text").and_then(Value::as_str)
-                        {
-                            if final_text.len() > MAX_RESPONSE_TEXT_BYTES {
-                                let _ = deliver(
-                                    tx,
-                                    deadline,
-                                    Err(anyhow::anyhow!("Codex response exceeded the size limit")),
-                                )
-                                .await;
+                        else {
+                            let _ = deliver(
+                                tx,
+                                deadline,
+                                Err(anyhow::anyhow!(
+                                    "Codex agent completion omitted authoritative text"
+                                )),
+                            )
+                            .await;
+                            return;
+                        };
+                        if final_text.len() > MAX_RESPONSE_TEXT_BYTES {
+                            let _ = deliver(
+                                tx,
+                                deadline,
+                                Err(anyhow::anyhow!("Codex response exceeded the size limit")),
+                            )
+                            .await;
+                            return;
+                        }
+                        let had_deltas = agent_deltas
+                            .get(item_id)
+                            .is_some_and(|value| !value.is_empty());
+                        authoritative_text = Some(final_text.to_string());
+                        if !had_deltas {
+                            if !deliver(
+                                tx,
+                                deadline,
+                                Ok(StreamChunk::TextDelta(final_text.to_string())),
+                            )
+                            .await
+                            {
                                 return;
-                            }
-                            let had_deltas = agent_deltas
-                                .get(item_id)
-                                .is_some_and(|value| !value.is_empty());
-                            text = final_text.to_string();
-                            if !had_deltas {
-                                if !deliver(tx, deadline, Ok(StreamChunk::TextDelta(text.clone())))
-                                    .await
-                                {
-                                    return;
-                                }
                             }
                         }
                     }
                 }
                 Some("item/tool/call") => {
+                    if !active_agent_items.is_empty() {
+                        let _ = deliver(
+                            tx,
+                            deadline,
+                            Err(anyhow::anyhow!(
+                                "Codex tool call arrived before authoritative agent completion"
+                            )),
+                        )
+                        .await;
+                        return;
+                    }
                     let Some(params) = event.get("params") else {
                         let _ = deliver(
                             tx,
@@ -1360,12 +1544,12 @@ impl TurnSession {
                         })),
                     )
                     .await;
-                    if !text.is_empty() {
+                    if let Some(text) = authoritative_text.take() {
                         let _ = deliver(
                             tx,
                             deadline,
                             Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text {
-                                text: text.clone(),
+                                text,
                             })),
                         )
                         .await;
@@ -1398,23 +1582,18 @@ impl TurnSession {
                         .await;
                         return;
                     }
-                    if text.is_empty() {
-                        if let Some(final_text) = completed_agent_text(&event) {
-                            if final_text.len() > MAX_RESPONSE_TEXT_BYTES {
-                                let _ = deliver(
-                                    tx,
-                                    deadline,
-                                    Err(anyhow::anyhow!("Codex response exceeded the size limit")),
-                                )
-                                .await;
-                                return;
-                            }
-                            text = final_text;
-                            let _ = deliver(tx, deadline, Ok(StreamChunk::TextDelta(text.clone())))
-                                .await;
-                        }
+                    if !active_agent_items.is_empty() || !active_tool_calls.is_empty() {
+                        let _ = deliver(
+                            tx,
+                            deadline,
+                            Err(anyhow::anyhow!(
+                                "Codex turn completed with unresolved item lifecycles"
+                            )),
+                        )
+                        .await;
+                        return;
                     }
-                    if !text.is_empty() {
+                    if let Some(text) = authoritative_text.take() {
                         let _ = deliver(
                             tx,
                             deadline,
@@ -1450,7 +1629,17 @@ impl TurnSession {
                         return;
                     }
                     if item_type == "agentMessage" && method == Some("item/started") {
-                        active_agent_items.insert(correlation.item_id.clone().unwrap_or_default());
+                        if !active_agent_items
+                            .insert(correlation.item_id.clone().unwrap_or_default())
+                        {
+                            let _ = deliver(
+                                tx,
+                                deadline,
+                                Err(anyhow::anyhow!("Duplicate Codex agent item start")),
+                            )
+                            .await;
+                            return;
+                        }
                     }
                     if item_type == "dynamicToolCall" {
                         let tool = event.pointer("/params/item/tool").and_then(Value::as_str);
@@ -1487,7 +1676,18 @@ impl TurnSession {
                             arguments,
                         };
                         if method == Some("item/started") {
-                            active_tool_calls.insert(call_id.to_string(), call);
+                            if active_tool_calls
+                                .insert(call_id.to_string(), call)
+                                .is_some()
+                            {
+                                let _ = deliver(
+                                    tx,
+                                    deadline,
+                                    Err(anyhow::anyhow!("Duplicate Codex dynamic-tool item start")),
+                                )
+                                .await;
+                                return;
+                            }
                         } else if active_tool_calls.remove(call_id).as_ref() != Some(&call) {
                             let _ = deliver(
                                 tx,
@@ -1607,18 +1807,6 @@ fn validate_event_correlation(
     Ok(EventCorrelation { item_id })
 }
 
-fn completed_agent_text(event: &Value) -> Option<String> {
-    event
-        .pointer("/params/turn/items")
-        .and_then(Value::as_array)?
-        .iter()
-        .rev()
-        .find(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))?
-        .get("text")?
-        .as_str()
-        .map(str::to_string)
-}
-
 #[async_trait]
 impl LlmProvider for CodexAppServerProvider {
     async fn send_message(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
@@ -1699,7 +1887,7 @@ for line in sys.stdin:
     if method == 'initialize':
         result = {'capabilities': {}}
     elif method == 'config/read':
-        result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'profiles': {}, 'apps': {'_default': {'enabled': False}}, 'web_search': 'disabled', 'allow_login_shell': False, 'shell_environment_policy': {'inherit': 'none'}, 'agents': {'enabled': False}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+        result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'profiles': {}, 'apps': {'_default': {'enabled': False}}, 'web_search': 'disabled', 'allow_login_shell': False, 'shell_environment_policy': {'inherit': 'none'}, 'agents': {'enabled': False}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','skill_mcp_dependency_install','web_search','browser_use','computer_use']}}}
     elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read':
         assert m['params']['refreshToken'] is True
@@ -1758,6 +1946,75 @@ for line in sys.stdin:
         (directory, command)
     }
 
+    fn event_app_server(events: Vec<Value>) -> (tempfile::TempDir, AppServerCommand) {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("event_app_server.py");
+        let source = r#"import json, sys
+events = json.loads(r'''EVENTS_JSON''')
+for line in sys.stdin:
+    m = json.loads(line); method = m.get('method')
+    if method == 'initialized': continue
+    if method == 'initialize': result = {}
+    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'profiles': {}, 'apps': {'_default': {'enabled': False}}, 'web_search': 'disabled', 'allow_login_shell': False, 'shell_environment_policy': {'inherit': 'none'}, 'agents': {'enabled': False}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','skill_mcp_dependency_install','web_search','browser_use','computer_use']}}}
+    elif method == 'configRequirements/read': result = {'requirements': None}
+    elif method == 'account/read': result = {'account': {'type': 'chatgpt'}}
+    elif method == 'thread/start': result = {'thread': {'id': 'thread'}}
+    elif method == 'turn/start': result = {'turn': {'id': 'turn'}}
+    else: result = {}
+    print(json.dumps({'id': m.get('id'), 'result': result}), flush=True)
+    if method == 'turn/start':
+        for event in events: print(json.dumps(event), flush=True)
+"#
+        .replace("EVENTS_JSON", &serde_json::to_string(&events).unwrap());
+        std::fs::write(&script, source).unwrap();
+        let command = AppServerCommand::test(
+            PathBuf::from("python3"),
+            vec![script.to_string_lossy().into_owned()],
+        );
+        (directory, command)
+    }
+
+    #[cfg(unix)]
+    fn bind_validated_executable_then_replace(command: &mut AppServerCommand, directory: &Path) {
+        let source = if command.program.components().count() == 1 {
+            std::env::split_paths(&std::env::var_os("PATH").unwrap())
+                .map(|path| path.join(&command.program))
+                .find(|path| path.is_file())
+                .unwrap()
+        } else {
+            command.program.clone()
+        };
+        let bound_path = directory.join("bound-native");
+        std::fs::copy(source, &bound_path).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bound_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = File::open(&bound_path).unwrap();
+        let expected = file_identity_from_open_file(&bound_path, &executable).unwrap();
+        command.program = bound_path.clone();
+        command.bound_executable = Some(Arc::new(executable));
+        command.identity = Some(ExecutableIdentity {
+            files: vec![expected.clone()],
+            package_version: "test".into(),
+            package_digest: [1; 32],
+            native_digest: expected.sha256,
+            team_id: Some("TEAM".into()),
+            designated_requirement: Some("requirement".into()),
+        });
+        command.audit_override = true;
+        command.validate_identity().unwrap();
+
+        let replacement = directory.join("replacement-native");
+        std::fs::copy("/usr/bin/false", &replacement).unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::rename(replacement, bound_path).unwrap();
+        // The open descriptor remains the validated artifact, while reopening the
+        // immutable production path would now select the adversarial replacement.
+        assert_ne!(
+            file_identity(&command.program).unwrap().sha256,
+            expected.sha256
+        );
+    }
+
     fn hanging_app_server(
         hang_during_initialize: bool,
         timeout: Duration,
@@ -1778,7 +2035,7 @@ for line in sys.stdin:
     if hang_initialize and method == 'initialize':
         continue
     if method == 'initialize': result = {}
-    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'profiles': {}, 'apps': {'_default': {'enabled': False}}, 'web_search': 'disabled', 'allow_login_shell': False, 'shell_environment_policy': {'inherit': 'none'}, 'agents': {'enabled': False}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'profiles': {}, 'apps': {'_default': {'enabled': False}}, 'web_search': 'disabled', 'allow_login_shell': False, 'shell_environment_policy': {'inherit': 'none'}, 'agents': {'enabled': False}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','skill_mcp_dependency_install','web_search','browser_use','computer_use']}}}
     elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read': result = {'account': {'type': 'chatgpt'}}
     elif method == 'thread/start': result = {'thread': {'id': 'thread'}}
@@ -1821,7 +2078,7 @@ for line in sys.stdin:
     m = json.loads(line); method = m.get('method')
     if method == 'initialized': continue
     if method == 'initialize': result = {}
-    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'profiles': {}, 'apps': {'_default': {'enabled': False}}, 'web_search': 'disabled', 'allow_login_shell': False, 'shell_environment_policy': {'inherit': 'none'}, 'agents': {'enabled': False}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'profiles': {}, 'apps': {'_default': {'enabled': False}}, 'web_search': 'disabled', 'allow_login_shell': False, 'shell_environment_policy': {'inherit': 'none'}, 'agents': {'enabled': False}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','skill_mcp_dependency_install','web_search','browser_use','computer_use']}}}
     elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read': result = {'account': {'type': 'chatgpt'}}
     elif method == 'thread/start': result = {'thread': {'id': 'thread'}}
@@ -1870,7 +2127,13 @@ for line in sys.stdin:
             "features.shell_tool=false",
             "features.unified_exec=false",
             "features.multi_agent=false",
+            "features.hooks=false",
+            "features.skill_mcp_dependency_install=false",
+            "features.web_search=false",
+            "features.browser_use=false",
+            "features.computer_use=false",
             "web_search=\"disabled\"",
+            "allow_login_shell=false",
             "shell_environment_policy.inherit=\"none\"",
         ] {
             assert!(
@@ -1960,7 +2223,8 @@ for line in sys.stdin:
             "features": {
                 "apps": false, "plugins": false, "remote_plugin": false,
                 "shell_tool": false, "unified_exec": false, "multi_agent": false,
-                "hooks": false, "web_search": false, "browser_use": false,
+                "hooks": false, "skill_mcp_dependency_install": false,
+                "web_search": false, "browser_use": false,
                 "computer_use": false
             }
         }});
@@ -1984,6 +2248,21 @@ for line in sys.stdin:
         let mut managed_profile = safe.clone();
         managed_profile["config"]["profiles"]["managed"] = json!({"web_search": "live"});
         assert!(verify_effective_config(&managed_profile).is_err());
+        let mut inherited_skill_install = safe.clone();
+        inherited_skill_install["config"]["features"]["skill_mcp_dependency_install"] = json!(true);
+        assert!(verify_effective_config(&inherited_skill_install).is_err());
+        let mut missing_skill_install = safe.clone();
+        missing_skill_install["config"]["features"]
+            .as_object_mut()
+            .unwrap()
+            .remove("skill_mcp_dependency_install");
+        assert!(verify_effective_config(&missing_skill_install).is_err());
+        let mut empty_apps = safe.clone();
+        empty_apps["config"]["apps"] = json!({});
+        assert!(verify_effective_config(&empty_apps).is_err());
+        let mut default_app_enabled = safe.clone();
+        default_app_enabled["config"]["apps"]["_default"]["enabled"] = json!(true);
+        assert!(verify_effective_config(&default_app_enabled).is_err());
         verify_effective_requirements(&json!({"requirements": null})).unwrap();
         assert!(verify_effective_requirements(&json!({
             "requirements": {"features": {"apps": true}}
@@ -2061,7 +2340,6 @@ for line in sys.stdin:
         for (pointer, value) in [
             ("/params/threadId", "other-thread"),
             ("/params/turnId", "other-turn"),
-            ("/params/itemId", "other-item"),
         ] {
             let mut invalid = valid.clone();
             *invalid.pointer_mut(pointer).unwrap() = json!(value);
@@ -2169,22 +2447,8 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn installed_production_schema_fails_closed_without_readable_roots() {
-        let version = std::process::Command::new("codex")
-            .arg("--version")
-            .stderr(Stdio::null())
-            .output();
-        if version.is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains("codex-cli 0.149.1")
-        }) {
-            match AppServerCommand::production() {
-                Ok(command) => {
-                    assert!(!command.detect_protocol_capabilities().restricted_read_only)
-                }
-                Err(error) => assert!(error.to_string().contains("writable ancestor")),
-            }
-        }
+    fn production_allowlist_stays_empty_until_an_artifact_is_independently_audited() {
+        assert!(AUDITED_CODEX_ARTIFACTS.is_empty());
     }
 
     #[cfg(unix)]
@@ -2291,6 +2555,143 @@ for line in sys.stdin:
         let response = provider.send_message(&request).await.unwrap();
         assert_eq!(response.content[0].as_text(), Some("hello"));
         assert_eq!(response.provider, "chatgpt_subscription");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_schema_spawn_rejects_path_replacement_after_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("schema.py");
+        std::fs::write(
+            &script,
+            r#"import json, os, sys
+out = sys.argv[-1]
+os.makedirs(os.path.join(out, 'v2'))
+json.dump({'properties': {'dynamicTools': {}}}, open(os.path.join(out, 'v2', 'ThreadStartParams.json'), 'w'))
+json.dump({'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnly'}}, 'definitions': {'ReadOnly': {'properties': {'type': {'enum': ['readOnly']}, 'networkAccess': {'type': 'boolean'}, 'access': {'$ref': '#/definitions/Restricted'}}}, 'Restricted': {'properties': {'type': {'enum': ['restricted']}, 'readableRoots': {'type': 'array', 'items': {'type': 'string'}}, 'includePlatformDefaults': {'type': 'boolean'}}}}}, open(os.path.join(out, 'v2', 'TurnStartParams.json'), 'w'))
+"#,
+        )
+        .unwrap();
+        let mut command = AppServerCommand::test(
+            PathBuf::from("python3"),
+            vec![script.to_string_lossy().into_owned()],
+        );
+        bind_validated_executable_then_replace(&mut command, directory.path());
+        let capabilities = command.detect_protocol_capabilities();
+        assert!(!capabilities.dynamic_tools);
+        assert!(!capabilities.restricted_read_only);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_auth_spawn_rejects_path_replacement_after_validation() {
+        let (directory, mut command) = mock_app_server("chatgpt");
+        bind_validated_executable_then_replace(&mut command, directory.path());
+        let error = CodexAppServerAuth::with_command(command)
+            .status(false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("changed after validation"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_turn_spawn_rejects_path_replacement_after_validation() {
+        let (directory, mut command) = mock_app_server("chatgpt");
+        bind_validated_executable_then_replace(&mut command, directory.path());
+        let provider = CodexAppServerProvider::with_command(command, "test-model", false);
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![Message {
+                role: "user".into(),
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            }]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("changed after validation"));
+    }
+
+    async fn event_stream_error(events: Vec<Value>, with_tool: bool) -> String {
+        let (_directory, command) = event_app_server(events);
+        let provider = CodexAppServerProvider::with_command(command, "test-model", with_tool);
+        let mut request = ProviderRequest::new(vec![]);
+        if with_tool {
+            request = request.with_tools(vec![ToolDefinition {
+                name: "lookup".into(),
+                description: "lookup".into(),
+                input_schema: crate::tools::types::ToolInputSchema::simple(vec![]),
+            }]);
+        }
+        provider
+            .send_message(&request)
+            .await
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_turn_completion_rejects_unfinished_agent_delta() {
+        let error = event_stream_error(
+            vec![
+                json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn","item":{"id":"agent-1","type":"agentMessage"}}}),
+                json!({"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"agent-1","delta":"unfinished"}}),
+                json!({"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed"}}}),
+            ],
+            false,
+        )
+        .await;
+        assert!(error.contains("unresolved item lifecycles"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_delta_rejects_wrong_lifecycle_item() {
+        let error = event_stream_error(
+            vec![
+                json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn","item":{"id":"agent-1","type":"agentMessage"}}}),
+                json!({"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"agent-2","delta":"mismatched"}}),
+            ],
+            false,
+        )
+        .await;
+        assert!(error.contains("lacked a correlated item lifecycle"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_rejects_unfinished_agent_text() {
+        let error = event_stream_error(
+            vec![
+                json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn","item":{"id":"agent-1","type":"agentMessage"}}}),
+                json!({"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"agent-1","delta":"unfinished"}}),
+                json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn","item":{"id":"call-1","type":"dynamicToolCall","tool":"lookup","arguments":{"q":"x"}}}}),
+                json!({"method":"item/tool/call","params":{"threadId":"thread","turnId":"turn","itemId":"call-1","callId":"call-1","tool":"lookup","arguments":{"q":"x"}}}),
+            ],
+            true,
+        )
+        .await;
+        assert!(error.contains("before authoritative agent completion"));
+    }
+
+    #[tokio::test]
+    async fn test_turn_completion_rejects_active_dynamic_tool_lifecycle() {
+        let error = event_stream_error(
+            vec![
+                json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn","item":{"id":"call-1","type":"dynamicToolCall","tool":"lookup","arguments":{}}}}),
+                json!({"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed"}}}),
+            ],
+            true,
+        )
+        .await;
+        assert!(error.contains("unresolved item lifecycles"));
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_agent_and_dynamic_tool_starts_fail_closed() {
+        let agent_start = json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn","item":{"id":"agent-1","type":"agentMessage"}}});
+        let error = event_stream_error(vec![agent_start.clone(), agent_start], false).await;
+        assert!(error.contains("Duplicate Codex agent item start"));
+
+        let tool_start = json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn","item":{"id":"call-1","type":"dynamicToolCall","tool":"lookup","arguments":{}}}});
+        let error = event_stream_error(vec![tool_start.clone(), tool_start], true).await;
+        assert!(error.contains("Duplicate Codex dynamic-tool item start"));
     }
 
     #[tokio::test]
@@ -2412,7 +2813,7 @@ for line in sys.stdin:
     m = json.loads(line); method = m.get('method')
     if method == 'initialized': continue
     if method == 'initialize': result = {}
-    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'profiles': {}, 'apps': {'_default': {'enabled': False}}, 'web_search': 'disabled', 'allow_login_shell': False, 'shell_environment_policy': {'inherit': 'none'}, 'agents': {'enabled': False}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','web_search','browser_use','computer_use']}}}
+    elif method == 'config/read': result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'profiles': {}, 'apps': {'_default': {'enabled': False}}, 'web_search': 'disabled', 'allow_login_shell': False, 'shell_environment_policy': {'inherit': 'none'}, 'agents': {'enabled': False}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','skill_mcp_dependency_install','web_search','browser_use','computer_use']}}}
     elif method == 'configRequirements/read': result = {'requirements': None}
     elif method == 'account/read': result = {'account': {'type': 'chatgpt'}}
     elif method == 'thread/start': result = {'thread': {'id': 'thread'}}

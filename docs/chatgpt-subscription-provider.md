@@ -38,6 +38,31 @@ sandbox enforcement before this provider becomes available. This deliberate
 fail-closed compatibility limit prevents a future schema-compatible release from
 being trusted automatically.
 
+## Adding an audited Codex release
+
+`AUDITED_CODEX_ARTIFACTS` is intentionally an exact, source-controlled allowlist,
+not a version range. To add a release, an independent audit must record and review:
+
+- the exact `@openai/codex` package version and registry integrity/provenance;
+- SHA-256 digests for the launcher, main manifest, platform manifest, packaged
+  provenance record, and native binary (combined exactly as the implementation
+  defines `package_digest`);
+- the native binary's SHA-256 digest and, on macOS, its Team ID and full designated
+  requirement;
+- generated app-server schemas proving the restricted `readOnly` access variant
+  and any advertised dynamic-tool protocol;
+- end-to-end fixtures proving merged per-thread config disables every enumerated
+  app, plugin, MCP, environment, profile, hook, agent, shell, skill dependency
+  installer, web/browser/computer capability, and network/filesystem escape.
+
+The reviewed values are then added as one `AuditedArtifact` tuple. Finch requires
+the native path to be root-owned and immutable to the invoking user, opens it during
+resolution, validates and signs/hashes that open object, and requires both the open
+descriptor and the path to retain the audited identity immediately before every
+schema, auth, or turn spawn. This OS-enforced immutability closes the same-UID
+path-to-exec replacement window on supported platforms. Merely installing a newer
+version or matching its schema never expands the allowlist.
+
 The profile default is `gpt-5.6-sol`; the official `gpt-5.6` alias currently routes
 to that model. Finch does not substitute the lower-cost Terra tier implicitly.
 
