@@ -4218,6 +4218,7 @@ Rules:\n\
                     };
 
                     if !named_turn {
+                        self.conversation.write().await.abort_staged(qid);
                         *self.active_query_id.write().await = None;
                         self.tool_call_history.write().await.remove(&qid);
                     }
@@ -6651,10 +6652,18 @@ Rules:\n\
             content: content_blocks,
         };
 
-        self.conversation
+        let committed = self
+            .conversation
             .write()
             .await
-            .add_message(tool_result_message);
+            .commit_tool_round(query_id, tool_result_message);
+        if !committed {
+            tracing::debug!(
+                "Ignoring tool-round commit for query {} because its stage was aborted",
+                query_id
+            );
+            return Ok(());
+        }
 
         // Send tool-continuation turn to the LLM worker loop
         let _ = self.llm_tx.send(LlmRequest::Query {
