@@ -73,6 +73,22 @@ Run `finch --help` and `finch <command> --help` for the full generated CLI refer
 currently reach the same profile selector; generated help emphasizes `/model` while retaining the
 other spellings for compatibility.
 
+## Shared brains (experimental)
+
+Tests and live smokes involving Brains must not be invoked directly. Give the
+process a disposable Finch home with the guarded wrapper (credentials needed
+by a live smoke should be supplied explicitly through environment variables):
+
+```bash
+./scripts/test_brains.sh env FINCH_LIVE_TESTS=1 cargo test --test live -- --ignored
+```
+
+The wrapper deletes the temporary store on success or failure and fails if the
+real `~/.finch/brains` manifest changes.
+
+A named Brain keeps one ordered conversation and one persistent typed Lisp/Co-Forth VM across
+multiple terminals and daemon restarts.
+
 ### Tools and approval
 
 Finch can inspect files, search source, propose changes, run commands, and call configured MCP
