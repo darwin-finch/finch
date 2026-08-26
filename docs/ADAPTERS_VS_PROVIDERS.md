@@ -52,7 +52,7 @@ let clean_output = adapter.clean_output(&raw_output);
 ### 2. TeacherProvider (External API Services)
 
 **Location**: `src/providers/`
-**Purpose**: Make HTTP requests to **external API services** for training/fallback
+**Purpose**: Make HTTP requests to **external API services** for inference fallback
 **Network**: Makes HTTP API calls
 **Async**: Yes, all methods are async
 
@@ -85,8 +85,8 @@ let teacher = ClaudeProvider::new(api_key);
 // Make async API call
 let response = teacher.send_message(messages).await?;
 
-// Learn from high-quality response
-local_generator.learn_from_claude(&response);
+// Use the provider response; Finch does not collect it for training
+display(response);
 ```
 
 ---
@@ -104,7 +104,7 @@ local_generator.learn_from_claude(&response);
 | **Speed** | Fast (microseconds) | Slower (network latency) |
 | **Dependencies** | None (just formatting) | HTTP client, API keys |
 | **Examples** | Qwen, Llama, Mistral adapters | Claude, OpenAI, Grok APIs |
-| **Used For** | Prompt formatting, output cleaning | Training, fallback, complex queries |
+| **Used For** | Prompt formatting, output cleaning | Fallback and complex queries |
 
 ---
 

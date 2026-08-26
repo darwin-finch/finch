@@ -1,10 +1,10 @@
 # Architecture
 
-This document describes the technical architecture of Shammah, a local-first AI coding assistant that uses pre-trained ONNX models with LoRA fine-tuning.
+This document describes the technical architecture of Shammah, a local-first AI coding assistant that uses pre-trained ONNX models and cloud fallback.
 
 ## Overview
 
-Shammah provides **immediate, high-quality AI assistance** using pre-trained local models (Qwen via ONNX Runtime) or cloud fallback (Claude, GPT-4, Gemini, Grok), then continuously improves through weighted LoRA fine-tuning to adapt to your specific coding patterns.
+Shammah provides **immediate, high-quality AI assistance** using pre-trained local models (Qwen via ONNX Runtime) or cloud fallback (Claude, GPT-4, Gemini, Grok). Explicit weighted feedback is retained privately, but training is disabled.
 
 **Current State (v0.7.0):**
 - ✅ ONNX Runtime with KV cache support
@@ -13,7 +13,7 @@ Shammah provides **immediate, high-quality AI assistance** using pre-trained loc
 - ✅ OpenAI-compatible HTTP API (VS Code / Continue.dev integration)
 - ✅ Tool execution with pass-through (Read, Glob, Grep, Bash, WebFetch, Edit, Write, Patch)
 - ✅ SSE streaming for local and remote
-- ✅ LoRA fine-tuning infrastructure (feedback collection + JSONL queue)
+- ✅ Private explicit feedback collection (no automatic training trigger)
 - ✅ Multi-provider teacher support (6 providers: Claude, GPT-4, Gemini, Grok, Mistral, Groq)
 - ✅ Unified `[[providers]]` config with transparent migration from `[[teachers]]`
 - ✅ Tabbed setup wizard with ONNX model selection and markdown preview dialogs
@@ -28,9 +28,9 @@ Shammah provides **immediate, high-quality AI assistance** using pre-trained loc
 - ✅ Sliding window context (configurable, default 20 messages) with optional summarization
 - ✅ Input token count in status bar (`↑ N.Nk`)
 - 🚧 MCP plugin system (partial)
-- 🚧 LoRA adapter loading at inference time (Issue #1)
+- ⛔ LoRA training and adapter loading blocked on Issues #1, #7, and #74
 
-**Key Innovation:** Pre-trained models + weighted LoRA fine-tuning = immediate quality + continuous improvement.
+**Learning boundary:** Pre-trained models provide immediate quality. Explicit feedback is retained, but does not alter a model.
 
 ## Architecture Overview
 
@@ -77,16 +77,16 @@ REPL appears instantly (<100ms)
            v
     User Feedback?
            │
-    ├─ 🔴 Critical issue → High-weight training (10x)
-    ├─ 🟡 Could improve → Medium-weight training (3x)
-    └─ 🟢 Looks good → Normal-weight training (1x)
+    ├─ 🔴 Critical issue → Retained weight 10x
+    ├─ 🟡 Could improve → Retained weight 3x
+    └─ 🟢 Looks good → Retained weight 1x
            │
            v
     ┌──────────────────────────────────┐
-    │  Background LoRA Fine-Tuning     │
-    │  (Python script, non-blocking)   │
-    │  - Weighted sampling             │
-    │  - Saves to safetensors          │
+    │  Private feedback.jsonl          │
+    │  - Locked and synced             │
+    │  - No worker or subprocess       │
+    │  - No adapter generation/loading │
     └──────────────────────────────────┘
 ```
 
@@ -375,16 +375,16 @@ Feedback logged with weight to append-only JSONL
 [Pending] Load via onnxruntime-genai Adapters API at inference
 ```
 
-**Weighted Training:**
+**Weighted Feedback:**
 - **High-weight (10x)**: Critical issues (strategy errors)
   - Example: "Never use .unwrap() in production"
-  - Impact: Model strongly learns to avoid this
+  - Meaning: Retained as a critical user rating
 - **Medium-weight (3x)**: Style preferences
   - Example: "Prefer iterator chains over manual loops"
-  - Impact: Model learns your preferred approach
+  - Meaning: Retained as an improvement request
 - **Normal-weight (1x)**: Good examples
   - Example: "This is exactly right"
-  - Impact: Model learns normally
+  - Meaning: Retained as a positive rating
 
 **Current Status:**
 Explicit feedback collection works, but it does not enqueue or trigger training.
@@ -898,7 +898,7 @@ executable training queue.
 **Models:**
 - Base: Qwen-2.5-1.5B/3B/7B/14B (ONNX format, pre-trained)
 - Source: onnx-community on HuggingFace
-- Adapters: LoRA (domain-specific, ~5MB each, via Python training)
+- Adapters: legacy LoRA files are preserved but not loaded by Finch
 
 **HTTP Server:** Axum
 - Tokio async runtime
@@ -973,13 +973,13 @@ executable training queue.
 
 ## Future Optimizations
 
-### Pure Rust LoRA Training
-- Current: Python-based training (2x memory overhead)
-- Future: Custom Rust implementation compatible with ONNX Runtime
-- Options: burn.rs, custom ONNX graph mods, or wait for ONNX Training support
+### Native LoRA Feasibility
+- Current: training is disabled; the Python path is not connected to runtime
+- Future work is gated by Issues #1, #7, and #74
+- Any proposal needs measured native feasibility and explicit resource/privacy controls
 
-### Adapter Loading at Runtime
-- Load trained LoRA adapters during ONNX inference
+### Adapter Loading at Runtime (Blocked)
+- The default runtime does not scan for or load LoRA adapters
 - Requires weight merging or dynamic ONNX graph modification
 - Enables instant domain switching without reloading base model
 

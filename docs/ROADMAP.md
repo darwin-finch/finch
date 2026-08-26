@@ -21,7 +21,7 @@ Core infrastructure is complete and production-ready.
 - IMPCPD iterative planning loop (`/plan <task>`) with 7 adversarial personas
 - Universal alignment prompt — JSON normalization across all 6 providers
 - Live LLM test suite (`FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_`)
-- LoRA weighted feedback collection + JSONL queue (adapter loading still pending)
+- Private explicit feedback collection (automatic training and adapter loading disabled)
 - Progressive bootstrap — instant REPL startup, background model load
 - CLAUDE.md / FINCH.md context injection (matches Claude Code behaviour)
 
@@ -31,12 +31,13 @@ Core infrastructure is complete and production-ready.
 
 ### [#1] LoRA adapter loading at ONNX runtime
 **Effort:** 40–80h  **Priority:** High
-The feedback collection pipeline is complete; the missing piece is loading trained LoRA
-adapters into ONNX Runtime at inference time. Options:
+Explicit feedback collection is complete, but training and adapter loading remain blocked.
+Any future implementation must first establish a supported native non-Python path through
+Issues #7 and #74. Historical options included:
 - Option A (simpler): Python training → merge weights → re-export ONNX model
 - Option B (preferred): Runtime adapter injection via weight merging in Rust
 
-Blocked on designing the ONNX graph modification strategy.
+Blocked on verified native feasibility and resource/privacy controls.
 
 ### [#2] Mistral ONNX support
 **Effort:** 4–8h  **Priority:** Medium

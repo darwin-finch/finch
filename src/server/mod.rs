@@ -21,7 +21,7 @@ pub use brain_runner::{
 pub use brain_service::{
     BrainLifecycleService, BrainSubmissionError, BrainSubmissionOutcome, BrainWatch,
 };
-pub use feedback_handler::{handle_feedback, handle_training_status, FeedbackStore};
+pub use feedback_handler::{handle_feedback, handle_training_status};
 pub use handlers::{
     create_router, handle_node_info, handle_node_stats, health_check, metrics_endpoint,
 };
@@ -37,6 +37,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::claude::ClaudeClient;
 use crate::config::Config;
+use crate::feedback::FeedbackLogger;
 use crate::local::LocalGenerator;
 use crate::metrics::MetricsLogger;
 use crate::models::{BootstrapLoader, GeneratorState};
@@ -95,7 +96,7 @@ pub struct AgentServer {
     /// Generator state (tracks model loading progress)
     generator_state: Arc<RwLock<GeneratorState>>,
     /// Append-only explicit user feedback. This is not a training queue.
-    feedback_store: Arc<FeedbackStore>,
+    feedback_store: Arc<FeedbackLogger>,
     /// Authoritative event logs and program stacks for named shared brains.
     brain_store: crate::brain::store::BrainStore,
     /// Send-safe bridge to frontend-owned Cap'n Proto runner callbacks.
@@ -135,7 +136,7 @@ impl AgentServer {
                 None,
             )),
             generator_state,
-            feedback_store: Arc::new(FeedbackStore::new(state_root.join("feedback.jsonl"))),
+            feedback_store: Arc::new(FeedbackLogger::at(state_root.join("feedback.jsonl"))?),
             brain_store: crate::brain::store::BrainStore::with_root(
                 machine,
                 Some(state_root.join("brains")),
@@ -169,7 +170,7 @@ impl AgentServer {
             local_generator: Arc::new(RwLock::new(LocalGenerator::default())),
             bootstrap_loader,
             generator_state,
-            feedback_store: Arc::new(FeedbackStore::new(state_root.join("feedback.jsonl"))),
+            feedback_store: Arc::new(FeedbackLogger::at(state_root.join("feedback.jsonl"))?),
             brain_store: store,
             brain_runners: BrainRunnerBroker::default(),
             brain_approvals: BrainApprovalBroker::default(),
@@ -235,7 +236,7 @@ impl AgentServer {
             local_generator,
             bootstrap_loader,
             generator_state,
-            feedback_store: Arc::new(FeedbackStore::new(FeedbackStore::default_path()?)),
+            feedback_store: Arc::new(FeedbackLogger::new()?),
             brain_store: crate::brain::store::BrainStore::new(machine),
             brain_runners: BrainRunnerBroker::default(),
             brain_approvals: BrainApprovalBroker::default(),
@@ -439,7 +440,7 @@ impl AgentServer {
     }
 
     /// Get the append-only explicit feedback store.
-    pub fn feedback_store(&self) -> &Arc<FeedbackStore> {
+    pub fn feedback_store(&self) -> &Arc<FeedbackLogger> {
         &self.feedback_store
     }
 

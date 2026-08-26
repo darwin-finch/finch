@@ -9,64 +9,10 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::models::WeightedExample;
-
-/// Append-only storage for explicit user feedback.
-///
-/// A successful write is synced before the endpoint acknowledges it. The
-/// legacy `training_queue.jsonl` remains untouched and is not executable from
-/// this store.
-#[derive(Debug)]
-pub struct FeedbackStore {
-    path: PathBuf,
-    write_lock: Mutex<()>,
-}
-
-impl FeedbackStore {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            write_lock: Mutex::new(()),
-        }
-    }
-
-    pub fn default_path() -> anyhow::Result<PathBuf> {
-        dirs::home_dir()
-            .map(|home| home.join(".finch").join("feedback.jsonl"))
-            .ok_or_else(|| anyhow::anyhow!("cannot persist feedback without a home directory"))
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn record(&self, example: &WeightedExample) -> anyhow::Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|error| anyhow::anyhow!("feedback store lock poisoned: {error}"))?;
-
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let mut encoded = serde_json::to_vec(example)?;
-        encoded.push(b'\n');
-
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        file.write_all(&encoded)?;
-        file.sync_all()?;
-        Ok(())
-    }
-}
+use crate::feedback::{FeedbackEntry, FeedbackLogger};
 
 /// Request body for /v1/feedback endpoint
 #[derive(Debug, Deserialize)]
@@ -94,7 +40,7 @@ pub struct FeedbackResponse {
 
 /// Handle POST /v1/feedback - durably retain explicit feedback
 pub async fn handle_feedback(
-    State(feedback_store): State<Arc<FeedbackStore>>,
+    State(feedback_store): State<Arc<FeedbackLogger>>,
     Json(request): Json<FeedbackRequest>,
 ) -> Result<Json<FeedbackResponse>, Response> {
     info!(
@@ -105,27 +51,26 @@ pub async fn handle_feedback(
     );
 
     // Validate weight
-    if request.weight <= 0.0 {
+    if !request.weight.is_finite() || request.weight <= 0.0 {
         warn!(weight = request.weight, "Invalid weight (must be > 0)");
         return Err((
             StatusCode::BAD_REQUEST,
             Json(FeedbackResponse {
                 status: "error".to_string(),
-                message: Some("Weight must be greater than 0".to_string()),
+                message: Some("Weight must be finite and greater than 0".to_string()),
             }),
         )
             .into_response());
     }
 
-    // Create weighted example
-    let example = WeightedExample {
-        query: request.query,
-        response: request.response,
-        weight: request.weight,
-        feedback: request.feedback,
-    };
+    let entry = FeedbackEntry::weighted(
+        request.query,
+        request.response,
+        request.weight,
+        request.feedback,
+    );
 
-    if let Err(error) = feedback_store.record(&example) {
+    if let Err(error) = feedback_store.log(&entry) {
         warn!(%error, "Failed to persist feedback");
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -198,7 +143,7 @@ mod tests {
         let adapter_path = temp.path().join("adapters/latest.safetensors");
         std::fs::write(&legacy_queue, "legacy queued example\n").unwrap();
 
-        let first_store = Arc::new(FeedbackStore::new(&feedback_path));
+        let first_store = Arc::new(FeedbackLogger::at(&feedback_path).unwrap());
         let response = handle_feedback(
             State(first_store),
             Json(FeedbackRequest {
@@ -223,7 +168,7 @@ mod tests {
 
         // Recreating the store models a daemon restart. Existing feedback is
         // appended, not replaced, and legacy training state stays preserved.
-        let restarted_store = Arc::new(FeedbackStore::new(&feedback_path));
+        let restarted_store = Arc::new(FeedbackLogger::at(&feedback_path).unwrap());
         let response = handle_feedback(
             State(restarted_store),
             Json(FeedbackRequest {
@@ -240,7 +185,7 @@ mod tests {
         let lines: Vec<_> = std::fs::read_to_string(&feedback_path)
             .unwrap()
             .lines()
-            .map(|line| serde_json::from_str::<WeightedExample>(line).unwrap())
+            .map(|line| serde_json::from_str::<FeedbackEntry>(line).unwrap())
             .collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].query, "first query");
@@ -253,10 +198,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_feedback_is_rejected_without_creating_storage() {
+    async fn invalid_feedback_is_rejected_without_recording_an_entry() {
         let temp = tempfile::tempdir().unwrap();
         let feedback_path = temp.path().join("feedback.jsonl");
-        let store = Arc::new(FeedbackStore::new(&feedback_path));
+        let store = Arc::new(FeedbackLogger::at(&feedback_path).unwrap());
 
         let response = handle_feedback(
             State(store),
@@ -272,7 +217,8 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(!feedback_path.exists());
+        assert!(feedback_path.exists());
+        assert_eq!(std::fs::metadata(&feedback_path).unwrap().len(), 0);
     }
 
     #[tokio::test]

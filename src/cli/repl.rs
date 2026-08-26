@@ -17,13 +17,12 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::claude::{ClaudeClient, MessageRequest};
 use crate::config::Config;
+use crate::feedback::{FeedbackEntry, FeedbackLogger};
 use crate::local::LocalGenerator;
 use crate::metrics::{MetricsLogger, RequestMetric, ResponseComparison, TrainingTrends};
 use crate::models::tokenizer::TextTokenizer;
 use crate::models::ThresholdValidator;
-use crate::models::{
-    BootstrapLoader, GeneratorState, Sampler, SamplingConfig, TrainingCoordinator, WeightedExample,
-};
+use crate::models::{BootstrapLoader, GeneratorState, Sampler, SamplingConfig};
 use crate::providers::{TeacherContextConfig, TeacherSession};
 use crate::router::{ForwardReason, RouteDecision, Router};
 use crate::tools::executor::{generate_tool_signature, ApprovalSource, ToolSignature};
@@ -49,7 +48,7 @@ use super::status_bar::StatusBar;
 use super::tui::TuiRenderer;
 
 // Phase 3.5: Import output macros for global output routing
-use crate::{output_error, output_status};
+use crate::output_status;
 
 /// User's menu choice for tool confirmation
 #[derive(Debug, Clone)]
@@ -60,6 +59,21 @@ enum ConfirmationChoice {
     ApproveExactPersistent,
     ApprovePatternPersistent,
     Deny,
+}
+
+#[cfg(test)]
+mod disabled_training_tests {
+    #[test]
+    fn legacy_repl_has_no_automatic_training_queue_producer() {
+        let source = include_str!("repl.rs");
+        let disabled_flag = ["auto", "_train"].concat();
+        let queue_writer = ["write_training", "_queue"].concat();
+        let python_script = ["train", "_lora.py"].concat();
+
+        assert!(!source.contains(&disabled_flag));
+        assert!(!source.contains(&queue_writer));
+        assert!(!source.contains(&python_script));
+    }
 }
 
 // Use ConfirmationResult from event loop module
@@ -137,8 +151,8 @@ pub struct Repl {
     conversation: Arc<RwLock<ConversationHistory>>,
     // REPL mode (normal, planning, executing)
     mode: ReplMode,
-    // LoRA fine-tuning (NEW)
-    training_coordinator: Arc<TrainingCoordinator>,
+    // Durable explicit feedback; never a training trigger.
+    feedback_logger: Option<FeedbackLogger>,
     sampler: Arc<RwLock<Sampler>>,
     // Track last exchange for feedback
     last_query: Option<String>,
@@ -181,12 +195,6 @@ pub struct Repl {
 
     // Enable sliding-window auto-compaction (from config.features.auto_compact_enabled)
     auto_compact_enabled: bool,
-}
-
-/// Background training statistics
-struct BackgroundTrainingStats {
-    examples_trained: usize,
-    queue_path: String,
 }
 
 #[allow(dead_code)]
@@ -585,12 +593,7 @@ impl Repl {
         ));
         let local_generator = Arc::new(RwLock::new(LocalGenerator::new()));
 
-        // Initialize LoRA fine-tuning system
-        let training_coordinator = Arc::new(TrainingCoordinator::new(
-            100,  // buffer_size: keep last 100 examples
-            10,   // threshold: train after 10 examples
-            true, // auto_train: enabled
-        ));
+        let feedback_logger = FeedbackLogger::new().ok();
 
         let sampling_config = SamplingConfig::default(); // 5% baseline, 3x arch, 5x security
         let sampler = Arc::new(RwLock::new(Sampler::new(sampling_config)));
@@ -707,8 +710,7 @@ impl Repl {
             input_handler,
             conversation: Arc::new(RwLock::new(ConversationHistory::new())),
             mode: ReplMode::Normal,
-            // LoRA fine-tuning
-            training_coordinator,
+            feedback_logger,
             sampler,
             last_query: None,
             last_response: None,
@@ -3419,24 +3421,12 @@ impl Repl {
             _ => "User feedback".to_string(),
         });
 
-        // Create weighted example
-        let example = match weight as i32 {
-            10 => WeightedExample::critical(query.clone(), response.clone(), feedback.clone()),
-            3 => WeightedExample::improvement(query.clone(), response.clone(), feedback.clone()),
-            1 => WeightedExample::normal(query.clone(), response.clone(), feedback.clone()),
-            _ => WeightedExample::with_weight(
-                query.clone(),
-                response.clone(),
-                feedback.clone(),
-                weight,
-            ),
-        };
-
-        // Add to training coordinator
-        let should_train = self
-            .training_coordinator
-            .add_example(example)
-            .context("Failed to add training example")?;
+        let entry = FeedbackEntry::weighted(query, response, weight, Some(feedback.clone()));
+        let logger = self
+            .feedback_logger
+            .as_ref()
+            .context("Feedback logger is unavailable")?;
+        logger.log(&entry).context("Failed to persist feedback")?;
 
         // Display confirmation
         let weight_emoji = match weight as i32 {
@@ -3454,49 +3444,7 @@ impl Repl {
             self.output_status(format!("   Note: {}", note_text));
         }
 
-        // Get buffer stats
-        let buffer = self.training_coordinator.buffer()?;
-        let example_count = buffer.examples().len();
-        let total_weight = buffer.total_weight();
-        drop(buffer); // Release lock
-
-        self.output_status(format!(
-            "   Training buffer: {} examples ({:.1} weighted)",
-            example_count, total_weight
-        ));
-
-        // Trigger training if threshold reached
-        if should_train {
-            self.output_status("\n🔄 Training threshold reached, starting background training...");
-            self.output_status("   (Training runs in background, you can continue querying)");
-
-            // Spawn background training task
-            let coordinator = Arc::clone(&self.training_coordinator);
-            let models_dir = self.models_dir.clone();
-
-            tokio::spawn(async move {
-                match Self::run_background_training(coordinator, models_dir).await {
-                    Ok(stats) => {
-                        output_status!(
-                            "\n✓ {} examples queued for offline training",
-                            stats.examples_trained
-                        );
-                        output_status!("   Queue: {}", stats.queue_path);
-                        output_status!(
-                            "   To train: python3 scripts/train_lora.py {} \\",
-                            stats.queue_path
-                        );
-                        output_status!("             ~/.finch/adapters/latest.safetensors");
-                        output_status!("   (See GitHub Issue #1 for adapter re-loading into ONNX)");
-                    }
-                    Err(e) => {
-                        output_error!("\n⚠️  Training queue export failed: {}", e);
-                    }
-                }
-            });
-
-            self.output_status("   Training started in background...");
-        }
+        self.output_status("   Saved privately; automatic training is disabled.");
 
         Ok(())
     }
@@ -3953,52 +3901,6 @@ impl Repl {
         }
 
         Ok(())
-    }
-
-    /// Export training examples to the offline queue (JSONL) for later Python-based LoRA training.
-    ///
-    /// In-process Rust LoRA training is not implemented because ONNX Runtime is inference-only
-    /// and cannot be used for gradient-based weight updates. The full training pipeline uses a
-    /// separate Python script (`scripts/train_lora.py`) that loads the base model via PyTorch +
-    /// PEFT, trains LoRA adapters, and exports them as safetensors.
-    ///
-    /// Adapter re-loading back into ONNX after training is tracked in:
-    ///   GitHub Issue #1 — https://github.com/darwin-finch/finch/issues/1
-    async fn run_background_training(
-        coordinator: Arc<TrainingCoordinator>,
-        _models_dir: Option<PathBuf>,
-    ) -> Result<BackgroundTrainingStats> {
-        tracing::info!("Exporting training examples to offline queue");
-
-        // Verify the buffer has examples before writing
-        let num_examples = {
-            let buffer = coordinator.buffer()?;
-            let n = buffer.examples().len();
-            if n == 0 {
-                anyhow::bail!("No training examples in buffer");
-            }
-            n
-        };
-
-        // Write examples to ~/.finch/training_queue.jsonl for the Python training pipeline.
-        // This is the only part of the training flow that works end-to-end in Rust today.
-        coordinator.write_training_queue()?;
-
-        let queue_path = dirs::home_dir()
-            .map(|h| {
-                h.join(".finch")
-                    .join("training_queue.jsonl")
-                    .display()
-                    .to_string()
-            })
-            .unwrap_or_else(|| "~/.finch/training_queue.jsonl".to_string());
-
-        tracing::info!("Queued {} examples → {}", num_examples, queue_path);
-
-        Ok(BackgroundTrainingStats {
-            examples_trained: num_examples,
-            queue_path,
-        })
     }
 
     /// Handle /plan command - enter planning mode

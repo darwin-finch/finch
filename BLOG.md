@@ -1,6 +1,6 @@
 # Building a Local-First AI Coding Agent: Grok, MemTree, and What Comes Next
 
-We've been building **Finch** — a local-first AI coding agent written in Rust. It's in the same spirit as Claude Code or Cursor, but designed to run on your own hardware, learn your codebase over time, and work with whatever AI backend you have access to. This is the story of where it came from, what we've figured out, and what's still open.
+We've been building **Finch** — a local-first AI coding agent written in Rust. It's in the same spirit as Claude Code or Cursor, but designed to run on your own hardware, retain explicit private feedback, and work with whatever AI backend you have access to. This is the story of where it came from, what we've figured out, and what's still open.
 
 ---
 
@@ -176,7 +176,7 @@ In rough priority order:
 - Autonomous agent mode: run Finch headlessly overnight on a task backlog, commit with a custom git identity (persona), log everything to JSONL, periodically reflect on completed work to update the agent's own system prompt. The data structures and CLI command are already there; it needs end-to-end testing.
 
 **Longer term:**
-- LoRA adapter loading at inference time: planned pipeline is MLX/PEFT training → Olive conversion → onnxruntime-genai Adapters API at inference (tracked as GitHub Issue #1)
+- LoRA training and adapter loading are disabled while native feasibility remains blocked on Issues #1, #7, and #74
 
 ---
 
@@ -187,7 +187,7 @@ What we're building is an AI coding agent that:
 1. Works offline with a local model, or in cloud-only mode with any provider you have access to
 2. Accumulates structured memory across sessions rather than forgetting everything
 3. Can run autonomously overnight on a task backlog, committing work as a named agent
-4. Learns your patterns over time via LoRA fine-tuning on your feedback
+4. Retains only feedback you explicitly submit; feedback does not trigger training or alter the model
 5. Costs as little as possible — local inference is free after the model download; Grok via X Premium+ is covered by a subscription most developers already have
 
 The architecture is in good shape. The provider layer is clean and tested. The agentic loop works. The memory structure is designed and partially implemented. The main gaps are all in the "making it visible and persistent" category: the tree UI, real embeddings, and SQLite-backed persistence.

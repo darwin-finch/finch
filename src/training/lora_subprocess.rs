@@ -1,6 +1,7 @@
-// LoRA training subprocess spawner
+// Legacy manual LoRA training subprocess spawner
 //
-// Triggers Python training script in background (non-blocking)
+// Not connected to daemon startup, request handling, or feedback. Automatic
+// Python training is disabled under GitHub issue #139.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -86,7 +87,7 @@ impl LoRATrainingSubprocess {
         Self::new(LoRATrainingConfig::default())
     }
 
-    /// Trigger background training (non-blocking)
+    /// Explicitly invoke the legacy manual training experiment (non-blocking).
     ///
     /// Spawns Python training script as a detached subprocess.
     /// Does not block - training runs in background.

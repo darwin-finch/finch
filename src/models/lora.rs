@@ -396,7 +396,10 @@ impl LoRATrainer {
     }
 }
 
-/// Training coordinator (Phase 6: Implemented JSONL queue writer)
+/// Legacy manual training coordinator.
+///
+/// Automatic runtime producers are disabled under GitHub Issue #139. Existing
+/// queues remain readable and this API remains for explicit compatibility use.
 #[derive(Debug)]
 pub struct TrainingCoordinator {
     buffer: std::sync::RwLock<ExampleBuffer>,
@@ -407,7 +410,7 @@ pub struct TrainingCoordinator {
 
 impl TrainingCoordinator {
     pub fn new(buffer_size: usize, threshold: usize, auto_train: bool) -> Self {
-        // Training queue: ~/.finch/training_queue.jsonl
+        // Preserved legacy queue: ~/.finch/training_queue.jsonl
         let queue_path = dirs::home_dir()
             .expect("No home directory")
             .join(".finch")
