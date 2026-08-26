@@ -130,7 +130,7 @@ fn gui_automation_startup_messages(
     );
     if state == AutomationState::PermissionRequired {
         messages.push(
-            "   Run /setup and press R to retry or O to open System Settings → Privacy & Security → Accessibility."
+            "   Run /setup and press R for a passive re-check, P to request the macOS prompt, or O to open System Settings → Privacy & Security → Accessibility."
                 .to_string(),
         );
     }
@@ -174,6 +174,8 @@ mod gui_automation_startup_tests {
         assert!(output.contains("may have been revoked"));
         assert!(output.contains("may have changed"));
         assert!(output.contains("Finch cannot identify that TCC record"));
+        assert!(output.contains("R for a passive re-check"));
+        assert!(output.contains("P to request the macOS prompt"));
     }
 
     #[test]

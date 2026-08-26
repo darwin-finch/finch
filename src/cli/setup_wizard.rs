@@ -381,9 +381,9 @@ enum GuiSettingsFeedback {
 impl GuiSettingsFeedback {
     fn compact_message(&self) -> &str {
         match self {
-            Self::OpenRequested => "Open requested; press R to re-check.",
-            Self::Suppressed => "Not opened (SSH/headless); use local O.",
-            Self::Failed(_) => "Open failed; press D for the full error.",
+            Self::OpenRequested => "Open requested; R re-checks.",
+            Self::Suppressed => "Not opened (SSH/headless).",
+            Self::Failed(_) => "Open failed; D has the error.",
         }
     }
 
@@ -2507,6 +2507,40 @@ const SETTINGS_CONTEXT_IDX: usize = 8;
 
 /// Handle input for Features section (with arrow key navigation)
 fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        return handle_features_input_with_gui_actions(
+            state,
+            key,
+            &mut || AutomationBroker::new(true).availability(),
+            &mut || {
+                AutomationBroker::new(true)
+                    .request_permission(AutomationPromptContext::for_current_session(true))
+            },
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        handle_features_input_impl(state, key)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn handle_features_input_with_gui_actions(
+    state: &mut WizardState,
+    key: crossterm::event::KeyEvent,
+    passive_check: &mut dyn FnMut() -> AutomationAvailability,
+    request_permission: &mut dyn FnMut() -> AutomationPermissionResult,
+) -> Result<bool> {
+    handle_features_input_impl(state, key, passive_check, request_permission)
+}
+
+fn handle_features_input_impl(
+    state: &mut WizardState,
+    key: crossterm::event::KeyEvent,
+    #[cfg(target_os = "macos")] passive_check: &mut dyn FnMut() -> AutomationAvailability,
+    #[cfg(target_os = "macos")] request_permission: &mut dyn FnMut() -> AutomationPermissionResult,
+) -> Result<bool> {
     if let Some(SectionState::Features {
         auto_approve,
         streaming,
@@ -2602,6 +2636,25 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
             return Ok(false);
         }
 
+        #[cfg(target_os = "macos")]
+        if *selected_idx == 3
+            && *gui_automation
+            && handle_gui_permission_input_with(
+                key.code,
+                gui_automation_availability,
+                gui_automation_prompt,
+                gui_automation_prompted,
+                gui_automation_last_known_available,
+                gui_automation_permission_context,
+                gui_automation_settings_feedback,
+                gui_automation_details_scroll,
+                passive_check,
+                request_permission,
+            )
+        {
+            return Ok(false);
+        }
+
         // Text fields and toggle rows share these constants with the renderer so
         // keyboard focus and visual selection cannot drift apart.
         match key.code {
@@ -2677,26 +2730,6 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
                 }
             }
             #[cfg(target_os = "macos")]
-            KeyCode::Char('r') | KeyCode::Char('R') if *selected_idx == 3 && *gui_automation => {
-                *gui_automation_settings_feedback = None;
-                *gui_automation_details_scroll = 0;
-                let result = AutomationBroker::new(true)
-                    .request_permission(AutomationPromptContext::for_current_session(true));
-                if result.prompt == AutomationPromptDisposition::Requested {
-                    *gui_automation_prompted = true;
-                }
-                if result.availability.state == AutomationState::Available {
-                    *gui_automation_last_known_available = true;
-                }
-                if result.prompt == AutomationPromptDisposition::Requested
-                    || result.availability.state == AutomationState::Available
-                {
-                    *gui_automation_permission_context = permission_context_key();
-                }
-                *gui_automation_availability = result.availability;
-                *gui_automation_prompt = result.prompt;
-            }
-            #[cfg(target_os = "macos")]
             KeyCode::Char('o') | KeyCode::Char('O') if *selected_idx == 3 && *gui_automation => {
                 open_gui_settings_with(gui_automation_settings_feedback, || {
                     AutomationBroker::new(true).open_permission_settings(
@@ -2720,6 +2753,50 @@ fn handle_features_input(state: &mut WizardState, key: crossterm::event::KeyEven
         }
     }
     Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn handle_gui_permission_input_with(
+    key: KeyCode,
+    availability: &mut AutomationAvailability,
+    prompt: &mut AutomationPromptDisposition,
+    prompted: &mut bool,
+    last_known_available: &mut bool,
+    permission_context: &mut String,
+    settings_feedback: &mut Option<GuiSettingsFeedback>,
+    details_scroll: &mut u16,
+    passive_check: impl FnOnce() -> AutomationAvailability,
+    request_permission: impl FnOnce() -> AutomationPermissionResult,
+) -> bool {
+    let result = match key {
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            let availability = passive_check();
+            AutomationPermissionResult {
+                availability,
+                prompt: AutomationPromptDisposition::NotNeeded,
+            }
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') => request_permission(),
+        _ => return false,
+    };
+
+    *settings_feedback = None;
+    *details_scroll = 0;
+    if result.prompt == AutomationPromptDisposition::Requested {
+        *prompted = true;
+    }
+    if result.availability.state == AutomationState::Available {
+        *last_known_available = true;
+    }
+    if result.prompt == AutomationPromptDisposition::Requested
+        || result.availability.state == AutomationState::Available
+    {
+        *permission_context = permission_context_key();
+    }
+    *availability = result.availability;
+    *prompt = result.prompt;
+    true
 }
 
 #[cfg(target_os = "macos")]
@@ -4323,25 +4400,25 @@ fn gui_automation_status_lines(
             "Configured; macOS reports the current Finch process is Accessibility-trusted; Finch still approves each effect"
         }
         (AutomationState::PermissionRequired, AutomationPromptDisposition::SuppressedRemote) => {
-            "Configured; current Finch process is not Accessibility-trusted (prompt suppressed over SSH); press R locally"
+            "Configured; current Finch process is not Accessibility-trusted (prompt suppressed over SSH); press P locally to request, or R to re-check"
         }
         (
             AutomationState::PermissionRequired,
             AutomationPromptDisposition::SuppressedNonInteractive,
         ) => {
-            "Configured; current Finch process is not Accessibility-trusted (headless prompt suppressed); retry interactively"
+            "Configured; current Finch process is not Accessibility-trusted (headless prompt suppressed); press P in an interactive session"
         }
         (AutomationState::PermissionRequired, _) if last_known_available => {
-            "Configured; current Finch process is not Accessibility-trusted after a prior successful observation (access revoked or code identity changed); press R"
+            "Configured; current Finch process is not Accessibility-trusted after a prior successful observation (access revoked or code identity changed); press R to re-check or P to request"
         }
         (AutomationState::PermissionRequired, AutomationPromptDisposition::Requested) => {
-            "Configured; macOS prompt requested, but the current Finch process is not Accessibility-trusted yet; press R to verify"
+            "Configured; macOS prompt requested, but the current Finch process is not Accessibility-trusted yet; press R to verify or P to request again"
         }
         (AutomationState::PermissionRequired, _) if prompted => {
-            "Configured; current Finch process remains untrusted after an earlier request; press R to retry"
+            "Configured; current Finch process remains untrusted after an earlier request; press R to re-check or P to request again"
         }
         (AutomationState::PermissionRequired, _) => {
-            "Configured; current Finch process is not Accessibility-trusted; press R to request/check"
+            "Configured; current Finch process is not Accessibility-trusted; press R to check or P to request the macOS prompt"
         }
     };
 
@@ -4364,7 +4441,7 @@ fn gui_automation_status_lines(
     }
     if availability.state == AutomationState::PermissionRequired {
         lines.push(
-            "Recovery: a checkbox or prompt is not proof of access. Open System Settings → Privacy & Security → Accessibility, then press R to re-check this live process. If it remains untrusted, relaunch the same executable/host context and check again."
+            "Recovery: a checkbox or prompt is not proof of access. Press P to request the macOS prompt, or open System Settings → Privacy & Security → Accessibility, then press R for a passive re-check of this live process. If it remains untrusted, relaunch the same executable/host context and check again."
                 .to_string(),
         );
     }
@@ -4775,18 +4852,19 @@ fn render_features_section(
     if show_gui_details {
         let mut compact_lines = Vec::new();
         if let Some(feedback) = gui_automation_settings_feedback {
-            compact_lines.push(Line::from(vec![
-                Span::styled("Settings: ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(feedback.compact_message()),
-            ]));
+            compact_lines.push(Line::from(feedback.compact_message()));
         } else {
             let compact_trust = if gui_automation_availability.state == AutomationState::Available {
-                "Current Finch process: Accessibility-trusted."
+                "Current Finch process: trusted."
             } else {
-                "Current Finch process: not Accessibility-trusted."
+                "Current Finch process: untrusted."
             };
             compact_lines.push(Line::from(compact_trust));
         }
+        compact_lines.push(Line::from(Span::styled(
+            "R: Passive check | P: Request prompt",
+            Style::default().fg(Color::Cyan),
+        )));
         compact_lines.push(Line::from(Span::styled(
             "O: System Settings → Privacy & Security → Accessibility",
             Style::default().fg(Color::Cyan),
@@ -4813,7 +4891,7 @@ fn render_features_section(
         #[cfg(target_os = "macos")]
         {
             if show_gui_details {
-                "R: Re-check | O: Settings | D: Full status"
+                "R: Check | P: Prompt | O/D: More"
             } else {
                 "↑/↓: Move | Space: Toggle | E: Edit | Enter: Continue"
             }
@@ -5244,6 +5322,102 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn test_gui_permission_keys_separate_passive_check_from_prompt_request() {
+        use std::cell::Cell;
+
+        let passive_checks = Cell::new(0);
+        let prompt_requests = Cell::new(0);
+        let mut state = WizardState::new(None);
+        state.current_section = WizardSection::Features;
+        if let Some(SectionState::Features {
+            gui_automation,
+            gui_automation_prompt,
+            gui_automation_prompted,
+            gui_automation_settings_feedback,
+            gui_automation_details_scroll,
+            selected_idx,
+            ..
+        }) = state.sections.get_mut(&WizardSection::Features)
+        {
+            *gui_automation = true;
+            *gui_automation_prompt = AutomationPromptDisposition::Requested;
+            *gui_automation_prompted = true;
+            *gui_automation_settings_feedback = Some(GuiSettingsFeedback::OpenRequested);
+            *gui_automation_details_scroll = 8;
+            *selected_idx = 3;
+        }
+
+        handle_features_input_with_gui_actions(
+            &mut state,
+            key(KeyCode::Char('r')),
+            &mut || {
+                passive_checks.set(passive_checks.get() + 1);
+                AutomationAvailability {
+                    state: AutomationState::PermissionRequired,
+                    backend: "test-native",
+                    operations: vec!["click", "type"],
+                }
+            },
+            &mut || {
+                prompt_requests.set(prompt_requests.get() + 1);
+                panic!("passive R must never invoke the native prompt callback")
+            },
+        )
+        .unwrap();
+        assert_eq!(passive_checks.get(), 1);
+        assert_eq!(prompt_requests.get(), 0);
+        if let Some(SectionState::Features {
+            gui_automation_prompt,
+            gui_automation_settings_feedback,
+            gui_automation_details_scroll,
+            ..
+        }) = state.sections.get(&WizardSection::Features)
+        {
+            assert_eq!(
+                *gui_automation_prompt,
+                AutomationPromptDisposition::NotNeeded
+            );
+            assert!(gui_automation_settings_feedback.is_none());
+            assert_eq!(*gui_automation_details_scroll, 0);
+        }
+
+        handle_features_input_with_gui_actions(
+            &mut state,
+            key(KeyCode::Char('p')),
+            &mut || panic!("explicit P must use the prompt callback"),
+            &mut || {
+                prompt_requests.set(prompt_requests.get() + 1);
+                AutomationPermissionResult {
+                    availability: AutomationAvailability {
+                        state: AutomationState::PermissionRequired,
+                        backend: "test-native",
+                        operations: vec!["click", "type"],
+                    },
+                    prompt: AutomationPromptDisposition::Requested,
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(passive_checks.get(), 1);
+        assert_eq!(prompt_requests.get(), 1);
+        if let Some(SectionState::Features {
+            gui_automation_prompt,
+            gui_automation_prompted,
+            gui_automation_permission_context,
+            ..
+        }) = state.sections.get(&WizardSection::Features)
+        {
+            assert_eq!(
+                *gui_automation_prompt,
+                AutomationPromptDisposition::Requested
+            );
+            assert!(*gui_automation_prompted);
+            assert_eq!(gui_automation_permission_context, &permission_context_key());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn gui_toggle_persists_consent_without_claiming_prompt_granted_access() {
         use crate::runtime::automation::{
             AutomationAvailability, AutomationPermissionResult, AutomationPromptDisposition,
@@ -5436,6 +5610,8 @@ mod tests {
         let rendered = test_buffer_text(terminal.backend().buffer());
 
         assert!(rendered.contains("Current Finch process"));
+        assert!(rendered.contains("R: Passive check"));
+        assert!(rendered.contains("P: Request prompt"));
         assert!(rendered.contains("O: System Settings"));
         assert!(rendered.contains("Privacy"));
         assert!(rendered.contains("Security"));
