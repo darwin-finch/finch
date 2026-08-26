@@ -209,6 +209,8 @@ impl Dialog {
     /// File-mutating tools (write/edit) get an extra "Edit in $EDITOR" option.
     /// The title is formatted as `"{tool_name}\n{summary}"` for two-line display.
     pub fn tool_approval(tool_name: &str, summary: &str) -> Self {
+        let tool_name = crate::cli::diff::sanitize_terminal(tool_name);
+        let summary = crate::cli::diff::sanitize_multiline(summary);
         let is_file_mutating = matches!(tool_name.to_lowercase().as_str(), "write" | "edit");
         let options = if is_file_mutating {
             vec![
@@ -227,6 +229,24 @@ impl Dialog {
         Dialog::select(format!("{}\n{}", tool_name, summary), options)
     }
 
+    /// Build a file-tool approval using the shared structured diff renderer.
+    pub fn tool_approval_for_use(
+        tool_use: &crate::tools::types::ToolUse,
+        summary: &str,
+        colors: &crate::config::ColorScheme,
+        mode: crate::cli::diff::DiffColorMode,
+    ) -> Self {
+        let mut dialog = Self::tool_approval(&tool_use.name, summary);
+        if let Some(preview) =
+            crate::cli::repl_event::tool_display::tool_approval_diff_preview(tool_use, colors, mode)
+        {
+            // FileDiff sanitizes untrusted content before applying its own SGR
+            // theme sequences. Keep those trusted sequences intact here.
+            dialog.body = Some(preview);
+        }
+        dialog
+    }
+
     /// Set the help message for this dialog
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
         self.help_message = Some(help.into());
@@ -236,7 +256,7 @@ impl Dialog {
     /// Set optional body text shown inside the box above the options.
     /// Useful for displaying a plan or other content the user needs to read before deciding.
     pub fn with_body(mut self, body: impl Into<String>) -> Self {
-        self.body = Some(body.into());
+        self.body = Some(crate::cli::diff::sanitize_multiline(&body.into()));
         self
     }
 
@@ -1780,6 +1800,63 @@ mod tests {
         let dialog = Dialog::tool_approval("Bash", "run command");
         assert!(dialog.title.contains("Bash"));
         assert!(dialog.title.contains("run command"));
+    }
+
+    #[test]
+    fn test_file_approval_uses_shared_sanitized_diff_renderer() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "old\n").unwrap();
+        let tool = crate::tools::types::ToolUse::new(
+            "edit".into(),
+            serde_json::json!({
+                "file_path": file.path(),
+                "old_string": "old\n",
+                "new_string": "new\n"
+            }),
+        );
+        let dialog = Dialog::tool_approval_for_use(
+            &tool,
+            "File: src/\u{1b}[31mhostile.rs",
+            &crate::config::ColorTheme::Dark.to_scheme(),
+            crate::cli::diff::DiffColorMode::NoColor,
+        );
+        let body = dialog.body.as_deref().unwrap();
+        assert!(body.contains(file.path().to_string_lossy().as_ref()));
+        assert!(body.contains("- old"));
+        assert!(body.contains("+ new"));
+        assert!(!dialog.title.contains('\u{1b}'));
+        assert!(!body.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn test_file_approval_preview_composes_with_light_and_dark_themes() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "old\n").unwrap();
+        let tool = crate::tools::types::ToolUse::new(
+            "edit".into(),
+            serde_json::json!({
+                "file_path": file.path(),
+                "old_string": "old\n",
+                "new_string": "new\n"
+            }),
+        );
+        let dark = Dialog::tool_approval_for_use(
+            &tool,
+            "File: src/theme.rs",
+            &crate::config::ColorTheme::Dark.to_scheme(),
+            crate::cli::diff::DiffColorMode::Theme,
+        );
+        let light = Dialog::tool_approval_for_use(
+            &tool,
+            "File: src/theme.rs",
+            &crate::config::ColorTheme::Light.to_scheme(),
+            crate::cli::diff::DiffColorMode::Theme,
+        );
+        let dark_body = dark.body.unwrap();
+        let light_body = light.body.unwrap();
+        assert_ne!(dark_body, light_body);
+        assert!(dark_body.contains("38;2;126;231;135"));
+        assert!(light_body.contains("38;2;0;92;38"));
     }
 
     #[test]

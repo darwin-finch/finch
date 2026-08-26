@@ -7,7 +7,10 @@ use similar::TextDiff;
 pub const MAX_DIFF_INPUT_BYTES: usize = 1_048_576;
 pub const MAX_DIFF_LINES: usize = 400;
 pub const MAX_DIFF_FILES: usize = 64;
-pub const MAX_DIFF_LINE_CHARS: usize = 4096;
+pub const MAX_DIFF_LINE_CHARS: usize = 512;
+pub const MAX_DIFF_HUNKS: usize = 128;
+pub const MAX_DIFF_STRUCTURAL_LINES: usize = 1024;
+pub const MAX_RENDER_CHARS: usize = 131_072;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileDiff {
@@ -43,6 +46,23 @@ pub enum DiffLineKind {
 pub enum DiffColorMode {
     Theme,
     NoColor,
+}
+impl DiffColorMode {
+    /// Select the terminal mode used by interactive production renderers.
+    pub fn production() -> Self {
+        Self::for_environment(
+            std::env::var_os("NO_COLOR").is_some(),
+            std::env::var("TERM").ok().as_deref(),
+        )
+    }
+
+    fn for_environment(no_color: bool, term: Option<&str>) -> Self {
+        if no_color || term == Some("dumb") {
+            Self::NoColor
+        } else {
+            Self::Theme
+        }
+    }
 }
 
 impl FileDiff {
@@ -97,11 +117,16 @@ impl FileDiff {
         Self::parse_all(text).into_iter().next()
     }
     pub fn parse_all(text: &str) -> Vec<Self> {
+        if text.len() > MAX_DIFF_INPUT_BYTES {
+            return vec![elided_input("diff input exceeded display byte limit")];
+        }
         let mut files = vec![];
         let mut file: Option<Self> = None;
         let mut hunk: Option<DiffHunk> = None;
         let mut accepted_lines = 0usize;
-        let mut accepted_bytes = 0usize;
+        let mut structural_lines = 0usize;
+        let mut accepted_hunks = 0usize;
+        let mut git_header_awaits_file_headers = false;
         fn flush_hunk(file: &mut Option<FileDiff>, hunk: &mut Option<DiffHunk>) {
             if let (Some(f), Some(h)) = (file.as_mut(), hunk.take()) {
                 f.hunks.push(h)
@@ -114,34 +139,45 @@ impl FileDiff {
         ) {
             flush_hunk(file, hunk);
             if let Some(f) = file.take() {
-                if !f.old_path.is_empty() || !f.new_path.is_empty() {
+                if files.len() < MAX_DIFF_FILES
+                    && (!f.old_path.is_empty() || !f.new_path.is_empty())
+                {
                     files.push(f)
                 }
             }
         }
         for raw in text.lines() {
-            accepted_bytes = accepted_bytes.saturating_add(raw.len());
-            if accepted_bytes > MAX_DIFF_INPUT_BYTES {
+            structural_lines += 1;
+            if structural_lines > MAX_DIFF_STRUCTURAL_LINES {
                 file.get_or_insert_with(empty_file).elided =
-                    Some("diff input exceeded display byte limit".into());
+                    Some("diff exceeded structural line limit".into());
                 break;
             }
             if files.len() >= MAX_DIFF_FILES {
                 break;
             }
             let line = raw.trim_end_matches('\r');
-            if line.starts_with("diff --git ") {
+            if let Some(paths) = line.strip_prefix("diff --git ") {
                 flush_file(&mut files, &mut file, &mut hunk);
-                file = Some(empty_file());
+                let mut next = empty_file();
+                if let Some((old, new)) = parse_git_paths(paths) {
+                    next.old_path = old;
+                    next.new_path = new;
+                }
+                file = Some(next);
+                git_header_awaits_file_headers = true;
                 continue;
             }
             if let Some(path) = line.strip_prefix("--- ") {
-                if file.as_ref().is_some_and(|f| {
-                    !f.old_path.is_empty() && (!f.hunks.is_empty() || hunk.is_some())
-                }) {
+                if !git_header_awaits_file_headers
+                    && file
+                        .as_ref()
+                        .is_some_and(|f| !f.old_path.is_empty() && !f.new_path.is_empty())
+                {
                     flush_file(&mut files, &mut file, &mut hunk)
                 }
                 file.get_or_insert_with(empty_file).old_path = parse_path(path);
+                git_header_awaits_file_headers = false;
                 continue;
             }
             if let Some(path) = line.strip_prefix("+++ ") {
@@ -156,15 +192,35 @@ impl FileDiff {
                 file.get_or_insert_with(empty_file).new_path = parse_path(path);
                 continue;
             }
-            if line.starts_with("Binary files ") || line == "GIT binary patch" {
+            if let Some((old, new)) = parse_binary_paths(line) {
+                let f = file.get_or_insert_with(empty_file);
+                if f.old_path.is_empty() {
+                    f.old_path = old;
+                }
+                if f.new_path.is_empty() {
+                    f.new_path = new;
+                }
+                f.binary = true;
+                f.elided = Some("binary content omitted".into());
+                continue;
+            }
+            if line == "GIT binary patch" {
                 let f = file.get_or_insert_with(empty_file);
                 f.binary = true;
                 f.elided = Some("binary content omitted".into());
                 continue;
             }
             if line.starts_with("@@") {
+                if accepted_hunks >= MAX_DIFF_HUNKS {
+                    file.get_or_insert_with(empty_file).elided =
+                        Some("diff exceeded hunk limit".into());
+                    break;
+                }
                 flush_hunk(&mut file, &mut hunk);
                 hunk = parse_hunk_header(line);
+                if hunk.is_some() {
+                    accepted_hunks += 1;
+                }
                 continue;
             }
             if let Some(note) = line.strip_prefix("# finch: ") {
@@ -197,6 +253,33 @@ impl FileDiff {
         }
         flush_file(&mut files, &mut file, &mut hunk);
         files
+    }
+
+    /// Parse a line-oriented retained payload without first joining an
+    /// unbounded vector supplied by a reconnect or replay path.
+    pub fn parse_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<Self> {
+        let mut source = String::new();
+        for (index, line) in lines.into_iter().enumerate() {
+            if index >= MAX_DIFF_STRUCTURAL_LINES {
+                return vec![elided_input("diff exceeded structural line limit")];
+            }
+            let separator_bytes = usize::from(index > 0);
+            let Some(required) = source
+                .len()
+                .checked_add(separator_bytes)
+                .and_then(|size| size.checked_add(line.len()))
+            else {
+                return vec![elided_input("diff input exceeded display byte limit")];
+            };
+            if required > MAX_DIFF_INPUT_BYTES {
+                return vec![elided_input("diff input exceeded display byte limit")];
+            }
+            if index > 0 {
+                source.push('\n');
+            }
+            source.push_str(line);
+        }
+        Self::parse_all(&source)
     }
 
     pub fn to_unified(&self) -> String {
@@ -235,7 +318,7 @@ impl FileDiff {
         if let Some(v) = &self.elided {
             out.push_str(&format!("# finch: {}\n", sanitize_terminal(v)))
         }
-        out
+        bound_rendered(out, "# finch: diff rendering truncated")
     }
     pub fn added(&self) -> usize {
         count(self, DiffLineKind::Add)
@@ -279,7 +362,13 @@ impl FileDiff {
         let width = self
             .hunks
             .iter()
-            .map(|h| (h.old_start + h.old_count).max(h.new_start + h.new_count))
+            .filter_map(|h| {
+                Some(
+                    h.old_start
+                        .checked_add(h.old_count)?
+                        .max(h.new_start.checked_add(h.new_count)?),
+                )
+            })
             .max()
             .unwrap_or(1)
             .to_string()
@@ -304,18 +393,18 @@ impl FileDiff {
                 let (a, b, m, t) = match line.kind {
                     DiffLineKind::Context => {
                         let v = (Some(old), Some(new), ' ', Tone::Context);
-                        old += 1;
-                        new += 1;
+                        old = old.saturating_add(1);
+                        new = new.saturating_add(1);
                         v
                     }
                     DiffLineKind::Remove => {
                         let v = (Some(old), None, '-', Tone::Remove);
-                        old += 1;
+                        old = old.saturating_add(1);
                         v
                     }
                     DiffLineKind::Add => {
                         let v = (None, Some(new), '+', Tone::Add);
-                        new += 1;
+                        new = new.saturating_add(1);
                         v
                     }
                     DiffLineKind::NoNewline => (None, None, '\\', Tone::Meta),
@@ -338,8 +427,31 @@ impl FileDiff {
                 ))
             }
         }
-        out
+        bound_rendered(out, "… [diff rendering truncated]")
     }
+}
+
+/// Build the stable path and aggregate line-count summary for parsed files.
+pub fn summarize_files(files: &[FileDiff]) -> String {
+    let added: usize = files.iter().map(FileDiff::added).sum();
+    let removed: usize = files.iter().map(FileDiff::removed).sum();
+    if files.len() == 1 {
+        format!("{}  +{} -{}", files[0].display_path(), added, removed)
+    } else {
+        format!("{} files  +{} -{}", files.len(), added, removed)
+    }
+}
+
+/// Render one bounded changeset using a single theme and total output limit.
+pub fn render_files(files: &[FileDiff], colors: &ColorScheme, mode: DiffColorMode) -> String {
+    bound_rendered(
+        files
+            .iter()
+            .map(|diff| diff.render(colors, mode))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "… [diff rendering truncated]",
+    )
 }
 
 fn empty_file() -> FileDiff {
@@ -348,6 +460,16 @@ fn empty_file() -> FileDiff {
         new_path: String::new(),
         binary: false,
         elided: None,
+        hunks: vec![],
+    }
+}
+
+fn elided_input(reason: &str) -> FileDiff {
+    FileDiff {
+        old_path: "(diff input)".into(),
+        new_path: "(diff input)".into(),
+        binary: false,
+        elided: Some(reason.into()),
         hunks: vec![],
     }
 }
@@ -372,6 +494,8 @@ fn parse_hunk_header(line: &str) -> Option<DiffHunk> {
     let mut p = line.get(2..end)?.split_whitespace();
     let (old_start, old_count) = range(p.next()?)?;
     let (new_start, new_count) = range(p.next()?)?;
+    old_start.checked_add(old_count)?;
+    new_start.checked_add(new_count)?;
     Some(DiffHunk {
         old_start,
         old_count,
@@ -380,6 +504,59 @@ fn parse_hunk_header(line: &str) -> Option<DiffHunk> {
         context: sanitize_terminal(line.get(end + 2..).unwrap_or("")),
         lines: vec![],
     })
+}
+fn parse_git_paths(value: &str) -> Option<(String, String)> {
+    let tokens = git_tokens(value);
+    Some((parse_path(tokens.first()?), parse_path(tokens.get(1)?)))
+}
+fn git_tokens(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            current.push('\\');
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quoted {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            quoted = !quoted;
+            current.push(ch);
+            continue;
+        }
+        if ch.is_whitespace() && !quoted {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+fn parse_binary_paths(line: &str) -> Option<(String, String)> {
+    let middle = line
+        .strip_prefix("Binary files ")?
+        .strip_suffix(" differ")?;
+    let (old, new) = middle.split_once(" and ")?;
+    Some((parse_path(old), parse_path(new)))
+}
+fn bound_rendered(value: String, marker: &str) -> String {
+    if value.chars().count() <= MAX_RENDER_CHARS {
+        return value;
+    }
+    let prefix: String = value.chars().take(MAX_RENDER_CHARS).collect();
+    let cut = prefix.rfind('\n').unwrap_or(prefix.len());
+    format!("{}\n{marker}", &prefix[..cut])
 }
 fn range(s: &str) -> Option<(usize, usize)> {
     let mut p = s.get(1..)?.split(',');
@@ -390,7 +567,7 @@ fn range(s: &str) -> Option<(usize, usize)> {
 }
 fn parse_path(raw: &str) -> String {
     let raw = raw.split('\t').next().unwrap_or(raw).trim();
-    let decoded = if raw.starts_with('"') && raw.ends_with('"') {
+    let decoded = if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
         unquote(&raw[1..raw.len() - 1])
     } else {
         raw.into()
@@ -501,6 +678,38 @@ pub fn sanitize_terminal(s: &str) -> String {
     }
     out
 }
+/// Remove terminal controls from bounded multi-line dialog content.
+pub fn sanitize_multiline(s: &str) -> String {
+    const MARKER: &str = "… [content truncated]";
+    if s.len() > MAX_DIFF_INPUT_BYTES {
+        return MARKER.into();
+    }
+    let mut out = String::new();
+    let mut chars = 0usize;
+    for (index, line) in s.lines().enumerate() {
+        if index >= MAX_DIFF_STRUCTURAL_LINES {
+            out.push('\n');
+            out.push_str(MARKER);
+            return out;
+        }
+        let clean = sanitize_terminal(line);
+        let separator = usize::from(index > 0);
+        let next = chars
+            .saturating_add(separator)
+            .saturating_add(clean.chars().count());
+        if next > MAX_RENDER_CHARS {
+            out.push('\n');
+            out.push_str(MARKER);
+            return out;
+        }
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(&clean);
+        chars = next;
+    }
+    out
+}
 enum Tone {
     Add,
     Remove,
@@ -546,6 +755,21 @@ mod tests {
             d.render(&ColorTheme::Dark.to_scheme(), DiffColorMode::Theme),
             d.render(&ColorTheme::Light.to_scheme(), DiffColorMode::Theme)
         )
+    }
+    #[test]
+    fn production_mode_honors_accessible_no_color_environment() {
+        assert_eq!(
+            DiffColorMode::for_environment(true, Some("xterm-256color")),
+            DiffColorMode::NoColor
+        );
+        assert_eq!(
+            DiffColorMode::for_environment(false, Some("dumb")),
+            DiffColorMode::NoColor
+        );
+        assert_eq!(
+            DiffColorMode::for_environment(false, Some("xterm-256color")),
+            DiffColorMode::Theme
+        );
     }
     #[test]
     fn multi_file_paths_do_not_bleed() {
@@ -598,6 +822,12 @@ mod tests {
         assert!(d.binary)
     }
     #[test]
+    fn malformed_single_quote_path_does_not_panic() {
+        let diff = FileDiff::parse("--- \"\n+++ b/safe\n").unwrap();
+        assert_eq!(diff.old_path, "\"");
+        assert_eq!(diff.new_path, "safe");
+    }
+    #[test]
     fn large_diff_is_elided() {
         let x = "a".repeat(MAX_DIFF_INPUT_BYTES);
         assert!(FileDiff::from_texts("x", &x, &x).elided.is_some())
@@ -616,5 +846,82 @@ mod tests {
             .iter()
             .flat_map(|h| &h.lines)
             .all(|line| { line.text.chars().count() <= MAX_DIFF_LINE_CHARS }));
+    }
+
+    #[test]
+    fn newline_only_oversized_input_is_rejected_before_traversal() {
+        let parsed = FileDiff::parse(&"\n".repeat(MAX_DIFF_INPUT_BYTES + 1)).unwrap();
+        assert!(parsed.elided.as_deref().unwrap().contains("byte limit"));
+        assert!(parsed.hunks.is_empty());
+        assert_eq!(
+            sanitize_multiline(&"\n".repeat(MAX_DIFF_INPUT_BYTES + 1)),
+            "… [content truncated]"
+        );
+    }
+
+    #[test]
+    fn hostile_hunk_count_and_usize_ranges_are_bounded() {
+        let headers = format!("--- a/x\n+++ b/x\n{}", "@@ -1,0 +1,0 @@\n".repeat(10_000));
+        let parsed = FileDiff::parse(&headers).unwrap();
+        assert!(parsed.hunks.len() <= MAX_DIFF_HUNKS);
+        let impossible = format!("--- a/x\n+++ b/x\n@@ -{},2 +1,1 @@\n-x\n+y\n", usize::MAX);
+        assert!(FileDiff::parse(&impossible).unwrap().hunks.is_empty());
+
+        let files = (0..100)
+            .map(|index| format!("diff --git a/{index} b/{index}\n"))
+            .collect::<String>();
+        assert!(FileDiff::parse_all(&files).len() <= MAX_DIFF_FILES);
+    }
+
+    #[test]
+    fn standard_git_binary_diff_attributes_paths_without_file_headers() {
+        let parsed = FileDiff::parse(
+            "diff --git a/old.bin b/new.bin\nBinary files a/old.bin and b/new.bin differ\n",
+        )
+        .unwrap();
+        assert_eq!(
+            (parsed.old_path.as_str(), parsed.new_path.as_str()),
+            ("old.bin", "new.bin")
+        );
+        assert!(parsed.binary);
+    }
+
+    #[test]
+    fn canonical_multi_file_payload_keeps_leading_binary_file() {
+        let binary = FileDiff::from_texts("image.bin", "", "\0").to_unified();
+        let text = FileDiff::from_texts("notes.txt", "old\n", "new\n").to_unified();
+        let parsed = FileDiff::parse_all(&format!("{binary}{text}"));
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].display_path(), "image.bin");
+        assert!(parsed[0].binary);
+        assert_eq!(parsed[1].display_path(), "notes.txt");
+    }
+
+    #[test]
+    fn rendered_output_has_a_total_character_bound() {
+        let body = "x".repeat(MAX_DIFF_LINE_CHARS);
+        let patch = format!(
+            "--- a/x\n+++ b/x\n@@ -1,400 +1,400 @@\n{}",
+            (0..400)
+                .map(|_| format!("-{body}\n+{body}\n"))
+                .collect::<String>()
+        );
+        let rendered = FileDiff::parse(&patch)
+            .unwrap()
+            .render(&ColorScheme::default(), DiffColorMode::NoColor);
+        assert!(rendered.chars().count() <= MAX_RENDER_CHARS + 40);
+        assert!(rendered.contains("rendering truncated"));
+    }
+
+    #[test]
+    fn aggregate_render_has_one_total_character_bound() {
+        let line = "x".repeat(MAX_DIFF_LINE_CHARS);
+        let contents = format!("{}\n", line).repeat(16);
+        let files = (0..MAX_DIFF_FILES)
+            .map(|index| FileDiff::from_texts(&format!("{index}.txt"), "", &contents))
+            .collect::<Vec<_>>();
+        let rendered = render_files(&files, &ColorScheme::default(), DiffColorMode::NoColor);
+        assert!(rendered.chars().count() <= MAX_RENDER_CHARS + 40);
+        assert!(rendered.contains("rendering truncated"));
     }
 }
