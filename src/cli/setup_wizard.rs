@@ -11,7 +11,7 @@ use ratatui::{
     Frame,
 };
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,7 +55,7 @@ const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
         "chatgpt_subscription",
         "ChatGPT subscription (Codex)",
         "gpt-5.6-sol",
-        "sign in first with: finch auth login chatgpt",
+        "device sign-in and Sol validation happen before setup is saved",
     ),
     (
         "grok",
@@ -1084,6 +1084,202 @@ pub fn apply_and_save(result: &SetupResult) -> Result<()> {
         crate::config::Persona::save_system_prompt_override(&result.default_persona, prompt)?;
     }
     Ok(())
+}
+
+/// Result of the shared first-run, `finch setup`, and `/setup` commit ceremony.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupApplyOutcome {
+    /// Authentication and model validation succeeded and configuration was saved.
+    Saved,
+    /// The user explicitly chose not to save the wizard changes.
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatGptSetupState {
+    SignedOut,
+    SignedIn,
+    LoginPending,
+    Ready,
+    Fallback,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatGptSetupAction {
+    Reuse,
+    Replace,
+    Login,
+    LoginSucceeded,
+    Fallback,
+    Cancel,
+}
+
+impl ChatGptSetupState {
+    fn transition(self, action: ChatGptSetupAction) -> Result<Self> {
+        use ChatGptSetupAction as Action;
+        use ChatGptSetupState as State;
+        match (self, action) {
+            (State::SignedIn, Action::Reuse) => Ok(State::Ready),
+            (State::SignedIn, Action::Replace) | (State::SignedOut, Action::Login) => {
+                Ok(State::LoginPending)
+            }
+            (State::LoginPending, Action::LoginSucceeded) => Ok(State::Ready),
+            (State::SignedIn | State::SignedOut | State::LoginPending, Action::Fallback) => {
+                Ok(State::Fallback)
+            }
+            (State::SignedIn | State::SignedOut | State::LoginPending, Action::Cancel) => {
+                Ok(State::Cancelled)
+            }
+            _ => Err(anyhow::anyhow!("Invalid ChatGPT setup state transition")),
+        }
+    }
+}
+
+/// Validate ChatGPT authentication and Sol availability before atomically committing setup.
+///
+/// This is the single post-wizard state machine used by all three setup entry points. Finch
+/// displays the device code but never reads the app-server-owned credential file.
+pub async fn validate_and_apply(result: &SetupResult) -> Result<SetupApplyOutcome> {
+    use crate::config::ProviderEntry;
+    use crate::providers::CodexAppServerAuth;
+
+    let selected = result
+        .providers
+        .iter()
+        .any(|provider| matches!(provider, ProviderEntry::ChatgptSubscription { .. }));
+    if !selected {
+        apply_and_save(result)?;
+        return Ok(SetupApplyOutcome::Saved);
+    }
+
+    let auth = CodexAppServerAuth::new()?;
+    let status = auth.status(false).await?;
+    let had_existing_account = status.signed_in;
+    let mut state = if status.signed_in {
+        ChatGptSetupState::SignedIn
+    } else {
+        ChatGptSetupState::SignedOut
+    };
+
+    if state == ChatGptSetupState::SignedIn {
+        let choice = read_setup_choice(
+            "ChatGPT is already signed in. [R]euse, [L]og in to replace it, [F]allback without ChatGPT, or [C]ancel setup: ",
+            &[('r', ChatGptSetupAction::Reuse), ('l', ChatGptSetupAction::Replace), ('f', ChatGptSetupAction::Fallback), ('c', ChatGptSetupAction::Cancel)],
+        )?;
+        state = state.transition(choice)?;
+        if choice == ChatGptSetupAction::Replace {
+            auth.logout().await?;
+        }
+    } else {
+        let choice = read_setup_choice(
+            "ChatGPT is signed out. [L]og in, [F]allback without ChatGPT, or [C]ancel setup: ",
+            &[
+                ('l', ChatGptSetupAction::Login),
+                ('f', ChatGptSetupAction::Fallback),
+                ('c', ChatGptSetupAction::Cancel),
+            ],
+        )?;
+        state = state.transition(choice)?;
+    }
+
+    while state == ChatGptSetupState::LoginPending {
+        let login = auth.begin_device_login().await?;
+        println!("Open: {}", login.details.verification_url);
+        println!("Enter code: {}", login.details.user_code);
+        println!("This code expires; complete it within the displayed ten-minute sign-in window.");
+        let choice = read_setup_choice(
+            "Complete sign-in in your browser, then [W]ait; or [C]ancel setup: ",
+            &[
+                ('w', ChatGptSetupAction::LoginSucceeded),
+                ('c', ChatGptSetupAction::Cancel),
+            ],
+        )?;
+        if choice == ChatGptSetupAction::Cancel {
+            auth.cancel_device_login(login).await?;
+            state = state.transition(ChatGptSetupAction::Cancel)?;
+        } else {
+            match auth.finish_device_login(login).await {
+                Ok(()) => state = state.transition(ChatGptSetupAction::LoginSucceeded)?,
+                Err(error) => {
+                    eprintln!("ChatGPT sign-in was not completed: {error}");
+                    let recovery = read_setup_choice(
+                        "[R]etry sign-in, [F]allback without ChatGPT, or [C]ancel setup: ",
+                        &[
+                            ('r', ChatGptSetupAction::Login),
+                            ('f', ChatGptSetupAction::Fallback),
+                            ('c', ChatGptSetupAction::Cancel),
+                        ],
+                    )?;
+                    state = match recovery {
+                        ChatGptSetupAction::Login => ChatGptSetupState::LoginPending,
+                        action => state.transition(action)?,
+                    };
+                }
+            }
+        }
+    }
+
+    match state {
+        ChatGptSetupState::Ready => {
+            auth.validate_sol_access().await?;
+            apply_and_save(result)?;
+            Ok(SetupApplyOutcome::Saved)
+        }
+        ChatGptSetupState::Fallback => {
+            let mut config = config_from_setup_result(result);
+            config
+                .providers
+                .retain(|provider| !matches!(provider, ProviderEntry::ChatgptSubscription { .. }));
+            config.save()?;
+            if let Some(prompt) = result.custom_system_prompt.as_deref() {
+                crate::config::Persona::save_system_prompt_override(
+                    &result.default_persona,
+                    prompt,
+                )?;
+            }
+            Ok(SetupApplyOutcome::Saved)
+        }
+        ChatGptSetupState::Cancelled => {
+            if had_existing_account {
+                let decision = read_setup_choice(
+                    "Keep the existing ChatGPT sign-in? [K]eep or [O]log out: ",
+                    &[
+                        ('k', ChatGptSetupAction::Reuse),
+                        ('o', ChatGptSetupAction::Replace),
+                    ],
+                )?;
+                if decision == ChatGptSetupAction::Replace {
+                    auth.logout().await?;
+                }
+            }
+            Ok(SetupApplyOutcome::Cancelled)
+        }
+        _ => Err(anyhow::anyhow!(
+            "ChatGPT setup did not reach a terminal state"
+        )),
+    }
+}
+
+fn read_setup_choice(
+    prompt: &str,
+    choices: &[(char, ChatGptSetupAction)],
+) -> Result<ChatGptSetupAction> {
+    loop {
+        print!("{prompt}");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let choice = input
+            .trim()
+            .chars()
+            .next()
+            .map(|value| value.to_ascii_lowercase());
+        if let Some((_, action)) = choices.iter().find(|(key, _)| Some(*key) == choice) {
+            return Ok(*action);
+        }
+        println!("Please choose one of the displayed options.");
+    }
 }
 
 /// Convert wizard output into the complete configuration written to disk.
@@ -7498,5 +7694,38 @@ mod tests {
                 && model == "gpt-5.6-sol"
                 && name == "renamed"
         ));
+    }
+
+    #[test]
+    fn chatgpt_setup_state_machine_covers_reuse_replace_fallback_and_cancel() {
+        assert_eq!(
+            ChatGptSetupState::SignedIn
+                .transition(ChatGptSetupAction::Reuse)
+                .unwrap(),
+            ChatGptSetupState::Ready
+        );
+        assert_eq!(
+            ChatGptSetupState::SignedIn
+                .transition(ChatGptSetupAction::Replace)
+                .unwrap()
+                .transition(ChatGptSetupAction::LoginSucceeded)
+                .unwrap(),
+            ChatGptSetupState::Ready
+        );
+        assert_eq!(
+            ChatGptSetupState::SignedOut
+                .transition(ChatGptSetupAction::Fallback)
+                .unwrap(),
+            ChatGptSetupState::Fallback
+        );
+        assert_eq!(
+            ChatGptSetupState::LoginPending
+                .transition(ChatGptSetupAction::Cancel)
+                .unwrap(),
+            ChatGptSetupState::Cancelled
+        );
+        assert!(ChatGptSetupState::SignedOut
+            .transition(ChatGptSetupAction::Reuse)
+            .is_err());
     }
 }

@@ -13,6 +13,13 @@ finch auth status chatgpt
 finch setup
 ```
 
+Finch creates a private, named Codex home for this profile. App-server writes and
+refreshes its own file-mode credentials there; Finch never opens `auth.json`.
+The profile is held through a descriptor-relative private directory and receives
+a minimal atomically rewritten configuration, so ambient `HOME`/`CODEX_HOME`
+plugins, apps, MCP servers, hooks, skills, memories, profiles, instructions, and
+history are not inherited.
+
 Each Finch request starts an ephemeral Codex thread with `approvalPolicy: never`
 and a turn-level restricted read-only policy whose only readable root is a fresh
 empty temporary directory. Finch clears MCP configuration, disables inherited
@@ -24,24 +31,22 @@ installed protocol schema cannot express the restricted read-only policy.
 Codex CLI 0.149.1 does not expose the required readable-root controls, so Finch
 rejects that version for all ChatGPT subscription turns; install a newer Codex
 release whose generated schema includes the restricted `readOnly` access variant.
-Finch additionally pins one canonical, owner-controlled Codex launcher/interpreter
-identity and SHA-256 artifact pair for schema inspection and runtime, rejects any
-writable installation ancestor, and accepts only explicitly audited CLI
-versions. No Codex release is currently on that allowlist: a release must be audited
-for effective built-in tools, managed configuration precedence, environments, and
-sandbox enforcement before this provider becomes available. This deliberate fail-
-closed compatibility limit prevents a future schema-compatible release from being
-trusted automatically.
+Finch resolves a canonical owner-controlled self-contained native Codex binary,
+opens it without following links, and copies the bytes from that same held
+descriptor into a private immutable staging directory. Schema inspection and all
+runtime processes use that staged identity. Finch also reads the effective config
+and managed requirements over app-server before authentication or text operations,
+and rejects any enabled or unknown action surface.
 
 The profile default is `gpt-5.6-sol`; the official `gpt-5.6` alias currently routes
 to that model. Finch does not substitute the lower-cost Terra tier implicitly.
 
 This is an agent-protocol adapter, not raw Chat Completions or Responses API
-parity. Finch tool calls require the installed app-server schema to advertise the
-experimental `dynamicTools` thread capability. If it does not, Finch rejects that
-provider before starting the turn and proceeds to the next configured provider
-(for example Grok). Text-only turns require the same restricted sandbox boundary
-and therefore also fall back when it is unavailable.
+parity. The current stable adapter is text-only and does not opt into app-server's
+experimental API. Finch-owned tool and approval projection remains gated on the
+exact-once integration work in issues #46 and #157. Requests carrying Finch tools
+therefore skip this provider and proceed to the next configured provider. Text-only
+turns also fall back when the required restricted sandbox boundary is unavailable.
 
 The ignored live smoke test is opt-in:
 

@@ -934,96 +934,12 @@ async fn main() -> Result<()> {
                 use finch::cli::show_setup_wizard;
                 match show_setup_wizard() {
                     Ok(result) => {
-                        // Create config from unified providers list (new format)
-                        let active_theme = result.active_theme.clone();
-                        let default_persona = result.default_persona.clone();
-                        let daemon_only_mode = result.daemon_only_mode;
-                        let mdns_discovery = result.mdns_discovery;
-                        let finch_api_key = result.finch_api_key.clone();
-
-                        // Patch any empty API keys in the providers list with
-                        // auto-detected values from environment variables.
-                        let mut providers = result.providers;
-                        let needs_chatgpt_login = providers.iter().any(|provider| {
-                            matches!(
-                                provider,
-                                finch::config::ProviderEntry::ChatgptSubscription { .. }
-                            )
-                        });
-                        let auto = build_teachers_from_env();
-                        for p in &mut providers {
-                            if let Some(key) = p.api_key() {
-                                if key.is_empty() {
-                                    let ptype = p.provider_type().to_string();
-                                    if let Some(detected) =
-                                        auto.iter().find(|t| t.provider == ptype)
-                                    {
-                                        // Replace the empty-key entry with a filled one
-                                        *p = finch::config::ProviderEntry::from_teacher_entry(
-                                            detected,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        // If still no cloud providers with keys, add auto-detected ones
-                        let has_keys = providers
-                            .iter()
-                            .any(|p| p.api_key().map(|k| !k.is_empty()).unwrap_or(false));
-                        if !has_keys && !auto.is_empty() {
-                            for t in &auto {
-                                providers
-                                    .insert(0, finch::config::ProviderEntry::from_teacher_entry(t));
-                            }
-                        }
-
-                        let mut new_config = Config::with_providers(providers);
-                        finch::cli::setup_wizard::apply_daemon_api_key(
-                            &mut new_config,
-                            &finch_api_key,
-                        );
-                        new_config.active_theme = active_theme;
-                        new_config.active_persona = default_persona;
-                        if let Some(hf_tok) = result.hf_token {
-                            if !hf_tok.is_empty() {
-                                new_config.huggingface_token = Some(hf_tok);
-                            }
-                        }
-                        new_config.features = finch::config::FeaturesConfig {
-                            auto_approve_tools: result.auto_approve_tools,
-                            streaming_enabled: result.streaming_enabled,
-                            debug_logging: result.debug_logging,
-                            #[cfg(target_os = "macos")]
-                            gui_automation: result.gui_automation,
-                            #[cfg(target_os = "macos")]
-                            gui_automation_prompted: result.gui_automation_prompted,
-                            #[cfg(target_os = "macos")]
-                            gui_automation_last_known_available: result
-                                .gui_automation_last_known_available,
-                            #[cfg(target_os = "macos")]
-                            gui_automation_permission_context: result
-                                .gui_automation_permission_context,
-                            memory_context_lines: result.memory_context_lines,
-                            max_verbatim_messages: new_config.features.max_verbatim_messages,
-                            context_recall_k: new_config.features.context_recall_k,
-                            enable_summarization: new_config.features.enable_summarization,
-                            auto_compact_enabled: new_config.features.auto_compact_enabled,
-                        };
-                        if daemon_only_mode {
-                            new_config.server.mode = "daemon-only".to_string();
-                        }
-                        if mdns_discovery {
-                            new_config.server.advertise = true;
-                        }
-                        new_config.client.auto_discover = result.auto_discover;
-                        #[allow(deprecated)]
+                        if finch::cli::setup_wizard::validate_and_apply(&result).await?
+                            == finch::cli::setup_wizard::SetupApplyOutcome::Cancelled
                         {
-                            new_config.streaming_enabled = new_config.features.streaming_enabled;
+                            return Err(anyhow::anyhow!("Setup cancelled"));
                         }
-                        new_config.save()?;
-                        if needs_chatgpt_login {
-                            ensure_chatgpt_setup_login().await?;
-                        }
+                        let new_config = finch::config::load_config()?;
                         use crossterm::style::Stylize as _;
                         eprintln!("\n{}\n", "✓ Configuration saved!".green().bold());
                         new_config
@@ -2611,34 +2527,17 @@ async fn run_setup() -> Result<()> {
 
     // Run the wizard
     let result = show_setup_wizard()?;
-    finch::cli::setup_wizard::apply_and_save(&result)?;
-    if result.providers.iter().any(|provider| {
-        matches!(
-            provider,
-            finch::config::ProviderEntry::ChatgptSubscription { .. }
-        )
-    }) {
-        ensure_chatgpt_setup_login().await?;
+    if finch::cli::setup_wizard::validate_and_apply(&result).await?
+        == finch::cli::setup_wizard::SetupApplyOutcome::Cancelled
+    {
+        println!("Setup cancelled; configuration was not changed.");
+        return Ok(());
     }
 
     println!("\n✓ Configuration saved to ~/.finch/config.toml");
     println!("  You can now run: finch");
     println!("  Or start the daemon: finch daemon\n");
 
-    Ok(())
-}
-
-async fn ensure_chatgpt_setup_login() -> Result<()> {
-    use finch::providers::CodexAppServerAuth;
-    let auth = CodexAppServerAuth::new()?;
-    if auth.status(false).await?.signed_in {
-        return Ok(());
-    }
-    let login = auth.begin_device_login().await?;
-    println!("Open: {}", login.details.verification_url);
-    println!("Enter code: {}", login.details.user_code);
-    auth.finish_device_login(login).await?;
-    println!("ChatGPT subscription sign-in complete.");
     Ok(())
 }
 

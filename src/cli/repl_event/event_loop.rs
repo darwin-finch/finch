@@ -2590,15 +2590,22 @@ impl EventLoop {
                         }
                         match wizard_result {
                             Ok(Ok(Some(result))) => {
-                                // Save the new config.
-                                if let Err(e) = crate::cli::setup_wizard::apply_and_save(&result) {
-                                    self.output_manager
-                                        .write_info(format!("Setup saved with error: {e}"));
-                                } else {
-                                    self.output_manager.write_info(
-                                        "Settings saved. Restart finch to apply changes."
-                                            .to_string(),
-                                    );
+                                match crate::cli::setup_wizard::validate_and_apply(&result).await {
+                                    Ok(crate::cli::setup_wizard::SetupApplyOutcome::Saved) => {
+                                        self.output_manager.write_info(
+                                            "Settings saved. Restart finch to apply changes."
+                                                .to_string(),
+                                        );
+                                    }
+                                    Ok(crate::cli::setup_wizard::SetupApplyOutcome::Cancelled) => {
+                                        self.output_manager.write_info(
+                                            "Setup cancelled; settings were not changed."
+                                                .to_string(),
+                                        );
+                                    }
+                                    Err(error) => self
+                                        .output_manager
+                                        .write_info(format!("Setup was not saved: {error}")),
                                 }
                             }
                             Ok(Ok(None)) => {
