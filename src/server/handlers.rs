@@ -3269,11 +3269,44 @@ async fn watch_named_brain(
             }
             drop(command_tx);
             drop(approval_tx);
-            let _ = worker.await;
-            let _ = approval_worker.await;
-            let _ = lifecycle.detach(&name, attachment_id, connection_id);
+            // This socket owns only this opaque connection generation. Detach
+            // it before waiting on command futures: an ordinary command may be
+            // holding the Brain turn lane while suspended on an approval whose
+            // only audience was this connection. `detach` first validates the
+            // exact attachment/connection pair, fails those addressed
+            // approvals closed, and deliberately leaves the durable runner
+            // lease alone.
+            teardown_remote_brain_connection(
+                &lifecycle,
+                &name,
+                attachment_id,
+                connection_id,
+                worker,
+                approval_worker,
+            )
+            .await;
         })
         .into_response())
+}
+
+async fn teardown_remote_brain_connection(
+    lifecycle: &crate::server::BrainLifecycleService,
+    name: &str,
+    attachment_id: crate::brain::store::AttachmentId,
+    connection_id: crate::brain::store::ConnectionId,
+    worker: tokio::task::JoinHandle<()>,
+    approval_worker: tokio::task::JoinHandle<()>,
+) {
+    // The exact connection check also makes this safe after an explicit
+    // Detach reply: a stale socket cannot detach a replacement generation.
+    let _ = lifecycle.detach(name, attachment_id, connection_id);
+    // Command futures are transport-owned. Once their connection is gone they
+    // cannot deliver a reply or retain the turn lane. Abort both lanes and
+    // await cancellation so no detached task keeps stale authority alive.
+    worker.abort();
+    approval_worker.abort();
+    let _ = worker.await;
+    let _ = approval_worker.await;
 }
 
 #[derive(Debug, Deserialize)]
@@ -3705,6 +3738,85 @@ mod handler_tests {
         BrainEvent, BrainEventKind, BrainId, BrainSnapshot, ProgramLanguage,
     };
     use crate::brain::tasks::{BrainTask, BrainTaskPriority, BrainTaskStatus};
+
+    #[tokio::test]
+    async fn websocket_teardown_is_bounded_and_connection_scoped() {
+        use crate::brain::store::{BrainStore, ConnectionId};
+        use crate::server::{BrainApprovalBroker, BrainLifecycleService, BrainRunnerBroker};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Dropped(std::sync::Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+        }
+
+        let approvals = BrainApprovalBroker::default();
+        let lifecycle = BrainLifecycleService::new(
+            BrainStore::with_root("box.local", Some(tempfile::tempdir().unwrap().keep())),
+            BrainRunnerBroker::default(), approvals.clone(),
+        );
+        let attached = lifecycle.attach("shared", "alice", AttachmentRole::Driver, None).unwrap();
+        let connection_id = attached.connection_id.unwrap();
+        let _events = lifecycle.watch("shared", attached.attachment_id, connection_id).unwrap();
+        let unrelated = lifecycle.attach("shared", "bob", AttachmentRole::Observer, None).unwrap();
+        let unrelated_connection = unrelated.connection_id.unwrap();
+        let _unrelated_events = lifecycle.watch(
+            "shared", unrelated.attachment_id, unrelated_connection,
+        ).unwrap();
+        let snapshot = lifecycle.snapshot("shared").unwrap();
+        let lease = lifecycle.acquire_runner(
+            "shared", "runner", &snapshot.environment, None, 60_000,
+        ).unwrap();
+
+        let request_seq = 7;
+        let approval_id = "disconnect-approval";
+        let registration = approvals.register(request_seq, approval_id, BrainApprovalAudience {
+            brain_id: snapshot.brain_id,
+            brain: "shared".into(),
+            attachment_id: attached.attachment_id,
+            subject: attached.subject.clone(),
+            role: attached.role,
+            environment_generation: snapshot.environment.generation,
+        }).unwrap();
+        let worker_dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_guard = Dropped(worker_dropped.clone());
+        let worker = tokio::spawn(async move {
+            let _guard = worker_guard;
+            let _ = registration.wait().await;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        // A worker which already reached terminal completion is harmless.
+        let completed_worker = tokio::spawn(async {});
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            teardown_remote_brain_connection(
+                &lifecycle, "shared", attached.attachment_id, connection_id,
+                worker, completed_worker,
+            ),
+        ).await.expect("connection teardown waited on suspended tool/approval work");
+
+        assert!(worker_dropped.load(Ordering::SeqCst));
+        assert!(lifecycle.connection("shared", attached.attachment_id, connection_id).is_err());
+        assert!(lifecycle.connection(
+            "shared", unrelated.attachment_id, unrelated_connection,
+        ).is_ok());
+        assert_eq!(lifecycle.snapshot("shared").unwrap().runner_lease, Some(lease.clone()));
+        assert!(approvals.claim(
+            snapshot.brain_id, request_seq, approval_id, attached.attachment_id,
+        ).is_err());
+
+        // Repeating cleanup with a stale generation cannot broaden revocation.
+        teardown_remote_brain_connection(
+            &lifecycle, "shared", attached.attachment_id, ConnectionId(connection_id.0),
+            tokio::spawn(async {}), tokio::spawn(async {}),
+        ).await;
+        assert!(lifecycle.connection(
+            "shared", unrelated.attachment_id, unrelated_connection,
+        ).is_ok());
+        assert_eq!(lifecycle.snapshot("shared").unwrap().runner_lease, Some(lease));
+    }
 
     #[test]
     fn messages_endpoint_forwards_the_complete_caller_owned_context() {
