@@ -625,6 +625,45 @@ struct PendingNamedBrainTurn {
     restart: Option<crate::tools::implementations::restart::DeferredFrontendRestart>,
 }
 
+struct CancelledNamedBrainTurn {
+    run_id: crate::brain::store::RunId,
+    response_tx: tokio::sync::oneshot::Sender<
+        std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError>,
+    >,
+    turn_events: Vec<crate::server::RunnerTurnEvent>,
+    effect_journal: Vec<crate::server::RunnerEffectRecord>,
+}
+
+fn take_cancelled_named_brain_turn(
+    pending_turns: &mut std::collections::HashMap<Uuid, PendingNamedBrainTurn>,
+    query_id: Uuid,
+) -> Option<CancelledNamedBrainTurn> {
+    let mut pending = pending_turns.remove(&query_id)?;
+    pending.cancellation_requested = true;
+    Some(CancelledNamedBrainTurn {
+        run_id: pending.run_id,
+        response_tx: pending.response_tx,
+        turn_events: pending.turn_events,
+        effect_journal: pending.effect_journal,
+    })
+}
+
+fn publish_cancelled_named_brain_turn(cancelled: CancelledNamedBrainTurn) {
+    let _ = cancelled.response_tx.send(Err(crate::server::RunnerTurnError {
+        message: "named Brain run cancelled".into(),
+        turn_events: cancelled.turn_events,
+        effect_journal: cancelled.effect_journal,
+    }));
+}
+
+fn clear_matching_active_query(active_query_id: &mut Option<Uuid>, query_id: Uuid) -> bool {
+    if *active_query_id != Some(query_id) {
+        return false;
+    }
+    *active_query_id = None;
+    true
+}
+
 async fn resume_named_brain_program_boundaries(
     runtime: &crate::runtime::ProgramRuntime,
     event_tx: mpsc::UnboundedSender<ReplEvent>,
@@ -3842,6 +3881,13 @@ Rules:\n\
             }
 
             ReplEvent::QueryComplete { query_id, response } => {
+                if matches!(
+                    self.query_states.get_state(query_id).await,
+                    Some(QueryState::Cancelled)
+                ) {
+                    tracing::debug!("Ignoring late completion for cancelled query {}", query_id);
+                    return Ok(());
+                }
                 // Add response to conversation
                 self.conversation
                     .write()
@@ -3866,6 +3912,13 @@ Rules:\n\
             }
 
             ReplEvent::QueryFailed { query_id, error } => {
+                if matches!(
+                    self.query_states.get_state(query_id).await,
+                    Some(QueryState::Cancelled)
+                ) {
+                    tracing::debug!("Ignoring late failure for cancelled query {}", query_id);
+                    return Ok(());
+                }
                 // DON'T remove streaming message here - fallback providers need it!
                 // The message will be removed on StreamingComplete or stays for final error display
 
@@ -4084,6 +4137,16 @@ Rules:\n\
                 query_id,
                 full_response,
             } => {
+                if matches!(
+                    self.query_states.get_state(query_id).await,
+                    Some(QueryState::Cancelled)
+                ) {
+                    tracing::debug!(
+                        "Ignoring late streaming completion for cancelled query {}",
+                        query_id
+                    );
+                    return Ok(());
+                }
                 tracing::debug!("[EVENT_LOOP] Handling StreamingComplete event");
 
                 // Check if this query is executing tools
@@ -4221,16 +4284,11 @@ Rules:\n\
                     // Fire the per-query cancellation token so handle_present_plan
                     // (and any other token-aware loops) can detect the cancel immediately.
                     self.query_states.cancel_query(qid).await;
-                    let named_turn = if let Some(pending) =
-                        self.pending_named_brain_turns.get_mut(&qid)
-                    {
-                        pending.cancellation_requested = true;
-                        true
-                    } else {
-                        false
-                    };
+                    let named_turn = self.pending_named_brain_turns.contains_key(&qid);
 
-                    if !named_turn {
+                    if named_turn {
+                        self.terminate_cancelled_named_brain_turn(qid).await;
+                    } else {
                         self.conversation.write().await.abort_staged(qid);
                         *self.active_query_id.write().await = None;
                         self.tool_call_history.write().await.remove(&qid);
@@ -4248,7 +4306,7 @@ Rules:\n\
 
                     // Show cancellation message
                     self.output_manager.write_info(if named_turn {
-                        "⚠️  Cancellation requested; waiting for the named Brain turn to reach a safe boundary"
+                        "⚠️  Named Brain turn cancelled at a safe terminal boundary"
                     } else {
                         "⚠️  Query cancelled by user (Ctrl+C)"
                     });
@@ -4888,10 +4946,43 @@ Rules:\n\
             return;
         };
         self.query_states.cancel_query(query_id).await;
-        if let Some(pending) = self.pending_named_brain_turns.get_mut(&query_id) {
-            pending.cancellation_requested = true;
-        }
+        self.terminate_cancelled_named_brain_turn(query_id).await;
         let _ = request.response_tx.send(Ok(true));
+    }
+
+    /// End a cancelled named-Brain provider turn exactly once. Aborting the
+    /// staged round before removing its correlation record fences every late
+    /// tool result, while returning the collected events/effects lets the
+    /// daemon publish the canonical cancellation outcome.
+    async fn terminate_cancelled_named_brain_turn(&mut self, query_id: Uuid) -> bool {
+        self.conversation.write().await.abort_staged(query_id);
+        if let Some(unit) = self.query_states.tool_work_unit(query_id).await {
+            unit.set_failed();
+        }
+        let transient_output_unit = self.query_states.brain_output_work_unit(query_id).await;
+        self.query_states.set_tool_work_unit(query_id, None).await;
+        self.query_states
+            .set_brain_output_work_unit(query_id, None)
+            .await;
+        let Some(cancelled) =
+            take_cancelled_named_brain_turn(&mut self.pending_named_brain_turns, query_id)
+        else {
+            return false;
+        };
+        self.agent_scheduler.set_active_brain_parent(None).await;
+        self.local_brain_projections
+            .push_back(failed_local_brain_projection(
+                cancelled.run_id,
+                &cancelled.turn_events,
+                transient_output_unit,
+            ));
+        self.tool_call_history.write().await.remove(&query_id);
+        {
+            let mut active_query_id = self.active_query_id.write().await;
+            clear_matching_active_query(&mut active_query_id, query_id);
+        }
+        publish_cancelled_named_brain_turn(cancelled);
+        true
     }
 
     async fn project_named_brain_memory(
@@ -8346,6 +8437,118 @@ mod tests {
         )
         .is_err());
         assert!(llm_rx.try_recv().is_err(), "completed round must send only one continuation");
+    }
+
+    #[tokio::test]
+    async fn named_brain_cancellation_terminates_staged_round_and_fences_late_results() {
+        use crate::brain::store::{
+            AttachmentId, AttachmentRole, BrainApprovalAudience, BrainId, RunId,
+        };
+        use crate::claude::{ContentBlock, Message};
+        use crate::cli::conversation::ToolRoundError;
+
+        for cancel_after_partial_result in [false, true] {
+            let query_id = uuid::Uuid::new_v4();
+            let run_id = RunId(uuid::Uuid::new_v4());
+            let mut conversation = crate::cli::conversation::ConversationHistory::new();
+            let token = conversation
+                .stage_assistant(
+                    query_id,
+                    Message {
+                        role: "assistant".into(),
+                        content: ["A", "B"]
+                            .into_iter()
+                            .map(|id| ContentBlock::ToolUse {
+                                id: id.into(),
+                                name: "Read".into(),
+                                input: serde_json::json!({}),
+                            })
+                            .collect(),
+                    },
+                )
+                .unwrap();
+            if cancel_after_partial_result {
+                conversation
+                    .record_tool_result(query_id, token, "A", &Ok("a".into()))
+                    .unwrap();
+            }
+
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            let mut pending = std::collections::HashMap::new();
+            pending.insert(
+                query_id,
+                super::PendingNamedBrainTurn {
+                    brain: "shared".into(),
+                    run_id,
+                    response_tx,
+                    turn_events: if cancel_after_partial_result {
+                        vec![crate::server::RunnerTurnEvent::Result {
+                            tool_id: "A".into(),
+                            output: "a".into(),
+                            is_error: false,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    effect_journal: Vec::new(),
+                    cancellation_requested: false,
+                    approval_audience: BrainApprovalAudience {
+                        brain_id: BrainId(uuid::Uuid::new_v4()),
+                        brain: "shared".into(),
+                        attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+                        subject: "driver@box.local".into(),
+                        role: AttachmentRole::Driver,
+                        environment_generation: 1,
+                    },
+                    approval_tx: None,
+                    restart: None,
+                },
+            );
+            let mut active = Some(query_id);
+
+            assert!(conversation.abort_staged(query_id));
+            assert!(super::clear_matching_active_query(&mut active, query_id));
+            let cancelled =
+                super::take_cancelled_named_brain_turn(&mut pending, query_id).unwrap();
+            assert!(super::take_cancelled_named_brain_turn(&mut pending, query_id).is_none());
+            super::publish_cancelled_named_brain_turn(cancelled);
+            let terminal = response_rx.await.unwrap().unwrap_err();
+            assert_eq!(terminal.message, "named Brain run cancelled");
+            assert_eq!(
+                terminal.turn_events.len(),
+                usize::from(cancel_after_partial_result)
+            );
+            assert!(pending.is_empty());
+            assert_eq!(active, None);
+
+            for tool_id in ["A", "B"] {
+                assert_eq!(
+                    conversation.record_tool_result(
+                        query_id,
+                        token,
+                        tool_id,
+                        &Ok(format!("late-{tool_id}")),
+                    ),
+                    Err(ToolRoundError::NoActiveStage)
+                );
+            }
+            let (llm_tx, mut llm_rx) = tokio::sync::mpsc::unbounded_channel();
+            assert!(super::commit_tool_round_and_continue(
+                &mut conversation,
+                query_id,
+                token,
+                &llm_tx,
+            )
+            .is_err());
+            assert!(llm_rx.try_recv().is_err());
+
+            // A subsequent prompt is no longer rejected by the single-active-
+            // turn gate and can establish a fresh query correlation.
+            let later_query = uuid::Uuid::new_v4();
+            assert!(active.is_none());
+            active = Some(later_query);
+            assert_eq!(active, Some(later_query));
+        }
     }
 
     #[test]
