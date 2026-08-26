@@ -1,6 +1,10 @@
 #!/bin/bash
 # Test script for model persistence and training visibility
 
+script_path="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+source "$(dirname "$script_path")/lib/brain_test_isolation.sh"
+brain_test_isolation_reexec_launcher "$script_path" "$@"
+
 set -e
 
 echo "=== Testing Model Persistence and Training Visibility ==="
