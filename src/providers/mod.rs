@@ -14,6 +14,7 @@ pub mod types;
 
 // Provider implementations
 pub mod claude;
+pub mod codex_app_server;
 pub mod gemini;
 pub mod openai;
 
