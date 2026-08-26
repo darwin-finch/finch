@@ -3799,7 +3799,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         arguments: Vec<TypedValue>,
         origin: &crate::vm::SourceOrigin,
     ) -> std::result::Result<Vec<TypedValue>, VmDiagnostic> {
-        let _binding = registered_host_binding(requirement, origin)?;
+        let binding = registered_host_binding(requirement, origin)?;
         let request = match requirement.capability {
             crate::vm::CapabilityKind::SessionEmit => {
                 // `output-open` uses the same session-emission authority as
@@ -4453,6 +4453,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         "process-run requires a command and string arguments",
                     ));
                 };
+                validate_process_request(binding, requirement, command, origin)?;
                 let mut process = std::process::Command::new(command);
                 for value in values {
                     let TypedValue::String(value) = value else {
@@ -4833,6 +4834,33 @@ fn host_binding_error(
         message,
         Some(origin.clone()),
     )
+}
+
+fn validate_process_request(
+    binding: Option<CoreHostBinding>,
+    requirement: &CapabilityRequirement,
+    command: &str,
+    origin: &crate::vm::SourceOrigin,
+) -> std::result::Result<(), VmDiagnostic> {
+    if binding != Some(CoreHostBinding::ProcessRun) {
+        return Err(host_binding_error(
+            origin,
+            "process execution requires the registered process-run host binding",
+        ));
+    }
+    let ResourceSelector::Process { executables } = &requirement.selector else {
+        return Err(host_binding_error(
+            origin,
+            "process-run reached the host without a concrete process selector",
+        ));
+    };
+    if executables.len() != 1 || executables.first().map(String::as_str) != Some(command) {
+        return Err(host_binding_error(
+            origin,
+            "process-run executable does not match the authorized process selector",
+        ));
+    }
+    Ok(())
 }
 
 /// Convert the statically admitted MCP input subset into JSON. Optional
@@ -5855,6 +5883,51 @@ mod tests {
         };
         assert!(registered_host_binding(&wrong_requirement, &origin).is_err());
         assert!(registered_host_binding(&requirement, &SourceOrigin::generated("+"),).is_err());
+
+        let process_requirement = CapabilityRequirement {
+            capability: crate::vm::CapabilityKind::ProcessRun,
+            selector: crate::vm::ResourceSelector::Process {
+                executables: vec!["/usr/bin/true".into()],
+            },
+        };
+        assert_eq!(
+            registered_host_binding(
+                &process_requirement,
+                &SourceOrigin::generated("process-run"),
+            )
+            .unwrap(),
+            Some(CoreHostBinding::ProcessRun)
+        );
+        assert_eq!(
+            registered_host_binding(
+                &process_requirement,
+                &SourceOrigin::generated("legacy-process-run"),
+            )
+            .unwrap(),
+            None
+        );
+        let process_origin = SourceOrigin::generated("process-run");
+        assert!(validate_process_request(
+            Some(CoreHostBinding::ProcessRun),
+            &process_requirement,
+            "/usr/bin/true",
+            &process_origin,
+        )
+        .is_ok());
+        assert!(validate_process_request(
+            None,
+            &process_requirement,
+            "/usr/bin/true",
+            &SourceOrigin::generated("legacy-process-run"),
+        )
+        .is_err());
+        assert!(validate_process_request(
+            Some(CoreHostBinding::ProcessRun),
+            &process_requirement,
+            "/usr/bin/false",
+            &process_origin,
+        )
+        .is_err());
     }
 
     #[test]
