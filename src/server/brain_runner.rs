@@ -293,6 +293,38 @@ impl BrainRunnerBroker {
         drop(requests);
     }
 
+    /// Tell the exact leased runner to cancel one run without making the
+    /// caller own the reply future. Connection teardown uses this before
+    /// aborting the daemon-side wait so process-local cleanup cannot silently
+    /// leave the frontend executing effects.
+    pub(crate) fn request_run_cancellation(
+        &self,
+        brain: &str,
+        lease_id: RunnerLeaseId,
+        run_id: RunId,
+    ) -> Result<()> {
+        let registration = self
+            .registrations
+            .read()
+            .expect("runner broker lock poisoned")
+            .get(brain)
+            .cloned()
+            .with_context(|| format!("named Brain '{brain}' has no connected runner callback"))?;
+        anyhow::ensure!(
+            registration.lease_id == lease_id,
+            "named Brain '{brain}' runner callback belongs to a stale lease"
+        );
+        let (response_tx, _response_rx) = oneshot::channel();
+        registration
+            .tx
+            .send(RunnerRequest::Cancel(RunnerCancelRequest {
+                brain: brain.to_string(),
+                run_id,
+                response_tx,
+            }))
+            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))
+    }
+
     pub fn register(
         &self,
         brain: impl Into<String>,

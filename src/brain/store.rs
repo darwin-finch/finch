@@ -946,6 +946,10 @@ pub struct BrainStore {
     execution_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     run_publication_gates:
         Arc<RwLock<HashMap<(String, RunId), Arc<tokio::sync::Mutex<RunPublicationGate>>>>>,
+    /// Ephemeral transport generation that currently supervises a live run.
+    /// This is deliberately not replayed: restored queued work is transport
+    /// independent until a new connection explicitly dispatches it.
+    run_connection_owners: Arc<RwLock<HashMap<(String, RunId), ConnectionId>>>,
     disconnect_retry_owners: Arc<std::sync::Mutex<HashSet<(String, RunId)>>>,
     #[cfg(test)]
     fail_event_batches: Arc<std::sync::atomic::AtomicUsize>,
@@ -1133,6 +1137,7 @@ impl BrainStore {
             runtime_checkpoints: Arc::new(RwLock::new(HashMap::new())),
             execution_locks: Arc::new(RwLock::new(HashMap::new())),
             run_publication_gates: Arc::new(RwLock::new(HashMap::new())),
+            run_connection_owners: Arc::new(RwLock::new(HashMap::new())),
             disconnect_retry_owners: Arc::new(std::sync::Mutex::new(HashSet::new())),
             #[cfg(test)]
             fail_event_batches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1175,6 +1180,50 @@ impl BrainStore {
             .entry(name.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone())
+    }
+
+    pub(crate) fn bind_run_connection(
+        &self,
+        name: &str,
+        run_id: RunId,
+        connection_id: ConnectionId,
+    ) -> Result<()> {
+        let name = Self::validate_name(name)?;
+        anyhow::ensure!(
+            !self.inspect_run(name, run_id)?.status.is_terminal(),
+            "terminal Brain run cannot acquire connection ownership"
+        );
+        self.run_connection_owners
+            .write()
+            .expect("shared Brain run-owner map poisoned")
+            .insert((name.to_string(), run_id), connection_id);
+        Ok(())
+    }
+
+    pub(crate) fn connection_owned_active_runs(
+        &self,
+        name: &str,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+    ) -> Result<Vec<RunId>> {
+        let snapshot = self.snapshot(name)?;
+        let owners = self
+            .run_connection_owners
+            .read()
+            .expect("shared Brain run-owner map poisoned");
+        Ok(snapshot
+            .runs
+            .into_iter()
+            .filter(|run| {
+                run.initiating_attachment_id == attachment_id
+                    && matches!(
+                        run.status,
+                        BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
+                    )
+                    && owners.get(&(name.to_string(), run.run_id)) == Some(&connection_id)
+            })
+            .map(|run| run.run_id)
+            .collect())
     }
 
     fn run_publication_gate(
@@ -1234,6 +1283,10 @@ impl BrainStore {
         self.run_publication_gates
             .write()
             .expect("shared Brain run-gate map poisoned")
+            .remove(&(name.to_string(), run_id));
+        self.run_connection_owners
+            .write()
+            .expect("shared Brain run-owner map poisoned")
             .remove(&(name.to_string(), run_id));
         Ok(())
     }

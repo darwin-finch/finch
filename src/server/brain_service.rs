@@ -532,13 +532,76 @@ impl BrainLifecycleService {
         attachment_id: AttachmentId,
         connection_id: ConnectionId,
     ) -> Result<()> {
-        let brain_id = self.store.snapshot(brain)?.brain_id;
+        // Validate the exact generation before deriving any run authority. A
+        // stale socket must not cancel work started by its replacement.
+        self.store.require_connection(brain, attachment_id, connection_id)?;
+        let snapshot = self.store.snapshot(brain)?;
+        let brain_id = snapshot.brain_id;
         let reserved = self
             .store
             .pending_reserved_cancellations_for_attachment(brain, attachment_id)?;
+        let ordinary = self
+            .store
+            .connection_owned_active_runs(brain, attachment_id, connection_id)?
+            .into_iter()
+            .filter(|run_id| !reserved.contains(run_id))
+            .collect::<Vec<_>>();
+        let runner_lease = snapshot.runner_lease.as_ref().map(|lease| lease.lease_id);
         self.store.detach(brain, attachment_id, connection_id)?;
         self.approvals
             .cancel_connection(brain_id, attachment_id, connection_id);
+        // The runner cancellation is addressed to this Brain's exact durable
+        // run and current lease. First publish (or durably hand off) the
+        // Result+Failed outcome, then enqueue cancellation before aborting the
+        // daemon wait. Any late response is fenced by terminal state and its
+        // dropped response channel.
+        for run_id in ordinary {
+            let run = self.store.inspect_run(brain, run_id)?;
+            let detail = "initiating Brain connection disconnected".to_string();
+            match self.store.terminalize_run_with_result_if_active(
+                brain,
+                "daemon",
+                run_id,
+                run.request_seq,
+                BrainRunStatus::Failed,
+                detail.clone(),
+            ) {
+                Ok(Some(_)) => {}
+                Ok(None) if self.store.inspect_run(brain, run_id)?.status.is_terminal() => {
+                    continue;
+                }
+                Ok(None) => self.store.schedule_disconnect_terminalization_retry(
+                    brain.to_string(),
+                    "daemon".into(),
+                    run_id,
+                    run.request_seq,
+                    BrainRunStatus::Failed,
+                    detail,
+                ),
+                Err(error) => {
+                    tracing::error!(brain = %brain, run_id = %run_id.0, %error,
+                        "disconnect terminalization deferred to durable retry owner");
+                    self.store.schedule_disconnect_terminalization_retry(
+                        brain.to_string(),
+                        "daemon".into(),
+                        run_id,
+                        run.request_seq,
+                        BrainRunStatus::Failed,
+                        detail,
+                    );
+                }
+            }
+            if let Some(lease_id) = runner_lease {
+                if let Err(error) = self
+                    .runners
+                    .request_run_cancellation(brain, lease_id, run_id)
+                {
+                    tracing::warn!(brain = %brain, run_id = %run_id.0, %error,
+                        "could not forward disconnect cancellation to runner");
+                }
+            }
+            self.runners.abort_run(brain, run_id);
+        }
         // A cancellation reservation is durable authority, not authority
         // owned by the WebSocket command future. Once that exact initiating
         // generation disconnects, finish its reserved terminal outcome and
@@ -604,6 +667,9 @@ impl BrainLifecycleService {
         let (accepted, run) = self
             .store
             .accept_speculative_run(brain, &attachment.subject, attachment_id, prompt)
+            .map_err(BrainSubmissionError::State)?;
+        self.store
+            .bind_run_connection(brain, run.run_id, connection_id)
             .map_err(BrainSubmissionError::State)?;
         let snapshot = self.snapshot(brain).map_err(BrainSubmissionError::State)?;
         let ready_lease = snapshot.runner_lease.filter(|lease| {
