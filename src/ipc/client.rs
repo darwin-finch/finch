@@ -1125,6 +1125,11 @@ impl brain_runner::Server for BrainRunnerImpl {
                     context,
                     approval_audience,
                     approval_connection_id: None,
+                    // The daemon enforces and persists the authoritative turn
+                    // deadline; this frontend-local reconstruction never
+                    // registers daemon approval continuations.
+                    hard_deadline: tokio::time::Instant::now(),
+                    hard_deadline_ms: crate::brain::store::unix_millis(),
                     approval_tx: Some(approval_tx),
                     cancel: tokio_util::sync::CancellationToken::new(),
                     response_tx,

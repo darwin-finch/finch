@@ -11,6 +11,7 @@ mod openai_handlers;
 pub mod openai_types; // Public for client access
 
 pub use brain_approval::BrainApprovalBroker;
+pub(crate) use brain_approval::ApprovalDeadline;
 pub use brain_runner::{
     BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerDeadlines,
     RunnerDispatchError, RunnerDispatchFailure, RunnerEffectRecord, RunnerMemoryProjectionRequest,

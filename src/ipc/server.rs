@@ -86,6 +86,8 @@ struct BrainTurnControlImpl {
     request_seq: u64,
     expected_audience: crate::brain::store::BrainApprovalAudience,
     expected_connection_id: Option<crate::brain::store::ConnectionId>,
+    hard_deadline: tokio::time::Instant,
+    hard_deadline_ms: u64,
 }
 
 fn require_approval_connection(
@@ -102,6 +104,7 @@ pub(crate) fn test_turn_control_client(
     expected_audience: crate::brain::store::BrainApprovalAudience,
     expected_connection_id: Option<crate::brain::store::ConnectionId>,
 ) -> finch_ipc_capnp::brain_turn_control::Client {
+    let duration = std::time::Duration::from_secs(20 * 60);
     capnp_rpc::new_client(
         BrainTurnControlImpl {
             server,
@@ -109,6 +112,10 @@ pub(crate) fn test_turn_control_client(
             request_seq,
             expected_audience,
             expected_connection_id,
+            hard_deadline: tokio::time::Instant::now() + duration,
+            hard_deadline_ms: crate::brain::store::unix_millis().saturating_add(
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            ),
         },
     )
 }
@@ -436,11 +443,19 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
             Ok(connection_id) => connection_id,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
+        let deadline = match crate::server::ApprovalDeadline::clamped_to_turn(
+            self.hard_deadline,
+            self.hard_deadline_ms,
+        ) {
+            Ok(deadline) => deadline,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
         let registration = match self.server.brain_approvals().register_for_connection_with_authority(
             self.request_seq,
             approval_id.clone(),
             audience.clone(),
             connection_id,
+            deadline,
             || self.server.brain_store().begin_run_approval_for_connection(
                 &self.brain,
                 audience.attachment_id,
@@ -451,6 +466,7 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
                 subject.clone(),
                 audience.clone(),
                 detail.clone(),
+                deadline.expires_ms,
             ),
         ) {
             Ok(registration) => registration,
@@ -1837,6 +1853,8 @@ async fn forward_runner_request(
                                 request_seq: request.request_seq,
                                 expected_audience: request.approval_audience.clone(),
                                 expected_connection_id: request.approval_connection_id,
+                                hard_deadline: request.hard_deadline,
+                                hard_deadline_ms: request.hard_deadline_ms,
                             });
                         payload.set_control(control);
                     }

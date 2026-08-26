@@ -521,6 +521,7 @@ fn vm_approval_choices(prompt: &crate::vm::ApprovalPrompt) -> Vec<crate::vm::App
 fn vm_approval_dialog(
     prompt: &crate::vm::ApprovalPrompt,
     audience: Option<&crate::brain::store::BrainApprovalAudience>,
+    expires_ms: Option<u64>,
     runtime: &crate::runtime::ProgramRuntime,
 ) -> crate::cli::tui::Dialog {
     use crate::cli::tui::{Dialog, DialogOption};
@@ -569,9 +570,12 @@ fn vm_approval_dialog(
     let audience = audience
         .map(|audience| format!("\n\n{}", approval_audience_summary(audience)))
         .unwrap_or_default();
+    let expiry = expires_ms
+        .map(|expires_ms| format!("\nApproval expires at Unix ms {expires_ms}"))
+        .unwrap_or_default();
     Dialog::select("Finch VM capability request", options).with_body(format!(
-        "Reason: {}\nHost availability: {:?}\n\nRequired capability:\n{}{}{}",
-        prompt.request.reason, availability, exact, warning, audience
+        "Reason: {}\nHost availability: {:?}\n\nRequired capability:\n{}{}{}{}",
+        prompt.request.reason, availability, exact, warning, audience, expiry
     ))
 }
 
@@ -817,6 +821,7 @@ struct RemoteBrainApproval {
     client: crate::brain::remote::AttachedBrainClient,
     request_seq: u64,
     approval_id: String,
+    expires_ms: u64,
     audience: crate::brain::store::BrainApprovalAudience,
     kind: RemoteBrainApprovalKind,
 }
@@ -1008,6 +1013,7 @@ fn project_remote_brain_run_event(
             approval_id,
             approval_kind,
             subject,
+            expires_ms,
             audience,
             detail,
             ..
@@ -1037,6 +1043,9 @@ fn project_remote_brain_run_event(
                 {
                     projection.unit.append_row_body_line(row, line.to_owned());
                 }
+                projection
+                    .unit
+                    .append_row_body_line(row, format!("Expires at Unix ms {expires_ms}"));
                 projection.approval_rows.insert(approval_id.clone(), row);
             }
         }
@@ -5853,6 +5862,7 @@ Rules:\n\
                 approval_id,
                 approval_kind,
                 subject,
+                expires_ms,
                 audience: Some(audience),
                 detail,
             } => {
@@ -5909,6 +5919,7 @@ Rules:\n\
                         client,
                         request_seq: *request_seq,
                         approval_id: approval_id.clone(),
+                        expires_ms: *expires_ms,
                         audience: audience.clone(),
                         kind,
                     });
@@ -5947,10 +5958,19 @@ Rules:\n\
                 let mut summary = tool_approval_summary(tool_use);
                 summary.push_str("\n\n");
                 summary.push_str(&approval_audience_summary(&pending.audience));
+                summary.push_str(&format!(
+                    "\nApproval expires at Unix ms {}",
+                    pending.expires_ms
+                ));
                 crate::cli::tui::Dialog::tool_approval(&tool_use.name, &summary)
             }
             RemoteBrainApprovalKind::Vm { prompt, .. } => {
-                vm_approval_dialog(prompt, Some(&pending.audience), self.program_runtime.as_ref())
+                vm_approval_dialog(
+                    prompt,
+                    Some(&pending.audience),
+                    Some(pending.expires_ms),
+                    self.program_runtime.as_ref(),
+                )
             }
         };
         self.active_remote_brain_approval = Some(pending);
@@ -6194,6 +6214,7 @@ Rules:\n\
                 approval_id,
                 approval_kind,
                 subject,
+                expires_ms,
                 audience,
                 detail,
                 ..
@@ -6231,6 +6252,7 @@ Rules:\n\
                 for line in body {
                     unit.append_row_body_line(row, line);
                 }
+                unit.append_row_body_line(row, format!("Expires at Unix ms {expires_ms}"));
                 self.remote_brain_approval_rows
                     .insert(approval_id.clone(), row);
             }
@@ -7311,7 +7333,7 @@ Rules:\n\
         let audience = query_id
             .and_then(|query_id| self.pending_named_brain_turns.get(&query_id))
             .map(|turn| &turn.approval_audience);
-        let dialog = vm_approval_dialog(&prompt, audience, self.program_runtime.as_ref());
+        let dialog = vm_approval_dialog(&prompt, audience, None, self.program_runtime.as_ref());
 
         self.pending_vm_approval = Some(PendingVmApproval {
             response_tx,
@@ -8799,6 +8821,7 @@ mod tests {
                 approval_id: "approval-1".into(),
                 approval_kind: "tool".into(),
                 subject: "write_cache".into(),
+                expires_ms: 123_456,
                 audience: None,
                 detail: serde_json::json!({"key": "beta"}),
             },
@@ -8836,6 +8859,25 @@ mod tests {
                 event
             })
             .collect::<Vec<_>>();
+        let expiry_output = crate::cli::output_manager::OutputManager::new(
+            crate::config::ColorScheme::default(),
+        );
+        expiry_output.disable_stdout();
+        let mut expiry_projections = std::collections::HashMap::new();
+        for event in &events[..5] {
+            super::project_remote_brain_run_event(
+                &expiry_output,
+                &mut expiry_projections,
+                event,
+            );
+        }
+        let pending = expiry_output.get_messages();
+        assert_eq!(pending.len(), 1);
+        let pending_rendered = pending[0].format(&crate::config::ColorScheme::default());
+        assert!(
+            pending_rendered.contains("Expires at Unix ms 123456"),
+            "{pending_rendered}"
+        );
         let mut projections = std::collections::HashMap::new();
         let local_unit = super::ensure_remote_brain_run_projection(
             &output,
@@ -8990,6 +9032,7 @@ mod tests {
                 approval_id: "approval-1".into(),
                 approval_kind: "tool".into(),
                 subject: "write_cache".into(),
+                expires_ms: 123_456,
                 audience: None,
                 detail: serde_json::json!({}),
             },
@@ -9071,6 +9114,22 @@ mod tests {
                 true,
                 event,
             ));
+            if matches!(event.kind, BrainEventKind::ApprovalRequested { .. }) {
+                let remote_output = crate::cli::output_manager::OutputManager::new(
+                    crate::config::ColorScheme::default(),
+                );
+                remote_output.disable_stdout();
+                assert!(super::project_remote_brain_live_run_event(
+                    &remote_output,
+                    &mut std::collections::HashMap::new(),
+                    &mut std::collections::VecDeque::new(),
+                    false,
+                    event,
+                ));
+                assert!(remote_output.get_messages().iter().any(|message| message
+                    .format(&crate::config::ColorScheme::default())
+                    .contains("Expires at Unix ms 123456")));
+            }
         }
         assert!(local_projections.is_empty());
         super::project_remote_brain_snapshot_runs(

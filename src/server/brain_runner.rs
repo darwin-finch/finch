@@ -123,6 +123,10 @@ pub struct RunnerTurnRequest {
     pub context: Vec<crate::claude::Message>,
     pub approval_audience: crate::brain::store::BrainApprovalAudience,
     pub approval_connection_id: Option<crate::brain::store::ConnectionId>,
+    /// One authoritative hard deadline for the whole turn. Reverse approval
+    /// windows are clamped to this same monotonic/wall-clock boundary.
+    pub hard_deadline: tokio::time::Instant,
+    pub hard_deadline_ms: u64,
     /// Reverse approval bridge installed by the Cap'n Proto client adapter.
     /// Daemon-side broker requests leave this unset until they cross IPC.
     pub approval_tx: Option<mpsc::UnboundedSender<RunnerApprovalRequest>>,
@@ -294,10 +298,9 @@ impl RunnerDispatchError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunnerDeadlines {
     pub program: Duration,
-    /// Total turn lifetime, including provider generation, one-shot repair,
-    /// tool execution, and approval suspension. This deliberately exceeds
-    /// the approval broker's 15-minute expiry so a legitimate human approval
-    /// wait is not cut off by the provider deadline while remaining bounded.
+    /// Hard total turn lifetime, including provider generation, one-shot
+    /// repair, tool execution, and approval suspension. Every approval expiry
+    /// is clamped to the remaining portion of this same boundary.
     pub turn: Duration,
     pub cancel: Duration,
     pub project_memory: Duration,
@@ -798,11 +801,11 @@ impl BrainRunnerBroker {
         operation: RunnerOperation,
         registration: &Registration,
         cancel: &tokio_util::sync::CancellationToken,
+        deadline: tokio::time::Instant,
         response_rx: oneshot::Receiver<Result<T, E>>,
         abort_rx: oneshot::Receiver<()>,
         map_remote_error: impl FnOnce(E) -> anyhow::Error,
     ) -> Result<T> {
-        let deadline = tokio::time::Instant::now() + self.deadlines.for_operation(operation);
         let mut active = registration.active.subscribe();
         if !*active.borrow() {
             return Err(RunnerDispatchError::new(
@@ -882,6 +885,7 @@ impl BrainRunnerBroker {
         grant_ceiling: Option<crate::vm::EffectSet>,
     ) -> Result<RunnerProgramResult> {
         let operation = RunnerOperation::Program;
+        let deadline = tokio::time::Instant::now() + self.deadlines.for_operation(operation);
         let registration = self.registration(brain, lease_id, operation)?;
         let (response_tx, response_rx) = oneshot::channel();
         let (abort_rx, _inflight) = self.track_inflight(brain, run_id);
@@ -917,6 +921,7 @@ impl BrainRunnerBroker {
             operation,
             &registration,
             &cancel,
+            deadline,
             response_rx,
             abort_rx,
             anyhow::Error::new,
@@ -936,6 +941,10 @@ impl BrainRunnerBroker {
         approval_connection_id: Option<crate::brain::store::ConnectionId>,
     ) -> Result<RunnerTurnResult> {
         let operation = RunnerOperation::Turn;
+        let duration = self.deadlines.for_operation(operation);
+        let hard_deadline = tokio::time::Instant::now() + duration;
+        let hard_deadline_ms = crate::brain::store::unix_millis()
+            .saturating_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
         let registration = self.registration(brain, lease_id, operation)?;
         let (response_tx, response_rx) = oneshot::channel();
         let (abort_rx, _inflight) = self.track_inflight(brain, run_id);
@@ -959,6 +968,8 @@ impl BrainRunnerBroker {
                     context,
                     approval_audience,
                     approval_connection_id,
+                    hard_deadline,
+                    hard_deadline_ms,
                     approval_tx: None,
                     cancel: cancel.clone(),
                     response_tx,
@@ -971,6 +982,7 @@ impl BrainRunnerBroker {
             operation,
             &registration,
             &cancel,
+            hard_deadline,
             response_rx,
             abort_rx,
             anyhow::Error::new,
@@ -985,6 +997,7 @@ impl BrainRunnerBroker {
         run_id: RunId,
     ) -> Result<bool> {
         let operation = RunnerOperation::Cancel;
+        let deadline = tokio::time::Instant::now() + self.deadlines.for_operation(operation);
         let registration = self.registration(brain, lease_id, operation)?;
         let (response_tx, response_rx) = oneshot::channel();
         let (abort_rx, _inflight) = self.track_inflight(brain, run_id);
@@ -1004,6 +1017,7 @@ impl BrainRunnerBroker {
             operation,
             &registration,
             &cancel,
+            deadline,
             response_rx,
             abort_rx,
             anyhow::Error::msg,
@@ -1026,6 +1040,7 @@ impl BrainRunnerBroker {
         source: String,
     ) -> Result<usize> {
         let operation = RunnerOperation::ProjectMemory;
+        let deadline = tokio::time::Instant::now() + self.deadlines.for_operation(operation);
         let registration = self.registration(brain, lease_id, operation)?;
         let (response_tx, response_rx) = oneshot::channel();
         let (abort_rx, _inflight) = self.track_inflight(brain, run_id);
@@ -1051,6 +1066,7 @@ impl BrainRunnerBroker {
             operation,
             &registration,
             &cancel,
+            deadline,
             response_rx,
             abort_rx,
             anyhow::Error::msg,

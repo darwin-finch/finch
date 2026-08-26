@@ -507,6 +507,10 @@ pub enum BrainEventKind {
         approval_id: String,
         approval_kind: String,
         subject: String,
+        /// Exact daemon-enforced expiry for this approval continuation.
+        /// Zero is reserved for events written before deadline publication.
+        #[serde(default)]
+        expires_ms: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         audience: Option<BrainApprovalAudience>,
         detail: serde_json::Value,
@@ -2178,6 +2182,7 @@ impl BrainStore {
         subject: String,
         audience: BrainApprovalAudience,
         detail: serde_json::Value,
+        expires_ms: u64,
     ) -> Result<RunId> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
@@ -2224,6 +2229,7 @@ impl BrainStore {
                 approval_id,
                 approval_kind,
                 subject,
+                expires_ms,
                 audience: Some(audience),
                 detail,
             },
@@ -5762,6 +5768,7 @@ mod tests {
                     approval_id: "tool-1".into(),
                     approval_kind: "tool".into(),
                     subject: "search_word".into(),
+                    expires_ms: 123_456,
                     audience: Some(audience.clone()),
                     detail: serde_json::json!({"input": {"query": "fib"}}),
                 },
@@ -5803,11 +5810,13 @@ mod tests {
             BrainEventKind::ApprovalRequested {
                 approval_id,
                 subject,
+                expires_ms,
                 audience: Some(event_audience),
                 ..
             }
                 if approval_id == "tool-1"
                     && subject == "search_word"
+                    && *expires_ms == 123_456
                     && event_audience == &audience
         ));
         assert!(matches!(

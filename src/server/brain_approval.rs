@@ -13,6 +13,48 @@ use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 use crate::brain::store::{AttachmentId, BrainApprovalAudience, BrainId, ConnectionId};
 
+const APPROVAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ApprovalDeadline {
+    pub expires_ms: u64,
+    instant: tokio::time::Instant,
+}
+
+impl ApprovalDeadline {
+    fn full_window() -> Self {
+        Self {
+            expires_ms: crate::brain::store::unix_millis()
+                .saturating_add(u64::try_from(APPROVAL_WINDOW.as_millis()).unwrap_or(u64::MAX)),
+            instant: tokio::time::Instant::now() + APPROVAL_WINDOW,
+        }
+    }
+
+    pub(crate) fn clamped_to_turn(
+        hard_deadline: tokio::time::Instant,
+        hard_deadline_ms: u64,
+    ) -> Result<Self> {
+        let now = tokio::time::Instant::now();
+        let now_ms = crate::brain::store::unix_millis();
+        let monotonic_remaining = hard_deadline
+            .checked_duration_since(now)
+            .unwrap_or_default();
+        let wall_remaining_ms = hard_deadline_ms.saturating_sub(now_ms);
+        let remaining_ms = u64::try_from(monotonic_remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .min(wall_remaining_ms)
+            .min(u64::try_from(APPROVAL_WINDOW.as_millis()).unwrap_or(u64::MAX));
+        anyhow::ensure!(
+            remaining_ms > 0,
+            "named Brain turn has no remaining approval budget"
+        );
+        Ok(Self {
+            expires_ms: now_ms.saturating_add(remaining_ms),
+            instant: now + std::time::Duration::from_millis(remaining_ms),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ApprovalKey {
     brain_id: BrainId,
@@ -37,6 +79,7 @@ pub struct BrainApprovalBroker {
 pub struct ApprovalRegistration {
     broker: BrainApprovalBroker,
     key: ApprovalKey,
+    deadline: ApprovalDeadline,
     response_rx: Option<oneshot::Receiver<Result<serde_json::Value, String>>>,
 }
 
@@ -79,19 +122,38 @@ impl BrainApprovalBroker {
         approval_id: impl Into<String>,
         audience: BrainApprovalAudience,
     ) -> Result<ApprovalRegistration> {
-        self.register_inner(request_seq, approval_id, audience, None)
+        self.register_inner(
+            request_seq,
+            approval_id,
+            audience,
+            None,
+            ApprovalDeadline::full_window(),
+        )
     }
 
     pub fn register_for_connection(
-        &self, request_seq: u64, approval_id: impl Into<String>,
-        audience: BrainApprovalAudience, connection_id: ConnectionId,
+        &self,
+        request_seq: u64,
+        approval_id: impl Into<String>,
+        audience: BrainApprovalAudience,
+        connection_id: ConnectionId,
     ) -> Result<ApprovalRegistration> {
-        self.register_inner(request_seq, approval_id, audience, Some(connection_id))
+        self.register_inner(
+            request_seq,
+            approval_id,
+            audience,
+            Some(connection_id),
+            ApprovalDeadline::full_window(),
+        )
     }
 
     pub(crate) fn register_for_connection_with_authority<T>(
-        &self, request_seq: u64, approval_id: impl Into<String>,
-        audience: BrainApprovalAudience, connection_id: ConnectionId,
+        &self,
+        request_seq: u64,
+        approval_id: impl Into<String>,
+        audience: BrainApprovalAudience,
+        connection_id: ConnectionId,
+        deadline: ApprovalDeadline,
         authorize: impl FnOnce() -> Result<T>,
     ) -> Result<(ApprovalRegistration, T)> {
         let key = ApprovalKey {
@@ -123,16 +185,24 @@ impl BrainApprovalBroker {
                 delivered_decision: None,
             },
         );
-        Ok((ApprovalRegistration {
-            broker: self.clone(),
-            key,
-            response_rx: Some(response_rx),
-        }, authorized))
+        Ok((
+            ApprovalRegistration {
+                broker: self.clone(),
+                key,
+                deadline,
+                response_rx: Some(response_rx),
+            },
+            authorized,
+        ))
     }
 
     fn register_inner(
-        &self, request_seq: u64, approval_id: impl Into<String>,
-        audience: BrainApprovalAudience, connection_id: Option<ConnectionId>,
+        &self,
+        request_seq: u64,
+        approval_id: impl Into<String>,
+        audience: BrainApprovalAudience,
+        connection_id: Option<ConnectionId>,
+        deadline: ApprovalDeadline,
     ) -> Result<ApprovalRegistration> {
         let key = ApprovalKey {
             brain_id: audience.brain_id,
@@ -161,6 +231,7 @@ impl BrainApprovalBroker {
         Ok(ApprovalRegistration {
             broker: self.clone(),
             key,
+            deadline,
             response_rx: Some(response_rx),
         })
     }
@@ -356,9 +427,11 @@ impl ApprovalRegistration {
             .response_rx
             .take()
             .expect("approval registration receiver already consumed");
-        let response = tokio::time::timeout(std::time::Duration::from_secs(15 * 60), response_rx)
+        let response = tokio::time::timeout_at(self.deadline.instant, response_rx)
             .await
-            .context("approval request expired after 15 minutes")?
+            .with_context(|| {
+                format!("approval request expired at {} ms", self.deadline.expires_ms)
+            })?
             .context("approval decision channel closed")?;
         self.broker
             .cancel_key(&self.key, "approval request completed");
@@ -409,6 +482,59 @@ mod tests {
             role: AttachmentRole::Driver,
             environment_generation: 1,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clamped_expiry_is_the_enforced_boundary_and_rejects_late_approval() {
+        let broker = BrainApprovalBroker::default();
+        let attachment_id = AttachmentId(uuid::Uuid::new_v4());
+        let audience = audience(attachment_id);
+        let hard_window = std::time::Duration::from_millis(100);
+        let registered_ms = crate::brain::store::unix_millis();
+        let hard_deadline_ms = registered_ms.saturating_add(100);
+        let deadline = ApprovalDeadline::clamped_to_turn(
+            tokio::time::Instant::now() + hard_window,
+            hard_deadline_ms,
+        )
+        .unwrap();
+        let published_window_ms = deadline.expires_ms.saturating_sub(registered_ms);
+        assert!((1..=100).contains(&published_window_ms));
+        let registration = broker
+            .register_inner(
+                7,
+                "approval-1",
+                audience.clone(),
+                None,
+                deadline,
+            )
+            .unwrap();
+        let waiter = tokio::spawn(registration.wait());
+
+        tokio::time::advance(std::time::Duration::from_millis(published_window_ms - 1)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        let error = waiter.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&deadline.expires_ms.to_string()),
+            "{error:#}"
+        );
+
+        let late = broker.claim(audience.brain_id, 7, "approval-1", attachment_id);
+        let late = match late {
+            Ok(_) => panic!("late approval resumed an expired continuation"),
+            Err(error) => error,
+        };
+        assert!(late.to_string().contains("not pending"));
+
+        let exhausted = ApprovalDeadline::clamped_to_turn(
+            tokio::time::Instant::now(),
+            crate::brain::store::unix_millis(),
+        )
+        .unwrap_err();
+        assert!(exhausted.to_string().contains("no remaining approval budget"));
     }
 
     #[tokio::test]

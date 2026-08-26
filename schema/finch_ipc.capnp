@@ -1016,6 +1016,7 @@ struct BrainApprovalRequested {
   hasAudience     @4 :Bool;
   audience        @5 :BrainApprovalAudience;
   detail          @6 :JsonValue;
+  expiresMs       @7 :UInt64; # Exact daemon-enforced approval expiry.
 }
 
 struct BrainApprovalDecided {

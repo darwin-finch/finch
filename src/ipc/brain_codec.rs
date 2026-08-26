@@ -1459,6 +1459,7 @@ pub(super) fn encode_event(
             approval_id,
             approval_kind,
             subject,
+            expires_ms,
             audience,
             detail,
         } => {
@@ -1467,6 +1468,7 @@ pub(super) fn encode_event(
             requested.set_approval_id(approval_id);
             requested.set_approval_kind(approval_kind);
             requested.set_subject(subject);
+            requested.set_expires_ms(*expires_ms);
             encode_json_value(requested.reborrow().init_detail(), detail)?;
             if let Some(audience) = audience {
                 requested.set_has_audience(true);
@@ -1679,6 +1681,7 @@ pub(super) fn decode_event(
                 approval_id: text(requested.get_approval_id()?)?,
                 approval_kind: text(requested.get_approval_kind()?)?,
                 subject: text(requested.get_subject()?)?,
+                expires_ms: requested.get_expires_ms(),
                 audience: requested
                     .get_has_audience()
                     .then(|| requested.get_audience())
@@ -2052,6 +2055,7 @@ mod tests {
                 approval_id: "approval-1".into(),
                 approval_kind: "tool".into(),
                 subject: "edit".into(),
+                expires_ms: 123_456,
                 audience: Some(audience),
                 detail: serde_json::json!({"path": "src/lib.rs"}),
             },
