@@ -1,0 +1,86 @@
+name: Issue 56 Brain isolation security
+
+on:
+  push:
+    branches: [ codex/issue-56-brain-test-isolation ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-56-brain-isolation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  isolation-boundaries:
+    name: Isolation boundaries (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install capnproto (Ubuntu)
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y capnproto
+
+    - name: Install capnproto (macOS)
+      if: runner.os == 'macOS'
+      run: brew install capnp
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Cargo state
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: issue-56-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Check bins and tests
+      timeout-minutes: 25
+      run: cargo check --lib --bins --tests
+
+    - name: Build isolation supervisor
+      timeout-minutes: 20
+      run: cargo build --bin finch-test-supervisor
+
+    - name: Reject self-issued proof authority
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test --lib
+        brain::isolation_tests::isolated_proof_rejects_self_issued_environment_authority
+        -- --nocapture
+
+    - name: Validate offset-independent concurrent proof reads
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test --lib
+        brain::isolation_tests::isolated_proof_validation_is_offset_independent_under_concurrency
+        -- --nocapture
+
+    - name: Reject rewritten proof at the production constructor
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test --lib
+        server::tests::production_constructor_rejects_rewritten_proof_and_accepts_exact_restore
+        -- --nocapture
+
+    - name: Exercise the complete synthetic isolation harness
+      timeout-minutes: 15
+      run: ./scripts/test_brain_isolation.sh
