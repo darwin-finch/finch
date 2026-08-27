@@ -675,7 +675,30 @@ fn run() -> anyhow::Result<i32> {
     }
 }
 
+fn run_child_panic_probe() -> ! {
+    let descendant = Command::new("/bin/sh")
+        .args(["-c", "trap '' TERM HUP INT; while :; do /bin/sleep 1; done"])
+        .spawn()
+        .expect("panic probe descendant must spawn");
+    if let Some(path) = std::env::var_os("FINCH_TEST_PANIC_DESCENDANT_PID_FILE") {
+        fs::write(path, descendant.id().to_string()).expect("panic probe PID must be recorded");
+    }
+    if let Some(path) = std::env::var_os("FINCH_TEST_PANIC_HOME_FILE") {
+        fs::write(
+            path,
+            std::env::var_os("HOME").expect("panic probe requires HOME"),
+        )
+        .expect("panic probe HOME must be recorded");
+    }
+    panic!("intentional supervised child panic probe");
+}
+
 fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--child-panic-probe"))
+        && std::env::args_os().nth(2).is_none()
+    {
+        run_child_panic_probe();
+    }
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new("--verify-inherited-proof"))
         && std::env::args_os().nth(2).is_none()

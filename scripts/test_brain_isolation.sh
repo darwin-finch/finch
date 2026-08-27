@@ -141,6 +141,57 @@ phase=ordinary-nonzero-cleanup
 if run_isolated bash -c 'exit 23'; then exit 1; else test "$?" -eq 23; fi
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
+# A Rust panic after spawning a TERM-resistant descendant still leaves both
+# processes inside the outer supervisor's group. The group must be quiescent
+# before its disposable HOME is removed.
+panic_pid_file="$scratch/panic-descendant.pid"
+panic_home_file="$scratch/panic-home"
+phase=rust-panic-descendant-cleanup
+panic_status=0
+FINCH_TEST_PANIC_DESCENDANT_PID_FILE="$panic_pid_file" \
+FINCH_TEST_PANIC_HOME_FILE="$panic_home_file" \
+  run_isolated "$supervisor" --child-panic-probe >/dev/null 2>&1 || panic_status=$?
+test "$panic_status" -ne 0
+panic_pid="$(cat "$panic_pid_file")"
+! /bin/ps -p "$panic_pid" -o pid= 2>/dev/null | grep -q '[0-9]'
+test ! -e "$(cat "$panic_home_file")"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+# Model an external test timeout while both the leader and a TERM-resistant
+# descendant are live. The watchdog targets only this supervisor instance.
+timeout_target_file="$scratch/timeout-target"
+timeout_descendant_pid_file="$scratch/timeout-descendant.pid"
+timeout_home_file="$scratch/timeout-home"
+phase=timeout-descendant-cleanup
+(
+  for _ in {1..400}; do
+    if [[ -s "$timeout_target_file" ]]; then
+      kill -TERM "$(cat "$timeout_target_file")"
+      exit 0
+    fi
+    sleep 0.005
+  done
+  exit 91
+) & signaler_pid=$!
+timeout_status=0
+FINCH_TIMEOUT_TARGET_FILE="$timeout_target_file" \
+FINCH_TIMEOUT_DESCENDANT_PID_FILE="$timeout_descendant_pid_file" \
+FINCH_TIMEOUT_HOME_FILE="$timeout_home_file" run_isolated bash -c '
+  (trap "" TERM HUP INT; printf "%s\n" "$BASHPID" >"$FINCH_TIMEOUT_DESCENDANT_PID_FILE"; sleep 30) &
+  printf "%s\n" "$HOME" >"$FINCH_TIMEOUT_HOME_FILE"
+  printf "%s\n" "$FINCH_TEST_SUPERVISOR_PID" >"$FINCH_TIMEOUT_TARGET_FILE"
+  sleep 30
+' || timeout_status=$?
+signaler_status=0
+wait "$signaler_pid" || signaler_status=$?
+signaler_pid=''
+test "$signaler_status" -eq 0
+test "$timeout_status" -eq 143
+timeout_descendant_pid="$(cat "$timeout_descendant_pid_file")"
+! /bin/ps -p "$timeout_descendant_pid" -o pid= 2>/dev/null | grep -q '[0-9]'
+test ! -e "$(cat "$timeout_home_file")"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
 # A caller-controlled PATH cannot hide a live group member from the
 # supervisor. The external observer proves HOME exists for the descendant's
 # entire lifetime; cleanup happens only after the trusted /bin/ps inspection
@@ -295,12 +346,12 @@ fi
 rm "$fake_home/.finch/brains/secret-fifo"
 
 socket_path="$fake_home/.finch/brains/secret-socket"
-if command -v python3 >/dev/null 2>&1 && [[ "${#socket_path}" -lt 100 ]]; then
+if command -v perl >/dev/null 2>&1 && [[ "${#socket_path}" -lt 100 ]]; then
   phase=manifest-socket-status
   socket_status=0
   FINCH_REAL_STORE="$fake_home/.finch/brains" \
-    run_isolated python3 -c \
-    'import os,socket; p=os.environ["FINCH_REAL_STORE"]+"/secret-socket"; s=socket.socket(socket.AF_UNIX); s.bind(p); s.close()' \
+    run_isolated perl -MSocket=AF_UNIX,SOCK_STREAM,sockaddr_un -e \
+    'socket(my $socket, AF_UNIX, SOCK_STREAM, 0) or die $!; bind($socket, sockaddr_un($ENV{FINCH_REAL_STORE}."/secret-socket")) or die $!' \
     2>"$diagnostic" || socket_status=$?
   [[ "$socket_status" == 70 ]] || {
     echo "socket manifest adversary returned $socket_status, expected 70" >&2
@@ -341,15 +392,15 @@ FINCH_STUBBORN_PID_FILE="$stubborn_pid_file" FINCH_STUBBORN_READY_FILE="$stubbor
 FINCH_STUBBORN_TERM_FILE="$stubborn_term_file" FINCH_STUBBORN_TARGET_FILE="$stubborn_target_file" \
 FINCH_STUBBORN_HOME_FILE="$stubborn_home_file" run_isolated bash -c '
   leader_pid=$BASHPID
-  python3 -c '\''
-import os, signal, time
-signal.signal(signal.SIGTERM, lambda *_: open(os.environ["FINCH_STUBBORN_TERM_FILE"], "w").write("term\n"))
-signal.signal(signal.SIGHUP, signal.SIG_IGN)
-signal.signal(signal.SIGINT, signal.SIG_IGN)
-open(os.environ["FINCH_STUBBORN_READY_FILE"], "w").write("ready\n")
-while True:
-    time.sleep(1)
-'\'' &
+  perl -e '\''
+$SIG{TERM} = sub { open(my $fh, ">", $ENV{FINCH_STUBBORN_TERM_FILE}) or die $!; print {$fh} "term\n"; close($fh) };
+$SIG{HUP} = "IGNORE";
+$SIG{INT} = "IGNORE";
+open(my $ready, ">", $ENV{FINCH_STUBBORN_READY_FILE}) or die $!;
+print {$ready} "ready\n";
+close($ready);
+sleep 1 while 1;
+  '\'' &
   while [[ ! -s "$FINCH_STUBBORN_READY_FILE" ]]; do sleep 0.005; done
   printf "%s %s\n" "$FINCH_TEST_SUPERVISOR_PID" "$leader_pid" >"$FINCH_STUBBORN_TARGET_FILE"
   printf "%s\n" "$HOME" >"$FINCH_STUBBORN_HOME_FILE"
@@ -388,34 +439,27 @@ mock_finch="$mock_debug_dir/finch"
 mock_bind_log="$scratch/mock-bind.log"
 mkdir -p "$mock_debug_dir" "$mock_release_dir"
 printf '%s\n' \
-  '#!/usr/bin/env python3' \
-  'import json, os, socket, sys' \
-  'from http.server import BaseHTTPRequestHandler, HTTPServer' \
-  'expected = os.environ["FINCH_TEST_DAEMON_ADDR"]' \
-  'if sys.argv[1:] != ["daemon", "--bind", expected]: sys.exit(64)' \
-  'sock = socket.socket(fileno=11)' \
-  'actual = "%s:%s" % sock.getsockname()' \
-  'if actual != expected: sys.exit(65)' \
-  'with open(os.environ["FINCH_MOCK_BIND_LOG"], "a") as log: log.write(expected + "|" + actual + "\n")' \
-  'with open(os.environ["FINCH_TEST_BOUND_ADDR_FILE"], "w") as address: address.write(actual)' \
-  'class Handler(BaseHTTPRequestHandler):' \
-  '    def log_message(self, *_): pass' \
-  '    def send(self, status, body, kind="application/json"):' \
-  '        data = body.encode(); self.send_response(status); self.send_header("Content-Type", kind); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)' \
-  '    def do_GET(self):' \
-  '        if self.path == "/health": self.send(200, "{\"status\":\"ok\"}")' \
-  '        elif self.path == "/metrics": self.send(200, "finch_test 1\n", "text/plain")' \
-  '        else: self.send(404, "{}")' \
-  '    def do_POST(self):' \
-  '        request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))' \
-  '        if any(message.get("role") == "tool" for message in request.get("messages", [])):' \
-  '            response = {"choices":[{"message":{"content":"tool result accepted"}}]}' \
-  '        else:' \
-  '            response = {"choices":[{"message":{"tool_calls":[{"id":"call_test","type":"function","function":{"name":"bash","arguments":"{\\\"command\\\":\\\"ls\\\"}"}}]}}]}' \
-  '        self.send(200, json.dumps(response))' \
-  'server = HTTPServer(("127.0.0.1", 0), Handler, bind_and_activate=False)' \
-  'server.socket = sock; server.server_address = sock.getsockname(); server.server_name = "localhost"; server.server_port = sock.getsockname()[1]' \
-  'server.serve_forever()' >"$mock_finch"
+  '#!/usr/bin/env perl' \
+  'use strict; use warnings; use IO::Socket::INET;' \
+  'my $expected = $ENV{FINCH_TEST_DAEMON_ADDR};' \
+  'exit 64 unless @ARGV == 3 && $ARGV[0] eq "daemon" && $ARGV[1] eq "--bind" && $ARGV[2] eq $expected;' \
+  'my $server = IO::Socket::INET->new_from_fd(11, "r+") or die "listener FD11: $!";' \
+  'my $actual = $server->sockhost().":".$server->sockport();' \
+  'exit 65 unless $actual eq $expected;' \
+  'open(my $log, ">>", $ENV{FINCH_MOCK_BIND_LOG}) or die $!; print {$log} "$expected|$actual\n"; close($log);' \
+  'open(my $address, ">", $ENV{FINCH_TEST_BOUND_ADDR_FILE}) or die $!; print {$address} $actual; close($address);' \
+  'while (my $client = $server->accept()) {' \
+  '  my $request = <$client> // next; my ($method, $path) = split(/ /, $request); my $length = 0;' \
+  '  while (defined(my $line = <$client>) && $line ne "\r\n") { $length = $1 if $line =~ /^Content-Length:\s*(\d+)/i; }' \
+  '  my $body = ""; read($client, $body, $length) if $length;' \
+  '  my ($status, $kind, $response) = (200, "application/json", "{}");' \
+  '  if ($method eq "GET" && $path eq "/health") { $response = "{\\\"status\\\":\\\"ok\\\"}"; }' \
+  '  elsif ($method eq "GET" && $path eq "/metrics") { $kind = "text/plain"; $response = "finch_test 1\n"; }' \
+  '  elsif ($method eq "POST" && $body =~ /"role"\s*:\s*"tool"/) { $response = "{\\\"choices\\\":[{\\\"message\\\":{\\\"content\\\":\\\"tool result accepted\\\"}}]}"; }' \
+  '  elsif ($method eq "POST") { $response = "{\\\"choices\\\":[{\\\"message\\\":{\\\"tool_calls\\\":[{\\\"id\\\":\\\"call_test\\\",\\\"type\\\":\\\"function\\\",\\\"function\\\":{\\\"name\\\":\\\"bash\\\",\\\"arguments\\\":\\\"{\\\\\\\"command\\\\\\\":\\\\\\\"ls\\\\\\\"}\\\"}}]}}]}"; }' \
+  '  else { $status = 404; }' \
+  '  print {$client} "HTTP/1.1 $status OK\r\nContent-Type: $kind\r\nContent-Length: ".length($response)."\r\nConnection: close\r\n\r\n$response"; close($client);' \
+  '}' >"$mock_finch"
 chmod +x "$mock_finch"
 cp "$mock_finch" "$mock_release_dir/finch"
 FINCH_BIN="$mock_finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" \
