@@ -1406,8 +1406,9 @@ mod tests {
     #[test]
     fn test_create_session_boundary_wires_policy_capture_and_structured_manifest() {
         let directory = tempfile::tempdir().unwrap();
-        let output = directory.path().join("diagnostics/compute-plan.ndjson");
-        let unrelated_output = directory.path().join("general-finch.log");
+        let directory_root = fs::canonicalize(directory.path()).unwrap();
+        let output = directory_root.join("diagnostics/compute-plan.ndjson");
+        let unrelated_output = directory_root.join("general-finch.log");
         let ort_log_before = std::env::var_os("ORT_LOG");
         let rust_log_before = std::env::var_os("RUST_LOG");
 
@@ -1488,8 +1489,9 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
-        let target = directory.path().join("target.ndjson");
-        let output = directory.path().join("compute-plan.ndjson");
+        let directory_root = fs::canonicalize(directory.path()).unwrap();
+        let target = directory_root.join("target.ndjson");
+        let output = directory_root.join("compute-plan.ndjson");
         fs::write(&target, "keep").unwrap();
         symlink(&target, &output).unwrap();
 
@@ -1509,8 +1511,9 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
-        let real = directory.path().join("real");
-        let linked = directory.path().join("linked");
+        let directory_root = fs::canonicalize(directory.path()).unwrap();
+        let real = directory_root.join("real");
+        let linked = directory_root.join("linked");
         fs::create_dir(&real).unwrap();
         symlink(&real, &linked).unwrap();
 
@@ -1525,8 +1528,9 @@ mod tests {
     #[ignore = "requires the macOS unified logging service"]
     fn test_coreml_profile_capture_production_log_stream_smoke() {
         let directory = tempfile::tempdir().unwrap();
-        let output = directory.path().join("compute-plan.ndjson");
-        let mut config = OnnxLoadConfig::with_size(ModelSize::Small, directory.path().into());
+        let directory_root = fs::canonicalize(directory.path()).unwrap();
+        let output = directory_root.join("compute-plan.ndjson");
+        let mut config = OnnxLoadConfig::with_size(ModelSize::Small, directory_root);
         config.coreml.profile_compute_plan = true;
         config.coreml_profile_output = Some(output.clone());
         let (_, report) = commit_with_coreml_diagnostics(
