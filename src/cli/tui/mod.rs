@@ -124,42 +124,57 @@ fn poset_to_forth_lines(
 
     let mut lines: Vec<String> = Vec::new();
 
-    // Build predecessor map: node_id → [pred_id, ...]
-    let mut preds: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
-    let mut has_successor: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for &(pred, succ) in &poset.edges {
+    // Canonicalize the graph before rendering. `Poset` exposes its storage so
+    // callers can restore plans, and restored node/edge order is not a semantic
+    // part of the partial order.
+    let node_ids: std::collections::BTreeSet<usize> =
+        poset.nodes.iter().map(|node| node.id).collect();
+    let mut edges: Vec<(usize, usize)> = poset
+        .edges
+        .iter()
+        .copied()
+        .filter(|(pred, succ)| node_ids.contains(pred) && node_ids.contains(succ))
+        .collect();
+    edges.sort_unstable();
+    edges.dedup();
+
+    // Build predecessor map: node_id → [pred_id, ...]. The canonical edge
+    // order also gives every word a stable predecessor call order.
+    let mut preds: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for &(pred, succ) in &edges {
         preds.entry(succ).or_default().push(pred);
-        has_successor.insert(pred);
     }
 
-    // Topological sort (Kahn's algorithm)
-    let mut in_degree: std::collections::HashMap<usize, usize> =
-        poset.nodes.iter().map(|n| (n.id, 0)).collect();
-    for &(_, succ) in &poset.edges {
+    // Stable topological sort (Kahn's algorithm). A min-heap makes the next
+    // ready node independent of randomized HashMap iteration and edge order.
+    let mut in_degree: std::collections::BTreeMap<usize, usize> =
+        node_ids.iter().copied().map(|id| (id, 0)).collect();
+    for &(_, succ) in &edges {
         *in_degree.entry(succ).or_insert(0) += 1;
     }
-    let mut queue: std::collections::VecDeque<usize> = in_degree
+    let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>> = in_degree
         .iter()
         .filter(|(_, &d)| d == 0)
-        .map(|(&id, _)| id)
+        .map(|(&id, _)| std::cmp::Reverse(id))
         .collect();
     let mut topo: Vec<usize> = Vec::new();
-    while let Some(id) = queue.pop_front() {
+    while let Some(std::cmp::Reverse(id)) = ready.pop() {
         topo.push(id);
-        for &(pred, succ) in &poset.edges {
+        for &(pred, succ) in &edges {
             if pred == id {
                 let d = in_degree.entry(succ).or_insert(0);
                 *d = d.saturating_sub(1);
                 if *d == 0 {
-                    queue.push_back(succ);
+                    ready.push(std::cmp::Reverse(succ));
                 }
             }
         }
     }
     // Any remaining (cycles) append in id order.
-    for n in &poset.nodes {
-        if !topo.contains(&n.id) {
-            topo.push(n.id);
+    for &id in &node_ids {
+        if !topo.contains(&id) {
+            topo.push(id);
         }
     }
 
@@ -228,11 +243,11 @@ fn poset_to_forth_lines(
     // we group them on the same line with a `\ concurrent` annotation.
     if lines.len() < max_lines {
         // Compute depth of each node (longest path from a root).
-        let mut depth: std::collections::HashMap<usize, usize> =
-            poset.nodes.iter().map(|n| (n.id, 0)).collect();
+        let mut depth: std::collections::BTreeMap<usize, usize> =
+            node_ids.iter().copied().map(|id| (id, 0)).collect();
         for &id in &topo {
             let d = depth.get(&id).copied().unwrap_or(0);
-            for &(pred, succ) in &poset.edges {
+            for &(pred, succ) in &edges {
                 if pred == id {
                     let entry = depth.entry(succ).or_insert(0);
                     if d + 1 > *entry {
@@ -3752,6 +3767,47 @@ mod tests {
         }
     }
 
+    fn strip_poset_ansi(input: &str) -> String {
+        let mut visible = String::new();
+        let mut chars = input.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '\x1b' {
+                visible.push(ch);
+                continue;
+            }
+            for escape_ch in chars.by_ref() {
+                if escape_ch.is_ascii_alphabetic() || escape_ch == '\x07' {
+                    break;
+                }
+            }
+        }
+        visible
+    }
+
+    fn rendered_word_body(lines: &[String], id: usize) -> String {
+        let header = format!(": W{id}");
+        let start = lines
+            .iter()
+            .position(|line| strip_poset_ansi(line).contains(&header))
+            .unwrap_or_else(|| panic!("missing rendered definition for W{id}"));
+        lines[start + 1..]
+            .iter()
+            .map(|line| strip_poset_ansi(line))
+            .take_while(|line| line.trim() != ";")
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn shuffle_with_seed<T>(values: &mut [T], seed: u64) {
+        let mut state = seed;
+        for upper in (1..values.len()).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            values.swap(upper, (state as usize) % (upper + 1));
+        }
+    }
+
     #[test]
     fn test_poset_empty_produces_only_program() {
         // An empty poset still emits the PROGRAM wrapper word.
@@ -3909,16 +3965,38 @@ mod tests {
         );
         poset.add_edge(0, 1);
         let lines = poset_to_forth_lines(&poset, 80, 40);
-        // W1's definition should mention W0 as a predecessor call
-        let combined = lines.join("\n");
-        // Find W1's definition block and check W0 appears inside it
-        if let Some(w1_pos) = combined.find(": W1") {
-            let after_w1 = &combined[w1_pos..];
-            let semicolon_pos = after_w1.find(';').unwrap_or(after_w1.len());
-            let w1_body = &after_w1[..semicolon_pos];
-            assert!(
-                w1_body.contains("W0"),
-                "W1 body should call W0 (its predecessor)"
+        let w1_body = rendered_word_body(&lines, 1);
+        assert!(
+            w1_body.contains("W0"),
+            "W1 body should call W0 (its predecessor): {w1_body:?}"
+        );
+    }
+
+    #[test]
+    fn test_poset_rendering_is_stable_across_storage_orders() {
+        let mut poset = crate::poset::Poset::new();
+        for label in ["zero", "one", "two", "three", "four", "five"] {
+            poset.add_node(
+                label.to_string(),
+                crate::poset::NodeKind::Task,
+                crate::poset::NodeAuthor::User,
+            );
+        }
+        poset.edges = vec![(2, 3), (0, 3), (1, 3), (3, 4), (1, 4), (4, 5), (2, 5)];
+
+        let expected = poset_to_forth_lines(&poset, 80, 80);
+        assert!(rendered_word_body(&expected, 3).contains("W0 W1 W2"));
+        assert!(rendered_word_body(&expected, 4).contains("W1 W3"));
+        assert!(rendered_word_body(&expected, 5).contains("W2 W4"));
+
+        for seed in 0..64 {
+            let mut shuffled = poset.clone();
+            shuffle_with_seed(&mut shuffled.nodes, seed);
+            shuffle_with_seed(&mut shuffled.edges, seed ^ 0xa5a5_a5a5_a5a5_a5a5);
+            let actual = poset_to_forth_lines(&shuffled, 80, 80);
+            assert_eq!(
+                actual, expected,
+                "rendering changed for node/edge shuffle seed {seed}"
             );
         }
     }
