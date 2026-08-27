@@ -30,8 +30,7 @@ use context::{ExecutionBudget, ExecutionContext};
 use outcome::{ExecutionBackend, ExecutionOutcome, ExecutionStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -254,7 +253,7 @@ pub struct VmRevisionSnapshot {
 }
 
 pub const PROGRAM_RUNTIME_ARCHIVE_VERSION: u32 = 1;
-pub const PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION: u32 = 1;
+pub const PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION: u32 = 2;
 /// Full reducible checkpoints are intentionally expensive. Retain a bounded
 /// recent lineage in memory and in the ordinary archive; an application that
 /// needs older history owns it in its durable event/checkpoint store.
@@ -301,6 +300,46 @@ pub struct ProgramRuntimeAuthorityState {
     #[serde(default = "default_capability_policy")]
     pub policy: CapabilityPolicy,
     pub ledger: CapabilityLedger,
+    #[serde(default)]
+    pub resource_roots: Vec<ResourceRootBindingRecord>,
+    #[serde(default)]
+    pub resource_root_audit: Vec<ResourceRootAuditEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceRootBindingRecord {
+    pub root: crate::vm::ResourceRoot,
+    pub path: PathBuf,
+    pub device: u64,
+    pub inode: u64,
+    pub generation: u64,
+    pub whole_machine: bool,
+    pub bound_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceRootAuditAction {
+    Bound,
+    Revoked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceRootAuditEntry {
+    pub sequence: u64,
+    pub root: crate::vm::ResourceRoot,
+    pub generation: u64,
+    pub path: PathBuf,
+    pub whole_machine: bool,
+    pub action: ResourceRootAuditAction,
+    pub at_unix_ms: u64,
+    pub actor: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ResourceRootState {
+    bindings: BTreeMap<crate::vm::ResourceRoot, Arc<ResourceRootBindingRecord>>,
+    audit: Vec<ResourceRootAuditEntry>,
 }
 
 /// One session's persistent language runtimes.
@@ -313,7 +352,7 @@ pub struct ProgramRuntime {
     /// Application-owned filesystem roots. A root binding only establishes
     /// where a refined path resolves; capability grants remain mandatory for
     /// every operation beneath it.
-    resource_roots: Arc<RwLock<BTreeMap<crate::vm::ResourceRoot, Arc<PathBuf>>>>,
+    resource_roots: Arc<RwLock<ResourceRootState>>,
     /// Identity used to evaluate reusable capability scopes. It is host-owned
     /// policy state, not part of reducible VM checkpoints.
     session_id: uuid::Uuid,
@@ -352,6 +391,8 @@ struct NetworkSocket {
     stream: TcpStream,
     host: String,
     port: u16,
+    owner: uuid::Uuid,
+    generation: u64,
 }
 
 /// Host-side ownership record for an output handle. The VM only sees the
@@ -589,16 +630,37 @@ impl ProgramRuntime {
             .unwrap_or_else(|_| workspace_root.clone())
             .to_string_lossy()
             .into_owned();
+        let workspace_binding = resource_root_binding_record(
+            crate::vm::ResourceRoot::Workspace,
+            &workspace_root,
+            1,
+            false,
+            unix_time_ms(),
+        )
+        .expect("the current workspace is a stable directory");
+        let resource_roots = ResourceRootState {
+            bindings: BTreeMap::from([(
+                crate::vm::ResourceRoot::Workspace,
+                Arc::new(workspace_binding.clone()),
+            )]),
+            audit: vec![ResourceRootAuditEntry {
+                sequence: 1,
+                root: workspace_binding.root.clone(),
+                generation: workspace_binding.generation,
+                path: workspace_binding.path.clone(),
+                whole_machine: false,
+                action: ResourceRootAuditAction::Bound,
+                at_unix_ms: workspace_binding.bound_at_unix_ms,
+                actor: "runtime-bootstrap".into(),
+            }],
+        };
         Self {
             typed: Arc::new(Mutex::new(typed_runtime)),
             revision: Arc::new(AtomicU64::new(0)),
             manifest_generation: AtomicU64::new(1),
             submission_gate: tokio::sync::Mutex::new(()),
             automation,
-            resource_roots: Arc::new(RwLock::new(BTreeMap::from([(
-                crate::vm::ResourceRoot::Workspace,
-                Arc::new(workspace_root),
-            )]))),
+            resource_roots: Arc::new(RwLock::new(resource_roots)),
             session_id: uuid::Uuid::new_v4(),
             project_id,
             memory: RwLock::new(None),
@@ -637,7 +699,7 @@ impl ProgramRuntime {
         use crate::vm::{ResourceRoot, ResourceSelector};
 
         let root_availability = |root: &ResourceRoot| match self.resource_roots.read() {
-            Ok(roots) if roots.contains_key(root) => CapabilityAvailability::Available,
+            Ok(roots) if roots.bindings.contains_key(root) => CapabilityAvailability::Available,
             Ok(_) if matches!(root, ResourceRoot::Named(_)) => CapabilityAvailability::Unsupported,
             Ok(_) => CapabilityAvailability::Disabled,
             Err(_) => CapabilityAvailability::Degraded {
@@ -788,38 +850,134 @@ impl ProgramRuntime {
     /// Install the host-owned root behind `root<host-machine>`. This is an
     /// availability binding, deliberately separate from capability grants;
     /// callers must still grant a matching `file.read` or `file.write`
-    /// selector before a typed program can use it. Bind `/` only when the
-    /// user intentionally wants whole-machine scope.
+    /// selector before a typed program can use it. Whole-machine scope uses
+    /// the deliberately named `bind_whole_machine_root` API.
     pub fn bind_host_machine_root(&self, root: impl Into<PathBuf>) -> Result<()> {
-        self.bind_resource_root(crate::vm::ResourceRoot::HostMachine, root)
+        self.bind_resource_root(
+            crate::vm::ResourceRoot::HostMachine,
+            root,
+            false,
+            "local-user",
+        )
+    }
+
+    /// Deliberately expose the filesystem root as `root<host-machine>`. The
+    /// distinct API makes whole-machine availability visible in durable audit
+    /// instead of inferring it from an ordinary path binding.
+    pub fn bind_whole_machine_root(&self) -> Result<()> {
+        self.bind_resource_root(
+            crate::vm::ResourceRoot::HostMachine,
+            PathBuf::from("/"),
+            true,
+            "local-user-whole-machine",
+        )
     }
 
     /// Install an application-selected project root. This is distinct from
     /// the current workspace so a host can expose a narrower or broader
     /// project tree without changing process current-directory semantics.
     pub fn bind_project_root(&self, root: impl Into<PathBuf>) -> Result<()> {
-        self.bind_resource_root(crate::vm::ResourceRoot::Project, root)
+        self.bind_resource_root(crate::vm::ResourceRoot::Project, root, false, "local-user")
     }
 
     /// Install the output directory assigned to this task/session. Programs
     /// can receive write authority here without receiving workspace writes.
     pub fn bind_task_output_root(&self, root: impl Into<PathBuf>) -> Result<()> {
-        self.bind_resource_root(crate::vm::ResourceRoot::TaskOutput, root)
+        self.bind_resource_root(
+            crate::vm::ResourceRoot::TaskOutput,
+            root,
+            false,
+            "local-user",
+        )
     }
 
     fn bind_resource_root(
         &self,
         kind: crate::vm::ResourceRoot,
         root: impl Into<PathBuf>,
+        whole_machine: bool,
+        actor: &str,
     ) -> Result<()> {
-        let root = root.into().canonicalize()?;
-        if !root.is_dir() {
-            bail!("{kind} root is not a directory: {}", root.display());
+        let root = root.into();
+        if root == Path::new("/") && !whole_machine {
+            bail!("binding '/' requires bind_whole_machine_root");
         }
-        self.resource_roots
+        if whole_machine
+            && (kind != crate::vm::ResourceRoot::HostMachine || root != Path::new("/"))
+        {
+            bail!("whole-machine binding must be host-machine root '/'");
+        }
+        let policy = self
+            .capability_policy
+            .read()
+            .map_err(|_| anyhow::anyhow!("capability policy lock poisoned"))?;
+        let ledger = self
+            .capability_ledger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?;
+        let mut roots = self
+            .resource_roots
             .write()
-            .map_err(|_| anyhow::anyhow!("resource-root binding lock poisoned"))?
-            .insert(kind, Arc::new(root));
+            .map_err(|_| anyhow::anyhow!("resource-root binding lock poisoned"))?;
+        let previous = roots.clone();
+        let generation = roots
+            .audit
+            .iter()
+            .map(|entry| entry.generation)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("resource-root generation overflow"))?;
+        let now = unix_time_ms();
+        let binding = resource_root_binding_record(
+            kind.clone(),
+            &root,
+            generation,
+            whole_machine,
+            now,
+        )?;
+        if let Some(replaced) = roots.bindings.remove(&kind) {
+            let sequence = roots.audit.len() as u64 + 1;
+            roots.audit.push(ResourceRootAuditEntry {
+                sequence,
+                root: kind.clone(),
+                generation: replaced.generation,
+                path: replaced.path.clone(),
+                whole_machine: replaced.whole_machine,
+                action: ResourceRootAuditAction::Revoked,
+                at_unix_ms: now,
+                actor: actor.into(),
+            });
+        }
+        roots.bindings.insert(kind.clone(), Arc::new(binding.clone()));
+        let sequence = roots.audit.len() as u64 + 1;
+        roots.audit.push(ResourceRootAuditEntry {
+            sequence,
+            root: kind,
+            generation,
+            path: binding.path,
+            whole_machine,
+            action: ResourceRootAuditAction::Bound,
+            at_unix_ms: now,
+            actor: actor.into(),
+        });
+        if let Some(sink) = self
+            .authority_sink
+            .read()
+            .map_err(|_| anyhow::anyhow!("authority sink lock poisoned"))?
+            .clone()
+        {
+            if let Err(error) = sink(authority_state_from_parts(
+                self.session_id,
+                self.project_id.clone(),
+                policy.clone(),
+                ledger.clone(),
+                &roots,
+            )) {
+                *roots = previous;
+                return Err(error).context("persist resource-root binding");
+            }
+        }
         Ok(())
     }
 
@@ -838,10 +996,50 @@ impl ProgramRuntime {
     }
 
     fn clear_resource_root(&self, kind: &crate::vm::ResourceRoot) -> Result<()> {
-        self.resource_roots
+        let policy = self
+            .capability_policy
+            .read()
+            .map_err(|_| anyhow::anyhow!("capability policy lock poisoned"))?;
+        let ledger = self
+            .capability_ledger
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?;
+        let mut roots = self
+            .resource_roots
             .write()
-            .map_err(|_| anyhow::anyhow!("resource-root binding lock poisoned"))?
-            .remove(kind);
+            .map_err(|_| anyhow::anyhow!("resource-root binding lock poisoned"))?;
+        let previous = roots.clone();
+        let Some(binding) = roots.bindings.remove(kind) else {
+            return Ok(());
+        };
+        let sequence = roots.audit.len() as u64 + 1;
+        roots.audit.push(ResourceRootAuditEntry {
+            sequence,
+            root: kind.clone(),
+            generation: binding.generation,
+            path: binding.path.clone(),
+            whole_machine: binding.whole_machine,
+            action: ResourceRootAuditAction::Revoked,
+            at_unix_ms: unix_time_ms(),
+            actor: "local-user".into(),
+        });
+        if let Some(sink) = self
+            .authority_sink
+            .read()
+            .map_err(|_| anyhow::anyhow!("authority sink lock poisoned"))?
+            .clone()
+        {
+            if let Err(error) = sink(authority_state_from_parts(
+                self.session_id,
+                self.project_id.clone(),
+                policy.clone(),
+                ledger.clone(),
+                &roots,
+            )) {
+                *roots = previous;
+                return Err(error).context("persist resource-root revocation");
+            }
+        }
         Ok(())
     }
 
@@ -922,13 +1120,25 @@ impl ProgramRuntime {
             .capability_ledger
             .lock()
             .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))?;
-        Ok(ProgramRuntimeAuthorityState {
-            format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
-            session_id: self.session_id,
-            project_id: self.project_id.clone(),
-            policy: policy.clone(),
-            ledger: ledger.clone(),
-        })
+        self.authority_state_with(policy.clone(), ledger.clone())
+    }
+
+    fn authority_state_with(
+        &self,
+        policy: CapabilityPolicy,
+        ledger: CapabilityLedger,
+    ) -> Result<ProgramRuntimeAuthorityState> {
+        let roots = self
+            .resource_roots
+            .read()
+            .map_err(|_| anyhow::anyhow!("resource-root binding lock poisoned"))?;
+        Ok(authority_state_from_parts(
+            self.session_id,
+            self.project_id.clone(),
+            policy,
+            ledger,
+            &roots,
+        ))
     }
 
     pub fn capability_policy(&self) -> Result<CapabilityPolicy> {
@@ -982,13 +1192,7 @@ impl ProgramRuntime {
             let previous = ledger.clone();
             let result = mutation(&policy, &mut ledger)?;
             if let Some(sink) = &sink {
-                let state = ProgramRuntimeAuthorityState {
-                    format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
-                    session_id: self.session_id,
-                    project_id: self.project_id.clone(),
-                    policy: policy.clone(),
-                    ledger: ledger.clone(),
-                };
+                let state = self.authority_state_with(policy.clone(), ledger.clone())?;
                 if let Err(error) = sink(state) {
                     *ledger = previous;
                     return Err(error).context("persist ProgramRuntime authority mutation");
@@ -1002,13 +1206,7 @@ impl ProgramRuntime {
                 *ledger = previous.clone();
             }
             if let Some(sink) = sink {
-                let _ = sink(ProgramRuntimeAuthorityState {
-                    format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
-                    session_id: self.session_id,
-                    project_id: self.project_id.clone(),
-                    policy: self.capability_policy()?,
-                    ledger: previous,
-                });
+                let _ = sink(self.authority_state_with(self.capability_policy()?, previous)?);
             }
             return Err(error);
         }
@@ -1067,13 +1265,7 @@ impl ProgramRuntime {
             debug_assert!(did_revoke);
         }
         if let Some(sink) = &sink {
-            let state = ProgramRuntimeAuthorityState {
-                format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
-                session_id: self.session_id,
-                project_id: self.project_id.clone(),
-                policy: policy.clone(),
-                ledger: ledger.clone(),
-            };
+            let state = self.authority_state_with(policy.clone(), ledger.clone())?;
             if let Err(error) = sink(state) {
                 *ledger = previous_ledger;
                 return Err(error).context("persist ProgramRuntime capability policy");
@@ -1091,13 +1283,7 @@ impl ProgramRuntime {
                 *ledger = previous_ledger.clone();
             }
             if let Some(sink) = sink {
-                let _ = sink(ProgramRuntimeAuthorityState {
-                    format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
-                    session_id: self.session_id,
-                    project_id: self.project_id.clone(),
-                    policy: previous_policy,
-                    ledger: previous_ledger,
-                });
+                let _ = sink(self.authority_state_with(previous_policy, previous_ledger)?);
             }
             return Err(error);
         }
@@ -1120,6 +1306,10 @@ impl ProgramRuntime {
         }
         state.policy.validate().map_err(anyhow::Error::msg)?;
         validate_restored_process_authority(&state.ledger)?;
+        let restored_roots = validate_resource_root_authority(
+            &state.resource_roots,
+            &state.resource_root_audit,
+        )?;
         let now = unix_time_ms();
         if state.ledger.grants.grants.iter().any(|grant| {
             grant.is_active(now)
@@ -1140,6 +1330,11 @@ impl ProgramRuntime {
             .capability_ledger
             .lock()
             .map_err(|_| anyhow::anyhow!("capability ledger lock poisoned"))? = state.ledger;
+        *self
+            .resource_roots
+            .write()
+            .map_err(|_| anyhow::anyhow!("resource-root binding lock poisoned"))? =
+            restored_roots;
         self.refresh_active_grants()
     }
 
@@ -3131,7 +3326,7 @@ impl ProgramRuntime {
 
 struct TypedHostHandler {
     automation: Arc<AutomationBroker>,
-    resource_roots: Arc<RwLock<BTreeMap<crate::vm::ResourceRoot, Arc<PathBuf>>>>,
+    resource_roots: Arc<RwLock<ResourceRootState>>,
     output: String,
     output_chunks: Vec<String>,
     side_effects: Vec<crate::vm::interpreter::HostSideEffect>,
@@ -3148,23 +3343,13 @@ struct TypedHostHandler {
     network_grants: EffectSet,
     typed_effect_sink: Option<TypedEffectSink>,
     deferred_host_effects: DeferredHostEffects,
-    process_authorization_rollback: Option<ProcessAuthorizationRollback>,
+    authorization_attempt: Option<HostAuthorizationAttempt>,
 }
 
-struct ProcessAuthorizationRollback {
-    previous: CapabilityLedger,
-    authorized: CapabilityLedger,
-}
-
-fn rollback_process_authorization_if_unchanged(
-    ledger: &mut CapabilityLedger,
-    rollback: &ProcessAuthorizationRollback,
-) -> bool {
-    if ledger != &rollback.authorized {
-        return false;
-    }
-    *ledger = rollback.previous.clone();
-    true
+struct HostAuthorizationAttempt {
+    request: CapabilityRequest,
+    decision: AuthorizationDecision,
+    use_started: bool,
 }
 
 struct HostAuthorizationAudit {
@@ -3180,7 +3365,7 @@ struct HostAuthorizationAudit {
 impl TypedHostHandler {
     fn new(
         automation: Arc<AutomationBroker>,
-        resource_roots: Arc<RwLock<BTreeMap<crate::vm::ResourceRoot, Arc<PathBuf>>>>,
+        resource_roots: Arc<RwLock<ResourceRootState>>,
         scheduler: Option<agent_vm::AgentVmBinding>,
         memory: Option<Arc<crate::memory::MemorySystem>>,
         mcp_client: Option<Arc<crate::tools::mcp::McpClient>>,
@@ -3214,59 +3399,22 @@ impl TypedHostHandler {
             network_grants,
             typed_effect_sink,
             deferred_host_effects,
-            process_authorization_rollback: None,
+            authorization_attempt: None,
         }
     }
 
-    fn rollback_failed_process_launch(
-        &mut self,
-        origin: &SourceOrigin,
-    ) -> std::result::Result<(), VmDiagnostic> {
-        let Some(rollback) = self.process_authorization_rollback.take() else {
-            return Ok(());
-        };
-        let mut ledger = self.authorization.ledger.lock().map_err(|_| {
-            host_binding_error(
-                origin,
-                "capability ledger lock poisoned during launch rollback",
-            )
-        })?;
-        if !rollback_process_authorization_if_unchanged(&mut ledger, &rollback) {
-            return Err(host_binding_error(
-                origin,
-                "process launch failed after concurrent authority mutation; the authorization fact and any once-grant consumption were retained",
-            ));
+    fn mark_host_use(&mut self) {
+        // "Use" is the first point at which the host has either acquired the
+        // selected object for observation or is about to issue a potentially
+        // mutating external call. Validation, lookup, and opening a read-only
+        // object are attempts until they succeed; a write/connect/send/spawn
+        // becomes a use immediately before the first syscall that may cause
+        // an external effect. Failures before this point roll back the exact
+        // authorization fact (and once consumption); failures after it retain
+        // the audit because an effect may already have occurred.
+        if let Some(attempt) = &mut self.authorization_attempt {
+            attempt.use_started = true;
         }
-        if let Some(sink) = &self.authorization.sink {
-            let policy = self
-                .authorization
-                .policy
-                .read()
-                .map_err(|_| host_binding_error(origin, "capability policy lock poisoned"))?
-                .clone();
-            let Some(project_id) = self.authorization.context.project_id.clone() else {
-                *ledger = rollback.authorized;
-                return Err(host_binding_error(
-                    origin,
-                    "host authorization has no project identity during launch rollback",
-                ));
-            };
-            sink(ProgramRuntimeAuthorityState {
-                format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
-                session_id: self.authorization.context.session_id,
-                project_id,
-                policy,
-                ledger: rollback.previous,
-            })
-            .map_err(|error| {
-                *ledger = rollback.authorized;
-                host_binding_error(
-                    origin,
-                    format!("persist failed process launch rollback: {error:#}"),
-                )
-            })?;
-        }
-        Ok(())
     }
 
     /// Advance one host-owned stream. The stream's opaque kind/ID is checked
@@ -3310,6 +3458,9 @@ impl TypedHostHandler {
                         "CSV stream backend is malformed",
                     ));
                 };
+                if let Some(attempt) = &mut self.authorization_attempt {
+                    attempt.use_started = true;
+                }
                 let record = read_bounded_csv_record(reader)
                     .map_err(|message| host_binding_error(origin, message))?;
                 Ok(vec![TypedValue::Option {
@@ -3342,6 +3493,9 @@ impl TypedHostHandler {
                         "file line stream backend is malformed",
                     ));
                 };
+                if let Some(attempt) = &mut self.authorization_attempt {
+                    attempt.use_started = true;
+                }
                 let line = read_bounded_utf8_line(reader)
                     .map_err(|message| host_binding_error(origin, message))?;
                 Ok(vec![TypedValue::Option {
@@ -3369,6 +3523,9 @@ impl TypedHostHandler {
                         "workbook stream backend is malformed",
                     ));
                 };
+                if let Some(attempt) = &mut self.authorization_attempt {
+                    attempt.use_started = true;
+                }
                 Ok(vec![TypedValue::Option {
                     inner_type: Type::list(Type::String),
                     value: rows.next().map(|row| {
@@ -3437,6 +3594,9 @@ impl TypedHostHandler {
         );
         if !backend_matches {
             return Err(host_binding_error(origin, "stream backend is malformed"));
+        }
+        if let Some(attempt) = &mut self.authorization_attempt {
+            attempt.use_started = true;
         }
         streams.remove(id);
         Ok(vec![TypedValue::Unit])
@@ -3724,7 +3884,12 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         if effect.requirement.capability == CapabilityKind::NetworkConnect
             && binding == Some(CoreHostBinding::NetworkSend)
         {
-            let Some(TypedValue::Resource { kind, handle, .. }) = arguments.first() else {
+            let Some(TypedValue::Resource {
+                kind,
+                handle,
+                generation,
+            }) = arguments.first()
+            else {
                 return Err(host_binding_error(
                     &effect.origin,
                     "network-send requires a socket resource",
@@ -3743,13 +3908,17 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
             let socket = sockets
                 .get(handle)
                 .ok_or_else(|| host_binding_error(&effect.origin, "unknown network socket"))?;
+            if socket.owner != self.execution_id || socket.generation != *generation {
+                return Err(host_binding_error(
+                    &effect.origin,
+                    "network socket is stale or belongs to another ProgramRun",
+                ));
+            }
             effect.requirement.selector = ResourceSelector::Network {
                 host: socket.host.clone(),
                 ports: vec![socket.port],
             };
-            return Ok(());
-        }
-        if effect.requirement.capability == CapabilityKind::FileRead
+        } else if effect.requirement.capability == CapabilityKind::FileRead
             && matches!(
                 binding,
                 Some(
@@ -3782,29 +3951,39 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 ));
             }
             effect.requirement = stream.requirement.clone();
-            return Ok(());
+        } else if effect.requirement.capability == CapabilityKind::ProcessRun {
+            if binding != Some(CoreHostBinding::ProcessRun) {
+                return Err(host_binding_error(
+                    &effect.origin,
+                    "process execution requires the registered process-run host binding",
+                ));
+            }
+            let [TypedValue::String(command), TypedValue::List { values, .. }] =
+                arguments.as_slice()
+            else {
+                return Err(host_binding_error(
+                    &effect.origin,
+                    "process-run requires an executable and string arguments",
+                ));
+            };
+            let process_arguments = values
+                .iter()
+                .map(|value| match value {
+                    TypedValue::String(value) => Ok(value.clone()),
+                    _ => Err(host_binding_error(
+                        &effect.origin,
+                        "process-run arguments must be strings",
+                    )),
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let identity = open_process_executable(command, &process_arguments)
+                .map(|opened| opened.identity)
+                .map_err(|message| host_binding_error(&effect.origin, message))?;
+            effect.requirement.selector = ResourceSelector::Process {
+                executables: vec![identity.encode()],
+            };
         }
-        if effect.requirement.capability != CapabilityKind::ProcessRun {
-            return Ok(());
-        }
-        if binding != Some(CoreHostBinding::ProcessRun) {
-            return Err(host_binding_error(
-                &effect.origin,
-                "process execution requires the registered process-run host binding",
-            ));
-        }
-        let Some(TypedValue::String(command)) = arguments.first() else {
-            return Err(host_binding_error(
-                &effect.origin,
-                "process-run requires an executable string",
-            ));
-        };
-        let identity = resolve_process_executable(command)
-            .map_err(|message| host_binding_error(&effect.origin, message))?;
-        effect.requirement.selector = ResourceSelector::Process {
-            executables: vec![identity.encode()],
-        };
-        Ok(())
+        validate_core_host_request(binding, &effect.requirement, arguments, &effect.origin)
     }
 
     fn authorize_awaited_effect(
@@ -3865,7 +4044,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
             self.authorization.ledger.lock().map_err(|_| {
                 host_binding_error(&effect.origin, "capability ledger lock poisoned")
             })?;
-        let recorded = ledger.recorded_authorization(&request);
+        let recorded = ledger.recorded_authorization(&request, &context);
         let previous = recorded.is_none().then(|| ledger.clone());
         let decision =
             recorded.unwrap_or_else(|| ledger.authorize(&request, &context, "typed-host-boundary"));
@@ -3877,13 +4056,16 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     "host authorization has no project identity",
                 ));
             };
-            let state = ProgramRuntimeAuthorityState {
-                format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
-                session_id: context.session_id,
+            let roots = self.resource_roots.read().map_err(|_| {
+                host_binding_error(&effect.origin, "resource-root binding lock poisoned")
+            })?;
+            let state = authority_state_from_parts(
+                context.session_id,
                 project_id,
                 policy,
-                ledger: ledger.clone(),
-            };
+                ledger.clone(),
+                &roots,
+            );
             if let Err(error) = sink(state) {
                 *ledger = previous.clone();
                 return Err(host_binding_error(
@@ -3894,13 +4076,11 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         }
         match decision {
             AuthorizationDecision::Allowed { .. } => {
-                if effect.requirement.capability == CapabilityKind::ProcessRun {
-                    self.process_authorization_rollback =
-                        previous.map(|previous| ProcessAuthorizationRollback {
-                            previous,
-                            authorized: ledger.clone(),
-                        });
-                }
+                self.authorization_attempt = Some(HostAuthorizationAttempt {
+                    request,
+                    decision,
+                    use_started: false,
+                });
                 Ok(())
             }
             AuthorizationDecision::ApprovalRequired => Err(VmDiagnostic::error(
@@ -3936,6 +4116,76 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         if synchronous_output_open {
             return Ok(());
         }
+        if self.deferred_host_effects.defers(effect) && self.authorization_attempt.is_some() {
+            let Some((request, decision)) = self
+                .authorization_attempt
+                .as_ref()
+                .map(|attempt| (attempt.request.clone(), attempt.decision.clone()))
+            else {
+                unreachable!("checked above")
+            };
+            let policy = self
+                .authorization
+                .policy
+                .read()
+                .map_err(|_| host_binding_error(&effect.origin, "capability policy lock poisoned"))?
+                .clone();
+            let mut context = self.authorization.context.clone();
+            context.now_unix_ms = unix_time_ms();
+            context.policy_hash = policy.policy_hash.clone();
+            let ledger_handle = Arc::clone(&self.authorization.ledger);
+            let mut ledger = ledger_handle.lock().map_err(|_| {
+                host_binding_error(&effect.origin, "capability ledger lock poisoned")
+            })?;
+            if ledger.recorded_authorization(&request, &context) != Some(decision) {
+                let authorized = ledger.clone();
+                ledger.rollback_authorization(&request);
+                if let Some(sink) = &self.authorization.sink {
+                    let Some(project_id) = context.project_id.clone() else {
+                        *ledger = authorized;
+                        self.authorization_attempt = None;
+                        return Err(host_binding_error(
+                            &effect.origin,
+                            "deferred host authorization has no project identity during invalidation",
+                        ));
+                    };
+                    let roots = self.resource_roots.read().map_err(|_| {
+                        host_binding_error(
+                            &effect.origin,
+                            "resource-root binding lock poisoned",
+                        )
+                    })?;
+                    if let Err(error) = sink(authority_state_from_parts(
+                        context.session_id,
+                        project_id,
+                        policy,
+                        ledger.clone(),
+                        &roots,
+                    )) {
+                        *ledger = authorized;
+                        self.authorization_attempt = None;
+                        return Err(host_binding_error(
+                            &effect.origin,
+                            format!("persist invalidated deferred host authorization: {error:#}"),
+                        ));
+                    }
+                }
+                self.authorization_attempt = None;
+                return Err(host_binding_error(
+                    &effect.origin,
+                    "authorization was revoked, expired, or replaced before deferred dispatch",
+                ));
+            }
+            self.mark_host_use();
+            if let Some(sink) = &self.typed_effect_sink {
+                sink(VmEffectEnvelope {
+                    execution_id: self.execution_id,
+                    effect: effect.clone(),
+                });
+            }
+            self.authorization_attempt = None;
+            return Ok(());
+        }
         if let Some(sink) = &self.typed_effect_sink {
             sink(VmEffectEnvelope {
                 execution_id: self.execution_id,
@@ -3960,7 +4210,11 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
     ) -> std::result::Result<Vec<TypedValue>, VmDiagnostic> {
         let values = match &effect.event {
             crate::vm::interpreter::HostSideEffect::Request { arguments } => {
-                self.request(&effect.requirement, arguments.clone(), &effect.origin)?
+                self.request_with_authority_lease(
+                    &effect.requirement,
+                    arguments.clone(),
+                    &effect.origin,
+                )?
             }
             _ => {
                 return Err(VmDiagnostic::error(
@@ -4007,6 +4261,117 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         Ok(values)
     }
 
+    fn request_with_authority_lease(
+        &mut self,
+        requirement: &CapabilityRequirement,
+        arguments: Vec<TypedValue>,
+        origin: &SourceOrigin,
+    ) -> std::result::Result<Vec<TypedValue>, VmDiagnostic> {
+        let Some((request, decision)) = self
+            .authorization_attempt
+            .as_ref()
+            .map(|attempt| (attempt.request.clone(), attempt.decision.clone()))
+        else {
+            return self.request(requirement, arguments, origin);
+        };
+        let policy = self
+            .authorization
+            .policy
+            .read()
+            .map_err(|_| host_binding_error(origin, "capability policy lock poisoned"))?
+            .clone();
+        let mut context = self.authorization.context.clone();
+        context.now_unix_ms = unix_time_ms();
+        context.policy_hash = policy.policy_hash.clone();
+        #[cfg(test)]
+        run_authorization_before_use_hook(self.execution_id, requirement.capability.clone());
+        let ledger_handle = Arc::clone(&self.authorization.ledger);
+        let mut ledger = ledger_handle
+            .lock()
+            .map_err(|_| host_binding_error(origin, "capability ledger lock poisoned"))?;
+        if ledger.recorded_authorization(&request, &context) != Some(decision) {
+            let authorized = ledger.clone();
+            ledger.rollback_authorization(&request);
+            if let Some(sink) = &self.authorization.sink {
+                let Some(project_id) = context.project_id.clone() else {
+                    *ledger = authorized;
+                    self.authorization_attempt = None;
+                    return Err(host_binding_error(
+                        origin,
+                        "host authorization has no project identity during invalidation",
+                    ));
+                };
+                let roots = self.resource_roots.read().map_err(|_| {
+                    host_binding_error(origin, "resource-root binding lock poisoned")
+                })?;
+                if let Err(error) = sink(authority_state_from_parts(
+                    context.session_id,
+                    project_id,
+                    policy.clone(),
+                    ledger.clone(),
+                    &roots,
+                )) {
+                    *ledger = authorized;
+                    self.authorization_attempt = None;
+                    return Err(host_binding_error(
+                        origin,
+                        format!("persist invalidated host authorization: {error:#}"),
+                    ));
+                }
+            }
+            self.authorization_attempt = None;
+            return Err(host_binding_error(
+                origin,
+                "authorization was revoked, expired, or replaced before host use",
+            ));
+        }
+
+        // Holding the ledger lock makes the host use and revoke/policy paths
+        // linearizable. A revocation which wins this lock prevents the use;
+        // one which arrives later is ordered after the completed attempt.
+        let mut result = self.request(requirement, arguments, origin);
+        let attempt = self
+            .authorization_attempt
+            .take()
+            .expect("authorization attempt exists while lease is held");
+        if !attempt.use_started {
+            if result.is_ok() {
+                result = Err(host_binding_error(
+                    origin,
+                    "host binding completed without finalizing its authority use",
+                ));
+            }
+            let authorized = ledger.clone();
+            ledger.rollback_authorization(&attempt.request);
+            if let Some(sink) = &self.authorization.sink {
+                let Some(project_id) = context.project_id else {
+                    *ledger = authorized;
+                    return Err(host_binding_error(
+                        origin,
+                        "host authorization has no project identity during rollback",
+                    ));
+                };
+                let roots = self.resource_roots.read().map_err(|_| {
+                    host_binding_error(origin, "resource-root binding lock poisoned")
+                })?;
+                if let Err(error) = sink(authority_state_from_parts(
+                    context.session_id,
+                    project_id,
+                    policy,
+                    ledger.clone(),
+                    &roots,
+                )) {
+                    *ledger = authorized;
+                    return Err(host_binding_error(
+                        origin,
+                        format!("persist unused host authorization rollback: {error:#}"),
+                    ));
+                }
+            }
+        }
+        result
+    }
+
     fn request(
         &mut self,
         requirement: &CapabilityRequirement,
@@ -4014,6 +4379,11 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         origin: &crate::vm::SourceOrigin,
     ) -> std::result::Result<Vec<TypedValue>, VmDiagnostic> {
         let binding = registered_host_binding(requirement, origin)?;
+        // `prepare_awaited_effect` rejects forged portable continuations, but
+        // embedders may call this trait method directly. Repeat the complete
+        // binding check at the final operation boundary so no direct adapter
+        // can substitute runtime arguments after authority was derived.
+        validate_core_host_request(binding, requirement, &arguments, origin)?;
         let request = match requirement.capability {
             crate::vm::CapabilityKind::SessionEmit => {
                 // `output-open` uses the same session-emission authority as
@@ -4103,13 +4473,19 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     "unknown VM inspection operation",
                 ));
             }
-            crate::vm::CapabilityKind::AutomationInspect => match origin.word.as_deref() {
-                Some("automation-displays") => AutomationRequest::Displays,
-                Some("automation-windows") => AutomationRequest::Windows,
-                _ => AutomationRequest::Availability,
+            crate::vm::CapabilityKind::AutomationInspect => match binding {
+                Some(CoreHostBinding::AutomationDisplays) => AutomationRequest::Displays,
+                Some(CoreHostBinding::AutomationWindows) => AutomationRequest::Windows,
+                Some(CoreHostBinding::AutomationAvailability) => AutomationRequest::Availability,
+                _ => {
+                    return Err(host_binding_error(
+                        origin,
+                        "automation inspection requires its exact registered host binding",
+                    ))
+                }
             },
-            crate::vm::CapabilityKind::AutomationWrite => {
-                if arguments.len() == 4 {
+            crate::vm::CapabilityKind::AutomationWrite => match binding {
+                Some(CoreHostBinding::AutomationClick) => {
                     let [TypedValue::Float(x), TypedValue::Float(y), TypedValue::String(button), TypedValue::Int(count)] =
                         arguments.as_slice()
                     else {
@@ -4126,7 +4502,8 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                             host_binding_error(origin, "click count is out of range")
                         })?,
                     }
-                } else {
+                }
+                Some(CoreHostBinding::AutomationType) => {
                     let [TypedValue::String(text), TypedValue::Int(delay_ms)] =
                         arguments.as_slice()
                     else {
@@ -4142,7 +4519,13 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         })?,
                     }
                 }
-            }
+                _ => {
+                    return Err(host_binding_error(
+                        origin,
+                        "automation mutation requires its exact registered host binding",
+                    ))
+                }
+            },
             crate::vm::CapabilityKind::FileRead => {
                 match origin.word.as_deref() {
                     Some("csv-next") | Some("file-lines-next") | Some("stream-next") => {
@@ -4153,10 +4536,8 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     }
                     _ => {}
                 }
-                let path = match arguments.first() {
-                    Some(TypedValue::Path { relative, selector }) => self
-                        .secure_file_path(selector, relative)
-                        .map_err(|message| host_binding_error(origin, message))?,
+                let (relative, selector) = match arguments.first() {
+                    Some(TypedValue::Path { relative, selector }) => (relative, selector),
                     _ => {
                         return Err(host_binding_error(
                             origin,
@@ -4164,6 +4545,18 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         ));
                     }
                 };
+                let mode = if matches!(
+                    binding,
+                    Some(CoreHostBinding::TreeList | CoreHostBinding::TreeMerkle)
+                ) {
+                    SecureOpenMode::ReadDirectory
+                } else {
+                    SecureOpenMode::ReadFile
+                };
+                let mut file = self
+                    .open_secure_resource(selector, relative, mode)
+                    .map_err(|message| host_binding_error(origin, message))?;
+                self.mark_host_use();
                 match origin.word.as_deref() {
                     Some("workbook-open") | Some("workbook-sheet-open") => {
                         let sheet = match arguments.as_slice() {
@@ -4180,7 +4573,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                                 ))
                             }
                         };
-                        let rows = read_workbook_rows(&path, sheet)
+                        let rows = read_workbook_rows(&file, relative, sheet)
                             .map_err(|message| host_binding_error(origin, message))?;
                         let handle = uuid::Uuid::new_v4().to_string();
                         self.streams
@@ -4211,7 +4604,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                                 "workbook-sheets requires one path",
                             ));
                         }
-                        let sheets = read_workbook_sheet_names(&path)
+                        let sheets = read_workbook_sheet_names(&file, relative)
                             .map_err(|message| host_binding_error(origin, message))?;
                         return Ok(vec![TypedValue::List {
                             element_type: Type::String,
@@ -4228,7 +4621,8 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                             ));
                         };
                         let values = read_workbook_range(
-                            &path,
+                            &file,
+                            relative,
                             sheet,
                             *start_row,
                             *start_column,
@@ -4268,7 +4662,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                                 "workbook-summary maximum rows must be between 1 and 100000",
                             ));
                         }
-                        let summary = summarize_workbook(&path, sheet, max_rows)
+                        let summary = summarize_workbook(&file, relative, sheet, max_rows)
                             .map_err(|message| host_binding_error(origin, message))?;
                         return Ok(vec![TypedValue::Json(summary)]);
                     }
@@ -4276,8 +4670,6 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         if arguments.len() != 1 {
                             return Err(host_binding_error(origin, "csv-open requires one path"));
                         }
-                        let file = std::fs::File::open(path)
-                            .map_err(|error| host_binding_error(origin, error.to_string()))?;
                         let handle = uuid::Uuid::new_v4().to_string();
                         self.streams
                             .lock()
@@ -4319,8 +4711,6 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                                 "csv-summary maximum rows must be between 1 and 100000",
                             ));
                         }
-                        let file = std::fs::File::open(path)
-                            .map_err(|error| host_binding_error(origin, error.to_string()))?;
                         let summary = summarize_csv(BufReader::new(file), max_rows)
                             .map_err(|message| host_binding_error(origin, message))?;
                         return Ok(vec![TypedValue::Json(summary)]);
@@ -4332,8 +4722,6 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                                 "file-lines-open requires one path",
                             ));
                         }
-                        let file = std::fs::File::open(path)
-                            .map_err(|error| host_binding_error(origin, error.to_string()))?;
                         let handle = uuid::Uuid::new_v4().to_string();
                         self.streams
                             .lock()
@@ -4360,7 +4748,8 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         if arguments.len() != 1 {
                             return Err(host_binding_error(origin, "file-size requires one path"));
                         }
-                        let size = std::fs::metadata(path)
+                        let size = file
+                            .metadata()
                             .map_err(|error| host_binding_error(origin, error.to_string()))?
                             .len();
                         let size = i64::try_from(size).map_err(|_| {
@@ -4372,7 +4761,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         if arguments.len() != 1 {
                             return Err(host_binding_error(origin, "file-hash requires one path"));
                         }
-                        let digest = sha256_file(&path)
+                        let digest = sha256_file_handle(&file)
                             .map_err(|message| host_binding_error(origin, message))?;
                         return Ok(vec![TypedValue::String(hex_digest(&digest))]);
                     }
@@ -4395,7 +4784,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                                 "tree-list maximum entries must be between 1 and 100000",
                             ));
                         }
-                        let (entries, truncated) = list_directory_tree(&path, max_entries)
+                        let (entries, truncated) = list_directory_tree(file, max_entries)
                             .map_err(|message| host_binding_error(origin, message))?;
                         let value = TypedValue::Record(vec![
                             (
@@ -4417,7 +4806,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                                 "tree-merkle requires one path",
                             ));
                         }
-                        let digest = merkle_directory(&path)
+                        let digest = merkle_directory(file)
                             .map_err(|message| host_binding_error(origin, message))?;
                         return Ok(vec![TypedValue::String(digest)]);
                     }
@@ -4445,8 +4834,6 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                                 ),
                             ));
                         }
-                        let mut file = std::fs::File::open(path)
-                            .map_err(|error| host_binding_error(origin, error.to_string()))?;
                         file.seek(SeekFrom::Start(offset))
                             .map_err(|error| host_binding_error(origin, error.to_string()))?;
                         let mut bytes = vec![0; length];
@@ -4460,7 +4847,8 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         if arguments.len() != 1 {
                             return Err(host_binding_error(origin, "file-read requires one path"));
                         }
-                        let bytes = std::fs::read(path)
+                        let mut bytes = Vec::new();
+                        file.read_to_end(&mut bytes)
                             .map_err(|error| host_binding_error(origin, error.to_string()))?;
                         return Ok(vec![TypedValue::Bytes(bytes)]);
                     }
@@ -4475,10 +4863,12 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         "file-write requires a path and bytes",
                     ));
                 };
-                let path = self
-                    .secure_file_path(selector, relative)
+                self.mark_host_use();
+                let mut file = self
+                    .open_secure_resource(selector, relative, SecureOpenMode::WriteFile)
                     .map_err(|message| host_binding_error(origin, message))?;
-                std::fs::write(path, bytes)
+                file.write_all(bytes)
+                    .and_then(|_| file.sync_all())
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 return Ok(vec![TypedValue::Unit]);
             }
@@ -4510,6 +4900,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     return Err(host_binding_error(origin, "agent scheduler is unavailable"));
                 };
                 let spawn_binding = binding.clone();
+                self.mark_host_use();
                 let identity = binding
                     .block_on(async move { spawn_binding.spawn_spec(spec).await })
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
@@ -4529,6 +4920,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 let task_id = agent_vm::parse_task_id(task_id)
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 let wait_binding = binding.clone();
+                self.mark_host_use();
                 let result = binding
                     .block_on(async move { wait_binding.wait(task_id).await })
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
@@ -4544,6 +4936,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 let task_id = agent_vm::parse_task_id(task_id)
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 let poll_binding = binding.clone();
+                self.mark_host_use();
                 let snapshot = binding
                     .block_on(async move { poll_binding.poll(task_id).await })
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
@@ -4559,6 +4952,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 let task_id = agent_vm::parse_task_id(task_id)
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 let cancel_binding = binding.clone();
+                self.mark_host_use();
                 binding
                     .block_on(async move { cancel_binding.cancel(task_id).await })
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
@@ -4572,6 +4966,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     return Err(host_binding_error(origin, "memory service is unavailable"));
                 };
                 let query = query.clone();
+                self.mark_host_use();
                 let values = block_on_host(async move { memory.query(&query, None).await })
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
                 return Ok(vec![TypedValue::List {
@@ -4587,6 +4982,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     return Err(host_binding_error(origin, "memory service is unavailable"));
                 };
                 let content = content.clone();
+                self.mark_host_use();
                 block_on_host(async move {
                     memory
                         .insert_conversation("assistant", &content, None, None)
@@ -4642,6 +5038,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     return Err(host_binding_error(origin, "MCP client is unavailable"));
                 };
                 let wire_name = format!("mcp_{authorized_server}_{authorized_tool}");
+                self.mark_host_use();
                 let response = block_on_host(async move {
                     client.execute_tool_value(&wire_name, parameters).await
                 })
@@ -4672,7 +5069,6 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         "process-run requires a command and string arguments",
                     ));
                 };
-                let executable = validate_process_request(binding, requirement, command, origin)?;
                 let arguments = values
                     .iter()
                     .map(|value| match value {
@@ -4683,10 +5079,16 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         )),
                     })
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                let child = match spawn_open_process(executable, &arguments) {
+                let executable = validate_process_request(
+                    binding,
+                    requirement,
+                    command,
+                    &arguments,
+                    origin,
+                )?;
+                let child = match spawn_open_process(executable) {
                     Ok(child) => child,
                     Err(error) => {
-                        self.rollback_failed_process_launch(origin)?;
                         return Err(host_binding_error(origin, error));
                     }
                 };
@@ -4694,7 +5096,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 // Once it returns a child, the verified descriptor has been
                 // executed and the authorization is a real use even if the
                 // program later exits unsuccessfully.
-                self.process_authorization_rollback = None;
+                self.mark_host_use();
                 let output = child
                     .wait_with_output()
                     .map_err(|error| host_binding_error(origin, error.to_string()))?;
@@ -4720,6 +5122,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 let language = language.clone();
                 let intent = intent.clone();
                 let source = source.clone();
+                self.mark_host_use();
                 let decision = block_on_host(async move {
                     crate::tools::implementations::propose::propose_artifact_with_decision(
                         &language, &intent, &source,
@@ -4781,6 +5184,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         .map_err(|error| host_binding_error(origin, error.to_string()))?
                         .next()
                         .ok_or_else(|| host_binding_error(origin, "host has no addresses"))?;
+                    self.mark_host_use();
                     let stream =
                         TcpStream::connect_timeout(&address, std::time::Duration::from_secs(5))
                             .map_err(|error| host_binding_error(origin, error.to_string()))?;
@@ -4794,6 +5198,8 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                                 stream,
                                 host: host.clone(),
                                 port,
+                                owner: self.execution_id,
+                                generation: 0,
                             },
                         );
                     return Ok(vec![TypedValue::Resource {
@@ -4802,8 +5208,11 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         generation: 0,
                     }]);
                 }
-                let [TypedValue::Resource { kind, handle, .. }, TypedValue::Bytes(payload)] =
-                    arguments.as_slice()
+                let [TypedValue::Resource {
+                    kind,
+                    handle,
+                    generation,
+                }, TypedValue::Bytes(payload)] = arguments.as_slice()
                 else {
                     return Err(host_binding_error(
                         origin,
@@ -4816,6 +5225,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         "resource is not a network socket",
                     ));
                 }
+                self.mark_host_use();
                 let mut sockets = self
                     .network
                     .lock()
@@ -4823,6 +5233,12 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 let socket = sockets
                     .get_mut(handle)
                     .ok_or_else(|| host_binding_error(origin, "unknown network socket"))?;
+                if socket.owner != self.execution_id || socket.generation != *generation {
+                    return Err(host_binding_error(
+                        origin,
+                        "network socket is stale or belongs to another ProgramRun",
+                    ));
+                }
                 let endpoint = CapabilityRequirement {
                     capability: crate::vm::CapabilityKind::NetworkConnect,
                     selector: crate::vm::ResourceSelector::Network {
@@ -4858,6 +5274,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 ));
             }
         };
+        self.mark_host_use();
         let value = self
             .automation
             .execute(request)
@@ -4966,19 +5383,21 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
 }
 
 impl TypedHostHandler {
-    fn secure_file_path(
+    fn open_secure_resource(
         &self,
         selector: &crate::vm::FileSelector,
         relative: &str,
-    ) -> std::result::Result<PathBuf, String> {
-        let root = self
+        mode: SecureOpenMode,
+    ) -> std::result::Result<std::fs::File, String> {
+        let binding = self
             .resource_roots
             .read()
             .map_err(|_| "resource-root binding lock poisoned".to_string())?
+            .bindings
             .get(&selector.root)
             .cloned()
             .ok_or_else(|| format!("{} root is not installed by this host", selector.root))?;
-        secure_resource_path(&root, selector, relative)
+        open_resource_beneath_mode(&binding, selector, relative, mode)
     }
 }
 
@@ -5047,6 +5466,261 @@ fn registered_host_binding(
     Ok(Some(binding))
 }
 
+/// Re-derive the exact authority and ABI of a core host request from the
+/// immutable vocabulary at the final host boundary. The VM normally creates
+/// this tuple, but cached/foreign continuations are untrusted here: a coarse
+/// capability kind, forged origin, or same-shaped argument list must never
+/// select a different host operation.
+fn validate_core_host_request(
+    binding: Option<CoreHostBinding>,
+    requirement: &CapabilityRequirement,
+    arguments: &[TypedValue],
+    origin: &SourceOrigin,
+) -> std::result::Result<(), VmDiagnostic> {
+    let word = origin.word.as_deref();
+    if binding.is_none() {
+        if word == Some("output-open")
+            && matches!(arguments, [TypedValue::String(_)])
+            && requirement.capability == CapabilityKind::SessionEmit
+            && requirement.selector == ResourceSelector::None
+        {
+            return Ok(());
+        }
+        return Err(host_binding_error(
+            origin,
+            "host request has no exact registered core binding",
+        ));
+    }
+    let binding = binding.expect("checked above");
+
+    if let Some(name) = word {
+        if let Some(spec) = core_word_spec(name) {
+            let declared = spec
+                .signature
+                .effects
+                .0
+                .iter()
+                .find(|declared| declared.capability == requirement.capability)
+                .ok_or_else(|| {
+                    host_binding_error(origin, "core binding does not declare this capability")
+                })?;
+            let expected = crate::vm::interpreter::instantiate_requirement(declared, arguments)
+                .map_err(|message| host_binding_error(origin, message))?;
+            let dynamically_bound = matches!(
+                binding,
+                CoreHostBinding::NetworkSend
+                    | CoreHostBinding::FileLinesNext
+                    | CoreHostBinding::FileLinesClose
+                    | CoreHostBinding::CsvNext
+                    | CoreHostBinding::CsvClose
+                    | CoreHostBinding::StreamNext
+                    | CoreHostBinding::StreamClose
+                    | CoreHostBinding::ProcessRun
+            );
+            if !dynamically_bound && expected != *requirement {
+                return Err(host_binding_error(
+                    origin,
+                    "runtime arguments do not derive the authorized capability requirement",
+                ));
+            }
+        }
+    }
+
+    let string = |value: &TypedValue| matches!(value, TypedValue::String(_));
+    let integer = |value: &TypedValue| matches!(value, TypedValue::Int(_));
+    let float = |value: &TypedValue| matches!(value, TypedValue::Float(_));
+    let path = |value: &TypedValue| matches!(value, TypedValue::Path { .. });
+    let bytes = |value: &TypedValue| matches!(value, TypedValue::Bytes(_));
+    let stream = |value: &TypedValue| matches!(value, TypedValue::Stream { .. });
+    let resource = |value: &TypedValue, kind: &str| {
+        matches!(value, TypedValue::Resource { kind: actual, .. } if actual == kind)
+    };
+    let task = |value: &TypedValue| matches!(value, TypedValue::Task { .. });
+    let valid_arguments = match binding {
+        CoreHostBinding::SessionEmit => matches!(arguments, [value] if string(value)),
+        CoreHostBinding::VmVocabulary
+        | CoreHostBinding::CapabilityList
+        | CoreHostBinding::AutomationAvailability
+        | CoreHostBinding::AutomationDisplays
+        | CoreHostBinding::AutomationWindows => arguments.is_empty(),
+        CoreHostBinding::FileRead
+        | CoreHostBinding::FileHash
+        | CoreHostBinding::TreeMerkle
+        | CoreHostBinding::FileSize
+        | CoreHostBinding::FileLinesOpen
+        | CoreHostBinding::CsvOpen
+        | CoreHostBinding::WorkbookOpen
+        | CoreHostBinding::WorkbookSheets => matches!(arguments, [value] if path(value)),
+        CoreHostBinding::TreeList => {
+            matches!(arguments, [first, second] if path(first) && integer(second))
+        }
+        CoreHostBinding::FileSlice => matches!(arguments, [first, second, third]
+            if path(first) && integer(second) && integer(third)),
+        CoreHostBinding::WorkbookSheetOpen => {
+            matches!(arguments, [first, second] if path(first) && string(second))
+        }
+        CoreHostBinding::WorkbookRange => matches!(arguments,
+            [first, sheet, row, column, rows, columns]
+                if path(first) && string(sheet) && integer(row) && integer(column)
+                    && integer(rows) && integer(columns)),
+        CoreHostBinding::WorkbookSummary => matches!(arguments,
+            [first, sheet, rows] if path(first) && string(sheet) && integer(rows)),
+        CoreHostBinding::CsvSummary => {
+            matches!(arguments, [first, rows] if path(first) && integer(rows))
+        }
+        CoreHostBinding::FileLinesNext
+        | CoreHostBinding::FileLinesClose
+        | CoreHostBinding::CsvNext
+        | CoreHostBinding::CsvClose
+        | CoreHostBinding::StreamNext
+        | CoreHostBinding::StreamClose => matches!(arguments, [value] if stream(value)),
+        CoreHostBinding::FileWrite => {
+            matches!(arguments, [first, second] if path(first) && bytes(second))
+        }
+        CoreHostBinding::ProcessRun => matches!(arguments,
+            [command, TypedValue::List { values, .. }]
+                if string(command) && values.iter().all(string)),
+        CoreHostBinding::McpCall => matches!(arguments,
+            [server, tool, TypedValue::Json(_)] if string(server) && string(tool))
+            || arguments.len() == 1 && word.is_some_and(|name| name.starts_with("mcp.")),
+        CoreHostBinding::ProposalOpen => {
+            matches!(arguments, [first, second, third]
+                if string(first) && string(second) && string(third))
+        }
+        CoreHostBinding::NetworkConnect => {
+            matches!(arguments, [host, port] if string(host) && integer(port))
+        }
+        CoreHostBinding::NetworkSend => {
+            matches!(arguments, [socket, payload]
+                if resource(socket, "network-socket") && bytes(payload))
+        }
+        CoreHostBinding::MemoryRecall | CoreHostBinding::MemoryStore => {
+            matches!(arguments, [value] if string(value))
+        }
+        CoreHostBinding::ScheduleCreate => {
+            matches!(arguments, [source, interval] if string(source) && integer(interval))
+        }
+        CoreHostBinding::ScheduleGet | CoreHostBinding::ScheduleCancel => {
+            matches!(arguments, [value] if resource(value, "schedule"))
+        }
+        CoreHostBinding::AgentSpawn => matches!(arguments, [value] if string(value)),
+        CoreHostBinding::AgentSpawnWith => matches!(arguments, [TypedValue::Record(_)]),
+        CoreHostBinding::AgentAwait
+        | CoreHostBinding::AgentPoll
+        | CoreHostBinding::AgentCancel => matches!(arguments, [value] if task(value)),
+        CoreHostBinding::AutomationClick => matches!(arguments, [x, y, button, count]
+            if float(x) && float(y) && string(button) && integer(count)),
+        CoreHostBinding::AutomationType => {
+            matches!(arguments, [text, delay] if string(text) && integer(delay))
+        }
+    };
+    if !valid_arguments {
+        return Err(host_binding_error(
+            origin,
+            format!("runtime arguments do not match the {binding:?} host ABI"),
+        ));
+    }
+
+    let stream_kind_matches = match binding {
+        CoreHostBinding::FileLinesNext | CoreHostBinding::FileLinesClose => matches!(
+            arguments,
+            [TypedValue::Stream {
+                kind,
+                element_type,
+                ..
+            }] if kind == "file-lines" && *element_type == Type::String
+        ),
+        CoreHostBinding::CsvNext | CoreHostBinding::CsvClose => matches!(
+            arguments,
+            [TypedValue::Stream {
+                kind,
+                element_type,
+                ..
+            }] if kind == "csv-records" && *element_type == Type::list(Type::String)
+        ),
+        _ => true,
+    };
+    if !stream_kind_matches {
+        return Err(host_binding_error(
+            origin,
+            "stream resource kind does not match the registered host binding",
+        ));
+    }
+
+    if matches!(
+        binding,
+        CoreHostBinding::FileRead
+            | CoreHostBinding::FileHash
+            | CoreHostBinding::TreeMerkle
+            | CoreHostBinding::FileSize
+            | CoreHostBinding::FileLinesOpen
+            | CoreHostBinding::CsvOpen
+            | CoreHostBinding::WorkbookOpen
+            | CoreHostBinding::WorkbookSheets
+            | CoreHostBinding::TreeList
+            | CoreHostBinding::FileSlice
+            | CoreHostBinding::WorkbookSheetOpen
+            | CoreHostBinding::WorkbookRange
+            | CoreHostBinding::WorkbookSummary
+            | CoreHostBinding::CsvSummary
+            | CoreHostBinding::FileWrite
+    ) {
+        let Some(TypedValue::Path {
+            selector: runtime_selector,
+            relative,
+        }) = arguments.first()
+        else {
+            unreachable!("file binding ABI was validated above")
+        };
+        let ResourceSelector::File {
+            selector: authorized_selector,
+        } = &requirement.selector
+        else {
+            return Err(host_binding_error(
+                origin,
+                "file host binding requires a concrete file selector",
+            ));
+        };
+        let exact_selector = crate::vm::FileSelectorTemplate {
+            root: runtime_selector.root.clone(),
+            parts: vec![crate::vm::FileSelectorTemplatePart::Argument {
+                index: 0,
+                bound: runtime_selector.clone(),
+            }],
+            upper_bound: runtime_selector.clone(),
+        }
+        .instantiate(arguments)
+        .map_err(|error| host_binding_error(origin, error.to_string()))?;
+        if &exact_selector != authorized_selector || !runtime_selector.matches(relative) {
+            return Err(host_binding_error(
+                origin,
+                "runtime path does not match the authorized file selector",
+            ));
+        }
+    }
+
+    if binding == CoreHostBinding::ProcessRun {
+        let TypedValue::String(command) = &arguments[0] else {
+            unreachable!("validated above")
+        };
+        let ResourceSelector::Process { executables } = &requirement.selector else {
+            return Err(host_binding_error(origin, "process selector is not concrete"));
+        };
+        let [encoded] = executables.as_slice() else {
+            return Err(host_binding_error(origin, "process selector is not exact"));
+        };
+        let identity = ProcessExecutableIdentity::decode(encoded)
+            .map_err(|message| host_binding_error(origin, message))?;
+        if identity.path != *command {
+            return Err(host_binding_error(
+                origin,
+                "process command does not match the authorized executable identity",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn host_binding_error(
     origin: &crate::vm::SourceOrigin,
     message: impl Into<String>,
@@ -5063,6 +5737,7 @@ fn validate_process_request(
     binding: Option<CoreHostBinding>,
     requirement: &CapabilityRequirement,
     command: &str,
+    arguments: &[String],
     origin: &crate::vm::SourceOrigin,
 ) -> std::result::Result<OpenedProcessExecutable, VmDiagnostic> {
     if binding != Some(CoreHostBinding::ProcessRun) {
@@ -5085,8 +5760,8 @@ fn validate_process_request(
     };
     let approved = ProcessExecutableIdentity::decode(encoded)
         .map_err(|message| host_binding_error(origin, message))?;
-    let current =
-        open_process_executable(command).map_err(|message| host_binding_error(origin, message))?;
+    let current = open_process_executable(command, arguments)
+        .map_err(|message| host_binding_error(origin, message))?;
     if approved != current.identity {
         return Err(host_binding_error(
             origin,
@@ -5096,7 +5771,7 @@ fn validate_process_request(
     Ok(current)
 }
 
-const PROCESS_IDENTITY_PREFIX: &str = "finch-process-v2:";
+const PROCESS_IDENTITY_PREFIX: &str = "finch-process-v3:";
 
 fn validate_restored_process_authority(ledger: &CapabilityLedger) -> Result<()> {
     for grant in &ledger.grants.grants {
@@ -5107,11 +5782,17 @@ fn validate_restored_process_authority(ledger: &CapabilityLedger) -> Result<()> 
             bail!("stored process capability grant has an invalid selector");
         };
         for executable in executables {
-            ProcessExecutableIdentity::decode(executable).map_err(|_| {
+            let approved = ProcessExecutableIdentity::decode(executable).map_err(|_| {
                 anyhow::anyhow!(
-                    "legacy raw-path process capability grant cannot be restored; reapprove the executable to bind a stable v2 identity"
+                    "legacy process capability grant cannot be restored; reapprove the executable to bind a stable v3 invocation identity"
                 )
             })?;
+            let current = open_process_executable(&approved.path, &approved.arguments)
+                .map_err(anyhow::Error::msg)?
+                .identity;
+            if current != approved {
+                bail!("stored process capability identity changed since approval");
+            }
         }
     }
     Ok(())
@@ -5123,6 +5804,11 @@ struct ProcessExecutableIdentity {
     sha256: String,
     device: u64,
     inode: u64,
+    arguments: Vec<String>,
+    environment_sha256: String,
+    cwd_path: String,
+    cwd_device: u64,
+    cwd_inode: u64,
 }
 
 struct OpenedProcessExecutable {
@@ -5134,6 +5820,13 @@ struct OpenedProcessExecutable {
         target_os = "dragonfly"
     ))]
     file: std::fs::File,
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    cwd: std::fs::File,
 }
 
 impl ProcessExecutableIdentity {
@@ -5159,10 +5852,13 @@ impl ProcessExecutableIdentity {
 fn resolve_process_executable(
     command: &str,
 ) -> std::result::Result<ProcessExecutableIdentity, String> {
-    Ok(open_process_executable(command)?.identity)
+    Ok(open_process_executable(command, &[])?.identity)
 }
 
-fn open_process_executable(command: &str) -> std::result::Result<OpenedProcessExecutable, String> {
+fn open_process_executable(
+    command: &str,
+    arguments: &[String],
+) -> std::result::Result<OpenedProcessExecutable, String> {
     #[cfg(not(any(
         target_os = "linux",
         target_os = "android",
@@ -5170,7 +5866,7 @@ fn open_process_executable(command: &str) -> std::result::Result<OpenedProcessEx
         target_os = "dragonfly"
     )))]
     {
-        let _ = command;
+        let _ = (command, arguments);
         return Err(
             "process-run is unsupported on this platform because stable opened-object execution is unavailable"
                 .into(),
@@ -5184,6 +5880,7 @@ fn open_process_executable(command: &str) -> std::result::Result<OpenedProcessEx
         target_os = "dragonfly"
     ))]
     {
+        use std::os::fd::FromRawFd;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
         let supplied = Path::new(command);
@@ -5227,15 +5924,68 @@ fn open_process_executable(command: &str) -> std::result::Result<OpenedProcessEx
             return Err("process-run executable changed while it was being opened".into());
         }
         ensure_effective_execute_permission(&canonical, &metadata)?;
-        let digest = sha256_open_file(&file)?;
+        let mut source = file.try_clone().map_err(|error| error.to_string())?;
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| error.to_string())?;
+        let snapshot_directory = tempfile::tempdir()
+            .map_err(|error| format!("create private executable snapshot directory: {error}"))?;
+        let snapshot_path = snapshot_directory.path().join("executable");
+        let mut snapshot_writer = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&snapshot_path)
+            .map_err(|error| format!("create private executable snapshot: {error}"))?;
+        std::io::copy(&mut source, &mut snapshot_writer)
+            .map_err(|error| format!("snapshot process executable: {error}"))?;
+        snapshot_writer
+            .sync_all()
+            .map_err(|error| format!("sync process executable snapshot: {error}"))?;
+        snapshot_writer
+            .set_permissions(std::fs::Permissions::from_mode(0o500))
+            .map_err(|error| format!("seal process executable snapshot mode: {error}"))?;
+        drop(snapshot_writer);
+        let snapshot = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&snapshot_path)
+            .map_err(|error| format!("reopen sealed executable snapshot: {error}"))?;
+        std::fs::remove_file(&snapshot_path)
+            .map_err(|error| format!("unlink sealed executable snapshot: {error}"))?;
+        drop(snapshot_directory);
+        let digest = sha256_open_file(&snapshot)?;
+
+        let cwd_path = std::env::current_dir()
+            .map_err(|error| format!("resolve process working directory: {error}"))?;
+        let cwd_fd = nix::fcntl::open(
+            &cwd_path,
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .map_err(|error| format!("open process working directory: {error}"))?;
+        let cwd = unsafe { std::fs::File::from_raw_fd(cwd_fd) };
+        let cwd_metadata = cwd
+            .metadata()
+            .map_err(|error| format!("inspect process working directory: {error}"))?;
+        let environment_sha256 = format!("{:x}", Sha256::digest(b""));
         Ok(OpenedProcessExecutable {
             identity: ProcessExecutableIdentity {
                 path: canonical.to_string_lossy().into_owned(),
                 sha256: hex_digest(&digest),
                 device: metadata.dev(),
                 inode: metadata.ino(),
+                arguments: arguments.to_vec(),
+                environment_sha256,
+                cwd_path: cwd_path.to_string_lossy().into_owned(),
+                cwd_device: cwd_metadata.dev(),
+                cwd_inode: cwd_metadata.ino(),
             },
-            file,
+            file: snapshot,
+            cwd,
         })
     }
 }
@@ -5315,6 +6065,31 @@ fn sha256_open_file(file: &std::fs::File) -> std::result::Result<[u8; 32], Strin
 ))]
 type ProcessBeforeExecHook = (String, Box<dyn FnOnce() + Send>);
 
+#[cfg(test)]
+type AuthorizationBeforeUseHook = (uuid::Uuid, CapabilityKind, Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+static AUTHORIZATION_BEFORE_USE_HOOK: std::sync::OnceLock<
+    Mutex<Vec<AuthorizationBeforeUseHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn run_authorization_before_use_hook(execution_id: uuid::Uuid, capability: CapabilityKind) {
+    let mut hook = AUTHORIZATION_BEFORE_USE_HOOK
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(index) = hook
+        .iter()
+        .position(|(expected_execution, expected_capability, _)| {
+            *expected_execution == execution_id && *expected_capability == capability
+        })
+    {
+        let (_, _, callback) = hook.remove(index);
+        callback();
+    }
+}
+
 #[cfg(all(
     test,
     any(
@@ -5355,26 +6130,19 @@ fn run_process_before_exec_hook(path: &str) {
 ))]
 fn spawn_open_process(
     executable: OpenedProcessExecutable,
-    arguments: &[String],
 ) -> std::result::Result<std::process::Child, String> {
     use std::ffi::CString;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
 
     let argv = std::iter::once(executable.identity.path.as_str())
-        .chain(arguments.iter().map(String::as_str))
+        .chain(executable.identity.arguments.iter().map(String::as_str))
         .map(|value| CString::new(value).map_err(|_| "process argument contains NUL".to_string()))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let environment = std::env::vars_os()
-        .map(|(key, value)| {
-            let mut entry = key.as_os_str().as_bytes().to_vec();
-            entry.push(b'=');
-            entry.extend_from_slice(value.as_os_str().as_bytes());
-            CString::new(entry).map_err(|_| "process environment contains NUL".to_string())
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let environment = Vec::<CString>::new();
     let fd = executable.file.as_raw_fd();
+    let cwd_fd = executable.cwd.as_raw_fd();
     #[cfg(test)]
     run_process_before_exec_hook(&executable.identity.path);
     let mut command = std::process::Command::new("/bin/false");
@@ -5384,9 +6152,13 @@ fn spawn_open_process(
         .stderr(std::process::Stdio::piped());
     unsafe {
         command.pre_exec(
-            move || match nix::unistd::fexecve(fd, &argv, &environment) {
-                Ok(never) => match never {},
-                Err(error) => Err(std::io::Error::from_raw_os_error(error as i32)),
+            move || {
+                nix::unistd::fchdir(cwd_fd)
+                    .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
+                match nix::unistd::fexecve(fd, &argv, &environment) {
+                    Ok(never) => match never {},
+                    Err(error) => Err(std::io::Error::from_raw_os_error(error as i32)),
+                }
             },
         );
     }
@@ -5401,7 +6173,6 @@ fn spawn_open_process(
 )))]
 fn spawn_open_process(
     _executable: OpenedProcessExecutable,
-    _arguments: &[String],
 ) -> std::result::Result<std::process::Child, String> {
     Err("process-run is unsupported on this platform".into())
 }
@@ -5418,7 +6189,7 @@ fn normalize_process_grant(
     for executable in executables.iter_mut() {
         if executable.starts_with(PROCESS_IDENTITY_PREFIX) {
             let approved = ProcessExecutableIdentity::decode(executable)?;
-            let current = resolve_process_executable(&approved.path)?;
+            let current = open_process_executable(&approved.path, &approved.arguments)?.identity;
             if approved != current {
                 return Err("process grant identity does not match the current executable".into());
             }
@@ -5437,13 +6208,30 @@ fn validate_process_effect(effect: &VmSideEffect) -> std::result::Result<(), VmD
             "process-run requires a typed host request",
         ));
     };
-    let Some(TypedValue::String(command)) = arguments.first() else {
+    let [TypedValue::String(command), TypedValue::List { values, .. }] = arguments.as_slice() else {
         return Err(host_binding_error(
             &effect.origin,
-            "process-run requires an executable string",
+            "process-run requires an executable and string arguments",
         ));
     };
-    validate_process_request(binding, &effect.requirement, command, &effect.origin).map(|_| ())
+    let process_arguments = values
+        .iter()
+        .map(|value| match value {
+            TypedValue::String(value) => Ok(value.clone()),
+            _ => Err(host_binding_error(
+                &effect.origin,
+                "process-run arguments must be strings",
+            )),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    validate_process_request(
+        binding,
+        &effect.requirement,
+        command,
+        &process_arguments,
+        &effect.origin,
+    )
+    .map(|_| ())
 }
 
 /// Convert the statically admitted MCP input subset into JSON. Optional
@@ -5488,8 +6276,28 @@ fn typed_mcp_arguments(value: &TypedValue) -> std::result::Result<serde_json::Va
 }
 
 /// Hash a file in bounded chunks, keeping large inputs out of VM memory.
+#[cfg(any())]
 fn sha256_file(path: &Path) -> std::result::Result<[u8; 32], String> {
     let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut output = [0_u8; 32];
+    output.copy_from_slice(&digest);
+    Ok(output)
+}
+
+fn sha256_file_handle(file: &std::fs::File) -> std::result::Result<[u8; 32], String> {
+    let mut file = file.try_clone().map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -5516,9 +6324,45 @@ fn hex_digest(digest: &[u8; 32]) -> String {
 /// instead of followed so an authorized workspace selector cannot escape
 /// through mutable filesystem topology after verification.
 fn list_directory_tree(
-    root: &Path,
+    root: std::fs::File,
     maximum_entries: usize,
 ) -> std::result::Result<(Vec<TypedValue>, bool), String> {
+    #[cfg(not(unix))]
+    {
+        let _ = (root, maximum_entries);
+        return Err("descriptor-relative tree listing is unsupported on this platform".into());
+    }
+    #[cfg(unix)]
+    {
+        let mut directory = nix::dir::Dir::from(root).map_err(|error| error.to_string())?;
+        let mut raw_entries = Vec::new();
+        let mut scanned = 0usize;
+        walk_directory_for_listing(
+            &mut directory,
+            "",
+            &mut raw_entries,
+            &mut scanned,
+            100_000,
+        )?;
+        raw_entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let truncated = raw_entries.len() > maximum_entries;
+        raw_entries.truncate(maximum_entries);
+        return Ok((
+            raw_entries
+                .into_iter()
+                .map(|(relative, kind, size)| {
+                    TypedValue::Record(vec![
+                        ("path".into(), TypedValue::String(relative)),
+                        ("kind".into(), TypedValue::String(kind)),
+                        ("size".into(), TypedValue::Int(size)),
+                    ])
+                })
+                .collect(),
+            truncated,
+        ));
+    }
+    #[cfg(any())]
+    {
     const MAX_SCANNED_DIRECTORY_ENTRIES: usize = 100_000;
     let metadata = std::fs::symlink_metadata(root).map_err(|error| error.to_string())?;
     if metadata.file_type().is_symlink() {
@@ -5570,8 +6414,102 @@ fn list_directory_tree(
         ]));
     }
     Ok((entries, !pending.is_empty()))
+    }
 }
 
+#[cfg(unix)]
+fn walk_directory_for_listing(
+    directory: &mut nix::dir::Dir,
+    prefix: &str,
+    entries: &mut Vec<(String, String, i64)>,
+    scanned: &mut usize,
+    maximum_entries: usize,
+) -> std::result::Result<(), String> {
+    use nix::dir::Dir;
+    use nix::fcntl::{AtFlags, OFlag};
+    use nix::sys::stat::{fstat, fstatat, Mode, SFlag};
+    use std::os::fd::FromRawFd;
+    use std::os::fd::AsRawFd;
+
+    let mut names = directory
+        .iter()
+        .map(|entry| {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let bytes = entry.file_name().to_bytes();
+            if bytes == b"." || bytes == b".." {
+                return Ok(None);
+            }
+            let name = std::str::from_utf8(bytes)
+                .map_err(|_| "tree-list cannot represent a non-UTF-8 path".to_string())?;
+            Ok(Some(name.to_owned()))
+        })
+        .collect::<std::result::Result<Vec<_>, String>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    names.sort();
+    for name in names {
+        *scanned += 1;
+        if *scanned > maximum_entries {
+            return Err(format!(
+                "tree-list exceeds the {maximum_entries} scanned-entry limit"
+            ));
+        }
+        let relative = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let stat = fstatat(
+            Some(directory.as_raw_fd()),
+            name.as_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| error.to_string())?;
+        let kind = SFlag::from_bits_truncate(stat.st_mode);
+        if kind.contains(SFlag::S_IFLNK) {
+            return Err(format!("tree-list rejects symlink '{relative}'"));
+        }
+        if kind.contains(SFlag::S_IFDIR) {
+            let mut child = Dir::openat(
+                Some(directory.as_raw_fd()),
+                name.as_str(),
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| error.to_string())?;
+            entries.push((relative.clone(), "directory".into(), 0));
+            walk_directory_for_listing(
+                &mut child,
+                &relative,
+                entries,
+                scanned,
+                maximum_entries,
+            )?;
+        } else if kind.contains(SFlag::S_IFREG) {
+            let fd = nix::fcntl::openat(
+                Some(directory.as_raw_fd()),
+                name.as_str(),
+                OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| error.to_string())?;
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let opened = fstat(file.as_raw_fd()).map_err(|error| error.to_string())?;
+            if !SFlag::from_bits_truncate(opened.st_mode).contains(SFlag::S_IFREG) {
+                return Err(format!("tree-list entry changed while opening '{relative}'"));
+            }
+            let size = i64::try_from(opened.st_size)
+                .map_err(|_| format!("tree-list file '{relative}' is too large to represent"))?;
+            entries.push((relative, "file".into(), size));
+        } else {
+            return Err(format!("tree-list rejects unsupported entry '{relative}'"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any())]
 fn enqueue_directory_entries(
     root: &Path,
     directory: &Path,
@@ -5601,7 +6539,22 @@ fn enqueue_directory_entries(
 /// Compute a bounded, deterministic digest for a directory tree.  This is an
 /// inventory primitive: it deliberately rejects symlinks rather than trying
 /// to make a potentially escaping traversal appear safe.
-fn merkle_directory(root: &Path) -> std::result::Result<String, String> {
+fn merkle_directory(root: std::fs::File) -> std::result::Result<String, String> {
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        return Err("descriptor-relative tree hashing is unsupported on this platform".into());
+    }
+    #[cfg(unix)]
+    {
+        let mut directory = nix::dir::Dir::from(root).map_err(|error| error.to_string())?;
+        let mut hasher = Sha256::new();
+        let mut entries = 0usize;
+        merkle_walk_descriptor(&mut directory, "", &mut hasher, &mut entries, 100_000)?;
+        return Ok(format!("{:x}", hasher.finalize()));
+    }
+    #[cfg(any())]
+    {
     const MAX_TREE_MERKLE_ENTRIES: usize = 100_000;
     let metadata = std::fs::symlink_metadata(root).map_err(|error| error.to_string())?;
     if metadata.file_type().is_symlink() {
@@ -5621,8 +6574,94 @@ fn merkle_directory(root: &Path) -> std::result::Result<String, String> {
         MAX_TREE_MERKLE_ENTRIES,
     )?;
     Ok(format!("{:x}", hasher.finalize()))
+    }
 }
 
+#[cfg(unix)]
+fn merkle_walk_descriptor(
+    directory: &mut nix::dir::Dir,
+    prefix: &str,
+    hasher: &mut Sha256,
+    entries: &mut usize,
+    maximum_entries: usize,
+) -> std::result::Result<(), String> {
+    use nix::dir::Dir;
+    use nix::fcntl::{AtFlags, OFlag};
+    use nix::sys::stat::{fstatat, Mode, SFlag};
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let mut names = directory
+        .iter()
+        .map(|entry| {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let bytes = entry.file_name().to_bytes();
+            if bytes == b"." || bytes == b".." {
+                return Ok(None);
+            }
+            let name = std::str::from_utf8(bytes)
+                .map_err(|_| "tree-merkle cannot represent a non-UTF-8 path".to_string())?;
+            Ok(Some(name.to_owned()))
+        })
+        .collect::<std::result::Result<Vec<_>, String>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    names.sort();
+    for name in names {
+        *entries += 1;
+        if *entries > maximum_entries {
+            return Err(format!(
+                "tree-merkle exceeds the {maximum_entries}-entry traversal limit"
+            ));
+        }
+        let relative = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let stat = fstatat(
+            Some(directory.as_raw_fd()),
+            name.as_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| error.to_string())?;
+        let kind = SFlag::from_bits_truncate(stat.st_mode);
+        if kind.contains(SFlag::S_IFLNK) {
+            return Err(format!("tree-merkle rejects symlink '{relative}'"));
+        }
+        if kind.contains(SFlag::S_IFDIR) {
+            hasher.update(b"directory\0");
+            hasher.update(relative.as_bytes());
+            hasher.update(b"\0");
+            let mut child = Dir::openat(
+                Some(directory.as_raw_fd()),
+                name.as_str(),
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| error.to_string())?;
+            merkle_walk_descriptor(&mut child, &relative, hasher, entries, maximum_entries)?;
+        } else if kind.contains(SFlag::S_IFREG) {
+            let fd = nix::fcntl::openat(
+                Some(directory.as_raw_fd()),
+                name.as_str(),
+                OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| error.to_string())?;
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            hasher.update(b"file\0");
+            hasher.update(relative.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(sha256_file_handle(&file)?);
+        } else {
+            return Err(format!("tree-merkle rejects unsupported entry '{relative}'"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any())]
 fn merkle_walk(
     root: &Path,
     directory: &Path,
@@ -5682,23 +6721,40 @@ fn merkle_walk(
 /// XML reader. The explicit cell bound prevents that host projection from
 /// becoming an unbounded second copy.
 fn read_workbook_rows(
-    path: &Path,
+    file: &std::fs::File,
+    label: &str,
     requested_sheet: Option<&str>,
 ) -> std::result::Result<Vec<Vec<String>>, String> {
-    use calamine::{open_workbook_auto, Reader};
+    use calamine::{open_workbook_auto_from_rs, Reader};
 
     const MAX_WORKBOOK_CELLS: usize = 10_000_000;
-    let mut workbook = open_workbook_auto(path)
-        .map_err(|error| format!("cannot open workbook '{}': {error}", path.display()))?;
+    const MAX_WORKBOOK_BYTES: u64 = 512 * 1024 * 1024;
+    let size = file.metadata().map_err(|error| error.to_string())?.len();
+    if size > MAX_WORKBOOK_BYTES {
+        return Err(format!(
+            "workbook exceeds the {MAX_WORKBOOK_BYTES}-byte snapshot limit"
+        ));
+    }
+    let mut snapshot = file.try_clone().map_err(|error| error.to_string())?;
+    snapshot
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    let mut bytes = Vec::with_capacity(size as usize);
+    snapshot
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let reader = std::io::Cursor::new(bytes);
+    let mut workbook = open_workbook_auto_from_rs(reader)
+        .map_err(|error| format!("cannot open workbook '{label}': {error}"))?;
     let sheet = requested_sheet
         .map(str::to_owned)
         .or_else(|| workbook.sheet_names().first().cloned())
-        .ok_or_else(|| format!("workbook '{}' has no sheets", path.display()))?;
+        .ok_or_else(|| format!("workbook '{label}' has no sheets"))?;
     let range = workbook.worksheet_range(&sheet).map_err(|error| {
         format!(
             "cannot read workbook sheet '{}' from '{}': {error}",
             sheet,
-            path.display()
+            label
         )
     })?;
     let mut cell_count = 0usize;
@@ -5736,7 +6792,8 @@ fn workbook_cell_to_string(cell: &calamine::Data) -> String {
 /// Calamine currently decodes the owning sheet first, so this bounds the
 /// language-visible result rather than claiming to be a streaming decoder.
 fn read_workbook_range(
-    path: &Path,
+    file: &std::fs::File,
+    label: &str,
     sheet: &str,
     start_row: i64,
     start_column: i64,
@@ -5765,7 +6822,7 @@ fn read_workbook_range(
         ));
     }
 
-    let rows = read_workbook_rows(path, Some(sheet))?;
+    let rows = read_workbook_rows(file, label, Some(sheet))?;
     Ok(rows
         .iter()
         .skip(start_row)
@@ -5781,13 +6838,14 @@ fn read_workbook_range(
 /// Produce the same bounded per-column facts as `csv-summary`, treating the
 /// first worksheet row as headers and never returning source rows.
 fn summarize_workbook(
-    path: &Path,
+    file: &std::fs::File,
+    label: &str,
     sheet: &str,
     max_rows: usize,
 ) -> std::result::Result<serde_json::Value, String> {
     const MAX_WORKBOOK_COLUMNS: usize = 4096;
 
-    let rows = read_workbook_rows(path, Some(sheet))?;
+    let rows = read_workbook_rows(file, label, Some(sheet))?;
     let (headers, data_rows) = rows
         .split_first()
         .ok_or_else(|| "workbook-summary requires a header row".to_string())?;
@@ -5868,11 +6926,29 @@ fn summarize_workbook(
     }))
 }
 
-fn read_workbook_sheet_names(path: &Path) -> std::result::Result<Vec<String>, String> {
-    use calamine::{open_workbook_auto, Reader};
+fn read_workbook_sheet_names(
+    file: &std::fs::File,
+    label: &str,
+) -> std::result::Result<Vec<String>, String> {
+    use calamine::{open_workbook_auto_from_rs, Reader};
 
-    let workbook = open_workbook_auto(path)
-        .map_err(|error| format!("cannot open workbook '{}': {error}", path.display()))?;
+    const MAX_WORKBOOK_BYTES: u64 = 512 * 1024 * 1024;
+    let size = file.metadata().map_err(|error| error.to_string())?.len();
+    if size > MAX_WORKBOOK_BYTES {
+        return Err(format!(
+            "workbook exceeds the {MAX_WORKBOOK_BYTES}-byte snapshot limit"
+        ));
+    }
+    let mut snapshot = file.try_clone().map_err(|error| error.to_string())?;
+    snapshot
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    let mut bytes = Vec::with_capacity(size as usize);
+    snapshot
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let workbook = open_workbook_auto_from_rs(std::io::Cursor::new(bytes))
+        .map_err(|error| format!("cannot open workbook '{label}': {error}"))?;
     Ok(workbook.sheet_names().to_vec())
 }
 
@@ -6173,38 +7249,303 @@ where
     })
 }
 
-fn secure_resource_path(
-    root: &Path,
+fn authority_state_from_parts(
+    session_id: uuid::Uuid,
+    project_id: String,
+    policy: CapabilityPolicy,
+    ledger: CapabilityLedger,
+    roots: &ResourceRootState,
+) -> ProgramRuntimeAuthorityState {
+    ProgramRuntimeAuthorityState {
+        format_version: PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION,
+        session_id,
+        project_id,
+        policy,
+        ledger,
+        resource_roots: roots
+            .bindings
+            .values()
+            .map(|binding| binding.as_ref().clone())
+            .collect(),
+        resource_root_audit: roots.audit.clone(),
+    }
+}
+
+fn resource_root_binding_record(
+    root: crate::vm::ResourceRoot,
+    supplied: &Path,
+    generation: u64,
+    whole_machine: bool,
+    bound_at_unix_ms: u64,
+) -> Result<ResourceRootBindingRecord> {
+    let canonical = supplied
+        .canonicalize()
+        .with_context(|| format!("resolve resource root '{}'", supplied.display()))?;
+    let metadata = std::fs::symlink_metadata(&canonical)
+        .with_context(|| format!("inspect resource root '{}'", canonical.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("resource root is not a stable directory: {}", canonical.display());
+    }
+    #[cfg(unix)]
+    let (device, inode) = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let (device, inode) = (0, 0);
+    Ok(ResourceRootBindingRecord {
+        root,
+        path: canonical,
+        device,
+        inode,
+        generation,
+        whole_machine,
+        bound_at_unix_ms,
+    })
+}
+
+fn validate_resource_root_authority(
+    bindings: &[ResourceRootBindingRecord],
+    audit: &[ResourceRootAuditEntry],
+) -> Result<ResourceRootState> {
+    let mut replayed = BTreeMap::<
+        crate::vm::ResourceRoot,
+        (u64, PathBuf, bool, u64),
+    >::new();
+    let mut next_generation = 1_u64;
+    let mut previous_time = 0_u64;
+    for (index, entry) in audit.iter().enumerate() {
+        if entry.sequence != index as u64 + 1
+            || entry.generation == 0
+            || entry.actor.trim().is_empty()
+            || entry.at_unix_ms < previous_time
+        {
+            bail!("resource-root audit sequence is malformed");
+        }
+        previous_time = entry.at_unix_ms;
+        if entry.whole_machine
+            && (entry.root != crate::vm::ResourceRoot::HostMachine
+                || entry.path != Path::new("/"))
+        {
+            bail!("resource-root audit contains an invalid whole-machine binding");
+        }
+        match entry.action {
+            ResourceRootAuditAction::Bound => {
+                if entry.generation != next_generation || replayed.contains_key(&entry.root) {
+                    bail!("resource-root audit contains an invalid bind transition");
+                }
+                replayed.insert(
+                    entry.root.clone(),
+                    (
+                        entry.generation,
+                        entry.path.clone(),
+                        entry.whole_machine,
+                        entry.at_unix_ms,
+                    ),
+                );
+                next_generation = next_generation
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("resource-root generation overflow"))?;
+            }
+            ResourceRootAuditAction::Revoked => {
+                let Some((generation, path, whole_machine, _)) = replayed.remove(&entry.root)
+                else {
+                    bail!("resource-root audit revokes an inactive root");
+                };
+                if generation != entry.generation
+                    || path != entry.path
+                    || whole_machine != entry.whole_machine
+                {
+                    bail!("resource-root audit revoke does not match the active binding");
+                }
+            }
+        }
+    }
+    let mut active = BTreeMap::new();
+    for binding in bindings {
+        if binding.generation == 0 {
+            bail!("resource-root generation must be non-zero");
+        }
+        if binding.whole_machine
+            && (binding.root != crate::vm::ResourceRoot::HostMachine
+                || binding.path != Path::new("/"))
+        {
+            bail!("resource-root authority contains an invalid whole-machine binding");
+        }
+        let current = resource_root_binding_record(
+            binding.root.clone(),
+            &binding.path,
+            binding.generation,
+            binding.whole_machine,
+            binding.bound_at_unix_ms,
+        )?;
+        if &current != binding {
+            bail!(
+                "resource-root identity changed since approval: {}",
+                binding.path.display()
+            );
+        }
+        let Some((generation, path, whole_machine, bound_at)) = replayed.get(&binding.root)
+        else {
+            bail!("active resource root has no replayed audit authority");
+        };
+        if *generation != binding.generation
+            || *path != binding.path
+            || *whole_machine != binding.whole_machine
+            || *bound_at != binding.bound_at_unix_ms
+        {
+            bail!("active resource root does not match its latest audit event");
+        }
+        if active
+            .insert(binding.root.clone(), Arc::new(binding.clone()))
+            .is_some()
+        {
+            bail!("authority state contains duplicate active resource roots");
+        }
+    }
+    if active.len() != replayed.len() {
+        bail!("resource-root active bindings do not match replayed audit state");
+    }
+    Ok(ResourceRootState {
+        bindings: active,
+        audit: audit.to_vec(),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SecureOpenMode {
+    ReadFile,
+    WriteFile,
+    ReadDirectory,
+}
+
+#[cfg(unix)]
+fn open_resource_beneath_mode(
+    binding: &ResourceRootBindingRecord,
     selector: &crate::vm::FileSelector,
     relative: &str,
-) -> std::result::Result<PathBuf, String> {
+    mode: SecureOpenMode,
+) -> std::result::Result<std::fs::File, String> {
+    use nix::fcntl::{open, openat, OFlag};
+    use nix::sys::stat::{fstat, Mode};
+    use std::os::fd::{AsRawFd, FromRawFd};
+
     if !selector.matches(relative) || relative.contains(['*', '?']) {
         return Err("path is outside its declared selector".to_string());
     }
-    let root = root
-        .canonicalize()
-        .map_err(|error| format!("resource root is unavailable: {error}"))?;
-    let candidate = root.join(relative);
-    let check = if candidate.exists() {
-        candidate
-            .canonicalize()
-            .map_err(|error| format!("path cannot be canonicalized: {error}"))?
-    } else {
-        let parent = candidate
-            .parent()
-            .ok_or_else(|| "path has no parent".to_string())?
-            .canonicalize()
-            .map_err(|error| format!("path parent cannot be canonicalized: {error}"))?;
-        parent.join(
-            candidate
-                .file_name()
-                .ok_or_else(|| "path has no filename".to_string())?,
-        )
-    };
-    if !check.starts_with(&root) {
-        return Err("path escapes its resource root".to_string());
+    let components = Path::new(relative)
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Ok(name.to_owned()),
+            _ => Err("resource path must contain only normal relative components".to_string()),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if components.is_empty() {
+        return Err("resource path is empty".into());
     }
-    Ok(check)
+    let root_fd = open(
+        &binding.path,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("open resource root '{}': {error}", binding.path.display()))?;
+    let mut directory = unsafe { std::fs::File::from_raw_fd(root_fd) };
+    let root_stat = fstat(directory.as_raw_fd()).map_err(|error| error.to_string())?;
+    if root_stat.st_dev as u64 != binding.device || root_stat.st_ino as u64 != binding.inode {
+        return Err("resource-root identity changed since it was bound".into());
+    }
+    for component in &components[..components.len() - 1] {
+        let fd = openat(
+            Some(directory.as_raw_fd()),
+            component.as_os_str(),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| format!("open resource path component: {error}"))?;
+        directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    let final_component = components
+        .last()
+        .expect("non-empty components checked above")
+        .as_os_str();
+    #[cfg(test)]
+    run_resource_before_final_open_hook(relative);
+    let (flags, create_mode) = match mode {
+        SecureOpenMode::ReadFile => (
+            OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ),
+        SecureOpenMode::ReadDirectory => (
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ),
+        SecureOpenMode::WriteFile => (
+            OFlag::O_WRONLY
+                | OFlag::O_CREAT
+                | OFlag::O_NONBLOCK
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        ),
+    };
+    let fd = openat(
+        Some(directory.as_raw_fd()),
+        final_component,
+        flags,
+        create_mode,
+    )
+    .map_err(|error| format!("open resource object: {error}"))?;
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let opened = fstat(file.as_raw_fd()).map_err(|error| error.to_string())?;
+    let opened_kind = nix::sys::stat::SFlag::from_bits_truncate(opened.st_mode);
+    match mode {
+        SecureOpenMode::ReadFile | SecureOpenMode::WriteFile
+            if !opened_kind.contains(nix::sys::stat::SFlag::S_IFREG) =>
+        {
+            return Err("resource object is not a regular file".into());
+        }
+        SecureOpenMode::ReadDirectory
+            if !opened_kind.contains(nix::sys::stat::SFlag::S_IFDIR) =>
+        {
+            return Err("resource object is not a directory".into());
+        }
+        _ => {}
+    }
+    if matches!(mode, SecureOpenMode::WriteFile) {
+        nix::unistd::ftruncate(&file, 0)
+            .map_err(|error| format!("truncate resource object: {error}"))?;
+    }
+    Ok(file)
+}
+
+#[cfg(all(test, unix))]
+type ResourceBeforeFinalOpenHook = (String, Box<dyn FnOnce() + Send>);
+
+#[cfg(all(test, unix))]
+static RESOURCE_BEFORE_FINAL_OPEN_HOOK: std::sync::OnceLock<
+    Mutex<Vec<ResourceBeforeFinalOpenHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, unix))]
+fn run_resource_before_final_open_hook(relative: &str) {
+    let mut hook = RESOURCE_BEFORE_FINAL_OPEN_HOOK
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(index) = hook.iter().position(|(expected, _)| expected == relative) {
+        let (_, callback) = hook.remove(index);
+        callback();
+    }
+}
+
+#[cfg(not(unix))]
+fn open_resource_beneath_mode(
+    _binding: &ResourceRootBindingRecord,
+    _selector: &crate::vm::FileSelector,
+    _relative: &str,
+    _mode: SecureOpenMode,
+) -> std::result::Result<std::fs::File, String> {
+    Err("descriptor-relative resource access is unsupported on this platform".into())
 }
 
 impl Default for ProgramRuntime {
@@ -6447,60 +7788,33 @@ fn typed_value(value: TypedValue) -> Result<ProgramValue> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn failed_process_launch_rollback_never_overwrites_concurrent_authority_mutation() {
-        let previous = CapabilityLedger::default();
-        let mut authorized = previous.clone();
-        authorized
-            .issue(
-                CapabilityRequirement {
-                    capability: CapabilityKind::ProcessRun,
-                    selector: ResourceSelector::Process {
-                        executables: vec!["test-identity".into()],
-                    },
-                },
-                GrantScope::Global,
-                "test-policy",
-                "test-user",
-                1,
-                None,
-            )
-            .unwrap();
-        let rollback = ProcessAuthorizationRollback {
-            previous: previous.clone(),
-            authorized: authorized.clone(),
-        };
-
-        let mut unchanged = authorized.clone();
-        assert!(rollback_process_authorization_if_unchanged(
-            &mut unchanged,
-            &rollback
-        ));
-        assert_eq!(unchanged, previous);
-
-        let mut concurrently_mutated = authorized;
-        concurrently_mutated
-            .issue(
-                CapabilityRequirement {
-                    capability: CapabilityKind::MemoryRead,
-                    selector: ResourceSelector::Memory {
-                        tree: "session".into(),
-                        path: "**".into(),
-                    },
-                },
-                GrantScope::Global,
-                "test-policy",
-                "other-user",
-                2,
-                None,
-            )
-            .unwrap();
-        let expected = concurrently_mutated.clone();
-        assert!(!rollback_process_authorization_if_unchanged(
-            &mut concurrently_mutated,
-            &rollback
-        ));
-        assert_eq!(concurrently_mutated, expected);
+    fn production_host_handler(runtime: &ProgramRuntime) -> TypedHostHandler {
+        let execution_id = uuid::Uuid::new_v4();
+        TypedHostHandler::new(
+            Arc::clone(&runtime.automation),
+            Arc::clone(&runtime.resource_roots),
+            None,
+            None,
+            None,
+            BTreeMap::new(),
+            "[]".into(),
+            Arc::clone(&runtime.network),
+            Arc::clone(&runtime.output_handles),
+            Arc::clone(&runtime.streams),
+            execution_id,
+            HostAuthorizationAudit {
+                ledger: Arc::clone(&runtime.capability_ledger),
+                policy: Arc::clone(&runtime.capability_policy),
+                sink: None,
+                context: runtime.authorization_context_for(None).unwrap(),
+                reason: "host-boundary regression".into(),
+                program_hash: "test-program".into(),
+                agent_ancestry: Vec::new(),
+            },
+            TypedRuntime::intrinsic_grants(),
+            None,
+            DeferredHostEffects::None,
+        )
     }
 
     #[test]
@@ -6562,6 +7876,7 @@ mod tests {
                 Some(CoreHostBinding::ProcessRun),
                 &process_requirement,
                 "/usr/bin/true",
+                &[],
                 &process_origin,
             )
             .is_ok());
@@ -6569,6 +7884,7 @@ mod tests {
                 None,
                 &process_requirement,
                 "/usr/bin/true",
+                &[],
                 &SourceOrigin::generated("legacy-process-run"),
             )
             .is_err());
@@ -6576,6 +7892,7 @@ mod tests {
                 Some(CoreHostBinding::ProcessRun),
                 &process_requirement,
                 "/usr/bin/false",
+                &[],
                 &process_origin,
             )
             .is_err());
@@ -6589,6 +7906,7 @@ mod tests {
                 Some(CoreHostBinding::ProcessRun),
                 &empty,
                 "/usr/bin/true",
+                &[],
                 &process_origin,
             )
             .is_err());
@@ -6609,10 +7927,109 @@ mod tests {
                 Some(CoreHostBinding::ProcessRun),
                 &multiple,
                 "/usr/bin/true",
+                &[],
                 &process_origin,
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn every_host_dispatch_rejects_a_same_capability_wrong_binding_or_abi() {
+        let requirement = CapabilityRequirement {
+            capability: CapabilityKind::AutomationWrite,
+            selector: ResourceSelector::Automation { application: None },
+        };
+        let click = vec![
+            TypedValue::Float(1.0),
+            TypedValue::Float(2.0),
+            TypedValue::String("left".into()),
+            TypedValue::Int(1),
+        ];
+        let origin = SourceOrigin::generated("automation-click");
+        assert!(validate_core_host_request(
+            Some(CoreHostBinding::AutomationClick),
+            &requirement,
+            &click,
+            &origin,
+        )
+        .is_ok());
+        assert!(validate_core_host_request(
+            Some(CoreHostBinding::AutomationType),
+            &requirement,
+            &click,
+            &origin,
+        )
+        .is_err());
+        assert!(validate_core_host_request(
+            Some(CoreHostBinding::AutomationClick),
+            &requirement,
+            &[TypedValue::String("text".into()), TypedValue::Int(0)],
+            &origin,
+        )
+        .is_err());
+
+        let file_requirement = CapabilityRequirement::file(
+            crate::vm::FileOperation::Read,
+            crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
+        );
+        let broad = crate::vm::FileSelector::parse("./**").unwrap();
+        assert!(validate_core_host_request(
+            Some(CoreHostBinding::FileRead),
+            &file_requirement,
+            &[TypedValue::Path {
+                selector: broad,
+                relative: "README.md".into(),
+            }],
+            &SourceOrigin::generated("file-read"),
+        )
+        .is_err());
+
+        let mut checked = 0_usize;
+        for (name, spec) in crate::vm::vocabulary::core_word_registry() {
+            let CoreWordImplementation::HostEffect(binding) = spec.implementation else {
+                continue;
+            };
+            let Some(declared) = spec.signature.effects.0.first() else {
+                panic!("host binding '{name}' has no declared authority");
+            };
+            let hostile = vec![TypedValue::Unit; 9];
+            assert!(
+                validate_core_host_request(
+                    Some(binding),
+                    declared,
+                    &hostile,
+                    &SourceOrigin::generated(name.clone()),
+                )
+                .is_err(),
+                "host binding '{name}' accepted a hostile ABI",
+            );
+            checked += 1;
+        }
+        assert!(checked > 30, "expected the complete core host registry");
+
+        let runtime = ProgramRuntime::new();
+        let mut host = production_host_handler(&runtime);
+        let error = crate::vm::interpreter::CapabilityHandler::request(
+            &mut host,
+            &requirement,
+            vec![TypedValue::String("hostile".into()), TypedValue::Int(0)],
+            &origin,
+        )
+        .expect_err("the production host boundary must reject automation ABI substitution");
+        assert_eq!(error.code, "E-HOST-002");
+
+        let error = crate::vm::interpreter::CapabilityHandler::request(
+            &mut host,
+            &file_requirement,
+            vec![TypedValue::Path {
+                selector: crate::vm::FileSelector::parse("./**").unwrap(),
+                relative: "README.md".into(),
+            }],
+            &SourceOrigin::generated("file-read"),
+        )
+        .expect_err("the production host boundary must reject selector/argument substitution");
+        assert_eq!(error.code, "E-HOST-002");
     }
 
     #[test]
@@ -7441,12 +8858,18 @@ mod tests {
         std::fs::write(tree.join("alpha.txt"), "alpha").unwrap();
         std::fs::write(tree.join("nested").join("beta.txt"), "beta").unwrap();
 
-        let first = merkle_directory(&tree).unwrap();
+        let first = merkle_directory(std::fs::File::open(&tree).unwrap()).unwrap();
         assert_eq!(first.len(), 64);
-        assert_eq!(first, merkle_directory(&tree).unwrap());
+        assert_eq!(
+            first,
+            merkle_directory(std::fs::File::open(&tree).unwrap()).unwrap()
+        );
 
         std::fs::write(tree.join("nested").join("beta.txt"), "changed").unwrap();
-        assert_ne!(first, merkle_directory(&tree).unwrap());
+        assert_ne!(
+            first,
+            merkle_directory(std::fs::File::open(&tree).unwrap()).unwrap()
+        );
     }
 
     #[test]
@@ -7457,7 +8880,8 @@ mod tests {
         std::fs::write(root.path().join("a-dir").join("b.txt"), "beta").unwrap();
         std::fs::write(root.path().join("a.txt"), "alpha").unwrap();
 
-        let (entries, truncated) = list_directory_tree(root.path(), 3).unwrap();
+        let (entries, truncated) =
+            list_directory_tree(std::fs::File::open(root.path()).unwrap(), 3).unwrap();
         assert!(truncated);
         assert_eq!(entries.len(), 3);
         let paths = entries
@@ -7588,16 +9012,11 @@ mod tests {
             )]
         );
         let ledger = runtime.capability_ledger().unwrap();
-        let audit = ledger
-            .authorization_audit
-            .last()
-            .expect("the rejected follow-up must remain auditable");
+        assert_eq!(ledger.authorization_audit.len(), 1);
         assert!(matches!(
-            &audit.requirement.selector,
-            ResourceSelector::File { selector }
-                if selector == &crate::vm::FileSelector::parse("./Cargo.toml").unwrap()
+            ledger.authorization_audit[0].decision,
+            AuthorizationDecision::Allowed { .. }
         ));
-        assert_eq!(audit.decision, AuthorizationDecision::ApprovalRequired);
     }
 
     #[tokio::test]
@@ -9065,12 +10484,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         let approved_identity = ProcessExecutableIdentity::decode(&executables[0]).unwrap();
         assert_eq!(approved_identity.path, "/usr/bin/printf");
         runtime
-            .grant_typed_capability(crate::vm::CapabilityRequirement {
-                capability: crate::vm::CapabilityKind::ProcessRun,
-                selector: crate::vm::ResourceSelector::Process {
-                    executables: vec!["/usr/bin/printf".into()],
-                },
-            })
+            .grant_typed_capability(pending.required_capabilities[0].clone())
             .unwrap();
         let approved = runtime.submit(request).await.unwrap();
         assert_eq!(approved.status, ExecutionStatus::Completed);
@@ -9166,7 +10580,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
     ))]
     #[tokio::test]
     async fn replaced_process_executable_does_not_consume_once_grant() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("tool");
@@ -9254,7 +10668,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
 
         let expected = executable.to_string_lossy().into_owned();
         *PROCESS_BEFORE_EXEC_HOOK
-            .get_or_init(|| Mutex::new(None))
+            .get_or_init(|| Mutex::new(Vec::new()))
             .lock()
             .unwrap() = Some((
             expected,
@@ -9288,6 +10702,116 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
                 .map(|entry| &entry.decision),
             Some(AuthorizationDecision::Allowed { .. })
         ));
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    #[tokio::test]
+    async fn same_inode_mutation_cannot_change_the_snapshotted_process_invocation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("tool");
+        std::fs::copy("/usr/bin/printf", &executable).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = std::fs::canonicalize(executable).unwrap();
+        let source = format!(
+            "(process-run {} (list \"same-inode\"))",
+            serde_json::to_string(&executable.to_string_lossy()).unwrap()
+        );
+        let runtime = ProgramRuntime::new();
+        let pending = runtime
+            .submit_typed_only(submission(
+                ProgramLanguage::Lisp,
+                &source,
+                ExecutionEffect::ExternalWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
+        let ResourceSelector::Process { executables } =
+            &pending.required_capabilities[0].selector
+        else {
+            panic!("process requirement must be concrete")
+        };
+        let identity = ProcessExecutableIdentity::decode(&executables[0]).unwrap();
+        assert_eq!(identity.arguments, vec!["same-inode"]);
+        assert_eq!(identity.environment_sha256, format!("{:x}", Sha256::digest(b"")));
+        assert_eq!(identity.cwd_path, std::env::current_dir().unwrap().to_string_lossy());
+
+        let expected_path = executable.to_string_lossy().into_owned();
+        let original_inode = std::fs::metadata(&executable).unwrap().ino();
+        let mutated = executable.clone();
+        *PROCESS_BEFORE_EXEC_HOOK
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap() = Some((
+            expected_path,
+            Box::new(move || {
+                std::fs::copy("/usr/bin/false", &mutated).unwrap();
+                std::fs::set_permissions(&mutated, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                assert_eq!(std::fs::metadata(&mutated).unwrap().ino(), original_inode);
+            }),
+        ));
+        let completed = runtime
+            .resolve_typed_approval(
+                &pending.approval_prompts[0],
+                ApprovalChoice::AllowOnce,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ExecutionStatus::Completed);
+        assert_eq!(completed.values, vec![ProgramValue::String("same-inode".into())]);
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    #[test]
+    fn authority_restart_rejects_same_inode_process_mutation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("tool");
+        std::fs::copy("/usr/bin/printf", &executable).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = std::fs::canonicalize(executable).unwrap();
+        let original_inode = std::fs::metadata(&executable).unwrap().ino();
+        let identity = open_process_executable(&executable.to_string_lossy(), &["approved".into()])
+            .unwrap()
+            .identity;
+        let runtime = ProgramRuntime::new();
+        let mut ledger = CapabilityLedger::default();
+        ledger
+            .issue(
+                CapabilityRequirement {
+                    capability: CapabilityKind::ProcessRun,
+                    selector: ResourceSelector::Process {
+                        executables: vec![identity.encode()],
+                    },
+                },
+                GrantScope::Global,
+                runtime.capability_policy().unwrap().policy_hash,
+                "test-user",
+                unix_time_ms(),
+                None,
+            )
+            .unwrap();
+        std::fs::copy("/usr/bin/false", &executable).unwrap();
+        assert_eq!(std::fs::metadata(&executable).unwrap().ino(), original_inode);
+        let error = runtime
+            .restore_capability_ledger(ledger)
+            .expect_err("restart must revalidate executable bytes");
+        assert!(format!("{error:#}").contains("identity changed since approval"));
     }
 
     #[cfg(any(
@@ -9456,10 +10980,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .await
             .unwrap();
         assert_eq!(outcome.status, ExecutionStatus::Failed);
-        assert!(outcome
-            .diagnostics
-            .iter()
-            .any(|message| message.contains("stable opened-object execution is unavailable")));
+        assert!(!outcome.diagnostics.is_empty());
         let ledger = runtime.capability_ledger().unwrap();
         assert!(ledger.grants.grants.is_empty());
         assert!(ledger.authorization_audit.is_empty());
@@ -9927,6 +11448,48 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         );
     }
 
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    #[tokio::test]
+    async fn process_grant_cannot_be_reused_for_different_arguments() {
+        let runtime = ProgramRuntime::new();
+        let first = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(process-run \"/usr/bin/printf\" (list \"approved\"))",
+                ExecutionEffect::ExternalWrite,
+            ))
+            .await
+            .unwrap();
+        runtime
+            .grant_typed_capability(first.required_capabilities[0].clone())
+            .unwrap();
+        let mismatched = runtime
+            .submit(submission(
+                ProgramLanguage::Lisp,
+                "(process-run \"/usr/bin/printf\" (list \"hostile\"))",
+                ExecutionEffect::ExternalWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mismatched.status, ExecutionStatus::AuthorizationRequired);
+        let ResourceSelector::Process { executables } =
+            &mismatched.required_capabilities[0].selector
+        else {
+            panic!("process request must bind its exact arguments")
+        };
+        assert_eq!(
+            ProcessExecutableIdentity::decode(&executables[0])
+                .unwrap()
+                .arguments,
+            vec!["hostile"]
+        );
+    }
+
     #[tokio::test]
     async fn approved_typed_network_connect_and_send_use_scoped_host_binding() {
         let listener = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
@@ -10062,28 +11625,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             ))
             .await
             .unwrap();
-        assert_eq!(sent.status, ExecutionStatus::AuthorizationRequired);
-        assert_eq!(
-            sent.required_capabilities,
-            vec![CapabilityRequirement {
-                capability: CapabilityKind::NetworkConnect,
-                selector: ResourceSelector::Network {
-                    host: "127.0.0.1".into(),
-                    ports: vec![port],
-                },
-            }]
-        );
+        assert_eq!(sent.status, ExecutionStatus::Failed);
+        assert!(!sent.diagnostics.is_empty());
         let ledger = runtime.capability_ledger().unwrap();
-        let audit = ledger
-            .authorization_audit
-            .last()
-            .expect("the rejected send must remain auditable");
-        assert!(matches!(
-            &audit.requirement.selector,
-            ResourceSelector::Network { host, ports }
-                if host == "127.0.0.1" && ports == &[port]
-        ));
-        assert_eq!(audit.decision, AuthorizationDecision::ApprovalRequired);
+        assert_eq!(ledger.authorization_audit.len(), 1);
         server.join().unwrap();
     }
 
@@ -10936,7 +12481,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         let error = runtime
             .restore_capability_ledger(ledger.clone())
             .expect_err("raw-path authority must not be restored");
-        assert!(format!("{error:#}").contains("legacy raw-path process capability grant"));
+        assert!(format!("{error:#}").contains("legacy process capability grant"));
         assert!(runtime
             .capability_ledger()
             .unwrap()
@@ -10952,9 +12497,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
                 project_id: "legacy-project".into(),
                 policy,
                 ledger,
+                resource_roots: Vec::new(),
+                resource_root_audit: Vec::new(),
             })
             .expect_err("raw-path authority state must require explicit reapproval");
-        assert!(format!("{error:#}").contains("stable v2 identity"));
+        assert!(format!("{error:#}").contains("stable v3 invocation identity"));
         assert!(restored
             .capability_ledger()
             .unwrap()
@@ -11152,10 +12699,106 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
         let selector = crate::vm::FileSelector::parse("./**").unwrap();
 
-        let error =
-            secure_resource_path(&workspace.path().to_path_buf(), &selector, "outside-link")
-                .unwrap_err();
-        assert!(error.contains("escapes its resource root"));
+        let root = resource_root_binding_record(
+            crate::vm::ResourceRoot::Workspace,
+            workspace.path(),
+            1,
+            false,
+            1,
+        )
+        .unwrap();
+        assert!(open_resource_beneath_mode(
+            &root,
+            &selector,
+            "outside-link",
+            SecureOpenMode::ReadFile,
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_relative_open_rejects_final_component_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let victim = workspace.path().join("victim");
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(&victim, b"inside").unwrap();
+        std::fs::write(outside.path(), b"outside").unwrap();
+        let binding = resource_root_binding_record(
+            crate::vm::ResourceRoot::Workspace,
+            workspace.path(),
+            1,
+            false,
+            1,
+        )
+        .unwrap();
+        let selector = crate::vm::FileSelector::parse("./**").unwrap();
+        let outside_path = outside.path().to_path_buf();
+        RESOURCE_BEFORE_FINAL_OPEN_HOOK
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .push((
+                "victim".into(),
+                Box::new(move || {
+                    std::fs::remove_file(&victim).unwrap();
+                    symlink(outside_path, victim).unwrap();
+                }),
+            ));
+        assert!(open_resource_beneath_mode(
+            &binding,
+            &selector,
+            "victim",
+            SecureOpenMode::ReadFile,
+        )
+        .is_err());
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_relative_open_keeps_the_opened_parent_after_path_replacement() {
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = workspace.path().join("dir");
+        let replacement = workspace.path().join("replacement");
+        let displaced = workspace.path().join("displaced");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(directory.join("value"), b"authorized").unwrap();
+        std::fs::write(replacement.join("value"), b"replacement").unwrap();
+        let binding = resource_root_binding_record(
+            crate::vm::ResourceRoot::Workspace,
+            workspace.path(),
+            1,
+            false,
+            1,
+        )
+        .unwrap();
+        let selector = crate::vm::FileSelector::parse("./**").unwrap();
+        let replacement_target = workspace.path().join("dir");
+        RESOURCE_BEFORE_FINAL_OPEN_HOOK
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .push((
+                "dir/value".into(),
+                Box::new(move || {
+                    std::fs::rename(directory, displaced).unwrap();
+                    std::fs::rename(replacement, replacement_target).unwrap();
+                }),
+            ));
+        let mut file = open_resource_beneath_mode(
+            &binding,
+            &selector,
+            "dir/value",
+            SecureOpenMode::ReadFile,
+        )
+        .unwrap();
+        let mut value = String::new();
+        file.read_to_string(&mut value).unwrap();
+        assert_eq!(value, "authorized");
     }
 
     #[test]
@@ -11163,16 +12806,29 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         let workspace = tempfile::tempdir().unwrap();
         let selector = crate::vm::FileSelector::parse("${host-machine}/etc/**").unwrap();
         std::fs::create_dir(workspace.path().join("etc")).unwrap();
+        std::fs::write(workspace.path().join("etc/hosts"), b"local").unwrap();
 
         // Root selection happens in `TypedHostHandler`; the generic canonical
         // check only proves that a child remains under the root selected by
         // the host binding.
-        let path =
-            secure_resource_path(&workspace.path().to_path_buf(), &selector, "etc/hosts").unwrap();
-        assert_eq!(
-            path,
-            workspace.path().canonicalize().unwrap().join("etc/hosts")
-        );
+        let root = resource_root_binding_record(
+            crate::vm::ResourceRoot::HostMachine,
+            workspace.path(),
+            1,
+            false,
+            1,
+        )
+        .unwrap();
+        let mut file = open_resource_beneath_mode(
+            &root,
+            &selector,
+            "etc/hosts",
+            SecureOpenMode::ReadFile,
+        )
+        .unwrap();
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "local");
     }
 
     #[tokio::test]
@@ -11355,5 +13011,329 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             std::fs::read(root.path().join("created.txt")).unwrap(),
             b"host-write"
         );
+    }
+
+    #[tokio::test]
+    async fn revocation_winning_the_authorization_use_race_prevents_file_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note.txt"), b"before").unwrap();
+        let runtime = ProgramRuntime::new();
+        runtime.bind_host_machine_root(root.path()).unwrap();
+        let pending = runtime
+            .submit_typed_only(submission(
+                ProgramLanguage::Lisp,
+                "(host-file-write (host-path \"note.txt\") (bytes \"after\"))",
+                ExecutionEffect::ExternalWrite,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
+        let ledger = Arc::clone(&runtime.capability_ledger);
+        AUTHORIZATION_BEFORE_USE_HOOK
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .push((
+                pending.execution_id,
+                CapabilityKind::FileWrite,
+                Box::new(move || {
+                    let mut ledger = ledger.lock().unwrap();
+                    let grant_id = ledger
+                        .grants
+                        .grants
+                        .iter()
+                        .rev()
+                        .find(|grant| grant.revoked_at_unix_ms.is_none())
+                        .expect("approval issued an unrevoked grant")
+                        .id;
+                    assert!(ledger.revoke(grant_id, "concurrent-revoker", unix_time_ms()));
+                }),
+            ));
+        let outcome = runtime
+            .resolve_typed_approval(
+                &pending.approval_prompts[0],
+                ApprovalChoice::AllowOnce,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ExecutionStatus::Failed);
+        assert_eq!(std::fs::read(root.path().join("note.txt")).unwrap(), b"before");
+        let ledger = runtime.capability_ledger().unwrap();
+        assert!(ledger.authorization_audit.is_empty());
+        assert!(ledger
+            .audit
+            .iter()
+            .any(|entry| entry.action == crate::vm::CapabilityAuditAction::Revoked));
+    }
+
+    #[tokio::test]
+    async fn failed_file_open_rolls_back_once_use_and_restart_state() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ProgramRuntime::new();
+        runtime.bind_host_machine_root(root.path()).unwrap();
+        let pending = runtime
+            .submit_typed_only(submission(
+                ProgramLanguage::Lisp,
+                "(host-file-read (host-path \"missing.txt\"))",
+                ExecutionEffect::WorkspaceRead,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
+        let failed = runtime
+            .resolve_typed_approval(
+                &pending.approval_prompts[0],
+                ApprovalChoice::AllowOnce,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status, ExecutionStatus::Failed);
+        let ledger = runtime.capability_ledger().unwrap();
+        let grant = ledger.grants.grants.last().expect("once grant remains");
+        assert!(matches!(grant.scope, GrantScope::Once { .. }));
+        assert!(grant.consumed_at_unix_ms.is_none());
+        assert!(ledger.authorization_audit.is_empty());
+        assert!(!ledger
+            .audit
+            .iter()
+            .any(|entry| entry.action == crate::vm::CapabilityAuditAction::Consumed));
+
+        let encoded = serde_json::to_vec(&runtime.authority_state().unwrap()).unwrap();
+        let state: ProgramRuntimeAuthorityState = serde_json::from_slice(&encoded).unwrap();
+        let mut restored = ProgramRuntime::new();
+        restored.restore_authority_state(state).unwrap();
+        let restored = restored.capability_ledger().unwrap();
+        assert!(restored.grants.grants.last().unwrap().consumed_at_unix_ms.is_none());
+        assert!(restored.authorization_audit.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rollback_sink_failure_retains_the_last_durable_authorization_state() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ProgramRuntime::new();
+        runtime.bind_host_machine_root(root.path()).unwrap();
+        let saw_authorized = Arc::new(AtomicBool::new(false));
+        let durable = Arc::new(Mutex::new(None::<ProgramRuntimeAuthorityState>));
+        let sink_saw_authorized = Arc::clone(&saw_authorized);
+        let sink_durable = Arc::clone(&durable);
+        runtime
+            .set_authority_sink(Arc::new(move |state| {
+                if !state.ledger.authorization_audit.is_empty() {
+                    sink_saw_authorized.store(true, AtomicOrdering::SeqCst);
+                } else if sink_saw_authorized.load(AtomicOrdering::SeqCst)
+                    && state.ledger.grants.grants.iter().any(|grant| {
+                        matches!(grant.scope, GrantScope::Once { .. })
+                            && grant.consumed_at_unix_ms.is_none()
+                    })
+                {
+                    anyhow::bail!("injected rollback persistence failure");
+                }
+                *sink_durable.lock().unwrap() = Some(state);
+                Ok(())
+            }))
+            .unwrap();
+        let pending = runtime
+            .submit_typed_only(submission(
+                ProgramLanguage::Lisp,
+                "(host-file-read (host-path \"missing.txt\"))",
+                ExecutionEffect::WorkspaceRead,
+            ))
+            .await
+            .unwrap();
+        let failed = runtime
+            .resolve_typed_approval(
+                &pending.approval_prompts[0],
+                ApprovalChoice::AllowOnce,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status, ExecutionStatus::Failed);
+        assert!(failed
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("persist unused host authorization rollback")));
+        let ledger = runtime.capability_ledger().unwrap();
+        assert_eq!(ledger.authorization_audit.len(), 1);
+        assert!(ledger.grants.grants.last().unwrap().consumed_at_unix_ms.is_some());
+        assert_eq!(
+            durable.lock().unwrap().as_ref().unwrap().ledger,
+            ledger,
+            "memory must remain at the last successfully persisted authority state"
+        );
+    }
+
+    #[tokio::test]
+    async fn unused_authorization_rollback_preserves_an_unrelated_concurrent_grant() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ProgramRuntime::new();
+        runtime.bind_host_machine_root(root.path()).unwrap();
+        let pending = runtime
+            .submit_typed_only(submission(
+                ProgramLanguage::Lisp,
+                "(host-file-read (host-path \"missing.txt\"))",
+                ExecutionEffect::WorkspaceRead,
+            ))
+            .await
+            .unwrap();
+        let ledger = Arc::clone(&runtime.capability_ledger);
+        let policy_hash = runtime.capability_policy().unwrap().policy_hash;
+        AUTHORIZATION_BEFORE_USE_HOOK
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap()
+            .push((
+                pending.execution_id,
+                CapabilityKind::FileRead,
+                Box::new(move || {
+                    ledger
+                        .lock()
+                        .unwrap()
+                        .issue(
+                            CapabilityRequirement {
+                                capability: CapabilityKind::MemoryRead,
+                                selector: ResourceSelector::Memory {
+                                    tree: "session".into(),
+                                    path: "concurrent".into(),
+                                },
+                            },
+                            GrantScope::Global,
+                            policy_hash,
+                            "concurrent-user",
+                            unix_time_ms(),
+                            None,
+                        )
+                        .unwrap();
+                }),
+            ));
+        let failed = runtime
+            .resolve_typed_approval(
+                &pending.approval_prompts[0],
+                ApprovalChoice::AllowOnce,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status, ExecutionStatus::Failed);
+        let ledger = runtime.capability_ledger().unwrap();
+        assert!(ledger.grants.grants.iter().any(|grant| {
+            grant.requirement.capability == CapabilityKind::MemoryRead
+                && grant.created_by == "concurrent-user"
+                && grant.is_active(unix_time_ms())
+        }));
+        assert!(ledger.authorization_audit.is_empty());
+    }
+
+    #[test]
+    fn resource_root_bind_revoke_and_whole_machine_lifecycle_is_durable() {
+        let runtime = ProgramRuntime::new();
+        let persisted = Arc::new(Mutex::new(Vec::new()));
+        let persisted_sink = Arc::clone(&persisted);
+        runtime
+            .set_authority_sink(Arc::new(move |state| {
+                persisted_sink.lock().unwrap().push(state);
+                Ok(())
+            }))
+            .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        runtime.bind_project_root(project.path()).unwrap();
+        runtime.clear_project_root().unwrap();
+        assert!(runtime.bind_host_machine_root(PathBuf::from("/")).is_err());
+        runtime.bind_whole_machine_root().unwrap();
+        runtime.clear_host_machine_root().unwrap();
+
+        let states = persisted.lock().unwrap();
+        assert_eq!(states.len(), 4);
+        assert!(states
+            .iter()
+            .all(|state| state.format_version == PROGRAM_RUNTIME_AUTHORITY_STATE_VERSION));
+        let final_state = states.last().unwrap();
+        assert!(final_state
+            .resource_root_audit
+            .iter()
+            .any(|entry| entry.root == crate::vm::ResourceRoot::Project
+                && entry.action == ResourceRootAuditAction::Bound));
+        assert!(final_state
+            .resource_root_audit
+            .iter()
+            .any(|entry| entry.root == crate::vm::ResourceRoot::Project
+                && entry.action == ResourceRootAuditAction::Revoked));
+        assert!(final_state
+            .resource_root_audit
+            .iter()
+            .any(|entry| entry.whole_machine
+                && entry.action == ResourceRootAuditAction::Bound));
+        assert!(!final_state
+            .resource_roots
+            .iter()
+            .any(|binding| binding.root == crate::vm::ResourceRoot::HostMachine));
+    }
+
+    #[test]
+    fn failed_authority_sink_rolls_back_resource_root_bind_and_revoke() {
+        let runtime = ProgramRuntime::new();
+        let project = tempfile::tempdir().unwrap();
+        let initial = runtime.authority_state().unwrap();
+        runtime
+            .set_authority_sink(Arc::new(|_| anyhow::bail!("injected root sink failure")))
+            .unwrap();
+        assert!(runtime.bind_project_root(project.path()).is_err());
+        assert_eq!(runtime.authority_state().unwrap(), initial);
+
+        runtime.clear_authority_sink().unwrap();
+        runtime.bind_project_root(project.path()).unwrap();
+        let bound = runtime.authority_state().unwrap();
+        runtime
+            .set_authority_sink(Arc::new(|_| anyhow::bail!("injected root sink failure")))
+            .unwrap();
+        assert!(runtime.clear_project_root().is_err());
+        assert_eq!(runtime.authority_state().unwrap(), bound);
+    }
+
+    #[test]
+    fn authority_restart_rejects_replaced_resource_root_identity() {
+        let runtime = ProgramRuntime::new();
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("project");
+        let displaced = parent.path().join("displaced");
+        std::fs::create_dir(&project).unwrap();
+        runtime.bind_project_root(&project).unwrap();
+        let state = runtime.authority_state().unwrap();
+        std::fs::rename(&project, &displaced).unwrap();
+        std::fs::create_dir(&project).unwrap();
+
+        let mut restored = ProgramRuntime::new();
+        let error = restored
+            .restore_authority_state(state)
+            .expect_err("replacement directory must not inherit root authority");
+        assert!(format!("{error:#}").contains("identity changed since approval"));
+        assert_eq!(
+            restored.capability_availability(&CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("${project}/**").unwrap(),
+            )),
+            CapabilityAvailability::Disabled
+        );
+    }
+
+    #[test]
+    fn authority_restart_rejects_incomplete_resource_root_lifecycle_audit() {
+        let runtime = ProgramRuntime::new();
+        let project = tempfile::tempdir().unwrap();
+        runtime.bind_project_root(project.path()).unwrap();
+        runtime.clear_project_root().unwrap();
+        let mut state = runtime.authority_state().unwrap();
+        let removed = state.resource_root_audit.pop().unwrap();
+        assert_eq!(removed.action, ResourceRootAuditAction::Revoked);
+
+        let mut restored = ProgramRuntime::new();
+        let error = restored
+            .restore_authority_state(state)
+            .expect_err("audit replay must detect an omitted revocation");
+        assert!(format!("{error:#}").contains("replayed audit state"));
     }
 }

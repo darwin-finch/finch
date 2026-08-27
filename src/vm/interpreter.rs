@@ -117,6 +117,19 @@ pub trait CapabilityHandler {
         origin: &SourceOrigin,
     ) -> Result<Vec<TypedValue>, VmDiagnostic>;
 
+    /// Final host-use boundary for handlers which maintain revocable,
+    /// durable authorization state. Stateless handlers inherit the direct
+    /// request bridge; authority-aware handlers override this to revalidate
+    /// immediately before the operation and finalize or roll back its use.
+    fn request_with_authority_lease(
+        &mut self,
+        requirement: &CapabilityRequirement,
+        arguments: Vec<TypedValue>,
+        origin: &SourceOrigin,
+    ) -> Result<Vec<TypedValue>, VmDiagnostic> {
+        self.request(requirement, arguments, origin)
+    }
+
     /// Handle an awaited effect with its protocol metadata intact. Hosts that
     /// only need the capability arguments can use the default bridge; richer
     /// adapters may project a host-issued resource (such as `output-open`)
@@ -1651,7 +1664,7 @@ impl<'a, H: CapabilityHandler> Interpreter<'a, H> {
     }
 }
 
-fn instantiate_requirement(
+pub(crate) fn instantiate_requirement(
     requirement: &CapabilityRequirement,
     arguments: &[TypedValue],
 ) -> Result<CapabilityRequirement, String> {
