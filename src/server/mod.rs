@@ -1393,16 +1393,18 @@ mod tests {
             }
             let mut forged = original.clone();
             forged[0] = if forged[0] == b'a' { b'b' } else { b'a' };
-            assert_eq!(unsafe { nix::libc::fchmod(9, 0o600) }, 0);
-            let mut writer = std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open("/dev/fd/9")
-                .unwrap();
-            writer.write_all(&forged).unwrap();
-            writer.sync_all().unwrap();
-            drop(writer);
-            assert_eq!(unsafe { nix::libc::fchmod(9, 0o400) }, 0);
+            for fd in [9, 108] {
+                assert_eq!(unsafe { nix::libc::fchmod(fd, 0o600) }, 0);
+                let mut writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(format!("/dev/fd/{fd}"))
+                    .unwrap();
+                writer.write_all(&forged).unwrap();
+                writer.sync_all().unwrap();
+                drop(writer);
+                assert_eq!(unsafe { nix::libc::fchmod(fd, 0o400) }, 0);
+            }
 
             let generator_state = Arc::new(RwLock::new(GeneratorState::NotAvailable));
             let result = AgentServer::new(
@@ -1429,16 +1431,18 @@ mod tests {
                 "constructor mutated Finch state before rejecting rewritten authority"
             );
 
-            assert_eq!(unsafe { nix::libc::fchmod(9, 0o600) }, 0);
-            let mut writer = std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open("/dev/fd/9")
-                .unwrap();
-            writer.write_all(&original).unwrap();
-            writer.sync_all().unwrap();
-            drop(writer);
-            assert_eq!(unsafe { nix::libc::fchmod(9, 0o400) }, 0);
+            for fd in [9, 108] {
+                assert_eq!(unsafe { nix::libc::fchmod(fd, 0o600) }, 0);
+                let mut writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(format!("/dev/fd/{fd}"))
+                    .unwrap();
+                writer.write_all(&original).unwrap();
+                writer.sync_all().unwrap();
+                drop(writer);
+                assert_eq!(unsafe { nix::libc::fchmod(fd, 0o400) }, 0);
+            }
             crate::brain::isolated_test_proof().unwrap();
             return;
         }
