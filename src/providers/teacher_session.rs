@@ -421,8 +421,11 @@ mod tests {
     struct MockProvider;
 
     #[async_trait::async_trait]
-    impl LlmProvider for MockProvider {
-        async fn send_message(&self, _request: &ProviderRequest) -> Result<ProviderResponse> {
+    impl ProviderBackend for MockProvider {
+        async fn send_message_validated(
+            &self,
+            _request: ValidatedProviderRequest,
+        ) -> Result<ProviderResponse> {
             Ok(ProviderResponse {
                 id: "test".to_string(),
                 model: "test".to_string(),
@@ -435,9 +438,9 @@ mod tests {
             })
         }
 
-        async fn send_message_stream(
+        async fn send_message_stream_validated(
             &self,
-            _request: &ProviderRequest,
+            _request: ValidatedProviderRequest,
         ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
             let (tx, rx) = mpsc::channel(1);
             tokio::spawn(async move {
@@ -456,12 +459,20 @@ mod tests {
             "mock-model"
         }
 
-        fn supports_streaming(&self) -> bool {
-            true
-        }
-
-        fn supports_tools(&self) -> bool {
-            true
+        fn capabilities(&self, model: &str) -> super::ModelCapabilities {
+            super::ModelCapabilities::static_metadata(
+                self.name(),
+                model,
+                "2026-08-26",
+                "test fixture",
+                super::CapabilitySupport::Supported,
+                super::CapabilitySupport::Supported,
+                super::CapabilitySupport::Unsupported,
+                super::ReasoningCapability::unsupported("2026-08-26", "test fixture"),
+                Some(1_000),
+                Some(10_000),
+                None,
+            )
         }
     }
 

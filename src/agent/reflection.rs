@@ -245,20 +245,23 @@ git_email = "vesper@local.finch"
         // We use a mock provider that panics if called, proving no API call is made.
         use crate::claude::ClaudeClient;
         use crate::providers::types::{ProviderRequest, ProviderResponse, StreamChunk};
-        use crate::providers::LlmProvider;
+        use crate::providers::{ProviderBackend, ValidatedProviderRequest};
         use anyhow::Result;
         use tokio::sync::mpsc::Receiver;
 
         struct PanicProvider;
 
         #[async_trait::async_trait]
-        impl LlmProvider for PanicProvider {
-            async fn send_message(&self, _: &ProviderRequest) -> Result<ProviderResponse> {
+        impl ProviderBackend for PanicProvider {
+            async fn send_message_validated(
+                &self,
+                _: ValidatedProviderRequest,
+            ) -> Result<ProviderResponse> {
                 panic!("send_message should not be called for empty task list");
             }
-            async fn send_message_stream(
+            async fn send_message_stream_validated(
                 &self,
-                _: &ProviderRequest,
+                _: ValidatedProviderRequest,
             ) -> Result<Receiver<Result<StreamChunk>>> {
                 panic!("send_message_stream should not be called for empty task list");
             }

@@ -6,7 +6,11 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use super::{LlmProvider, ProviderRequest, ProviderResponse, StreamChunk};
+use super::{
+    resolve_effective_request, validate_provider_request, CapabilityProvenance, CapabilitySupport,
+    LlmProvider, ModelCapabilities, ModelFeature, ProviderBackend, ProviderRequest,
+    ProviderResponse, StreamChunk, ValidatedProviderRequest,
+};
 
 /// A chain of providers to try in order
 pub struct FallbackChain {
@@ -49,22 +53,22 @@ impl FallbackChain {
         let mut last_error = None;
 
         for (idx, provider) in self.providers.iter().enumerate() {
-            if request
-                .tools
-                .as_ref()
-                .is_some_and(|tools| !tools.is_empty())
-                && !provider.supports_tools()
-            {
-                tracing::info!(
-                    provider = provider.name(),
-                    "Skipping provider because this turn requires tools"
-                );
-                last_error = Some(anyhow::anyhow!(
-                    "Provider {} cannot satisfy this turn's tool capability",
-                    provider.name()
-                ));
-                continue;
-            }
+            let mut candidate = request.clone();
+            candidate.model = provider.default_model().to_string();
+            let (mut provider_request, capabilities) =
+                match resolve_effective_request(provider.as_ref(), &candidate) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        tracing::info!(
+                            provider = provider.name(),
+                            model = candidate.model,
+                            error = %error,
+                            "Skipping provider because its model is ineligible for this turn"
+                        );
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
             tracing::debug!(
                 "Trying provider {} ({}/{})",
                 provider.name(),
@@ -74,28 +78,28 @@ impl FallbackChain {
 
             // Create a modified request with this provider's model ID,
             // sanitizing orphaned tool_use blocks from previous failed providers
-            let mut provider_request = ProviderRequest {
-                model: provider.default_model().to_string(),
-                messages: request.messages.clone(),
-                max_tokens: request.max_tokens,
-                tools: request.tools.clone(),
-                temperature: request.temperature,
-                stream: request.stream,
-                system: request.system.clone(),
-            };
-            let dropped =
-                provider_request.truncate_to_context_limit(provider.context_limit_tokens());
-            if dropped > 0 {
-                tracing::debug!(
-                    provider = provider.name(),
-                    dropped_messages = dropped,
-                    context_limit = provider.context_limit_tokens(),
-                    "Truncated conversation history to fit provider context window"
-                );
+            if let Some(context_limit) = capabilities.context_window.max_tokens {
+                let dropped = provider_request.truncate_to_context_limit(context_limit);
+                if dropped > 0 {
+                    tracing::debug!(
+                        provider = provider.name(),
+                        dropped_messages = dropped,
+                        context_limit,
+                        "Truncated conversation history to fit provider context window"
+                    );
+                }
             }
             provider_request.sanitize_messages();
+            let validated =
+                match validate_provider_request(provider.as_ref(), &provider_request, false) {
+                    Ok(validated) => validated,
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
 
-            match provider.send_message(&provider_request).await {
+            match provider.send_message_validated(validated).await {
                 Ok(response) => {
                     if idx > 0 {
                         tracing::info!(
@@ -139,22 +143,25 @@ impl FallbackChain {
         let mut last_error = None;
 
         for (idx, provider) in self.providers.iter().enumerate() {
-            if request
-                .tools
-                .as_ref()
-                .is_some_and(|tools| !tools.is_empty())
-                && !provider.supports_tools()
-            {
-                tracing::info!(
-                    provider = provider.name(),
-                    "Skipping provider because this streaming turn requires tools"
-                );
-                last_error = Some(anyhow::anyhow!(
-                    "Provider {} cannot satisfy this turn's tool capability",
-                    provider.name()
-                ));
-                continue;
-            }
+            let mut candidate = request.clone();
+            candidate.model = provider.default_model().to_string();
+            candidate.stream = true;
+            let (mut provider_request, capabilities) = match resolve_effective_request(
+                provider.as_ref(),
+                &candidate,
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    tracing::info!(
+                        provider = provider.name(),
+                        model = candidate.model,
+                        error = %error,
+                        "Skipping provider because its model is ineligible for this streaming turn"
+                    );
+                    last_error = Some(error);
+                    continue;
+                }
+            };
             tracing::debug!(
                 "Trying streaming with provider {} ({}/{})",
                 provider.name(),
@@ -164,28 +171,28 @@ impl FallbackChain {
 
             // Create a modified request with this provider's model ID,
             // sanitizing orphaned tool_use blocks from previous failed providers
-            let mut provider_request = ProviderRequest {
-                model: provider.default_model().to_string(),
-                messages: request.messages.clone(),
-                max_tokens: request.max_tokens,
-                tools: request.tools.clone(),
-                temperature: request.temperature,
-                stream: request.stream,
-                system: request.system.clone(),
-            };
-            let dropped =
-                provider_request.truncate_to_context_limit(provider.context_limit_tokens());
-            if dropped > 0 {
-                tracing::debug!(
-                    provider = provider.name(),
-                    dropped_messages = dropped,
-                    context_limit = provider.context_limit_tokens(),
-                    "Truncated conversation history to fit provider context window"
-                );
+            if let Some(context_limit) = capabilities.context_window.max_tokens {
+                let dropped = provider_request.truncate_to_context_limit(context_limit);
+                if dropped > 0 {
+                    tracing::debug!(
+                        provider = provider.name(),
+                        dropped_messages = dropped,
+                        context_limit,
+                        "Truncated conversation history to fit provider context window"
+                    );
+                }
             }
             provider_request.sanitize_messages();
+            let validated =
+                match validate_provider_request(provider.as_ref(), &provider_request, true) {
+                    Ok(validated) => validated,
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
 
-            match provider.send_message_stream(&provider_request).await {
+            match provider.send_message_stream_validated(validated).await {
                 Ok(receiver) => {
                     if idx > 0 {
                         tracing::info!(
@@ -221,16 +228,20 @@ impl FallbackChain {
 
 // Implement LlmProvider trait for FallbackChain
 #[async_trait::async_trait]
-impl LlmProvider for FallbackChain {
-    async fn send_message(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        self.send_message_with_fallback(request).await
+impl ProviderBackend for FallbackChain {
+    async fn send_message_validated(
+        &self,
+        request: ValidatedProviderRequest,
+    ) -> Result<ProviderResponse> {
+        self.send_message_with_fallback(request.request()).await
     }
 
-    async fn send_message_stream(
+    async fn send_message_stream_validated(
         &self,
-        request: &ProviderRequest,
+        request: ValidatedProviderRequest,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-        self.send_message_stream_with_fallback(request).await
+        self.send_message_stream_with_fallback(request.request())
+            .await
     }
 
     fn name(&self) -> &str {
@@ -245,16 +256,37 @@ impl LlmProvider for FallbackChain {
             .unwrap_or("default")
     }
 
-    fn supports_streaming(&self) -> bool {
-        self.primary_provider()
-            .map(|p| p.supports_streaming())
-            .unwrap_or(false)
-    }
+    fn capabilities(&self, model: &str) -> ModelCapabilities {
+        fn aggregate(
+            providers: &[Arc<dyn LlmProvider>],
+            select: impl Fn(&ModelCapabilities) -> CapabilitySupport,
+        ) -> CapabilitySupport {
+            let mut saw_unknown = false;
+            for provider in providers {
+                let capability = provider.capabilities(provider.default_model());
+                match select(&capability) {
+                    CapabilitySupport::Supported => return CapabilitySupport::Supported,
+                    CapabilitySupport::Unknown => saw_unknown = true,
+                    CapabilitySupport::Unsupported => {}
+                }
+            }
+            if saw_unknown {
+                CapabilitySupport::Unknown
+            } else if providers.is_empty() {
+                CapabilitySupport::Unknown
+            } else {
+                CapabilitySupport::Unsupported
+            }
+        }
 
-    fn supports_tools(&self) -> bool {
-        self.providers
-            .iter()
-            .any(|provider| provider.supports_tools())
+        let mut capabilities = ModelCapabilities::unknown(self.name(), model);
+        let configured = |support| ModelFeature {
+            support,
+            provenance: CapabilityProvenance::Configuration,
+        };
+        capabilities.streaming = configured(aggregate(&self.providers, |c| c.streaming.support));
+        capabilities.tools = configured(aggregate(&self.providers, |c| c.tools.support));
+        capabilities
     }
 }
 
@@ -263,6 +295,7 @@ mod tests {
     use super::*;
     use crate::claude::types::ContentBlock;
     use crate::tools::types::{ToolDefinition, ToolInputSchema};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Mock provider for testing
     struct MockProvider {
@@ -272,14 +305,140 @@ mod tests {
 
     struct NoToolProvider;
 
+    struct ImplicitReasoningProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
     #[async_trait::async_trait]
-    impl LlmProvider for NoToolProvider {
-        async fn send_message(&self, _: &ProviderRequest) -> Result<ProviderResponse> {
-            panic!("provider without tools must be skipped before invocation")
+    impl ProviderBackend for ImplicitReasoningProvider {
+        async fn send_message_validated(
+            &self,
+            _: ValidatedProviderRequest,
+        ) -> Result<ProviderResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            panic!("reasoning-ineligible provider must be skipped")
         }
-        async fn send_message_stream(
+
+        async fn send_message_stream_validated(
+            &self,
+            _: ValidatedProviderRequest,
+        ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            panic!("reasoning-ineligible provider must be skipped")
+        }
+
+        fn name(&self) -> &str {
+            "openai"
+        }
+
+        fn default_model(&self) -> &str {
+            "gpt-4o"
+        }
+
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            ModelCapabilities::static_metadata(
+                self.name(),
+                model,
+                "2026-08-26",
+                "test fixture",
+                CapabilitySupport::Supported,
+                CapabilitySupport::Supported,
+                CapabilitySupport::Unsupported,
+                ReasoningCapability::unsupported("2026-08-26", "test fixture"),
+                Some(1_000),
+                Some(10_000),
+                None,
+            )
+        }
+
+        fn requested_reasoning_effort(
             &self,
             _: &ProviderRequest,
+        ) -> Option<crate::config::ReasoningEffort> {
+            Some(crate::config::ReasoningEffort::High)
+        }
+    }
+
+    struct ModelBoundProvider {
+        model: &'static str,
+        tools: CapabilitySupport,
+        streaming: CapabilitySupport,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderBackend for ModelBoundProvider {
+        async fn send_message_validated(
+            &self,
+            request: ValidatedProviderRequest,
+        ) -> Result<ProviderResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                request.request().model,
+                self.model,
+                "fallback rebound the selected profile's model"
+            );
+            Ok(ProviderResponse {
+                id: "model-bound".into(),
+                model: request.request().model.clone(),
+                content: vec![ContentBlock::Text { text: "ok".into() }],
+                stop_reason: Some("end_turn".into()),
+                role: "assistant".into(),
+                provider: "compatible".into(),
+            })
+        }
+
+        async fn send_message_stream_validated(
+            &self,
+            request: ValidatedProviderRequest,
+        ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                request.request().model,
+                self.model,
+                "fallback rebound the selected profile's model"
+            );
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+
+        fn name(&self) -> &str {
+            "compatible"
+        }
+
+        fn default_model(&self) -> &str {
+            self.model
+        }
+
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            assert_eq!(model, self.model);
+            ModelCapabilities::static_metadata(
+                self.name(),
+                model,
+                "2026-08-26",
+                "test fixture",
+                self.streaming,
+                self.tools,
+                CapabilitySupport::Unsupported,
+                ReasoningCapability::unsupported("2026-08-26", "test fixture"),
+                Some(1_000),
+                Some(10_000),
+                None,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderBackend for NoToolProvider {
+        async fn send_message_validated(
+            &self,
+            _: ValidatedProviderRequest,
+        ) -> Result<ProviderResponse> {
+            panic!("provider without tools must be skipped before invocation")
+        }
+        async fn send_message_stream_validated(
+            &self,
+            _: ValidatedProviderRequest,
         ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
             panic!("provider without tools must be skipped before invocation")
         }
@@ -289,8 +448,20 @@ mod tests {
         fn default_model(&self) -> &str {
             "no-tools-model"
         }
-        fn supports_tools(&self) -> bool {
-            false
+        fn capabilities(&self, model: &str) -> super::ModelCapabilities {
+            super::ModelCapabilities::static_metadata(
+                self.name(),
+                model,
+                "2026-08-26",
+                "test fixture",
+                super::CapabilitySupport::Supported,
+                super::CapabilitySupport::Unsupported,
+                super::CapabilitySupport::Unsupported,
+                super::ReasoningCapability::unsupported("2026-08-26", "test fixture"),
+                Some(1_000),
+                Some(10_000),
+                None,
+            )
         }
     }
 
@@ -304,8 +475,11 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl LlmProvider for MockProvider {
-        async fn send_message(&self, _request: &ProviderRequest) -> Result<ProviderResponse> {
+    impl ProviderBackend for MockProvider {
+        async fn send_message_validated(
+            &self,
+            _request: ValidatedProviderRequest,
+        ) -> Result<ProviderResponse> {
             if self.should_fail {
                 anyhow::bail!("Mock provider {} failed", self.name);
             }
@@ -322,9 +496,9 @@ mod tests {
             })
         }
 
-        async fn send_message_stream(
+        async fn send_message_stream_validated(
             &self,
-            _request: &ProviderRequest,
+            _request: ValidatedProviderRequest,
         ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
             if self.should_fail {
                 anyhow::bail!("Mock provider {} streaming failed", self.name);
@@ -347,12 +521,20 @@ mod tests {
             "test-model"
         }
 
-        fn supports_streaming(&self) -> bool {
-            true
-        }
-
-        fn supports_tools(&self) -> bool {
-            true
+        fn capabilities(&self, model: &str) -> super::ModelCapabilities {
+            super::ModelCapabilities::static_metadata(
+                self.name(),
+                model,
+                "2026-08-26",
+                "test fixture",
+                super::CapabilitySupport::Supported,
+                super::CapabilitySupport::Supported,
+                super::CapabilitySupport::Unsupported,
+                super::ReasoningCapability::unsupported("2026-08-26", "test fixture"),
+                Some(1_000),
+                Some(10_000),
+                None,
+            )
         }
     }
 
@@ -460,5 +642,77 @@ mod tests {
         }]);
         let response = chain.send_message_with_fallback(&request).await.unwrap();
         assert_eq!(response.provider, "grok-fallback");
+    }
+
+    #[tokio::test]
+    async fn fallback_skips_ineligible_model_without_rebinding_profile_model() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let chain = FallbackChain::new(vec![
+            Box::new(ModelBoundProvider {
+                model: "text-only",
+                tools: CapabilitySupport::Unsupported,
+                streaming: CapabilitySupport::Supported,
+                calls: Arc::clone(&first_calls),
+            }),
+            Box::new(ModelBoundProvider {
+                model: "tool-model",
+                tools: CapabilitySupport::Supported,
+                streaming: CapabilitySupport::Supported,
+                calls: Arc::clone(&second_calls),
+            }),
+        ]);
+        let request = ProviderRequest::new(vec![]).with_tools(vec![ToolDefinition {
+            name: "lookup".into(),
+            description: "lookup".into(),
+            input_schema: ToolInputSchema::simple(vec![]),
+        }]);
+        let response = chain.send_message_with_fallback(&request).await.unwrap();
+        assert_eq!(response.model, "tool-model");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_fallback_skips_ineligible_model_before_invocation() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let chain = FallbackChain::new(vec![
+            Box::new(ModelBoundProvider {
+                model: "blocking-only",
+                tools: CapabilitySupport::Supported,
+                streaming: CapabilitySupport::Unsupported,
+                calls: Arc::clone(&first_calls),
+            }),
+            Box::new(ModelBoundProvider {
+                model: "streaming",
+                tools: CapabilitySupport::Supported,
+                streaming: CapabilitySupport::Supported,
+                calls: Arc::clone(&second_calls),
+            }),
+        ]);
+        chain
+            .send_message_stream_with_fallback(&ProviderRequest::new(vec![]).with_stream(true))
+            .await
+            .unwrap();
+        assert_eq!(first_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_includes_profile_configured_reasoning_in_eligibility() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let chain = FallbackChain::new(vec![
+            Box::new(ImplicitReasoningProvider {
+                calls: Arc::clone(&primary_calls),
+            }),
+            Box::new(MockProvider::new("fallback", false)),
+        ]);
+        let response = chain
+            .send_message_with_fallback(&ProviderRequest::new(vec![]))
+            .await
+            .unwrap();
+        assert_eq!(response.provider, "fallback");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 0);
     }
 }

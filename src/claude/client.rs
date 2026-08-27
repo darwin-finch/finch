@@ -113,19 +113,25 @@ impl ClaudeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{ProviderResponse, StreamChunk as ProviderStreamChunk};
+    use crate::providers::{
+        ProviderBackend, ProviderResponse, StreamChunk as ProviderStreamChunk,
+        ValidatedProviderRequest,
+    };
 
     struct ConfiguredProvider;
 
     #[async_trait::async_trait]
-    impl LlmProvider for ConfiguredProvider {
-        async fn send_message(&self, _request: &ProviderRequest) -> Result<ProviderResponse> {
+    impl ProviderBackend for ConfiguredProvider {
+        async fn send_message_validated(
+            &self,
+            _request: ValidatedProviderRequest,
+        ) -> Result<ProviderResponse> {
             unreachable!("conversion test does not send requests")
         }
 
-        async fn send_message_stream(
+        async fn send_message_stream_validated(
             &self,
-            _request: &ProviderRequest,
+            _request: ValidatedProviderRequest,
         ) -> Result<mpsc::Receiver<Result<ProviderStreamChunk>>> {
             unreachable!("conversion test does not send requests")
         }

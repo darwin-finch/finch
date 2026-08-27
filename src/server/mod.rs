@@ -822,26 +822,31 @@ mod tests {
         assert!(!constant_time_eq(b"brain-secret", b"brain-secrex"));
         assert!(!constant_time_eq(b"brain-secret", b"brain-secret-longer"));
     }
-    use crate::providers::{LlmProvider, ProviderRequest, ProviderResponse, StreamChunk};
+    use crate::providers::{
+        LlmProvider, ProviderBackend, ProviderResponse, StreamChunk, ValidatedProviderRequest,
+    };
     use async_trait::async_trait;
     use tokio::sync::mpsc::Receiver;
 
     struct NamedProvider(String);
 
     #[async_trait]
-    impl LlmProvider for NamedProvider {
+    impl ProviderBackend for NamedProvider {
         fn name(&self) -> &str {
             &self.0
         }
         fn default_model(&self) -> &str {
             "test-model"
         }
-        async fn send_message(&self, _r: &ProviderRequest) -> anyhow::Result<ProviderResponse> {
+        async fn send_message_validated(
+            &self,
+            _r: ValidatedProviderRequest,
+        ) -> anyhow::Result<ProviderResponse> {
             unimplemented!()
         }
-        async fn send_message_stream(
+        async fn send_message_stream_validated(
             &self,
-            _r: &ProviderRequest,
+            _r: ValidatedProviderRequest,
         ) -> anyhow::Result<Receiver<anyhow::Result<StreamChunk>>> {
             unimplemented!()
         }

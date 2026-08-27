@@ -398,16 +398,16 @@ mod tests {
     struct NullProvider;
 
     #[async_trait::async_trait]
-    impl crate::providers::LlmProvider for NullProvider {
-        async fn send_message(
+    impl crate::providers::ProviderBackend for NullProvider {
+        async fn send_message_validated(
             &self,
-            _req: &crate::providers::ProviderRequest,
+            _req: crate::providers::ValidatedProviderRequest,
         ) -> anyhow::Result<crate::providers::ProviderResponse> {
             anyhow::bail!("null provider")
         }
-        async fn send_message_stream(
+        async fn send_message_stream_validated(
             &self,
-            _req: &crate::providers::ProviderRequest,
+            _req: crate::providers::ValidatedProviderRequest,
         ) -> anyhow::Result<
             tokio::sync::mpsc::Receiver<anyhow::Result<crate::providers::StreamChunk>>,
         > {
@@ -425,10 +425,10 @@ mod tests {
     struct EchoProvider(String);
 
     #[async_trait::async_trait]
-    impl crate::providers::LlmProvider for EchoProvider {
-        async fn send_message(
+    impl crate::providers::ProviderBackend for EchoProvider {
+        async fn send_message_validated(
             &self,
-            _req: &crate::providers::ProviderRequest,
+            _req: crate::providers::ValidatedProviderRequest,
         ) -> anyhow::Result<crate::providers::ProviderResponse> {
             use crate::claude::types::ContentBlock;
             use crate::providers::ProviderResponse;
@@ -443,9 +443,9 @@ mod tests {
                 provider: "echo".to_string(),
             })
         }
-        async fn send_message_stream(
+        async fn send_message_stream_validated(
             &self,
-            _req: &crate::providers::ProviderRequest,
+            _req: crate::providers::ValidatedProviderRequest,
         ) -> anyhow::Result<
             tokio::sync::mpsc::Receiver<anyhow::Result<crate::providers::StreamChunk>>,
         > {
