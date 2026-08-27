@@ -2399,8 +2399,9 @@ mod tests {
             ));
             let mut invalid_terminal = reservation.not_applied_request();
             invalid_terminal.get().set_reason("too late");
-            assert!(invalid_terminal.send().promise.await.unwrap_err().to_string()
-                .contains("host permit"));
+            let invalid_terminal_error = invalid_terminal.send().promise.await.err()
+                .expect("begun reservation must reject a permit-free outcome");
+            assert!(invalid_terminal_error.to_string().contains("host permit"));
 
             store.release_runner_lease("shared", lease.lease_id).unwrap();
             store.acquire_runner_lease("shared", "successor", 1, None, 300_000).unwrap();
@@ -2412,8 +2413,9 @@ mod tests {
                     ..effect.clone()
                 },
             ).unwrap();
-            assert!(stale_reserve.send().promise.await.unwrap_err().to_string()
-                .contains("successor"));
+            let stale_reserve_error = stale_reserve.send().promise.await.err()
+                .expect("successor lease must invalidate the original reserve capability");
+            assert!(stale_reserve_error.to_string().contains("successor"));
             store.transition_run(
                 "shared", "daemon", run.run_id,
                 crate::brain::store::BrainRunStatus::Cancelled,

@@ -2429,6 +2429,7 @@ mod tests {
                 tasks: vec![task],
                 schedules: vec![schedule],
                 pending_schedule_dues: vec![pending_due],
+                effect_audits: Vec::new(),
             },
         };
         let encoded = encode_brain_wire_message(&expected).unwrap();

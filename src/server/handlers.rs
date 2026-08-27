@@ -5426,6 +5426,7 @@ mod handler_tests {
             tasks,
             schedules: Vec::new(),
             pending_schedule_dues: Vec::new(),
+            effect_audits: Vec::new(),
         }
     }
 
@@ -6075,6 +6076,7 @@ mod handler_tests {
             tasks: Vec::new(),
             schedules: Vec::new(),
             pending_schedule_dues: Vec::new(),
+            effect_audits: Vec::new(),
         };
 
         let messages = named_brain_provider_messages(&snapshot);
@@ -6163,6 +6165,7 @@ mod handler_tests {
             tasks: Vec::new(),
             schedules: Vec::new(),
             pending_schedule_dues: Vec::new(),
+            effect_audits: Vec::new(),
         };
 
         let messages = named_brain_provider_messages(&snapshot);
