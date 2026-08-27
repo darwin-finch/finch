@@ -164,7 +164,7 @@ pub struct Config {
 
     /// Secret-free named provider credential records. Secret material is
     /// resolved through an injected credential store only after graph validation.
-    credentials: Vec<ProviderCredential>,
+    pub(crate) credentials: Vec<ProviderCredential>,
 
     /// Teacher LLM provider configuration (array of teachers in priority order)
     pub teachers: Vec<TeacherEntry>,
