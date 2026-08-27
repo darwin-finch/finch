@@ -110,57 +110,176 @@ fn resolve_real_store(home: &Path) -> anyhow::Result<PathBuf> {
     Ok(store)
 }
 
-fn hash_node(path: &Path, relative: &Path, digest: &mut Sha256) -> anyhow::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
+fn hash_manifest_stat(digest: &mut Sha256, relative: &Path, stat: &libc::stat) {
     digest.update(relative.as_os_str().as_encoded_bytes());
-    digest.update(metadata.mode().to_ne_bytes());
-    digest.update(metadata.uid().to_ne_bytes());
-    digest.update(metadata.gid().to_ne_bytes());
-    digest.update(metadata.nlink().to_ne_bytes());
-    digest.update(metadata.dev().to_ne_bytes());
-    digest.update(metadata.ino().to_ne_bytes());
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        digest.update(b"link");
-        digest.update(fs::read_link(path)?.as_os_str().as_encoded_bytes());
-    } else if file_type.is_file() {
-        digest.update(b"file");
-        let mut file = File::open(path)?;
-        let mut buffer = [0_u8; 8192];
-        loop {
-            let count = file.read(&mut buffer)?;
-            if count == 0 {
-                break;
+    digest.update(stat.st_mode.to_ne_bytes());
+    digest.update(stat.st_uid.to_ne_bytes());
+    digest.update(stat.st_gid.to_ne_bytes());
+    digest.update(stat.st_nlink.to_ne_bytes());
+    digest.update(stat.st_dev.to_ne_bytes());
+    digest.update(stat.st_ino.to_ne_bytes());
+    digest.update(stat.st_size.to_ne_bytes());
+}
+
+fn hash_manifest_directory(
+    directory: &mut nix::dir::Dir,
+    relative: &Path,
+    digest: &mut Sha256,
+    nodes: &mut usize,
+    bytes: &mut u64,
+) -> anyhow::Result<()> {
+    use nix::fcntl::{openat, readlinkat, AtFlags, OFlag};
+    use nix::sys::stat::{fstat, fstatat, Mode, SFlag};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    const MAX_MANIFEST_NODES: usize = 100_000;
+    const MAX_MANIFEST_BYTES: u64 = 1 << 30;
+
+    let mut names = directory
+        .iter()
+        .map(|entry| {
+            let entry = entry?;
+            let bytes = entry.file_name().to_bytes();
+            if bytes == b"." || bytes == b".." {
+                return Ok(None);
             }
-            digest.update(&buffer[..count]);
+            Ok(Some(std::ffi::OsString::from_vec(bytes.to_vec())))
+        })
+        .collect::<Result<Vec<_>, nix::Error>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    names.sort();
+
+    for name in names {
+        *nodes += 1;
+        anyhow::ensure!(
+            *nodes <= MAX_MANIFEST_NODES,
+            "real Brain store manifest exceeds its node bound"
+        );
+        let child_relative = relative.join(&name);
+        let observed = fstatat(
+            Some(directory.as_raw_fd()),
+            name.as_os_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )?;
+        hash_manifest_stat(digest, &child_relative, &observed);
+        if std::env::var_os("FINCH_TEST_MANIFEST_RACE_NAME").as_deref() == Some(name.as_os_str()) {
+            let ready = std::env::var_os("FINCH_TEST_MANIFEST_RACE_READY")
+                .context("manifest race probe requires a ready path")?;
+            let continuation = std::env::var_os("FINCH_TEST_MANIFEST_RACE_CONTINUE")
+                .context("manifest race probe requires a continuation path")?;
+            fs::write(ready, b"ready\n")?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !Path::new(&continuation).exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            anyhow::ensure!(
+                Path::new(&continuation).exists(),
+                "manifest race probe continuation timed out"
+            );
         }
-    } else if file_type.is_dir() {
-        digest.update(b"dir");
-        let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            hash_node(&entry.path(), &relative.join(entry.file_name()), digest)?;
+        let kind = SFlag::from_bits_truncate(observed.st_mode);
+        if kind.contains(SFlag::S_IFLNK) {
+            digest.update(b"link");
+            digest.update(
+                readlinkat(Some(directory.as_raw_fd()), name.as_os_str())?.as_encoded_bytes(),
+            );
+        } else if kind.contains(SFlag::S_IFREG) {
+            digest.update(b"file");
+            let fd = openat(
+                Some(directory.as_raw_fd()),
+                name.as_os_str(),
+                OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )?;
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            let opened = fstat(file.as_raw_fd())?;
+            anyhow::ensure!(
+                SFlag::from_bits_truncate(opened.st_mode).contains(SFlag::S_IFREG)
+                    && opened.st_dev == observed.st_dev
+                    && opened.st_ino == observed.st_ino,
+                "real Brain store entry changed while opening"
+            );
+            let length = u64::try_from(opened.st_size)?;
+            *bytes = bytes
+                .checked_add(length)
+                .context("real Brain store manifest byte count overflowed")?;
+            anyhow::ensure!(
+                *bytes <= MAX_MANIFEST_BYTES,
+                "real Brain store manifest exceeds its byte bound"
+            );
+            let mut remaining = length;
+            let mut buffer = [0_u8; 8192];
+            while remaining != 0 {
+                let chunk = buffer.len().min(remaining as usize);
+                let count = file.read(&mut buffer[..chunk])?;
+                anyhow::ensure!(count != 0, "real Brain store file changed while hashing");
+                digest.update(&buffer[..count]);
+                remaining -= count as u64;
+            }
+        } else if kind.contains(SFlag::S_IFDIR) {
+            digest.update(b"dir");
+            let mut child = nix::dir::Dir::openat(
+                Some(directory.as_raw_fd()),
+                name.as_os_str(),
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )?;
+            let opened = fstat(child.as_raw_fd())?;
+            anyhow::ensure!(
+                opened.st_dev == observed.st_dev && opened.st_ino == observed.st_ino,
+                "real Brain store directory changed while opening"
+            );
+            hash_manifest_directory(&mut child, &child_relative, digest, nodes, bytes)?;
+        } else if kind.contains(SFlag::S_IFSOCK) {
+            digest.update(b"socket");
+        } else if kind.contains(SFlag::S_IFIFO) {
+            digest.update(b"fifo");
+        } else if kind.contains(SFlag::S_IFBLK) {
+            digest.update(b"block");
+        } else if kind.contains(SFlag::S_IFCHR) {
+            digest.update(b"char");
+        } else {
+            digest.update(b"other");
         }
-    } else if file_type.is_socket() {
-        digest.update(b"socket");
-    } else if file_type.is_fifo() {
-        digest.update(b"fifo");
-    } else if file_type.is_block_device() {
-        digest.update(b"block");
-    } else if file_type.is_char_device() {
-        digest.update(b"char");
-    } else {
-        digest.update(b"other");
     }
     Ok(())
 }
 
 fn manifest_digest(store: &Path) -> anyhow::Result<String> {
-    if !store.exists() {
-        return Ok(hex::encode(Sha256::digest(b"missing")));
-    }
+    use nix::fcntl::{open, OFlag};
+    use nix::sys::stat::{fstat, Mode, SFlag};
+
+    let fd = match open(
+        store,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(nix::errno::Errno::ENOENT) => return Ok(hex::encode(Sha256::digest(b"missing"))),
+        Err(error) => return Err(error.into()),
+    };
+    let root = unsafe { File::from_raw_fd(fd) };
+    let root_stat = fstat(root.as_raw_fd())?;
+    anyhow::ensure!(
+        SFlag::from_bits_truncate(root_stat.st_mode).contains(SFlag::S_IFDIR),
+        "real Brain store must remain a directory"
+    );
     let mut digest = Sha256::new();
-    hash_node(store, Path::new("."), &mut digest)?;
+    hash_manifest_stat(&mut digest, Path::new("."), &root_stat);
+    digest.update(b"dir");
+    let mut directory = nix::dir::Dir::from(root)?;
+    let mut nodes = 0;
+    let mut bytes = 0;
+    hash_manifest_directory(
+        &mut directory,
+        Path::new("."),
+        &mut digest,
+        &mut nodes,
+        &mut bytes,
+    )?;
     Ok(hex::encode(digest.finalize()))
 }
 
@@ -304,7 +423,12 @@ fn service_proof_authentication(
     verifying_key: &[u8; 32],
 ) -> anyhow::Result<()> {
     let mut request = [0_u8; 64];
+    let deadline = Instant::now() + Duration::from_millis(10);
+    let mut serviced = 0_u16;
     loop {
+        if serviced == 256 || Instant::now() >= deadline {
+            return Ok(());
+        }
         match socket.recv(&mut request) {
             Ok(count) => {
                 anyhow::ensure!(
@@ -316,6 +440,7 @@ fn service_proof_authentication(
                     "invalid proof-auth request"
                 );
                 socket.send(verifying_key)?;
+                serviced += 1;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -347,22 +472,61 @@ fn leader_exited(child: &Child) -> io::Result<bool> {
     Ok(unsafe { information.si_pid() } != 0)
 }
 
+fn bounded_ps_output() -> anyhow::Result<Vec<u8>> {
+    let mut child = Command::new("/bin/ps")
+        .args(["-axo", "pid=,pgid="])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("inspect supervised process group")?;
+    let mut stdout = child.stdout.take().context("capture process inventory")?;
+    let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+    anyhow::ensure!(flags >= 0, "could not inspect process inventory pipe flags");
+    set_descriptor_flag(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)?;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    anyhow::ensure!(
+                        output.len() + count <= 1024 * 1024,
+                        "process inventory exceeded its output bound"
+                    );
+                    output.extend_from_slice(&buffer[..count]);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::ensure!(
+                status.success(),
+                "could not inspect supervised process group"
+            );
+            return Ok(output);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("process-group inspection exceeded its one-second deadline");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn process_group_members(group: libc::pid_t) -> anyhow::Result<Vec<libc::pid_t>> {
     if std::env::var_os("FINCH_TEST_FORCE_GROUP_INSPECTION_FAILURE").is_some() {
         anyhow::bail!("forced test process-group inspection failure");
     }
     // PATH belongs to the supervised child. Process membership is a cleanup
     // authority decision, so invoke the platform-owned executable directly.
-    let output = Command::new("/bin/ps")
-        .args(["-axo", "pid=,pgid="])
-        .output()
-        .context("inspect supervised process group")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "could not inspect supervised process group"
-    );
+    let output = bounded_ps_output()?;
     let mut members = Vec::new();
-    for line in String::from_utf8(output.stdout)?.lines() {
+    for line in String::from_utf8(output)?.lines() {
         let mut fields = line.split_whitespace();
         let Some(pid): Option<libc::pid_t> = fields.next().and_then(|value| value.parse().ok())
         else {
@@ -480,7 +644,8 @@ impl Drop for OwnedProcessGroup {
         std::thread::sleep(Duration::from_millis(100));
         let _ = signal_process_group(self.group, libc::SIGKILL);
         let mut quiescent = false;
-        for _ in 0..200 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
             if leader_exited(&self.child).unwrap_or(false)
                 && process_group_members(self.group).is_ok_and(|members| members.is_empty())
             {

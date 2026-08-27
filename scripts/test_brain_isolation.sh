@@ -401,6 +401,42 @@ if rg -q 'secret-fifo|existing|events.jsonl' "$diagnostic"; then
 fi
 rm "$fake_home/.finch/brains/secret-fifo"
 
+# Force the metadata/open race window: after the supervisor has classified a
+# regular file, replace its name with a FIFO. Descriptor-relative O_NOFOLLOW +
+# O_NONBLOCK traversal must reject the identity change without hanging.
+phase=manifest-swap-to-fifo-status
+race_name=manifest-race-node
+race_path="$fake_home/.finch/brains/$race_name"
+race_ready="$scratch/manifest-race.ready"
+race_continue="$scratch/manifest-race.continue"
+(
+  for _ in {1..400}; do
+    [[ -e "$race_ready" ]] && break
+    sleep 0.005
+  done
+  [[ -e "$race_ready" ]]
+  rm -f -- "$race_path"
+  mkfifo "$race_path"
+  : >"$race_continue"
+) & race_swapper_pid=$!
+race_status=0
+FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
+  FINCH_TEST_MANIFEST_RACE_NAME="$race_name" FINCH_TEST_MANIFEST_RACE_READY="$race_ready" \
+  FINCH_TEST_MANIFEST_RACE_CONTINUE="$race_continue" FINCH_REAL_STORE="$fake_home/.finch/brains" \
+  "$supervisor" bash -c 'printf regular >"$FINCH_REAL_STORE/manifest-race-node"' \
+  2>"$diagnostic" || race_status=$?
+wait "$race_swapper_pid"
+[[ "$race_status" == 70 ]] || {
+  echo "manifest swap adversary returned $race_status, expected 70" >&2
+  exit 1
+}
+phase=manifest-swap-to-fifo-redaction
+if rg -q "$race_name|existing|events.jsonl" "$diagnostic"; then
+  echo 'manifest swap diagnostic disclosed a protected path' >&2
+  exit 1
+fi
+rm -f -- "$race_path" "$race_ready" "$race_continue"
+
 socket_path="$fake_home/.finch/brains/secret-socket"
 if [[ "${#socket_path}" -lt 100 ]]; then
   phase=manifest-socket-status

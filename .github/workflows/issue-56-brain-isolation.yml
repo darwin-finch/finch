@@ -10,11 +10,10 @@ on:
       - 'src/brain/**'
       - 'src/daemon/**'
       - 'src/ipc/**'
+      - 'src/main.rs'
       - 'src/server/**'
-      - 'scripts/lib/brain_test_isolation.sh'
-      - 'scripts/test_brain*.sh'
-      - 'tests/BRAIN_TEST_INVENTORY.md'
-      - 'tests/brain*_test.rs'
+      - 'scripts/**'
+      - 'tests/**'
   push:
     branches: [ main ]
     paths:
@@ -25,11 +24,10 @@ on:
       - 'src/brain/**'
       - 'src/daemon/**'
       - 'src/ipc/**'
+      - 'src/main.rs'
       - 'src/server/**'
-      - 'scripts/lib/brain_test_isolation.sh'
-      - 'scripts/test_brain*.sh'
-      - 'tests/BRAIN_TEST_INVENTORY.md'
-      - 'tests/brain*_test.rs'
+      - 'scripts/**'
+      - 'tests/**'
   workflow_dispatch:
 
 permissions:
@@ -124,6 +122,7 @@ jobs:
         ./scripts/test_brains.sh cargo test --lib server::brain_service -- --nocapture
         ./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_persists_named_brain_only_in_isolated_home -- --exact --nocapture
         ./scripts/test_brains.sh cargo test --lib server::tests::production_constructor_rejects_unverified_environment_before_store_mutation -- --exact --nocapture
+        ./scripts/test_brains.sh cargo test --test daemon_integration_test test_daemon_spawn_and_health -- --exact --ignored --nocapture
 
     - name: Exercise the complete synthetic isolation harness
       timeout-minutes: 15

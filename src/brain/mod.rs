@@ -936,6 +936,24 @@ mod isolation_tests {
     const HOSTILE_MODE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
     const HOSTILE_MODE_OUTPUT_LIMIT: usize = 64 * 1024;
 
+    struct HostileModeGroup {
+        child: std::process::Child,
+        group: nix::libc::pid_t,
+        reaped: bool,
+    }
+
+    impl Drop for HostileModeGroup {
+        fn drop(&mut self) {
+            if self.reaped {
+                return;
+            }
+            let _ = unsafe { nix::libc::kill(-self.group, nix::libc::SIGTERM) };
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = unsafe { nix::libc::kill(-self.group, nix::libc::SIGKILL) };
+            let _ = self.child.wait();
+        }
+    }
+
     fn supervisor_contract_present() -> bool {
         // The permanent Brain-isolation CI gate runs these entries through
         // scripts/test_brains.sh, which supplies the authenticated contract.
@@ -983,19 +1001,39 @@ mod isolation_tests {
     }
 
     fn mode_group_has_descendants(group: nix::libc::pid_t) -> Result<bool, String> {
-        let output = std::process::Command::new("/bin/ps")
+        let mut child = std::process::Command::new("/bin/ps")
             .args(["-axo", "pid=,pgid="])
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
             .map_err(|error| error.to_string())?;
-        if !output.status.success() {
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or("process inventory pipe unavailable")?;
+        set_nonblocking(&stdout);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let mut output = Vec::new();
+        let status = loop {
+            drain_bounded(&mut stdout, &mut output);
+            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("hostile proof-mode process inventory timed out".to_owned());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        drain_bounded(&mut stdout, &mut output);
+        if !status.success() {
             return Err("could not inspect hostile proof-mode process group".to_owned());
         }
-        Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        Ok(String::from_utf8_lossy(&output).lines().any(|line| {
             let mut fields = line.split_whitespace();
-            let pid: Option<nix::libc::pid_t> =
-                fields.next().and_then(|value| value.parse().ok());
-            let pgid: Option<nix::libc::pid_t> =
-                fields.next().and_then(|value| value.parse().ok());
+            let pid: Option<nix::libc::pid_t> = fields.next().and_then(|value| value.parse().ok());
+            let pgid: Option<nix::libc::pid_t> = fields.next().and_then(|value| value.parse().ok());
             matches!((pid, pgid), (Some(pid), Some(pgid)) if pgid == group && pid != group)
         }))
     }
@@ -1014,6 +1052,32 @@ mod isolation_tests {
             return Err(std::io::Error::last_os_error().to_string());
         }
         Ok(unsafe { information.si_pid() } != 0)
+    }
+
+    fn finish_mode_group(
+        child: &mut std::process::Child,
+        group: nix::libc::pid_t,
+    ) -> Result<std::process::ExitStatus, String> {
+        if mode_leader_exited(child)? && !mode_group_has_descendants(group)? {
+            return child.wait().map_err(|error| error.to_string());
+        }
+        terminate_mode_group(group, nix::libc::SIGTERM);
+        let grace = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < grace {
+            if mode_leader_exited(child)? && !mode_group_has_descendants(group)? {
+                return child.wait().map_err(|error| error.to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        terminate_mode_group(group, nix::libc::SIGKILL);
+        let kill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < kill_deadline {
+            if mode_leader_exited(child)? && !mode_group_has_descendants(group)? {
+                return child.wait().map_err(|error| error.to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Err("SIGKILL did not quiesce and reap the hostile proof-mode process group".to_owned())
     }
 
     fn run_hostile_proof_mode_with_deadline(
@@ -1041,72 +1105,66 @@ mod isolation_tests {
                 Ok(())
             });
         }
-        let mut child = command.spawn().map_err(|error| error.to_string())?;
-        let group = child.id() as nix::libc::pid_t;
-        let mut stdout = child.stdout.take().expect("hostile mode stdout was not piped");
-        let mut stderr = child.stderr.take().expect("hostile mode stderr was not piped");
+        let child = command.spawn().map_err(|error| error.to_string())?;
+        let group_id = child.id() as nix::libc::pid_t;
+        let mut group = HostileModeGroup {
+            child,
+            group: group_id,
+            reaped: false,
+        };
+        let mut stdout = group
+            .child
+            .stdout
+            .take()
+            .expect("hostile mode stdout was not piped");
+        let mut stderr = group
+            .child
+            .stderr
+            .take()
+            .expect("hostile mode stderr was not piped");
         set_nonblocking(&stdout);
         set_nonblocking(&stderr);
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
         let deadline = std::time::Instant::now() + mode_deadline;
-        let status = loop {
+        let (status, timed_out) = loop {
             drain_bounded(&mut stdout, &mut stdout_bytes);
             drain_bounded(&mut stderr, &mut stderr_bytes);
-            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-                break status;
+            if mode_leader_exited(&group.child)? {
+                break (finish_mode_group(&mut group.child, group_id)?, false);
             }
             if std::time::Instant::now() >= deadline {
-                terminate_mode_group(group, nix::libc::SIGTERM);
-                let grace = std::time::Instant::now() + std::time::Duration::from_millis(500);
-                while std::time::Instant::now() < grace {
-                    drain_bounded(&mut stdout, &mut stdout_bytes);
-                    drain_bounded(&mut stderr, &mut stderr_bytes);
-                    if mode_leader_exited(&child)? && !mode_group_has_descendants(group)? {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                if !mode_leader_exited(&child)? || mode_group_has_descendants(group)? {
-                    terminate_mode_group(group, nix::libc::SIGKILL);
-                }
-                let kill_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(2);
-                while std::time::Instant::now() < kill_deadline {
-                    drain_bounded(&mut stdout, &mut stdout_bytes);
-                    drain_bounded(&mut stderr, &mut stderr_bytes);
-                    if mode_leader_exited(&child)? && !mode_group_has_descendants(group)? {
-                        let status = child.wait().map_err(|error| error.to_string())?;
-                        let redact = |bytes: &[u8]| {
-                            String::from_utf8_lossy(bytes)
-                                .replace(proof.home.to_string_lossy().as_ref(), "<isolated-home>")
-                                .replace(
-                                    proof.socket_root.to_string_lossy().as_ref(),
-                                    "<socket-root>",
-                                )
-                                .replace(&proof.brain_addr, "<brain-address>")
-                                .replace(&proof.daemon_addr, "<daemon-address>")
-                        };
-                        return Err(format!(
-                            "timed out after {mode_deadline:?} (terminated with {status}); stdout={} stderr={}",
-                            redact(&stdout_bytes),
-                            redact(&stderr_bytes)
-                        ));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                return Err(format!(
-                    "timed out after {mode_deadline:?}; SIGKILL did not quiesce and reap the owned process group"
-                ));
+                break (finish_mode_group(&mut group.child, group_id)?, true);
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
+        group.reaped = true;
         drain_bounded(&mut stdout, &mut stdout_bytes);
         drain_bounded(&mut stderr, &mut stderr_bytes);
+        if timed_out {
+            let redact = |bytes: &[u8]| {
+                String::from_utf8_lossy(bytes)
+                    .replace(proof.home.to_string_lossy().as_ref(), "<isolated-home>")
+                    .replace(
+                        proof.socket_root.to_string_lossy().as_ref(),
+                        "<socket-root>",
+                    )
+                    .replace(&proof.brain_addr, "<brain-address>")
+                    .replace(&proof.daemon_addr, "<daemon-address>")
+            };
+            return Err(format!(
+                "timed out after {mode_deadline:?} (terminated with {status}); stdout={} stderr={}",
+                redact(&stdout_bytes),
+                redact(&stderr_bytes)
+            ));
+        }
         let redact = |bytes: Vec<u8>| {
             String::from_utf8_lossy(&bytes)
                 .replace(proof.home.to_string_lossy().as_ref(), "<isolated-home>")
-                .replace(proof.socket_root.to_string_lossy().as_ref(), "<socket-root>")
+                .replace(
+                    proof.socket_root.to_string_lossy().as_ref(),
+                    "<socket-root>",
+                )
                 .replace(&proof.brain_addr, "<brain-address>")
                 .replace(&proof.daemon_addr, "<daemon-address>")
                 .into_bytes()
@@ -1179,6 +1237,14 @@ mod isolation_tests {
             return;
         }
         if let Ok(mode) = std::env::var(MODE_ENV) {
+            if mode == "normal-exit-descendant-child" {
+                unsafe {
+                    nix::libc::signal(nix::libc::SIGTERM, nix::libc::SIG_IGN);
+                }
+                loop {
+                    std::thread::park();
+                }
+            }
             if mode == "attacker-key-responder" {
                 use std::os::fd::FromRawFd as _;
 
@@ -1214,6 +1280,23 @@ mod isolation_tests {
                 loop {
                     std::thread::park();
                 }
+            }
+            if mode == "normal-exit-descendant" {
+                let descendant = supervised_test_subprocess_command()
+                    .args([
+                        "--exact",
+                        "brain::isolation_tests::isolated_proof_rejects_self_issued_environment_authority",
+                        "--nocapture",
+                    ])
+                    .env(MODE_ENV, "normal-exit-descendant-child")
+                    .spawn()
+                    .unwrap();
+                std::fs::write(
+                    valid.home.join("normal-exit-descendant.pid"),
+                    descendant.id().to_string(),
+                )
+                .unwrap();
+                return;
             }
             let start_attacker_responder = |key: [u8; 32],
                                             marker: &std::path::Path|
@@ -1472,6 +1555,25 @@ mod isolation_tests {
         assert!(
             timeout_started.elapsed() < std::time::Duration::from_secs(3),
             "hostile proof-mode timeout and reap exceeded its bounded grace"
+        );
+
+        let proof = isolated_test_proof().unwrap();
+        let output = run_hostile_proof_mode("normal-exit-descendant")
+            .expect("normal-exit descendant mode must be reclaimed");
+        assert!(output.status.success());
+        let descendant_pid: nix::libc::pid_t =
+            std::fs::read_to_string(proof.home.join("normal-exit-descendant.pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+        assert_eq!(
+            unsafe { nix::libc::kill(descendant_pid, 0) },
+            -1,
+            "normal-exit hostile proof descendant survived group cleanup"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(nix::libc::ESRCH)
         );
 
         for mode in [

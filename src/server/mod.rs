@@ -122,18 +122,31 @@ pub struct AgentServer {
     mcp_client: tokio::sync::OnceCell<Arc<crate::tools::mcp::McpClient>>,
     /// Runtime-rotatable password for remote named-brain access.
     brain_password: Arc<RwLock<String>>,
+    /// Pins the descriptor-relative state root used only by authenticated
+    /// Brain HTTP fixtures, so a pathname swap cannot redirect later opens.
+    #[cfg(test)]
+    supervised_state_root: Option<std::fs::File>,
+}
+
+#[cfg(test)]
+struct SupervisedStateRoot {
+    directory: std::fs::File,
+    path: std::path::PathBuf,
 }
 
 #[cfg(test)]
 fn supervised_state_root(
-    home: &std::path::Path,
+    proof: &crate::brain::IsolatedTestProof,
     requested: &std::path::Path,
-) -> Result<std::path::PathBuf> {
+) -> Result<SupervisedStateRoot> {
     use anyhow::Context as _;
+    use nix::fcntl::{open, openat, OFlag};
+    use nix::sys::stat::{fstat, Mode, SFlag};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::path::Component;
 
     let relative = requested
-        .strip_prefix(home)
+        .strip_prefix(&proof.home)
         .context("Brain HTTP fixture state must remain under the sealed HOME")?;
     anyhow::ensure!(
         !relative.as_os_str().is_empty()
@@ -143,44 +156,47 @@ fn supervised_state_root(
         "Brain HTTP fixture state must be a normal descendant of the sealed HOME"
     );
 
-    let canonical_home =
-        std::fs::canonicalize(home).context("Could not resolve the sealed Brain test HOME")?;
-    let mut cursor = canonical_home.clone();
+    let home_fd = open(
+        &proof.home,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .context("Could not open the sealed Brain test HOME")?;
+    let mut directory = unsafe { std::fs::File::from_raw_fd(home_fd) };
+    let home_stat = fstat(directory.as_raw_fd())?;
+    anyhow::ensure!(
+        (home_stat.st_dev as u64, home_stat.st_ino as u64) == proof.home_identity,
+        "sealed Brain test HOME identity changed"
+    );
     for component in relative.components() {
         let Component::Normal(name) = component else {
             unreachable!()
         };
-        cursor.push(name);
-        let metadata = std::fs::symlink_metadata(&cursor).with_context(|| {
-            format!(
-                "Brain HTTP fixture state component is unavailable: {}",
-                cursor.display()
-            )
-        })?;
-        anyhow::ensure!(
-            !metadata.file_type().is_symlink(),
-            "Brain HTTP fixture state cannot traverse symlinks"
-        );
+        let child_fd = openat(
+            Some(directory.as_raw_fd()),
+            name,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .context("Brain HTTP fixture state cannot traverse symlinks")?;
+        directory = unsafe { std::fs::File::from_raw_fd(child_fd) };
     }
-    let canonical_state = std::fs::canonicalize(&cursor)
-        .context("Could not resolve the Brain HTTP fixture state root")?;
+    let state_stat = fstat(directory.as_raw_fd())?;
     anyhow::ensure!(
-        canonical_state.starts_with(&canonical_home) && canonical_state != canonical_home,
-        "Brain HTTP fixture state must remain under the sealed HOME"
-    );
-    anyhow::ensure!(
-        canonical_state.is_dir(),
+        SFlag::from_bits_truncate(state_stat.st_mode).contains(SFlag::S_IFDIR),
         "Brain HTTP fixture state root must be a directory"
     );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        anyhow::ensure!(
-            std::fs::metadata(&canonical_state)?.uid() == nix::unistd::geteuid().as_raw(),
-            "Brain HTTP fixture state root must be owned by the isolated test user"
-        );
-    }
-    Ok(canonical_state)
+    anyhow::ensure!(
+        state_stat.st_uid == nix::unistd::geteuid().as_raw(),
+        "Brain HTTP fixture state root must be owned by the isolated test user"
+    );
+    #[cfg(target_os = "linux")]
+    let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    #[cfg(target_os = "macos")]
+    let path = std::path::PathBuf::from(format!("/dev/fd/{}", directory.as_raw_fd()));
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    anyhow::bail!("descriptor-relative Brain fixture state is unsupported on this platform");
+    Ok(SupervisedStateRoot { directory, path })
 }
 
 impl AgentServer {
@@ -213,6 +229,7 @@ impl AgentServer {
             mcp_servers: std::collections::HashMap::new(),
             mcp_client: tokio::sync::OnceCell::new(),
             brain_password: Arc::new(RwLock::new(String::new())),
+            supervised_state_root: None,
         })
     }
 
@@ -225,10 +242,11 @@ impl AgentServer {
         use anyhow::Context as _;
         let proof = crate::brain::isolated_test_proof()
             .context("Brain HTTP fixture requires supervisor authority")?;
-        let state_root = supervised_state_root(&proof.home, state_root)?;
+        let state_root = supervised_state_root(&proof, state_root)?;
         let password = proof.brain_password()?;
-        let mut server = Self::for_brain_http_test(machine, &state_root, brain_credentials)?;
+        let mut server = Self::for_brain_http_test(machine, &state_root.path, brain_credentials)?;
         server.brain_password = Arc::new(RwLock::new(password));
+        server.supervised_state_root = Some(state_root.directory);
         Ok(server)
     }
 
@@ -263,6 +281,7 @@ impl AgentServer {
             mcp_servers: std::collections::HashMap::new(),
             mcp_client: tokio::sync::OnceCell::new(),
             brain_password: Arc::new(RwLock::new(password)),
+            supervised_state_root: None,
         })
     }
 
@@ -333,6 +352,8 @@ impl AgentServer {
             mcp_servers,
             mcp_client: tokio::sync::OnceCell::new(),
             brain_password: Arc::new(RwLock::new(brain_password)),
+            #[cfg(test)]
+            supervised_state_root: None,
         })
     }
 
@@ -839,7 +860,7 @@ mod tests {
     fn isolated_provider_graph() -> ProviderGraph {
         let config =
             crate::config::Config::with_providers(vec![crate::config::ProviderEntry::Claude {
-                api_key: "isolated-provider-graph".into(),
+                api_key: "sk-ant-isolated-provider-graph".into(),
                 model: None,
                 base_url: None,
                 chat_path: None,
@@ -1294,6 +1315,43 @@ mod tests {
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
         std::fs::remove_file(link).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervised_http_fixture_pins_state_root_across_ancestor_swap() {
+        if !supervisor_contract_present() {
+            return;
+        }
+        let proof = crate::brain::isolated_test_proof()
+            .expect("HTTP containment regression requires supervisor authority");
+        let requested = proof
+            .home
+            .join(format!("pinned-state-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&requested).unwrap();
+        let pinned = supervised_state_root(&proof, &requested).unwrap();
+        let moved = proof
+            .home
+            .join(format!("moved-state-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::rename(&requested, &moved).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+        std::os::unix::fs::symlink(outside.path(), &requested).unwrap();
+
+        let mut server = AgentServer::for_brain_http_test(
+            "containment.local",
+            &pinned.path,
+            crate::brain::credential::BrainCredentialAuthority::ephemeral([73; 32]),
+        )
+        .unwrap();
+        server.supervised_state_root = Some(pinned.directory);
+
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+        assert!(moved.join("metrics").is_dir());
+        assert!(moved.join("feedback.jsonl").is_file());
+        assert!(moved.join("brains").is_dir());
     }
 
     #[test]
