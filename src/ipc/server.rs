@@ -2021,11 +2021,13 @@ async fn forward_runner_request(
                 Err(error) => (Err(error.to_string().into()), true),
             };
             audit_active.store(false, std::sync::atomic::Ordering::Release);
-            if let Err(error) = server
-                .brain_store()
-                .reconcile_effect_audit_authority(&reconciliation_grant)
-            {
-                result = Err(error.to_string().into());
+            if disconnected {
+                if let Err(error) = server
+                    .brain_store()
+                    .reconcile_effect_audit_authority(&reconciliation_grant)
+                {
+                    result = Err(error.to_string().into());
+                }
             }
             let _ = request.response_tx.send(result);
             disconnected
@@ -2095,11 +2097,13 @@ async fn forward_runner_request(
                 }
             };
             audit_active.store(false, std::sync::atomic::Ordering::Release);
-            if let Err(error) = server
-                .brain_store()
-                .reconcile_effect_audit_authority(&reconciliation_grant)
-            {
-                result = Err(error.to_string().into());
+            if disconnected {
+                if let Err(error) = server
+                    .brain_store()
+                    .reconcile_effect_audit_authority(&reconciliation_grant)
+                {
+                    result = Err(error.to_string().into());
+                }
             }
             let _ = request.response_tx.send(result);
             disconnected
