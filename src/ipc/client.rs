@@ -769,7 +769,9 @@ struct BrainRunnerImpl {
 fn effect_audit_reservation_proxy(
     reservation: finch_ipc_capnp::brain_effect_reservation::Client,
 ) -> crate::server::RunnerEffectAuditReservation {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::unbounded_channel::<
+        crate::server::RunnerEffectAuditReservationRequest,
+    >();
     tokio::task::spawn_local(async move {
         let Some(request) = rx.recv().await else {
             return;
@@ -807,7 +809,8 @@ fn effect_audit_reservation_proxy(
 fn host_effect_permit_proxy(
     permit: finch_ipc_capnp::brain_host_effect_permit::Client,
 ) -> crate::server::RunnerHostEffectPermit {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) =
+        mpsc::unbounded_channel::<crate::server::RunnerHostEffectFinishRequest>();
     tokio::task::spawn_local(async move {
         let Some(request) = rx.recv().await else {
             return;
@@ -844,7 +847,8 @@ fn host_effect_permit_proxy(
 fn program_effect_audit_proxy(
     control: finch_ipc_capnp::brain_program_control::Client,
 ) -> crate::server::RunnerEffectAuditControl {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) =
+        mpsc::unbounded_channel::<crate::server::RunnerEffectAuditControlRequest>();
     tokio::task::spawn_local(async move {
         while let Some(request) = rx.recv().await {
             let crate::server::RunnerEffectAuditControlRequest::Reserve {
@@ -858,7 +862,8 @@ fn program_effect_audit_proxy(
                 crate::ipc::checkpoint_codec::encode_vm_side_effect(
                     call.get().init_effect(),
                     &effect,
-                )?;
+                )
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
                 let response = call.send().promise.await?;
                 Ok(effect_audit_reservation_proxy(
                     response.get()?.get_reservation()?,
@@ -875,7 +880,8 @@ fn program_effect_audit_proxy(
 fn turn_effect_audit_proxy(
     control: finch_ipc_capnp::brain_turn_control::Client,
 ) -> crate::server::RunnerEffectAuditControl {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) =
+        mpsc::unbounded_channel::<crate::server::RunnerEffectAuditControlRequest>();
     tokio::task::spawn_local(async move {
         while let Some(request) = rx.recv().await {
             let crate::server::RunnerEffectAuditControlRequest::Reserve {
@@ -889,7 +895,8 @@ fn turn_effect_audit_proxy(
                 crate::ipc::checkpoint_codec::encode_vm_side_effect(
                     call.get().init_effect(),
                     &effect,
-                )?;
+                )
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
                 let response = call.send().promise.await?;
                 Ok(effect_audit_reservation_proxy(
                     response.get()?.get_reservation()?,
