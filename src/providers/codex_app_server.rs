@@ -107,6 +107,7 @@ struct AppServerCommand {
     codex_home: Option<PathBuf>,
     _profile_directory: Option<Arc<std::fs::File>>,
     _staging: Option<Arc<PinnedExecutable>>,
+    protocol_override: Option<ProtocolCapabilities>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,6 +455,7 @@ impl AppServerCommand {
             codex_home: Some(codex_home),
             _profile_directory: Some(profile_directory),
             _staging: Some(pinned),
+            protocol_override: None,
         })
     }
 
@@ -475,6 +477,11 @@ impl AppServerCommand {
             codex_home: None,
             _profile_directory: None,
             _staging: None,
+            protocol_override: Some(ProtocolCapabilities {
+                dynamic_tools: false,
+                restricted_read_only: true,
+                audited_contract: true,
+            }),
         }
     }
 
@@ -485,6 +492,19 @@ impl AppServerCommand {
         self.turn_timeout = timeout;
         self.schema_timeout = timeout;
         self
+    }
+
+    #[cfg(test)]
+    fn with_test_protocol(mut self, capabilities: ProtocolCapabilities) -> Self {
+        self.protocol_override = Some(capabilities);
+        self
+    }
+
+    fn require_restricted_protocol(&self) -> Result<()> {
+        require_restricted_boundary(
+            self.protocol_override
+                .unwrap_or_else(|| self.detect_protocol_capabilities()),
+        )
     }
 
     fn detect_protocol_capabilities(&self) -> ProtocolCapabilities {
@@ -1273,6 +1293,8 @@ pub enum DeviceLoginOutcome {
     Completed,
     /// Finch requested cancellation and Codex acknowledged it.
     Cancelled,
+    /// The account completed authentication after Finch requested cancellation.
+    CompletedAfterCancel,
 }
 
 impl std::fmt::Debug for PendingChatGptLogin {
@@ -1361,6 +1383,7 @@ impl CodexAppServerAuth {
 
     pub async fn validate_sol_access(&self) -> Result<ChatGptAccountStatus> {
         self.command.require_audited_identity()?;
+        self.command.require_restricted_protocol()?;
         let mut client = RpcClient::spawn(&self.command).await?;
         let outcome = async {
             client.attest_effective_surface().await?;
@@ -1418,6 +1441,9 @@ impl CodexAppServerAuth {
             DeviceLoginOutcome::Cancelled => {
                 bail!("ChatGPT device login was cancelled")
             }
+            DeviceLoginOutcome::CompletedAfterCancel => {
+                bail!("ChatGPT device login completed while cancellation was pending")
+            }
         }
     }
 
@@ -1441,16 +1467,20 @@ impl CodexAppServerAuth {
             let mut updated = false;
             loop {
                 let event = tokio::select! {
-                    event = client.next_event() => event?,
+                    // A user cancellation that becomes ready in the same scheduler turn as a
+                    // successful completion wins. The cancellation exchange then determines
+                    // whether Codex committed the account, so setup can require an explicit
+                    // retain/logout acknowledgement instead of silently saving it.
+                    biased;
                     cancelled = wait_for_login_cancel(&mut cancel) => {
                         cancelled?;
-                        cancel_login_and_wait(
+                        return cancel_login_and_wait(
                             &mut client,
                             &login.details.login_id,
                             Instant::now() + CHILD_EXIT_TIMEOUT,
-                        ).await?;
-                        return Ok(DeviceLoginOutcome::Cancelled);
-                    }
+                        ).await;
+                    },
+                    event = client.next_event() => event?,
                 };
                 match event.get("method").and_then(Value::as_str) {
                     Some("account/updated") => {
@@ -1516,7 +1546,12 @@ impl CodexAppServerAuth {
         )
         .await;
         client.shutdown().await;
-        outcome
+        match outcome? {
+            DeviceLoginOutcome::Cancelled => Ok(()),
+            DeviceLoginOutcome::CompletedAfterCancel | DeviceLoginOutcome::Completed => {
+                bail!("ChatGPT device login completed before cancellation was acknowledged")
+            }
+        }
     }
 
     pub async fn logout(&self) -> Result<()> {
@@ -1593,7 +1628,7 @@ async fn cancel_login_and_wait(
     client: &mut RpcClient,
     login_id: &str,
     deadline: Instant,
-) -> Result<()> {
+) -> Result<DeviceLoginOutcome> {
     client
         .request_allowing(
             "account/login/cancel",
@@ -1601,21 +1636,43 @@ async fn cancel_login_and_wait(
             &["account/updated", "account/login/completed"],
         )
         .await?;
+    let mut completed_successfully = false;
+    let mut account_updated = false;
     loop {
         let event = timeout_at(deadline, client.next_event())
             .await
             .context("Timed out waiting for cancelled ChatGPT login")??;
         match event.get("method").and_then(Value::as_str) {
-            Some("account/updated") => continue,
+            Some("account/updated") => {
+                if account_updated
+                    || event.pointer("/params/authMode").and_then(Value::as_str) != Some("chatgpt")
+                {
+                    bail!("ChatGPT login cancellation sent an invalid account update");
+                }
+                account_updated = true;
+                if completed_successfully {
+                    client.require_no_post_terminal_message().await?;
+                    return Ok(DeviceLoginOutcome::CompletedAfterCancel);
+                }
+            }
             Some("account/login/completed") => {
                 let params = event.get("params").context("Invalid login notification")?;
-                if params.get("loginId").and_then(Value::as_str) != Some(login_id)
-                    || params.get("success").and_then(Value::as_bool) != Some(false)
-                {
+                if params.get("loginId").and_then(Value::as_str) != Some(login_id) {
                     bail!("ChatGPT login cancellation did not match the pending login");
                 }
+                if params.get("success").and_then(Value::as_bool) == Some(true) {
+                    if completed_successfully {
+                        bail!("ChatGPT login cancellation sent a duplicate completion");
+                    }
+                    completed_successfully = true;
+                    if account_updated {
+                        client.require_no_post_terminal_message().await?;
+                        return Ok(DeviceLoginOutcome::CompletedAfterCancel);
+                    }
+                    continue;
+                }
                 client.require_no_post_terminal_message().await?;
-                return Ok(());
+                return Ok(DeviceLoginOutcome::Cancelled);
             }
             Some(method) => bail!("Unexpected notification {method} while cancelling login"),
             None => bail!("Invalid login cancellation lifecycle message"),
@@ -1746,7 +1803,9 @@ impl CodexAppServerProvider {
             bail!("ChatGPT subscription provider requires GPT-5.6 Sol");
         }
         let command = AppServerCommand::production(&credential_ref)?;
-        let capabilities = command.detect_protocol_capabilities();
+        let capabilities = command
+            .protocol_override
+            .unwrap_or_else(|| command.detect_protocol_capabilities());
         require_restricted_boundary(capabilities)?;
         Ok(Self {
             command,
@@ -2601,7 +2660,7 @@ for line in sys.stdin:
         print(json.dumps({'method': 'thread/started', 'params': {'thread': {'id': started_id}}}), flush=True)
         if thread_event == 'duplicate':
             print(json.dumps({'method': 'thread/started', 'params': {'thread': {'id': started_id}}}), flush=True)
-    if method == 'account/login/start' and thread_event not in ['pending_login', 'cancel_duplicate']:
+    if method == 'account/login/start' and thread_event not in ['pending_login', 'cancel_duplicate', 'cancel_success_race']:
         completed = {'method': 'account/login/completed', 'params': {'loginId': 'wrong-login' if thread_event == 'login_mismatch' else 'login-1', 'success': thread_event not in ['login_denied', 'login_expired'], 'error': 'access_denied' if thread_event == 'login_denied' else ('expired_token' if thread_event == 'login_expired' else None)}}
         updated = {'method': 'account/updated', 'params': {'authMode': 'chatgpt', 'planType': 'plus'}}
         if thread_event == 'login_updated_first': print(json.dumps(updated), flush=True)
@@ -2609,7 +2668,9 @@ for line in sys.stdin:
         if thread_event not in ['login_denied', 'login_expired', 'login_updated_first']: print(json.dumps(updated), flush=True)
         if thread_event in ['login_duplicate', 'login_late']: print(json.dumps(completed), flush=True)
     if method == 'account/login/cancel':
-        print(json.dumps({'method':'account/login/completed','params':{'loginId':'login-1','success':False,'error':'cancelled'}}), flush=True)
+        success = thread_event == 'cancel_success_race'
+        print(json.dumps({'method':'account/login/completed','params':{'loginId':'login-1','success':success,'error':None if success else 'cancelled'}}), flush=True)
+        if success: print(json.dumps({'method':'account/updated','params':{'authMode':'chatgpt','planType':'plus'}}), flush=True)
         if thread_event == 'cancel_duplicate': print(json.dumps({'method':'account/login/completed','params':{'loginId':'login-1','success':False,'error':'cancelled'}}), flush=True)
     if method == 'account/logout':
         print(json.dumps({'method': 'account/updated', 'params': {'authMode': None, 'planType': None}}), flush=True)
@@ -3368,6 +3429,34 @@ for line in sys.stdin:
         let login = auth.begin_device_login().await.unwrap();
         let error = auth.cancel_device_login(login).await.unwrap_err();
         assert!(error.to_string().contains("after terminal state"));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_success_race_reports_authenticated_account_for_acknowledgement() {
+        let (_directory, command) =
+            mock_app_server_with_thread_event("chatgpt", "cancel_success_race");
+        let auth = CodexAppServerAuth::with_command(command);
+        let login = auth.begin_device_login().await.unwrap();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        cancel_tx.send(true).unwrap();
+        let outcome = auth
+            .finish_device_login_or_cancel(login, cancel_rx)
+            .await
+            .unwrap();
+        assert_eq!(outcome, DeviceLoginOutcome::CompletedAfterCancel);
+    }
+
+    #[tokio::test]
+    async fn test_sol_validation_rejects_unaudited_restricted_schema_before_spawn() {
+        let command = AppServerCommand::test(PathBuf::from("/must/not/spawn"), vec![])
+            .with_test_protocol(ProtocolCapabilities {
+                dynamic_tools: false,
+                restricted_read_only: false,
+                audited_contract: true,
+            });
+        let auth = CodexAppServerAuth::with_command(command);
+        let error = auth.validate_sol_access().await.unwrap_err();
+        assert!(error.to_string().contains("restricted capability boundary"));
     }
 
     #[tokio::test]

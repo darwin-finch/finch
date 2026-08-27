@@ -1104,6 +1104,17 @@ pub enum SetupApplyOutcome {
     Cancelled,
 }
 
+/// Entry point invoking the shared post-wizard authentication and commit ceremony.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupInvocation {
+    /// Automatic setup because no Finch configuration exists yet.
+    FirstRun,
+    /// Explicit `finch setup` command.
+    Command,
+    /// In-session `/setup` command.
+    Repl,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatGptSetupState {
     SignedOut,
@@ -1112,6 +1123,7 @@ enum ChatGptSetupState {
     Ready,
     Fallback,
     Cancelled,
+    AuthenticatedAfterCancel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1177,8 +1189,48 @@ fn device_ui_action(event: &Event) -> DeviceUiAction {
     }
 }
 
-fn device_login_remaining(started: std::time::Instant) -> Duration {
-    Duration::from_secs(10 * 60).saturating_sub(started.elapsed())
+struct DeviceCountdown {
+    deadline: tokio::time::Instant,
+    ticks: tokio::time::Interval,
+}
+
+impl DeviceCountdown {
+    fn new(timeout: Duration) -> Self {
+        let mut ticks = tokio::time::interval(Duration::from_secs(1));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self {
+            deadline: tokio::time::Instant::now() + timeout,
+            ticks,
+        }
+    }
+
+    fn remaining(&self) -> Duration {
+        self.deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+    }
+
+    async fn tick(&mut self) {
+        self.ticks.tick().await;
+    }
+}
+
+fn device_login_body(
+    verification_url: &str,
+    user_code: &str,
+    notice: &str,
+    remaining: Duration,
+) -> Vec<Line<'static>> {
+    vec![
+        Line::from(format!("Open: {verification_url}")),
+        Line::from(format!("Code: {user_code}")),
+        Line::from(""),
+        Line::from(format!(
+            "{notice} · {:02}:{:02} remaining",
+            remaining.as_secs() / 60,
+            remaining.as_secs() % 60
+        )),
+        Line::from("Codex owns polling and honors authorization slow-down responses."),
+    ]
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -1348,32 +1400,30 @@ impl SetupAuthUi {
         login: crate::providers::codex_app_server::ChatGptDeviceLogin,
     ) -> Result<crate::providers::codex_app_server::DeviceLoginOutcome> {
         let details = login.details.clone();
-        let started = std::time::Instant::now();
+        let mut countdown = DeviceCountdown::new(Duration::from_secs(10 * 60));
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let wait = auth.finish_device_login_or_cancel(login, cancel_rx);
         tokio::pin!(wait);
         let mut notice = "Pending authorization".to_string();
+        let mut cancel_requested = false;
         loop {
-            let remaining = device_login_remaining(started);
+            let remaining = countdown.remaining();
+            let body = device_login_body(
+                &details.verification_url,
+                &details.user_code,
+                &notice,
+                remaining,
+            );
             self.draw(
                 "ChatGPT device sign-in",
-                &[
-                    Line::from(format!("Open: {}", details.verification_url)),
-                    Line::from(format!("Code: {}", details.user_code)),
-                    Line::from(""),
-                    Line::from(format!(
-                        "{notice} · {:02}:{:02} remaining",
-                        remaining.as_secs() / 60,
-                        remaining.as_secs() % 60
-                    )),
-                    Line::from("Codex owns polling and honors authorization slow-down responses."),
-                ],
+                &body,
                 "[C] copy code  [O] open browser  [Esc] cancel",
             )?;
             tokio::select! {
-                result = &mut wait => return result,
-                event = self.next_event() => match device_ui_action(&event?) {
+                biased;
+                event = self.next_event(), if !cancel_requested => match device_ui_action(&event?) {
                             DeviceUiAction::Cancel => {
+                                cancel_requested = true;
                                 let _ = cancel_tx.send(true);
                                 notice = "Cancelling with Codex…".into();
                             }
@@ -1390,7 +1440,9 @@ impl SetupAuthUi {
                                 };
                             }
                             DeviceUiAction::Redraw | DeviceUiAction::Ignore => {}
-                }
+                },
+                result = &mut wait => return result,
+                _ = countdown.tick() => {}
             }
         }
     }
@@ -1453,13 +1505,73 @@ fn configured_provider_is_usable(provider: &ProviderEntry) -> bool {
     }
 }
 
+fn configured_fallback_exists(result: &SetupResult) -> bool {
+    result.providers.iter().any(|provider| {
+        !matches!(provider, ProviderEntry::ChatgptSubscription { .. })
+            && configured_provider_is_usable(provider)
+    })
+}
+
+fn validation_recovery_choices(
+    has_configured_fallback: bool,
+) -> Vec<(char, ChatGptSetupAction, &'static str)> {
+    let mut choices = vec![
+        ('k', ChatGptSetupAction::Keep, "retain sign-in"),
+        ('o', ChatGptSetupAction::Logout, "log out"),
+    ];
+    if has_configured_fallback {
+        choices.insert(
+            0,
+            (
+                'f',
+                ChatGptSetupAction::Fallback,
+                "save configured fallback; retain sign-in",
+            ),
+        );
+    }
+    choices
+}
+
+fn save_without_chatgpt(result: &SetupResult) -> Result<()> {
+    let mut config = config_from_setup_result(result);
+    config
+        .providers
+        .retain(|provider| !matches!(provider, ProviderEntry::ChatgptSubscription { .. }));
+    if !config.providers.iter().any(configured_provider_is_usable) {
+        anyhow::bail!("Setup cannot remove ChatGPT because no other usable provider is configured");
+    }
+    config.save()?;
+    if let Some(prompt) = result.custom_system_prompt.as_deref() {
+        crate::config::Persona::save_system_prompt_override(&result.default_persona, prompt)?;
+    }
+    Ok(())
+}
+
+fn state_after_device_login(
+    state: ChatGptSetupState,
+    outcome: crate::providers::codex_app_server::DeviceLoginOutcome,
+) -> Result<ChatGptSetupState> {
+    use crate::providers::codex_app_server::DeviceLoginOutcome;
+
+    match outcome {
+        DeviceLoginOutcome::Completed => state.transition(ChatGptSetupAction::LoginSucceeded),
+        DeviceLoginOutcome::Cancelled => state.transition(ChatGptSetupAction::Cancel),
+        DeviceLoginOutcome::CompletedAfterCancel => Ok(ChatGptSetupState::AuthenticatedAfterCancel),
+    }
+}
+
 /// Validate ChatGPT authentication and Sol availability before atomically committing setup.
 ///
 /// This is the single post-wizard state machine used by all three setup entry points. Finch
 /// displays the device code but never reads the app-server-owned credential file.
-pub async fn validate_and_apply(result: &SetupResult) -> Result<SetupApplyOutcome> {
+pub async fn validate_and_apply_for(
+    invocation: SetupInvocation,
+    result: &SetupResult,
+) -> Result<SetupApplyOutcome> {
     use crate::config::ProviderEntry;
     use crate::providers::CodexAppServerAuth;
+
+    tracing::debug!(?invocation, "Starting shared setup commit ceremony");
 
     let selected = result
         .providers
@@ -1514,12 +1626,7 @@ pub async fn validate_and_apply(result: &SetupResult) -> Result<SetupApplyOutcom
     while state == ChatGptSetupState::LoginPending {
         let login = auth.begin_device_login().await?;
         match ui.wait_for_device_login(&auth, login).await {
-            Ok(crate::providers::codex_app_server::DeviceLoginOutcome::Completed) => {
-                state = state.transition(ChatGptSetupAction::LoginSucceeded)?
-            }
-            Ok(crate::providers::codex_app_server::DeviceLoginOutcome::Cancelled) => {
-                state = state.transition(ChatGptSetupAction::Cancel)?
-            }
+            Ok(outcome) => state = state_after_device_login(state, outcome)?,
             Err(error) => {
                 let recovery = ui
                     .choose(
@@ -1545,16 +1652,19 @@ pub async fn validate_and_apply(result: &SetupResult) -> Result<SetupApplyOutcom
             let validation = auth.validate_sol_access().await;
             let saved = validation.and_then(|_| apply_and_save(result));
             if let Err(error) = saved {
+                let choices = validation_recovery_choices(configured_fallback_exists(result));
                 let decision = ui
                     .choose(
                         "ChatGPT setup could not be saved",
                         &format!("{error}\n\nThe managed sign-in remains opaque to Finch."),
-                        &[
-                            ('k', ChatGptSetupAction::Keep, "retain sign-in"),
-                            ('o', ChatGptSetupAction::Logout, "log out"),
-                        ],
+                        &choices,
                     )
                     .await?;
+                if decision == ChatGptSetupAction::Fallback {
+                    save_without_chatgpt(result)?;
+                    ui.restore()?;
+                    return Ok(SetupApplyOutcome::Saved);
+                }
                 if decision == ChatGptSetupAction::Logout {
                     auth.logout().await?;
                 }
@@ -1565,25 +1675,26 @@ pub async fn validate_and_apply(result: &SetupResult) -> Result<SetupApplyOutcom
             Ok(SetupApplyOutcome::Saved)
         }
         ChatGptSetupState::Fallback => {
-            let mut config = config_from_setup_result(result);
-            config
-                .providers
-                .retain(|provider| !matches!(provider, ProviderEntry::ChatgptSubscription { .. }));
-            if !config.providers.iter().any(configured_provider_is_usable) {
-                ui.restore()?;
-                anyhow::bail!(
-                    "Setup cannot remove ChatGPT because no other usable provider is configured"
-                );
-            }
-            config.save()?;
-            if let Some(prompt) = result.custom_system_prompt.as_deref() {
-                crate::config::Persona::save_system_prompt_override(
-                    &result.default_persona,
-                    prompt,
-                )?;
-            }
+            save_without_chatgpt(result)?;
             ui.restore()?;
             Ok(SetupApplyOutcome::Saved)
+        }
+        ChatGptSetupState::AuthenticatedAfterCancel => {
+            let decision = ui
+                .choose(
+                    "Sign-in completed while cancelling",
+                    "Codex authenticated the managed account before cancellation completed. Explicitly choose whether to retain it.",
+                    &[
+                        ('k', ChatGptSetupAction::Keep, "retain sign-in"),
+                        ('o', ChatGptSetupAction::Logout, "log out"),
+                    ],
+                )
+                .await?;
+            if decision == ChatGptSetupAction::Logout {
+                auth.logout().await?;
+            }
+            ui.restore()?;
+            Ok(SetupApplyOutcome::Cancelled)
         }
         ChatGptSetupState::Cancelled => {
             if had_existing_account {
@@ -1608,6 +1719,14 @@ pub async fn validate_and_apply(result: &SetupResult) -> Result<SetupApplyOutcom
             "ChatGPT setup did not reach a terminal state"
         )),
     }
+}
+
+/// Apply setup through the shared ceremony without a specific UI entry-point label.
+///
+/// New interactive entry points should call [`validate_and_apply_for`] explicitly so tests and
+/// diagnostics can prove that first-run, command, and REPL setup use the same boundary.
+pub async fn validate_and_apply(result: &SetupResult) -> Result<SetupApplyOutcome> {
+    validate_and_apply_for(SetupInvocation::Command, result).await
 }
 
 /// Convert wizard output into the complete configuration written to disk.
@@ -8096,10 +8215,16 @@ mod tests {
             .iter()
             .filter(|provider| !matches!(provider, ProviderEntry::ChatgptSubscription { .. }))
             .any(|provider| configured_provider_is_usable(provider)));
+        assert!(validation_recovery_choices(true)
+            .iter()
+            .any(|(_, action, _)| *action == ChatGptSetupAction::Fallback));
+        assert!(!validation_recovery_choices(false)
+            .iter()
+            .any(|(_, action, _)| *action == ChatGptSetupAction::Fallback));
     }
 
     #[test]
-    fn device_setup_events_cover_copy_open_cancel_resize_and_countdown() {
+    fn device_setup_events_cover_copy_open_cancel_and_resize() {
         use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
 
         let key = |code| {
@@ -8123,13 +8248,41 @@ mod tests {
             device_ui_action(&Event::Resize(120, 40)),
             DeviceUiAction::Redraw
         );
-        let started = std::time::Instant::now() - Duration::from_secs(125);
-        let remaining = device_login_remaining(started);
-        assert!(remaining <= Duration::from_secs(475));
-        assert!(remaining >= Duration::from_secs(474));
         assert!(open_verification_url("http://example.invalid")
             .unwrap_err()
             .to_string()
             .contains("non-HTTPS"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_device_countdown_redraws_while_input_is_idle() {
+        let mut countdown = DeviceCountdown::new(Duration::from_secs(600));
+
+        countdown.tick().await;
+        let initial = countdown.remaining();
+        let initial_render = device_login_body("https://example.test", "CODE", "Pending", initial);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        countdown.tick().await;
+        let updated = countdown.remaining();
+        let updated_render = device_login_body("https://example.test", "CODE", "Pending", updated);
+
+        assert!(updated <= initial.saturating_sub(Duration::from_secs(1)));
+        assert_ne!(initial_render, updated_render);
+    }
+
+    #[test]
+    fn test_successful_login_after_cancel_requires_explicit_acknowledgement_state() {
+        let state = state_after_device_login(
+            ChatGptSetupState::LoginPending,
+            crate::providers::codex_app_server::DeviceLoginOutcome::CompletedAfterCancel,
+        )
+        .unwrap();
+
+        assert_eq!(state, ChatGptSetupState::AuthenticatedAfterCancel);
+        assert!(state.transition(ChatGptSetupAction::Cancel).is_err());
+        assert!(state
+            .transition(ChatGptSetupAction::LoginSucceeded)
+            .is_err());
     }
 }

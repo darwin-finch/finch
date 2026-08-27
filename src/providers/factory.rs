@@ -170,18 +170,49 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
 pub fn create_providers_from_entries(
     entries: &[ProviderEntry],
 ) -> Result<Vec<Box<dyn LlmProvider>>> {
+    create_providers_from_entries_with(entries, create_provider_from_entry)
+}
+
+fn create_providers_from_entries_with<F>(
+    entries: &[ProviderEntry],
+    mut create: F,
+) -> Result<Vec<Box<dyn LlmProvider>>>
+where
+    F: FnMut(&ProviderEntry) -> Result<Box<dyn LlmProvider>>,
+{
     let cloud: Vec<_> = entries.iter().filter(|e| !e.is_local()).collect();
     if cloud.is_empty() {
         bail!("No cloud provider entries configured");
     }
-    cloud
-        .iter()
-        .enumerate()
-        .map(|(idx, entry)| {
-            create_provider_from_entry(entry)
-                .with_context(|| format!("Failed to create provider #{}", idx + 1))
-        })
-        .collect()
+    let mut providers = Vec::with_capacity(cloud.len());
+    let mut skipped_chatgpt = Vec::new();
+    for (idx, entry) in cloud.into_iter().enumerate() {
+        match create(entry) {
+            Ok(provider) => providers.push(provider),
+            Err(error) if matches!(entry, ProviderEntry::ChatgptSubscription { .. }) => {
+                tracing::warn!(
+                    provider_index = idx + 1,
+                    error = %error,
+                    "Skipping unusable ChatGPT subscription provider; configured fallbacks remain available"
+                );
+                skipped_chatgpt.push(format!("provider #{}: {error}", idx + 1));
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to create provider #{}", idx + 1));
+            }
+        }
+    }
+    if providers.is_empty() {
+        if skipped_chatgpt.is_empty() {
+            bail!("No usable cloud provider entries configured");
+        }
+        bail!(
+            "No usable cloud provider entries configured; {}",
+            skipped_chatgpt.join("; ")
+        );
+    }
+    Ok(providers)
 }
 
 /// Return a single `LlmProvider` from a slice of unified entries.
@@ -577,5 +608,35 @@ mod tests {
         }];
         let result = create_providers_from_entries(&entries);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unusable_chatgpt_schema_preserves_later_configured_grok_fallback() {
+        let entries = vec![
+            ProviderEntry::ChatgptSubscription {
+                credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
+                    .into(),
+                model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.into()),
+                name: Some("subscription".into()),
+            },
+            ProviderEntry::Grok {
+                api_key: "xai-test".into(),
+                model: Some("grok-code-fast-1".into()),
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: Some("fallback".into()),
+            },
+        ];
+        let providers = create_providers_from_entries_with(&entries, |entry| {
+            if matches!(entry, ProviderEntry::ChatgptSubscription { .. }) {
+                bail!("restricted schema unavailable")
+            }
+            create_provider_from_entry(entry)
+        })
+        .unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name(), "grok");
+        assert_eq!(providers[0].default_model(), "grok-code-fast-1");
     }
 }
