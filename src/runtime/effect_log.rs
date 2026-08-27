@@ -5,9 +5,235 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+/// Maximum serialized intent admitted for one host effect. Admission occurs
+/// before a permit can be issued, so an untrusted model cannot turn the audit
+/// log into an unbounded payload sink.
+pub const MAX_EFFECT_AUDIT_INTENT_BYTES: usize = 256 * 1024;
+/// Maximum serialized terminal outcome retained for one host effect.
+pub const MAX_EFFECT_AUDIT_OUTCOME_BYTES: usize = 64 * 1024;
+/// Maximum number of non-terminal effects owned by one named-Brain run.
+pub const MAX_ACTIVE_EFFECT_AUDITS_PER_RUN: usize = 64;
+
+/// Complete immutable identity of one named-Brain host effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EffectAuditIdentity {
+    pub brain_id: Uuid,
+    pub run_id: Uuid,
+    pub request_seq: u64,
+    pub execution_id: Uuid,
+    pub effect_sequence: u64,
+}
+
+/// Provenance minted by the daemon when it creates a run-scoped reverse
+/// capability. This is audit data, not a bearer token exposed on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectAuditAuthority {
+    pub authority_id: Uuid,
+    pub runner_lease_id: Uuid,
+    pub runner_subject: String,
+    pub connection_id: Option<Uuid>,
+    pub environment_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EffectAuditIntent {
+    pub identity: EffectAuditIdentity,
+    pub effect: crate::vm::VmSideEffect,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum EffectAuditTerminalOutcome {
+    Acknowledged {
+        response: crate::runtime::VmResumeResponse,
+    },
+    NotApplied {
+        reason: String,
+    },
+    FailedPartial {
+        detail: String,
+    },
+    AbandonedNotApplied,
+    UncertainProcessLoss,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum EffectAuditState {
+    IntentAccepted,
+    AwaitingHostResult,
+    Terminal { outcome: EffectAuditTerminalOutcome },
+}
+
+impl EffectAuditState {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Terminal { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EffectAuditEntry {
+    pub intent: EffectAuditIntent,
+    pub authority: EffectAuditAuthority,
+    pub state: EffectAuditState,
+}
+
+/// One canonical reducer input. Exact replays are no-ops; any changed
+/// content, authority, or outcome under an existing identity fails closed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "transition", rename_all = "snake_case")]
+pub enum EffectAuditTransition {
+    Reserve {
+        intent: EffectAuditIntent,
+        authority: EffectAuditAuthority,
+    },
+    Begin {
+        identity: EffectAuditIdentity,
+        authority_id: Uuid,
+    },
+    Finish {
+        identity: EffectAuditIdentity,
+        authority_id: Uuid,
+        outcome: EffectAuditTerminalOutcome,
+    },
+}
+
+impl EffectAuditTransition {
+    pub fn identity(&self) -> EffectAuditIdentity {
+        match self {
+            Self::Reserve { intent, .. } => intent.identity,
+            Self::Begin { identity, .. } | Self::Finish { identity, .. } => *identity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EffectAuditReducer {
+    entries: BTreeMap<EffectAuditIdentity, EffectAuditEntry>,
+}
+
+impl EffectAuditReducer {
+    pub fn entries(&self) -> &BTreeMap<EffectAuditIdentity, EffectAuditEntry> {
+        &self.entries
+    }
+
+    pub fn get(&self, identity: &EffectAuditIdentity) -> Option<&EffectAuditEntry> {
+        self.entries.get(identity)
+    }
+
+    pub fn active_for_run(&self, run_id: Uuid) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| entry.intent.identity.run_id == run_id && !entry.state.is_terminal())
+            .count()
+    }
+
+    /// Validate and apply one monotonic transition. Returns false for an
+    /// exact retry and true only when the state changed.
+    pub fn apply(&mut self, transition: EffectAuditTransition) -> Result<bool> {
+        let identity = transition.identity();
+        match transition {
+            EffectAuditTransition::Reserve { intent, authority } => {
+                anyhow::ensure!(intent.identity == identity, "effect audit identity changed");
+                anyhow::ensure!(
+                    serde_json::to_vec(&intent)?.len() <= MAX_EFFECT_AUDIT_INTENT_BYTES,
+                    "effect audit intent exceeds the bounded payload limit"
+                );
+                if let Some(existing) = self.entries.get(&identity) {
+                    anyhow::ensure!(
+                        existing.intent == intent && existing.authority == authority,
+                        "conflicting effect audit reservation for {identity:?}"
+                    );
+                    return Ok(false);
+                }
+                anyhow::ensure!(
+                    self.active_for_run(identity.run_id) < MAX_ACTIVE_EFFECT_AUDITS_PER_RUN,
+                    "effect audit active-intent quota exceeded for run {}",
+                    identity.run_id
+                );
+                self.entries.insert(
+                    identity,
+                    EffectAuditEntry {
+                        intent,
+                        authority,
+                        state: EffectAuditState::IntentAccepted,
+                    },
+                );
+                Ok(true)
+            }
+            EffectAuditTransition::Begin {
+                identity,
+                authority_id,
+            } => {
+                let entry = self
+                    .entries
+                    .get_mut(&identity)
+                    .context("cannot begin a host effect without a durable audit reservation")?;
+                anyhow::ensure!(
+                    entry.authority.authority_id == authority_id,
+                    "effect audit authority mismatch"
+                );
+                match entry.state {
+                    EffectAuditState::IntentAccepted => {
+                        entry.state = EffectAuditState::AwaitingHostResult;
+                        Ok(true)
+                    }
+                    EffectAuditState::AwaitingHostResult => Ok(false),
+                    EffectAuditState::Terminal { .. } => {
+                        bail!("cannot begin a terminal effect audit")
+                    }
+                }
+            }
+            EffectAuditTransition::Finish {
+                identity,
+                authority_id,
+                outcome,
+            } => {
+                anyhow::ensure!(
+                    serde_json::to_vec(&outcome)?.len() <= MAX_EFFECT_AUDIT_OUTCOME_BYTES,
+                    "effect audit outcome exceeds the bounded payload limit"
+                );
+                let entry = self
+                    .entries
+                    .get_mut(&identity)
+                    .context("cannot finish a host effect without a durable audit reservation")?;
+                anyhow::ensure!(
+                    entry.authority.authority_id == authority_id,
+                    "effect audit authority mismatch"
+                );
+                match &entry.state {
+                    EffectAuditState::IntentAccepted => {
+                        anyhow::ensure!(
+                            matches!(
+                                outcome,
+                                EffectAuditTerminalOutcome::NotApplied { .. }
+                                    | EffectAuditTerminalOutcome::AbandonedNotApplied
+                            ),
+                            "a host outcome cannot be recorded before durable begin"
+                        );
+                        entry.state = EffectAuditState::Terminal { outcome };
+                        Ok(true)
+                    }
+                    EffectAuditState::AwaitingHostResult => {
+                        entry.state = EffectAuditState::Terminal { outcome };
+                        Ok(true)
+                    }
+                    EffectAuditState::Terminal { outcome: existing } => {
+                        anyhow::ensure!(
+                            existing == &outcome,
+                            "conflicting terminal effect audit outcome"
+                        );
+                        Ok(false)
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "record", rename_all = "snake_case")]
@@ -43,15 +269,27 @@ impl VmEffectDeliveryLog {
         let mut effects = BTreeMap::new();
         let mut acknowledgements = HashMap::new();
         if path.exists() {
-            let reader = BufReader::new(
-                File::open(&path)
-                    .with_context(|| format!("open VM effect log '{}'", path.display()))?,
-            );
-            for (index, line) in reader.lines().enumerate() {
-                let line = line.with_context(|| {
-                    format!("read VM effect log '{}' line {}", path.display(), index + 1)
-                })?;
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("read VM effect log '{}'", path.display()))?;
+            let records = bytes
+                .split_inclusive(|byte| *byte == b'\n')
+                .collect::<Vec<_>>();
+            let mut committed_len = 0usize;
+            for (index, terminated) in records.iter().enumerate() {
+                if terminated.last() != Some(&b'\n') {
+                    break;
+                }
+                let line = std::str::from_utf8(&terminated[..terminated.len() - 1]).with_context(
+                    || {
+                        format!(
+                            "decode VM effect log '{}' line {}",
+                            path.display(),
+                            index + 1
+                        )
+                    },
+                )?;
                 if line.trim().is_empty() {
+                    committed_len += terminated.len();
                     continue;
                 }
                 let record: EffectLogRecord = serde_json::from_str(&line).with_context(|| {
@@ -62,13 +300,25 @@ impl VmEffectDeliveryLog {
                     )
                 })?;
                 apply_record(&mut effects, &mut acknowledgements, record)?;
+                committed_len += terminated.len();
+            }
+            if committed_len != bytes.len() {
+                let file = OpenOptions::new().write(true).open(&path)?;
+                file.set_len(committed_len as u64)?;
+                file.sync_all()?;
             }
         }
+        let new_file = !path.exists();
         let writer = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("open VM effect log writer '{}'", path.display()))?;
+        if new_file {
+            if let Some(parent) = path.parent() {
+                File::open(parent)?.sync_all()?;
+            }
+        }
         Ok(Self {
             path,
             writer,
@@ -222,6 +472,118 @@ mod tests {
         }
     }
 
+    fn audit_fixture() -> (EffectAuditIntent, EffectAuditAuthority) {
+        let identity = EffectAuditIdentity {
+            brain_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            request_seq: 9,
+            execution_id: Uuid::new_v4(),
+            effect_sequence: 2,
+        };
+        (
+            EffectAuditIntent {
+                identity,
+                effect: effect(identity.execution_id, identity.effect_sequence, "audit").effect,
+            },
+            EffectAuditAuthority {
+                authority_id: Uuid::new_v4(),
+                runner_lease_id: Uuid::new_v4(),
+                runner_subject: "runner".into(),
+                connection_id: Some(Uuid::new_v4()),
+                environment_generation: 4,
+            },
+        )
+    }
+
+    #[test]
+    fn audit_reducer_replays_exact_transitions_and_rejects_changed_content() {
+        let (intent, authority) = audit_fixture();
+        let reserve = EffectAuditTransition::Reserve {
+            intent: intent.clone(),
+            authority: authority.clone(),
+        };
+        let mut reducer = EffectAuditReducer::default();
+        assert!(reducer.apply(reserve.clone()).unwrap());
+        assert!(!reducer.apply(reserve).unwrap());
+
+        let mut changed = intent.clone();
+        changed.effect.origin = SourceOrigin::generated("forged");
+        assert!(reducer
+            .apply(EffectAuditTransition::Reserve {
+                intent: changed,
+                authority: authority.clone(),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting"));
+
+        let begin = EffectAuditTransition::Begin {
+            identity: intent.identity,
+            authority_id: authority.authority_id,
+        };
+        assert!(reducer.apply(begin.clone()).unwrap());
+        assert!(!reducer.apply(begin).unwrap());
+        assert!(reducer
+            .apply(EffectAuditTransition::Begin {
+                identity: intent.identity,
+                authority_id: Uuid::new_v4(),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("authority mismatch"));
+
+        let finish = EffectAuditTransition::Finish {
+            identity: intent.identity,
+            authority_id: authority.authority_id,
+            outcome: EffectAuditTerminalOutcome::Acknowledged {
+                response: crate::runtime::VmResumeResponse::Result { values: Vec::new() },
+            },
+        };
+        assert!(reducer.apply(finish.clone()).unwrap());
+        assert!(!reducer.apply(finish).unwrap());
+        assert!(reducer
+            .apply(EffectAuditTransition::Finish {
+                identity: intent.identity,
+                authority_id: authority.authority_id,
+                outcome: EffectAuditTerminalOutcome::FailedPartial {
+                    detail: "changed".into(),
+                },
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting terminal"));
+    }
+
+    #[test]
+    fn audit_reducer_never_acknowledges_before_durable_begin() {
+        let (intent, authority) = audit_fixture();
+        let mut reducer = EffectAuditReducer::default();
+        reducer
+            .apply(EffectAuditTransition::Reserve {
+                intent: intent.clone(),
+                authority: authority.clone(),
+            })
+            .unwrap();
+        assert!(reducer
+            .apply(EffectAuditTransition::Finish {
+                identity: intent.identity,
+                authority_id: authority.authority_id,
+                outcome: EffectAuditTerminalOutcome::Acknowledged {
+                    response: crate::runtime::VmResumeResponse::Result { values: Vec::new() },
+                },
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("before durable begin"));
+        assert!(reducer
+            .apply(EffectAuditTransition::Finish {
+                identity: intent.identity,
+                authority_id: authority.authority_id,
+                outcome: EffectAuditTerminalOutcome::AbandonedNotApplied,
+            })
+            .unwrap());
+    }
+
     #[test]
     fn reopens_and_replays_only_each_consumers_unacknowledged_suffix() {
         let directory = tempfile::tempdir().unwrap();
@@ -270,5 +632,29 @@ mod tests {
             .err()
             .expect("corrupt log must fail closed");
         assert!(error.to_string().contains("line 2"));
+    }
+
+    #[test]
+    fn recovers_a_torn_final_delivery_record_but_rejects_nonfinal_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("effects.jsonl");
+        let execution_id = Uuid::new_v4();
+        {
+            let mut log = VmEffectDeliveryLog::open(&path).unwrap();
+            log.append(effect(execution_id, 0, "one")).unwrap();
+        }
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(br#"{"record":"effect""#)
+            .unwrap();
+        let reopened = VmEffectDeliveryLog::open(&path).unwrap();
+        assert_eq!(reopened.pending("client").len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap().last(), Some(&b'\n'));
+
+        std::fs::write(&path, b"not-json\n{}\n").unwrap();
+        let error = VmEffectDeliveryLog::open(&path).err().unwrap();
+        assert!(error.to_string().contains("line 1"));
     }
 }
