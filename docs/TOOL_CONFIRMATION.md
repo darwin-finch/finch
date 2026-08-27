@@ -1,5 +1,8 @@
 # Tool Confirmation Feature
 
+> **Archived overview:** Permission behavior has changed. Use the current
+> [tool execution contract](../src/tools/EXECUTION.md) and tests.
+
 ## Overview
 
 The tool confirmation feature adds interactive prompts before executing tools in Shammah. This gives users control over what actions Claude performs on their behalf, with options to approve once, remember the approval for the session, or deny execution.

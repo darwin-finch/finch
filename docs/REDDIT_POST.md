@@ -1,5 +1,8 @@
 # Reddit Posts
 
+> **Archived drafts:** These are historical marketing drafts, not current product documentation or
+> verified capability statements.
+
 Two versions: one for r/rust (technical), one for r/programming (broader).
 
 ---

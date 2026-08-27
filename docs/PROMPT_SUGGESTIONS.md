@@ -1,5 +1,8 @@
 # Prompt Suggestions - User Guide
 
+> **Archived guide:** This document describes an earlier implementation and is not current user
+> documentation.
+
 ## Overview
 
 Shammah provides contextual prompt suggestions to help users discover features and improve their workflow, inspired by Claude Code's suggestion system.

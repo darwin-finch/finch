@@ -1,5 +1,9 @@
 # Shammah Daemon Mode
 
+> **Archived guide:** Ports, routes, process ownership, and Brain transport have changed. Verify
+> current behavior against the [README](../README.md) and
+> [HTTP route definitions](../src/server/handlers.rs).
+
 **Status:** Phase 1 - ✅ Complete
 
 Daemon mode transforms Shammah from a CLI-only tool into a multi-tenant HTTP server that can serve multiple clients concurrently while maintaining Claude API compatibility.

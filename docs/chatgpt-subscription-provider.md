@@ -15,8 +15,10 @@ OpenAI Platform remains available directly with an API key:
 [[providers]]
 type = "openai"
 api_key = "sk-..."
-model = "gpt-4o"
 ```
+
+Select a model offered by the current provider catalog or set an explicit model known to your
+OpenAI Platform account; this migration note does not pin a model name.
 
 A Finch-native ChatGPT subscription flow may be added only if OpenAI publishes a
 supported third-party contract for client registration, authorization, audience,

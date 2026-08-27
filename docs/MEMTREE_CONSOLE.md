@@ -1,5 +1,8 @@
 # MemTree Console - Tree-Structured Conversation Interface
 
+> **Archived design:** This document is retained as project history and does not describe the
+> current default Finch interface.
+
 ## Overview
 
 The MemTree Console is a hierarchical, tree-structured conversation interface inspired by Claude Code's clean output format. It organizes conversation history as a navigable tree where you can expand/collapse sections and see the relationship between messages, responses, and tool calls.

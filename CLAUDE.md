@@ -4,42 +4,35 @@ This document orients AI assistants working on the Finch project. Implementation
 
 ## Project Context
 
-**Project Name**: Shammah (שָׁמָה - "watchman/guardian")
+**Project Name**: Finch
 **Binary**: `finch`
-**Purpose**: Local-first AI coding assistant with explicit private feedback
-**Core Innovation**: Local ONNX inference across 6 model families; Apple Silicon acceleration via CoreML EP; cloud fallback during bootstrap
+**Purpose**: Experimental terminal coding assistant with provider-backed chat, typed programs,
+named Brains, tool use, and explicit private feedback
 
-**The Problem:** Traditional AI assistants require constant internet, incur API costs per query, and can't learn your patterns.
-
-**The Solution:** Finch runs locally after a one-time model download (<100ms startup, near-zero marginal cost per query, offline-capable), with cloud fallback while the local model loads on first run.
-
-**Key Metrics:**
-- Startup: <100ms (instant REPL)
-- First-run: 0ms blocked (background download)
-- System support: 8GB–64GB+ RAM (adaptive model selection)
+Finch is under active development. Configuration variants and loader code are not proof of
+end-to-end provider or local-model conformance. Do not repeat performance, offline, model-support,
+or release-readiness claims without dated evidence; see Issues #74, #98, #120, and #147.
 
 ## Architecture Overview
 
 ```
-User Query
+CLI / query client
     ↓
-Router (model ready? → local; loading? → teacher API)
+configured provider graph or daemon client
     ↓
-ONNX Local Model (Qwen/Llama/Gemma/Mistral/Phi/DeepSeek)
-CoreML EP on macOS · CUDA/ROCm/CPU on Linux
+provider transport and/or experimental local generator
     ↓
-Response
+typed runtime + capability broker for program effects
 ```
 
 ### Module Docs
 
 | Component | Module Doc |
 |-----------|-----------|
-| Progressive Bootstrap | `src/models/BOOTSTRAP.md` |
-| ONNX Model Integration | `src/models/ONNX.md` |
-| LoRA Fine-Tuning | `src/models/LORA.md` |
+| Local model loader | `src/models/unified_loader.rs` · `src/models/ONNX.md` |
+| Disabled LoRA path | `docs/AUTOMATIC_TRAINING.md` · `src/models/LORA.md` |
 | Router | `src/router/ROUTING.md` |
-| TUI Renderer | `src/cli/tui/ARCHITECTURE.md` · `docs/TUI_ARCHITECTURE.md` |
+| TUI Renderer | `src/cli/tui/ARCHITECTURE.md` |
 | Tool Execution & Permissions | `src/tools/EXECUTION.md` |
 | Claude Client | `src/claude/CLIENT.md` |
 | Context Assembly | `src/context/ASSEMBLY.md` |
@@ -82,31 +75,22 @@ Behaviors that **must always be true**. If a test doesn't exist for a claim belo
 - **`gui_click` with raw coordinates is an internal primitive, not a user-facing tool** — it must not appear in the default tool list for non-developer personas.
 - **Accessibility permission errors must explain how to fix them** — the error message must include the exact path to grant access (`System Settings → Privacy & Security → Accessibility`).
 
-### Exchange (peer function exchange via shared channel)
-
-- **`finch exchange run` never executes without user confirmation** — the daemon returns what would run; the CLI must print it and require explicit `--yes` or interactive confirmation before executing.
-- **A peer's proposal does not install into the local VM until the local user accepts** — `finch exchange run` installs nothing silently; rejection leaves the VM unchanged.
-- **Forked sessions share base vocabulary implicitly** — two sessions running the same binary start from identical stdlib + builtins; the exchange channel carries only the delta.
-- **Proposals are visible before execution** — `finch exchange list` always shows the full program text, not just a name, so the user can read what they are accepting.
-- **Rejection is a first-class operation** — clearing or ignoring a proposal must be as easy as accepting it; no proposal should require action to dismiss.
-
 ## Key Design Decisions
 
-### Pre-trained models (not training from scratch)
+### Provider and local-model claims
 
-Using pre-trained Qwen models gives immediate quality from day 1 with no cold-start period. LoRA training and adapter loading remain blocked on Issues #1, #7, and #74.
+Use current provider profiles and pre-trained local artifacts only. Local routing and provider parity
+remain experimental under Issues #74 and #98. LoRA training and adapter loading are disabled under
+Issue #139; preserved legacy queues and adapters are not processed automatically.
 
 ### Weighted feedback
 
 Three historical weight tiers are retained for explicit feedback: high (10x), medium (3x), normal (1x). `Ctrl+G` = good, `Ctrl+B` = bad. Feedback is private durable data; it does not trigger training.
 
-### Progressive Bootstrap
+### Local backend investigation
 
-REPL appears in <100ms; model loads in the background. Queries forward to teacher API (Claude/GPT-4/etc.) until `GeneratorState::Ready`. See `src/models/BOOTSTRAP.md`.
-
-### ONNX over Candle on macOS
-
-`candle-metal` is missing layer-norm kernels and matmul dimension combinations for Qwen. `candle-coreml` requires incompatible ANEMLL format. ONNX + CoreML EP is the only reliable macOS path. See `src/models/ONNX.md`.
+The source contains ONNX Runtime and Candle loaders. Historical backend experiments are recorded in
+`docs/MODEL_BACKEND_STATUS.md`, but that document is not end-to-end routing or conformance evidence.
 
 ### Storage layout
 
@@ -117,7 +101,9 @@ REPL appears in <100ms; model loads in the background. Queries forward to teache
 ├── feedback.jsonl       # Private explicit feedback; never a training trigger
 ├── training_queue.jsonl # Preserved legacy queue; not processed automatically
 ├── metrics/             # Usage metrics
-└── tool_patterns.json   # Approved tool patterns
+├── tool_patterns.json   # Approved tool patterns
+├── sessions/            # Saved REPL sessions
+└── brains/              # Named Brain event logs and state
 
 ~/.cache/huggingface/hub/  # Base models (HF standard)
 ```
@@ -126,21 +112,25 @@ REPL appears in <100ms; model loads in the background. Queries forward to teache
 
 - **Interactive REPL:** `finch`
 - **Single query / pipe:** `finch query "..."` or `echo "..." | finch`
-- **Daemon (auto-spawned, OpenAI-compatible API):** `finch daemon --bind 127.0.0.1:11435`
-  - VS Code / Continue.dev: point at `http://localhost:11435`, provider = `openai`, model = `local`
-  - mDNS discovery: `finch daemon --bind 0.0.0.0:11435 --mdns`
+- **Foreground HTTP server:** `finch daemon` (default `127.0.0.1:8000`)
+- **Managed background daemon:** `finch daemon-start` (default `127.0.0.1:11435`)
+- **Restricted remote Brain TLS listener:** configured default `0.0.0.0:11436`; opened only when
+  service advertisement is enabled
+- **Direct typed programs:** `finch --forth`, `finch --lisp`, and `finch --exec`
 
 ## Technology Stack
 
 - **Language:** Rust (memory safety, performance, Apple Silicon support)
-- **ML Framework:** ONNX Runtime (`ort` crate) — primary; Candle (Linux/CPU alt)
+- **ML frameworks in source:** ONNX Runtime (`ort` crate) and Candle
 - **Async:** Tokio
-- **HTTP server:** Axum (daemon, OpenAI-compatible API)
+- **HTTP server:** Axum (`/v1/chat/completions`, `/v1/models`, `/v1/messages`, and Finch-specific
+  routes; not the full OpenAI API and not the Responses API)
 - **TUI:** Ratatui + crossterm
 - **Key deps:** `hf-hub`, `tokenizers`, `indicatif`, `sysinfo`
 
-**Supported model families (ONNX):** Qwen 2.5, Llama 3, Gemma 2, Mistral, Phi, DeepSeek Coder
-**Teacher providers:** Claude, GPT-4, Gemini, Grok, Mistral, Groq
+Provider profile variants and local model repositories are defined in source. Treat the model
+catalog, setup choices, and loaders as configuration surfaces—not claims that each combination has
+passed conformance.
 
 ## Development Guidelines
 
@@ -226,28 +216,22 @@ git add Cargo.toml && git commit -m "chore: bump version to vX.Y.Z"
 git tag vX.Y.Z && git push origin main && git push origin vX.Y.Z
 ```
 
-GitHub Actions builds `finch-macos-arm64.tar.gz` (macOS 14 runner) and `finch-linux-x86_64.tar.gz` (ubuntu-24.04+).
+GitHub Actions is configured to build `finch-macos-arm64.tar.gz` (macOS 14 runner) and
+`finch-linux-x86_64.tar.gz` (Ubuntu 24.04 runner). Do not describe a release as ready merely because
+artifacts exist; release and installer reliability are tracked in Issues #119 and #144.
 
 **Platform notes:**
 - Intel macOS: **not supported** (`ort` has no prebuilt binaries; GitHub deprecated Intel Mac runners Jun 2025)
 - Linux: must be `ubuntu-24.04`+ (requires glibc 2.38+)
-- macOS-only deps in `Cargo.toml` must appear **before** the `[target.'cfg(target_os = "macos")'.dependencies]` header
+- macOS-only dependencies belong **after** the `[target.'cfg(target_os = "macos")'.dependencies]`
+  header so they remain target-scoped
 
 ## Current Project Status
 
-**Version**: 0.7.6 (Feb 2026)
-
-| Capability | Status |
-|-----------|--------|
-| Local ONNX inference | ✅ |
-| 6 model families | ✅ |
-| 6 teacher providers | ✅ |
-| TUI with scrollback/streaming | ✅ |
-| Daemon (OpenAI-compatible API) | ✅ |
-| mDNS discovery | ✅ |
-| Private explicit feedback collection | ✅ |
-| LoRA training + adapter loading | Blocked: Issues #1/#7/#74 |
-| Mistral ONNX | ⏳ Issue #2 |
+`Cargo.toml` is authoritative for the source version. Finch is experimental. The interactive CLI,
+typed runtime, bounded HTTP routes, local persistence, MCP client, and explicit feedback store have
+implementation and tests. Provider/local routing parity, remote collaboration, subagents, and
+release integration remain active work. Automatic LoRA training is disabled.
 
 ### Open Issues
 
@@ -258,23 +242,18 @@ See **https://github.com/darwin-finch/finch/issues**
 | Document | Purpose |
 |----------|---------|
 | `README.md` | User-facing documentation |
-| `CHANGELOG.md` | Version history |
-| `docs/ROADMAP.md` | Future work planning |
-| `docs/ARCHITECTURE.md` | System architecture overview |
-| `docs/DAEMON_MODE.md` | Daemon architecture details |
-| `docs/TUI_ARCHITECTURE.md` | TUI rendering (full detail) |
-| `docs/TOOL_CONFIRMATION.md` | Tool permission system |
-| `docs/MODEL_BACKEND_STATUS.md` | Model backend comparison |
-| `docs/USER_GUIDE.md` | Setup and usage |
+| `CONTRIBUTING.md` | Contributor setup and attribution policy |
+| `docs/README.md` | Current/reference/design/archive documentation map |
+| `CHANGELOG.md` | Version history; not current capability evidence |
 
 ## Key Principles
 
-1. **Immediate Quality** — pre-trained models work day 1
-2. **Explicit Feedback** — user ratings are retained privately
-3. **User Control** — feedback never implies consent to train
-4. **Privacy First** — local inference, offline capability
-5. **Professional UX** — instant startup, graceful degradation
-6. **Rust Best Practices** — safe, idiomatic, performant code
+1. **Evidence before claims** — configuration or design intent is not conformance
+2. **Explicit feedback** — user ratings are retained privately
+3. **User control** — feedback never implies consent to train
+4. **Capability boundaries** — host effects require typed authority and policy review
+5. **Accessible interfaces** — semantic, text-returning automation is the public contract
+6. **Rust best practices** — safe, idiomatic, tested code
 
 ---
 
