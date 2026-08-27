@@ -103,11 +103,20 @@ generator = "~/.claude-proxy/models/generator-7b.mlmodel"
 # Path to constitutional validator model
 validator = "~/.claude-proxy/models/constitutional.mlmodel"
 
-# Use Apple Neural Engine (recommended on Apple Silicon)
-use_neural_engine = true
+# CoreML compute units Finch requests on Apple platforms. "all" lets CoreML
+# choose among compatible ANE, GPU, and CPU devices; it does not prove where
+# any operator ran. Other values: "cpu_and_neural_engine", "cpu_and_gpu",
+# and "cpu_only".
+[coreml]
+compute_units = "all"
 
-# Fallback to CPU if ANE unavailable
-cpu_fallback = true
+# Opt-in placement diagnostics. CoreML writes the hardware selected for each
+# operator and estimated execution time to Finch's local logs when this is true.
+# Operator/model details may be present in those logs.
+profile_compute_plan = false
+
+# Whether CoreML may take nodes inside Loop, Scan, and If subgraphs.
+enable_subgraphs = false
 
 # Storage Configuration
 [storage]

@@ -103,6 +103,8 @@ where
         #[serde(default)]
         backend: Option<BackendConfig>,
         #[serde(default)]
+        coreml: Option<super::backend::CoreMlConfig>,
+        #[serde(default)]
         client: Option<ClientConfig>,
         #[serde(default)]
         server: Option<ServerConfig>,
@@ -130,6 +132,7 @@ where
 
     let toml_config: TomlConfig = toml::from_str(&contents)
         .map_err(|e| anyhow::anyhow!(errors::config_parse_error(&e.to_string())))?;
+    let legacy_coreml = toml_config.backend.as_ref().map(|backend| backend.coreml);
 
     // Determine providers: prefer new format; fall back to legacy teachers/backend.
     let providers = if !toml_config.providers.is_empty() {
@@ -156,6 +159,10 @@ where
     }
 
     let mut config = config_factory(providers);
+
+    if let Some(coreml) = toml_config.coreml.or(legacy_coreml) {
+        config.backend.coreml = coreml;
+    }
 
     // Apply scalar overrides
     if let Some(features) = toml_config.features {

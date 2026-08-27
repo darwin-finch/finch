@@ -1,6 +1,6 @@
 // Configuration structs
 
-use super::backend::BackendConfig;
+use super::backend::{BackendConfig, CoreMlConfig};
 use super::colors::ColorScheme;
 use super::provider::ProviderEntry;
 use serde::{Deserialize, Serialize};
@@ -485,6 +485,7 @@ impl ProviderEntry {
                 enabled: *enabled,
                 inference_provider: *inference_provider,
                 execution_target: *execution_target,
+                coreml: CoreMlConfig::default(),
                 model_family: *model_family,
                 model_size: *model_size,
                 model_repo: model_repo.clone(),
@@ -872,6 +873,7 @@ impl Config {
             client: Some(self.client.clone()),
             server: Some(self.server.clone()),
             providers,
+            coreml: Some(self.backend.coreml),
             colors: Some(self.colors.clone()),
             features: Some(self.features.clone()),
             license: self.license.clone(),
@@ -902,6 +904,8 @@ struct TomlConfig {
     server: Option<ServerConfig>,
     #[serde(default)]
     providers: Vec<ProviderEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coreml: Option<CoreMlConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     colors: Option<ColorScheme>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -938,6 +942,7 @@ mod tests {
             client: None,
             server: None,
             providers: Vec::new(),
+            coreml: None,
             colors: None,
             features: None,
             license: LicenseConfig::default(),
@@ -961,6 +966,63 @@ mod tests {
     fn test_server_config_generates_a_nonempty_brain_password() {
         let server = ServerConfig::default();
         assert!(server.brain_password.len() >= 16);
+    }
+
+    #[test]
+    fn test_coreml_policy_persistence_round_trip_uses_isolated_path() {
+        use crate::config::{CoreMlComputeUnits, ExecutionTarget, ProviderEntry};
+        use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
+
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("config.toml");
+        let second_path = directory.path().join("reloaded.toml");
+        let mut config = Config::with_providers(vec![ProviderEntry::Local {
+            inference_provider: InferenceProvider::Onnx,
+            execution_target: ExecutionTarget::Auto,
+            model_family: ModelFamily::Qwen2,
+            model_size: ModelSize::Medium,
+            model_repo: None,
+            model_path: None,
+            enabled: true,
+            name: None,
+        }]);
+        config.backend.coreml = CoreMlConfig {
+            compute_units: CoreMlComputeUnits::CpuAndGpu,
+            profile_compute_plan: true,
+            enable_subgraphs: true,
+        };
+
+        config.save_to(&first_path).unwrap();
+        let reloaded = crate::config::load_config_from_path(&first_path).unwrap();
+        assert_eq!(reloaded.backend.coreml, config.backend.coreml);
+
+        reloaded.save_to(&second_path).unwrap();
+        let reloaded_again = crate::config::load_config_from_path(&second_path).unwrap();
+        assert_eq!(reloaded_again.backend.coreml, config.backend.coreml);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_legacy_coreml_provider_reloads_with_compatible_default_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+                [[providers]]
+                type = "local"
+                inference_provider = "onnx"
+                execution_target = "coreml"
+                model_family = "Qwen2"
+                model_size = "Medium"
+                enabled = true
+            "#,
+        )
+        .unwrap();
+
+        let loaded = crate::config::load_config_from_path(&path).unwrap();
+        assert_eq!(loaded.backend.execution_target, ExecutionTarget::CoreML);
+        assert_eq!(loaded.backend.coreml, CoreMlConfig::default());
     }
 
     #[test]

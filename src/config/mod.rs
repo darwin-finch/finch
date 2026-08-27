@@ -11,7 +11,7 @@ mod settings;
 
 #[allow(deprecated)]
 pub use backend::BackendDevice; // Deprecated alias for ExecutionTarget
-pub use backend::{BackendConfig, ExecutionTarget};
+pub use backend::{BackendConfig, CoreMlComputeUnits, CoreMlConfig, ExecutionTarget};
 pub use colors::{
     ColorScheme, ColorSpec, ColorTheme, DialogColors, MessageBand, MessageColors, StatusColors,
     UiColors,

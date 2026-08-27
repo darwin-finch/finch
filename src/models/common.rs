@@ -74,7 +74,7 @@ impl ModelConfig {
 /// Device configuration options (DEPRECATED: Phase 4 - kept for compatibility)
 ///
 /// With ONNX Runtime, device selection is handled by execution providers:
-/// - CoreML (Apple Neural Engine)
+/// - CoreML (requested Apple compute-unit policy; placement is runtime-selected)
 /// - CPU (fallback)
 /// - CUDA/TensorRT (NVIDIA GPUs)
 /// - DirectML (Windows GPUs)

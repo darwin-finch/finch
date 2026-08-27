@@ -8,13 +8,13 @@ use std::path::PathBuf;
 ///
 /// All targets use ONNX Runtime as the inference provider.
 /// The target determines which ONNX Runtime execution provider is used:
-/// - CoreML: Uses Apple Neural Engine (ANE) via CoreML execution provider
+/// - CoreML: Uses the requested CoreML compute-unit policy on Apple platforms
 /// - CPU: Uses CPU execution provider (universal fallback)
 /// - CUDA: Uses CUDA execution provider for NVIDIA GPUs
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionTarget {
-    /// Apple Neural Engine via CoreML execution provider (macOS only, ONNX Runtime)
+    /// CoreML execution provider (macOS only, ONNX Runtime)
     #[cfg(target_os = "macos")]
     #[serde(rename = "coreml")]
     CoreML,
@@ -42,7 +42,7 @@ impl ExecutionTarget {
     pub fn name(&self) -> &'static str {
         match self {
             #[cfg(target_os = "macos")]
-            ExecutionTarget::CoreML => "CoreML (ANE)",
+            ExecutionTarget::CoreML => "CoreML (Auto: ANE/GPU/CPU)",
             #[cfg(feature = "cuda")]
             ExecutionTarget::Cuda => "CUDA (GPU)",
             ExecutionTarget::Cpu => "CPU",
@@ -54,9 +54,7 @@ impl ExecutionTarget {
     pub fn description(&self) -> &'static str {
         match self {
             #[cfg(target_os = "macos")]
-            ExecutionTarget::CoreML => {
-                "Apple Neural Engine (CoreML) - Fastest on Mac, best battery life"
-            }
+            ExecutionTarget::CoreML => "CoreML with automatic compute-unit selection (ANE/GPU/CPU)",
             #[cfg(feature = "cuda")]
             ExecutionTarget::Cuda => "NVIDIA GPU (CUDA) - Very fast on supported hardware",
             ExecutionTarget::Cpu => "CPU (Universal Fallback) - Slower than specialized hardware",
@@ -127,6 +125,48 @@ impl ExecutionTarget {
     }
 }
 
+/// Compute units Finch asks CoreML to consider.
+///
+/// This is a requested policy, not evidence that CoreML assigned any operation
+/// to a particular device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreMlComputeUnits {
+    /// Allow CoreML to choose among all compatible compute units.
+    #[default]
+    All,
+    /// Restrict CoreML to CPU and compatible Apple Neural Engine devices.
+    CpuAndNeuralEngine,
+    /// Restrict CoreML to CPU and compatible GPU devices.
+    CpuAndGpu,
+    /// Restrict CoreML to CPU.
+    CpuOnly,
+}
+
+impl CoreMlComputeUnits {
+    /// Human-readable requested policy. This does not describe observed placement.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::All => "Auto: ANE/GPU/CPU",
+            Self::CpuAndNeuralEngine => "CPU + ANE",
+            Self::CpuAndGpu => "CPU + GPU",
+            Self::CpuOnly => "CPU only",
+        }
+    }
+}
+
+/// CoreML execution-provider options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CoreMlConfig {
+    /// Requested CoreML compute units.
+    pub compute_units: CoreMlComputeUnits,
+    /// Ask CoreML to log its compute plan for placement diagnostics.
+    pub profile_compute_plan: bool,
+    /// Allow CoreML to take nodes inside Loop, Scan, and If subgraphs.
+    pub enable_subgraphs: bool,
+}
+
 /// Backend configuration for model inference
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendConfig {
@@ -142,6 +182,10 @@ pub struct BackendConfig {
     /// Selected execution target (where code runs: CoreML/CPU/CUDA)
     #[serde(alias = "device")] // Support old config field name
     pub execution_target: ExecutionTarget,
+
+    /// Requested CoreML policy and opt-in diagnostics.
+    #[serde(default)]
+    pub coreml: CoreMlConfig,
 
     /// Model family to use (Qwen2, Gemma2, etc.)
     #[serde(default = "default_model_family")]
@@ -248,6 +292,7 @@ impl Default for BackendConfig {
             enabled: default_backend_enabled(),
             inference_provider: default_inference_provider(),
             execution_target: ExecutionTarget::Auto,
+            coreml: CoreMlConfig::default(),
             model_family: default_model_family(),
             model_size: default_model_size(),
             model_repo: None,
@@ -260,12 +305,23 @@ impl Default for BackendConfig {
 }
 
 impl BackendConfig {
+    /// Describe the requested target policy without implying observed placement.
+    pub fn requested_target_name(&self) -> String {
+        #[cfg(target_os = "macos")]
+        if self.execution_target == ExecutionTarget::CoreML {
+            return format!("CoreML ({})", self.coreml.compute_units.name());
+        }
+
+        self.execution_target.name().to_string()
+    }
+
     /// Create new backend config with execution target
     pub fn with_target(target: ExecutionTarget) -> Self {
         Self {
             enabled: default_backend_enabled(),
             inference_provider: default_inference_provider(),
             execution_target: target,
+            coreml: CoreMlConfig::default(),
             model_family: default_model_family(),
             model_size: default_model_size(),
             model_repo: None,
@@ -288,6 +344,7 @@ impl BackendConfig {
             enabled: default_backend_enabled(),
             inference_provider: default_inference_provider(),
             execution_target: target,
+            coreml: CoreMlConfig::default(),
             model_family: family,
             model_size: size,
             model_repo: None,
@@ -367,6 +424,79 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let decoded: ExecutionTarget = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_coreml_auto_label_is_truthful() {
+        let name = ExecutionTarget::CoreML.name();
+        let description = ExecutionTarget::CoreML.description();
+        assert!(name.contains("Auto"));
+        assert!(!name.contains("ANE only"));
+        assert!(!description.to_ascii_lowercase().contains("fastest"));
+
+        let config = BackendConfig::with_target(ExecutionTarget::CoreML);
+        assert_eq!(config.requested_target_name(), "CoreML (Auto: ANE/GPU/CPU)");
+
+        for (policy, expected) in [
+            (CoreMlComputeUnits::All, "Auto: ANE/GPU/CPU"),
+            (CoreMlComputeUnits::CpuAndNeuralEngine, "CPU + ANE"),
+            (CoreMlComputeUnits::CpuAndGpu, "CPU + GPU"),
+            (CoreMlComputeUnits::CpuOnly, "CPU only"),
+        ] {
+            let mut config = BackendConfig::with_target(ExecutionTarget::CoreML);
+            config.coreml.compute_units = policy;
+            assert_eq!(
+                config.requested_target_name(),
+                format!("CoreML ({expected})")
+            );
+        }
+    }
+
+    #[test]
+    fn test_live_configuration_guide_does_not_claim_auto_is_ane_only_or_fastest() {
+        let guide = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/CONFIGURATION.md"
+        ));
+        assert!(!guide.contains("Use Apple Neural Engine"));
+        assert!(!guide.contains("ANE unavailable"));
+        assert!(!guide.contains("CoreML (ANE)"));
+        assert!(!guide.contains("Fastest on Mac"));
+        assert!(guide.contains("does not prove where"));
+    }
+
+    #[test]
+    fn test_coreml_compute_units_serde_round_trip() {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Wrapper {
+            compute_units: CoreMlComputeUnits,
+        }
+
+        for policy in [
+            CoreMlComputeUnits::All,
+            CoreMlComputeUnits::CpuAndNeuralEngine,
+            CoreMlComputeUnits::CpuAndGpu,
+            CoreMlComputeUnits::CpuOnly,
+        ] {
+            let original = Wrapper {
+                compute_units: policy,
+            };
+            let encoded = toml::to_string(&original).unwrap();
+            assert_eq!(toml::from_str::<Wrapper>(&encoded).unwrap(), original);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_legacy_coreml_target_defaults_to_all_compute_units() {
+        let legacy = r#"
+            execution_target = "coreml"
+            model_family = "Qwen2"
+            model_size = "Medium"
+        "#;
+        let decoded: BackendConfig = toml::from_str(legacy).unwrap();
+        assert_eq!(decoded.coreml, CoreMlConfig::default());
     }
 
     #[test]
