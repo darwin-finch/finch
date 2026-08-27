@@ -23,7 +23,8 @@ use crate::claude::types::{ContentBlock, ImageSource};
 use crate::config::ReasoningEffort;
 
 const REQUEST_TIMEOUT_SECS: u64 = 60;
-const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DECODED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -77,20 +78,17 @@ fn validate_image_source(source: &ImageSource) -> Result<OpenAIImageUrl> {
     let validator: fn(&[u8]) -> Result<()> = match source.media_type.as_str() {
         "image/png" => validate_png,
         "image/jpeg" => validate_jpeg,
-        other => anyhow::bail!(
-            "OpenAI image media type '{}' is unsupported; expected image/png or image/jpeg",
-            other
-        ),
+        _ => anyhow::bail!("OpenAI image media type is unsupported; expected PNG or JPEG"),
     };
-    let estimated_decoded = source.data.len().saturating_mul(3) / 4;
-    if estimated_decoded > MAX_IMAGE_BYTES {
-        anyhow::bail!("OpenAI image exceeded the 10 MiB decoded-size limit");
+    let max_base64_bytes = MAX_IMAGE_BYTES.div_ceil(3).saturating_mul(4);
+    if source.data.len() > max_base64_bytes {
+        anyhow::bail!("OpenAI image exceeded the 8 MB encoded-image limit");
     }
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&source.data)
         .context("OpenAI image contained invalid base64")?;
     if bytes.len() > MAX_IMAGE_BYTES {
-        anyhow::bail!("OpenAI image exceeded the 10 MiB decoded-size limit");
+        anyhow::bail!("OpenAI image exceeded the 8 MB encoded-image limit");
     }
     validator(&bytes)?;
     Ok(OpenAIImageUrl {
@@ -118,6 +116,11 @@ fn validate_png(bytes: &[u8]) -> Result<()> {
             .context("OpenAI PNG chunk length overflowed")?;
         if chunk_end > bytes.len() {
             anyhow::bail!("OpenAI PNG was truncated");
+        }
+        let expected_crc =
+            u32::from_be_bytes(bytes[header_end + length..chunk_end].try_into().unwrap());
+        if png_crc32(&bytes[offset + 4..header_end + length]) != expected_crc {
+            anyhow::bail!("OpenAI PNG failed integrity validation");
         }
         if !saw_ihdr {
             if chunk_type != b"IHDR" || length != 13 {
@@ -155,11 +158,37 @@ fn validate_png(bytes: &[u8]) -> Result<()> {
             if length != 0 || !saw_idat || chunk_end != bytes.len() {
                 anyhow::bail!("OpenAI PNG had an invalid terminal IEND chunk");
             }
+            let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+            decoder.set_limits(png::Limits {
+                bytes: MAX_DECODED_IMAGE_BYTES,
+            });
+            let mut reader = decoder
+                .read_info()
+                .map_err(|_| anyhow::anyhow!("OpenAI PNG failed integrity validation"))?;
+            let output_size = reader.output_buffer_size();
+            if output_size > MAX_DECODED_IMAGE_BYTES {
+                anyhow::bail!("OpenAI PNG decoded dimensions were excessive");
+            }
+            let mut output = vec![0; output_size];
+            reader
+                .next_frame(&mut output)
+                .map_err(|_| anyhow::anyhow!("OpenAI PNG failed integrity validation"))?;
             return Ok(());
         }
         offset = chunk_end;
     }
     anyhow::bail!("OpenAI PNG was incomplete")
+}
+
+fn png_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (0u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
 }
 
 fn validate_jpeg(bytes: &[u8]) -> Result<()> {
@@ -359,12 +388,8 @@ fn reject_unknown_keys(
     allowed: &[&str],
     context: &str,
 ) -> Result<()> {
-    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
-        anyhow::bail!(
-            "OpenAI stream contained unknown {} field '{}'",
-            context,
-            key
-        );
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        anyhow::bail!("OpenAI stream contained an unknown {} field", context);
     }
     Ok(())
 }
@@ -484,7 +509,7 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
     }
     if let Some(role) = &choice.delta.role {
         if role != "assistant" {
-            anyhow::bail!("OpenAI stream returned unknown delta role '{}'", role);
+            anyhow::bail!("OpenAI stream returned an unknown delta role");
         }
     }
     if choice.delta.role.is_none()
@@ -554,13 +579,15 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
             anyhow::bail!("OpenAI stream sent duplicate terminal status");
         }
         match reason.as_str() {
-            "stop" | "tool_calls" => {}
+            "stop" if state.tool_calls.is_empty() => {}
+            "tool_calls" if !state.tool_calls.is_empty() => {}
+            "stop" => anyhow::bail!("OpenAI stream stopped despite containing function calls"),
+            "tool_calls" => {
+                anyhow::bail!("OpenAI stream reported function calls without any call items")
+            }
             "length" => anyhow::bail!("OpenAI stream reached its output-token limit"),
             "content_filter" => anyhow::bail!("OpenAI stream was stopped by content filtering"),
-            _ => anyhow::bail!(
-                "OpenAI stream returned unknown terminal status '{}'",
-                reason
-            ),
+            _ => anyhow::bail!("OpenAI stream returned an unknown terminal status"),
         }
     }
     Ok(output)
@@ -581,6 +608,7 @@ async fn publish_canonical_completion(
     state: &CanonicalStreamState,
     tx: &mpsc::Sender<Result<StreamChunk>>,
 ) -> Result<()> {
+    let tool_blocks = finalize_tool_calls(&state.tool_calls, true)?;
     if !state.accumulated_text.is_empty() {
         tx.send(Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text {
             text: state.accumulated_text.clone(),
@@ -588,7 +616,7 @@ async fn publish_canonical_completion(
         .await
         .map_err(|_| anyhow::anyhow!("OpenAI stream receiver was dropped"))?;
     }
-    for block in finalize_tool_calls(&state.tool_calls, true)? {
+    for block in tool_blocks {
         tx.send(Ok(StreamChunk::ContentBlockComplete(block)))
             .await
             .map_err(|_| anyhow::anyhow!("OpenAI stream receiver was dropped"))?;
@@ -1063,7 +1091,9 @@ impl OpenAIProvider {
                                 );
                             }
                             if !outstanding_tool_ids.insert(call.id.clone()) {
-                                anyhow::bail!("Duplicate OpenAI function call ID '{}'", call.id);
+                                anyhow::bail!(
+                                    "OpenAI request contained duplicate function call IDs"
+                                );
                             }
                         }
                     }
@@ -1086,6 +1116,9 @@ impl OpenAIProvider {
                     });
                 }
                 _ => {
+                    if rule == TransportRule::CanonicalGpt56ChatCompletions && msg.role != "user" {
+                        anyhow::bail!("OpenAI request contained an unsupported message role");
+                    }
                     // user/developer messages: keep ordered multimodal content for canonical
                     // OpenAI. Compatible providers retain Finch's historical text shape.
                     let mut content_parts: Vec<OpenAIContentPart> = Vec::new();
@@ -1145,8 +1178,7 @@ impl OpenAIProvider {
                             && !outstanding_tool_ids.remove(&tool_call_id)
                         {
                             anyhow::bail!(
-                                "OpenAI tool result references unknown function call ID '{}'",
-                                tool_call_id
+                                "OpenAI tool result references an unknown function call ID"
                             );
                         }
                         messages.push(OpenAIMessage::Tool {
@@ -1212,6 +1244,7 @@ impl OpenAIProvider {
                 && rule == TransportRule::CanonicalGpt56ChatCompletions)
                 .then_some(OpenAIStreamOptions {
                     include_usage: true,
+                    include_obfuscation: false,
                 }),
         };
         Self::validate_request_payload(&openai_request)?;
@@ -1300,13 +1333,23 @@ impl OpenAIProvider {
                 .finish_reason
                 .as_deref()
                 .context("OpenAI response omitted terminal status")?;
+            let has_tool_calls = content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
             match reason {
-                "stop" | "tool_calls" => {}
+                "stop" if !has_tool_calls => {}
+                "tool_calls" if has_tool_calls => {}
+                "stop" => {
+                    anyhow::bail!("OpenAI response stopped despite containing function calls")
+                }
+                "tool_calls" => {
+                    anyhow::bail!("OpenAI response reported function calls without any call items")
+                }
                 "length" => anyhow::bail!("OpenAI response reached its output-token limit"),
                 "content_filter" => {
                     anyhow::bail!("OpenAI response was stopped by content filtering")
                 }
-                _ => anyhow::bail!("OpenAI returned unknown terminal status '{}'", reason),
+                _ => anyhow::bail!("OpenAI returned an unknown terminal status"),
             }
         }
 
@@ -1394,6 +1437,7 @@ impl OpenAIProvider {
         if rule == TransportRule::CanonicalGpt56ChatCompletions {
             openai_request.stream_options = Some(OpenAIStreamOptions {
                 include_usage: true,
+                include_obfuscation: false,
             });
         }
         Self::validate_request_payload(&openai_request)?;
@@ -1743,6 +1787,7 @@ struct OpenAIRequest {
 #[derive(Debug, Clone, Serialize)]
 struct OpenAIStreamOptions {
     include_usage: bool,
+    include_obfuscation: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1938,6 +1983,29 @@ mod tests {
             0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11,
             0x00, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0x01, 0xff, 0xd9,
         ])
+    }
+
+    fn corrupted_png(corrupt_crc_only: bool) -> String {
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(VALID_PNG_BASE64)
+            .unwrap();
+        let mut offset = 8usize;
+        loop {
+            let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            let data_start = offset + 8;
+            let crc_start = data_start + length;
+            if &bytes[offset + 4..offset + 8] == b"IDAT" {
+                if corrupt_crc_only {
+                    bytes[crc_start] ^= 1;
+                } else {
+                    bytes[data_start] ^= 1;
+                    let crc = png_crc32(&bytes[offset + 4..crc_start]);
+                    bytes[crc_start..crc_start + 4].copy_from_slice(&crc.to_be_bytes());
+                }
+                return base64::engine::general_purpose::STANDARD.encode(bytes);
+            }
+            offset = crc_start + 4;
+        }
     }
 
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
@@ -2212,7 +2280,8 @@ mod tests {
             .mock("POST", "/v1/chat/completions")
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
                 "model":"gpt-5.6-sol", "stream":true,
-                "stream_options":{"include_usage":true}, "max_completion_tokens":4096
+                "stream_options":{"include_usage":true,"include_obfuscation":false},
+                "max_completion_tokens":4096
             })))
             .with_status(200)
             .with_header("content-type", "text/event-stream; charset=utf-8")
@@ -2412,6 +2481,8 @@ mod tests {
             "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
             "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n",
             "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
         ] {
             let (complete, errors) = canonical_stream_outcome(body.to_string()).await;
             assert!(!complete);
@@ -2556,6 +2627,36 @@ mod tests {
             .with_model("gpt-5.6-sol");
             assert!(provider.to_openai_request(&truncated).is_err());
         }
+        for corrupt in [corrupted_png(true), corrupted_png(false)] {
+            let request = ProviderRequest::new(vec![crate::claude::Message::with_content(
+                "user",
+                vec![ContentBlock::image("image/png", corrupt)],
+            )])
+            .with_model("gpt-5.6-sol");
+            assert!(provider
+                .to_openai_request(&request)
+                .unwrap_err()
+                .to_string()
+                .contains("integrity validation"));
+        }
+        let exact_limit = ImageSource {
+            source_type: "base64".into(),
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_IMAGE_BYTES]),
+        };
+        assert!(!validate_image_source(&exact_limit)
+            .unwrap_err()
+            .to_string()
+            .contains("8 MB"));
+        let over_limit = ImageSource {
+            source_type: "base64".into(),
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_IMAGE_BYTES + 1]),
+        };
+        assert!(validate_image_source(&over_limit)
+            .unwrap_err()
+            .to_string()
+            .contains("8 MB"));
         let mismatch = ProviderRequest::new(vec![crate::claude::Message::with_content(
             "user",
             vec![ContentBlock::tool_result(
@@ -2577,13 +2678,20 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let provider =
             public_canonical_test_provider(format!("http://{}", listener.local_addr().unwrap()));
-        let request = ProviderRequest::new(vec![crate::claude::Message::with_content(
-            "user",
-            vec![ContentBlock::image("image/png", "iVBORw0KGgo=")],
-        )])
-        .with_model("gpt-5.6-sol");
-        let error = provider.send_message(&request).await.unwrap_err();
-        assert!(error.to_string().contains("PNG"));
+        for data in [
+            "iVBORw0KGgo=".to_string(),
+            corrupted_png(true),
+            corrupted_png(false),
+            base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_IMAGE_BYTES + 1]),
+        ] {
+            let request = ProviderRequest::new(vec![crate::claude::Message::with_content(
+                "user",
+                vec![ContentBlock::image("image/png", data)],
+            )])
+            .with_model("gpt-5.6-sol");
+            let error = provider.send_message(&request).await.unwrap_err();
+            assert!(error.to_string().len() < 256);
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(1), listener.accept())
                 .await
@@ -2735,6 +2843,14 @@ mod tests {
                 "non-assistant role",
             ),
             (
+                r#"{"id":"x","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":null},"finish_reason":"tool_calls"}]}"#,
+                "without any call items",
+            ),
+            (
+                r#"{"id":"x","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_x","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":"stop"}]}"#,
+                "despite containing function calls",
+            ),
+            (
                 r#"{"id":"x","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":"ok","mystery_item":{}},"finish_reason":"stop"}]}"#,
                 "unknown response message field",
             ),
@@ -2809,6 +2925,125 @@ mod tests {
         assert!(error.to_string().contains("1 MiB limit"));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn canonical_malformed_fields_and_request_errors_are_bounded_and_redacted() {
+        let malicious = "MALICIOUS_PRIVATE_VALUE".repeat(50_000);
+        let body = format!(
+            "{{\"id\":\"x\",\"object\":\"chat.completion\",\"model\":\"gpt-5.6-sol\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"ok\",\"{}\":true}},\"finish_reason\":\"stop\"}}]}}",
+            malicious
+        );
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || CapturedLogs(Arc::clone(&writer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let provider = canonical_test_provider(server.url());
+        let error = provider
+            .send_message_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("gpt-5.6-sol"),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.len() < 256);
+        assert!(!error.contains("MALICIOUS_PRIVATE_VALUE"));
+
+        let huge = "REQUEST_PRIVATE_VALUE".repeat(50_000);
+        let invalid_role = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            huge.clone(),
+            vec![ContentBlock::text("x")],
+        )])
+        .with_model("gpt-5.6-sol");
+        let invalid_mime = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            "user",
+            vec![ContentBlock::image(huge.clone(), "AAAA")],
+        )])
+        .with_model("gpt-5.6-sol");
+        let duplicate_ids = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            "assistant",
+            vec![
+                ContentBlock::ToolUse {
+                    id: huge.clone(),
+                    name: "read".into(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: huge.clone(),
+                    name: "read".into(),
+                    input: serde_json::json!({}),
+                },
+            ],
+        )])
+        .with_model("gpt-5.6-sol");
+        let unknown_result = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            "user",
+            vec![ContentBlock::tool_result(huge.clone(), "x".into(), None)],
+        )])
+        .with_model("gpt-5.6-sol");
+        for request in [invalid_role, invalid_mime, duplicate_ids, unknown_result] {
+            let error = provider
+                .to_openai_request(&request)
+                .unwrap_err()
+                .to_string();
+            assert!(error.len() < 256);
+            assert!(!error.contains("REQUEST_PRIVATE_VALUE"));
+        }
+        for response in [
+            OpenAIResponse {
+                id: "x".into(),
+                object: Some("chat.completion".into()),
+                model: "gpt-5.6-sol".into(),
+                choices: vec![OpenAIChoice {
+                    index: 0,
+                    message: OpenAIResponseMessage {
+                        role: huge.clone(),
+                        content: Some("x".into()),
+                        tool_calls: None,
+                    },
+                    finish_reason: Some("stop".into()),
+                }],
+                usage: None,
+            },
+            OpenAIResponse {
+                id: "x".into(),
+                object: Some("chat.completion".into()),
+                model: "gpt-5.6-sol".into(),
+                choices: vec![OpenAIChoice {
+                    index: 0,
+                    message: OpenAIResponseMessage {
+                        role: "assistant".into(),
+                        content: Some("x".into()),
+                        tool_calls: None,
+                    },
+                    finish_reason: Some(huge.clone()),
+                }],
+                usage: None,
+            },
+        ] {
+            let error = provider
+                .parse_response(response, TransportRule::CanonicalGpt56ChatCompletions)
+                .unwrap_err()
+                .to_string();
+            assert!(error.len() < 256);
+            assert!(!error.contains("REQUEST_PRIVATE_VALUE"));
+        }
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(!logs.contains("MALICIOUS_PRIVATE_VALUE"));
+        assert!(!logs.contains("REQUEST_PRIVATE_VALUE"));
+        assert!(logs.len() < 16 * 1024);
+    }
+
     #[tokio::test]
     async fn compatible_nonstream_keeps_historical_malformed_tool_argument_fallback() {
         let mut server = mockito::Server::new_async().await;
@@ -2834,6 +3069,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.tool_uses()[0].input, serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn compatible_stream_keeps_accepting_default_obfuscation_field() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(concat!(
+                "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"compatible-model\",\"obfuscation\":\"padding\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+                "data: [DONE]\n\n"
+            ))
+            .create_async()
+            .await;
+        let provider = OpenAIProvider::new_compatible(
+            "key".into(),
+            server.url(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "compatible-model".into(),
+            "compatible".into(),
+        )
+        .unwrap();
+        let mut rx = provider
+            .send_message_stream_once(&ProviderRequest::new(vec![crate::claude::Message::user(
+                "hello",
+            )]))
+            .await
+            .unwrap();
+        let mut text = String::new();
+        while let Some(chunk) = rx.recv().await {
+            if let StreamChunk::TextDelta(delta) = chunk.unwrap() {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(text, "ok");
     }
 
     #[tokio::test]

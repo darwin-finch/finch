@@ -6,8 +6,10 @@ not from the provider display name alone.
 - `https://api.openai.com/v1/chat/completions` with `gpt-5.6-sol` (or its
   `gpt-5.6` alias) uses Finch's canonical GPT-5.6 Chat Completions contract.
   It sends developer instructions, `max_completion_tokens`, reasoning effort,
-  function calls/results, and typed PNG/JPEG `image_url` data URLs. Streaming
-  requires one known terminal status followed by exactly one `[DONE]` marker.
+  function calls/results, and typed PNG/JPEG `image_url` data URLs up to 8 MB.
+  PNG CRC and compressed image data are verified before network access.
+  Streaming requests disable obfuscation explicitly, and require one known
+  terminal status followed by exactly one `[DONE]` marker.
 - GPT-4o and OpenAI-compatible xAI, Groq, Mistral, Ollama, remote-Finch, and
   custom endpoints retain the historical compatible request and parser shape.
 
