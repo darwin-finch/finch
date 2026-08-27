@@ -860,6 +860,13 @@ struct BrainTurnResult {
   effectJournal   @7 :List(BrainEffectRecord);
   hasCommitAck    @8 :Bool;
   commitAck       @9 :BrainTurnCommitAck;
+  errorKind      @10 :BrainTurnErrorKind;
+}
+
+enum BrainTurnErrorKind {
+  runnerAuthored                       @0;
+  infrastructureProviderTaskTerminated @1;
+  runCancelled                         @2;
 }
 
 # Optional reverse capability returned by the runner with a completed turn.

@@ -1350,7 +1350,13 @@ async fn dispatch_named_brain_run(
     }
     if published.status == BrainRunStatus::Failed {
         if let Err(error) = &execution {
-            if provider_task_terminated_unexpectedly(error) {
+            if matches!(
+                error.downcast_ref::<crate::server::RunnerTurnError>(),
+                Some(crate::server::RunnerTurnError {
+                    kind: crate::server::RunnerTurnErrorKind::InfrastructureProviderTaskTerminated,
+                    ..
+                })
+            ) {
                 return Err(anyhow::anyhow!(error.to_string()));
             }
         }
@@ -1907,14 +1913,6 @@ fn runner_callback_disconnected(error: &anyhow::Error) -> bool {
     )
 }
 
-fn provider_task_terminated_unexpectedly(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .to_string()
-            .starts_with("provider task terminated unexpectedly:")
-    })
-}
-
 async fn dispatch_named_brain_turn(
     store: &crate::brain::store::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
@@ -1975,7 +1973,29 @@ async fn dispatch_named_brain_turn(
                     drop(publication);
                     anyhow::bail!("named Brain run cancelled");
                 }
-                if !provider_task_terminated_unexpectedly(&error) {
+                if failure.kind == crate::server::RunnerTurnErrorKind::RunCancelled {
+                    persist_named_brain_effect_journal(
+                        store,
+                        name,
+                        Some(run_id),
+                        request_seq,
+                        &lease.subject,
+                        &failure.effect_journal,
+                    )?;
+                    store.transition_run(
+                        name,
+                        "daemon",
+                        run_id,
+                        crate::brain::store::BrainRunStatus::Cancelled,
+                        Some(error.to_string()),
+                    )?;
+                    drop(publication);
+                    store.prune_run_publication(name, run_id)?;
+                    return Err(anyhow::anyhow!(error.to_string()));
+                }
+                if failure.kind
+                    != crate::server::RunnerTurnErrorKind::InfrastructureProviderTaskTerminated
+                {
                     persist_named_brain_turn_events(
                         store,
                         name,
@@ -4374,6 +4394,7 @@ mod handler_tests {
                 match runner_rx.recv().await.unwrap() {
                     crate::server::RunnerRequest::Turn(request) => {
                         request.response_tx.send(Err(crate::server::RunnerTurnError {
+                            kind: crate::server::RunnerTurnErrorKind::RunnerAuthored,
                             message: "later prompt reached runner".into(),
                             turn_events: Vec::new(),
                             effect_journal: Vec::new(),
@@ -4602,6 +4623,7 @@ mod handler_tests {
             }
         };
         later_turn.response_tx.send(Err(crate::server::RunnerTurnError {
+            kind: crate::server::RunnerTurnErrorKind::RunnerAuthored,
             message: "lane recovered".into(), turn_events: Vec::new(), effect_journal: Vec::new(),
         })).unwrap();
         let later_run_id = later.await.unwrap().unwrap().run.unwrap().run_id;
@@ -5467,6 +5489,7 @@ mod handler_tests {
                     "approval audience has no live connection generation"
                 ));
                 request.response_tx.send(Err(crate::server::RunnerTurnError {
+                    kind: crate::server::RunnerTurnErrorKind::RunnerAuthored,
                     message: approval.to_string(),
                     turn_events: Vec::new(),
                     effect_journal: Vec::new(),
@@ -5542,6 +5565,7 @@ mod handler_tests {
                 }
             };
             request.response_tx.send(Err(crate::server::RunnerTurnError {
+                kind: crate::server::RunnerTurnErrorKind::RunnerAuthored,
                 message: "later prompt reached runner".into(),
                 turn_events: Vec::new(),
                 effect_journal: Vec::new(),
@@ -6932,7 +6956,7 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn failed_named_brain_turn_persists_partial_approval_lifecycle() {
+    async fn runner_authored_provider_prefix_persists_partial_approval_and_effects() {
         let temp = tempfile::tempdir().unwrap();
         let store = crate::brain::store::BrainStore::with_root(
             "box.local",
@@ -6981,7 +7005,9 @@ mod handler_tests {
             request
                 .response_tx
                 .send(Err(crate::server::RunnerTurnError {
-                    message: "provider failed after approval".into(),
+                    kind: crate::server::RunnerTurnErrorKind::RunnerAuthored,
+                    message: "provider task terminated unexpectedly: runner-authored failure"
+                        .into(),
                     turn_events: vec![
                         crate::server::RunnerTurnEvent::ApprovalRequested {
                             approval_id: "approval-1".into(),
@@ -7011,7 +7037,9 @@ mod handler_tests {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("provider failed after approval"));
+        assert!(error
+            .to_string()
+            .contains("provider task terminated unexpectedly: runner-authored failure"));
         let snapshot = store.snapshot("shared").unwrap();
         assert!(snapshot.events.iter().any(|event| matches!(
             &event.kind,
@@ -7819,6 +7847,7 @@ mod handler_tests {
             interactive
                 .response_tx
                 .send(Err(crate::server::RunnerTurnError {
+                    kind: crate::server::RunnerTurnErrorKind::RunnerAuthored,
                     message: "stop after context assertion".into(),
                     turn_events: Vec::new(),
                     effect_journal: Vec::new(),
@@ -8026,6 +8055,7 @@ mod handler_tests {
             request
                 .response_tx
                 .send(Err(crate::server::RunnerTurnError {
+                    kind: crate::server::RunnerTurnErrorKind::RunnerAuthored,
                     message: "context checked".into(),
                     turn_events: Vec::new(),
                     effect_journal: Vec::new(),

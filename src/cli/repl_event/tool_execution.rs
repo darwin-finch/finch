@@ -56,6 +56,7 @@ pub struct ToolExecutionCoordinator {
     /// Co-Forth poset — each tool call auto-pushes a trace node here.
     poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
     tasks: ToolRoundTasks,
+    cancelled_effects: Arc<Mutex<HashMap<Uuid, Vec<crate::server::RunnerEffectRecord>>>>,
 }
 
 #[derive(Clone, Default)]
@@ -277,6 +278,7 @@ impl ToolExecutionCoordinator {
             plan_content,
             poset: None,
             tasks: ToolRoundTasks::default(),
+            cancelled_effects: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -323,6 +325,7 @@ impl ToolExecutionCoordinator {
         let plan_content = Arc::clone(&self.plan_content);
         let output_manager = Arc::clone(&self.output_manager);
         let poset = self.poset.clone();
+        let cancelled_effects = Arc::clone(&self.cancelled_effects);
 
         // Build a per-tool presentation binding. Ordinary streaming tools append
         // their lines to their row; a typed VM program's portable `say` events
@@ -489,6 +492,23 @@ impl ToolExecutionCoordinator {
 
             // Tool approved (or doesn't need approval), execute it
             if cancellation_token.is_cancelled() {
+                if let Ok(Ok(tool_result)) = &result {
+                    let records =
+                        serde_json::from_str::<crate::runtime::outcome::ExecutionOutcome>(
+                            &tool_result.content,
+                        )
+                        .ok()
+                        .map(|outcome| super::query_processor::runner_effect_records(&outcome))
+                        .unwrap_or_default();
+                    if !records.is_empty() {
+                        cancelled_effects
+                            .lock()
+                            .expect("cancelled effect journal lock poisoned")
+                            .entry(query_id)
+                            .or_default()
+                            .extend(records);
+                    }
+                }
                 return;
             }
             let conversation_snapshot = tokio::select! {
@@ -609,6 +629,17 @@ impl ToolExecutionCoordinator {
 
     pub async fn close_and_wait_for_round(&self, query_id: Uuid, round_token: ToolRoundToken) {
         self.tasks.close_and_wait(query_id, round_token).await;
+    }
+
+    pub(super) fn take_cancelled_effects(
+        &self,
+        query_id: Uuid,
+    ) -> Vec<crate::server::RunnerEffectRecord> {
+        self.cancelled_effects
+            .lock()
+            .expect("cancelled effect journal lock poisoned")
+            .remove(&query_id)
+            .unwrap_or_default()
     }
 }
 

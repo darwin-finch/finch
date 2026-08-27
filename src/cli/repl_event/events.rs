@@ -38,6 +38,15 @@ pub enum ConfirmationResult {
     Deny,
 }
 
+/// Machine-readable identity for failures that cross the provider task boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryFailureKind {
+    /// An ordinary provider, parsing, or frontend failure.
+    Ordinary,
+    /// The spawned provider task itself panicked or was cancelled unexpectedly.
+    ProviderTaskTerminated,
+}
+
 /// Events that flow through the REPL event loop
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -57,6 +66,7 @@ pub enum ReplEvent {
     QueryFailed {
         query_id: Uuid,
         error: String,
+        kind: QueryFailureKind,
     },
 
     /// A tool execution completed
@@ -314,6 +324,7 @@ mod tests {
         let event = ReplEvent::QueryFailed {
             query_id: id,
             error: "network timeout".to_string(),
+            kind: QueryFailureKind::Ordinary,
         };
         match event {
             ReplEvent::QueryFailed { error, .. } => assert_eq!(error, "network timeout"),

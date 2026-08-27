@@ -1936,7 +1936,13 @@ fn decode_runner_turn_result(
             .map_err(|error| error.to_string())?,
     )?;
     if !error.is_empty() {
+        let kind = match result.get_error_kind().map_err(|error| error.to_string())? {
+            finch_ipc_capnp::BrainTurnErrorKind::RunnerAuthored => crate::server::RunnerTurnErrorKind::RunnerAuthored,
+            finch_ipc_capnp::BrainTurnErrorKind::InfrastructureProviderTaskTerminated => crate::server::RunnerTurnErrorKind::InfrastructureProviderTaskTerminated,
+            finch_ipc_capnp::BrainTurnErrorKind::RunCancelled => crate::server::RunnerTurnErrorKind::RunCancelled,
+        };
         return Err(crate::server::RunnerTurnError {
+            kind,
             message: error.to_string(),
             turn_events,
             effect_journal,
@@ -2071,6 +2077,160 @@ mod tests {
 
     struct SocketApprovalRunner {
         failed_tx: Option<tokio::sync::oneshot::Sender<String>>,
+    }
+
+    struct HeldTurnRunner {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    struct ImmediateTurnRunner;
+
+    fn successful_turn(
+        mut results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
+    ) -> capnp::Result<()> {
+        let checkpoint = crate::runtime::ProgramRuntime::new()
+            .revision_history()
+            .map_err(|error| capnp::Error::failed(error.to_string()))?
+            .pop()
+            .and_then(|revision| revision.checkpoint)
+            .ok_or_else(|| capnp::Error::failed("test runtime has no checkpoint".into()))?;
+        let mut result = results.get().init_result();
+        result.set_source("(say \"successor\")");
+        result.set_language(super::finch_ipc_capnp::ProgramLanguage::Lisp);
+        result.set_output("successor");
+        result.set_runtime_revision(0);
+        super::encode_checkpoint(result.reborrow().init_checkpoint(), &checkpoint)
+            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+        result.set_error("");
+        result.set_error_kind(super::finch_ipc_capnp::BrainTurnErrorKind::RunnerAuthored);
+        Ok(())
+    }
+
+    macro_rules! turn_only_methods {
+        () => {
+            fn run_program(&mut self, _: super::finch_ipc_capnp::brain_runner::RunProgramParams, _: super::finch_ipc_capnp::brain_runner::RunProgramResults) -> capnp::capability::Promise<(), capnp::Error> {
+                capnp::capability::Promise::err(capnp::Error::unimplemented("turn-only test runner".into()))
+            }
+            fn cancel_run(&mut self, _: super::finch_ipc_capnp::brain_runner::CancelRunParams, _: super::finch_ipc_capnp::brain_runner::CancelRunResults) -> capnp::capability::Promise<(), capnp::Error> {
+                capnp::capability::Promise::ok(())
+            }
+            fn project_memory(&mut self, _: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams, _: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults) -> capnp::capability::Promise<(), capnp::Error> {
+                capnp::capability::Promise::ok(())
+            }
+        };
+    }
+
+    impl super::finch_ipc_capnp::brain_runner::Server for HeldTurnRunner {
+        turn_only_methods!();
+        fn run_turn(&mut self, _: super::finch_ipc_capnp::brain_runner::RunTurnParams, results: super::finch_ipc_capnp::brain_runner::RunTurnResults) -> capnp::capability::Promise<(), capnp::Error> {
+            let started = self.started.take().expect("held runner called twice");
+            let release = self.release.take().expect("held runner called twice");
+            capnp::capability::Promise::from_future(async move {
+                let _ = started.send(());
+                let _ = release.await;
+                successful_turn(results)
+            })
+        }
+    }
+
+    impl super::finch_ipc_capnp::brain_runner::Server for ImmediateTurnRunner {
+        turn_only_methods!();
+        fn run_turn(&mut self, _: super::finch_ipc_capnp::brain_runner::RunTurnParams, results: super::finch_ipc_capnp::brain_runner::RunTurnResults) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::from_future(async move { successful_turn(results) })
+        }
+    }
+
+    #[test]
+    fn raw_runner_eof_fences_held_success_and_successor_completes_next_turn() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                let temp = tempfile::tempdir().unwrap();
+                let store = crate::brain::store::BrainStore::with_root("box.local", Some(temp.path().join("brains")));
+                let server = std::sync::Arc::new(crate::server::AgentServer::for_brain_protocol_test(
+                    store.clone(),
+                    crate::brain::credential::BrainCredentialAuthority::ephemeral([93; 32]),
+                    "test-password".into(),
+                    temp.path(),
+                ).unwrap());
+                async fn connect(server: std::sync::Arc<crate::server::AgentServer>) -> (crate::ipc::IpcClient, tokio::task::JoinHandle<anyhow::Result<()>>) {
+                    let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+                    let server_task = tokio::task::spawn_local(async move { super::handle_connection(server_stream, server).await });
+                    let client = crate::ipc::IpcClient::connect_test_stream(client_stream).await.unwrap();
+                    (client, server_task)
+                }
+                let (driver, driver_server) = connect(std::sync::Arc::clone(&server)).await;
+                let attachment = driver.brain_attach("shared", "driver", crate::brain::store::AttachmentRole::Driver, None).await.unwrap();
+                let mut watch = driver.brain_watch("shared", &attachment).await.unwrap();
+                watch.recv().await.unwrap().unwrap();
+
+                let (old_runner, old_server) = connect(std::sync::Arc::clone(&server)).await;
+                let environment = old_runner.brain_snapshot("shared").await.unwrap().environment;
+                old_runner.brain_claim_runner_identity("runner@box.local/raw").await.unwrap();
+                let lease = old_runner.brain_acquire_runner("shared", "runner@box.local/raw", &environment, None, 60_000).await.unwrap();
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                old_runner.register_test_brain_runner_client(
+                    "shared",
+                    lease.lease_id,
+                    capnp_rpc::new_client(HeldTurnRunner { started: Some(started_tx), release: Some(release_rx) }),
+                ).await.unwrap();
+                let first_driver = driver.clone();
+                let first_attachment = attachment.clone();
+                let first = tokio::task::spawn_local(async move {
+                    first_driver.brain_submit("shared", &first_attachment, crate::brain::store::BrainEventKind::Prompt { text: "held old response".into() }).await
+                });
+                started_rx.await.unwrap();
+                let first_run = store.snapshot("shared").unwrap().runs[0].run_id;
+                old_runner.abort_test_transport_without_frontend_cancel();
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while !old_server.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                }).await.expect("raw runner EOF did not reach the daemon");
+
+                let (successor, successor_server) = connect(std::sync::Arc::clone(&server)).await;
+                successor.brain_claim_runner_identity("runner@box.local/raw").await.unwrap();
+                let successor_lease = successor.brain_acquire_runner(
+                    "shared",
+                    "runner@box.local/raw",
+                    &environment,
+                    Some(lease.lease_id),
+                    60_000,
+                ).await.unwrap();
+                assert_eq!(successor_lease.lease_id, lease.lease_id);
+                successor.register_test_brain_runner_client("shared", successor_lease.lease_id, capnp_rpc::new_client(ImmediateTurnRunner)).await.unwrap();
+                assert!(
+                    release_tx.send(()).is_err(),
+                    "old callback still accepted a reply after raw transport loss"
+                );
+                let _ = first.await.unwrap();
+                let snapshot = store.snapshot("shared").unwrap();
+                assert_eq!(store.inspect_run("shared", first_run).unwrap().status, crate::brain::store::BrainRunStatus::Cancelled);
+                assert!(snapshot.events.iter().all(|event| event.run_id != Some(first_run) || !matches!(&event.kind,
+                    crate::brain::store::BrainEventKind::Program { .. }
+                    | crate::brain::store::BrainEventKind::RuntimeCommitted { .. }
+                    | crate::brain::store::BrainEventKind::EffectRecorded { .. }
+                    | crate::brain::store::BrainEventKind::Result { .. }
+                )));
+                assert_eq!(snapshot.events.iter().filter(|event| {
+                    matches!(&event.kind, crate::brain::store::BrainEventKind::RunStatusChanged {
+                        run_id,
+                        status,
+                        ..
+                    } if *run_id == first_run && status.is_terminal())
+                }).count(), 1);
+                driver.brain_submit("shared", &attachment, crate::brain::store::BrainEventKind::Prompt { text: "successor turn".into() }).await.unwrap();
+                assert!(store.snapshot("shared").unwrap().runs.iter().any(|run| run.run_id != first_run && run.status == crate::brain::store::BrainRunStatus::Completed));
+                drop(successor);
+                drop(driver);
+                old_server.abort();
+                successor_server.abort();
+                driver_server.abort();
+            }).await.expect("raw EOF successor race exceeded its bounded deadline");
+        }));
     }
 
     impl super::finch_ipc_capnp::brain_runner::Server for SocketApprovalRunner {
@@ -2622,6 +2782,7 @@ mod tests {
             let mut result =
                 message.init_root::<super::finch_ipc_capnp::brain_turn_result::Builder>();
             result.set_error("provider failed after approval");
+            result.set_error_kind(super::finch_ipc_capnp::BrainTurnErrorKind::InfrastructureProviderTaskTerminated);
             super::super::checkpoint_codec::encode_effect_record(
                 result.reborrow().init_effect_journal(1).get(0),
                 expected_effect.execution_id,
@@ -2643,6 +2804,7 @@ mod tests {
             .get_root_as_reader::<super::finch_ipc_capnp::brain_turn_result::Reader>()
             .unwrap();
         let error = decode_runner_turn_result(Ok(reader)).unwrap_err();
+        assert_eq!(error.kind, crate::server::RunnerTurnErrorKind::InfrastructureProviderTaskTerminated);
         assert_eq!(error.message, "provider failed after approval");
         assert_eq!(
             error.turn_events,

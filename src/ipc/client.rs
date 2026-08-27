@@ -145,6 +145,12 @@ impl IpcClient {
         Self::connect_stream(stream).await
     }
 
+    #[cfg(test)]
+    pub(crate) fn abort_test_transport_without_frontend_cancel(&self) {
+        self._rpc_handle.active_brain_turns.borrow_mut().clear();
+        self._rpc_handle.handle.abort();
+    }
+
     async fn connect_stream(stream: tokio::net::UnixStream) -> Result<Self> {
         let (reader, writer) = stream.into_split();
         let network = twoparty::VatNetwork::new(
@@ -1242,8 +1248,16 @@ impl brain_runner::Server for BrainRunnerImpl {
                         result.set_commit_ack(client);
                     }
                     result.set_error("");
+                    result.set_error_kind(finch_ipc_capnp::BrainTurnErrorKind::RunnerAuthored);
                 }
-                Err(error) => result.set_error(&error.message),
+                Err(error) => {
+                    result.set_error(&error.message);
+                    result.set_error_kind(match error.kind {
+                        crate::server::RunnerTurnErrorKind::RunnerAuthored => finch_ipc_capnp::BrainTurnErrorKind::RunnerAuthored,
+                        crate::server::RunnerTurnErrorKind::InfrastructureProviderTaskTerminated => finch_ipc_capnp::BrainTurnErrorKind::InfrastructureProviderTaskTerminated,
+                        crate::server::RunnerTurnErrorKind::RunCancelled => finch_ipc_capnp::BrainTurnErrorKind::RunCancelled,
+                    });
+                }
             }
             Ok(())
         })

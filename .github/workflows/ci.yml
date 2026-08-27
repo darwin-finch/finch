@@ -127,6 +127,8 @@ jobs:
         set -euo pipefail
         cargo test --lib server::brain_runner::tests:: -- --nocapture
         cargo test --lib server::handlers::handler_tests::dropped_named_turn_callback_terminalizes_the_exact_run_once -- --nocapture
+        cargo test --lib server::handlers::handler_tests::runner_authored_provider_prefix_persists_partial_approval_and_effects -- --nocapture
+        cargo test --lib ipc::server::tests::raw_runner_eof_fences_held_success_and_successor_completes_next_turn -- --nocapture
         cargo test --lib cli::repl_event::event_loop::tests::real_event_and_llm_loops_admit_one_immediate_tool_continuation_after_retirement -- --nocapture
         cargo test --lib cli::repl_event::event_loop::tests::continuation_is_sent_exactly_once_for_one_complete_validated_round -- --nocapture
         cargo test --lib cli::repl_event::event_loop::tests::continuation_exit_ -- --nocapture

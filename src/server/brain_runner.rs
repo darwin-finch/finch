@@ -180,14 +180,23 @@ impl RunnerTurnCommitAck {
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{message}")]
 pub struct RunnerTurnError {
+    pub kind: RunnerTurnErrorKind,
     pub message: String,
     pub turn_events: Vec<RunnerTurnEvent>,
     pub effect_journal: Vec<RunnerEffectRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerTurnErrorKind {
+    RunnerAuthored,
+    InfrastructureProviderTaskTerminated,
+    RunCancelled,
+}
+
 impl From<String> for RunnerTurnError {
     fn from(message: String) -> Self {
         Self {
+            kind: RunnerTurnErrorKind::RunnerAuthored,
             message,
             turn_events: Vec::new(),
             effect_journal: Vec::new(),

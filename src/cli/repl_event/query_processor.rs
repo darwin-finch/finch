@@ -1093,6 +1093,7 @@ pub(crate) async fn process_query_with_tools(
                             let _ = event_tx.send(ReplEvent::QueryFailed {
                                 query_id,
                                 error: format!("{}", e),
+                                kind: super::QueryFailureKind::Ordinary,
                             });
                             return;
                         }
@@ -1169,6 +1170,7 @@ pub(crate) async fn process_query_with_tools(
                             let _ = event_tx.send(ReplEvent::QueryFailed {
                                 query_id,
                                 error: format!("Could not stage tool round: {error}"),
+                                kind: super::QueryFailureKind::Ordinary,
                             });
                             return;
                         }
@@ -1400,6 +1402,7 @@ pub(crate) async fn process_query_with_tools(
                         let _ = event_tx.send(ReplEvent::QueryFailed {
                             query_id,
                             error: format!("Could not stage tool round: {error}"),
+                            kind: super::QueryFailureKind::Ordinary,
                         });
                         return;
                     }
@@ -1545,6 +1548,7 @@ pub(crate) async fn process_query_with_tools(
             let _ = event_tx.send(ReplEvent::QueryFailed {
                 query_id,
                 error: format!("{}", e),
+                kind: super::QueryFailureKind::Ordinary,
             });
         }
     }

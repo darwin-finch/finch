@@ -380,6 +380,7 @@ impl LlmLoop {
                 let _ = terminal_event_tx.send(ReplEvent::QueryFailed {
                     query_id,
                     error: format!("provider task terminated unexpectedly: {error}"),
+                    kind: super::QueryFailureKind::ProviderTaskTerminated,
                 });
             }
             #[cfg(test)]

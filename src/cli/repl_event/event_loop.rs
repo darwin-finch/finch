@@ -39,7 +39,7 @@ use crate::router::Router;
 use crate::tools::executor::ToolExecutor;
 use crate::tools::types::ToolDefinition;
 
-use super::events::{LlmRequest, ReplEvent, RunnerReconnectTarget};
+use super::events::{LlmRequest, QueryFailureKind, ReplEvent, RunnerReconnectTarget};
 use super::llm_loop::LlmLoop;
 use super::model_selection::{activate_local_when_ready, LocalActivationOutcome, ModelSelection};
 use super::query_processor::{refresh_context_strip, ActiveToolUsesMap};
@@ -691,6 +691,7 @@ fn publish_cancelled_named_brain_turn(cancelled: CancelledNamedBrainTurn) {
     let _ = cancelled
         .response_tx
         .send(Err(crate::server::RunnerTurnError {
+            kind: crate::server::RunnerTurnErrorKind::RunCancelled,
             message: "named Brain run cancelled".into(),
             turn_events: cancelled.turn_events,
             effect_journal: cancelled.effect_journal,
@@ -1340,6 +1341,7 @@ fn assemble_named_brain_turn(
         })
     })()
     .map_err(|error| crate::server::RunnerTurnError {
+        kind: crate::server::RunnerTurnErrorKind::RunnerAuthored,
         message: error.to_string(),
         turn_events,
         effect_journal,
@@ -3969,7 +3971,11 @@ Rules:\n\
                 self.output_manager.write_response(&response);
             }
 
-            ReplEvent::QueryFailed { query_id, error } => {
+            ReplEvent::QueryFailed {
+                query_id,
+                error,
+                kind,
+            } => {
                 if !self.query_states.fail_query(query_id, error.clone()).await {
                     tracing::debug!("Ignoring failure without terminal authority for {query_id}");
                     return Ok(());
@@ -4007,6 +4013,12 @@ Rules:\n\
                     let _ = pending
                         .response_tx
                         .send(Err(crate::server::RunnerTurnError {
+                            kind: match kind {
+                                QueryFailureKind::Ordinary => {
+                                    crate::server::RunnerTurnErrorKind::RunnerAuthored
+                                }
+                                QueryFailureKind::ProviderTaskTerminated => crate::server::RunnerTurnErrorKind::InfrastructureProviderTaskTerminated,
+                            },
                             message: error.clone(),
                             turn_events: pending.turn_events,
                             effect_journal: pending.effect_journal,
@@ -4944,6 +4956,7 @@ Rules:\n\
             let _ = request
                 .response_tx
                 .send(Err(crate::server::RunnerTurnError {
+                    kind: crate::server::RunnerTurnErrorKind::RunnerAuthored,
                     message: format!(
                         "frontend does not hold the runner lease for named Brain '{}'",
                         request.brain
@@ -4957,6 +4970,7 @@ Rules:\n\
             let _ = request
                 .response_tx
                 .send(Err(crate::server::RunnerTurnError {
+                    kind: crate::server::RunnerTurnErrorKind::RunnerAuthored,
                     message: format!(
                         "named Brain '{}' runner is already executing a turn",
                         request.brain
@@ -5043,6 +5057,7 @@ Rules:\n\
                 let _ = pending
                     .response_tx
                     .send(Err(crate::server::RunnerTurnError {
+                        kind: crate::server::RunnerTurnErrorKind::RunnerAuthored,
                         message: "frontend LLM worker is unavailable".to_string(),
                         turn_events: pending.turn_events,
                         effect_journal: pending.effect_journal,
@@ -5183,6 +5198,10 @@ Rules:\n\
             tracing::warn!("Detached slow cancelled provider task {query_id}");
             self.query_states.detach_provider_task(query_id).await;
         }
+        let completed_effects = self.tool_coordinator.take_cancelled_effects(query_id);
+        if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
+            turn.effect_journal.extend(completed_effects);
+        }
     }
 
     async fn project_named_brain_memory(
@@ -5265,6 +5284,7 @@ Rules:\n\
             .restore_snapshot(local_conversation_snapshot);
         if cancellation_requested {
             let _ = response_tx.send(Err(crate::server::RunnerTurnError {
+                kind: crate::server::RunnerTurnErrorKind::RunCancelled,
                 message: "named Brain run cancelled".into(),
                 turn_events,
                 effect_journal,
@@ -6990,6 +7010,7 @@ Rules:\n\
                     let _ = self.event_tx.send(ReplEvent::QueryFailed {
                         query_id,
                         error: "frontend LLM worker is unavailable".into(),
+                        kind: QueryFailureKind::Ordinary,
                     });
                     return Ok(());
                 }
@@ -7001,6 +7022,7 @@ Rules:\n\
                     let _ = self.event_tx.send(ReplEvent::QueryFailed {
                         query_id,
                         error: "frontend LLM worker stopped before continuation admission".into(),
+                        kind: QueryFailureKind::Ordinary,
                     });
                     return Ok(());
                 }
@@ -7020,6 +7042,7 @@ Rules:\n\
                     let _ = self.event_tx.send(ReplEvent::QueryFailed {
                         query_id,
                         error: "frontend LLM worker stopped before continuation spawn".into(),
+                        kind: QueryFailureKind::Ordinary,
                     });
                 }
                 return Ok(());
@@ -7039,6 +7062,7 @@ Rules:\n\
                 let _ = self.event_tx.send(ReplEvent::QueryFailed {
                     query_id,
                     error: error.to_string(),
+                    kind: QueryFailureKind::Ordinary,
                 });
             }
             return Ok(());
@@ -8778,6 +8802,44 @@ mod tests {
                 barrier.started.notify_one();
                 barrier.release.notified().await;
                 barrier.returned.notify_one();
+                let execution_id = uuid::Uuid::new_v4();
+                let effect = crate::vm::VmSideEffect {
+                    protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                    sequence: 0,
+                    requirement: crate::vm::CapabilityRequirement {
+                        capability: crate::vm::CapabilityKind::SessionEmit,
+                        selector: crate::vm::ResourceSelector::None,
+                    },
+                    event: crate::vm::HostSideEffect::Emit {
+                        text: "completed once".into(),
+                    },
+                    output: Vec::new(),
+                    origin: crate::vm::SourceOrigin::generated("cancelled-tool-test"),
+                };
+                let outcome = crate::runtime::outcome::ExecutionOutcome {
+                    execution_id,
+                    status: crate::runtime::outcome::ExecutionStatus::Completed,
+                    values: Vec::new(),
+                    output: "hello".into(),
+                    output_chunks: Vec::new(),
+                    side_effects: vec![effect.event.clone()],
+                    vm_side_effects: vec![effect.clone()],
+                    effect_journal: vec![crate::vm::EffectJournalEntry {
+                        effect,
+                        state: crate::vm::EffectJournalState::Acknowledged { values: Vec::new() },
+                    }],
+                    diagnostics: Vec::new(),
+                    vm_diagnostics: Vec::new(),
+                    inferred_capabilities: Vec::new(),
+                    required_capabilities: Vec::new(),
+                    approval_prompts: Vec::new(),
+                    input_revision: 0,
+                    output_revision: 0,
+                    effect: crate::programs::ExecutionEffect::ExternalWrite,
+                    backend: crate::runtime::outcome::ExecutionBackend::TypedVm,
+                    elapsed_ms: 0,
+                };
+                return serde_json::to_string(&outcome).map_err(anyhow::Error::from);
             }
             Ok(input["text"].as_str().unwrap_or_default().to_string())
         }
@@ -9994,9 +10056,19 @@ mod tests {
                 phase.store(PHYSICAL_TOOL_START_CUT, Ordering::SeqCst);
                 barrier.started.notified().await;
 
+                let release = Arc::clone(&barrier);
+                let query_states = Arc::clone(&harness.event_loop.query_states);
+                tokio::spawn(async move {
+                    while !matches!(
+                        query_states.get_state(query_id).await,
+                        Some(super::QueryState::Cancelled)
+                    ) {
+                        tokio::task::yield_now().await;
+                    }
+                    release.release.notify_one();
+                });
                 harness.disconnect_and_drive_cancel(submit).await;
                 harness.assert_restored_and_lease_preserved(query_id).await;
-                barrier.release.notify_one();
                 tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     barrier.returned.notified(),
@@ -10027,6 +10099,23 @@ mod tests {
                         .unwrap(),
                     serde_json::to_value(&harness.local_snapshot).unwrap()
                 );
+                let durable = harness.server.brain_store().snapshot("shared").unwrap();
+                assert_eq!(
+                    durable
+                        .events
+                        .iter()
+                        .filter(|event| matches!(
+                            &event.kind,
+                            crate::brain::store::BrainEventKind::EffectRecorded { .. }
+                        ))
+                        .count(),
+                    1,
+                    "a physically completed execute-once effect must be audited exactly once"
+                );
+                assert!(durable.events.iter().all(|event| !matches!(
+                    &event.kind,
+                    crate::brain::store::BrainEventKind::ToolResult { .. }
+                )));
                 harness.assert_next_local_query_succeeds().await;
                 harness.worker.abort();
                 harness.server_task.abort();
