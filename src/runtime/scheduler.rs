@@ -1704,6 +1704,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_spawn_reenters_authority_to_snapshot_grants_without_deadlock() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        grant_agent_capabilities(&runtime);
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(EchoGenerator)),
+            Arc::clone(&runtime),
+        );
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            runtime.submit(crate::runtime::ProgramSubmission {
+                language: crate::programs::ProgramLanguage::Lisp,
+                source_id: None,
+                source: "(agent-spawn \"snapshot ambient grants\")".into(),
+                intent: "regress reentrant AgentSpawn authority".into(),
+                effect: crate::programs::ExecutionEffect::VmWrite,
+                declared_capabilities: Vec::new(),
+                manifest_generation: runtime.manifest_generation(),
+                expected_revision: None,
+                budget: None,
+            }),
+        )
+        .await
+        .expect("AgentSpawn deadlocked while re-entering the authority ledger")
+        .unwrap();
+
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Completed,
+            "{:?}",
+            outcome.diagnostics
+        );
+        assert_eq!(scheduler.tasks.read().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn forth_can_fork_and_join_without_shelling_out() {
         let runtime = Arc::new(ProgramRuntime::new());
         grant_agent_capabilities(&runtime);
