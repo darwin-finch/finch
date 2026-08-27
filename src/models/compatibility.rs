@@ -383,6 +383,7 @@ pub fn get_notes(family: ModelFamily) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_all_families_support_coreml() {
         // All ONNX models should work with CoreML execution provider
@@ -522,26 +523,36 @@ mod tests {
 
     #[test]
     fn test_is_compatible() {
-        // All families should be compatible with CoreML and CPU
-        assert!(is_compatible(ModelFamily::Qwen2, ExecutionTarget::CoreML));
+        // All families should be compatible with CPU
         assert!(is_compatible(ModelFamily::Qwen2, ExecutionTarget::Cpu));
-        assert!(is_compatible(ModelFamily::Mistral, ExecutionTarget::CoreML));
-        assert!(is_compatible(
-            ModelFamily::DeepSeek,
-            ExecutionTarget::CoreML
-        ));
+        assert!(is_compatible(ModelFamily::Mistral, ExecutionTarget::Cpu));
+        assert!(is_compatible(ModelFamily::DeepSeek, ExecutionTarget::Cpu));
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(is_compatible(ModelFamily::Qwen2, ExecutionTarget::CoreML));
+            assert!(is_compatible(ModelFamily::Mistral, ExecutionTarget::CoreML));
+            assert!(is_compatible(
+                ModelFamily::DeepSeek,
+                ExecutionTarget::CoreML
+            ));
+        }
     }
 
     #[test]
     fn test_get_compatible_families() {
-        let coreml_families = get_compatible_families(ExecutionTarget::CoreML);
-        assert!(coreml_families.contains(&ModelFamily::Qwen2));
-        assert!(coreml_families.contains(&ModelFamily::Mistral));
-        assert!(coreml_families.contains(&ModelFamily::DeepSeek));
-
         let cpu_families = get_compatible_families(ExecutionTarget::Cpu);
         assert!(cpu_families.contains(&ModelFamily::Qwen2));
         assert!(cpu_families.contains(&ModelFamily::Mistral));
+        assert!(cpu_families.contains(&ModelFamily::DeepSeek));
+
+        #[cfg(target_os = "macos")]
+        {
+            let coreml_families = get_compatible_families(ExecutionTarget::CoreML);
+            assert!(coreml_families.contains(&ModelFamily::Qwen2));
+            assert!(coreml_families.contains(&ModelFamily::Mistral));
+            assert!(coreml_families.contains(&ModelFamily::DeepSeek));
+        }
     }
 
     #[test]
