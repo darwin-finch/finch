@@ -1,0 +1,56 @@
+name: Issue 72 Capability Contract
+
+on:
+  push:
+    branches:
+      - codex/issue-72-capability-core
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-72-capability-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  capability-contract:
+    name: Capability contract and provider boundary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y capnproto pkg-config libssl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo inputs and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: issue-72-${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            issue-72-${{ runner.os }}-cargo-
+
+      - name: Check all library, binary, and test targets
+        run: cargo check --lib --bins --tests
+
+      - name: Run provider capability and boundary tests
+        run: cargo test --lib providers::
+
+      - name: Prove validated request tokens cannot be forged
+        run: cargo test --doc -- ValidatedProviderRequest
