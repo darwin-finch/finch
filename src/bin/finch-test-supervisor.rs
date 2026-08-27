@@ -686,7 +686,7 @@ fn run_child_panic_probe() -> ! {
     if let Some(path) = std::env::var_os("FINCH_TEST_PANIC_HOME_FILE") {
         fs::write(
             path,
-            std::env::var_os("HOME").expect("panic probe requires HOME"),
+            std::env::var("HOME").expect("panic probe requires HOME"),
         )
         .expect("panic probe HOME must be recorded");
     }
