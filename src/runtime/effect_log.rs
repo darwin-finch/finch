@@ -4,7 +4,7 @@ use crate::runtime::VmEffectEnvelope;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -283,6 +283,12 @@ impl EffectAuditTransition {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EffectAuditReducer {
     entries: BTreeMap<EffectAuditIdentity, EffectAuditEntry>,
+    active_by_run: HashMap<Uuid, usize>,
+    active_count: usize,
+    active_bytes: usize,
+    total_count: usize,
+    replay_fence_count: usize,
+    detailed_terminal_order: VecDeque<EffectAuditIdentity>,
 }
 
 impl EffectAuditReducer {
@@ -295,25 +301,73 @@ impl EffectAuditReducer {
     }
 
     pub fn active_for_run(&self, run_id: Uuid) -> usize {
-        self.entries
-            .values()
-            .filter(|entry| entry.intent.identity.run_id == run_id && !entry.state.is_terminal())
-            .count()
+        self.active_by_run.get(&run_id).copied().unwrap_or(0)
     }
 
     pub fn active_count(&self) -> usize {
-        self.entries
-            .values()
-            .filter(|entry| !entry.state.is_terminal())
-            .count()
+        self.active_count
     }
 
     pub fn active_bytes(&self) -> usize {
-        self.entries
-            .values()
-            .filter(|entry| !entry.state.is_terminal())
-            .map(|entry| entry.intent.payload_bytes)
-            .sum()
+        self.active_bytes
+    }
+
+    pub fn total_count(&self) -> usize {
+        self.total_count
+    }
+
+    pub fn replay_fence_count(&self) -> usize {
+        self.replay_fence_count
+    }
+
+    /// Oldest detailed terminal identities beyond the retained observer tail.
+    /// This queue is maintained as transitions apply, avoiding a scan and sort
+    /// of the complete Brain event history during compaction.
+    pub(crate) fn terminal_compaction_candidates(
+        &self,
+        retained_limit: usize,
+    ) -> Vec<EffectAuditIdentity> {
+        self.detailed_terminal_order
+            .iter()
+            .take(self.detailed_terminal_order.len().saturating_sub(retained_limit))
+            .copied()
+            .collect()
+    }
+
+    /// Validate one transition without cloning the complete replay index.
+    /// The preview contains only the targeted entry plus copied scalar/index
+    /// counters, so persistence callers remain O(log N) in mature Brains.
+    pub fn validate(&self, transition: &EffectAuditTransition) -> Result<bool> {
+        let identity = transition.identity();
+        let mut entries = BTreeMap::new();
+        if let Some(entry) = self.entries.get(&identity) {
+            entries.insert(identity, entry.clone());
+        }
+        let mut active_by_run = HashMap::new();
+        if let Some(active) = self.active_by_run.get(&identity.run_id) {
+            active_by_run.insert(identity.run_id, *active);
+        }
+        let mut preview = Self {
+            entries,
+            active_by_run,
+            active_count: self.active_count,
+            active_bytes: self.active_bytes,
+            total_count: self.total_count,
+            replay_fence_count: self.replay_fence_count,
+            detailed_terminal_order: VecDeque::new(),
+        };
+        preview.apply(transition.clone())
+    }
+
+    fn mark_terminal(&mut self, run_id: Uuid, payload_bytes: usize) {
+        if let Some(active) = self.active_by_run.get_mut(&run_id) {
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                self.active_by_run.remove(&run_id);
+            }
+        }
+        self.active_count = self.active_count.saturating_sub(1);
+        self.active_bytes = self.active_bytes.saturating_sub(payload_bytes);
     }
 
     /// Replace a detailed terminal projection with its permanent fixed-size
@@ -339,6 +393,12 @@ impl EffectAuditReducer {
             },
         };
         entry.intent = entry.intent.tombstone_projection();
+        if self.detailed_terminal_order.front() == Some(identity) {
+            self.detailed_terminal_order.pop_front();
+        } else {
+            self.detailed_terminal_order.retain(|candidate| candidate != identity);
+        }
+        self.replay_fence_count += 1;
         Ok(())
     }
 
@@ -385,7 +445,7 @@ impl EffectAuditReducer {
                         "conflicting effect audit reservation for {identity:?}");
                     return Ok(false);
                 }
-                anyhow::ensure!(self.entries.len() < MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN,
+                anyhow::ensure!(self.total_count < MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN,
                     "effect audit replay index exhausted; archive this Brain before admitting more host effects");
                 anyhow::ensure!(
                     self.active_for_run(identity.run_id) < MAX_ACTIVE_EFFECT_AUDITS_PER_RUN,
@@ -401,6 +461,7 @@ impl EffectAuditReducer {
                         <= MAX_ACTIVE_EFFECT_AUDIT_BYTES_PER_BRAIN,
                     "effect audit Brain-wide active-byte quota exceeded"
                 );
+                let payload_bytes = intent.payload_bytes;
                 self.entries.insert(
                     identity,
                     EffectAuditEntry {
@@ -409,6 +470,10 @@ impl EffectAuditReducer {
                         state: EffectAuditState::IntentAccepted,
                     },
                 );
+                *self.active_by_run.entry(identity.run_id).or_insert(0) += 1;
+                self.active_count += 1;
+                self.active_bytes += payload_bytes;
+                self.total_count += 1;
                 Ok(true)
             }
             EffectAuditTransition::Begin {
@@ -443,15 +508,16 @@ impl EffectAuditReducer {
                     serde_json::to_vec(&outcome)?.len() <= MAX_EFFECT_AUDIT_OUTCOME_BYTES,
                     "effect audit outcome exceeds the bounded payload limit"
                 );
-                let entry = self
-                    .entries
-                    .get_mut(&identity)
-                    .context("cannot finish a host effect without a durable audit reservation")?;
-                anyhow::ensure!(
-                    entry.authority.authority_id == authority_id,
-                    "effect audit authority mismatch"
-                );
-                match &entry.state {
+                let payload_bytes = {
+                    let entry = self
+                        .entries
+                        .get_mut(&identity)
+                        .context("cannot finish a host effect without a durable audit reservation")?;
+                    anyhow::ensure!(
+                        entry.authority.authority_id == authority_id,
+                        "effect audit authority mismatch"
+                    );
+                    match &entry.state {
                     EffectAuditState::IntentAccepted => {
                         anyhow::ensure!(
                             matches!(
@@ -464,14 +530,14 @@ impl EffectAuditReducer {
                             "a host outcome cannot be recorded before durable begin"
                         );
                         entry.state = EffectAuditState::Terminal { outcome };
-                        Ok(true)
+                        entry.intent.payload_bytes
                     }
                     EffectAuditState::AwaitingHostResult => {
                         anyhow::ensure!(!matches!(outcome,
                                 EffectAuditTerminalOutcome::Redacted { .. }),
                             "observer-redacted outcome cannot enter the canonical audit log");
                         entry.state = EffectAuditState::Terminal { outcome };
-                        Ok(true)
+                        entry.intent.payload_bytes
                     }
                     EffectAuditState::Terminal { outcome: existing } => {
                         let matches = match existing {
@@ -481,9 +547,17 @@ impl EffectAuditReducer {
                             _ => existing == &outcome,
                         };
                         anyhow::ensure!(matches, "conflicting terminal effect audit outcome");
-                        Ok(false)
+                        return Ok(false);
                     }
+                }};
+                self.mark_terminal(identity.run_id, payload_bytes);
+                if !matches!(self.entries.get(&identity).map(|entry| &entry.state),
+                        Some(EffectAuditState::Terminal {
+                            outcome: EffectAuditTerminalOutcome::Compacted { .. }
+                        })) {
+                    self.detailed_terminal_order.push_back(identity);
                 }
+                Ok(true)
             }
             EffectAuditTransition::Fence {
                 identity,
@@ -519,7 +593,7 @@ impl EffectAuditReducer {
                         "effect audit replay fence conflicts with existing state");
                     return Ok(false);
                 }
-                anyhow::ensure!(self.entries.len() < MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN,
+                anyhow::ensure!(self.total_count < MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN,
                     "effect audit replay index exhausted; archive this Brain before admitting more host effects");
                 self.entries.insert(identity, EffectAuditEntry {
                     intent: EffectAuditIntent {
@@ -545,6 +619,8 @@ impl EffectAuditReducer {
                         },
                     },
                 });
+                self.total_count += 1;
+                self.replay_fence_count += 1;
                 Ok(true)
             }
         }
