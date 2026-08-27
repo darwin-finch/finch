@@ -582,3 +582,161 @@ fn epoch_stats(path: &Path) -> Result<(u64, u64, u64)> {
         )
         .with_context(|| format!("inspect {}", path.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fence(brain_id: uuid::Uuid, index: u64) -> EffectAuditTransition {
+        EffectAuditTransition::Fence {
+            identity: EffectAuditIdentity {
+                brain_id,
+                run_id: uuid::Uuid::from_u128(2),
+                request_seq: 3,
+                execution_id: uuid::Uuid::from_u128(index as u128 + 10),
+                effect_sequence: index,
+            },
+            intent_sha256: format!("{index:064x}"),
+            intent_bytes: 1,
+            authority_id: uuid::Uuid::from_u128(4),
+            authority_sha256: "a".repeat(64),
+            outcome_kind: "abandoned_not_applied".into(),
+            outcome_sha256: "b".repeat(64),
+        }
+    }
+
+    #[test]
+    fn replay_archive_rolls_past_32768_without_resetting_identity_fences() {
+        let temporary = tempfile::tempdir().unwrap();
+        let brain_id = uuid::Uuid::new_v4();
+        let mut archive = EffectAuditReplayArchive::open(temporary.path(), brain_id).unwrap();
+        let active_path = archive.directory.join(&archive.manifest.epochs[0].file);
+        let mut connection = open_epoch(&active_path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        for index in 0..MAX_REPLAY_EPOCH_RECORDS {
+            let transition = fence(brain_id, index);
+            let encoded = serde_json::to_vec(&transition).unwrap();
+            let encoded_len = encoded.len();
+            transaction
+                .execute(
+                    "INSERT INTO fences(identity, seq, transition_json, encoded_bytes)
+                 VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        identity_key(&transition.identity()).unwrap(),
+                        index as i64 + 1,
+                        encoded,
+                        encoded_len as i64
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        let (count, bytes, max_seq) = epoch_stats(&active_path).unwrap();
+        archive.manifest.epochs[0].record_count = count;
+        archive.manifest.epochs[0].encoded_bytes = bytes;
+        archive.manifest.epochs[0].max_seq = max_seq;
+        archive.persist_manifest().unwrap();
+
+        let old = fence(brain_id, 0);
+        let next = fence(brain_id, MAX_REPLAY_EPOCH_RECORDS);
+        assert!(!archive.append_fence(1, &old, 0).unwrap());
+        assert!(archive
+            .append_fence(MAX_REPLAY_EPOCH_RECORDS + 1, &next, 0)
+            .unwrap());
+        assert_eq!(archive.manifest.epochs.len(), 2);
+        assert_eq!(archive.lookup(&old.identity()).unwrap(), Some(old));
+        assert_eq!(
+            archive.lookup(&next.identity()).unwrap(),
+            Some(next.clone())
+        );
+
+        let mut conflict = next;
+        let EffectAuditTransition::Fence { outcome_sha256, .. } = &mut conflict else {
+            unreachable!();
+        };
+        *outcome_sha256 = "c".repeat(64);
+        assert!(archive
+            .append_fence(MAX_REPLAY_EPOCH_RECORDS + 2, &conflict, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting"));
+
+        drop(archive);
+        let reopened = EffectAuditReplayArchive::open(temporary.path(), brain_id).unwrap();
+        assert_eq!(reopened.lookup(&old.identity()).unwrap(), Some(old));
+    }
+
+    #[test]
+    fn replay_manifest_rejects_reordered_duplicate_and_missing_epochs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let brain_id = uuid::Uuid::new_v4();
+        let archive = EffectAuditReplayArchive::open(temporary.path(), brain_id).unwrap();
+        let mut invalid = archive.manifest.clone();
+        invalid.epochs.push(invalid.epochs[0].clone());
+        invalid.active_epoch = 1;
+        std::fs::write(
+            &archive.manifest_path,
+            serde_json::to_vec(&invalid).unwrap(),
+        )
+        .unwrap();
+        assert!(EffectAuditReplayArchive::open(temporary.path(), brain_id)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("missing, duplicated, or reordered"));
+
+        archive.persist_manifest().unwrap();
+        let next_path = archive.directory.join(epoch_file_name(1));
+        initialize_epoch(&next_path).unwrap();
+        let mut missing = archive.manifest.clone();
+        missing.epochs[0].sealed = true;
+        missing.active_epoch = 1;
+        missing.epochs.push(ReplayEpoch {
+            generation: 1,
+            file: epoch_file_name(1),
+            sealed: false,
+            record_count: 0,
+            encoded_bytes: 0,
+            max_seq: 0,
+        });
+        let missing_archive = EffectAuditReplayArchive {
+            directory: archive.directory.clone(),
+            manifest_path: archive.manifest_path.clone(),
+            manifest: missing,
+        };
+        missing_archive.persist_manifest().unwrap();
+        std::fs::remove_file(archive.directory.join(&archive.manifest.epochs[0].file)).unwrap();
+        assert!(EffectAuditReplayArchive::open(temporary.path(), brain_id).is_err());
+    }
+
+    #[test]
+    fn active_journal_exact_append_is_idempotent_and_conflict_fails_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let journal = EffectAuditActiveJournal::open(temporary.path()).unwrap();
+        let transition = fence(uuid::Uuid::new_v4(), 1);
+        journal.append(7, &transition).unwrap();
+        journal.append(7, &transition).unwrap();
+        assert_eq!(journal.load().unwrap(), vec![(7, transition.clone())]);
+        assert!(journal
+            .append(7, &fence(uuid::Uuid::new_v4(), 2))
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_archive_rejects_symlinked_storage_paths() {
+        use std::os::unix::fs::symlink;
+        let temporary = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        symlink(target.path(), temporary.path().join("effect-audit-replay")).unwrap();
+        assert!(
+            EffectAuditReplayArchive::open(temporary.path(), uuid::Uuid::new_v4())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("symbolic link")
+        );
+    }
+}

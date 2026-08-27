@@ -4945,9 +4945,7 @@ impl BrainStore {
                 let terminal_seq = self.with_effect_audit_storage_mut(
                     name, brain_id,
                     |storage| storage.active.last_seq_for(&identity),
-                )?.flatten().context(
-                    "terminal effect audit has no canonical active-segment sequence",
-                )?;
+                )?.flatten().unwrap_or(state.revision);
                 self.archive_terminal_effect_audit_locked(
                     name, &mut state, terminal_seq, identity,
                 )?;
@@ -10066,11 +10064,15 @@ mod tests {
             },
         ).unwrap();
         let snapshot = store.snapshot("shared").unwrap();
-        assert!(matches!(snapshot.effect_audits[0].state,
-            crate::runtime::effect_log::EffectAuditState::Terminal {
-                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
-                    ref outcome_kind
-                }
+        assert!(snapshot.effect_audits.is_empty(),
+            "terminal replay authority stays out of ordinary snapshots");
+        let fence = store.with_effect_audit_storage_mut(
+            "shared", snapshot.brain_id,
+            |storage| storage.replay.lookup(&identity),
+        ).unwrap().flatten().unwrap();
+        assert!(matches!(fence,
+            crate::runtime::effect_log::EffectAuditTransition::Fence {
+                ref outcome_kind, ..
             } if outcome_kind == "acknowledged"));
         assert!(!snapshot.events.iter().any(|event|
             matches!(event.kind, BrainEventKind::ToolResult { .. })));
@@ -10180,7 +10182,7 @@ mod tests {
     }
 
     #[test]
-    fn effect_audit_compaction_bounds_terminal_history_but_never_unresolved_state() {
+    fn effect_audit_epochs_bound_active_history_and_fence_replay_after_restart() {
         let temp = tempfile::tempdir().unwrap();
         let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let (_run, _lease, grant) = audit_run_fixture(&store);
@@ -10203,86 +10205,35 @@ mod tests {
         let unresolved = store.reserve_effect_audit(
             &grant, uuid::Uuid::new_v4(), audit_effect(3, "unresolved"),
         ).unwrap();
-        {
-            let mut brains = store.brains.write().unwrap();
-            let state = brains.get_mut("shared").unwrap();
-            store.compact_terminal_effect_audits_locked("shared", state, 1).unwrap();
-        }
         let snapshot = store.snapshot("shared").unwrap();
-        assert_eq!(snapshot.effect_audits.iter().filter(|entry| matches!(entry.state,
-            crate::runtime::effect_log::EffectAuditState::Terminal {
-                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Compacted { .. }
-            })).count(), 2);
-        assert_eq!(snapshot.effect_audits.len(), 4,
-            "compaction retains bounded replay fences instead of forgetting identities");
-        let compacted = snapshot.effect_audits.iter().filter(|entry| matches!(entry.state,
-            crate::runtime::effect_log::EffectAuditState::Terminal {
-                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Compacted { .. }
-            })).collect::<Vec<_>>();
-        assert!(compacted.iter().all(|entry| {
-            entry.intent.selector == crate::vm::ResourceSelector::None
-                && entry.intent.output.is_empty()
-                && entry.intent.effect_kind == "compacted"
-                && entry.intent.canonical_sha256.is_empty()
-        }), "ordinary snapshots expose only minimal observer tombstones");
+        assert_eq!(snapshot.effect_audits.len(), 1,
+            "ordinary snapshots retain only bounded unresolved observer state");
         assert!(snapshot.effect_audits.iter().any(|entry|
             entry.intent.identity == unresolved && !entry.state.is_terminal()));
         let journal = std::fs::read(temp.path().join("shared/events.jsonl")).unwrap();
-        assert!(journal.len()
-            < crate::runtime::effect_log::MAX_EFFECT_AUDIT_JOURNAL_BYTES_PER_BRAIN,
-            "fixed-size tombstones keep the canonical audit share under its hard bound");
+        assert!(!String::from_utf8_lossy(&journal).contains("terminal"),
+            "detailed audit rows do not force transcript-history rewrites");
         drop(store);
 
         let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let snapshot = restarted.snapshot("shared").unwrap();
-        assert_eq!(snapshot.effect_audits.len(), 4);
+        assert!(snapshot.effect_audits.is_empty(),
+            "restart reconciliation archives unresolved state before publication");
         let (identity, effect) = &completed[0];
-        let exact = crate::runtime::effect_log::EffectAuditTransition::Reserve {
-            intent: crate::runtime::effect_log::EffectAuditIntent::from_effect(*identity, effect).unwrap(),
-            authority: grant.authority.clone(),
-        };
+        assert_eq!(restarted.reserve_effect_audit(
+            &grant, identity.execution_id, effect.clone(),
+        ).unwrap(), *identity,
+            "exact lost reserve ACK replays before stale run/lease rejection");
         let mut changed_effect = effect.clone();
         changed_effect.event = crate::vm::HostSideEffect::Emit { text: "changed secret".into() };
-        let conflicting = crate::runtime::effect_log::EffectAuditTransition::Reserve {
-            intent: crate::runtime::effect_log::EffectAuditIntent::from_effect(
-                *identity, &changed_effect,
-            ).unwrap(),
-            authority: grant.authority.clone(),
-        };
-        let mut brains = restarted.brains.write().unwrap();
-        let state = brains.get_mut("shared").unwrap();
-        assert!(!restarted.append_effect_audit_transition_locked(
-            "shared", state, exact,
-        ).unwrap(), "an exact compacted retry remains a no-op after restart");
-        assert!(restarted.append_effect_audit_transition_locked(
-            "shared", state, conflicting,
+        assert!(restarted.reserve_effect_audit(
+            &grant, identity.execution_id, changed_effect,
         ).unwrap_err().to_string().contains("conflicting"));
-        assert!(!restarted.append_effect_audit_transition_locked(
-            "shared", state,
-            crate::runtime::effect_log::EffectAuditTransition::Finish {
-                identity: *identity,
-                authority_id: grant.authority.authority_id,
-                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Acknowledged {
-                    response: crate::runtime::VmResumeResponse::Result { values: Vec::new() },
-                },
-            },
-        ).unwrap(), "the exact compacted terminal outcome remains a no-op");
-        assert!(restarted.append_effect_audit_transition_locked(
-            "shared", state,
-            crate::runtime::effect_log::EffectAuditTransition::Finish {
-                identity: *identity,
-                authority_id: grant.authority.authority_id,
-                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::FailedPartial {
-                    detail: "changed outcome".into(),
-                },
-            },
-        ).unwrap_err().to_string().contains("conflicting terminal"));
-        assert!(restarted.append_effect_audit_transition_locked(
-            "shared", state,
-            crate::runtime::effect_log::EffectAuditTransition::Begin {
-                identity: *identity, authority_id: grant.authority.authority_id,
-            },
-        ).unwrap_err().to_string().contains("terminal"));
+        let mut forged = grant.clone();
+        forged.authority.authority_id = uuid::Uuid::new_v4();
+        assert!(restarted.reserve_effect_audit(
+            &forged, identity.execution_id, effect.clone(),
+        ).unwrap_err().to_string().contains("conflicting"));
     }
 
     #[test]
@@ -10313,7 +10264,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let (_run, _lease, grant) = audit_run_fixture(&store);
-        store.reserve_effect_audit(
+        let unbegun = store.reserve_effect_audit(
             &grant, uuid::Uuid::new_v4(), audit_effect(0, "unbegun"),
         ).unwrap();
         let begun = store.reserve_effect_audit(
@@ -10323,14 +10274,23 @@ mod tests {
         drop(store);
         let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let snapshot = restarted.snapshot("shared").unwrap();
-        assert!(snapshot.effect_audits.iter().any(|entry| matches!(entry.state,
-            crate::runtime::effect_log::EffectAuditState::Terminal {
-                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
-            })));
-        assert!(snapshot.effect_audits.iter().any(|entry| matches!(entry.state,
-            crate::runtime::effect_log::EffectAuditState::Terminal {
-                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss
-            })));
+        assert!(snapshot.effect_audits.is_empty());
+        let unbegun_fence = restarted.with_effect_audit_storage_mut(
+            "shared", snapshot.brain_id,
+            |storage| storage.replay.lookup(&unbegun),
+        ).unwrap().flatten().unwrap();
+        let begun_fence = restarted.with_effect_audit_storage_mut(
+            "shared", snapshot.brain_id,
+            |storage| storage.replay.lookup(&begun),
+        ).unwrap().flatten().unwrap();
+        assert!(matches!(unbegun_fence,
+            crate::runtime::effect_log::EffectAuditTransition::Fence {
+                ref outcome_kind, ..
+            } if outcome_kind == "abandoned_not_applied"));
+        assert!(matches!(begun_fence,
+            crate::runtime::effect_log::EffectAuditTransition::Fence {
+                ref outcome_kind, ..
+            } if outcome_kind == "uncertain_process_loss"));
     }
 
     #[test]
@@ -10354,12 +10314,7 @@ mod tests {
         ).unwrap();
         let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let snapshot = restarted.snapshot("legacy-audit").unwrap();
-        assert!(matches!(snapshot.effect_audits[0].state,
-            crate::runtime::effect_log::EffectAuditState::Terminal {
-                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
-                    ref outcome_kind
-                }
-            } if outcome_kind == "legacy_v14_snapshot"));
+        assert!(snapshot.effect_audits.is_empty());
     }
 
     #[test]

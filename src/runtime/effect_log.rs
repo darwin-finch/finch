@@ -1143,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_reducer_supports_thousands_then_fails_closed_at_replay_index_exhaustion() {
+    fn audit_reducer_supports_more_than_the_legacy_replay_epoch_capacity() {
         let (template, authority) = audit_fixture();
         let mut reducer = EffectAuditReducer::default();
         let mut first_reserve = None;
@@ -1172,9 +1172,9 @@ mod tests {
         assert!(!reducer.apply(first_reserve.unwrap()).unwrap(),
             "an exact old identity remains permanently fenced as a no-op");
 
-        let mut exhausted = EffectAuditReducer::default();
+        let mut continued = EffectAuditReducer::default();
         let mut first_fence = None;
-        for index in 0..MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN {
+        for index in 0..=MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN {
             let fence = EffectAuditTransition::Fence {
                 identity: EffectAuditIdentity {
                     brain_id: template.identity.brain_id,
@@ -1193,27 +1193,10 @@ mod tests {
             if first_fence.is_none() {
                 first_fence = Some(fence.clone());
             }
-            assert!(exhausted.apply(fence).unwrap());
+            assert!(continued.apply(fence).unwrap());
         }
-        assert!(!exhausted.apply(first_fence.unwrap()).unwrap(),
-            "an exact replay fence is idempotent even at capacity");
-        let error = exhausted.apply(EffectAuditTransition::Fence {
-            identity: EffectAuditIdentity {
-                execution_id: Uuid::new_v4(),
-                ..template.identity
-            },
-            intent_sha256: "c".repeat(64),
-            intent_bytes: 1,
-            authority_id: authority.authority_id,
-            authority_sha256: "a".repeat(64),
-            outcome_kind: "not_applied".into(),
-            outcome_sha256: "d".repeat(64),
-        }).unwrap_err();
-        assert!(error.to_string().contains("archive this Brain"));
-        assert!(MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN > 512);
-        assert!(MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN
-                * MAX_EFFECT_AUDIT_REPLAY_FENCE_EVENT_BYTES
-            < MAX_EFFECT_AUDIT_JOURNAL_BYTES_PER_BRAIN);
+        assert!(!continued.apply(first_fence.unwrap()).unwrap(),
+            "an exact old replay fence stays idempotent after epoch capacity");
     }
 
     #[test]
