@@ -11,19 +11,25 @@ use finch::claude::ContentBlock;
 use finch::claude::Message;
 use finch::generators::StreamChunk;
 use finch::providers::gemini::GeminiProvider;
-use finch::providers::{LlmProvider, ProviderBackend, ProviderRequest};
+use finch::providers::{CapabilitySupport, LlmProvider, ProviderBackend, ProviderRequest};
 
-/// Test that Gemini provider supports tools
+/// Test Gemini's exact attested optional capabilities.
 #[test]
-fn test_gemini_supports_tools() {
+fn test_gemini_exact_optional_capabilities() {
     // Create a Gemini provider
     let provider = GeminiProvider::new("test-key".to_string()).unwrap();
 
-    // Verify it supports tools
     assert!(provider.supports_tools(), "Gemini should support tools");
     assert!(
-        provider.supports_streaming(),
-        "Gemini should support streaming"
+        !provider.supports_streaming(),
+        "Unknown streaming capability must not become optimistic true"
+    );
+    assert_eq!(
+        provider
+            .capabilities(provider.default_model())
+            .streaming
+            .support,
+        CapabilitySupport::Unknown
     );
 }
 

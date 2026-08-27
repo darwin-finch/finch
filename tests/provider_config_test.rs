@@ -38,7 +38,7 @@ fn test_provider_factory_creates_correct_types() -> Result<()> {
     let claude_teacher = TeacherEntry {
         provider: "claude".to_string(),
         api_key: "test-key".to_string(),
-        model: Some("claude-sonnet-4".to_string()),
+        model: Some("claude-sonnet-5".to_string()),
         base_url: None,
         name: Some("Claude".to_string()),
     };
@@ -60,7 +60,7 @@ fn test_provider_factory_creates_correct_types() -> Result<()> {
     assert_eq!(gemini_provider.name(), "gemini");
 
     // Verify default models
-    assert_eq!(claude_provider.default_model(), "claude-sonnet-4");
+    assert_eq!(claude_provider.default_model(), "claude-sonnet-5");
     assert_eq!(gemini_provider.default_model(), "gemini-2.5-flash");
 
     Ok(())
@@ -80,7 +80,7 @@ fn test_provider_factory_creates_fallback_chain() -> Result<()> {
         TeacherEntry {
             provider: "claude".to_string(),
             api_key: "key2".to_string(),
-            model: Some("claude-sonnet-4".to_string()),
+            model: Some("claude-sonnet-5".to_string()),
             base_url: None,
             name: Some("Claude".to_string()),
         },
@@ -104,7 +104,7 @@ fn test_provider_factory_single_teacher() -> Result<()> {
     let teachers = vec![TeacherEntry {
         provider: "claude".to_string(),
         api_key: "test-key".to_string(),
-        model: Some("claude-sonnet-4".to_string()),
+        model: Some("claude-sonnet-5".to_string()),
         base_url: None,
         name: Some("Claude".to_string()),
     }];
@@ -113,7 +113,7 @@ fn test_provider_factory_single_teacher() -> Result<()> {
     let provider = providers::create_provider(&teachers)?;
 
     assert_eq!(provider.name(), "claude");
-    assert_eq!(provider.default_model(), "claude-sonnet-4");
+    assert_eq!(provider.default_model(), "claude-sonnet-5");
 
     Ok(())
 }
@@ -136,7 +136,7 @@ fn test_provider_requires_api_key() {
     let teacher = TeacherEntry {
         provider: "claude".to_string(),
         api_key: "".to_string(), // Empty!
-        model: Some("claude-sonnet-4".to_string()),
+        model: Some("claude-sonnet-5".to_string()),
         base_url: None,
         name: Some("Claude".to_string()),
     };
@@ -179,7 +179,7 @@ fn test_provider_names_case_insensitive() -> Result<()> {
     let teacher_upper = TeacherEntry {
         provider: "CLAUDE".to_string(),
         api_key: "test-key".to_string(),
-        model: Some("claude-sonnet-4".to_string()),
+        model: Some("claude-sonnet-5".to_string()),
         base_url: None,
         name: Some("Claude".to_string()),
     };
@@ -187,7 +187,7 @@ fn test_provider_names_case_insensitive() -> Result<()> {
     let teacher_lower = TeacherEntry {
         provider: "claude".to_string(),
         api_key: "test-key".to_string(),
-        model: Some("claude-sonnet-4".to_string()),
+        model: Some("claude-sonnet-5".to_string()),
         base_url: None,
         name: Some("Claude".to_string()),
     };
@@ -226,7 +226,7 @@ fn test_provider_capabilities() -> Result<()> {
     let claude_teacher = TeacherEntry {
         provider: "claude".to_string(),
         api_key: "test-key".to_string(),
-        model: Some("claude-sonnet-4".to_string()),
+        model: Some("claude-sonnet-5".to_string()),
         base_url: None,
         name: Some("Claude".to_string()),
     };
@@ -249,24 +249,14 @@ fn test_document_valid_model_names() {
     // This test documents the VALID model names we know work
     // Update this as APIs evolve
 
-    // Gemini (as of 2026-02-14):
-    let valid_gemini = vec![
-        "gemini-2.5-flash",
-        "gemini-2.5-pro",
-        "gemini-2.0-flash",
-        "gemini-1.5-pro",
-        "gemini-1.5-flash",
-    ];
+    // Exact statically attested records as of 2026-08-26.
+    let valid_gemini = vec!["gemini-2.5-flash"];
 
     // Claude:
-    let valid_claude = vec![
-        "claude-sonnet-4-20250514",
-        "claude-opus-4",
-        "claude-haiku-4",
-    ];
+    let valid_claude = vec!["claude-sonnet-5"];
 
     // OpenAI:
-    let valid_openai = vec!["gpt-4", "gpt-4-turbo", "gpt-3.5-turbo"];
+    let valid_openai = vec!["gpt-5.6-sol", "gpt-4o"];
 
     // This test just documents - doesn't validate
     // In the future, we could add runtime validation against these lists

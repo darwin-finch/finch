@@ -52,5 +52,11 @@ jobs:
       - name: Run provider capability and boundary tests
         run: "cargo test --lib providers::"
 
+      - name: Run provider capability integration regressions
+        run: |
+          cargo test --test provider_token_binding_test
+          cargo test --test gemini_streaming_test
+          cargo test --test provider_config_test
+
       - name: Prove validated request tokens cannot be forged
         run: cargo test --doc -- ValidatedProviderRequest
