@@ -4303,6 +4303,8 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         else {
             return self.request(requirement, arguments, origin);
         };
+        #[cfg(test)]
+        run_authorization_before_lease_hook(self.execution_id, requirement.capability.clone());
         let authority_use_gate = Arc::clone(&self.authorization.use_gate);
         let _authority_use = authority_use_gate
             .read()
@@ -6112,8 +6114,17 @@ static AUTHORIZATION_BEFORE_USE_HOOK: std::sync::OnceLock<Mutex<Vec<Authorizatio
     std::sync::OnceLock::new();
 
 #[cfg(test)]
-fn run_authorization_before_use_hook(execution_id: uuid::Uuid, capability: CapabilityKind) {
-    let mut hook = AUTHORIZATION_BEFORE_USE_HOOK
+static AUTHORIZATION_BEFORE_LEASE_HOOK: std::sync::OnceLock<
+    Mutex<Vec<AuthorizationBeforeUseHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn run_authorization_hook(
+    hooks: &std::sync::OnceLock<Mutex<Vec<AuthorizationBeforeUseHook>>>,
+    execution_id: uuid::Uuid,
+    capability: CapabilityKind,
+) {
+    let mut hook = hooks
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6126,6 +6137,16 @@ fn run_authorization_before_use_hook(execution_id: uuid::Uuid, capability: Capab
         let (_, _, callback) = hook.remove(index);
         callback();
     }
+}
+
+#[cfg(test)]
+fn run_authorization_before_use_hook(execution_id: uuid::Uuid, capability: CapabilityKind) {
+    run_authorization_hook(&AUTHORIZATION_BEFORE_USE_HOOK, execution_id, capability);
+}
+
+#[cfg(test)]
+fn run_authorization_before_lease_hook(execution_id: uuid::Uuid, capability: CapabilityKind) {
+    run_authorization_hook(&AUTHORIZATION_BEFORE_LEASE_HOOK, execution_id, capability);
 }
 
 #[cfg(all(
@@ -13187,10 +13208,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
     }
 
     #[tokio::test]
-    async fn revocation_winning_the_authorization_use_race_prevents_file_mutation() {
+    async fn public_revocation_winning_before_host_use_prevents_file_mutation() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("note.txt"), b"before").unwrap();
-        let runtime = ProgramRuntime::new();
+        let runtime = Arc::new(ProgramRuntime::new());
         runtime.bind_host_machine_root(root.path()).unwrap();
         let pending = runtime
             .submit_typed_only(submission(
@@ -13201,8 +13222,13 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .await
             .unwrap();
         assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
-        let ledger = Arc::clone(&runtime.capability_ledger);
-        AUTHORIZATION_BEFORE_USE_HOOK
+        let sequence = pending.approval_prompts[0].request.effect_sequence.unwrap();
+        let grant_id = runtime
+            .grant_typed_capability(pending.required_capabilities[0].clone())
+            .unwrap();
+        let (revoke_tx, revoke_rx) = std::sync::mpsc::channel();
+        let (revoked_tx, revoked_rx) = std::sync::mpsc::channel();
+        AUTHORIZATION_BEFORE_LEASE_HOOK
             .get_or_init(|| Mutex::new(Vec::new()))
             .lock()
             .unwrap()
@@ -13210,26 +13236,27 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
                 pending.execution_id,
                 CapabilityKind::FileWrite,
                 Box::new(move || {
-                    let mut ledger = ledger.lock().unwrap();
-                    let grant_id = ledger
-                        .grants
-                        .grants
-                        .iter()
-                        .rev()
-                        .find(|grant| grant.revoked_at_unix_ms.is_none())
-                        .expect("approval issued an unrevoked grant")
-                        .id;
-                    assert!(ledger.revoke(grant_id, "concurrent-revoker", unix_time_ms()));
+                    revoke_tx.send(()).unwrap();
+                    assert!(revoked_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect(
+                            "public revocation must finish before the shared use lease begins"
+                        ));
                 }),
             ));
+        let revoker_runtime = Arc::clone(&runtime);
+        let revoker = std::thread::spawn(move || {
+            revoke_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("host use reached the before-lease boundary");
+            let revoked = revoker_runtime.revoke_typed_capability(grant_id).unwrap();
+            revoked_tx.send(revoked).unwrap();
+        });
         let outcome = runtime
-            .resolve_typed_approval(
-                &pending.approval_prompts[0],
-                ApprovalChoice::AllowOnce,
-                "test-user",
-            )
+            .resume_typed_execution_for_effect(pending.execution_id, sequence)
             .await
             .unwrap();
+        revoker.join().unwrap();
         assert_eq!(outcome.status, ExecutionStatus::Failed);
         assert_eq!(
             std::fs::read(root.path().join("note.txt")).unwrap(),
@@ -13241,6 +13268,115 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .audit
             .iter()
             .any(|entry| entry.action == crate::vm::CapabilityAuditAction::Revoked));
+    }
+
+    #[test]
+    fn in_flight_deferred_use_blocks_public_revoke_and_root_mutation() {
+        let project = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(ProgramRuntime::new());
+        runtime.bind_project_root(project.path()).unwrap();
+        let grant_id = runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("${project}/**").unwrap(),
+            ))
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let worker_runtime = Arc::clone(&runtime);
+        let worker = std::thread::spawn(move || {
+            let release_rx = Arc::clone(&release_rx);
+            let sink: TypedEffectSink = Arc::new(move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("test releases the in-flight deferred host use");
+            });
+            let tokio = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let outcome = tokio.block_on(worker_runtime.submit_with_deferred_host_effects(
+                submission(
+                    ProgramLanguage::Lisp,
+                    "(project-file-read (project-path \"note.txt\"))",
+                    ExecutionEffect::WorkspaceRead,
+                ),
+                sink,
+            ));
+            outcome_tx.send(outcome).unwrap();
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("deferred sink reached the externally visible use boundary");
+
+        let (revoker_started_tx, revoker_started_rx) = std::sync::mpsc::channel();
+        let (revoked_tx, revoked_rx) = std::sync::mpsc::channel();
+        let revoker_runtime = Arc::clone(&runtime);
+        let revoker = std::thread::spawn(move || {
+            revoker_started_tx.send(()).unwrap();
+            revoked_tx
+                .send(revoker_runtime.revoke_typed_capability(grant_id))
+                .unwrap();
+        });
+        let (clearer_started_tx, clearer_started_rx) = std::sync::mpsc::channel();
+        let (cleared_tx, cleared_rx) = std::sync::mpsc::channel();
+        let clearer_runtime = Arc::clone(&runtime);
+        let clearer = std::thread::spawn(move || {
+            clearer_started_tx.send(()).unwrap();
+            cleared_tx
+                .send(clearer_runtime.clear_project_root())
+                .unwrap();
+        });
+        revoker_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("public revocation thread starts while the host use is in flight");
+        clearer_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("public root mutation thread starts while the host use is in flight");
+        assert!(
+            revoked_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "public revocation must wait for the in-flight shared use lease"
+        );
+        assert!(
+            cleared_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "public root mutation must wait for the in-flight shared use lease"
+        );
+
+        release_tx.send(()).unwrap();
+        let pending = outcome_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("deferred dispatch completes after its sink returns")
+            .unwrap();
+        assert_eq!(pending.status, ExecutionStatus::Suspended);
+        assert_eq!(
+            revoked_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("public revocation completes after the shared use lease")
+                .unwrap(),
+            true
+        );
+        cleared_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("public root mutation completes after the shared use lease")
+            .unwrap();
+        worker.join().unwrap();
+        revoker.join().unwrap();
+        clearer.join().unwrap();
+        assert!(!runtime
+            .authority_state()
+            .unwrap()
+            .resource_roots
+            .iter()
+            .any(|binding| binding.root == crate::vm::ResourceRoot::Project));
     }
 
     #[tokio::test]
