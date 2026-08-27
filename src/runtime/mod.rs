@@ -13227,7 +13227,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .grant_typed_capability(pending.required_capabilities[0].clone())
             .unwrap();
         let (revoke_tx, revoke_rx) = std::sync::mpsc::channel();
-        let (revoked_tx, revoked_rx) = std::sync::mpsc::channel();
+        let (revoked_tx, revoked_rx) = std::sync::mpsc::channel::<bool>();
         AUTHORIZATION_BEFORE_LEASE_HOOK
             .get_or_init(|| Mutex::new(Vec::new()))
             .lock()
