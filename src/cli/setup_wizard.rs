@@ -8169,4 +8169,53 @@ mod tests {
         assert!(message.contains("Legacy chatgpt_subscription profiles are unsupported"));
         assert!(message.contains("finch setup") || message.contains("configure OpenAI Platform"));
     }
+
+    #[test]
+    fn named_credential_setup_reopen_and_save_preserves_reference_without_secret() {
+        use crate::config::{
+            AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle,
+            CredentialProvider, EndpointFamily, ProviderCredential,
+        };
+        let credential = ProviderCredential {
+            name: "openai-work".into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::OpenaiPlatform,
+            issuer: "openai-platform".into(),
+            audience: AudienceBinding::standard(EndpointFamily::OpenaiPlatform),
+            tenant: None,
+            project: None,
+            account: Some("work".into()),
+            scopes: std::collections::BTreeSet::new(),
+            secret_ref: "env:OPENAI_WORK_API_KEY".into(),
+            lifecycle: CredentialLifecycle::default(),
+        };
+        let profile = ProviderEntry::Credentialed {
+            provider: CredentialProvider::OpenaiPlatform,
+            credential: CredentialBinding {
+                credential_ref: "openai-work".into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: Some("work".into()),
+                required_scopes: std::collections::BTreeSet::new(),
+            },
+            model: Some("gpt-5.6-sol".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("work-reasoning".into()),
+            reasoning_effort: Some(ReasoningEffort::High),
+        };
+        let existing = Config::with_providers(vec![profile.clone()])
+            .with_credentials(vec![credential.clone()]);
+
+        let result = build_setup_result(&WizardState::new(Some(&existing))).unwrap();
+        assert_eq!(result.providers, vec![profile]);
+        assert_eq!(result.credentials, vec![credential]);
+        let saved = config_from_setup_result(&result);
+        saved.validate().unwrap();
+        let serialized = toml::to_string(&saved.credentials).unwrap();
+        assert!(serialized.contains("env:OPENAI_WORK_API_KEY"));
+        assert!(!serialized.contains("sk-"));
+    }
 }

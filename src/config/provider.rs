@@ -75,7 +75,7 @@ fn default_model_size() -> ModelSize {
 /// inference_provider = "onnx"
 /// execution_target = "coreml"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ProviderEntry {
     /// A cloud model profile bound to a first-class named credential.
@@ -226,6 +226,20 @@ pub enum ProviderEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
+}
+
+impl std::fmt::Debug for ProviderEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("ProviderEntry");
+        debug.field("type", &self.provider_type());
+        debug.field("profile_name", &self.profile_name());
+        if let Some(binding) = self.credential_binding() {
+            debug.field("credential_ref", &binding.credential_ref);
+        } else if self.api_key().is_some() {
+            debug.field("legacy_inline_api_key", &"[REDACTED]");
+        }
+        debug.finish_non_exhaustive()
+    }
 }
 
 impl ProviderEntry {
@@ -394,6 +408,22 @@ mod tests {
         let toml = toml::to_string(&entry).unwrap();
         let decoded: ProviderEntry = toml::from_str(&toml).unwrap();
         assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn test_legacy_inline_api_key_debug_is_redacted() {
+        let secret = "sk-ant-super-secret-marker";
+        let entry = ProviderEntry::Claude {
+            api_key: secret.into(),
+            model: None,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("legacy".into()),
+        };
+        let debug = format!("{entry:?}");
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED]"));
     }
 
     #[test]

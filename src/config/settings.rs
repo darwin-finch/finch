@@ -301,7 +301,7 @@ pub struct LicenseConfig {
 }
 
 /// A single teacher entry with provider and settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TeacherEntry {
     /// Provider name: "claude", "openai", "grok", "gemini", "mistral", "groq"
     pub provider: String,
@@ -320,6 +320,19 @@ pub struct TeacherEntry {
     /// Optional name/label for this teacher (for UI/logging)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+impl std::fmt::Debug for TeacherEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TeacherEntry")
+            .field("provider", &self.provider)
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("name", &self.name)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
