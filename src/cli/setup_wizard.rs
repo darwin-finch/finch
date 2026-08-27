@@ -8213,9 +8213,9 @@ mod tests {
             chat_path: None,
             models_path: None,
             name: Some("work-reasoning".into()),
-            reasoning_effort: Some(ReasoningEffort::High),
+            reasoning_effort: Some(crate::config::ReasoningEffort::High),
         };
-        let existing = Config::with_providers(vec![profile.clone()])
+        let existing = crate::config::Config::with_providers(vec![profile.clone()])
             .with_credentials(vec![credential.clone()]);
 
         let result = build_setup_result(&WizardState::new(Some(&existing))).unwrap();

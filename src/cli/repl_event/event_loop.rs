@@ -212,6 +212,8 @@ pub struct EventLoop {
     /// through this field.
     program_runtime: Arc<crate::runtime::ProgramRuntime>,
     agent_scheduler: Arc<crate::runtime::scheduler::AgentScheduler>,
+    /// Revalidating provider resolver shared with child-agent model selection.
+    provider_resolver: crate::runtime::scheduler::ProviderResolver,
 
     /// Tool results collected per query (query_id -> Vec<(tool_id, result)>)
     tool_results: ToolResultsMap,
@@ -1772,6 +1774,7 @@ impl EventLoop {
             tool_coordinator,
             program_runtime,
             agent_scheduler,
+            provider_resolver,
             tool_results: Arc::new(RwLock::new(std::collections::HashMap::new())),
             active_query_id: Arc::new(RwLock::new(None)),
             pending_queries: std::collections::VecDeque::new(),
