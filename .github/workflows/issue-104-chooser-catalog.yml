@@ -1,0 +1,59 @@
+name: Issue 104 chooser and catalog
+
+on:
+  push:
+    branches:
+      - codex/issue-104-chooser-honesty
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-104-chooser-catalog-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  chooser-catalog:
+    name: Chooser/catalog regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout exact branch tip
+        uses: actions/checkout@v4
+
+      - name: Install capnproto
+        run: sudo apt-get install -y capnproto
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Cargo inputs and outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: issue-104-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Check scoped formatting
+        run: rustfmt --edition 2021 --check src/cli/setup_wizard.rs src/providers/model_catalog.rs
+
+      - name: Check library, binaries, and tests
+        run: cargo check --lib --bins --tests
+
+      - name: Run model catalog regressions
+        run: cargo test --lib model_catalog -- --nocapture
+
+      - name: Run setup wizard regressions
+        run: cargo test --lib setup_wizard -- --nocapture
