@@ -78,7 +78,7 @@ impl GeneratorModel {
                     "Loading pre-trained model: {} {} on {}",
                     load_config.family.name(),
                     load_config.size.to_size_string(load_config.family),
-                    load_config.target.name()
+                    load_config.requested_target_name()
                 );
 
                 let loader = UnifiedModelLoader::new()?;
@@ -293,6 +293,7 @@ mod tests {
                 family: crate::models::unified_loader::ModelFamily::Qwen2,
                 size: crate::models::unified_loader::ModelSize::Small,
                 target: crate::config::ExecutionTarget::Cpu,
+                coreml: crate::config::CoreMlConfig::default(),
                 repo_override: None,
             }),
         };
@@ -322,6 +323,7 @@ mod tests {
             family: ModelFamily::Qwen2,
             size: ModelSize::Small,
             target: ExecutionTarget::Cpu,
+            coreml: crate::config::CoreMlConfig::default(),
             repo_override: None,
         });
 

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::config::CoreMlConfig;
+
 /// Model size variants for Qwen2.5 models
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelSize {
@@ -64,6 +66,9 @@ pub struct OnnxLoadConfig {
     /// Optional: specific execution providers to use
     /// If None, will try CoreML → CPU fallback
     pub execution_providers: Option<Vec<ExecutionProvider>>,
+
+    /// Requested CoreML policy and opt-in diagnostics.
+    pub coreml: CoreMlConfig,
 }
 
 impl OnnxLoadConfig {
@@ -80,6 +85,7 @@ impl OnnxLoadConfig {
             size,
             cache_dir,
             execution_providers: None,
+            coreml: CoreMlConfig::default(),
         }
     }
 
@@ -94,6 +100,7 @@ impl OnnxLoadConfig {
             size,
             cache_dir,
             execution_providers: None,
+            coreml: CoreMlConfig::default(),
         }
     }
 
@@ -106,7 +113,7 @@ impl OnnxLoadConfig {
 /// Execution provider options for ONNX Runtime
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionProvider {
-    /// CoreML (Apple Neural Engine on Apple Silicon)
+    /// CoreML dispatcher using the configured compute-unit policy
     CoreML,
     /// CPU (fallback, works everywhere)
     CPU,

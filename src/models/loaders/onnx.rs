@@ -8,6 +8,7 @@ type TokenCallback = Box<dyn FnMut(u32, &str) + Send>;
 type ForwardOutput = (Vec<f32>, Vec<(DynValue, DynValue)>);
 use ort::{
     ep,
+    logging::LogLevel,
     memory::MemoryInfo,
     session::{builder::GraphOptimizationLevel, Session, SessionOutputs},
     value::{DynValue, Value},
@@ -18,6 +19,8 @@ use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 
 use super::onnx_config::{ExecutionProvider as ConfigExecutionProvider, ModelSize, OnnxLoadConfig};
+#[cfg(target_os = "macos")]
+use crate::config::{CoreMlComputeUnits, CoreMlConfig};
 use crate::models::download::{DownloadProgress, ModelDownloader};
 use crate::models::generator_new::TextGeneration;
 
@@ -25,6 +28,40 @@ use crate::models::generator_new::TextGeneration;
 #[allow(dead_code)]
 pub struct OnnxLoader {
     cache_dir: PathBuf,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CoreMlOrtOptions {
+    compute_units: ep::coreml::ComputeUnits,
+    profile_compute_plan: bool,
+    enable_subgraphs: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn coreml_ort_options(config: CoreMlConfig) -> CoreMlOrtOptions {
+    let compute_units = match config.compute_units {
+        CoreMlComputeUnits::All => ep::coreml::ComputeUnits::All,
+        CoreMlComputeUnits::CpuAndNeuralEngine => ep::coreml::ComputeUnits::CPUAndNeuralEngine,
+        CoreMlComputeUnits::CpuAndGpu => ep::coreml::ComputeUnits::CPUAndGPU,
+        CoreMlComputeUnits::CpuOnly => ep::coreml::ComputeUnits::CPUOnly,
+    };
+
+    CoreMlOrtOptions {
+        compute_units,
+        profile_compute_plan: config.profile_compute_plan,
+        enable_subgraphs: config.enable_subgraphs,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn coreml_execution_provider(config: CoreMlConfig) -> ort::ep::ExecutionProviderDispatch {
+    let options = coreml_ort_options(config);
+    ep::CoreML::default()
+        .with_compute_units(options.compute_units)
+        .with_profile_compute_plan(options.profile_compute_plan)
+        .with_subgraphs(options.enable_subgraphs)
+        .build()
 }
 
 impl OnnxLoader {
@@ -37,12 +74,15 @@ impl OnnxLoader {
     fn create_session(&self, model_path: &Path, config: &OnnxLoadConfig) -> Result<Session> {
         info!("Creating ONNX session from: {:?}", model_path);
 
-        // Suppress ONNX Runtime logs (set before session creation)
-        // ORT_LOGGING_LEVEL: 0=Verbose, 1=Info, 2=Warning, 3=Error, 4=Fatal
-        std::env::set_var("ORT_LOGGING_LEVEL", "2"); // Warning and above only
-
         // Build execution provider list
+        let session_log_level = if config.coreml.profile_compute_plan {
+            LogLevel::Verbose
+        } else {
+            LogLevel::Warning
+        };
         let mut builder = Session::builder()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_log_level(session_log_level)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -81,8 +121,13 @@ impl OnnxLoader {
                     ConfigExecutionProvider::CoreML => {
                         #[cfg(target_os = "macos")]
                         {
-                            info!("Requesting CoreML execution provider");
-                            providers.push(ep::CoreML::default().build());
+                            info!(
+                                requested_compute_units = config.coreml.compute_units.name(),
+                                profile_compute_plan = config.coreml.profile_compute_plan,
+                                enable_subgraphs = config.coreml.enable_subgraphs,
+                                "Requesting CoreML execution provider; actual placement is runtime-selected"
+                            );
+                            providers.push(coreml_execution_provider(config.coreml));
                         }
                         #[cfg(not(target_os = "macos"))]
                         warn!("CoreML was requested on a non-macOS host; falling back to CPU");
@@ -118,8 +163,13 @@ impl OnnxLoader {
             // Default: Try platform-specific providers first, then CPU
             #[cfg(target_os = "macos")]
             {
-                info!("Auto-selecting: Trying CoreML");
-                providers.push(ep::CoreML::default().build());
+                info!(
+                    requested_compute_units = config.coreml.compute_units.name(),
+                    profile_compute_plan = config.coreml.profile_compute_plan,
+                    enable_subgraphs = config.coreml.enable_subgraphs,
+                    "Auto-selecting CoreML provider; actual placement is runtime-selected"
+                );
+                providers.push(coreml_execution_provider(config.coreml));
             }
 
             #[cfg(feature = "cuda")]
@@ -768,6 +818,42 @@ mod tests {
         {
             assert_eq!(providers[0], ExecutionProvider::CoreML);
             assert_eq!(providers[1], ExecutionProvider::CPU);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_coreml_compute_unit_policies_map_to_exact_ort_options() {
+        use ep::coreml::ComputeUnits;
+
+        for (policy, expected) in [
+            (CoreMlComputeUnits::All, ComputeUnits::All),
+            (
+                CoreMlComputeUnits::CpuAndNeuralEngine,
+                ComputeUnits::CPUAndNeuralEngine,
+            ),
+            (CoreMlComputeUnits::CpuAndGpu, ComputeUnits::CPUAndGPU),
+            (CoreMlComputeUnits::CpuOnly, ComputeUnits::CPUOnly),
+        ] {
+            let options = coreml_ort_options(CoreMlConfig {
+                compute_units: policy,
+                ..CoreMlConfig::default()
+            });
+            assert_eq!(options.compute_units, expected);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_coreml_diagnostic_and_subgraph_flags_map_exactly() {
+        for enabled in [false, true] {
+            let options = coreml_ort_options(CoreMlConfig {
+                profile_compute_plan: enabled,
+                enable_subgraphs: !enabled,
+                ..CoreMlConfig::default()
+            });
+            assert_eq!(options.profile_compute_plan, enabled);
+            assert_eq!(options.enable_subgraphs, !enabled);
         }
     }
 }

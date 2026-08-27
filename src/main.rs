@@ -1659,10 +1659,18 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         let model_family = config.backend.model_family;
         let model_size = config.backend.model_size;
         let device = config.backend.execution_target;
+        let coreml = config.backend.coreml;
         let model_repo = config.backend.model_repo.clone();
         tokio::spawn(async move {
             if let Err(e) = loader_clone
-                .load_generator_async(provider, model_family, model_size, device, model_repo)
+                .load_generator_async(
+                    provider,
+                    model_family,
+                    model_size,
+                    device,
+                    coreml,
+                    model_repo,
+                )
                 .await
             {
                 output_status!("⚠️  Model loading failed: {}", e);

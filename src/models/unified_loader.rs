@@ -10,7 +10,7 @@ use super::generator_new::TextGeneration;
 use super::loaders::onnx::{LoadedOnnxModel, OnnxLoader};
 use super::loaders::onnx_config::{ModelSize as OnnxModelSize, OnnxLoadConfig};
 use super::model_selector::QwenSize;
-use crate::config::ExecutionTarget;
+use crate::config::{CoreMlConfig, ExecutionTarget};
 
 /// Inference provider selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -58,11 +58,24 @@ pub struct ModelLoadConfig {
     /// Which execution target to run on (CoreML/CPU/CUDA)
     #[serde(alias = "backend")] // Support old field name
     pub target: ExecutionTarget,
+    /// Requested CoreML policy and opt-in diagnostics.
+    #[serde(default)]
+    pub coreml: CoreMlConfig,
     /// Optional: override HuggingFace repository (for custom models)
     pub repo_override: Option<String>,
 }
 
 impl ModelLoadConfig {
+    /// Describe the requested target policy without implying observed placement.
+    pub fn requested_target_name(&self) -> String {
+        #[cfg(target_os = "macos")]
+        if self.target == ExecutionTarget::CoreML {
+            return format!("CoreML ({})", self.coreml.compute_units.name());
+        }
+
+        self.target.name().to_string()
+    }
+
     /// Legacy field accessor for backward compatibility
     #[deprecated(note = "Use target field directly")]
     pub fn backend(&self) -> ExecutionTarget {
@@ -411,6 +424,7 @@ impl UnifiedModelLoader {
             size: onnx_size,
             cache_dir,
             execution_providers,
+            coreml: config.coreml,
         })
     }
 
@@ -424,7 +438,7 @@ impl UnifiedModelLoader {
             "Loading {} {} on {}",
             config.family.name(),
             config.size.to_size_string(config.family),
-            config.target.name()
+            config.requested_target_name()
         );
 
         // 2. Check cache or download
@@ -674,6 +688,7 @@ mod tests {
             family: ModelFamily::Qwen2,
             size: ModelSize::Small,
             target: ExecutionTarget::Cpu,
+            coreml: CoreMlConfig::default(),
             repo_override: None,
         };
         let repo = loader.resolve_repository(&config).unwrap();
@@ -685,6 +700,7 @@ mod tests {
             family: ModelFamily::Gemma2,
             size: ModelSize::Small,
             target: ExecutionTarget::Cpu,
+            coreml: CoreMlConfig::default(),
             repo_override: None,
         };
         let repo = loader.resolve_repository(&config).unwrap();
@@ -696,6 +712,7 @@ mod tests {
             family: ModelFamily::Llama3,
             size: ModelSize::Medium,
             target: ExecutionTarget::Cpu,
+            coreml: CoreMlConfig::default(),
             repo_override: None,
         };
         let repo = loader.resolve_repository(&config).unwrap();
@@ -713,6 +730,7 @@ mod tests {
             family: ModelFamily::Qwen2,
             size: ModelSize::Medium,
             target: ExecutionTarget::CoreML,
+            coreml: CoreMlConfig::default(),
             repo_override: None,
         };
         let repo = loader.resolve_repository(&config).unwrap();
@@ -728,6 +746,7 @@ mod tests {
             family: ModelFamily::Qwen2,
             size: ModelSize::Small,
             target: ExecutionTarget::Cpu,
+            coreml: CoreMlConfig::default(),
             repo_override: Some("custom-org/custom-model".to_string()),
         };
         let repo = loader.resolve_repository(&config).unwrap();
