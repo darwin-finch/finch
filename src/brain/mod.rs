@@ -1026,55 +1026,54 @@ mod isolation_tests {
                 return;
             }
             if mode == "rewrite-restore" {
-                use std::os::fd::FromRawFd as _;
-
                 #[cfg(target_os = "macos")]
-                let proof_path = {
-                    use std::os::unix::ffi::OsStrExt as _;
-
-                    let mut path = [0_i8; nix::libc::PATH_MAX as usize];
-                    assert_eq!(
-                        unsafe { nix::libc::fcntl(9, nix::libc::F_GETPATH, path.as_mut_ptr()) },
-                        0,
-                        "could not resolve the proof backing path: {}",
-                        std::io::Error::last_os_error()
-                    );
-                    let path = unsafe { std::ffi::CStr::from_ptr(path.as_ptr()) };
-                    std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes()))
-                };
+                {
+                    assert_eq!(unsafe { nix::libc::fchmod(9, 0o600) }, 0);
+                    let error = std::fs::OpenOptions::new()
+                        .write(true)
+                        .truncate(true)
+                        .open("/dev/fd/9")
+                        .unwrap_err();
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert_eq!(unsafe { nix::libc::fchmod(9, 0o400) }, 0);
+                    isolated_test_proof().unwrap();
+                    return;
+                }
                 #[cfg(not(target_os = "macos"))]
-                let proof_path = std::path::PathBuf::from("/proc/self/fd/9");
+                {
+                    use std::os::fd::FromRawFd as _;
 
-                let duplicate = unsafe { nix::libc::dup(9) };
-                assert!(duplicate >= 0);
-                let reader = unsafe { std::fs::File::from_raw_fd(duplicate) };
-                let original = read_proof_at(&reader).unwrap();
-                let mut forged = original.clone();
-                forged[0] = if forged[0] == b'a' { b'b' } else { b'a' };
-                assert_eq!(unsafe { nix::libc::fchmod(9, 0o600) }, 0);
-                let mut rewrite = std::fs::OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(&proof_path)
-                    .unwrap();
-                rewrite.write_all(&forged).unwrap();
-                rewrite.sync_all().unwrap();
-                drop(rewrite);
-                assert_eq!(unsafe { nix::libc::fchmod(9, 0o400) }, 0);
-                assert!(isolated_test_proof().is_err());
+                    let duplicate = unsafe { nix::libc::dup(9) };
+                    assert!(duplicate >= 0);
+                    let reader = unsafe { std::fs::File::from_raw_fd(duplicate) };
+                    let original = read_proof_at(&reader).unwrap();
+                    let mut forged = original.clone();
+                    forged[0] = if forged[0] == b'a' { b'b' } else { b'a' };
+                    assert_eq!(unsafe { nix::libc::fchmod(9, 0o600) }, 0);
+                    let mut rewrite = std::fs::OpenOptions::new()
+                        .write(true)
+                        .truncate(true)
+                        .open("/proc/self/fd/9")
+                        .unwrap();
+                    rewrite.write_all(&forged).unwrap();
+                    rewrite.sync_all().unwrap();
+                    drop(rewrite);
+                    assert_eq!(unsafe { nix::libc::fchmod(9, 0o400) }, 0);
+                    assert!(isolated_test_proof().is_err());
 
-                assert_eq!(unsafe { nix::libc::fchmod(9, 0o600) }, 0);
-                let mut restore = std::fs::OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(&proof_path)
-                    .unwrap();
-                restore.write_all(&original).unwrap();
-                restore.sync_all().unwrap();
-                drop(restore);
-                assert_eq!(unsafe { nix::libc::fchmod(9, 0o400) }, 0);
-                isolated_test_proof().unwrap();
-                return;
+                    assert_eq!(unsafe { nix::libc::fchmod(9, 0o600) }, 0);
+                    let mut restore = std::fs::OpenOptions::new()
+                        .write(true)
+                        .truncate(true)
+                        .open("/proc/self/fd/9")
+                        .unwrap();
+                    restore.write_all(&original).unwrap();
+                    restore.sync_all().unwrap();
+                    drop(restore);
+                    assert_eq!(unsafe { nix::libc::fchmod(9, 0o400) }, 0);
+                    isolated_test_proof().unwrap();
+                    return;
+                }
             }
             if mode == "auth-key-replay" {
                 let replayed_key = supervisor_verifying_key(valid.supervisor_pid)
