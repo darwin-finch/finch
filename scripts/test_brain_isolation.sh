@@ -11,7 +11,9 @@ supervisor="${FINCH_TEST_SUPERVISOR_BIN:-$repo_root/target/debug/finch-test-supe
 
 scratch="$(mktemp -d "$(cd "${TMPDIR:-/tmp}" && pwd -P)/finch-brain-isolation-regression.XXXXXX")"
 sentinel_pid=''
+signaler_pid=''
 cleanup_regression() {
+  if [[ -n "$signaler_pid" ]]; then wait "$signaler_pid" 2>/dev/null || true; fi
   if [[ -n "$sentinel_pid" ]]; then printf '\n' >&7 2>/dev/null || true; wait "$sentinel_pid" 2>/dev/null || true; fi
   exec 7>&- 2>/dev/null || true
   rm -rf -- "$scratch"
@@ -68,6 +70,20 @@ expect_supervisor_70 env FINCH_TEST_REAL_HOME="$fake_home" \
 phase=canonical-rejection-clean
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
+# An absent parent uses the canonical platform temporary directory. Caller
+# input remains strict: the explicit symlink case above must still fail.
+phase=supervisor-canonicalizes-default-temp-parent
+env -u FINCH_TEST_TMP_PARENT FINCH_TEST_REAL_HOME="$fake_home" TMPDIR="$temp_parent/" \
+  "$supervisor" true
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+# The public launcher applies the same canonical-default contract before it
+# delegates to the supervisor.
+phase=launcher-canonicalizes-default-temp-parent
+env -u FINCH_TEST_TMP_PARENT FINCH_TEST_REAL_HOME="$fake_home" TMPDIR="$temp_parent/" \
+  "$repo_root/scripts/test_brains.sh" true
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
 hostile_home="$scratch/hostile-home"
 hostile_target="$scratch/effective-production-finch"
 mkdir -p "$hostile_home" "$hostile_target/brains"
@@ -109,7 +125,7 @@ forged_proof="$scratch/forged-proof"
 phase=forged-shell-proof-rejection
 printf '%s\n' forged "$fake_home" "$fake_home/.finch/brains" 0:0 0:0 \
   127.0.0.1:1 127.0.0.1:2 forged "$fake_home/.finch/daemon.sock" \
-  "$$" /bin/sh 0:0 >"$forged_proof"
+  "$fake_home/.finch" 0:0 "$$" /bin/sh 0:0 >"$forged_proof"
 (
   exec 9<"$forged_proof"
   FINCH_BRAIN_TEST_ISOLATED=1 FINCH_BRAIN_TEST_PROOF_FD=9 \
@@ -137,7 +153,11 @@ fi
 preserved_home="$(find "$temp_parent" -type d -name 'finch-brain-test-home.*' -print -quit)"
 test -n "$preserved_home" && test -d "$preserved_home"
 rg -q 'process group was not quiescent' "$scratch/inspection.err"
+preserved_socket_root="$(sed -n 's/.*socket root at \([^ ]*\) because.*/\1/p' "$scratch/inspection.err")"
+[[ "$preserved_socket_root" == /private/tmp/ft.* || "$preserved_socket_root" == /tmp/ft.* ]]
+test -d "$preserved_socket_root"
 rm -rf -- "$preserved_home"
+rm -rf -- "$preserved_socket_root"
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 # A normally exiting leader cannot strand a TERM-ignoring member of its owned
@@ -253,24 +273,57 @@ if command -v python3 >/dev/null 2>&1 && [[ "${#socket_path}" -lt 100 ]]; then
   rm "$socket_path"
 fi
 
-# The supervisor owns a real process group. TERM-resistant members are killed
-# within its bounded escalation window before HOME removal or return.
+# A first, external signal arriving only after the leader is a retained zombie
+# and a TERM-resistant descendant has entered teardown must still determine the
+# final status. Sampling only before teardown would miss this signal.
 stubborn_pid_file="$scratch/stubborn.pid"
+stubborn_ready_file="$scratch/stubborn.ready"
+stubborn_term_file="$scratch/stubborn.term"
+stubborn_target_file="$scratch/stubborn.target"
+stubborn_home_file="$scratch/stubborn.home"
+late_signal_file="$scratch/late-signal.observed"
 phase=signal-during-teardown
-if FINCH_STUBBORN_PID_FILE="$stubborn_pid_file" run_isolated bash -c '
-  trap "kill -TERM \"$PPID\"" TERM
-  trap "" HUP INT
-  echo "$BASHPID" >"$FINCH_STUBBORN_PID_FILE"
-  sleep 30 &
-  kill -TERM "$PPID"
-  wait
-'; then
-  exit 1
-else
-  test "$?" -eq 143
-fi
+(
+  for _ in {1..400}; do
+    if [[ -s "$stubborn_target_file" && -s "$stubborn_term_file" ]]; then
+      read -r supervisor_pid leader_pid <"$stubborn_target_file"
+      printf '%s\n' "$leader_pid" >"$late_signal_file"
+      kill -TERM "$supervisor_pid"
+      exit 0
+    fi
+    sleep 0.005
+  done
+  exit 91
+) & signaler_pid=$!
+signal_status=0
+FINCH_STUBBORN_PID_FILE="$stubborn_pid_file" FINCH_STUBBORN_READY_FILE="$stubborn_ready_file" \
+FINCH_STUBBORN_TERM_FILE="$stubborn_term_file" FINCH_STUBBORN_TARGET_FILE="$stubborn_target_file" \
+FINCH_STUBBORN_HOME_FILE="$stubborn_home_file" run_isolated bash -c '
+  leader_pid=$BASHPID
+  python3 -c '\''
+import os, signal, time
+signal.signal(signal.SIGTERM, lambda *_: open(os.environ["FINCH_STUBBORN_TERM_FILE"], "w").write("term\n"))
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+open(os.environ["FINCH_STUBBORN_READY_FILE"], "w").write("ready\n")
+while True:
+    time.sleep(1)
+'\'' &
+  while [[ ! -s "$FINCH_STUBBORN_READY_FILE" ]]; do sleep 0.005; done
+  printf "%s %s\n" "$FINCH_TEST_SUPERVISOR_PID" "$leader_pid" >"$FINCH_STUBBORN_TARGET_FILE"
+  printf "%s\n" "$HOME" >"$FINCH_STUBBORN_HOME_FILE"
+  printf "%s\n" "$leader_pid" >"$FINCH_STUBBORN_PID_FILE"
+  exit 0
+' || signal_status=$?
+signaler_status=0
+wait "$signaler_pid" || signaler_status=$?
+signaler_pid=''
+test "$signaler_status" -eq 0
+test "$signal_status" -eq 143
+test -s "$late_signal_file" && test -s "$stubborn_term_file"
 stubborn_group="$(cat "$stubborn_pid_file")"
 ! kill -0 -- "-$stubborn_group" 2>/dev/null
+test ! -e "$(cat "$stubborn_home_file")"
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 launchers=(demo_boot.sh smoke_vm_wire_provider.sh stress_test.sh test_persistence.sh test_server.sh test_tool_passthrough.sh test_tui_debug.sh)
@@ -281,6 +334,72 @@ for launcher in "${launchers[@]}"; do
     run_isolated "$repo_root/scripts/$launcher"
   [[ "$(cat "$launcher_probe")" == "$temp_parent"/finch-brain-test-home.* ]]
 done
+
+# Exercise the maintained HTTP launchers beyond their re-exec probe. The
+# synthetic Finch consumes inherited FD 11, records the exact sealed bind
+# argument, and serves the endpoints each launcher requires.
+phase=real-wrapped-server-launchers
+mock_debug_dir="$scratch/target/debug"
+mock_release_dir="$scratch/target/release"
+mock_finch="$mock_debug_dir/finch"
+mock_bind_log="$scratch/mock-bind.log"
+mkdir -p "$mock_debug_dir" "$mock_release_dir"
+printf '%s\n' \
+  '#!/usr/bin/env python3' \
+  'import json, os, socket, sys' \
+  'from http.server import BaseHTTPRequestHandler, HTTPServer' \
+  'expected = os.environ["FINCH_TEST_DAEMON_ADDR"]' \
+  'if sys.argv[1:] != ["daemon", "--bind", expected]: sys.exit(64)' \
+  'sock = socket.socket(fileno=11)' \
+  'actual = "%s:%s" % sock.getsockname()' \
+  'if actual != expected: sys.exit(65)' \
+  'with open(os.environ["FINCH_MOCK_BIND_LOG"], "a") as log: log.write(expected + "|" + actual + "\n")' \
+  'with open(os.environ["FINCH_TEST_BOUND_ADDR_FILE"], "w") as address: address.write(actual)' \
+  'class Handler(BaseHTTPRequestHandler):' \
+  '    def log_message(self, *_): pass' \
+  '    def send(self, status, body, kind="application/json"):' \
+  '        data = body.encode(); self.send_response(status); self.send_header("Content-Type", kind); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)' \
+  '    def do_GET(self):' \
+  '        if self.path == "/health": self.send(200, "{\"status\":\"ok\"}")' \
+  '        elif self.path == "/metrics": self.send(200, "finch_test 1\n", "text/plain")' \
+  '        else: self.send(404, "{}")' \
+  '    def do_POST(self):' \
+  '        request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))' \
+  '        if any(message.get("role") == "tool" for message in request.get("messages", [])):' \
+  '            response = {"choices":[{"message":{"content":"tool result accepted"}}]}' \
+  '        else:' \
+  '            response = {"choices":[{"message":{"tool_calls":[{"id":"call_test","type":"function","function":{"name":"bash","arguments":"{\\\"command\\\":\\\"ls\\\"}"}}]}}]}' \
+  '        self.send(200, json.dumps(response))' \
+  'server = HTTPServer(("127.0.0.1", 0), Handler, bind_and_activate=False)' \
+  'server.socket = sock; server.server_address = sock.getsockname(); server.server_name = "localhost"; server.server_port = sock.getsockname()[1]' \
+  'server.serve_forever()' >"$mock_finch"
+chmod +x "$mock_finch"
+cp "$mock_finch" "$mock_release_dir/finch"
+FINCH_BIN="$mock_finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" \
+  run_isolated "$repo_root/scripts/test_server.sh" >/dev/null
+FINCH_BIN="$mock_finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" ANTHROPIC_API_KEY=synthetic \
+  run_isolated "$repo_root/scripts/test_tool_passthrough.sh" >/dev/null
+test "$(wc -l <"$mock_bind_log" | tr -d ' ')" -eq 2
+awk -F '|' '$1 != $2 || $1 ~ /:0$/ { exit 1 }' "$mock_bind_log"
+
+phase=debug-release-profile-mismatch-rejected
+profile_status=0
+FINCH_BIN="$mock_release_dir/finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" \
+  run_isolated "$repo_root/scripts/test_server.sh" >/dev/null 2>&1 || profile_status=$?
+test "$profile_status" -eq 64
+
+# CI builds the release supervisor before this harness, making this a real
+# matched release-profile proof. Developer runs without that artifact retain
+# the debug and mismatch coverage above.
+release_supervisor="$repo_root/target/release/finch-test-supervisor"
+if [[ -x "$release_supervisor" ]]; then
+  phase=real-wrapped-release-profile
+  FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
+    FINCH_TEST_SUPERVISOR_BIN="$release_supervisor" FINCH_BIN="$mock_release_dir/finch" \
+    FINCH_MOCK_BIND_LOG="$mock_bind_log" "$release_supervisor" \
+    "$repo_root/scripts/test_server.sh" >/dev/null
+  test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+fi
 
 # An unrelated same-name process outside the supervisor's group survives.
 sentinel_fifo="$scratch/sentinel.control"

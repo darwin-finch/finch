@@ -5977,10 +5977,24 @@ mod handler_tests {
 
     #[tokio::test]
     async fn live_prompt_can_be_approved_while_its_turn_lane_is_held() {
-        let store = crate::brain::store::BrainStore::with_root("box.local", None);
-        let driver = store
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().to_path_buf()),
+        );
+        let pending = store
             .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
             .unwrap();
+        let driver = store
+            .activate_connection(
+                "shared",
+                pending.attachment_id,
+                pending.connection_id.unwrap(),
+            )
+            .unwrap();
+        assert!(driver.connected);
+        assert_eq!(driver.attachment_id, pending.attachment_id);
+        assert_eq!(driver.connection_id, pending.connection_id);
         let lease = store
             .acquire_runner_lease(
                 "shared",
@@ -7505,12 +7519,26 @@ mod handler_tests {
 
     #[tokio::test]
     async fn transport_neutral_submission_enforces_roles_and_creates_one_queued_run() {
-        let store = crate::brain::store::BrainStore::with_root("box.local", None);
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().to_path_buf()),
+        );
         let runners = crate::server::BrainRunnerBroker::default();
         let approvals = crate::server::BrainApprovalBroker::default();
-        let driver = store
+        let pending = store
             .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
             .unwrap();
+        let driver = store
+            .activate_connection(
+                "shared",
+                pending.attachment_id,
+                pending.connection_id.unwrap(),
+            )
+            .unwrap();
+        assert!(driver.connected);
+        assert_eq!(driver.attachment_id, pending.attachment_id);
+        assert_eq!(driver.connection_id, pending.connection_id);
         let outcome = submit_named_brain_event(
             &store,
             &runners,
@@ -7567,10 +7595,24 @@ mod handler_tests {
 
     #[tokio::test]
     async fn speculative_prompt_is_sent_once_and_only_its_correlated_transcript_is_hidden_later() {
-        let store = crate::brain::store::BrainStore::with_root("box.local", None);
-        let driver = store
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().to_path_buf()),
+        );
+        let pending = store
             .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
             .unwrap();
+        let driver = store
+            .activate_connection(
+                "shared",
+                pending.attachment_id,
+                pending.connection_id.unwrap(),
+            )
+            .unwrap();
+        assert!(driver.connected);
+        assert_eq!(driver.attachment_id, pending.attachment_id);
+        assert_eq!(driver.connection_id, pending.connection_id);
         let lease = store
             .acquire_runner_lease(
                 "shared",
@@ -7846,9 +7888,19 @@ mod handler_tests {
                         if text == "v13-visible-interleaved"
                 )
         }));
-        let driver = restarted
+        let pending = restarted
             .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
             .unwrap();
+        let driver = restarted
+            .activate_connection(
+                "shared",
+                pending.attachment_id,
+                pending.connection_id.unwrap(),
+            )
+            .unwrap();
+        assert!(driver.connected);
+        assert_eq!(driver.attachment_id, pending.attachment_id);
+        assert_eq!(driver.connection_id, pending.connection_id);
         let lease = restarted
             .acquire_runner_lease(
                 "shared",
@@ -7862,8 +7914,9 @@ mod handler_tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         runners.register("shared", lease.lease_id, tx);
         let checking = tokio::spawn(async move {
-            let crate::server::RunnerRequest::Turn(request) = rx.recv().await.unwrap() else {
-                panic!("expected ordinary prompt after restart")
+            let received = rx.recv().await.unwrap();
+            let crate::server::RunnerRequest::Turn(request) = received else {
+                panic!("expected ordinary prompt after restart, received {received:?}")
             };
             let context = request
                 .context
@@ -7906,10 +7959,24 @@ mod handler_tests {
 
     #[tokio::test]
     async fn daemon_projects_memory_only_after_the_successful_turn_is_committed() {
-        let store = crate::brain::store::BrainStore::with_root("box.local", None);
-        let driver = store
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().to_path_buf()),
+        );
+        let pending = store
             .attach("shared", "alice@box.local", AttachmentRole::Driver, None)
             .unwrap();
+        let driver = store
+            .activate_connection(
+                "shared",
+                pending.attachment_id,
+                pending.connection_id.unwrap(),
+            )
+            .unwrap();
+        assert!(driver.connected);
+        assert_eq!(driver.attachment_id, pending.attachment_id);
+        assert_eq!(driver.connection_id, pending.connection_id);
         let lease = store
             .acquire_runner_lease(
                 "shared",

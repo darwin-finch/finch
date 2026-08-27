@@ -7,9 +7,21 @@ set -euo pipefail
 
 script_path="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
 source "$(dirname "$script_path")/lib/brain_test_isolation.sh"
+finch_bin="${FINCH_BIN:-target/release/finch}"
+if [[ "${FINCH_BRAIN_TEST_ISOLATED:-}" != 1 ]]; then
+  case "$finch_bin" in
+    target/debug/finch|*/target/debug/finch)
+      export FINCH_TEST_SUPERVISOR_BIN="$(dirname "$script_path")/../target/debug/finch-test-supervisor" ;;
+    target/release/finch|*/target/release/finch)
+      export FINCH_TEST_SUPERVISOR_BIN="$(dirname "$script_path")/../target/release/finch-test-supervisor" ;;
+  esac
+fi
 brain_test_isolation_reexec_launcher "$script_path" "$@"
 
-finch_bin="${FINCH_BIN:-target/release/finch}"
+brain_test_isolation_require_finch_profile "$finch_bin" || {
+  echo 'Finch binary and test supervisor must use the same debug/release profile' >&2
+  exit 64
+}
 [[ -x "$finch_bin" ]] || { echo "Error: Binary not found. Run 'cargo build --release' first." >&2; exit 1; }
 [[ -n "${ANTHROPIC_API_KEY:-}" ]] || { echo 'ANTHROPIC_API_KEY is required for this live pass-through smoke' >&2; exit 1; }
 TEST_DIR=$(mktemp -d "$HOME/finch-tool-passthrough.XXXXXX")
@@ -22,7 +34,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM HUP
 mkdir -p "$HOME/.finch"
-FINCH_TEST_BOUND_ADDR_FILE="$address_file" "$finch_bin" daemon --bind 127.0.0.1:0 & daemon_pid=$!
+FINCH_TEST_BOUND_ADDR_FILE="$address_file" "$finch_bin" daemon --bind "$FINCH_TEST_DAEMON_ADDR" & daemon_pid=$!
 for _ in {1..100}; do [[ -s "$address_file" ]] && break; sleep 0.05; done
 [[ -s "$address_file" ]] || { echo 'Daemon did not publish its bound address' >&2; exit 1; }
 DAEMON_URL="http://$(cat "$address_file")"

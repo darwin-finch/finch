@@ -3,7 +3,6 @@
 #![cfg(unix)]
 
 use sha2::{Digest, Sha256};
-use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
@@ -165,14 +164,16 @@ fn manifest_digest(store: &Path) -> anyhow::Result<String> {
 
 fn create_proof(
     home: &Path,
+    socket_root: &Path,
     brain_address: &str,
     daemon_address: &str,
     password: &str,
 ) -> anyhow::Result<(File, String)> {
     let root = home.join(".finch/brains");
-    let socket = home.join(".finch/daemon.sock");
+    let socket = socket_root.join("daemon.sock");
     let home_metadata = fs::metadata(home)?;
     let root_metadata = fs::metadata(&root)?;
+    let socket_root_metadata = fs::metadata(socket_root)?;
     let token = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
@@ -197,6 +198,13 @@ fn create_proof(
         hex::encode(Sha256::digest(password.as_bytes()))
     )?;
     writeln!(writer, "{}", socket.display())?;
+    writeln!(writer, "{}", socket_root.display())?;
+    writeln!(
+        writer,
+        "{}:{}",
+        socket_root_metadata.dev(),
+        socket_root_metadata.ino()
+    )?;
     writeln!(writer, "{}", std::process::id())?;
     let supervisor_executable = std::env::current_exe()?.canonicalize()?;
     let supervisor_metadata = fs::metadata(&supervisor_executable)?;
@@ -240,7 +248,16 @@ fn configure_supervised_child(
             if libc::fcntl(9, libc::F_SETFD, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
-            for (source, target) in [(brain_fd, 10), (daemon_fd, 11)] {
+            // Cargo uses low-numbered descriptors for its GNU jobserver while
+            // launching a test binary. Keep sealed backups above that range;
+            // the test process restores and authenticates the specified
+            // FD10/FD11 production boundary before using either listener.
+            for (source, target) in [
+                (brain_fd, 10),
+                (daemon_fd, 11),
+                (brain_fd, 110),
+                (daemon_fd, 111),
+            ] {
                 if source != target && libc::dup2(source, target) == -1 {
                     return Err(io::Error::last_os_error());
                 }
@@ -254,7 +271,7 @@ fn configure_supervised_child(
 }
 
 fn duplicate_above_stdio(fd: RawFd) -> io::Result<File> {
-    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 20) };
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 200) };
     if duplicate == -1 {
         return Err(io::Error::last_os_error());
     }
@@ -446,12 +463,13 @@ fn run() -> anyhow::Result<i32> {
                 .ok_or_else(|| anyhow::anyhow!("HOME is unavailable"))?,
         ),
     )?;
-    let temp_parent = canonical_directory(
-        "temporary parent",
-        &PathBuf::from(
-            std::env::var_os("FINCH_TEST_TMP_PARENT").unwrap_or_else(|| OsString::from("/tmp")),
-        ),
-    )?;
+    let temp_parent_input = match std::env::var_os("FINCH_TEST_TMP_PARENT") {
+        Some(path) => PathBuf::from(path),
+        None => std::env::temp_dir()
+            .canonicalize()
+            .context("could not canonicalize the platform temporary directory")?,
+    };
+    let temp_parent = canonical_directory("temporary parent", &temp_parent_input)?;
     anyhow::ensure!(
         !matches!(real_home.as_path(), p if p == Path::new("/") || p == Path::new("/tmp") || p == Path::new("/var") || p == Path::new("/private")),
         "real HOME is too broad"
@@ -471,12 +489,27 @@ fn run() -> anyhow::Result<i32> {
         isolated.path().join(".finch"),
         fs::Permissions::from_mode(0o700),
     )?;
+    let socket_parent = if Path::new("/private/tmp").is_dir() {
+        Path::new("/private/tmp")
+    } else {
+        Path::new("/tmp")
+    };
+    let socket_root = tempfile::Builder::new()
+        .prefix("ft.")
+        .tempdir_in(socket_parent)?;
+    fs::set_permissions(socket_root.path(), fs::Permissions::from_mode(0o700))?;
     let brain_listener = TcpListener::bind("127.0.0.1:0")?;
     let daemon_listener = TcpListener::bind("127.0.0.1:0")?;
     let brain_address = brain_listener.local_addr()?.to_string();
     let daemon_address = daemon_listener.local_addr()?.to_string();
     let password = format!("test-{}", uuid::Uuid::new_v4().simple());
-    let (proof, token) = create_proof(isolated.path(), &brain_address, &daemon_address, &password)?;
+    let (proof, token) = create_proof(
+        isolated.path(),
+        socket_root.path(),
+        &brain_address,
+        &daemon_address,
+        &password,
+    )?;
     let mut pipes = [0; 2];
     if unsafe { libc::pipe(pipes.as_mut_ptr()) } == -1 {
         return Err(io::Error::last_os_error().into());
@@ -497,8 +530,9 @@ fn run() -> anyhow::Result<i32> {
         )
         .env(
             "FINCH_TEST_IPC_SOCKET",
-            isolated.path().join(".finch/daemon.sock"),
+            socket_root.path().join("daemon.sock"),
         )
+        .env("FINCH_TEST_SOCKET_ROOT", socket_root.path())
         .env("FINCH_BRAIN_TEST_ISOLATED", "1")
         .env("FINCH_BRAIN_TEST_TOKEN", &token)
         .env("FINCH_BRAIN_TEST_PROOF_FD", "9")
@@ -508,6 +542,8 @@ fn run() -> anyhow::Result<i32> {
         .env("FINCH_TEST_BRAIN_PASSWORD", &password)
         .env("FINCH_TEST_BRAIN_LISTENER_FD", "10")
         .env("FINCH_TEST_DAEMON_LISTENER_FD", "11")
+        .env("FINCH_TEST_BRAIN_LISTENER_BACKUP_FD", "110")
+        .env("FINCH_TEST_DAEMON_LISTENER_BACKUP_FD", "111")
         .env("FINCH_TEST_SUPERVISOR_PID", std::process::id().to_string())
         .env("FINCH_TEST_SUPERVISOR_BIN", std::env::current_exe()?);
     if std::env::var_os("CARGO_HOME").is_none() && real_home.join(".cargo").is_dir() {
@@ -547,9 +583,10 @@ fn run() -> anyhow::Result<i32> {
         Ok(status) => status,
         Err(error) => {
             let preserved = isolated.keep();
+            let preserved_socket_root = socket_root.keep();
             return Err(error.context(format!(
-                "isolated HOME preserved at {} because the process group was not quiescent",
-                preserved.display()
+                "isolated HOME preserved at {} and socket root at {} because the process group was not quiescent",
+                preserved.display(), preserved_socket_root.display()
             )));
         }
     };
@@ -563,6 +600,7 @@ fn run() -> anyhow::Result<i32> {
     observation?;
     drop(proof);
     drop(isolated);
+    drop(socket_root);
     // A signal arriving while TERM/KILL escalation was in progress must still
     // control the wrapper's exit status.
     let signal = PENDING_SIGNAL.load(Ordering::Relaxed);
