@@ -9671,7 +9671,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_successor_cannot_start_effect_but_original_permit_can_finish() {
+    fn effect_audit_stale_successor_cannot_start_but_original_permit_can_finish() {
         let store = BrainStore::with_root("box.local", None);
         let (_run, lease, grant) = audit_run_fixture(&store);
         let identity = store.reserve_effect_audit(
@@ -9694,7 +9694,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_reconciles_unbegun_and_begun_effects_without_reapplication() {
+    fn effect_audit_restart_reconciles_without_reapplication() {
         let temp = tempfile::tempdir().unwrap();
         let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let (_run, _lease, grant) = audit_run_fixture(&store);
@@ -9719,7 +9719,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v14_effect_record_reconstructs_as_legacy_terminal_snapshot() {
+    fn effect_audit_schema_v14_reconstructs_as_legacy_terminal_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let brain_id = store.snapshot("legacy-audit").unwrap().brain_id;

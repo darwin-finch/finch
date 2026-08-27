@@ -1,0 +1,33 @@
+name: Issue 163 durable effect audit
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/issue-163-effect-audit.yml"
+      - "schema/finch_ipc.capnp"
+      - "src/brain/store.rs"
+      - "src/ipc/**"
+      - "src/runtime/effect_log.rs"
+      - "src/server/brain_runner.rs"
+      - "src/server/mod.rs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  effect-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Cap'n Proto
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test durable reducer and log recovery
+        run: cargo test --lib runtime::effect_log::tests -- --nocapture
+      - name: Test named-Brain and Cap'n Proto audit boundary
+        run: cargo test --lib effect_audit -- --nocapture
