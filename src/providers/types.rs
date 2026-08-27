@@ -4,8 +4,393 @@
 // allowing the rest of the codebase to work with a unified interface.
 
 use crate::claude::types::{ContentBlock, Message};
+use crate::config::ReasoningEffort;
 use crate::tools::types::ToolDefinition;
 use serde::{Deserialize, Serialize};
+
+/// Whether a provider/model capability is known to be usable.
+///
+/// `Unknown` is deliberately distinct from `Unsupported`: callers may display
+/// the uncertainty, but must not send a request that depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySupport {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+/// Where Finch obtained a capability claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CapabilityProvenance {
+    /// Returned by an authoritative runtime catalog or handshake.
+    RuntimeDiscovery { source: String },
+    /// Dated metadata verified against a named provider contract.
+    StaticMetadata { tested_on: String, source: String },
+    /// Asserted by a validated local configuration boundary.
+    Configuration,
+    /// No reliable evidence is available.
+    Unknown,
+}
+
+/// A single yes/no/unknown model feature with its evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelFeature {
+    /// Whether the feature is known to be usable.
+    pub support: CapabilitySupport,
+    /// Evidence supporting the status.
+    pub provenance: CapabilityProvenance,
+}
+
+impl ModelFeature {
+    /// Construct an unknown feature with no provenance.
+    pub fn unknown() -> Self {
+        Self {
+            support: CapabilitySupport::Unknown,
+            provenance: CapabilityProvenance::Unknown,
+        }
+    }
+
+    /// Construct a dated static feature claim.
+    pub fn static_metadata(
+        support: CapabilitySupport,
+        tested_on: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            support,
+            provenance: CapabilityProvenance::StaticMetadata {
+                tested_on: tested_on.into(),
+                source: source.into(),
+            },
+        }
+    }
+
+    /// Return true only for explicit support, never for unknown status.
+    pub fn is_supported(&self) -> bool {
+        self.support == CapabilitySupport::Supported
+    }
+}
+
+/// Exact reasoning-effort values accepted by one provider/model adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningCapability {
+    /// `None` means unknown; an empty list means reasoning controls are
+    /// explicitly unsupported.
+    pub allowed_efforts: Option<Vec<ReasoningEffort>>,
+    pub provenance: CapabilityProvenance,
+}
+
+impl ReasoningCapability {
+    pub fn unknown() -> Self {
+        Self {
+            allowed_efforts: None,
+            provenance: CapabilityProvenance::Unknown,
+        }
+    }
+
+    pub fn unsupported(tested_on: &str, source: &str) -> Self {
+        Self {
+            allowed_efforts: Some(Vec::new()),
+            provenance: CapabilityProvenance::StaticMetadata {
+                tested_on: tested_on.to_string(),
+                source: source.to_string(),
+            },
+        }
+    }
+
+    pub fn allowed(
+        efforts: impl IntoIterator<Item = ReasoningEffort>,
+        tested_on: &str,
+        source: &str,
+    ) -> Self {
+        Self {
+            allowed_efforts: Some(efforts.into_iter().collect()),
+            provenance: CapabilityProvenance::StaticMetadata {
+                tested_on: tested_on.to_string(),
+                source: source.to_string(),
+            },
+        }
+    }
+
+    pub fn support(&self) -> CapabilitySupport {
+        match self.allowed_efforts.as_deref() {
+            None => CapabilitySupport::Unknown,
+            Some([]) => CapabilitySupport::Unsupported,
+            Some(_) => CapabilitySupport::Supported,
+        }
+    }
+
+    fn require(&self, provider: &str, model: &str, effort: ReasoningEffort) -> anyhow::Result<()> {
+        match self.allowed_efforts.as_deref() {
+            None => anyhow::bail!(
+                "Provider '{}' model '{}' has unknown reasoning capability; refusing configured effort '{}'",
+                provider,
+                model,
+                effort.as_str()
+            ),
+            Some(allowed) if allowed.is_empty() => anyhow::bail!(
+                "Provider '{}' model '{}' does not support reasoning controls",
+                provider,
+                model
+            ),
+            Some(allowed) if !allowed.contains(&effort) => anyhow::bail!(
+                "Provider '{}' model '{}' does not support reasoning effort '{}'; allowed efforts: {}",
+                provider,
+                model,
+                effort.as_str(),
+                allowed
+                    .iter()
+                    .map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Some(_) => Ok(()),
+        }
+    }
+}
+
+/// Context limits for a model, preserving the unit used by the boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextWindowCapability {
+    /// Token limit, when the provider boundary measures tokens.
+    pub max_tokens: Option<usize>,
+    /// Message limit, when a local generator measures retained messages.
+    pub max_messages: Option<usize>,
+    /// Evidence supporting the limit.
+    pub provenance: CapabilityProvenance,
+}
+
+/// Maximum completion tokens accepted by the exact model/adapter pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputTokenLimitCapability {
+    pub max_tokens: Option<usize>,
+    pub provenance: CapabilityProvenance,
+}
+
+impl OutputTokenLimitCapability {
+    pub fn unknown() -> Self {
+        Self {
+            max_tokens: None,
+            provenance: CapabilityProvenance::Unknown,
+        }
+    }
+}
+
+/// Request/response protocol used by the provider adapter for this model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireProtocol {
+    AnthropicMessages,
+    OpenAiChatCompletions,
+    GeminiGenerateContent,
+    CodexAppServer,
+}
+
+/// Known wire protocol and the evidence for that binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireProtocolCapability {
+    pub protocol: Option<WireProtocol>,
+    pub provenance: CapabilityProvenance,
+}
+
+impl WireProtocolCapability {
+    fn unknown() -> Self {
+        Self {
+            protocol: None,
+            provenance: CapabilityProvenance::Unknown,
+        }
+    }
+}
+
+impl ContextWindowCapability {
+    /// Construct an unknown context window with no assumed default.
+    pub fn unknown() -> Self {
+        Self {
+            max_tokens: None,
+            max_messages: None,
+            provenance: CapabilityProvenance::Unknown,
+        }
+    }
+}
+
+/// Capabilities of one exact provider/model pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCapabilities {
+    /// Provider identity owning the model.
+    pub provider: String,
+    /// Exact provider model ID.
+    pub model: String,
+    /// Incremental text streaming.
+    pub streaming: ModelFeature,
+    /// Provider-native tool calls.
+    pub tools: ModelFeature,
+    /// Multiple tool calls returned in a single assistant turn.
+    pub parallel_tool_calls: ModelFeature,
+    /// Provider-enforced structured response schemas.
+    pub structured_output: ModelFeature,
+    /// Image parts accepted as model input.
+    pub image_input: ModelFeature,
+    /// Audio parts accepted as model input.
+    pub audio_input: ModelFeature,
+    /// Token/usage accounting returned through Finch's response boundary.
+    pub usage_reporting: ModelFeature,
+    /// Provider-scoped continuation handles.
+    pub continuation: ModelFeature,
+    /// Request-controlled reasoning effort.
+    pub reasoning: ReasoningCapability,
+    /// Context window and its unit.
+    pub context_window: ContextWindowCapability,
+    /// Maximum requested completion length, distinct from input context.
+    pub output_token_limit: OutputTokenLimitCapability,
+    /// Concrete transport contract used for this exact pair.
+    pub wire_protocol: WireProtocolCapability,
+}
+
+impl ModelCapabilities {
+    /// A fail-closed descriptor for an unrecognized model.
+    pub fn unknown(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            streaming: ModelFeature::unknown(),
+            tools: ModelFeature::unknown(),
+            parallel_tool_calls: ModelFeature::unknown(),
+            structured_output: ModelFeature::unknown(),
+            image_input: ModelFeature::unknown(),
+            audio_input: ModelFeature::unknown(),
+            usage_reporting: ModelFeature::unknown(),
+            continuation: ModelFeature::unknown(),
+            reasoning: ReasoningCapability::unknown(),
+            context_window: ContextWindowCapability::unknown(),
+            output_token_limit: OutputTokenLimitCapability::unknown(),
+            wire_protocol: WireProtocolCapability::unknown(),
+        }
+    }
+
+    /// Build a descriptor from dated, provider-contract metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn static_metadata(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        tested_on: &str,
+        source: &str,
+        streaming: CapabilitySupport,
+        tools: CapabilitySupport,
+        continuation: CapabilitySupport,
+        reasoning: ReasoningCapability,
+        max_tokens: Option<usize>,
+        max_output_tokens: Option<usize>,
+        max_messages: Option<usize>,
+    ) -> Self {
+        let feature = |support| ModelFeature::static_metadata(support, tested_on, source);
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            streaming: feature(streaming),
+            tools: feature(tools),
+            parallel_tool_calls: ModelFeature::unknown(),
+            structured_output: ModelFeature::unknown(),
+            image_input: ModelFeature::unknown(),
+            audio_input: ModelFeature::unknown(),
+            usage_reporting: ModelFeature::unknown(),
+            continuation: feature(continuation),
+            reasoning,
+            context_window: ContextWindowCapability {
+                max_tokens,
+                max_messages,
+                provenance: CapabilityProvenance::StaticMetadata {
+                    tested_on: tested_on.to_string(),
+                    source: source.to_string(),
+                },
+            },
+            output_token_limit: if let Some(max_tokens) = max_output_tokens {
+                OutputTokenLimitCapability {
+                    max_tokens: Some(max_tokens),
+                    provenance: CapabilityProvenance::StaticMetadata {
+                        tested_on: tested_on.to_string(),
+                        source: source.to_string(),
+                    },
+                }
+            } else {
+                OutputTokenLimitCapability::unknown()
+            },
+            wire_protocol: WireProtocolCapability::unknown(),
+        }
+    }
+
+    /// Bind this exact model descriptor to the adapter's configured wire
+    /// protocol without implying any unverified optional model features.
+    pub fn with_wire_protocol(
+        mut self,
+        protocol: WireProtocol,
+        tested_on: &str,
+        source: &str,
+    ) -> Self {
+        self.wire_protocol = WireProtocolCapability {
+            protocol: Some(protocol),
+            provenance: CapabilityProvenance::StaticMetadata {
+                tested_on: tested_on.to_string(),
+                source: source.to_string(),
+            },
+        };
+        self
+    }
+
+    fn require(&self, feature: &str, capability: &ModelFeature) -> anyhow::Result<()> {
+        match capability.support {
+            CapabilitySupport::Supported => Ok(()),
+            CapabilitySupport::Unsupported => anyhow::bail!(
+                "Provider '{}' model '{}' does not support {}",
+                self.provider,
+                self.model,
+                feature
+            ),
+            CapabilitySupport::Unknown => anyhow::bail!(
+                "Provider '{}' model '{}' has unknown {} capability; refusing to assume support",
+                self.provider,
+                self.model,
+                feature
+            ),
+        }
+    }
+
+    /// Validate all request-local requirements before provider work begins.
+    pub fn validate_request(
+        &self,
+        request: &ProviderRequest,
+        streaming: bool,
+        reasoning: Option<ReasoningEffort>,
+    ) -> anyhow::Result<()> {
+        if streaming || request.stream {
+            self.require("streaming", &self.streaming)?;
+        }
+        if request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+        {
+            self.require("tool calls", &self.tools)?;
+        }
+        if let Some(effort) = reasoning {
+            self.reasoning
+                .require(&self.provider, &self.model, effort)?;
+        }
+        if let Some(limit) = self.output_token_limit.max_tokens {
+            if request.max_tokens as usize > limit {
+                anyhow::bail!(
+                    "Provider '{}' model '{}' supports at most {} output tokens, but {} were requested",
+                    self.provider,
+                    self.model,
+                    limit,
+                    request.max_tokens
+                );
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Unified request format for all LLM providers
 ///
@@ -749,5 +1134,99 @@ mod tests {
         let req = ProviderRequest::new(vec![]).with_tools(vec![tool]);
         assert!(req.tools.is_some());
         assert_eq!(req.tools.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unknown_model_capabilities_remain_unknown() {
+        let capabilities = ModelCapabilities::unknown("compatible", "unlisted-model");
+        assert_eq!(capabilities.streaming.support, CapabilitySupport::Unknown);
+        assert_eq!(capabilities.tools.support, CapabilitySupport::Unknown);
+        assert_eq!(
+            capabilities.parallel_tool_calls.support,
+            CapabilitySupport::Unknown
+        );
+        assert_eq!(
+            capabilities.structured_output.support,
+            CapabilitySupport::Unknown
+        );
+        assert_eq!(capabilities.image_input.support, CapabilitySupport::Unknown);
+        assert_eq!(capabilities.audio_input.support, CapabilitySupport::Unknown);
+        assert_eq!(
+            capabilities.usage_reporting.support,
+            CapabilitySupport::Unknown
+        );
+        assert_eq!(
+            capabilities.continuation.support,
+            CapabilitySupport::Unknown
+        );
+        assert_eq!(capabilities.reasoning.support(), CapabilitySupport::Unknown);
+        assert_eq!(capabilities.context_window.max_tokens, None);
+        assert_eq!(capabilities.output_token_limit.max_tokens, None);
+        assert_eq!(
+            capabilities.context_window.provenance,
+            CapabilityProvenance::Unknown
+        );
+        assert_eq!(
+            capabilities.output_token_limit.provenance,
+            CapabilityProvenance::Unknown
+        );
+        assert_eq!(capabilities.wire_protocol.protocol, None);
+        assert_eq!(
+            capabilities.wire_protocol.provenance,
+            CapabilityProvenance::Unknown
+        );
+    }
+
+    #[test]
+    fn unknown_optional_capability_does_not_block_baseline_text() {
+        let capabilities = ModelCapabilities::unknown("compatible", "unlisted-model");
+        capabilities
+            .validate_request(&ProviderRequest::new(vec![]), false, None)
+            .unwrap();
+        let error = capabilities
+            .validate_request(&ProviderRequest::new(vec![]).with_stream(true), false, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown streaming capability"));
+    }
+
+    #[test]
+    fn unsupported_requested_fields_have_precise_diagnostics() {
+        let capabilities = ModelCapabilities::static_metadata(
+            "text-only",
+            "model-a",
+            "2026-08-26",
+            "test fixture",
+            CapabilitySupport::Unsupported,
+            CapabilitySupport::Unsupported,
+            CapabilitySupport::Unsupported,
+            ReasoningCapability::unsupported("2026-08-26", "test fixture"),
+            Some(1_000),
+            Some(10_000),
+            None,
+        );
+        let tool = ToolDefinition {
+            name: "lookup".into(),
+            description: "lookup".into(),
+            input_schema: crate::tools::types::ToolInputSchema::simple(vec![]),
+        };
+        let cases = [
+            (
+                ProviderRequest::new(vec![]).with_stream(true),
+                "Provider 'text-only' model 'model-a' does not support streaming",
+            ),
+            (
+                ProviderRequest::new(vec![]).with_tools(vec![tool]),
+                "Provider 'text-only' model 'model-a' does not support tool calls",
+            ),
+        ];
+        for (request, expected) in cases {
+            assert_eq!(
+                capabilities
+                    .validate_request(&request, false, None)
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
     }
 }
