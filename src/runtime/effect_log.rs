@@ -23,6 +23,19 @@ pub const MAX_ACTIVE_EFFECT_AUDITS_PER_BRAIN: usize = 256;
 /// Brain-wide bound for canonical pre-redaction effect payloads represented
 /// by unresolved reservations.
 pub const MAX_ACTIVE_EFFECT_AUDIT_BYTES_PER_BRAIN: usize = 16 * 1024 * 1024;
+/// Maximum encoded bytes for one compact replay fence transition.
+pub const MAX_EFFECT_AUDIT_REPLAY_FENCE_TRANSITION_BYTES: usize = 768;
+/// Maximum encoded bytes for its complete canonical Brain event envelope.
+pub const MAX_EFFECT_AUDIT_REPLAY_FENCE_EVENT_BYTES: usize = 1_024;
+/// Byte budget reserved for the compact replay index.
+pub const EFFECT_AUDIT_REPLAY_INDEX_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+/// Capacity derived from the fixed event bound and replay-index budget.
+pub const MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN: usize =
+    EFFECT_AUDIT_REPLAY_INDEX_BUDGET_BYTES / MAX_EFFECT_AUDIT_REPLAY_FENCE_EVENT_BYTES;
+/// Upper bound for the audit share of the canonical Brain journal. Finite
+/// storage cannot retain infinite exact membership: at replay-index
+/// exhaustion admission fails closed and the operator must archive the Brain.
+pub const MAX_EFFECT_AUDIT_JOURNAL_BYTES_PER_BRAIN: usize = 64 * 1024 * 1024;
 
 /// Complete immutable identity of one named-Brain host effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -86,6 +99,20 @@ impl EffectAuditIntent {
             canonical_sha256: hex::encode(Sha256::digest(canonical)),
         })
     }
+
+    pub(crate) fn observer_projection(&self) -> Self {
+        let mut projected = self.clone();
+        projected.canonical_sha256.clear();
+        projected
+    }
+
+    pub(crate) fn tombstone_projection(&self) -> Self {
+        let mut projected = self.clone();
+        projected.selector = crate::vm::ResourceSelector::None;
+        projected.output.clear();
+        projected.effect_kind = "compacted".into();
+        projected
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -108,6 +135,9 @@ pub enum EffectAuditTerminalOutcome {
         outcome_kind: String,
         canonical_sha256: String,
     },
+    /// Observer-only terminal projection. Canonical reducers never accept
+    /// this value as a durable finish transition.
+    Redacted { outcome_kind: String },
     /// Read-only projection of a schema-v14 `EffectRecorded` event. New
     /// writers never emit this variant.
     LegacyV14Snapshot {
@@ -134,6 +164,22 @@ pub struct EffectAuditEntry {
     pub intent: EffectAuditIntent,
     pub authority: EffectAuditAuthority,
     pub state: EffectAuditState,
+}
+
+impl EffectAuditEntry {
+    pub(crate) fn observer_projection(&self) -> Self {
+        let mut projected = self.clone();
+        projected.intent = projected.intent.observer_projection();
+        projected.authority.authority_id = Uuid::nil();
+        projected.authority.runner_lease_id = Uuid::nil();
+        projected.authority.connection_id = None;
+        if let EffectAuditState::Terminal { outcome } = &projected.state {
+            projected.state = EffectAuditState::Terminal {
+                outcome: observer_terminal_outcome(outcome),
+            };
+        }
+        projected
+    }
 }
 
 /// Proof that the daemon durably committed `AwaitingHostResult`. Host
@@ -181,13 +227,55 @@ pub enum EffectAuditTransition {
         authority_id: Uuid,
         outcome: EffectAuditTerminalOutcome,
     },
+    /// Fixed-size canonical replay index record replacing a detailed terminal
+    /// Reserve/Begin/Finish history. It carries no effect or authority payload.
+    Fence {
+        identity: EffectAuditIdentity,
+        intent_sha256: String,
+        intent_bytes: usize,
+        authority_id: Uuid,
+        authority_sha256: String,
+        outcome_kind: String,
+        outcome_sha256: String,
+    },
 }
 
 impl EffectAuditTransition {
     pub fn identity(&self) -> EffectAuditIdentity {
         match self {
             Self::Reserve { intent, .. } => intent.identity,
-            Self::Begin { identity, .. } | Self::Finish { identity, .. } => *identity,
+            Self::Begin { identity, .. } | Self::Finish { identity, .. }
+                | Self::Fence { identity, .. } => *identity,
+        }
+    }
+
+    pub(crate) fn observer_projection(&self) -> Self {
+        match self {
+            Self::Reserve { intent, authority } => {
+                let mut authority = authority.clone();
+                authority.authority_id = Uuid::nil();
+                authority.runner_lease_id = Uuid::nil();
+                authority.connection_id = None;
+                Self::Reserve { intent: intent.observer_projection(), authority }
+            }
+            Self::Begin { identity, .. } => Self::Begin {
+                identity: *identity,
+                authority_id: Uuid::nil(),
+            },
+            Self::Finish { identity, outcome, .. } => Self::Finish {
+                identity: *identity,
+                authority_id: Uuid::nil(),
+                outcome: observer_terminal_outcome(outcome),
+            },
+            Self::Fence { identity, outcome_kind, .. } => Self::Fence {
+                identity: *identity,
+                intent_sha256: String::new(),
+                intent_bytes: 0,
+                authority_id: Uuid::nil(),
+                authority_sha256: String::new(),
+                outcome_kind: outcome_kind.clone(),
+                outcome_sha256: String::new(),
+            },
         }
     }
 }
@@ -228,9 +316,9 @@ impl EffectAuditReducer {
             .sum()
     }
 
-    /// Forget a terminal projection after its complete transition history has
-    /// been durably removed from the canonical Brain journal. Unresolved
-    /// write-ahead state is never eligible for retention compaction.
+    /// Replace a detailed terminal projection with its permanent fixed-size
+    /// intent/outcome digest fence. Unresolved write-ahead state is never
+    /// eligible for retention compaction.
     pub(crate) fn compact_terminal(&mut self, identity: &EffectAuditIdentity) -> Result<()> {
         let entry = self
             .entries
@@ -250,6 +338,7 @@ impl EffectAuditReducer {
                 canonical_sha256,
             },
         };
+        entry.intent = entry.intent.tombstone_projection();
         Ok(())
     }
 
@@ -274,12 +363,30 @@ impl EffectAuditReducer {
                     "effect audit intent digest metadata is invalid"
                 );
                 if let Some(existing) = self.entries.get(&identity) {
-                    anyhow::ensure!(
-                        existing.intent == intent && existing.authority == authority,
-                        "conflicting effect audit reservation for {identity:?}"
-                    );
+                    let compacted = matches!(existing.state,
+                        EffectAuditState::Terminal {
+                            outcome: EffectAuditTerminalOutcome::Compacted { .. }
+                        });
+                    let exact_intent = if compacted {
+                        existing.intent.canonical_sha256 == intent.canonical_sha256
+                            && existing.intent.payload_bytes == intent.payload_bytes
+                    } else {
+                        existing.intent == intent
+                    };
+                    let exact_authority = if compacted
+                            && existing.authority.runner_lease_id == Uuid::nil()
+                            && existing.authority.environment_generation == 0 {
+                        existing.authority.authority_id == authority.authority_id
+                            && existing.authority.runner_subject == authority_sha256(&authority)?
+                    } else {
+                        existing.authority == authority
+                    };
+                    anyhow::ensure!(exact_intent && exact_authority,
+                        "conflicting effect audit reservation for {identity:?}");
                     return Ok(false);
                 }
+                anyhow::ensure!(self.entries.len() < MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN,
+                    "effect audit replay index exhausted; archive this Brain before admitting more host effects");
                 anyhow::ensure!(
                     self.active_for_run(identity.run_id) < MAX_ACTIVE_EFFECT_AUDITS_PER_RUN,
                     "effect audit active-intent quota exceeded for run {}",
@@ -360,6 +467,9 @@ impl EffectAuditReducer {
                         Ok(true)
                     }
                     EffectAuditState::AwaitingHostResult => {
+                        anyhow::ensure!(!matches!(outcome,
+                                EffectAuditTerminalOutcome::Redacted { .. }),
+                            "observer-redacted outcome cannot enter the canonical audit log");
                         entry.state = EffectAuditState::Terminal { outcome };
                         Ok(true)
                     }
@@ -375,35 +485,128 @@ impl EffectAuditReducer {
                     }
                 }
             }
+            EffectAuditTransition::Fence {
+                identity,
+                intent_sha256,
+                intent_bytes,
+                authority_id,
+                authority_sha256,
+                outcome_kind,
+                outcome_sha256,
+            } => {
+                for digest in [&intent_sha256, &authority_sha256, &outcome_sha256] {
+                    anyhow::ensure!(digest.len() == 64
+                            && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                        "effect audit replay fence digest metadata is invalid");
+                }
+                anyhow::ensure!(intent_bytes > 0 && intent_bytes <= MAX_EFFECT_AUDIT_INTENT_BYTES,
+                    "effect audit replay fence intent size is invalid");
+                anyhow::ensure!(!outcome_kind.is_empty() && outcome_kind.len() <= 64,
+                    "effect audit replay fence outcome kind is invalid");
+                if let Some(existing) = self.entries.get(&identity) {
+                    let exact = existing.intent.canonical_sha256 == intent_sha256
+                        && existing.intent.payload_bytes == intent_bytes
+                        && existing.authority.authority_id == authority_id
+                        && existing.authority.runner_subject == authority_sha256
+                        && matches!(&existing.state, EffectAuditState::Terminal {
+                            outcome: EffectAuditTerminalOutcome::Compacted {
+                                outcome_kind: existing_kind,
+                                canonical_sha256: existing_sha256,
+                            }
+                        } if existing_kind == &outcome_kind
+                            && existing_sha256 == &outcome_sha256);
+                    anyhow::ensure!(exact,
+                        "effect audit replay fence conflicts with existing state");
+                    return Ok(false);
+                }
+                anyhow::ensure!(self.entries.len() < MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN,
+                    "effect audit replay index exhausted; archive this Brain before admitting more host effects");
+                self.entries.insert(identity, EffectAuditEntry {
+                    intent: EffectAuditIntent {
+                        identity,
+                        capability: crate::vm::CapabilityKind::SessionEmit,
+                        selector: crate::vm::ResourceSelector::None,
+                        output: Vec::new(),
+                        effect_kind: "compacted".into(),
+                        payload_bytes: intent_bytes,
+                        canonical_sha256: intent_sha256,
+                    },
+                    authority: EffectAuditAuthority {
+                        authority_id,
+                        runner_lease_id: Uuid::nil(),
+                        runner_subject: authority_sha256,
+                        connection_id: None,
+                        environment_generation: 0,
+                    },
+                    state: EffectAuditState::Terminal {
+                        outcome: EffectAuditTerminalOutcome::Compacted {
+                            outcome_kind,
+                            canonical_sha256: outcome_sha256,
+                        },
+                    },
+                });
+                Ok(true)
+            }
         }
     }
+}
+
+pub(crate) fn authority_sha256(authority: &EffectAuditAuthority) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(authority)?)))
+}
+
+pub(crate) fn replay_fence_transition(
+    entry: &EffectAuditEntry,
+) -> Result<EffectAuditTransition> {
+    let EffectAuditState::Terminal { outcome } = &entry.state else {
+        bail!("unresolved effect audit cannot become a replay fence");
+    };
+    let transition = EffectAuditTransition::Fence {
+        identity: entry.intent.identity,
+        intent_sha256: entry.intent.canonical_sha256.clone(),
+        intent_bytes: entry.intent.payload_bytes,
+        authority_id: entry.authority.authority_id,
+        authority_sha256: authority_sha256(&entry.authority)?,
+        outcome_kind: terminal_outcome_kind(outcome),
+        outcome_sha256: terminal_outcome_sha256(outcome)?,
+    };
+    anyhow::ensure!(serde_json::to_vec(&transition)?.len()
+            <= MAX_EFFECT_AUDIT_REPLAY_FENCE_TRANSITION_BYTES,
+        "effect audit replay fence exceeds its fixed encoded bound");
+    Ok(transition)
 }
 
 fn terminal_outcome_sha256(outcome: &EffectAuditTerminalOutcome) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(outcome)?)))
 }
 
-pub(crate) fn compacted_terminal_outcome(
-    outcome: &EffectAuditTerminalOutcome,
-) -> Result<EffectAuditTerminalOutcome> {
-    if let EffectAuditTerminalOutcome::Compacted { .. } = outcome {
-        return Ok(outcome.clone());
+fn terminal_outcome_kind(outcome: &EffectAuditTerminalOutcome) -> String {
+    match outcome {
+        EffectAuditTerminalOutcome::Acknowledged { .. } => "acknowledged".into(),
+        EffectAuditTerminalOutcome::NotApplied { .. } => "not_applied".into(),
+        EffectAuditTerminalOutcome::FailedPartial { .. } => "failed_partial".into(),
+        EffectAuditTerminalOutcome::AbandonedNotApplied => "abandoned_not_applied".into(),
+        EffectAuditTerminalOutcome::UncertainProcessLoss => "uncertain_process_loss".into(),
+        EffectAuditTerminalOutcome::Compacted { outcome_kind, .. } => outcome_kind.clone(),
+        EffectAuditTerminalOutcome::Redacted { outcome_kind } => outcome_kind.clone(),
+        EffectAuditTerminalOutcome::LegacyV14Snapshot { .. } => "legacy_v14_snapshot".into(),
     }
-    Ok(EffectAuditTerminalOutcome::Compacted {
-        outcome_kind: terminal_outcome_kind(outcome).to_string(),
-        canonical_sha256: terminal_outcome_sha256(outcome)?,
-    })
 }
 
-fn terminal_outcome_kind(outcome: &EffectAuditTerminalOutcome) -> &'static str {
+fn observer_terminal_outcome(outcome: &EffectAuditTerminalOutcome) -> EffectAuditTerminalOutcome {
     match outcome {
-        EffectAuditTerminalOutcome::Acknowledged { .. } => "acknowledged",
-        EffectAuditTerminalOutcome::NotApplied { .. } => "not_applied",
-        EffectAuditTerminalOutcome::FailedPartial { .. } => "failed_partial",
-        EffectAuditTerminalOutcome::AbandonedNotApplied => "abandoned_not_applied",
-        EffectAuditTerminalOutcome::UncertainProcessLoss => "uncertain_process_loss",
-        EffectAuditTerminalOutcome::Compacted { .. } => "compacted",
-        EffectAuditTerminalOutcome::LegacyV14Snapshot { .. } => "legacy_v14_snapshot",
+        EffectAuditTerminalOutcome::AbandonedNotApplied =>
+            EffectAuditTerminalOutcome::AbandonedNotApplied,
+        EffectAuditTerminalOutcome::UncertainProcessLoss =>
+            EffectAuditTerminalOutcome::UncertainProcessLoss,
+        EffectAuditTerminalOutcome::Compacted { outcome_kind, .. } =>
+            EffectAuditTerminalOutcome::Compacted {
+                outcome_kind: outcome_kind.clone(),
+                canonical_sha256: String::new(),
+            },
+        other => EffectAuditTerminalOutcome::Redacted {
+            outcome_kind: terminal_outcome_kind(other),
+        },
     }
 }
 
@@ -680,7 +883,7 @@ mod tests {
         assert!(!reducer.apply(reserve).unwrap());
 
         let mut changed = intent.clone();
-        changed.canonical_sha256 = "forged".into();
+        changed.canonical_sha256 = "f".repeat(64);
         assert!(reducer
             .apply(EffectAuditTransition::Reserve {
                 intent: changed,
@@ -842,6 +1045,80 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Brain-wide active-byte"));
+    }
+
+    #[test]
+    fn audit_reducer_supports_thousands_then_fails_closed_at_replay_index_exhaustion() {
+        let (template, authority) = audit_fixture();
+        let mut reducer = EffectAuditReducer::default();
+        let mut first_reserve = None;
+        for index in 0..1_024 {
+            let mut intent = template.clone();
+            intent.identity.run_id = Uuid::new_v4();
+            intent.identity.execution_id = Uuid::new_v4();
+            intent.identity.effect_sequence = index as u64;
+            intent.canonical_sha256 = format!("{index:064x}");
+            let reserve = EffectAuditTransition::Reserve {
+                intent: intent.clone(),
+                authority: authority.clone(),
+            };
+            if first_reserve.is_none() {
+                first_reserve = Some(reserve.clone());
+            }
+            assert!(reducer.apply(reserve).unwrap());
+            assert!(reducer.apply(EffectAuditTransition::Finish {
+                identity: intent.identity,
+                authority_id: authority.authority_id,
+                outcome: EffectAuditTerminalOutcome::AbandonedNotApplied,
+            }).unwrap());
+            reducer.compact_terminal(&intent.identity).unwrap();
+        }
+
+        assert!(!reducer.apply(first_reserve.unwrap()).unwrap(),
+            "an exact old identity remains permanently fenced as a no-op");
+
+        let mut exhausted = EffectAuditReducer::default();
+        let mut first_fence = None;
+        for index in 0..MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN {
+            let fence = EffectAuditTransition::Fence {
+                identity: EffectAuditIdentity {
+                    brain_id: template.identity.brain_id,
+                    run_id: template.identity.run_id,
+                    request_seq: template.identity.request_seq,
+                    execution_id: Uuid::from_u128(index as u128 + 1),
+                    effect_sequence: index as u64,
+                },
+                intent_sha256: format!("{index:064x}"),
+                intent_bytes: 1,
+                authority_id: authority.authority_id,
+                authority_sha256: "a".repeat(64),
+                outcome_kind: "abandoned_not_applied".into(),
+                outcome_sha256: "b".repeat(64),
+            };
+            if first_fence.is_none() {
+                first_fence = Some(fence.clone());
+            }
+            assert!(exhausted.apply(fence).unwrap());
+        }
+        assert!(!exhausted.apply(first_fence.unwrap()).unwrap(),
+            "an exact replay fence is idempotent even at capacity");
+        let error = exhausted.apply(EffectAuditTransition::Fence {
+            identity: EffectAuditIdentity {
+                execution_id: Uuid::new_v4(),
+                ..template.identity
+            },
+            intent_sha256: "c".repeat(64),
+            intent_bytes: 1,
+            authority_id: authority.authority_id,
+            authority_sha256: "a".repeat(64),
+            outcome_kind: "not_applied".into(),
+            outcome_sha256: "d".repeat(64),
+        }).unwrap_err();
+        assert!(error.to_string().contains("archive this Brain"));
+        assert!(MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN > 512);
+        assert!(MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN
+                * MAX_EFFECT_AUDIT_REPLAY_FENCE_EVENT_BYTES
+            < MAX_EFFECT_AUDIT_JOURNAL_BYTES_PER_BRAIN);
     }
 
     #[test]

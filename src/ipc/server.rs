@@ -2487,8 +2487,10 @@ mod tests {
             let snapshot = store.snapshot("shared").unwrap();
             assert!(matches!(snapshot.effect_audits[0].state,
                 crate::runtime::effect_log::EffectAuditState::Terminal {
-                    outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Acknowledged { .. }
-                }));
+                    outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
+                        ref outcome_kind
+                    }
+                } if outcome_kind == "acknowledged"));
             assert!(!snapshot.events.iter().any(|event| matches!(
                 event.kind, crate::brain::store::BrainEventKind::ToolResult { .. }
             )));
@@ -2795,8 +2797,10 @@ mod tests {
         finish.send().promise.await.unwrap();
         assert!(matches!(store.snapshot("shared").unwrap().effect_audits[0].state,
             crate::runtime::effect_log::EffectAuditState::Terminal {
-                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Acknowledged { .. }
-            }));
+                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
+                    ref outcome_kind
+                }
+            } if outcome_kind == "acknowledged"));
     }
 
     struct SocketApprovalRunner {

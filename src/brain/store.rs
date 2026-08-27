@@ -754,6 +754,16 @@ pub enum BrainWireMessage {
     Event { event: BrainEvent },
 }
 
+fn observer_effect_audit_event(event: &BrainEvent) -> BrainEvent {
+    let mut projected = event.clone();
+    if let BrainEventKind::EffectAuditTransition { transition } = &event.kind {
+        projected.kind = BrainEventKind::EffectAuditTransition {
+            transition: transition.observer_projection(),
+        };
+    }
+    projected
+}
+
 struct BrainState {
     brain_id: BrainId,
     events: Vec<BrainEvent>,
@@ -1507,7 +1517,7 @@ impl BrainStore {
             name: name.to_string(),
             environment: self.environment.clone(),
             revision: state.events.last().map(|e| e.seq).unwrap_or(0),
-            events: state.events.clone(),
+            events: state.events.iter().map(observer_effect_audit_event).collect(),
             program_stack: state.program_stack.clone(),
             attachments: sorted_attachments(&state.attachments),
             runner_lease: state
@@ -1522,7 +1532,9 @@ impl BrainStore {
             tasks: state.tasks.clone(),
             schedules: sorted_schedules(&state.schedules),
             pending_schedule_dues: sorted_schedule_dues(&state.pending_schedule_dues),
-            effect_audits: state.effect_audits.entries().values().cloned().collect(),
+            effect_audits: state.effect_audits.entries().values()
+                .map(crate::runtime::effect_log::EffectAuditEntry::observer_projection)
+                .collect(),
         })
     }
 
@@ -1755,7 +1767,7 @@ impl BrainStore {
         self.compact_terminal_effect_audits_locked(
             name, state, MAX_RETAINED_TERMINAL_EFFECT_AUDITS,
         )?;
-        let _ = state.tx.send(event);
+        let _ = state.tx.send(observer_effect_audit_event(&event));
         Ok(true)
     }
 
@@ -1791,7 +1803,7 @@ impl BrainStore {
         self.append_event_batch(name, &events)?;
         for event in &events {
             state.apply(event.clone());
-            let _ = state.tx.send(event.clone());
+            let _ = state.tx.send(observer_effect_audit_event(event));
         }
         self.compact_terminal_effect_audits_locked(
             name, state, MAX_RETAINED_TERMINAL_EFFECT_AUDITS,
@@ -1837,20 +1849,22 @@ impl BrainStore {
                 continue;
             }
             match transition {
-                crate::runtime::effect_log::EffectAuditTransition::Reserve { .. } =>
-                    retained_events.push(event.clone()),
+                crate::runtime::effect_log::EffectAuditTransition::Reserve { .. } => {}
                 crate::runtime::effect_log::EffectAuditTransition::Begin { .. } => {}
-                crate::runtime::effect_log::EffectAuditTransition::Finish { outcome, .. } => {
+                crate::runtime::effect_log::EffectAuditTransition::Finish { identity, .. } => {
                     let mut compacted = event.clone();
-                    let BrainEventKind::EffectAuditTransition {
-                        transition: crate::runtime::effect_log::EffectAuditTransition::Finish {
-                            outcome: compacted_outcome, ..
-                        },
-                    } = &mut compacted.kind else { unreachable!() };
-                    *compacted_outcome =
-                        crate::runtime::effect_log::compacted_terminal_outcome(outcome)?;
+                    let entry = state.effect_audits.get(identity)
+                        .context("terminal effect audit disappeared during compaction")?;
+                    compacted.kind = BrainEventKind::EffectAuditTransition {
+                        transition: crate::runtime::effect_log::replay_fence_transition(entry)?,
+                    };
+                    anyhow::ensure!(serde_json::to_vec(&compacted)?.len()
+                            <= crate::runtime::effect_log::MAX_EFFECT_AUDIT_REPLAY_FENCE_EVENT_BYTES,
+                        "effect audit replay fence event exceeds its fixed encoded bound");
                     retained_events.push(compacted);
                 }
+                crate::runtime::effect_log::EffectAuditTransition::Fence { .. } =>
+                    retained_events.push(event.clone()),
             }
         }
 
@@ -9879,8 +9893,10 @@ mod tests {
         let snapshot = store.snapshot("shared").unwrap();
         assert!(matches!(snapshot.effect_audits[0].state,
             crate::runtime::effect_log::EffectAuditState::Terminal {
-                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Acknowledged { .. }
-            }));
+                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
+                    ref outcome_kind
+                }
+            } if outcome_kind == "acknowledged"));
         assert!(!snapshot.events.iter().any(|event|
             matches!(event.kind, BrainEventKind::ToolResult { .. })));
     }
@@ -9922,14 +9938,21 @@ mod tests {
             };
             store.reserve_effect_audit(&grant, uuid::Uuid::new_v4(), effect).unwrap();
         }
-        let snapshot_json = serde_json::to_string(&store.snapshot("shared").unwrap()).unwrap();
+        let private_digests = store.brains.read().unwrap()["shared"].effect_audits.entries()
+            .values().map(|entry| entry.intent.canonical_sha256.clone()).collect::<Vec<_>>();
+        let snapshot = store.snapshot("shared").unwrap();
+        let snapshot_json = serde_json::to_string(&snapshot).unwrap();
         let journal = std::fs::read_to_string(temp.path().join("shared/events.jsonl")).unwrap();
         for secret in ["FILE_SECRET_163", "NETWORK_SECRET_163", "PROCESS_SECRET_163"] {
             assert!(!snapshot_json.contains(secret), "snapshot leaked {secret}");
-            assert!(!journal.contains(secret), "canonical observer journal leaked {secret}");
+            assert!(!journal.contains(secret), "canonical audit journal leaked {secret}");
         }
-        assert!(snapshot_json.contains("canonical_sha256"));
-        assert!(snapshot_json.contains("payload_bytes"));
+        assert!(snapshot.effect_audits.iter().all(|entry|
+            entry.intent.canonical_sha256.is_empty()
+                && entry.authority.authority_id == uuid::Uuid::nil()
+                && entry.authority.runner_lease_id == uuid::Uuid::nil()));
+        assert!(private_digests.iter().all(|digest| !snapshot_json.contains(digest)),
+            "ordinary snapshot leaked a private canonical replay digest");
     }
 
     #[test]
@@ -10017,8 +10040,22 @@ mod tests {
             })).count(), 2);
         assert_eq!(snapshot.effect_audits.len(), 4,
             "compaction retains bounded replay fences instead of forgetting identities");
+        let compacted = snapshot.effect_audits.iter().filter(|entry| matches!(entry.state,
+            crate::runtime::effect_log::EffectAuditState::Terminal {
+                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Compacted { .. }
+            })).collect::<Vec<_>>();
+        assert!(compacted.iter().all(|entry| {
+            entry.intent.selector == crate::vm::ResourceSelector::None
+                && entry.intent.output.is_empty()
+                && entry.intent.effect_kind == "compacted"
+                && entry.intent.canonical_sha256.is_empty()
+        }), "ordinary snapshots expose only minimal observer tombstones");
         assert!(snapshot.effect_audits.iter().any(|entry|
             entry.intent.identity == unresolved && !entry.state.is_terminal()));
+        let journal = std::fs::read(temp.path().join("shared/events.jsonl")).unwrap();
+        assert!(journal.len()
+            < crate::runtime::effect_log::MAX_EFFECT_AUDIT_JOURNAL_BYTES_PER_BRAIN,
+            "fixed-size tombstones keep the canonical audit share under its hard bound");
         drop(store);
 
         let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
@@ -10047,6 +10084,26 @@ mod tests {
         assert!(restarted.append_effect_audit_transition_locked(
             "shared", state, conflicting,
         ).unwrap_err().to_string().contains("conflicting"));
+        assert!(!restarted.append_effect_audit_transition_locked(
+            "shared", state,
+            crate::runtime::effect_log::EffectAuditTransition::Finish {
+                identity: *identity,
+                authority_id: grant.authority.authority_id,
+                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Acknowledged {
+                    response: crate::runtime::VmResumeResponse::Result { values: Vec::new() },
+                },
+            },
+        ).unwrap(), "the exact compacted terminal outcome remains a no-op");
+        assert!(restarted.append_effect_audit_transition_locked(
+            "shared", state,
+            crate::runtime::effect_log::EffectAuditTransition::Finish {
+                identity: *identity,
+                authority_id: grant.authority.authority_id,
+                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::FailedPartial {
+                    detail: "changed outcome".into(),
+                },
+            },
+        ).unwrap_err().to_string().contains("conflicting terminal"));
         assert!(restarted.append_effect_audit_transition_locked(
             "shared", state,
             crate::runtime::effect_log::EffectAuditTransition::Begin {
@@ -10126,8 +10183,10 @@ mod tests {
         let snapshot = restarted.snapshot("legacy-audit").unwrap();
         assert!(matches!(snapshot.effect_audits[0].state,
             crate::runtime::effect_log::EffectAuditState::Terminal {
-                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::LegacyV14Snapshot { .. }
-            }));
+                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
+                    ref outcome_kind
+                }
+            } if outcome_kind == "legacy_v14_snapshot"));
     }
 
     #[test]
