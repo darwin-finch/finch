@@ -46,10 +46,6 @@ pub fn load_config() -> Result<Config> {
 }
 
 fn try_load_from_finch_config() -> Result<Option<Config>> {
-    use super::backend::BackendConfig;
-    use super::colors::ColorScheme;
-    use super::settings::{ClientConfig, FeaturesConfig, ServerConfig, TeacherEntry};
-
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let config_path = home.join(".finch/config.toml");
 
@@ -57,7 +53,15 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
         return Ok(None);
     }
 
-    let contents = fs::read_to_string(&config_path).map_err(|_e| {
+    Ok(Some(load_config_from_path(&config_path)?))
+}
+
+pub(crate) fn load_config_from_path(config_path: &std::path::Path) -> Result<Config> {
+    use super::backend::BackendConfig;
+    use super::colors::ColorScheme;
+    use super::settings::{ClientConfig, FeaturesConfig, ServerConfig, TeacherEntry};
+
+    let contents = fs::read_to_string(config_path).map_err(|_e| {
         anyhow::anyhow!(errors::file_not_found_error(
             &config_path.display().to_string(),
             "Configuration file"
@@ -174,7 +178,7 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
         .validate()
         .context("Configuration validation failed")?;
 
-    Ok(Some(config))
+    Ok(config)
 }
 
 #[cfg(test)]

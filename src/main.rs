@@ -13,7 +13,6 @@ use finch::cli::{ConversationHistory, Repl};
 use finch::config::{load_config, Config};
 use finch::metrics::MetricsLogger;
 use finch::models::ThresholdRouter;
-use finch::providers::create_provider;
 use finch::router::Router;
 use tracing_subscriber::prelude::*;
 
@@ -87,6 +86,11 @@ struct Args {
 enum Command {
     /// Run interactive setup wizard
     Setup,
+    /// Manage provider authentication owned by supported provider clients
+    Auth {
+        #[command(subcommand)]
+        auth_command: AuthCommand,
+    },
     /// Run HTTP daemon server
     Daemon {
         /// Bind address (default: 127.0.0.1:8000)
@@ -177,6 +181,21 @@ enum Command {
         #[command(subcommand)]
         sessions_command: SessionsCommand,
     },
+}
+
+#[derive(Parser, Debug)]
+enum AuthCommand {
+    /// Sign in to a ChatGPT subscription through Codex device authorization
+    Login { provider: AuthProvider },
+    /// Show managed provider sign-in status
+    Status { provider: AuthProvider },
+    /// Sign out and revoke the managed provider session
+    Logout { provider: AuthProvider },
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum AuthProvider {
+    Chatgpt,
 }
 
 #[derive(Parser, Debug)]
@@ -308,8 +327,8 @@ fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
 /// This function creates a provider based on the teacher configuration
 /// and wraps it in a ClaudeClient for backwards compatibility.
 fn create_claude_client_with_provider(config: &Config) -> Result<ClaudeClient> {
-    let provider = create_provider(&config.teachers)?;
-    Ok(ClaudeClient::with_provider(provider))
+    let graph = finch::providers::create_provider_graph_from_config(config)?;
+    Ok(ClaudeClient::with_shared_provider(graph.default_provider()))
 }
 
 /// Execute a Finch script using only the shared typed runtime. Script headers
@@ -732,6 +751,9 @@ async fn main() -> Result<()> {
         Some(Command::Setup) => {
             return run_setup().await;
         }
+        Some(Command::Auth { auth_command }) => {
+            return run_auth_command(auth_command).await;
+        }
         Some(Command::Daemon { bind }) => {
             return run_daemon(bind).await;
         }
@@ -911,87 +933,12 @@ async fn main() -> Result<()> {
                 use finch::cli::show_setup_wizard;
                 match show_setup_wizard() {
                     Ok(result) => {
-                        // Create config from unified providers list (new format)
-                        let active_theme = result.active_theme.clone();
-                        let default_persona = result.default_persona.clone();
-                        let daemon_only_mode = result.daemon_only_mode;
-                        let mdns_discovery = result.mdns_discovery;
-                        let finch_api_key = result.finch_api_key.clone();
-
-                        // Patch any empty API keys in the providers list with
-                        // auto-detected values from environment variables.
-                        let mut providers = result.providers;
-                        let auto = build_teachers_from_env();
-                        for p in &mut providers {
-                            if let Some(key) = p.api_key() {
-                                if key.is_empty() {
-                                    let ptype = p.provider_type().to_string();
-                                    if let Some(detected) =
-                                        auto.iter().find(|t| t.provider == ptype)
-                                    {
-                                        // Replace the empty-key entry with a filled one
-                                        *p = finch::config::ProviderEntry::from_teacher_entry(
-                                            detected,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        // If still no cloud providers with keys, add auto-detected ones
-                        let has_keys = providers
-                            .iter()
-                            .any(|p| p.api_key().map(|k| !k.is_empty()).unwrap_or(false));
-                        if !has_keys && !auto.is_empty() {
-                            for t in &auto {
-                                providers
-                                    .insert(0, finch::config::ProviderEntry::from_teacher_entry(t));
-                            }
-                        }
-
-                        let mut new_config = Config::with_providers(providers);
-                        finch::cli::setup_wizard::apply_daemon_api_key(
-                            &mut new_config,
-                            &finch_api_key,
-                        );
-                        new_config.active_theme = active_theme;
-                        new_config.active_persona = default_persona;
-                        if let Some(hf_tok) = result.hf_token {
-                            if !hf_tok.is_empty() {
-                                new_config.huggingface_token = Some(hf_tok);
-                            }
-                        }
-                        new_config.features = finch::config::FeaturesConfig {
-                            auto_approve_tools: result.auto_approve_tools,
-                            streaming_enabled: result.streaming_enabled,
-                            debug_logging: result.debug_logging,
-                            #[cfg(target_os = "macos")]
-                            gui_automation: result.gui_automation,
-                            #[cfg(target_os = "macos")]
-                            gui_automation_prompted: result.gui_automation_prompted,
-                            #[cfg(target_os = "macos")]
-                            gui_automation_last_known_available: result
-                                .gui_automation_last_known_available,
-                            #[cfg(target_os = "macos")]
-                            gui_automation_permission_context: result
-                                .gui_automation_permission_context,
-                            memory_context_lines: result.memory_context_lines,
-                            max_verbatim_messages: new_config.features.max_verbatim_messages,
-                            context_recall_k: new_config.features.context_recall_k,
-                            enable_summarization: new_config.features.enable_summarization,
-                            auto_compact_enabled: new_config.features.auto_compact_enabled,
-                        };
-                        if daemon_only_mode {
-                            new_config.server.mode = "daemon-only".to_string();
-                        }
-                        if mdns_discovery {
-                            new_config.server.advertise = true;
-                        }
-                        new_config.client.auto_discover = result.auto_discover;
-                        #[allow(deprecated)]
+                        if finch::cli::setup_wizard::validate_first_run_and_apply(&result).await?
+                            == finch::cli::setup_wizard::SetupApplyOutcome::Cancelled
                         {
-                            new_config.streaming_enabled = new_config.features.streaming_enabled;
+                            return Err(anyhow::anyhow!("Setup cancelled"));
                         }
-                        new_config.save()?;
+                        let new_config = finch::config::load_config()?;
                         use crossterm::style::Stylize as _;
                         eprintln!("\n{}\n", "✓ Configuration saved!".green().bold());
                         new_config
@@ -1107,8 +1054,10 @@ async fn main() -> Result<()> {
     // Create router
     let router = Router::new(threshold_router);
 
-    // Create Claude client
-    let claude_client = create_claude_client_with_provider(&config)?;
+    // Construct the named provider graph once. The compatibility client and daemon profile
+    // router share these exact instances, including any staged ChatGPT app-server binary.
+    let provider_graph = finch::providers::create_provider_graph_from_config(&config)?;
+    let claude_client = ClaudeClient::with_shared_provider(provider_graph.default_provider());
 
     // Create metrics logger
     let metrics_logger = MetricsLogger::new(config.metrics_dir.clone())?;
@@ -1209,6 +1158,43 @@ async fn main() -> Result<()> {
 
     if std::env::var("SHAMMAH_DEBUG").is_ok() {
         eprintln!("[DEBUG] REPL exited, returning from main");
+    }
+    Ok(())
+}
+
+async fn run_auth_command(command: AuthCommand) -> Result<()> {
+    use finch::providers::CodexAppServerAuth;
+
+    let auth = CodexAppServerAuth::new()?;
+    match command {
+        AuthCommand::Login {
+            provider: AuthProvider::Chatgpt,
+        } => {
+            let login = auth.begin_device_login().await?;
+            println!("Open: {}", login.details.verification_url);
+            println!("Enter code: {}", login.details.user_code);
+            auth.finish_device_login(login).await?;
+            println!("ChatGPT subscription sign-in complete.");
+        }
+        AuthCommand::Status {
+            provider: AuthProvider::Chatgpt,
+        } => {
+            let status = auth.status(true).await?;
+            if status.signed_in {
+                match status.plan_type {
+                    Some(plan) => println!("ChatGPT subscription: signed in ({plan})"),
+                    None => println!("ChatGPT subscription: signed in"),
+                }
+            } else {
+                println!("ChatGPT subscription: signed out");
+            }
+        }
+        AuthCommand::Logout {
+            provider: AuthProvider::Chatgpt,
+        } => {
+            auth.logout().await?;
+            println!("ChatGPT subscription: signed out");
+        }
     }
     Ok(())
 }
@@ -1652,8 +1638,10 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     // Create router
     let router = Router::new(threshold_router);
 
-    // Create Claude client
-    let claude_client = create_claude_client_with_provider(&config)?;
+    // Construct once, then share the same provider instances between compatibility forwarding
+    // and named daemon profile routing.
+    let provider_graph = finch::providers::create_provider_graph_from_config(&config)?;
+    let claude_client = ClaudeClient::with_shared_provider(provider_graph.default_provider());
 
     // Create metrics logger
     let metrics_logger = MetricsLogger::new(config.metrics_dir.clone())?;
@@ -1737,13 +1725,6 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         brain_password: config.server.brain_password.clone(),
     };
 
-    // Build the multi-provider pool from [[providers]] config (cloud providers only).
-    // Falls back gracefully to the legacy ClaudeClient path when empty.
-    let providers: Vec<Box<dyn finch::providers::LlmProvider>> = {
-        use finch::providers::create_providers_from_entries;
-        create_providers_from_entries(&config.providers).unwrap_or_default()
-    };
-
     // Create and start agent server (with LocalGenerator support)
     let server = AgentServer::new(
         config.clone(),
@@ -1754,7 +1735,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         local_generator,
         bootstrap_loader,
         generator_state,
-        providers,
+        provider_graph,
     )?;
 
     // Set up mDNS service advertisement if enabled
@@ -2252,12 +2233,14 @@ async fn run_query_teacher_only(
 
     let claude_client = create_claude_client_with_provider(config)?;
     let model = config
-        .active_teacher()
-        .and_then(|t| t.model.clone())
+        .cloud_providers()
+        .first()
+        .and_then(|provider| provider.model().map(str::to_string))
         .unwrap_or_else(|| finch::config::constants::DEFAULT_CLAUDE_MODEL.to_string());
     let provider = config
-        .active_teacher()
-        .map(|teacher| teacher.provider.clone())
+        .cloud_providers()
+        .first()
+        .map(|provider| provider.provider_type().to_string())
         .unwrap_or_else(|| "teacher".to_string());
     let wire_metrics = default_wire_metrics_logger();
     let mut wire_metric =
@@ -2542,7 +2525,12 @@ async fn run_setup() -> Result<()> {
 
     // Run the wizard
     let result = show_setup_wizard()?;
-    finch::cli::setup_wizard::apply_and_save(&result)?;
+    if finch::cli::setup_wizard::validate_command_and_apply(&result).await?
+        == finch::cli::setup_wizard::SetupApplyOutcome::Cancelled
+    {
+        println!("Setup cancelled; configuration was not changed.");
+        return Ok(());
+    }
 
     println!("\n✓ Configuration saved to ~/.finch/config.toml");
     println!("  You can now run: finch");
@@ -2556,7 +2544,7 @@ async fn run_node_info() -> Result<()> {
     use finch::node::NodeInfo;
 
     let config = load_config().unwrap_or_else(|_| Config::new(vec![]));
-    let has_teacher = config.active_teacher().is_some();
+    let has_teacher = !config.cloud_providers().is_empty();
     let info = NodeInfo::load(has_teacher)?;
 
     println!("╔══════════════════════════════════════╗");
@@ -2849,7 +2837,7 @@ async fn run_worker(bind_address: String, info_only: bool) -> Result<()> {
     use finch::node::NodeInfo;
 
     let config = load_config().unwrap_or_else(|_| Config::new(vec![]));
-    let has_teacher = config.active_teacher().is_some();
+    let has_teacher = !config.cloud_providers().is_empty();
     let info = NodeInfo::load(has_teacher)?;
 
     // Always show node identity when starting as worker
@@ -2964,7 +2952,7 @@ async fn run_agent(
         }
     };
 
-    if config.active_teacher().is_none() {
+    if config.cloud_providers().is_empty() {
         anyhow::bail!(
             "No teacher API configured.\n\
              Agent mode requires a teacher API (Claude, GPT-4, etc.).\n\

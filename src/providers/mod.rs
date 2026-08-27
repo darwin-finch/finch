@@ -14,6 +14,7 @@ pub mod types;
 
 // Provider implementations
 pub mod claude;
+pub mod codex_app_server;
 pub mod gemini;
 pub mod openai;
 
@@ -31,9 +32,12 @@ pub mod alignment;
 pub use alignment::{with_alignment, UNIVERSAL_ALIGNMENT_PROMPT};
 
 // Re-export commonly used types
+pub use codex_app_server::{CodexAppServerAuth, CodexAppServerProvider};
 pub use factory::{
-    create_provider, create_provider_from_entries, create_provider_from_entry,
-    create_provider_from_teacher, create_providers, create_providers_from_entries,
+    create_provider, create_provider_from_config, create_provider_from_entries,
+    create_provider_from_entry, create_provider_from_teacher, create_provider_graph_from_config,
+    create_providers, create_providers_from_config, create_providers_from_entries, ProviderGraph,
+    ProviderProfile,
 };
 pub use fallback_chain::FallbackChain;
 pub use teacher_session::{

@@ -400,7 +400,10 @@ impl ProviderEntry {
                 base_url: None,
                 name: name.clone(),
             }),
-            Self::Ollama { .. } | Self::RemoteDaemon { .. } | Self::Local { .. } => None,
+            Self::ChatgptSubscription { .. }
+            | Self::Ollama { .. }
+            | Self::RemoteDaemon { .. }
+            | Self::Local { .. } => None,
         }
     }
 
@@ -744,12 +747,21 @@ impl Config {
 
     /// Save configuration to TOML file at ~/.finch/config.toml
     pub fn save(&self) -> anyhow::Result<()> {
-        use std::fs;
-
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
         let config_dir = home.join(".finch");
         let config_path = config_dir.join("config.toml");
+
+        self.save_to(&config_path)
+    }
+
+    /// Save configuration to an explicit path owned by the caller.
+    pub(crate) fn save_to(&self, config_path: &std::path::Path) -> anyhow::Result<()> {
+        use std::fs;
+
+        let config_dir = config_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Configuration path has no parent directory"))?;
 
         // Create directory if it doesn't exist
         fs::create_dir_all(&config_dir)?;

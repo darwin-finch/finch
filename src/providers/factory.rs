@@ -5,10 +5,50 @@
 use anyhow::{bail, Context, Result};
 
 use super::claude::ClaudeProvider;
+use super::codex_app_server::CodexAppServerProvider;
 use super::gemini::GeminiProvider;
 use super::openai::OpenAIProvider;
 use super::LlmProvider;
-use crate::config::{ProviderEntry, TeacherEntry};
+use crate::config::{Config, ProviderEntry, TeacherEntry};
+use std::sync::Arc;
+
+/// A successfully constructed cloud provider paired with its configured selector.
+#[derive(Clone)]
+pub struct ProviderProfile {
+    profile_name: String,
+    provider: Arc<dyn LlmProvider>,
+}
+
+impl ProviderProfile {
+    /// The stable configured selector for this provider.
+    pub fn profile_name(&self) -> &str {
+        &self.profile_name
+    }
+
+    /// The shared provider instance owned by this profile.
+    pub fn provider(&self) -> &Arc<dyn LlmProvider> {
+        &self.provider
+    }
+}
+
+/// A cloud provider graph constructed exactly once from configuration.
+#[derive(Clone)]
+pub struct ProviderGraph {
+    profiles: Vec<ProviderProfile>,
+    default_provider: Arc<dyn LlmProvider>,
+}
+
+impl ProviderGraph {
+    /// Successfully constructed named profiles in configured fallback order.
+    pub fn profiles(&self) -> &[ProviderProfile] {
+        &self.profiles
+    }
+
+    /// Shared primary/fallback provider used by compatibility clients.
+    pub fn default_provider(&self) -> Arc<dyn LlmProvider> {
+        Arc::clone(&self.default_provider)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // New API: ProviderEntry-based (unified)
@@ -20,6 +60,14 @@ use crate::config::{ProviderEntry, TeacherEntry};
 /// (`create_local_generator`).
 pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmProvider>> {
     match entry {
+        ProviderEntry::ChatgptSubscription {
+            credential_ref,
+            model,
+            ..
+        } => Ok(Box::new(CodexAppServerProvider::new(
+            credential_ref.clone(),
+            model.clone().unwrap_or_else(|| "gpt-5.6-sol".to_string()),
+        )?)),
         ProviderEntry::Claude {
             api_key,
             model,
@@ -161,18 +209,54 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
 pub fn create_providers_from_entries(
     entries: &[ProviderEntry],
 ) -> Result<Vec<Box<dyn LlmProvider>>> {
+    Ok(
+        create_named_providers_from_entries_with(entries, create_provider_from_entry)?
+            .into_iter()
+            .map(|(_, provider)| provider)
+            .collect(),
+    )
+}
+
+fn create_named_providers_from_entries_with<F>(
+    entries: &[ProviderEntry],
+    mut create: F,
+) -> Result<Vec<(String, Box<dyn LlmProvider>)>>
+where
+    F: FnMut(&ProviderEntry) -> Result<Box<dyn LlmProvider>>,
+{
     let cloud: Vec<_> = entries.iter().filter(|e| !e.is_local()).collect();
     if cloud.is_empty() {
         bail!("No cloud provider entries configured");
     }
-    cloud
-        .iter()
-        .enumerate()
-        .map(|(idx, entry)| {
-            create_provider_from_entry(entry)
-                .with_context(|| format!("Failed to create provider #{}", idx + 1))
-        })
-        .collect()
+    let mut providers = Vec::with_capacity(cloud.len());
+    let mut skipped_chatgpt = Vec::new();
+    for (idx, entry) in cloud.into_iter().enumerate() {
+        match create(entry) {
+            Ok(provider) => providers.push((entry.profile_name(), provider)),
+            Err(error) if matches!(entry, ProviderEntry::ChatgptSubscription { .. }) => {
+                tracing::warn!(
+                    provider_index = idx + 1,
+                    error = %error,
+                    "Skipping unusable ChatGPT subscription provider; configured fallbacks remain available"
+                );
+                skipped_chatgpt.push(format!("provider #{}: {error}", idx + 1));
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to create provider #{}", idx + 1));
+            }
+        }
+    }
+    if providers.is_empty() {
+        if skipped_chatgpt.is_empty() {
+            bail!("No usable cloud provider entries configured");
+        }
+        bail!(
+            "No usable cloud provider entries configured; {}",
+            skipped_chatgpt.join("; ")
+        );
+    }
+    Ok(providers)
 }
 
 /// Return a single `LlmProvider` from a slice of unified entries.
@@ -188,6 +272,90 @@ pub fn create_provider_from_entries(entries: &[ProviderEntry]) -> Result<Box<dyn
         use super::FallbackChain;
         Ok(Box::new(FallbackChain::new(providers)))
     }
+}
+
+fn graph_from_boxed_profiles(
+    profiles: Vec<(String, Box<dyn LlmProvider>)>,
+) -> Result<ProviderGraph> {
+    if profiles.is_empty() {
+        bail!("No usable cloud provider entries configured");
+    }
+    let profiles: Vec<_> = profiles
+        .into_iter()
+        .map(|(profile_name, provider)| ProviderProfile {
+            profile_name,
+            provider: Arc::from(provider),
+        })
+        .collect();
+    let default_provider = if profiles.len() == 1 {
+        Arc::clone(profiles[0].provider())
+    } else {
+        Arc::new(super::FallbackChain::from_shared(
+            profiles
+                .iter()
+                .map(|profile| Arc::clone(profile.provider()))
+                .collect(),
+        ))
+    };
+    Ok(ProviderGraph {
+        profiles,
+        default_provider,
+    })
+}
+
+/// Construct the named cloud provider graph once, preserving profile/provider identity when an
+/// unusable ChatGPT entry is skipped. Legacy teacher-only configuration remains supported.
+pub fn create_provider_graph_from_config(config: &Config) -> Result<ProviderGraph> {
+    let profiles = if config.providers.iter().any(|entry| !entry.is_local()) {
+        create_named_providers_from_entries_with(&config.providers, create_provider_from_entry)?
+    } else {
+        if config.teachers.is_empty() {
+            bail!("No teacher providers configured");
+        }
+        config
+            .teachers
+            .iter()
+            .enumerate()
+            .map(|(idx, teacher)| {
+                let profile_name = teacher
+                    .name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+                    .or_else(|| {
+                        teacher
+                            .model
+                            .clone()
+                            .filter(|model| !model.trim().is_empty())
+                    })
+                    .unwrap_or_else(|| teacher.provider.clone());
+                create_provider_from_teacher(teacher)
+                    .map(|provider| (profile_name, provider))
+                    .with_context(|| format!("Failed to create teacher provider #{}", idx + 1))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    graph_from_boxed_profiles(profiles)
+}
+
+/// Create the ordered cloud provider pool from unified configuration, falling back to legacy
+/// teacher entries only when no cloud `[[providers]]` entries exist.
+pub fn create_providers_from_config(config: &Config) -> Result<Vec<Box<dyn LlmProvider>>> {
+    if config.providers.iter().any(|entry| !entry.is_local()) {
+        return create_providers_from_entries(&config.providers);
+    }
+    create_providers(&config.teachers)
+}
+
+/// Create the active provider or fallback chain from unified or legacy configuration.
+pub fn create_provider_from_config(config: &Config) -> Result<Box<dyn LlmProvider>> {
+    let providers = create_providers_from_config(config)?;
+    if providers.len() == 1 {
+        return Ok(providers
+            .into_iter()
+            .next()
+            .expect("len == 1 checked above"));
+    }
+    Ok(Box::new(super::FallbackChain::new(providers)))
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +384,10 @@ pub fn create_provider_from_teacher(entry: &TeacherEntry) -> Result<Box<dyn LlmP
         "claude" => {
             let mut provider = ClaudeProvider::new_with_endpoints(
                 entry.api_key.clone(),
-                entry.base_url.as_deref().unwrap_or("https://api.anthropic.com"),
+                entry
+                    .base_url
+                    .as_deref()
+                    .unwrap_or("https://api.anthropic.com"),
                 "/v1/messages",
                 "/v1/models",
             )?;
@@ -347,6 +518,26 @@ mod tests {
             base_url: None,
             name: None,
         }
+    }
+
+    fn install_schema_app_server(directory: &tempfile::TempDir, restricted: bool) {
+        let fake = directory.path().join("schema_app_server.py");
+        let script = if restricted {
+            r#"import json, pathlib, sys
+out = pathlib.Path(sys.argv[-1]) / 'v2'
+out.mkdir(parents=True)
+(out / 'ThreadStartParams.json').write_text('{}')
+schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandboxPolicy'}}, 'definitions': {'ReadOnlySandboxPolicy': {'properties': {'type': {'enum': ['readOnly']}, 'networkAccess': {'type': 'boolean'}, 'access': {'$ref': '#/definitions/ReadOnlyAccess'}}}, 'ReadOnlyAccess': {'properties': {'type': {'enum': ['restricted']}, 'readableRoots': {'type': 'array', 'items': {'type': 'string'}}, 'includePlatformDefaults': {'type': 'boolean'}}}}}
+(out / 'TurnStartParams.json').write_text(json.dumps(schema))
+"#
+        } else {
+            "import sys\n# No restricted schema output.\nsys.exit(0)\n"
+        };
+        std::fs::write(&fake, script).unwrap();
+        crate::providers::codex_app_server::install_test_provider_app_server(
+            std::path::PathBuf::from("python3"),
+            vec![fake.to_string_lossy().into_owned()],
+        );
     }
 
     fn pentry(variant: ProviderEntry) -> ProviderEntry {
@@ -565,5 +756,76 @@ mod tests {
         }];
         let result = create_providers_from_entries(&entries);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unusable_chatgpt_schema_preserves_later_configured_grok_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        install_schema_app_server(&directory, false);
+        let entries = vec![
+            ProviderEntry::ChatgptSubscription {
+                credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
+                    .into(),
+                model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.into()),
+                name: Some("subscription".into()),
+            },
+            ProviderEntry::Grok {
+                api_key: "xai-test".into(),
+                model: Some("grok-code-fast-1".into()),
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: Some("fallback".into()),
+            },
+        ];
+        let path = directory.path().join("config.toml");
+        Config::with_providers(entries).save_to(&path).unwrap();
+        let config = crate::config::load_config_from_path(&path).unwrap();
+        let graph = create_provider_graph_from_config(&config).unwrap();
+        assert_eq!(graph.profiles().len(), 1);
+        assert_eq!(graph.profiles()[0].profile_name(), "fallback");
+        assert_eq!(graph.profiles()[0].provider().name(), "grok");
+        assert_eq!(
+            graph.profiles()[0].provider().default_model(),
+            "grok-code-fast-1"
+        );
+        assert!(graph
+            .profiles()
+            .iter()
+            .all(|profile| profile.profile_name() != "subscription"));
+    }
+
+    #[test]
+    fn test_saved_chatgpt_only_config_constructs_shared_startup_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        install_schema_app_server(&directory, true);
+        let path = directory.path().join("config.toml");
+        Config::with_providers(vec![ProviderEntry::ChatgptSubscription {
+            credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF.into(),
+            model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.into()),
+            name: Some("subscription".into()),
+        }])
+        .save_to(&path)
+        .unwrap();
+
+        let config = crate::config::load_config_from_path(&path).unwrap();
+        assert!(config.teachers.is_empty());
+        let graph = create_provider_graph_from_config(&config).unwrap();
+        assert_eq!(graph.profiles().len(), 1);
+        assert_eq!(graph.profiles()[0].profile_name(), "subscription");
+        let default_provider = graph.default_provider();
+        assert!(Arc::ptr_eq(
+            &default_provider,
+            graph.profiles()[0].provider()
+        ));
+        assert_eq!(default_provider.name(), "chatgpt_subscription");
+    }
+
+    #[test]
+    fn test_shared_startup_provider_preserves_legacy_teacher_config() {
+        let mut config = Config::new(vec![entry("claude", "legacy-key")]);
+        config.providers.clear();
+        let provider = create_provider_from_config(&config).unwrap();
+        assert_eq!(provider.name(), "claude");
     }
 }

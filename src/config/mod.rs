@@ -17,6 +17,8 @@ pub use colors::{
     UiColors,
 };
 pub use loader::load_config;
+#[cfg(test)]
+pub(crate) use loader::load_config_from_path;
 pub use persona::Persona;
 pub use provider::{ProviderEntry, ReasoningEffort};
 pub use settings::{

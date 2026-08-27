@@ -892,19 +892,8 @@ impl Repl {
             .unwrap_or(0);
         let available_teachers = config.teachers.clone();
 
-        let teacher_provider = match crate::providers::create_provider(&config.teachers) {
-            Ok(provider) => provider,
-            Err(e) => {
-                output_status!("⚠️  Failed to create teacher provider: {}", e);
-                output_status!("   Using default Claude fallback");
-                // This shouldn't happen since claude_client already works,
-                // but we need to handle the error case
-                panic!("Cannot create teacher provider")
-            }
-        };
-
-        let teacher_session = Arc::new(RwLock::new(TeacherSession::with_config(
-            teacher_provider,
+        let teacher_session = Arc::new(RwLock::new(TeacherSession::with_shared_provider(
+            claude_client.shared_provider(),
             teacher_config,
         )));
 

@@ -10,12 +10,17 @@ use super::{LlmProvider, ProviderRequest, ProviderResponse, StreamChunk};
 
 /// A chain of providers to try in order
 pub struct FallbackChain {
-    providers: Arc<Vec<Box<dyn LlmProvider>>>,
+    providers: Arc<Vec<Arc<dyn LlmProvider>>>,
 }
 
 impl FallbackChain {
     /// Create a new fallback chain with providers in priority order
     pub fn new(providers: Vec<Box<dyn LlmProvider>>) -> Self {
+        Self::from_shared(providers.into_iter().map(Arc::from).collect())
+    }
+
+    /// Create a fallback chain without reconstructing already validated providers.
+    pub fn from_shared(providers: Vec<Arc<dyn LlmProvider>>) -> Self {
         Self {
             providers: Arc::new(providers),
         }
@@ -44,6 +49,22 @@ impl FallbackChain {
         let mut last_error = None;
 
         for (idx, provider) in self.providers.iter().enumerate() {
+            if request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| !tools.is_empty())
+                && !provider.supports_tools()
+            {
+                tracing::info!(
+                    provider = provider.name(),
+                    "Skipping provider because this turn requires tools"
+                );
+                last_error = Some(anyhow::anyhow!(
+                    "Provider {} cannot satisfy this turn's tool capability",
+                    provider.name()
+                ));
+                continue;
+            }
             tracing::debug!(
                 "Trying provider {} ({}/{})",
                 provider.name(),
@@ -118,6 +139,22 @@ impl FallbackChain {
         let mut last_error = None;
 
         for (idx, provider) in self.providers.iter().enumerate() {
+            if request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| !tools.is_empty())
+                && !provider.supports_tools()
+            {
+                tracing::info!(
+                    provider = provider.name(),
+                    "Skipping provider because this streaming turn requires tools"
+                );
+                last_error = Some(anyhow::anyhow!(
+                    "Provider {} cannot satisfy this turn's tool capability",
+                    provider.name()
+                ));
+                continue;
+            }
             tracing::debug!(
                 "Trying streaming with provider {} ({}/{})",
                 provider.name(),
@@ -215,9 +252,9 @@ impl LlmProvider for FallbackChain {
     }
 
     fn supports_tools(&self) -> bool {
-        self.primary_provider()
-            .map(|p| p.supports_tools())
-            .unwrap_or(false)
+        self.providers
+            .iter()
+            .any(|provider| provider.supports_tools())
     }
 }
 
@@ -225,11 +262,36 @@ impl LlmProvider for FallbackChain {
 mod tests {
     use super::*;
     use crate::claude::types::ContentBlock;
+    use crate::tools::types::{ToolDefinition, ToolInputSchema};
 
     // Mock provider for testing
     struct MockProvider {
         name: String,
         should_fail: bool,
+    }
+
+    struct NoToolProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for NoToolProvider {
+        async fn send_message(&self, _: &ProviderRequest) -> Result<ProviderResponse> {
+            panic!("provider without tools must be skipped before invocation")
+        }
+        async fn send_message_stream(
+            &self,
+            _: &ProviderRequest,
+        ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
+            panic!("provider without tools must be skipped before invocation")
+        }
+        fn name(&self) -> &str {
+            "no-tools"
+        }
+        fn default_model(&self) -> &str {
+            "no-tools-model"
+        }
+        fn supports_tools(&self) -> bool {
+            false
+        }
     }
 
     impl MockProvider {
@@ -382,5 +444,21 @@ mod tests {
 
         let result = chain.send_message_stream_with_fallback(&request).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn tool_turn_skips_incapable_primary_before_invocation() {
+        let chain = FallbackChain::new(vec![
+            Box::new(NoToolProvider),
+            Box::new(MockProvider::new("grok-fallback", false)),
+        ]);
+        let mut request = ProviderRequest::new(vec![]);
+        request.tools = Some(vec![ToolDefinition {
+            name: "lookup".into(),
+            description: "look up a value".into(),
+            input_schema: ToolInputSchema::simple(vec![("key", "lookup key")]),
+        }]);
+        let response = chain.send_message_with_fallback(&request).await.unwrap();
+        assert_eq!(response.provider, "grok-fallback");
     }
 }

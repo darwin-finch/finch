@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 
 use crate::claude::types::{ContentBlock, Message, MessageRequest};
 use crate::claude::ClaudeClient;
-use crate::config::constants::DEFAULT_CLAUDE_MODEL;
 use crate::config::{persona::Persona, Config};
 use crate::generators::claude::CODING_SYSTEM_PROMPT;
 use crate::tools::implementations::{
@@ -109,12 +108,8 @@ impl AgentLoop {
         let client = create_client(&self.config)?;
 
         // Set up reflection engine
-        let model = self
-            .config
-            .active_teacher()
-            .and_then(|t| t.model.clone())
-            .unwrap_or_else(|| DEFAULT_CLAUDE_MODEL.to_string());
-        let reflector = ReflectionEngine::new(create_client(&self.config)?, model.clone());
+        let model = client.model_name().to_string();
+        let reflector = ReflectionEngine::new(client.clone(), model.clone());
 
         let mut completed_count: usize = 0;
         let mut completed_descs: Vec<String> = Vec::new();
@@ -507,8 +502,8 @@ async fn build_tool_executor(
 }
 
 fn create_client(config: &Config) -> Result<ClaudeClient> {
-    let provider = crate::providers::create_provider(&config.teachers)?;
-    Ok(ClaudeClient::with_provider(provider))
+    let graph = crate::providers::create_provider_graph_from_config(config)?;
+    Ok(ClaudeClient::with_shared_provider(graph.default_provider()))
 }
 
 fn truncate(s: &str, max_len: usize) -> &str {
@@ -516,5 +511,47 @@ fn truncate(s: &str, max_len: usize) -> &str {
         s
     } else {
         &s[..max_len]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ProviderEntry;
+
+    #[test]
+    fn test_saved_chatgpt_only_config_constructs_agent_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let fake = directory.path().join("schema_app_server.py");
+        std::fs::write(
+            &fake,
+            r#"import json, pathlib, sys
+out = pathlib.Path(sys.argv[-1]) / 'v2'
+out.mkdir(parents=True)
+(out / 'ThreadStartParams.json').write_text('{}')
+schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandboxPolicy'}}, 'definitions': {'ReadOnlySandboxPolicy': {'properties': {'type': {'enum': ['readOnly']}, 'networkAccess': {'type': 'boolean'}, 'access': {'$ref': '#/definitions/ReadOnlyAccess'}}}, 'ReadOnlyAccess': {'properties': {'type': {'enum': ['restricted']}, 'readableRoots': {'type': 'array', 'items': {'type': 'string'}}, 'includePlatformDefaults': {'type': 'boolean'}}}}}
+(out / 'TurnStartParams.json').write_text(json.dumps(schema))
+"#,
+        )
+        .unwrap();
+        crate::providers::codex_app_server::install_test_provider_app_server(
+            PathBuf::from("python3"),
+            vec![fake.to_string_lossy().into_owned()],
+        );
+
+        let path = directory.path().join("config.toml");
+        Config::with_providers(vec![ProviderEntry::ChatgptSubscription {
+            credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
+                .to_string(),
+            model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.to_string()),
+            name: Some("subscription".to_string()),
+        }])
+        .save_to(&path)
+        .unwrap();
+        let config = crate::config::load_config_from_path(&path).unwrap();
+
+        let client = create_client(&config).unwrap();
+        assert_eq!(client.provider_name(), "chatgpt_subscription");
+        assert_eq!(client.model_name(), "gpt-5.6-sol");
     }
 }
