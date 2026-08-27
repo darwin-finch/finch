@@ -61,6 +61,11 @@ impl MessageId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Restore a stable ID supplied by a canonical transcript event.
+    pub fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
 }
 
 impl Default for MessageId {

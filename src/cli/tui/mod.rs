@@ -1323,23 +1323,32 @@ impl TuiRenderer {
     }
 }
 
-// ─── Raw-mode printing helpers ────────────────────────────────────────────────
+// ─── Raw-mode canonical transcript commit ───────────────────────────────────
 
-impl TuiRenderer {
-    /// Print a multi-line string to the terminal scrollback.
-    /// In raw mode every `\n` needs an accompanying `\r`.
-    fn raw_println(text: &str) -> Result<()> {
-        let mut stdout = io::stdout();
-        for line in text.split('\n') {
-            let line = line.trim_end_matches('\r');
-            execute!(stdout, Print(line), Print("\r\n"))?;
+fn commit_complete_messages(
+    stdout: &mut impl Write,
+    messages: &[MessageRef],
+    accordion: &mut AccordionState,
+    colors: &ColorScheme,
+    printed_ids: &mut HashSet<MessageId>,
+) -> Result<()> {
+    for message in messages {
+        accordion.expand_all(message, colors);
+        let complete = accordion
+            .render_message(message, colors)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for line in complete.split('\n') {
+            execute!(stdout, Print(line.trim_end_matches('\r')), Print("\r\n"))?;
         }
-        Ok(())
+        execute!(stdout, Print("\r\n"))?;
+        stdout.flush()?;
+        // A failed body, delimiter, or flush leaves the message retryable.
+        printed_ids.insert(message.id());
     }
-
-    fn raw_blank_line() -> Result<()> {
-        execute!(io::stdout(), Print("\r\n")).map_err(anyhow::Error::from)
-    }
+    Ok(())
 }
 
 // ─── Live area management ─────────────────────────────────────────────────────
@@ -1444,7 +1453,7 @@ impl TuiRenderer {
             .iter()
             .map(|line| line.text.clone())
             .collect::<Vec<_>>();
-        let content_frame = plan_live_content_frame(
+        let mut content_frame = plan_live_content_frame(
             &mut self.autocomplete_state,
             term_h,
             term_width,
@@ -1452,6 +1461,7 @@ impl TuiRenderer {
             &all_live_lines,
             dialog_active || self.last_render_error.is_some(),
         );
+        pin_live_disclosure_header(&all_live_rendered, &mut content_frame, term_width);
         let visible_live_rendered =
             rendered_metadata_for_visible(&all_live_rendered, &content_frame.live_lines);
         if !content_frame.live_lines.is_empty() {
@@ -1827,6 +1837,41 @@ fn viewport_tail_rendered_lines(
     terminal_width: usize,
     row_budget: usize,
 ) -> Vec<RenderedTranscriptLine> {
+    let selected = rendered_tail_without_pinning(lines, terminal_width, row_budget);
+    if selected.iter().any(|line| line.row_id.is_some()) || selected.is_empty() {
+        return selected;
+    }
+    let Some((header_index, header)) = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, line)| line.row_id.is_some())
+    else {
+        return selected;
+    };
+    let header_rows = shadow_buffer::physical_rows(&header.text, terminal_width.max(1));
+    if header_rows > row_budget {
+        if row_budget == 0 {
+            return selected;
+        }
+        let mut compact = header.clone();
+        compact.text = visible_prefix(&compact.text, terminal_width.max(1));
+        return vec![compact];
+    }
+    let mut pinned = vec![header.clone()];
+    pinned.extend(rendered_tail_without_pinning(
+        &lines[header_index + 1..],
+        terminal_width,
+        row_budget.saturating_sub(header_rows),
+    ));
+    pinned
+}
+
+fn rendered_tail_without_pinning(
+    lines: &[RenderedTranscriptLine],
+    terminal_width: usize,
+    row_budget: usize,
+) -> Vec<RenderedTranscriptLine> {
     if row_budget == 0 {
         return Vec::new();
     }
@@ -1879,6 +1924,29 @@ fn rendered_metadata_for_visible(
         .collect::<Vec<_>>();
     matched.reverse();
     matched
+}
+
+fn pin_live_disclosure_header(
+    all: &[RenderedTranscriptLine],
+    frame: &mut LiveContentFrame,
+    terminal_width: usize,
+) {
+    if frame.live_lines.is_empty() || !all.iter().any(|line| line.row_id.is_some()) {
+        return;
+    }
+    let visible = rendered_metadata_for_visible(all, &frame.live_lines);
+    if visible.iter().any(|line| line.row_id.is_some()) {
+        return;
+    }
+    let budget = frame
+        .live_lines
+        .iter()
+        .map(|line| shadow_buffer::physical_rows(line, terminal_width.max(1)))
+        .sum();
+    frame.live_lines = viewport_tail_rendered_lines(all, terminal_width, budget)
+        .into_iter()
+        .map(|line| line.text)
+        .collect();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1948,11 +2016,9 @@ impl TuiRenderer {
 
         let mut to_commit: Vec<MessageRef> = Vec::new();
         for msg in unprinted.into_iter().take(committable) {
-            let id = msg.id();
             match msg.status() {
                 MessageStatus::Complete | MessageStatus::Failed => {
                     to_commit.push(msg);
-                    self.printed_ids.insert(id);
                 }
                 MessageStatus::InProgress => {
                     unreachable!("committable prefix excludes live messages")
@@ -1960,26 +2026,31 @@ impl TuiRenderer {
             }
         }
 
-        // A resize invalidates terminal coordinates for both the live region
-        // and the visible part of committed transcript. Rebuild that viewport
-        // once, including messages that became committable in this tick.
+        // Re-establish trustworthy live-area coordinates before committing a
+        // completion that raced resize. The completed message remains in the
+        // uncommitted suffix until its canonical bytes are actually written.
         if self.viewport_invalidated {
             self.redraw_full_viewport()?;
-            self.live_area_dirty = false;
-            return Ok(());
+            if to_commit.is_empty() {
+                self.live_area_dirty = false;
+                return Ok(());
+            }
         }
 
         if !to_commit.is_empty() {
             self.erase_live_area()?;
-            for msg in &to_commit {
-                Self::raw_println(&msg.complete_transcript(&self.colors))?;
-                // Blank line after every committed message so the output area
-                // stays readable (issue #15 — remove clutter between work items).
-                Self::raw_blank_line()?;
-            }
-            self.pending_viewport_size = Some(crossterm::terminal::size().unwrap_or((80, 24)));
-            self.viewport_invalidated = true;
-            self.redraw_full_viewport()?;
+            let mut stdout = io::stdout();
+            commit_complete_messages(
+                &mut stdout,
+                &to_commit,
+                &mut self.accordion,
+                &self.colors,
+                &mut self.printed_ids,
+            )?;
+            // Drawing the live region below the inserted canonical rows is
+            // what naturally scrolls those rows into terminal history. Do not
+            // clear/reproject the visible screen in this commit transaction.
+            self.draw_live_area()?;
             self.live_area_dirty = false;
         } else {
             // Only redraw when something actually changed: a message is streaming
@@ -2188,12 +2259,12 @@ impl TuiRenderer {
                     {
                         self.handle_tab_key(key);
                     }
-                    Event::Key(key)
-                        if key.modifiers == KeyModifiers::NONE
-                            && self.handle_completion_key(key.code) => {}
                     Event::Key(key) if self.handle_accordion_key(key) => {
                         self.render()?;
                     }
+                    Event::Key(key)
+                        if key.modifiers == KeyModifiers::NONE
+                            && self.handle_completion_key(key.code) => {}
                     Event::Key(key) => match (key.code, key.modifiers) {
                         // Shift+Enter or Alt/Option+Enter: insert newline instead of submit.
                         // Standard VT100 raw mode never sends SHIFT for Enter on macOS —
@@ -2404,13 +2475,13 @@ impl TuiRenderer {
         .sum::<usize>();
         let base_reserved_rows =
             1 + drawn_input_rows + drawn_status_rows + todo_rows + self.agent_tasks.len();
-        let all_live_lines = self
-            .projected_lines(self.find_live_messages())
-            .into_iter()
-            .map(|line| line.text)
+        let all_live_rendered = self.projected_lines(self.find_live_messages());
+        let all_live_lines = all_live_rendered
+            .iter()
+            .map(|line| line.text.clone())
             .collect::<Vec<_>>();
         let mut autocomplete = self.autocomplete_state.clone();
-        let content_frame = plan_live_content_frame(
+        let mut content_frame = plan_live_content_frame(
             &mut autocomplete,
             draw_height,
             draw_width,
@@ -2418,6 +2489,7 @@ impl TuiRenderer {
             &all_live_lines,
             self.last_render_error.is_some(),
         );
+        pin_live_disclosure_header(&all_live_rendered, &mut content_frame, term_width);
         let completion_rows = content_frame.completion_lines.len();
         let mut rows = 0;
         rows += content_frame
@@ -3838,6 +3910,89 @@ mod tests {
         assert!(raw.contains("[collapsed]"));
         assert!(!raw.contains("line four"));
         assert!(!raw.contains("\x1b[3J"), "must preserve native scrollback");
+    }
+
+    #[test]
+    fn oversized_expanded_projection_pins_a_keyboard_and_mouse_target() {
+        let work = Arc::new(WorkUnit::new("response"));
+        work.set_response(
+            (0..40)
+                .map(|n| format!("row {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        work.set_complete();
+        let message: MessageRef = work;
+        let colors = ColorScheme::default();
+        let state = AccordionState::default();
+        let all = state.render_message(&message, &colors);
+
+        let visible = viewport_tail_rendered_lines(&all, 20, 4);
+
+        assert!(
+            visible[0].row_id.is_some(),
+            "disclosure control must stay visible"
+        );
+        assert!(visible[0].text.contains("[expanded]"));
+        assert!(visible.iter().any(|line| line.text.contains("row 39")));
+        assert!(
+            visible
+                .iter()
+                .map(|line| shadow_buffer::physical_rows(&line.text, 20))
+                .sum::<usize>()
+                <= 4
+        );
+        let tiny = viewport_tail_rendered_lines(&all, 8, 1);
+        assert_eq!(tiny.len(), 1);
+        assert!(tiny[0].row_id.is_some());
+        assert_eq!(shadow_buffer::physical_rows(&tiny[0].text, 8), 1);
+    }
+
+    #[test]
+    fn canonical_commit_marks_only_after_success_and_follows_resize_clear() {
+        struct FlushFailure(Vec<u8>);
+        impl Write for FlushFailure {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("hostile flush failure"))
+            }
+        }
+
+        let work = Arc::new(WorkUnit::new("program"));
+        work.set_program_source("forth");
+        work.set_response("secret canonical body");
+        work.set_complete();
+        let message: MessageRef = work;
+        let colors = ColorScheme::default();
+        let mut state = AccordionState::default();
+        let mut printed = HashSet::new();
+        let mut failure = FlushFailure(Vec::new());
+        assert!(commit_complete_messages(
+            &mut failure,
+            std::slice::from_ref(&message),
+            &mut state,
+            &colors,
+            &mut printed,
+        )
+        .is_err());
+        assert!(printed.is_empty(), "failed commit must remain retryable");
+
+        let mut bytes = Vec::new();
+        begin_full_viewport_paint(
+            &mut bytes,
+            viewport_redraw_plan(8, 2, 1),
+            &["resize projection".into()],
+        )
+        .unwrap();
+        commit_complete_messages(&mut bytes, &[message], &mut state, &colors, &mut printed)
+            .unwrap();
+        let raw = String::from_utf8(bytes).unwrap();
+        assert!(raw.find("\x1b[2J").unwrap() < raw.find("secret canonical body").unwrap());
+        assert_eq!(raw.matches("secret canonical body").count(), 1);
+        assert_eq!(printed.len(), 1);
     }
 
     #[test]

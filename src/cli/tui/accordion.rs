@@ -33,6 +33,21 @@ pub struct AccordionState {
 }
 
 impl AccordionState {
+    pub fn expand_all(&mut self, message: &MessageRef, colors: &ColorScheme) {
+        if let Some(root) = message.transcript_row(colors) {
+            self.set_tree_expanded(&root);
+        }
+    }
+
+    fn set_tree_expanded(&mut self, row: &TranscriptRow) {
+        if !row.body.is_empty() || !row.children.is_empty() {
+            self.expanded.insert(row.id.clone(), true);
+        }
+        for child in &row.children {
+            self.set_tree_expanded(child);
+        }
+    }
+
     pub fn is_expanded(&self, row: &TranscriptRow) -> bool {
         self.expanded
             .get(&row.id)
@@ -174,15 +189,18 @@ impl AccordionState {
                     .get(&focused)
                     .copied()
                     .unwrap_or(false);
-                self.expanded.insert(focused, !current);
+                self.expanded.insert(focused.clone(), !current);
+                self.visible_expanded.insert(focused, !current);
                 true
             }
             KeyCode::Left => {
-                self.expanded.insert(focused, false);
+                self.expanded.insert(focused.clone(), false);
+                self.visible_expanded.insert(focused, false);
                 true
             }
             KeyCode::Right => {
-                self.expanded.insert(focused, true);
+                self.expanded.insert(focused.clone(), true);
+                self.visible_expanded.insert(focused, true);
                 true
             }
             KeyCode::Esc => {
@@ -208,7 +226,8 @@ impl AccordionState {
         let row_id = region.row_id.clone();
         self.focused = Some(row_id.clone());
         let current = self.visible_expanded.get(&row_id).copied().unwrap_or(false);
-        self.expanded.insert(row_id, !current);
+        self.expanded.insert(row_id.clone(), !current);
+        self.visible_expanded.insert(row_id, !current);
         true
     }
 }
@@ -343,5 +362,32 @@ mod tests {
         assert!(visible
             .iter()
             .any(|line| line.text.contains("visible output")));
+    }
+
+    #[test]
+    fn test_reconnect_projection_reuses_canonical_message_identity() {
+        let id = crate::cli::messages::MessageId::from_uuid(uuid::Uuid::from_u128(69));
+        let original = Arc::new(WorkUnit::with_id(id, "program"));
+        original.set_program_source("forth");
+        original.set_response("a\nb\nc\nd");
+        original.set_complete();
+        let original_message: MessageRef = original;
+        let colors = ColorScheme::default();
+        let mut state = AccordionState::default();
+        let initial = state.render_message(&original_message, &colors);
+        state.rebuild_hit_regions(&initial, 0, 80);
+        assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert!(state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)));
+
+        let replayed = Arc::new(WorkUnit::with_id(id, "program"));
+        replayed.set_program_source("forth");
+        replayed.set_response("a\nb\nc\nd\nafter reconnect");
+        replayed.set_complete();
+        let replayed_message: MessageRef = replayed;
+        let rendered = state.render_message(&replayed_message, &colors);
+        assert!(rendered[0].text.contains("[expanded]"));
+        assert!(rendered
+            .iter()
+            .any(|line| line.text.contains("after reconnect")));
     }
 }

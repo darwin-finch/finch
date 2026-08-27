@@ -192,8 +192,14 @@ impl fmt::Debug for WorkUnit {
 impl WorkUnit {
     /// Create a new WorkUnit with the given verb (e.g. `"Channeling"`).
     pub fn new(verb: impl Into<String>) -> Self {
+        Self::with_id(MessageId::new(), verb)
+    }
+
+    /// Reconstruct a WorkUnit with the stable ID carried by retained/canonical
+    /// session data so disclosure state survives frontend reconnects.
+    pub fn with_id(id: MessageId, verb: impl Into<String>) -> Self {
         Self {
-            id: MessageId::new(),
+            id,
             verb: verb.into(),
             started_at: Instant::now(),
             inner: Arc::new(RwLock::new(WorkUnitInner {
