@@ -27,6 +27,14 @@ jobs:
         os: [ubuntu-24.04, macos-14]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Assert issue 180 file scope
+        shell: bash
+        run: |
+          changed="$(git diff --name-only ca184e08a3e99992f86f3a3d14a260a7f3986760...HEAD)"
+          unexpected="$(printf '%s\n' "$changed" | grep -Ev '^(src/providers/openai\.rs|docs/OPENAI_TRANSPORT\.md|\.github/workflows/issue-180-openai-sol-transport\.yml)$' || true)"
+          test -z "$unexpected" || { printf 'Unexpected issue #180 paths:\n%s\n' "$unexpected"; exit 1; }
       - name: Install Cap'n Proto on Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y capnproto
