@@ -149,6 +149,34 @@ test -z "$(find "$hostile_state" -mindepth 2 -print -quit)"
 test ! -e "$hostile_state/corpus.jsonl"
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
+# Concurrent ordinary invocations receive disjoint process groups, state
+# roots, sockets, listener addresses, and credentials without mutating global
+# parent-shell environment.
+parallel_a="$scratch/parallel-a"
+parallel_b="$scratch/parallel-b"
+phase=parallel-supervisor-isolation
+FINCH_PARALLEL_RECORD="$parallel_a" run_isolated bash -c '
+  printf "%s|%s|%s|%s|%s|%s|%s|%s|%s\n" \
+    "$HOME" "$FINCH_BRAIN_TEST_ROOT" "$FINCH_TEST_SOCKET_ROOT" \
+    "$FINCH_TEST_IPC_SOCKET" "$FINCH_TEST_BRAIN_ADDR" \
+    "$FINCH_TEST_DAEMON_ADDR" "$FINCH_TEST_BRAIN_PASSWORD" \
+    "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" >"$FINCH_PARALLEL_RECORD"
+  sleep 0.2
+' & parallel_pid_a=$!
+FINCH_PARALLEL_RECORD="$parallel_b" run_isolated bash -c '
+  printf "%s|%s|%s|%s|%s|%s|%s|%s|%s\n" \
+    "$HOME" "$FINCH_BRAIN_TEST_ROOT" "$FINCH_TEST_SOCKET_ROOT" \
+    "$FINCH_TEST_IPC_SOCKET" "$FINCH_TEST_BRAIN_ADDR" \
+    "$FINCH_TEST_DAEMON_ADDR" "$FINCH_TEST_BRAIN_PASSWORD" \
+    "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" >"$FINCH_PARALLEL_RECORD"
+  sleep 0.2
+' & parallel_pid_b=$!
+wait "$parallel_pid_a"
+wait "$parallel_pid_b"
+test "$(awk -F '|' '{ for (field = 1; field <= NF; field++) print field "|" $field }' \
+  "$parallel_a" "$parallel_b" | sort -u | wc -l | tr -d ' ')" -eq 18
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
 # Environment strings plus a caller-created descriptor are not wrapper
 # authority. This linked, caller-owned proof must fail before any launcher can
 # treat the process as isolated.
