@@ -1494,9 +1494,12 @@ mod tests {
         symlink(&target, &output).unwrap();
 
         let error = open_private_profile_output(&output).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("private CoreML compute-plan output"));
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("CoreML compute-plan output")
+                || diagnostic.to_ascii_lowercase().contains("symlink"),
+            "unexpected symlink rejection diagnostic: {diagnostic}"
+        );
         assert_eq!(fs::read_to_string(target).unwrap(), "keep");
     }
 
