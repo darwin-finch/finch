@@ -20,7 +20,7 @@ ALLOWLIST_HEADER = (
     "size",
     "platform",
     "license",
-    "provenance",
+    "provenance_document",
     "generation_reason",
 )
 MAX_ALLOWLIST_ENTRIES = 20
@@ -43,6 +43,7 @@ GENERATED_SUFFIXES = (
     ".a",
     ".bak",
     ".core",
+    ".crash",
     ".dll",
     ".dmp",
     ".dump",
@@ -50,6 +51,7 @@ GENERATED_SUFFIXES = (
     ".exe",
     ".gcda",
     ".gcno",
+    ".ips",
     ".lib",
     ".log",
     ".o",
@@ -65,7 +67,13 @@ GENERATED_SUFFIXES = (
     ".swo",
     ".swp",
 )
-CACHE_COMPONENTS = {"__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
+CACHE_COMPONENTS = {
+    "target",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+}
 GENERATED_NAMES = {".coverage", "coverage.xml", "lcov.info"}
 CORE_NAME = re.compile(r"core(?:\.\d+)?$")
 
@@ -117,7 +125,15 @@ def load_allowlist(
         if len(fields) != len(ALLOWLIST_HEADER) or any(not field.strip() for field in fields):
             errors.append(f"{path}:{line_number}: every provenance field is required")
             continue
-        raw_name, expected_hash, raw_size, platform, license_name, provenance, reason = fields
+        (
+            raw_name,
+            expected_hash,
+            raw_size,
+            platform,
+            license_name,
+            raw_provenance,
+            reason,
+        ) = fields
         name = PurePosixPath(raw_name)
         if name.is_absolute() or ".." in name.parts or name.as_posix() != raw_name:
             errors.append(f"{path}:{line_number}: path must be a normalized repository-relative path")
@@ -126,6 +142,29 @@ def load_allowlist(
             errors.append(f"{path}:{line_number}: duplicate allowlist path {name}")
             continue
         entries.add(name)
+        provenance = PurePosixPath(raw_provenance)
+        if (
+            provenance.is_absolute()
+            or ".." in provenance.parts
+            or provenance.as_posix() != raw_provenance
+            or provenance.suffix.lower() != ".md"
+            or provenance.parent != name.parent
+        ):
+            errors.append(
+                f"{path}:{line_number}: provenance_document must be a colocated Markdown path"
+            )
+            continue
+        if provenance not in tracked:
+            errors.append(
+                f"{path}:{line_number}: provenance document is not tracked: {provenance}"
+            )
+            continue
+        provenance_path = root.joinpath(*provenance.parts)
+        if provenance_path.is_symlink() or not provenance_path.is_file():
+            errors.append(
+                f"{path}:{line_number}: provenance document must be a regular file: {provenance}"
+            )
+            continue
         if name not in tracked:
             errors.append(f"{path}:{line_number}: allowlisted path is not tracked: {name}")
             continue
@@ -147,8 +186,14 @@ def load_allowlist(
             errors.append(f"{path}:{line_number}: sha256 must be 64 lowercase hexadecimal digits")
         elif sha256(fixture) != expected_hash:
             errors.append(f"{path}:{line_number}: sha256 mismatch for {name}")
-        # Keep these names visible in diagnostics and make accidental empty metadata impossible.
-        _ = platform, license_name, provenance, reason
+        provenance_text = provenance_path.read_text()
+        required_provenance = (raw_name, expected_hash, raw_size, platform, license_name, reason)
+        missing = [value for value in required_provenance if value not in provenance_text]
+        if missing:
+            errors.append(
+                f"{path}:{line_number}: provenance document {provenance} is missing exact "
+                f"fixture metadata: {', '.join(missing)}"
+            )
 
     if len(entries) > MAX_ALLOWLIST_ENTRIES:
         errors.append(
@@ -173,18 +218,25 @@ def native_magic_reason(path: Path) -> str | None:
         return None
     with path.open("rb") as handle:
         prefix = handle.read(MAGIC_PREFIX_BYTES)
-    if prefix[:4] in MACH_O_MAGICS:
-        return "Mach-O magic"
-    if prefix.startswith(b"\x7fELF"):
-        return "ELF magic"
-    if prefix.startswith(b"!<arch>\n"):
-        return "static archive magic"
-    if prefix.startswith(b"BC\xc0\xde"):
-        return "LLVM bitcode magic"
-    if prefix.startswith(b"MZ") and len(prefix) >= 64:
-        pe_offset = struct.unpack_from("<I", prefix, 0x3C)[0]
-        if pe_offset + 4 <= len(prefix) and prefix[pe_offset : pe_offset + 4] == b"PE\0\0":
-            return "PE magic"
+        if prefix[:4] in MACH_O_MAGICS:
+            return "Mach-O magic"
+        if prefix.startswith(b"\x7fELF"):
+            return "ELF magic"
+        if prefix.startswith(b"!<arch>\n"):
+            return "static archive magic"
+        if prefix.startswith(b"BC\xc0\xde"):
+            return "LLVM bitcode magic"
+        if prefix.startswith(b"MZ") and len(prefix) >= 64:
+            pe_offset = struct.unpack_from("<I", prefix, 0x3C)[0]
+            if pe_offset < 64 or pe_offset + 4 > path.stat().st_size:
+                return None
+            if pe_offset + 4 <= len(prefix):
+                signature = prefix[pe_offset : pe_offset + 4]
+            else:
+                handle.seek(pe_offset)
+                signature = handle.read(4)
+            if signature == b"PE\0\0":
+                return "PE magic"
     return None
 
 

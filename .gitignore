@@ -51,6 +51,8 @@ shammah_errors.log
 *.rej
 *.dmp
 *.dump
+*.crash
+*.ips
 core
 core.[0-9]*
 *.profraw

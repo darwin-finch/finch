@@ -13,7 +13,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CHECKER = ROOT / "scripts/check_repository_hygiene.py"
-HEADER = "path\tsha256\tsize\tplatform\tlicense\tprovenance\tgeneration_reason\n"
+HEADER = (
+    "path\tsha256\tsize\tplatform\tlicense\tprovenance_document\t"
+    "generation_reason\n"
+)
 
 
 class HygieneRepository:
@@ -55,10 +58,10 @@ class RepositoryHygieneTests(unittest.TestCase):
         self.repo.close()
 
     def test_rejects_tracked_mach_o_elf_and_pe(self) -> None:
-        pe = bytearray(128)
+        pe = bytearray(8_256)
         pe[:2] = b"MZ"
-        struct.pack_into("<I", pe, 0x3C, 64)
-        pe[64:68] = b"PE\0\0"
+        struct.pack_into("<I", pe, 0x3C, 8_192)
+        pe[8_192:8_196] = b"PE\0\0"
         self.repo.write("tmp/mach-o", bytes.fromhex("feedfacf") + bytes(32))
         self.repo.write("tmp/elf", b"\x7fELF" + bytes(32))
         self.repo.write("tmp/windows", bytes(pe))
@@ -74,13 +77,22 @@ class RepositoryHygieneTests(unittest.TestCase):
     def test_rejects_tracked_transient_artifacts(self) -> None:
         self.repo.write("src/lib.rs.bak", b"temporary source")
         self.repo.write("debug/session.log", b"temporary log")
-        self.repo.track("src/lib.rs.bak", "debug/session.log")
+        self.repo.write("debug/process.crash", b"temporary crash report")
+        self.repo.write("target/cache-record", b"temporary build cache")
+        self.repo.track(
+            "src/lib.rs.bak",
+            "debug/session.log",
+            "debug/process.crash",
+            "target/cache-record",
+        )
 
         result = self.repo.run()
 
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("src/lib.rs.bak", result.stderr)
         self.assertIn("debug/session.log", result.stderr)
+        self.assertIn("debug/process.crash", result.stderr)
+        self.assertIn("target/cache-record", result.stderr)
 
     def test_accepts_executable_text_script(self) -> None:
         self.repo.write("scripts/example.sh", b"#!/bin/sh\nprintf '%s\\n' ok\n", executable=True)
@@ -94,16 +106,25 @@ class RepositoryHygieneTests(unittest.TestCase):
         contents = bytes.fromhex("feedfacf") + bytes(32)
         fixture = self.repo.write("tests/fixtures/arm64-header.bin", contents)
         digest = hashlib.sha256(contents).hexdigest()
+        reason = "prebuilt bytes required at parser boundary"
+        provenance = (
+            "# arm64 header fixture\n\n"
+            f"Path: tests/fixtures/arm64-header.bin\n\nSHA-256: {digest}\n\n"
+            f"Size: {fixture.stat().st_size}\n\nPlatform: macOS arm64\n\n"
+            f"License: CC0-1.0\n\nReason: {reason}\n"
+        )
+        self.repo.write("tests/fixtures/arm64-header.md", provenance.encode())
         row = (
             f"tests/fixtures/arm64-header.bin\t{digest}\t{fixture.stat().st_size}\t"
-            "macOS arm64\tCC0-1.0\tsynthetic test data\t"
-            "prebuilt bytes required at parser boundary\n"
+            f"macOS arm64\tCC0-1.0\ttests/fixtures/arm64-header.md\t{reason}\n"
         )
         self.repo.write(
             ".github/repository-hygiene-allowlist.tsv", (HEADER + row).encode()
         )
         self.repo.track(
-            ".github/repository-hygiene-allowlist.tsv", "tests/fixtures/arm64-header.bin"
+            ".github/repository-hygiene-allowlist.tsv",
+            "tests/fixtures/arm64-header.bin",
+            "tests/fixtures/arm64-header.md",
         )
 
         result = self.repo.run()

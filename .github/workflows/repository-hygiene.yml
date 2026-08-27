@@ -2,13 +2,6 @@ name: Repository hygiene
 
 on:
   pull_request:
-    paths:
-      - ".github/repository-hygiene-allowlist.tsv"
-      - ".github/workflows/repository-hygiene.yml"
-      - ".gitignore"
-      - "docs/REPOSITORY_HYGIENE.md"
-      - "scripts/check_repository_hygiene.py"
-      - "scripts/test_repository_hygiene.py"
   push:
     branches: [main]
 

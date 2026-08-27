@@ -1,2 +1,2 @@
 # Exceptional tracked artifacts only. See docs/REPOSITORY_HYGIENE.md.
-path	sha256	size	platform	license	provenance	generation_reason
+path	sha256	size	platform	license	provenance_document	generation_reason

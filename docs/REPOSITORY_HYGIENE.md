@@ -26,13 +26,15 @@ the boundary adequately. Add one row to `.github/repository-hygiene-allowlist.ts
 - lowercase SHA-256 digest and exact byte size;
 - producing or target platform;
 - license or redistribution terms;
-- provenance identifying where and how the bytes were obtained; and
+- a tracked, colocated Markdown provenance document identifying where and how the bytes were
+  obtained; and
 - the reason reproducing the fixture from source is insufficient.
 
 Keep the fixture minimal and deterministic, document its regeneration or acquisition next to the
-fixture, and have both the bytes and allowlist row reviewed. The guard verifies the path, size, and
-digest. Its allowlist is deliberately capped at 20 entries so exceptional data cannot quietly become
-a general artifact store.
+fixture, and have the bytes, provenance document, and allowlist row reviewed. The provenance document
+must repeat the exact path, digest, size, platform, license, and generation rationale; the guard
+verifies all six values in addition to the file metadata. Its allowlist is deliberately capped at 20
+entries so exceptional data cannot quietly become a general artifact store.
 
 ## Removed root artifacts
 
