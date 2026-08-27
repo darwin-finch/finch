@@ -215,7 +215,7 @@ mod tests {
         let resolver_calls = Cell::new(0);
         let source = Config::with_providers_and_paths(
             vec![ProviderEntry::Claude {
-                api_key: String::new(),
+                api_key: "sk-ant-test-key-1234567890".to_string(),
                 model: None,
                 base_url: None,
                 chat_path: None,
