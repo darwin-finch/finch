@@ -24,6 +24,7 @@ struct CredentialBoundProvider {
     inner: Box<dyn LlmProvider>,
     credential_name: String,
     expires_at: Option<DateTime<Utc>>,
+    revocation: crate::config::credential::LifecycleRevocation,
 }
 
 impl CredentialBoundProvider {
@@ -40,10 +41,17 @@ impl CredentialBoundProvider {
             inner,
             credential_name: credential.name.clone(),
             expires_at,
+            revocation: credential.revocation.clone(),
         }
     }
 
     fn validate_lifecycle(&self) -> Result<()> {
+        if self.revocation.is_revoked() {
+            bail!(
+                "credential '{}' was revoked after provider construction; select another profile",
+                self.credential_name
+            );
+        }
         if self.expires_at.is_some_and(|expires_at| expires_at <= Utc::now()) {
             bail!(
                 "credential '{}' expired after provider construction; reconnect or reselect the profile after updating it",
@@ -912,6 +920,7 @@ mod tests {
             scopes: BTreeSet::new(),
             secret_ref: format!("test:{name}"),
             lifecycle: CredentialLifecycle::default(),
+            revocation: Default::default(),
         }
     }
 
@@ -1092,6 +1101,7 @@ mod tests {
                 scopes: BTreeSet::new(),
                 secret_ref: "test:work".into(),
                 lifecycle: CredentialLifecycle::default(),
+                revocation: Default::default(),
             };
             let config = Config::with_providers(vec![profile]).with_credentials(vec![credential]);
             let resolver = CountingResolver {
@@ -1103,30 +1113,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_expired_live_binding_rejects_before_socket_activity() {
+    async fn test_active_binding_expiring_after_factory_rejects_before_socket_activity() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let inner = OpenAIProvider::new_compatible(
-            "must-not-be-sent".into(),
-            format!("http://{}", listener.local_addr().unwrap()),
-            "/v1/chat/completions",
-            "/v1/models",
-            "gpt-4o".into(),
-            "openai".into(),
-        )
-        .unwrap();
-        let mut metadata = named_openai_credential("work", "account-1");
-        metadata.lifecycle = CredentialLifecycle::Active {
-            expires_at: Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut profile = named_openai("primary", "work", "gpt-4o");
+        if let ProviderEntry::Credentialed { base_url, .. } = &mut profile {
+            *base_url = Some(origin.clone());
+        }
+        let mut credential = named_openai_credential("work", "account-1");
+        credential.audience = AudienceBinding::custom(&origin).unwrap();
+        credential.lifecycle = CredentialLifecycle::Active {
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::milliseconds(50)),
             refreshable: false,
         };
-        let provider = CredentialBoundProvider::new(Box::new(inner), &metadata);
+        let config = Config::with_providers(vec![profile]).with_credentials(vec![credential]);
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let provider = create_provider_graph_from_config_with_resolver(&config, &resolver)
+            .unwrap()
+            .default_provider();
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
 
         let error = provider
             .send_message(&ProviderRequest::new(Vec::new()).with_model("gpt-4o"))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("expired after provider construction"));
+        assert!(matches!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_live_config_revocation_invalidates_constructed_provider_before_socket_activity() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut profile = named_openai("primary", "work", "gpt-4o");
+        if let ProviderEntry::Credentialed { base_url, .. } = &mut profile {
+            *base_url = Some(origin.clone());
+        }
+        let mut credential = named_openai_credential("work", "account-1");
+        credential.audience = AudienceBinding::custom(&origin).unwrap();
+        let mut config =
+            Config::with_providers(vec![profile]).with_credentials(vec![credential]);
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let provider = create_provider_graph_from_config_with_resolver(&config, &resolver)
+            .unwrap()
+            .default_provider();
+        config.revoke_credential("work").unwrap();
+
+        let error = provider
+            .send_message(&ProviderRequest::new(Vec::new()).with_model("gpt-4o"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("revoked after provider construction"));
         assert!(matches!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock

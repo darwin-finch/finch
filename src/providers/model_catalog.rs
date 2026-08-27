@@ -511,6 +511,7 @@ mod tests {
             scopes: BTreeSet::new(),
             secret_ref: "test:work".into(),
             lifecycle: CredentialLifecycle::default(),
+            revocation: Default::default(),
         };
         let config = Config::with_providers(vec![profile]).with_credentials(vec![credential]);
         let resolver = CountingResolver(AtomicUsize::new(0));

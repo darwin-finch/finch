@@ -8,6 +8,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Authentication mechanism represented by a named credential.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +122,36 @@ pub enum CredentialLifecycle {
     LegacyAmbiguous,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct LifecycleRevocation(Arc<AtomicBool>);
+
+impl LifecycleRevocation {
+    pub(crate) fn revoke(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl fmt::Debug for LifecycleRevocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("LifecycleRevocation")
+            .field(&self.is_revoked())
+            .finish()
+    }
+}
+
+impl PartialEq for LifecycleRevocation {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_revoked() == other.is_revoked()
+    }
+}
+
+impl Eq for LifecycleRevocation {}
+
 impl Default for CredentialLifecycle {
     fn default() -> Self {
         Self::Active {
@@ -148,6 +180,10 @@ pub struct ProviderCredential {
     pub secret_ref: String,
     #[serde(default)]
     pub lifecycle: CredentialLifecycle,
+    /// In-process invalidation authority shared by configuration clones and
+    /// already-constructed providers. It is runtime state, never persisted.
+    #[serde(skip)]
+    pub(crate) revocation: LifecycleRevocation,
 }
 
 /// Profile-side authentication contract. Central provider descriptors supply
@@ -439,6 +475,12 @@ pub fn validate_binding(
     now: DateTime<Utc>,
 ) -> Result<()> {
     let name = &binding.credential_ref;
+    if credential.revocation.is_revoked() {
+        bail!(
+            "credential '{}' is revoked; choose or configure another named credential",
+            name
+        );
+    }
     let expected = descriptor(provider);
     if credential.provider != expected.provider {
         bail!(
@@ -549,6 +591,7 @@ mod tests {
             scopes: BTreeSet::new(),
             secret_ref: "env:FINCH_TEST_CREDENTIAL".into(),
             lifecycle: CredentialLifecycle::default(),
+            revocation: LifecycleRevocation::default(),
         }
     }
 

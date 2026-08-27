@@ -912,6 +912,7 @@ impl Config {
             .iter_mut()
             .find(|credential| credential.name == credential_name)
             .ok_or_else(|| anyhow::anyhow!("credential '{}' was not found", credential_name))?;
+        credential.revocation.revoke();
         credential.lifecycle = super::CredentialLifecycle::Revoked;
         Ok(dependents)
     }

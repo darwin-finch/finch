@@ -698,6 +698,45 @@ fn provider_entry_from_remote_model(
     }
 }
 
+fn named_catalog_refresh_config(
+    primary_model: &ModelConfig,
+    tool_models: &[ModelConfig],
+    editing_idx: usize,
+    selected_entry: &ProviderEntry,
+    credentials: Vec<crate::config::ProviderCredential>,
+) -> crate::config::Config {
+    let providers = std::iter::once(primary_model)
+        .chain(tool_models.iter())
+        .enumerate()
+        .filter_map(|(index, configured)| {
+            if index == editing_idx {
+                return Some(selected_entry.clone());
+            }
+            match configured {
+                ModelConfig::Remote {
+                    provider,
+                    name,
+                    api_key,
+                    model,
+                    enabled,
+                    persisted,
+                } if index == 0 || *enabled => Some(provider_entry_from_remote_model(
+                    provider,
+                    name,
+                    api_key,
+                    model,
+                    persisted.as_ref(),
+                )),
+                ModelConfig::Local { persisted, enabled, .. } if index == 0 || *enabled => {
+                    persisted.clone()
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    crate::config::Config::with_providers(providers).with_credentials(credentials)
+}
+
 #[derive(Debug, Clone)]
 struct PersonaInfo {
     slug: String, // Key used to load the persona (e.g. "expert-coder")
@@ -1964,6 +2003,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         provider_idx,
                         name,
                         api_key,
+                        model,
                         editing_idx,
                         ..
                     }) = adding_provider.as_ref()
@@ -1993,14 +2033,24 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         ));
                         return Ok(false);
                     };
-                    let named_config = persisted
-                        .filter(|entry| matches!(entry, ProviderEntry::Credentialed { .. }))
-                        .cloned()
-                        .map(|entry| {
-                            crate::config::Config::with_providers(vec![entry])
-                                .with_credentials(credentials.clone())
+                    let selected_entry = provider_entry_from_remote_model(
+                        provider_id,
+                        name,
+                        api_key,
+                        model,
+                        persisted,
+                    );
+                    let named_config = matches!(selected_entry, ProviderEntry::Credentialed { .. })
+                        .then(|| {
+                            named_catalog_refresh_config(
+                                primary_model,
+                                tool_models,
+                                editing_idx.unwrap_or(0),
+                                &selected_entry,
+                                credentials.clone(),
+                            )
                         });
-                    let named_profile = name.clone();
+                    let named_profile = selected_entry.profile_name();
                     let cache_dir = match catalog_cache_dir.clone() {
                         Some(path) => path,
                         None => {
@@ -6428,6 +6478,60 @@ mod tests {
     }
 
     #[test]
+    fn named_catalog_refresh_config_uses_edited_name_and_validates_siblings() {
+        use crate::config::{
+            AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle,
+            CredentialProvider, EndpointFamily, ProviderCredential,
+        };
+        let credential = ProviderCredential {
+            name: "work".into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::OpenaiPlatform,
+            issuer: "openai-platform".into(),
+            audience: AudienceBinding::standard(EndpointFamily::OpenaiPlatform),
+            tenant: None,
+            project: None,
+            account: None,
+            scopes: std::collections::BTreeSet::new(),
+            secret_ref: "env:OPENAI_WORK_API_KEY".into(),
+            lifecycle: CredentialLifecycle::default(),
+            revocation: Default::default(),
+        };
+        let named = |name: &str, credential_ref: &str| ProviderEntry::Credentialed {
+            provider: CredentialProvider::OpenaiPlatform,
+            credential: CredentialBinding {
+                credential_ref: credential_ref.into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: std::collections::BTreeSet::new(),
+            },
+            model: Some("gpt-4o".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some(name.into()),
+            reasoning_effort: None,
+        };
+        let primary = model_config_from_provider(&named("old-name", "work")).unwrap();
+        let sibling = model_config_from_provider(&named("broken", "missing")).unwrap();
+        let selected = named("renamed", "work");
+        let config = named_catalog_refresh_config(
+            &primary,
+            &[sibling],
+            0,
+            &selected,
+            vec![credential.clone()],
+        );
+        assert!(config.validate().unwrap_err().to_string().contains("missing"));
+
+        let valid = named_catalog_refresh_config(&primary, &[], 0, &selected, vec![credential]);
+        valid.validate().unwrap();
+        assert_eq!(valid.providers[0].profile_name(), "renamed");
+    }
+
+    #[test]
     fn builtin_discovery_profiles_use_provider_specific_urls_and_auth() {
         let claude = model_catalog_profile("claude", "claude-work", "key", None).unwrap();
         assert_eq!(claude.auth, CatalogAuth::AnthropicApiKey);
@@ -8296,6 +8400,7 @@ mod tests {
             scopes: std::collections::BTreeSet::new(),
             secret_ref: "env:OPENAI_WORK_API_KEY".into(),
             lifecycle: CredentialLifecycle::default(),
+            revocation: Default::default(),
         };
         let profile = ProviderEntry::Credentialed {
             provider: CredentialProvider::OpenaiPlatform,
