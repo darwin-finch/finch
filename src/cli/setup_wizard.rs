@@ -88,7 +88,7 @@ const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
-use crate::config::{ExecutionTarget, ProviderEntry, TeacherEntry};
+use crate::config::{CoreMlConfig, ExecutionTarget, ProviderEntry, TeacherEntry};
 use crate::models::compatibility;
 use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
 use crate::providers::endpoints::ProviderEndpoints;
@@ -664,6 +664,8 @@ struct WizardState {
     completed: HashSet<WizardSection>,
     confirming_cancel: bool,
     catalog_cache_dir: Option<std::path::PathBuf>,
+    /// Typed CoreML policy provenance from the loaded configuration.
+    coreml: CoreMlConfig,
 }
 
 impl WizardState {
@@ -904,6 +906,9 @@ impl WizardState {
             completed: HashSet::new(),
             confirming_cancel: false,
             catalog_cache_dir,
+            coreml: existing_config
+                .map(|config| config.backend.coreml)
+                .unwrap_or_default(),
         }
     }
 
@@ -966,6 +971,8 @@ pub struct SetupResult {
     pub backend_enabled: bool,
     pub inference_provider: InferenceProvider,
     pub execution_target: ExecutionTarget,
+    /// CoreML policy loaded into this wizard, including an explicit Auto/All reset.
+    pub coreml: CoreMlConfig,
     pub model_family: ModelFamily,
     pub model_size: ModelSize,
     pub custom_model_repo: Option<String>,
@@ -1902,6 +1909,7 @@ fn apply_setup_result_to_config(
     use crate::config::FeaturesConfig;
 
     apply_daemon_api_key(&mut new_config, &result.finch_api_key);
+    new_config.backend.coreml = result.coreml;
     new_config.active_theme = result.active_theme.clone();
     new_config.active_persona = result.default_persona.clone();
     if let Some(ref hf_tok) = result.hf_token {
@@ -4022,6 +4030,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         backend_enabled,
         inference_provider,
         execution_target,
+        coreml: state.coreml,
         model_family,
         model_size,
         custom_model_repo: None,
@@ -8703,6 +8712,63 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn test_coreml_policy_survives_wizard_mapping_save_and_reload_for_every_compute_unit() {
+        use crate::config::{Config, CoreMlComputeUnits};
+
+        for compute_units in [
+            CoreMlComputeUnits::All,
+            CoreMlComputeUnits::CpuAndNeuralEngine,
+            CoreMlComputeUnits::CpuAndGpu,
+            CoreMlComputeUnits::CpuOnly,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let config_path = directory.path().join("config.toml");
+            let metrics_dir = directory.path().join("metrics");
+            let providers = vec![ProviderEntry::Local {
+                inference_provider: InferenceProvider::Onnx,
+                execution_target: ExecutionTarget::Auto,
+                model_family: ModelFamily::Qwen2,
+                model_size: ModelSize::Medium,
+                model_repo: None,
+                model_path: None,
+                enabled: true,
+                name: Some("local-coreml-policy-test".to_string()),
+            }];
+            let mut existing =
+                Config::with_providers_and_paths(providers, metrics_dir.clone(), None);
+            existing.backend.coreml = CoreMlConfig {
+                compute_units,
+                profile_compute_plan: true,
+                enable_subgraphs: true,
+            };
+
+            let state = WizardState::new_with_catalog_cache_dir(Some(&existing), None);
+            let result = build_setup_result(&state).unwrap();
+            assert_eq!(result.coreml, existing.backend.coreml);
+
+            config_from_setup_result_with_paths(&result, metrics_dir.clone(), None)
+                .save_to(&config_path)
+                .unwrap();
+            let reloaded =
+                crate::config::load_config_from_path_with_paths(&config_path, metrics_dir, None)
+                    .unwrap();
+            assert_eq!(reloaded.backend.coreml, existing.backend.coreml);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_setup_coreml_auto_label_is_dispatcher_not_ane_only_or_fastest() {
+        let label = ExecutionTarget::CoreML.name();
+        let description = ExecutionTarget::CoreML.description();
+
+        assert_eq!(label, "CoreML (Auto: ANE/GPU/CPU)");
+        assert!(description.contains("automatic compute-unit selection"));
+        assert!(!description.to_ascii_lowercase().contains("fastest"));
+        assert!(!description.contains("ANE only"));
+    }
+
+    #[test]
     fn test_cloud_primary_keeps_local_qwen_as_tool_model_on_reopen() {
         use crate::config::{Config, ProviderEntry};
 
@@ -9299,7 +9365,12 @@ for line in sys.stdin:
             let (ceremony, restores) =
                 boundary_ceremony(&directory, [ChatGptSetupAction::Reuse], true);
             install_test_ceremony(ceremony);
-            let result = chatgpt_ceremony_result(false);
+            let mut result = chatgpt_ceremony_result(false);
+            result.coreml = CoreMlConfig {
+                compute_units: crate::config::CoreMlComputeUnits::CpuAndGpu,
+                profile_compute_plan: true,
+                enable_subgraphs: true,
+            };
             let outcome = match invocation {
                 SetupInvocation::FirstRun => validate_first_run_and_apply(&result).await,
                 SetupInvocation::Command => validate_command_and_apply(&result).await,
@@ -9310,6 +9381,13 @@ for line in sys.stdin:
             assert_eq!(outcome, SetupApplyOutcome::Saved);
             let saved = std::fs::read_to_string(config_path).unwrap();
             assert!(saved.contains("chatgpt_subscription"), "{invocation:?}");
+            let reloaded = crate::config::load_config_from_path_with_paths(
+                &directory.path().join("config.toml"),
+                directory.path().join("metrics"),
+                None,
+            )
+            .unwrap();
+            assert_eq!(reloaded.backend.coreml, result.coreml, "{invocation:?}");
             assert_eq!(*restores.lock().unwrap(), 1, "{invocation:?}");
         }
     }
