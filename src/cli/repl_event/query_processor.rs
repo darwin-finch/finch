@@ -1022,8 +1022,8 @@ pub(crate) async fn process_query_with_tools(
                         Ok(StreamChunk::Usage { input_tokens }) => {
                             input_token_count = Some(input_tokens);
                         }
-                        Ok(StreamChunk::ResponseMetadata { model }) => {
-                            tracing::debug!(actual_model = %model, "Provider reported streaming model");
+                        Ok(StreamChunk::ResponseMetadata { .. }) => {
+                            // No durable provenance owner exists in this path yet.
                         }
                         Ok(StreamChunk::TextDelta(delta)) => {
                             tracing::debug!("Received TextDelta: {} bytes", delta.len());

@@ -1450,6 +1450,10 @@ impl finch_daemon::Server for FinchDaemonImpl {
                         r.send().promise.await?;
                     }
                     Ok(StreamChunk::ResponseMetadata { model }) => {
+                        crate::generators::validate_response_model(&model)
+                            .map_err(|_| capnp::Error::failed(
+                                "IPC response model metadata was invalid".into(),
+                            ))?;
                         let mut r = receiver.on_chunk_request();
                         r.get()
                             .init_chunk()

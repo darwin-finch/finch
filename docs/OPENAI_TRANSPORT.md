@@ -31,6 +31,6 @@ authority.
 
 The canonical boundary validates images, call IDs, tool arguments, request
 size, SSE line/event/total size, response object, actual model consistency,
-usage chunks, and terminal state. Errors never include canonical upstream
-response bodies, prompts, images, tool arguments, credentials, or reasoning
-payloads.
+bounded log-safe model metadata, usage chunks, and terminal state. Errors never
+include canonical upstream response bodies, prompts, images, tool arguments,
+credentials, or reasoning payloads.

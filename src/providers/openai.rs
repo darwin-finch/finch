@@ -390,6 +390,14 @@ fn validate_canonical_response_shape(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+fn validate_canonical_actual_model(model: &str) -> Result<()> {
+    if model.trim().is_empty() {
+        anyhow::bail!("OpenAI response omitted the actual model");
+    }
+    crate::generators::validate_response_model(model)
+        .map_err(|_| anyhow::anyhow!("OpenAI response actual model was invalid"))
+}
+
 #[derive(Default)]
 struct CanonicalStreamState {
     response_id: Option<String>,
@@ -501,6 +509,8 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
         if chunk.model.trim().is_empty() {
             anyhow::bail!("OpenAI stream omitted the actual model");
         }
+        crate::generators::validate_response_model(&chunk.model)
+            .map_err(|_| anyhow::anyhow!("OpenAI stream actual model was invalid"))?;
         state.model = Some(chunk.model.clone());
     }
 
@@ -510,6 +520,7 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
             model: chunk.model.clone(),
         });
     }
+    let usage_seen_in_chunk = chunk.usage.is_some();
     if let Some(usage) = chunk.usage {
         if !chunk.choices.is_empty() {
             anyhow::bail!("OpenAI stream attached usage to a choice chunk");
@@ -526,7 +537,7 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
         });
     }
     if chunk.choices.is_empty() {
-        if output.is_empty() {
+        if !usage_seen_in_chunk {
             anyhow::bail!("OpenAI stream chunk had neither a choice nor usage");
         }
         return Ok(output);
@@ -1330,9 +1341,7 @@ impl OpenAIProvider {
             if response.object.as_deref() != Some("chat.completion") {
                 anyhow::bail!("OpenAI returned an unknown response object");
             }
-            if response.model.trim().is_empty() {
-                anyhow::bail!("OpenAI response omitted the actual model");
-            }
+            validate_canonical_actual_model(&response.model)?;
             if response.choices.len() != 1 || response.choices[0].index != 0 {
                 anyhow::bail!("OpenAI returned an unexpected choice set");
             }
@@ -1482,10 +1491,12 @@ impl OpenAIProvider {
                 .context("Failed to parse OpenAI API response")?,
         };
 
+        if rule == TransportRule::CanonicalGpt56ChatCompletions {
+            validate_canonical_actual_model(&openai_response.model)?;
+        }
+
         tracing::debug!(
             provider = %self.provider_name,
-            response_id = %openai_response.id,
-            model = %openai_response.model,
             choices = openai_response.choices.len(),
             "received OpenAI-compatible response"
         );
@@ -2647,6 +2658,10 @@ mod tests {
     async fn canonical_stream_requires_one_terminal_usage_only_chunk() {
         for (body, expected) in [
             (
+                "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[]}\n\n",
+                "neither a choice nor usage",
+            ),
+            (
                 "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
                 "without its requested usage",
             ),
@@ -2667,6 +2682,73 @@ mod tests {
             assert!(!complete);
             assert!(errors.iter().any(|error| error.contains(expected)));
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn canonical_actual_model_metadata_is_bounded_redacted_and_log_safe() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || CapturedLogs(Arc::clone(&writer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        for model in [
+            format!("MODEL_SECRET_{}", "m".repeat(300)),
+            "bad\nmodel".to_string(),
+        ] {
+            let event = serde_json::json!({
+                "id":"x",
+                "object":"chat.completion.chunk",
+                "model":model.clone(),
+                "choices":[{
+                    "index":0,
+                    "delta":{"role":"assistant"},
+                    "finish_reason":null
+                }]
+            });
+            let (complete, errors) = canonical_stream_outcome(format!("data: {event}\n\n")).await;
+            assert!(!complete);
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].contains("actual model was invalid"));
+            assert!(errors[0].len() < 128);
+            assert!(!errors[0].contains(&model));
+
+            let mut server = mockito::Server::new_async().await;
+            server
+                .mock("POST", "/v1/chat/completions")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    serde_json::json!({
+                        "id":"x",
+                        "object":"chat.completion",
+                        "model":model.clone(),
+                        "choices":[{
+                            "index":0,
+                            "message":{"role":"assistant","content":"ok"},
+                            "finish_reason":"stop"
+                        }]
+                    })
+                    .to_string(),
+                )
+                .create_async()
+                .await;
+            let error = canonical_test_provider(server.url())
+                .send_message_once(
+                    &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                        .with_model("gpt-5.6-sol"),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "OpenAI response actual model was invalid");
+            assert!(!error.contains(&model));
+        }
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(!logs.contains("MODEL_SECRET_"));
+        assert!(!logs.contains("bad\nmodel"));
     }
 
     #[tokio::test]

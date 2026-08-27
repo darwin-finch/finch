@@ -8,6 +8,18 @@ use tokio::sync::mpsc;
 use crate::claude::{ContentBlock, Message};
 use crate::tools::types::ToolDefinition;
 
+pub(crate) const MAX_RESPONSE_MODEL_BYTES: usize = 256;
+
+pub(crate) fn validate_response_model(model: &str) -> Result<()> {
+    if model.is_empty()
+        || model.len() > MAX_RESPONSE_MODEL_BYTES
+        || !model.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        anyhow::bail!("Provider response model metadata was invalid");
+    }
+    Ok(())
+}
+
 // Re-export implementations
 pub mod claude;
 pub mod daemon_local;
@@ -316,6 +328,22 @@ mod tests {
                 assert_eq!(model, "gpt-5.6-sol-served");
             }
             _ => panic!("Expected ResponseMetadata"),
+        }
+    }
+
+    #[test]
+    fn test_response_model_metadata_is_bounded_and_log_safe() {
+        validate_response_model(&"m".repeat(MAX_RESPONSE_MODEL_BYTES)).unwrap();
+        for model in [
+            "".to_string(),
+            "m".repeat(MAX_RESPONSE_MODEL_BYTES + 1),
+            "bad\nmodel".to_string(),
+            "bad model".to_string(),
+            "mødël".to_string(),
+        ] {
+            let error = validate_response_model(&model).unwrap_err().to_string();
+            assert_eq!(error, "Provider response model metadata was invalid");
+            assert!(!error.contains(&model));
         }
     }
 

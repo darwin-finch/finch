@@ -1465,15 +1465,7 @@ impl stream_receiver::Server for StreamReceiverImpl {
                 })
                 .map_err(|e| anyhow::anyhow!("{}", e)),
             Ok(Which::ResponseMetadata(metadata)) => metadata
-                .and_then(|metadata| {
-                    metadata
-                        .get_model()?
-                        .to_str()
-                        .map(|model| StreamChunk::ResponseMetadata {
-                            model: model.to_string(),
-                        })
-                        .map_err(|error| capnp::Error::failed(error.to_string()))
-                })
+                .and_then(decode_stream_response_metadata)
                 .map_err(|error| anyhow::anyhow!("{}", error)),
             Ok(Which::Done(())) => {
                 // Close the channel by dropping tx — but we don't have ownership.
@@ -1501,6 +1493,20 @@ impl stream_receiver::Server for StreamReceiverImpl {
         let _ = self.tx.send(result);
         Promise::ok(())
     }
+}
+
+fn decode_stream_response_metadata(
+    metadata: finch_ipc_capnp::stream_response_metadata::Reader<'_>,
+) -> std::result::Result<StreamChunk, capnp::Error> {
+    let model = metadata
+        .get_model()?
+        .to_str()
+        .map_err(|error| capnp::Error::failed(error.to_string()))?;
+    crate::generators::validate_response_model(model)
+        .map_err(|_| capnp::Error::failed("IPC response model metadata was invalid".into()))?;
+    Ok(StreamChunk::ResponseMetadata {
+        model: model.to_string(),
+    })
 }
 
 fn decode_unknown_stream_chunk(
@@ -1626,17 +1632,34 @@ mod tests {
             .get_root_as_reader::<finch_ipc_capnp::stream_chunk::Reader<'_>>()
             .unwrap();
         let model = match reader.which().unwrap() {
-            Which::ResponseMetadata(metadata) => metadata
-                .unwrap()
-                .get_model()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string(),
+            Which::ResponseMetadata(metadata) => match decode_stream_response_metadata(
+                metadata.unwrap(),
+            )
+            .unwrap()
+            {
+                StreamChunk::ResponseMetadata { model } => model,
+                _ => panic!("expected response metadata"),
+            },
             _ => panic!("expected response metadata"),
         };
         assert_eq!(model, "gpt-5.6-sol-served");
         assert!(decode_unknown_stream_chunk(capnp::NotInSchema(99)).is_none());
+
+        let mut invalid_message = capnp::message::Builder::new_default();
+        invalid_message
+            .init_root::<finch_ipc_capnp::stream_chunk::Builder<'_>>()
+            .init_response_metadata()
+            .set_model("bad\nmodel");
+        let invalid_reader = invalid_message
+            .get_root_as_reader::<finch_ipc_capnp::stream_chunk::Reader<'_>>()
+            .unwrap();
+        let error = match invalid_reader.which().unwrap() {
+            Which::ResponseMetadata(metadata) => {
+                decode_stream_response_metadata(metadata.unwrap()).unwrap_err()
+            }
+            _ => panic!("expected response metadata"),
+        };
+        assert_eq!(error.to_string(), "IPC response model metadata was invalid");
     }
 
     struct BlockingBrainRunner {
