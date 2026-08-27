@@ -1977,6 +1977,16 @@ impl CodexAppServerProvider {
                 .collect(),
         })
     }
+
+    async fn send_message_stream_once(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
+        let session = self.begin_turn(request).await?;
+        let (tx, rx) = mpsc::channel(100);
+        tokio::spawn(session.drive(tx));
+        Ok(rx)
+    }
 }
 
 fn isolated_thread_config() -> Value {
@@ -2564,12 +2574,13 @@ impl ProviderBackend for CodexAppServerProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<ProviderResponse> {
-        let model = if request.request().model.trim().is_empty() {
+        let request = request.into_request_for(self)?;
+        let model = if request.model.trim().is_empty() {
             self.default_model.clone()
         } else {
-            request.request().model.clone()
+            request.model.clone()
         };
-        let mut receiver = self.send_message_stream_validated(request).await?;
+        let mut receiver = self.send_message_stream_once(&request).await?;
         let mut content = Vec::new();
         while let Some(chunk) = receiver.recv().await {
             if let StreamChunk::ContentBlockComplete(block) = chunk? {
@@ -2595,10 +2606,8 @@ impl ProviderBackend for CodexAppServerProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-        let session = self.begin_turn(request.request()).await?;
-        let (tx, rx) = mpsc::channel(100);
-        tokio::spawn(session.drive(tx));
-        Ok(rx)
+        let request = request.into_request_for(self)?;
+        self.send_message_stream_once(&request).await
     }
 
     fn name(&self) -> &str {

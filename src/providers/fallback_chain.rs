@@ -233,15 +233,16 @@ impl ProviderBackend for FallbackChain {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<ProviderResponse> {
-        self.send_message_with_fallback(request.request()).await
+        let request = request.into_request_for(self)?;
+        self.send_message_with_fallback(&request).await
     }
 
     async fn send_message_stream_validated(
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-        self.send_message_stream_with_fallback(request.request())
-            .await
+        let request = request.into_request_for(self)?;
+        self.send_message_stream_with_fallback(&request).await
     }
 
     fn name(&self) -> &str {
@@ -372,15 +373,15 @@ mod tests {
             &self,
             request: ValidatedProviderRequest,
         ) -> Result<ProviderResponse> {
+            let request = request.into_request_for(self)?;
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(
-                request.request().model,
-                self.model,
+                request.model, self.model,
                 "fallback rebound the selected profile's model"
             );
             Ok(ProviderResponse {
                 id: "model-bound".into(),
-                model: request.request().model.clone(),
+                model: request.model.clone(),
                 content: vec![ContentBlock::Text { text: "ok".into() }],
                 stop_reason: Some("end_turn".into()),
                 role: "assistant".into(),
@@ -392,10 +393,10 @@ mod tests {
             &self,
             request: ValidatedProviderRequest,
         ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
+            let request = request.into_request_for(self)?;
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(
-                request.request().model,
-                self.model,
+                request.model, self.model,
                 "fallback rebound the selected profile's model"
             );
             let (_tx, rx) = mpsc::channel(1);

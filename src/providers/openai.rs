@@ -663,14 +663,16 @@ impl ProviderBackend for OpenAIProvider {
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<ProviderResponse> {
-        with_retry(|| self.send_message_once(request.request())).await
+        let request = request.into_request_for(self)?;
+        with_retry(|| self.send_message_once(&request)).await
     }
 
     async fn send_message_stream_validated(
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-        with_retry(|| self.send_message_stream_once(request.request())).await
+        let request = request.into_request_for(self)?;
+        with_retry(|| self.send_message_stream_once(&request)).await
     }
 
     fn name(&self) -> &str {

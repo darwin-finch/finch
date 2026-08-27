@@ -69,12 +69,23 @@ mod validated_boundary {
     pub struct ValidatedProviderRequest {
         request: ProviderRequest,
         capabilities: ModelCapabilities,
+        target: usize,
     }
 
     impl ValidatedProviderRequest {
-        /// The exact effective request that was validated.
-        pub fn request(&self) -> &ProviderRequest {
-            &self.request
+        /// Consume this token at the exact provider instance for which it was
+        /// validated and return the effective request.
+        #[doc(hidden)]
+        pub fn into_request_for(
+            self,
+            provider: &(impl ProviderBackend + ?Sized),
+        ) -> Result<ProviderRequest> {
+            if self.target != provider_target(provider) {
+                anyhow::bail!(
+                    "Validated provider request was presented to a different provider instance"
+                );
+            }
+            Ok(self.request)
         }
 
         /// The exact descriptor used to validate this request.
@@ -97,7 +108,12 @@ mod validated_boundary {
         Ok(ValidatedProviderRequest {
             request: effective,
             capabilities,
+            target: provider_target(provider),
         })
+    }
+
+    fn provider_target(provider: &(impl ProviderBackend + ?Sized)) -> usize {
+        provider as *const _ as *const () as usize
     }
 }
 
@@ -110,12 +126,16 @@ pub use validated_boundary::ValidatedProviderRequest;
 #[doc(hidden)]
 pub trait ProviderBackend: Send + Sync {
     /// Provider implementation called only after capability validation.
+    /// Implementations must consume the token with
+    /// [`ValidatedProviderRequest::into_request_for`] before any side effect.
     async fn send_message_validated(
         &self,
         request: ValidatedProviderRequest,
     ) -> Result<ProviderResponse>;
 
     /// Streaming provider implementation called only after capability validation.
+    /// Implementations must consume the token with
+    /// [`ValidatedProviderRequest::into_request_for`] before any side effect.
     async fn send_message_stream_validated(
         &self,
         request: ValidatedProviderRequest,
