@@ -7490,7 +7490,7 @@ mod tests {
         let retained_runtime = store.program_runtime("old").unwrap();
         retained_runtime
             .grant_typed_capability(crate::vm::CapabilityRequirement {
-                capability: crate::vm::CapabilityKind::ProcessRun,
+                capability: crate::vm::CapabilityKind::AgentSpawn,
                 selector: crate::vm::ResourceSelector::None,
             })
             .unwrap();
@@ -7833,7 +7833,7 @@ mod tests {
         let grant_id = runtime
             .issue_typed_capability(
                 crate::vm::CapabilityRequirement {
-                    capability: crate::vm::CapabilityKind::ProcessRun,
+                    capability: crate::vm::CapabilityKind::AgentSpawn,
                     selector: crate::vm::ResourceSelector::None,
                 },
                 crate::vm::GrantScope::Session { session_id },
@@ -7882,7 +7882,7 @@ mod tests {
         let grant_id = runtime
             .issue_typed_capability(
                 crate::vm::CapabilityRequirement {
-                    capability: crate::vm::CapabilityKind::ProcessRun,
+                    capability: crate::vm::CapabilityKind::AgentSpawn,
                     selector: crate::vm::ResourceSelector::None,
                 },
                 crate::vm::GrantScope::Session {
@@ -7915,7 +7915,7 @@ mod tests {
         let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let runtime = store.program_runtime("brain").unwrap();
         let requirement = crate::vm::CapabilityRequirement {
-            capability: crate::vm::CapabilityKind::ProcessRun,
+            capability: crate::vm::CapabilityKind::AgentSpawn,
             selector: crate::vm::ResourceSelector::None,
         };
         let grant_id = runtime
@@ -7929,7 +7929,7 @@ mod tests {
             )
             .unwrap();
         let mut denied = std::collections::BTreeSet::new();
-        denied.insert(crate::vm::CapabilityKind::ProcessRun);
+        denied.insert(crate::vm::CapabilityKind::AgentSpawn);
         assert_eq!(
             runtime
                 .apply_capability_policy(
@@ -8076,7 +8076,7 @@ mod tests {
         let runtime = store.program_runtime("brain").unwrap();
         runtime
             .grant_typed_capability(crate::vm::CapabilityRequirement {
-                capability: crate::vm::CapabilityKind::ProcessRun,
+                capability: crate::vm::CapabilityKind::AgentSpawn,
                 selector: crate::vm::ResourceSelector::None,
             })
             .unwrap();
