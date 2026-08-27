@@ -11,6 +11,8 @@ use super::LlmProvider;
 use crate::config::{Config, ProviderEntry, TeacherEntry};
 use std::sync::Arc;
 
+const LEGACY_CHATGPT_MIGRATION_ERROR: &str = "Legacy chatgpt_subscription profiles are unsupported because Finch no longer launches Codex app-server. Run `finch setup` and configure OpenAI Platform with an API key or another supported provider; subscription credentials are not API keys";
+
 /// A successfully constructed cloud provider paired with its configured selector.
 #[derive(Clone)]
 pub struct ProviderProfile {
@@ -76,9 +78,9 @@ impl ProviderGraph {
 /// (`create_local_generator`).
 pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmProvider>> {
     match entry {
-        ProviderEntry::LegacyChatgptSubscription { .. } => bail!(
-            "Legacy chatgpt_subscription profiles are unsupported because Finch no longer launches Codex app-server. Run `finch setup` and configure OpenAI Platform with an API key or another supported provider; subscription credentials are not API keys"
-        ),
+        ProviderEntry::LegacyChatgptSubscription { .. } => {
+            bail!(LEGACY_CHATGPT_MIGRATION_ERROR)
+        }
         ProviderEntry::Claude {
             api_key,
             model,
@@ -235,23 +237,26 @@ fn create_named_providers_from_entries_with<F>(
 where
     F: FnMut(&ProviderEntry) -> Result<Box<dyn LlmProvider>>,
 {
+    if let Some((idx, _)) = entries
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| matches!(entry, ProviderEntry::LegacyChatgptSubscription { .. }))
+    {
+        bail!(
+            "Provider #{} is invalid: {}",
+            idx + 1,
+            LEGACY_CHATGPT_MIGRATION_ERROR
+        );
+    }
+
     let cloud: Vec<_> = entries.iter().filter(|e| !e.is_local()).collect();
     if cloud.is_empty() {
         bail!("No cloud provider entries configured");
     }
     let mut providers = Vec::with_capacity(cloud.len());
-    let mut skipped_chatgpt = Vec::new();
     for (idx, entry) in cloud.into_iter().enumerate() {
         match create(entry) {
             Ok(provider) => providers.push((entry.profile_name(), provider)),
-            Err(error) if matches!(entry, ProviderEntry::LegacyChatgptSubscription { .. }) => {
-                tracing::warn!(
-                    provider_index = idx + 1,
-                    error = %error,
-                    "Skipping unsupported legacy ChatGPT subscription provider; configured fallbacks remain available"
-                );
-                skipped_chatgpt.push(format!("provider #{}: {error}", idx + 1));
-            }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("Failed to create provider #{}", idx + 1));
@@ -259,13 +264,7 @@ where
         }
     }
     if providers.is_empty() {
-        if skipped_chatgpt.is_empty() {
-            bail!("No usable cloud provider entries configured");
-        }
-        bail!(
-            "No usable cloud provider entries configured; {}",
-            skipped_chatgpt.join("; ")
-        );
+        bail!("No usable cloud provider entries configured");
     }
     Ok(providers)
 }
@@ -314,8 +313,9 @@ fn graph_from_boxed_profiles(
     })
 }
 
-/// Construct the named cloud provider graph once, preserving profile/provider identity when an
-/// unusable ChatGPT entry is skipped. Legacy teacher-only configuration remains supported.
+/// Construct the named cloud provider graph once. Invalid legacy subscription
+/// entries reject the complete graph before any provider is constructed.
+/// Legacy teacher-only configuration remains supported.
 pub fn create_provider_graph_from_config(config: &Config) -> Result<ProviderGraph> {
     let profiles = if config.providers.iter().any(|entry| !entry.is_local()) {
         create_named_providers_from_entries_with(&config.providers, create_provider_from_entry)?
@@ -797,8 +797,11 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_legacy_chatgpt_preserves_later_configured_grok_fallback() {
+    fn test_mixed_legacy_and_grok_rejects_before_provider_construction_or_http() {
         let directory = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let entries = vec![
             ProviderEntry::LegacyChatgptSubscription {
                 credential_ref: "codex-app-server:managed".into(),
@@ -808,7 +811,7 @@ mod tests {
             ProviderEntry::Grok {
                 api_key: "xai-test".into(),
                 model: Some("grok-code-fast-1".into()),
-                base_url: None,
+                base_url: Some(endpoint.clone()),
                 chat_path: None,
                 models_path: None,
                 name: Some("fallback".into()),
@@ -817,18 +820,35 @@ mod tests {
         let path = directory.path().join("config.toml");
         Config::with_providers(entries).save_to(&path).unwrap();
         let config = crate::config::load_config_from_path(&path).unwrap();
-        let graph = create_provider_graph_from_config(&config).unwrap();
-        assert_eq!(graph.profiles().len(), 1);
-        assert_eq!(graph.profiles()[0].profile_name(), "fallback");
-        assert_eq!(graph.profiles()[0].provider().name(), "grok");
-        assert_eq!(
-            graph.profiles()[0].provider().default_model(),
-            "grok-code-fast-1"
-        );
-        assert!(graph
-            .profiles()
-            .iter()
-            .all(|profile| profile.profile_name() != "subscription"));
+        let mut construction_attempts = 0;
+        let error = create_named_providers_from_entries_with(&config.providers, |entry| {
+            construction_attempts += 1;
+            let mut stream = std::net::TcpStream::connect(&endpoint)?;
+            std::io::Write::write_all(&mut stream, b"GET /unexpected HTTP/1.0\r\n\r\n")?;
+            create_provider_from_entry(entry)
+        })
+        .err()
+        .expect("mixed legacy configuration must fail as a complete graph");
+
+        assert_eq!(construction_attempts, 0);
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        let message = error.to_string();
+        assert!(message.contains("Provider #1 is invalid"));
+        assert!(message.contains("Legacy chatgpt_subscription profiles are unsupported"));
+
+        let error = create_provider_graph_from_config(&config)
+            .err()
+            .expect("production provider graph must reject mixed legacy configuration");
+        assert!(error
+            .to_string()
+            .contains("Legacy chatgpt_subscription profiles are unsupported"));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[test]
