@@ -334,12 +334,16 @@ mod tests {
     #[test]
     fn test_response_model_metadata_is_bounded_and_log_safe() {
         validate_response_model(&"m".repeat(MAX_RESPONSE_MODEL_BYTES)).unwrap();
+        let empty_error = validate_response_model("").unwrap_err().to_string();
+        assert_eq!(empty_error, "Provider response model metadata was invalid");
         for model in [
-            "".to_string(),
-            "m".repeat(MAX_RESPONSE_MODEL_BYTES + 1),
-            "bad\nmodel".to_string(),
-            "bad model".to_string(),
-            "mødël".to_string(),
+            format!(
+                "OVERSIZED_MODEL_SECRET{}",
+                "m".repeat(MAX_RESPONSE_MODEL_BYTES)
+            ),
+            "CONTROL_MODEL_SECRET\nINJECTED".to_string(),
+            "SPACE_MODEL_SECRET INJECTED".to_string(),
+            "UNICODE_MODEL_SECRET_mødël".to_string(),
         ] {
             let error = validate_response_model(&model).unwrap_err().to_string();
             assert_eq!(error, "Provider response model metadata was invalid");
