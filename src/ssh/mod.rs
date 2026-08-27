@@ -8,4 +8,4 @@
 /// event loop a chance to process other events between SSH I/O steps.
 pub mod client;
 
-pub use client::{SshSession, SshSessionStore};
+pub use client::{HostKeyPolicy, SshSession, SshSessionStore};

@@ -4,12 +4,10 @@
 /// session object).  Sessions are stored in `SshSessionStore` and
 /// referenced by host adapters through an opaque session identifier.
 ///
-/// Security note: `check_server_key` currently accepts all host keys.
-/// A future version will verify against `~/.finch/known_hosts`.
 use anyhow::{bail, Result};
 use russh::client::{self, Config, Handle};
+use russh::keys::ssh_key::{Fingerprint, HashAlg, PublicKey};
 use russh::ChannelMsg;
-use russh_keys::key::PublicKey;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -17,20 +15,65 @@ use uuid::Uuid;
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
-/// russh client handler — decides whether to trust server host keys.
-struct SshHandler;
+/// Host-key verification policy for a new SSH connection.
+///
+/// Prefer [`HostKeyPolicy::pinned_sha256`]. The insecure policy exists only to
+/// preserve the behavior of Finch's original `connect_*` methods until their
+/// callers can provide a host-key pin. It is accept-all, not trust on first use:
+/// it neither remembers the first key nor detects a later key change.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostKeyPolicy(HostKeyVerification);
 
-#[async_trait::async_trait]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HostKeyVerification {
+    InsecureAcceptAny,
+    PinnedSha256(Fingerprint),
+}
+
+impl HostKeyPolicy {
+    /// Accept every server host key without verification.
+    ///
+    /// # Security
+    ///
+    /// This permits man-in-the-middle attacks. It is provided for compatibility
+    /// with the pre-0.60 Finch SSH API and is not a TOFU policy.
+    pub fn insecure_accept_any() -> Self {
+        Self(HostKeyVerification::InsecureAcceptAny)
+    }
+
+    /// Require an exact OpenSSH SHA-256 host-key fingerprint.
+    ///
+    /// The expected format is `SHA256:<unpadded-base64>`, as printed by
+    /// `ssh-keygen -l -E sha256`.
+    pub fn pinned_sha256(fingerprint: &str) -> Result<Self> {
+        let fingerprint = fingerprint
+            .parse::<Fingerprint>()
+            .map_err(|e| anyhow::anyhow!("ssh-host-key: invalid SHA-256 fingerprint: {e}"))?;
+        if !fingerprint.is_sha256() {
+            bail!("ssh-host-key: expected a SHA-256 fingerprint");
+        }
+        Ok(Self(HostKeyVerification::PinnedSha256(fingerprint)))
+    }
+}
+
+/// russh client handler — decides whether to trust server host keys.
+struct SshHandler {
+    host_key_policy: HostKeyPolicy,
+}
+
 impl client::Handler for SshHandler {
     type Error = anyhow::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &PublicKey,
+        server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        // Accept all host keys for now (TOFU — trust on first use).
-        // TODO: verify against ~/.finch/known_hosts.
-        Ok(true)
+        Ok(match &self.host_key_policy.0 {
+            HostKeyVerification::InsecureAcceptAny => true,
+            HostKeyVerification::PinnedSha256(expected) => {
+                server_public_key.fingerprint(HashAlg::Sha256) == *expected
+            }
+        })
     }
 }
 
@@ -45,22 +88,45 @@ pub struct SshSession {
 
 impl SshSession {
     /// Connect and authenticate with a password.
+    ///
+    /// # Security
+    ///
+    /// This compatibility method accepts every server host key. New callers
+    /// should use [`Self::connect_password_with_host_key_policy`] with a pin.
     pub async fn connect_password(
         host: &str,
         port: u16,
         user: &str,
         password: &str,
     ) -> Result<Self> {
+        Self::connect_password_with_host_key_policy(
+            host,
+            port,
+            user,
+            password,
+            HostKeyPolicy::insecure_accept_any(),
+        )
+        .await
+    }
+
+    /// Connect with password authentication and an explicit host-key policy.
+    pub async fn connect_password_with_host_key_policy(
+        host: &str,
+        port: u16,
+        user: &str,
+        password: &str,
+        host_key_policy: HostKeyPolicy,
+    ) -> Result<Self> {
         let config = Arc::new(Config::default());
         let addr = format!("{host}:{port}");
-        let mut handle = client::connect(config, addr.as_str(), SshHandler)
+        let mut handle = client::connect(config, addr.as_str(), SshHandler { host_key_policy })
             .await
             .map_err(|e| anyhow::anyhow!("ssh-connect: {e}"))?;
         let authenticated = handle
             .authenticate_password(user, password)
             .await
             .map_err(|e| anyhow::anyhow!("ssh-auth: {e}"))?;
-        if !authenticated {
+        if !authenticated.success() {
             bail!("ssh-connect: authentication failed for {user}@{host}:{port}");
         }
         Ok(Self {
@@ -71,31 +137,59 @@ impl SshSession {
     }
 
     /// Connect and authenticate with an Ed25519 private key (32-byte seed).
+    ///
+    /// # Security
+    ///
+    /// This compatibility method accepts every server host key. New callers
+    /// should use [`Self::connect_key_with_host_key_policy`] with a pin.
     pub async fn connect_key(
         host: &str,
         port: u16,
         user: &str,
         private_key_bytes: &[u8],
     ) -> Result<Self> {
-        use russh_keys::key::{KeyPair, ED25519};
+        Self::connect_key_with_host_key_policy(
+            host,
+            port,
+            user,
+            private_key_bytes,
+            HostKeyPolicy::insecure_accept_any(),
+        )
+        .await
+    }
+
+    /// Connect with Ed25519 authentication and an explicit host-key policy.
+    pub async fn connect_key_with_host_key_policy(
+        host: &str,
+        port: u16,
+        user: &str,
+        private_key_bytes: &[u8],
+        host_key_policy: HostKeyPolicy,
+    ) -> Result<Self> {
+        use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
+        use russh::keys::{PrivateKey, PrivateKeyWithHashAlg};
+
         if private_key_bytes.len() != 32 {
             bail!("ssh-auth-key: private key must be 32 bytes");
         }
-        // Build an ed25519 signing key from the raw seed bytes.
-        let seed: [u8; 32] = private_key_bytes.try_into().unwrap();
-        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-        let keypair = KeyPair::Ed25519(sk.into());
+        let seed: [u8; 32] = private_key_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("ssh-auth-key: private key must be 32 bytes"))?;
+        let keypair = Ed25519Keypair::from_seed(&seed);
+        let private_key = PrivateKey::new(KeypairData::Ed25519(keypair), "")
+            .map_err(|e| anyhow::anyhow!("ssh-auth-key: invalid Ed25519 private key: {e}"))?;
+        let private_key = PrivateKeyWithHashAlg::new(Arc::new(private_key), None);
 
         let config = Arc::new(Config::default());
         let addr = format!("{host}:{port}");
-        let mut handle = client::connect(config, addr.as_str(), SshHandler)
+        let mut handle = client::connect(config, addr.as_str(), SshHandler { host_key_policy })
             .await
             .map_err(|e| anyhow::anyhow!("ssh-connect: {e}"))?;
         let authenticated = handle
-            .authenticate_publickey(user, Arc::new(keypair))
+            .authenticate_publickey(user, private_key)
             .await
             .map_err(|e| anyhow::anyhow!("ssh-auth-key: {e}"))?;
-        if !authenticated {
+        if !authenticated.success() {
             bail!("ssh-connect: key authentication failed for {user}@{host}:{port}");
         }
         Ok(Self {
@@ -141,12 +235,17 @@ impl SshSession {
         Ok((stdout, stderr, exit_code))
     }
 
-    /// Write a file via `cat >` (simple transfer, no SCP/SFTP dependency).
+    /// Write a file through the remote user's shell (no SCP/SFTP dependency).
+    ///
+    /// The remote shell must implement POSIX single-quote parsing and provide
+    /// `base64 -d`. The path is quoted as one shell word, but this remains a
+    /// shell command: it follows redirections and symlinks and is not a safe
+    /// filesystem capability primitive.
     pub async fn write_file(&mut self, remote_path: &str, content: &[u8]) -> Result<()> {
         use base64::Engine;
-        // Encode content as base64 and decode on the remote side.
+        let remote_path = quote_posix_shell_word(remote_path)?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(content);
-        let cmd = format!("echo '{}' | base64 -d > {}", b64, remote_path);
+        let cmd = format!("printf '%s' '{b64}' | base64 -d > {remote_path}");
         let (_, stderr, code) = self.exec(&cmd).await?;
         if code != 0 {
             bail!("ssh-write-file: remote exited {code}: {stderr}");
@@ -154,9 +253,14 @@ impl SshSession {
         Ok(())
     }
 
-    /// Read a file via `cat`.
+    /// Read a file through the remote user's POSIX-compatible shell.
+    ///
+    /// The path is quoted as one shell word. Redirections and symlinks still
+    /// have normal remote-shell semantics; this is not a safe filesystem
+    /// capability primitive.
     pub async fn read_file(&mut self, remote_path: &str) -> Result<Vec<u8>> {
-        let (stdout, stderr, code) = self.exec(&format!("cat {remote_path}")).await?;
+        let remote_path = quote_posix_shell_word(remote_path)?;
+        let (stdout, stderr, code) = self.exec(&format!("cat < {remote_path}")).await?;
         if code != 0 {
             bail!("ssh-read-file: remote exited {code}: {stderr}");
         }
@@ -175,6 +279,13 @@ impl SshSession {
     pub fn info(&self) -> String {
         format!("{}@{}", self.user, self.host)
     }
+}
+
+fn quote_posix_shell_word(value: &str) -> Result<String> {
+    if value.contains('\0') {
+        bail!("ssh-path: remote path contains a NUL byte");
+    }
+    Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
 }
 
 // ── Store ─────────────────────────────────────────────────────────────────────
@@ -257,5 +368,14 @@ mod tests {
     fn test_ssh_session_store_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SshSessionStore>();
+    }
+
+    #[test]
+    fn test_quote_posix_shell_word_blocks_path_injection() {
+        assert_eq!(
+            quote_posix_shell_word("a'; touch /tmp/pwned; echo '").unwrap(),
+            "'a'\"'\"'; touch /tmp/pwned; echo '\"'\"''"
+        );
+        assert!(quote_posix_shell_word("bad\0path").is_err());
     }
 }
