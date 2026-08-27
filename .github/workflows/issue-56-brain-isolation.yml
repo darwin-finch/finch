@@ -2,7 +2,7 @@ name: Issue 56 Brain isolation security
 
 on:
   push:
-    branches: [ codex/issue-56-brain-test-isolation ]
+    branches: [ codex/issue-56-binary-free-isolation ]
   workflow_dispatch:
 
 permissions:
@@ -58,7 +58,9 @@ jobs:
 
     - name: Build isolation supervisor
       timeout-minutes: 20
-      run: cargo build --bin finch-test-supervisor
+      run: |
+        cargo build --bin finch-test-supervisor
+        cargo build --release --bin finch-test-supervisor
 
     - name: Reject self-issued proof authority
       timeout-minutes: 15
@@ -80,6 +82,20 @@ jobs:
         ./scripts/test_brains.sh cargo test --lib
         server::tests::production_constructor_rejects_rewritten_proof_and_accepts_exact_restore
         -- --nocapture
+
+    - name: Reject fixture traversal before external mutation
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test --lib
+        supervised_http_fixture_rejects
+        -- --nocapture
+
+    - name: Exercise real Brain and server paths behind the guard
+      timeout-minutes: 25
+      run: |
+        ./scripts/test_brains.sh cargo test --lib brain::store -- --nocapture
+        ./scripts/test_brains.sh cargo test --lib server::brain_service -- --nocapture
+        ./scripts/test_brains.sh cargo test --lib server::tests::production_constructor -- --nocapture
 
     - name: Exercise the complete synthetic isolation harness
       timeout-minutes: 15

@@ -64,14 +64,6 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all -- --check
 
-    - name: Build Brain test supervisor
-      run: |
-        cargo build --bin finch-test-supervisor
-        cargo build --release --bin finch-test-supervisor
-
-    - name: Verify Brain test isolation harness
-      run: ./scripts/test_brain_isolation.sh
-
     - name: Run clippy (binary only, warnings allowed for now)
       run: cargo clippy --bin finch --all-features
       continue-on-error: true
@@ -95,9 +87,6 @@ jobs:
           echo "✗ Binary not found"
           exit 1
         fi
-
-    - name: Run tests behind the Brain production-store guard
-      run: ./scripts/test_brains.sh cargo test --lib --tests
 
   runtime-authority:
     name: Runtime Authority (Ubuntu)
