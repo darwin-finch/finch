@@ -30,3 +30,6 @@ Rust files. `RUSTFMT_1_98_MIGRATION_MANIFEST.txt` records the exact 57-file foot
 the resulting footprint differs. After the active Rust frontier merges, run that script and commit
 its source-only result as an isolated mechanical commit. Until then, the formatting contract job is
 expected to fail and the issue #191 pull request must remain blocked.
+
+The audited manifest SHA-256 is
+`16ea6402375aeffd18c972dbcd33d7777065d8f8be533fb8a1db368b6ebdbd13`.

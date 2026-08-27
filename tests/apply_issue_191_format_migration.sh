@@ -12,6 +12,13 @@ cd "$repository_root"
 
 expected_toolchain="1.98.0"
 manifest="docs/RUSTFMT_1_98_MIGRATION_MANIFEST.txt"
+expected_manifest_sha256="16ea6402375aeffd18c972dbcd33d7777065d8f8be533fb8a1db368b6ebdbd13"
+
+actual_manifest_sha256=$(shasum -a 256 "$manifest" | awk '{print $1}')
+if [[ "$actual_manifest_sha256" != "$expected_manifest_sha256" ]]; then
+  echo "The audited issue #191 manifest hash does not match" >&2
+  exit 1
+fi
 
 if [[ $(rustc +"$expected_toolchain" --version) != "rustc $expected_toolchain "* ]]; then
   echo "Rust $expected_toolchain is required for the mechanical migration" >&2
