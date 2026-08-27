@@ -105,8 +105,11 @@ jobs:
     - name: Run runtime authority regressions
       run: cargo test --lib runtime::tests -- --nocapture
 
+    - name: Compile all targets
+      run: cargo test --all-targets --no-run
+
     - name: Test all targets
-      run: cargo test --all-targets
+      run: timeout --signal=TERM --kill-after=30s 15m cargo test --all-targets -- --nocapture --test-threads=1
 
   build:
     name: Build Release
