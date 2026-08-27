@@ -88,12 +88,12 @@ pub fn default_cache_dir() -> Result<PathBuf> {
 
 pub fn static_fallback(provider: &str) -> Vec<String> {
     let models: &[&str] = match provider {
-        "claude" => &["claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"],
-        "openai" => &["gpt-4o", "gpt-4-turbo", "o3-mini"],
-        "grok" => &["grok-code-fast-1", "grok-2-latest"],
-        "gemini" => &["gemini-2.0-flash", "gemini-1.5-pro"],
-        "mistral" => &["mistral-large-latest", "codestral-latest"],
-        "groq" => &["llama-3.3-70b-versatile", "gemma2-9b-it"],
+        "claude" => &["claude-sonnet-5"],
+        "openai" => &["gpt-5.6-sol", "gpt-4o"],
+        "grok" => &["grok-4.6"],
+        "gemini" => &["gemini-2.5-flash"],
+        "mistral" => &["mistral-large-2512"],
+        "groq" => &["openai/gpt-oss-120b"],
         _ => &[],
     };
     models.iter().map(|model| (*model).to_string()).collect()

@@ -12,8 +12,11 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::types::{ProviderRequest, ProviderResponse, StreamChunk};
-use super::LlmProvider;
+use super::types::{
+    CapabilitySupport, ModelCapabilities, ProviderRequest, ProviderResponse, StreamChunk,
+    WireProtocol,
+};
+use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::claude::retry::{with_retry, NonRetriableError};
 use crate::claude::types::ContentBlock;
 
@@ -41,7 +44,7 @@ impl GeminiProvider {
         Ok(Self {
             client,
             api_key,
-            default_model: "gemini-2.0-flash-exp".to_string(),
+            default_model: "gemini-2.5-flash".to_string(),
         })
     }
 
@@ -412,16 +415,19 @@ impl GeminiProvider {
 }
 
 #[async_trait]
-impl LlmProvider for GeminiProvider {
-    async fn send_message(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        with_retry(|| self.send_message_once(request)).await
+impl ProviderBackend for GeminiProvider {
+    async fn send_message_validated(
+        &self,
+        request: ValidatedProviderRequest,
+    ) -> Result<ProviderResponse> {
+        with_retry(|| self.send_message_once(request.request())).await
     }
 
-    async fn send_message_stream(
+    async fn send_message_stream_validated(
         &self,
-        request: &ProviderRequest,
+        request: ValidatedProviderRequest,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-        with_retry(|| self.send_message_stream_once(request)).await
+        with_retry(|| self.send_message_stream_once(request.request())).await
     }
 
     fn name(&self) -> &str {
@@ -432,16 +438,28 @@ impl LlmProvider for GeminiProvider {
         &self.default_model
     }
 
-    fn supports_streaming(&self) -> bool {
-        true
-    }
-
-    fn supports_tools(&self) -> bool {
-        true
-    }
-
-    fn context_limit_tokens(&self) -> usize {
-        900_000 // Gemini 1.5 Pro supports 1M context
+    fn capabilities(&self, model: &str) -> ModelCapabilities {
+        if model != "gemini-2.5-flash" {
+            return ModelCapabilities::unknown(self.name(), model);
+        }
+        ModelCapabilities::static_metadata(
+            self.name(),
+            model,
+            "2026-08-26",
+            "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash",
+            CapabilitySupport::Unknown,
+            CapabilitySupport::Supported,
+            CapabilitySupport::Unsupported,
+            ReasoningCapability::unsupported("2026-08-26", "Finch Gemini adapter"),
+            Some(1_048_576),
+            Some(65_536),
+            None,
+        )
+        .with_wire_protocol(
+            WireProtocol::GeminiGenerateContent,
+            "2026-08-26",
+            "Finch Gemini generateContent adapter",
+        )
     }
 }
 
@@ -572,7 +590,7 @@ mod tests {
     #[test]
     fn test_default_model() {
         let provider = GeminiProvider::new("test-key".to_string()).unwrap();
-        assert_eq!(provider.default_model(), "gemini-2.0-flash-exp");
+        assert_eq!(provider.default_model(), "gemini-2.5-flash");
     }
 
     #[test]

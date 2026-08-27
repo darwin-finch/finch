@@ -9,8 +9,11 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::endpoints::ProviderEndpoints;
-use super::types::{ProviderRequest, ProviderResponse, StreamChunk};
-use super::LlmProvider;
+use super::types::{
+    CapabilitySupport, ModelCapabilities, ProviderRequest, ProviderResponse, StreamChunk,
+    WireProtocol,
+};
+use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::claude::retry::{with_retry, NonRetriableError};
 use crate::claude::streaming::StreamEvent;
 use crate::claude::types::{ContentBlock, MessageRequest};
@@ -394,16 +397,19 @@ impl ClaudeProvider {
 }
 
 #[async_trait]
-impl LlmProvider for ClaudeProvider {
-    async fn send_message(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        with_retry(|| self.send_message_once(request)).await
+impl ProviderBackend for ClaudeProvider {
+    async fn send_message_validated(
+        &self,
+        request: ValidatedProviderRequest,
+    ) -> Result<ProviderResponse> {
+        with_retry(|| self.send_message_once(request.request())).await
     }
 
-    async fn send_message_stream(
+    async fn send_message_stream_validated(
         &self,
-        request: &ProviderRequest,
+        request: ValidatedProviderRequest,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-        with_retry(|| self.send_message_stream_once(request)).await
+        with_retry(|| self.send_message_stream_once(request.request())).await
     }
 
     fn name(&self) -> &str {
@@ -414,16 +420,33 @@ impl LlmProvider for ClaudeProvider {
         &self.default_model
     }
 
-    fn supports_streaming(&self) -> bool {
-        true
-    }
-
-    fn supports_tools(&self) -> bool {
-        true
-    }
-
-    fn context_limit_tokens(&self) -> usize {
-        190_000 // Claude has a 200k context; leave 10k headroom for response
+    fn capabilities(&self, model: &str) -> ModelCapabilities {
+        if self.endpoints.chat_url != "https://api.anthropic.com/v1/messages"
+            || self.endpoints.models_url != "https://api.anthropic.com/v1/models"
+        {
+            return ModelCapabilities::unknown(self.name(), model);
+        }
+        if model != DEFAULT_CLAUDE_MODEL {
+            return ModelCapabilities::unknown(self.name(), model);
+        }
+        ModelCapabilities::static_metadata(
+            self.name(),
+            model,
+            "2026-08-26",
+            "https://platform.claude.com/docs/en/models/sonnet-5/whats-new-sonnet-5; https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview",
+            CapabilitySupport::Supported,
+            CapabilitySupport::Supported,
+            CapabilitySupport::Unsupported,
+            ReasoningCapability::unsupported("2026-08-26", "Finch Claude adapter"),
+            Some(1_000_000),
+            Some(128_000),
+            None,
+        )
+        .with_wire_protocol(
+            WireProtocol::AnthropicMessages,
+            "2026-08-26",
+            "Finch Anthropic Messages adapter",
+        )
     }
 }
 
@@ -449,7 +472,7 @@ mod tests {
             "/gateway/anthropic/models",
         )
         .unwrap()
-        .with_model("claude-test");
+        .with_model(DEFAULT_CLAUDE_MODEL);
 
         provider
             .send_message(&ProviderRequest::new(vec![
@@ -457,6 +480,40 @@ mod tests {
             ]))
             .await
             .unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn custom_claude_endpoint_cannot_claim_anthropic_streaming_capability() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/gateway/anthropic/messages")
+            .expect(0)
+            .with_status(500)
+            .create_async()
+            .await;
+        let provider = ClaudeProvider::new_with_endpoints(
+            "endpoint-secret".to_string(),
+            &server.url(),
+            "/gateway/anthropic/messages",
+            "/gateway/anthropic/models",
+        )
+        .unwrap()
+        .with_model(DEFAULT_CLAUDE_MODEL);
+
+        let capabilities = provider.capabilities(DEFAULT_CLAUDE_MODEL);
+        assert_eq!(capabilities.streaming.support, CapabilitySupport::Unknown);
+        assert_eq!(capabilities.tools.support, CapabilitySupport::Unknown);
+        assert_eq!(capabilities.context_window.max_tokens, None);
+
+        let error = provider
+            .send_message_stream(&ProviderRequest::new(vec![]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Provider 'claude' model 'claude-sonnet-5' has unknown streaming capability; refusing to assume support"
+        );
         mock.assert_async().await;
     }
 

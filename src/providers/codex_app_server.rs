@@ -28,8 +28,11 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 
-use super::types::{ProviderRequest, ProviderResponse, StreamChunk};
-use super::LlmProvider;
+use super::types::{
+    CapabilitySupport, ModelCapabilities, ProviderRequest, ProviderResponse, StreamChunk,
+    WireProtocol,
+};
+use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::claude::types::ContentBlock;
 use crate::tools::types::ToolDefinition;
 
@@ -2556,14 +2559,17 @@ fn completed_agent_text(event: &Value) -> Option<String> {
 }
 
 #[async_trait]
-impl LlmProvider for CodexAppServerProvider {
-    async fn send_message(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        let model = if request.model.trim().is_empty() {
+impl ProviderBackend for CodexAppServerProvider {
+    async fn send_message_validated(
+        &self,
+        request: ValidatedProviderRequest,
+    ) -> Result<ProviderResponse> {
+        let model = if request.request().model.trim().is_empty() {
             self.default_model.clone()
         } else {
-            request.model.clone()
+            request.request().model.clone()
         };
-        let mut receiver = self.send_message_stream(request).await?;
+        let mut receiver = self.send_message_stream_validated(request).await?;
         let mut content = Vec::new();
         while let Some(chunk) = receiver.recv().await {
             if let StreamChunk::ContentBlockComplete(block) = chunk? {
@@ -2585,11 +2591,11 @@ impl LlmProvider for CodexAppServerProvider {
         })
     }
 
-    async fn send_message_stream(
+    async fn send_message_stream_validated(
         &self,
-        request: &ProviderRequest,
+        request: ValidatedProviderRequest,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-        let session = self.begin_turn(request).await?;
+        let session = self.begin_turn(request.request()).await?;
         let (tx, rx) = mpsc::channel(100);
         tokio::spawn(session.drive(tx));
         Ok(rx)
@@ -2603,12 +2609,30 @@ impl LlmProvider for CodexAppServerProvider {
         &self.default_model
     }
 
-    fn supports_tools(&self) -> bool {
-        false
-    }
-
-    fn context_limit_tokens(&self) -> usize {
-        120_000
+    fn capabilities(&self, model: &str) -> ModelCapabilities {
+        if model != "gpt-5.6-sol" {
+            return ModelCapabilities::unknown(self.name(), model);
+        }
+        // The model may support more features upstream, but Finch's current
+        // app-server adapter intentionally exposes only its completed text path.
+        ModelCapabilities::static_metadata(
+            self.name(),
+            model,
+            "2026-08-26",
+            "https://developers.openai.com/api/docs/models/gpt-5.6-sol; Finch Codex app-server text adapter",
+            CapabilitySupport::Supported,
+            CapabilitySupport::Unsupported,
+            CapabilitySupport::Unsupported,
+            ReasoningCapability::unsupported("2026-08-26", "Finch Codex app-server adapter"),
+            Some(1_050_000),
+            Some(128_000),
+            None,
+        )
+        .with_wire_protocol(
+            WireProtocol::CodexAppServer,
+            "2026-08-26",
+            "Finch Codex app-server adapter",
+        )
     }
 }
 
@@ -3292,7 +3316,7 @@ for line in sys.stdin:
     async fn tool_request_fails_before_spawning_when_capability_is_absent() {
         let provider = CodexAppServerProvider::with_command(
             AppServerCommand::test(PathBuf::from("/does/not/exist"), vec![]),
-            "model",
+            GPT_5_6_SOL,
             false,
         );
         let request = ProviderRequest::new(vec![]).with_tools(vec![ToolDefinition {
@@ -3301,8 +3325,30 @@ for line in sys.stdin:
             input_schema: crate::tools::types::ToolInputSchema::simple(vec![]),
         }]);
         let error = provider.send_message_stream(&request).await.unwrap_err();
-        assert!(error.to_string().contains("does not enable tools"));
+        assert!(error.to_string().contains(
+            "Provider 'chatgpt_subscription' model 'gpt-5.6-sol' does not support tool calls"
+        ));
         assert!(!error.to_string().contains("does/not/exist"));
+    }
+
+    #[test]
+    fn codex_adapter_capabilities_are_explicitly_text_only() {
+        let provider = CodexAppServerProvider::with_command(
+            AppServerCommand::test(PathBuf::from("/does/not/exist"), vec![]),
+            GPT_5_6_SOL,
+            false,
+        );
+        let capabilities = provider.capabilities(GPT_5_6_SOL);
+        assert!(capabilities.streaming.is_supported());
+        assert_eq!(capabilities.tools.support, CapabilitySupport::Unsupported);
+        assert_eq!(
+            capabilities.reasoning.support(),
+            CapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            capabilities.continuation.support,
+            CapabilitySupport::Unsupported
+        );
     }
 
     #[test]

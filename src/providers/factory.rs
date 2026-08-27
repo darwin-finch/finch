@@ -29,6 +29,23 @@ impl ProviderProfile {
     pub fn provider(&self) -> &Arc<dyn LlmProvider> {
         &self.provider
     }
+
+    /// Capabilities of this profile's configured model.
+    pub fn capabilities(&self) -> Result<super::ModelCapabilities> {
+        let model = self.provider.default_model();
+        let capabilities = self.provider.capabilities(model);
+        if capabilities.provider != self.provider.name() || capabilities.model != model {
+            bail!(
+                "Capability descriptor identity mismatch for profile '{}': expected provider '{}' model '{}', got provider '{}' model '{}'",
+                self.profile_name,
+                self.provider.name(),
+                model,
+                capabilities.provider,
+                capabilities.model
+            );
+        }
+        Ok(capabilities)
+    }
 }
 
 /// A cloud provider graph constructed exactly once from configuration.
@@ -138,7 +155,7 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
                     .unwrap_or_else(|| "https://api.x.ai".to_string()),
                 chat_path.as_deref().unwrap_or("/v1/chat/completions"),
                 models_path.as_deref().unwrap_or("/v1/models"),
-                "grok-2".to_string(),
+                "grok-4.6".to_string(),
                 "grok".to_string(),
             )?;
             if let Some(m) = model {
@@ -170,7 +187,7 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
                     .unwrap_or_else(|| "https://api.mistral.ai".to_string()),
                 chat_path.as_deref().unwrap_or("/v1/chat/completions"),
                 models_path.as_deref().unwrap_or("/v1/models"),
-                "mistral-large-latest".to_string(),
+                "mistral-large-2512".to_string(),
                 "mistral".to_string(),
             )?;
             if let Some(m) = model {
@@ -424,7 +441,7 @@ pub fn create_provider_from_teacher(entry: &TeacherEntry) -> Result<Box<dyn LlmP
                     .unwrap_or_else(|| "https://api.x.ai".to_string()),
                 "/v1/chat/completions",
                 "/v1/models",
-                "grok-2".to_string(),
+                "grok-4.6".to_string(),
                 "grok".to_string(),
             )?;
             if let Some(model) = &entry.model {
@@ -450,7 +467,7 @@ pub fn create_provider_from_teacher(entry: &TeacherEntry) -> Result<Box<dyn LlmP
                     .unwrap_or_else(|| "https://api.mistral.ai".to_string()),
                 "/v1/chat/completions",
                 "/v1/models",
-                "mistral-large-latest".to_string(),
+                "mistral-large-2512".to_string(),
                 "mistral".to_string(),
             )?;
             if let Some(model) = &entry.model {
@@ -652,9 +669,9 @@ schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandbo
             TeacherEntry {
                 provider: "openai".to_string(),
                 api_key: "test-key".to_string(),
-                model: Some("gpt-4o-mini".to_string()),
+                model: Some("gpt-5.6-sol".to_string()),
                 base_url: None,
-                name: Some("GPT-4o-mini (cheaper)".to_string()),
+                name: Some("GPT-5.6 Sol".to_string()),
             },
         ];
 
@@ -663,7 +680,21 @@ schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandbo
         assert_eq!(providers[0].name(), "openai");
         assert_eq!(providers[1].name(), "openai");
         assert_eq!(providers[0].default_model(), "gpt-4o");
-        assert_eq!(providers[1].default_model(), "gpt-4o-mini");
+        assert_eq!(providers[1].default_model(), "gpt-5.6-sol");
+        assert_eq!(
+            providers[0]
+                .capabilities(providers[0].default_model())
+                .reasoning
+                .support(),
+            crate::providers::CapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            providers[1]
+                .capabilities(providers[1].default_model())
+                .reasoning
+                .support(),
+            crate::providers::CapabilitySupport::Supported
+        );
     }
 
     // -----------------------------------------------------------------------

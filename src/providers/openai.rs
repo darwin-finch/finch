@@ -12,8 +12,11 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use super::endpoints::ProviderEndpoints;
-use super::types::{ProviderRequest, ProviderResponse, StreamChunk};
-use super::LlmProvider;
+use super::types::{
+    CapabilitySupport, ModelCapabilities, ProviderRequest, ProviderResponse, StreamChunk,
+    WireProtocol,
+};
+use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::claude::retry::{with_retry, NonRetriableError};
 use crate::claude::types::ContentBlock;
 use crate::config::ReasoningEffort;
@@ -133,7 +136,7 @@ impl OpenAIProvider {
             "https://api.x.ai".to_string(),
             "/v1/chat/completions",
             "/v1/models",
-            "grok-2".to_string(),
+            "grok-4.6".to_string(),
             "grok".to_string(),
         )
     }
@@ -145,7 +148,7 @@ impl OpenAIProvider {
             "https://api.mistral.ai".to_string(),
             "/v1/chat/completions",
             "/v1/models",
-            "mistral-large-latest".to_string(),
+            "mistral-large-2512".to_string(),
             "mistral".to_string(),
         )
     }
@@ -158,7 +161,7 @@ impl OpenAIProvider {
             "https://api.groq.com".to_string(),
             "/openai/v1/chat/completions",
             "/openai/v1/models",
-            "llama-3.1-70b-versatile".to_string(),
+            "openai/gpt-oss-120b".to_string(),
             "groq".to_string(),
         )
     }
@@ -655,16 +658,19 @@ impl OpenAIProvider {
 }
 
 #[async_trait]
-impl LlmProvider for OpenAIProvider {
-    async fn send_message(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        with_retry(|| self.send_message_once(request)).await
+impl ProviderBackend for OpenAIProvider {
+    async fn send_message_validated(
+        &self,
+        request: ValidatedProviderRequest,
+    ) -> Result<ProviderResponse> {
+        with_retry(|| self.send_message_once(request.request())).await
     }
 
-    async fn send_message_stream(
+    async fn send_message_stream_validated(
         &self,
-        request: &ProviderRequest,
+        request: ValidatedProviderRequest,
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
-        with_retry(|| self.send_message_stream_once(request)).await
+        with_retry(|| self.send_message_stream_once(request.request())).await
     }
 
     fn name(&self) -> &str {
@@ -675,22 +681,129 @@ impl LlmProvider for OpenAIProvider {
         &self.default_model
     }
 
-    fn supports_streaming(&self) -> bool {
-        true
-    }
-
-    fn supports_tools(&self) -> bool {
-        true
-    }
-
-    fn context_limit_tokens(&self) -> usize {
-        match self.provider_name.as_str() {
-            "grok" => 250_000,    // Grok has 256k context; 6k headroom
-            "openai" => 120_000,  // GPT-4o has 128k context
-            "mistral" => 120_000, // Mistral Large has ~128k context
-            "groq" => 30_000,     // Groq varies by model; be conservative
-            _ => 120_000,
+    fn capabilities(&self, model: &str) -> ModelCapabilities {
+        let canonical_endpoints = match self.provider_name.as_str() {
+            "openai" => {
+                self.endpoints.chat_url == "https://api.openai.com/v1/chat/completions"
+                    && self.endpoints.models_url == "https://api.openai.com/v1/models"
+            }
+            "grok" => {
+                self.endpoints.chat_url == "https://api.x.ai/v1/chat/completions"
+                    && self.endpoints.models_url == "https://api.x.ai/v1/models"
+            }
+            "mistral" => {
+                self.endpoints.chat_url == "https://api.mistral.ai/v1/chat/completions"
+                    && self.endpoints.models_url == "https://api.mistral.ai/v1/models"
+            }
+            "groq" => {
+                self.endpoints.chat_url == "https://api.groq.com/openai/v1/chat/completions"
+                    && self.endpoints.models_url == "https://api.groq.com/openai/v1/models"
+            }
+            _ => false,
+        };
+        if !canonical_endpoints {
+            return ModelCapabilities::unknown(self.name(), model);
         }
+
+        let (source, streaming, tools, reasoning, max_tokens, max_output_tokens) =
+            match (self.provider_name.as_str(), model) {
+                ("openai", "gpt-5.6-sol") => (
+                    "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+                    CapabilitySupport::Supported,
+                    CapabilitySupport::Supported,
+                    ReasoningCapability::allowed(
+                        [
+                            ReasoningEffort::None,
+                            ReasoningEffort::Low,
+                            ReasoningEffort::Medium,
+                            ReasoningEffort::High,
+                            ReasoningEffort::Xhigh,
+                            ReasoningEffort::Max,
+                        ],
+                        "2026-08-26",
+                        "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+                    ),
+                    1_050_000,
+                    Some(128_000),
+                ),
+                ("openai", "gpt-4o") => (
+                    "https://developers.openai.com/api/docs/models/gpt-4o",
+                    CapabilitySupport::Supported,
+                    CapabilitySupport::Supported,
+                    ReasoningCapability::unsupported(
+                        "2026-08-26",
+                        "https://developers.openai.com/api/docs/models/gpt-4o",
+                    ),
+                    128_000,
+                    Some(16_384),
+                ),
+                ("grok", "grok-4.6") => (
+                    "https://docs.x.ai/developers/grok-4-6; https://docs.x.ai/developers/model-capabilities/text/streaming",
+                    CapabilitySupport::Supported,
+                    CapabilitySupport::Supported,
+                    ReasoningCapability::allowed(
+                        [
+                            ReasoningEffort::Low,
+                            ReasoningEffort::Medium,
+                            ReasoningEffort::High,
+                            ReasoningEffort::Xhigh,
+                        ],
+                        "2026-08-26",
+                        "https://docs.x.ai/developers/grok-4-6",
+                    ),
+                    500_000,
+                    None,
+                ),
+                ("mistral", "mistral-large-2512") => (
+                    "https://docs.mistral.ai/models/mistral-large-3-25-12",
+                    CapabilitySupport::Unknown,
+                    CapabilitySupport::Supported,
+                    ReasoningCapability::unknown(),
+                    256_000,
+                    None,
+                ),
+                ("groq", "openai/gpt-oss-120b") => (
+                    "https://console.groq.com/docs/model/openai/gpt-oss-120b; https://console.groq.com/docs/production-readiness/optimizing-latency",
+                    CapabilitySupport::Supported,
+                    CapabilitySupport::Supported,
+                    ReasoningCapability::allowed(
+                        [
+                            ReasoningEffort::Low,
+                            ReasoningEffort::Medium,
+                            ReasoningEffort::High,
+                        ],
+                        "2026-08-26",
+                        "https://console.groq.com/docs/model/openai/gpt-oss-120b",
+                    ),
+                    131_072,
+                    Some(65_536),
+                ),
+                // Ollama and remote-daemon catalogs are deployment-specific;
+                // all optional capabilities remain unknown until attested.
+                _ => return ModelCapabilities::unknown(self.name(), model),
+            };
+        ModelCapabilities::static_metadata(
+            self.name(),
+            model,
+            "2026-08-26",
+            source,
+            streaming,
+            tools,
+            CapabilitySupport::Unsupported,
+            reasoning,
+            Some(max_tokens),
+            max_output_tokens,
+            None,
+        )
+        .with_wire_protocol(
+            WireProtocol::OpenAiChatCompletions,
+            "2026-08-26",
+            "Finch OpenAI-compatible chat-completions adapter",
+        )
+    }
+
+    fn requested_reasoning_effort(&self, _request: &ProviderRequest) -> Option<ReasoningEffort> {
+        self.reasoning_effort
     }
 }
 
@@ -860,7 +973,7 @@ mod tests {
             .mock("POST", "/api/coding/paas/v4/chat/completions")
             .match_header("authorization", "Bearer endpoint-secret")
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
-                "model": "custom-model"
+                "model": "gpt-4o"
             })))
             .with_status(200)
             .with_body(r#"{"id":"chat-1","object":"chat.completion","created":1,"model":"custom-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#)
@@ -871,8 +984,8 @@ mod tests {
             server.url(),
             "/api/coding/paas/v4/chat/completions",
             "/api/coding/paas/v4/models",
-            "custom-model".to_string(),
-            "compatible-test".to_string(),
+            "gpt-4o".to_string(),
+            "openai".to_string(),
         )
         .unwrap();
 
@@ -1085,13 +1198,190 @@ mod tests {
     #[test]
     fn test_provider_supports_streaming() {
         let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
-        assert!(provider.supports_streaming());
+        assert!(provider
+            .capabilities(provider.default_model())
+            .streaming
+            .is_supported());
     }
 
     #[test]
     fn test_provider_supports_tools() {
         let provider = OpenAIProvider::new_grok("key".to_string()).unwrap();
-        assert!(provider.supports_tools());
+        assert!(provider
+            .capabilities(provider.default_model())
+            .tools
+            .is_supported());
+    }
+
+    #[test]
+    fn same_provider_models_can_have_different_reasoning_capabilities() {
+        let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        let sol = provider.capabilities("gpt-5.6-sol");
+        let legacy = provider.capabilities("gpt-4o");
+        assert_eq!(sol.provider, legacy.provider);
+        assert_eq!(sol.reasoning.support(), CapabilitySupport::Supported);
+        assert_eq!(legacy.reasoning.support(), CapabilitySupport::Unsupported);
+        assert_eq!(
+            provider
+                .capabilities("vendor-private-model")
+                .streaming
+                .support,
+            CapabilitySupport::Unknown
+        );
+    }
+
+    #[test]
+    fn deployment_specific_models_stay_unknown_without_runtime_attestation() {
+        let ollama = OpenAIProvider::new_ollama(
+            "http://localhost:11434".to_string(),
+            "qwen2.5:7b".to_string(),
+        )
+        .unwrap();
+        let remote =
+            OpenAIProvider::new_remote_daemon("http://localhost:11435".to_string()).unwrap();
+        assert_eq!(
+            ollama
+                .capabilities(ollama.default_model())
+                .streaming
+                .support,
+            CapabilitySupport::Unknown
+        );
+        assert_eq!(
+            remote
+                .capabilities(remote.default_model())
+                .streaming
+                .support,
+            CapabilitySupport::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_reasoning_rejects_ineligible_model_before_http() {
+        let provider = OpenAIProvider::new_compatible(
+            "key".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "gpt-4o".to_string(),
+            "openai".to_string(),
+        )
+        .unwrap()
+        .with_reasoning_effort(ReasoningEffort::High);
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Provider 'openai' model 'gpt-4o' does not support reasoning controls"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_endpoint_cannot_claim_canonical_openai_capabilities() {
+        let provider = OpenAIProvider::new_compatible(
+            "key".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "gpt-5.6-sol".to_string(),
+            "openai".to_string(),
+        )
+        .unwrap()
+        .with_reasoning_effort(ReasoningEffort::High);
+        assert_eq!(
+            provider.capabilities("gpt-5.6-sol").reasoning.support(),
+            CapabilitySupport::Unknown
+        );
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown reasoning capability"));
+        assert!(!error.to_string().contains("Connection refused"));
+    }
+
+    #[tokio::test]
+    async fn gpt_5_6_sol_rejects_minimal_reasoning_before_http() {
+        let provider = OpenAIProvider::new_openai("key".to_string())
+            .unwrap()
+            .with_model("gpt-5.6-sol")
+            .with_reasoning_effort(ReasoningEffort::Minimal);
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![]))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not support reasoning effort 'minimal'"));
+    }
+
+    #[test]
+    fn gpt_5_6_sol_reasoning_efforts_are_exact() {
+        let base = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        let capabilities = base.capabilities("gpt-5.6-sol");
+        let allowed = vec![
+            ReasoningEffort::None,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+        ];
+        assert_eq!(
+            capabilities.reasoning.allowed_efforts,
+            Some(allowed.clone())
+        );
+        for effort in allowed {
+            let provider = base
+                .clone()
+                .with_model("gpt-5.6-sol")
+                .with_reasoning_effort(effort);
+            crate::providers::validate_provider_request(
+                &provider,
+                &ProviderRequest::new(vec![]),
+                false,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn grok_and_groq_reasoning_efforts_are_exact() {
+        let grok = OpenAIProvider::new_grok("key".to_string()).unwrap();
+        assert_eq!(
+            grok.capabilities("grok-4.6").reasoning.allowed_efforts,
+            Some(vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::Xhigh,
+            ])
+        );
+        let groq = OpenAIProvider::new_groq("key".to_string()).unwrap();
+        assert_eq!(
+            groq.capabilities("openai/gpt-oss-120b")
+                .reasoning
+                .allowed_efforts,
+            Some(vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn gpt_4o_rejects_oversized_output_before_http() {
+        let provider = OpenAIProvider::new_openai("key".to_string()).unwrap();
+        let error = provider
+            .send_message(&ProviderRequest::new(vec![]).with_max_tokens(16_385))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Provider 'openai' model 'gpt-4o' supports at most 16384 output tokens, but 16385 were requested"
+        );
     }
 
     // ── Streaming tool-call accumulation ─────────────────────────────────────
