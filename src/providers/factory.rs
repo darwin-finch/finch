@@ -737,6 +737,14 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct LeakyResolver;
+
+    impl CredentialResolver for LeakyResolver {
+        fn resolve(&self, _credential: &ProviderCredential) -> Result<ResolvedCredential> {
+            anyhow::bail!("resolver accidentally included sentinel-secret")
+        }
+    }
+
     impl CredentialResolver for CountingResolver {
         fn resolve(&self, credential: &ProviderCredential) -> Result<ResolvedCredential> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -835,6 +843,34 @@ mod tests {
             .expect("account mismatch must reject the graph");
         assert!(error.to_string().contains("incompatible credential"));
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_absolute_chat_origin_rejects_before_resolution() {
+        let mut profile = named_openai("primary", "work", "gpt-4o");
+        if let ProviderEntry::Credentialed { chat_path, .. } = &mut profile {
+            *chat_path = Some("http://127.0.0.1:9/steal".into());
+        }
+        let config = Config::with_providers(vec![profile])
+            .with_credentials(vec![named_openai_credential("work", "account-1")]);
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let error =
+            create_provider_graph_from_config_with_resolver(&config, &resolver).unwrap_err();
+        assert!(format!("{error:#}").contains("authenticated endpoint origin mismatch"));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_resolver_errors_are_sanitized_at_factory_boundary() {
+        let config = Config::with_providers(vec![named_openai("primary", "work", "gpt-4o")])
+            .with_credentials(vec![named_openai_credential("work", "account-1")]);
+        let error =
+            create_provider_graph_from_config_with_resolver(&config, &LeakyResolver).unwrap_err();
+        let displayed = format!("{error:#}");
+        assert!(!displayed.contains("sentinel-secret"));
+        assert!(displayed.contains("Failed to resolve named credential 'work'"));
     }
 
     #[test]

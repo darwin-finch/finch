@@ -128,6 +128,7 @@ pub struct ProviderResolver {
     active: Arc<RwLock<Arc<dyn Generator>>>,
     profiles: Arc<Vec<crate::config::ProviderEntry>>,
     daemon_client: Option<Arc<crate::client::DaemonClient>>,
+    config: Option<Arc<crate::config::Config>>,
 }
 
 impl ProviderResolver {
@@ -136,6 +137,7 @@ impl ProviderResolver {
             active: Arc::new(RwLock::new(active)),
             profiles: Arc::new(Vec::new()),
             daemon_client: None,
+            config: None,
         }
     }
 
@@ -148,6 +150,20 @@ impl ProviderResolver {
             active: Arc::new(RwLock::new(active)),
             profiles: Arc::new(profiles),
             daemon_client,
+            config: None,
+        }
+    }
+
+    pub fn with_config(
+        active: Arc<dyn Generator>,
+        config: crate::config::Config,
+        daemon_client: Option<Arc<crate::client::DaemonClient>>,
+    ) -> Self {
+        Self {
+            active: Arc::new(RwLock::new(active)),
+            profiles: Arc::new(config.providers.clone()),
+            daemon_client,
+            config: Some(Arc::new(config)),
         }
     }
 
@@ -203,8 +219,12 @@ impl ProviderResolver {
                 ),
             ));
         }
-        let provider = crate::providers::create_provider_from_entry(entry)?;
-        let client = crate::claude::ClaudeClient::with_provider(provider);
+        let provider = if let Some(config) = &self.config {
+            crate::providers::create_provider_profile_from_config(config, &entry.profile_name())?
+        } else {
+            Arc::from(crate::providers::create_provider_from_entry(entry)?)
+        };
+        let client = crate::claude::ClaudeClient::with_shared_provider(provider);
         let inner: Arc<dyn Generator> = Arc::new(crate::generators::claude::ClaudeGenerator::new(
             Arc::new(client),
         ));

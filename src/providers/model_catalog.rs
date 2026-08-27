@@ -491,9 +491,9 @@ mod tests {
                 required_scopes: BTreeSet::new(),
             },
             model: Some("gpt-4o".into()),
-            base_url: Some(endpoint),
+            base_url: None,
             chat_path: None,
-            models_path: None,
+            models_path: Some(format!("{endpoint}/models")),
             name: Some("primary".into()),
             reasoning_effort: None,
         };
@@ -519,7 +519,7 @@ mod tests {
         let error = refresh_from_config(&config, "primary", &resolver, cache.path())
             .await
             .unwrap_err();
-        assert!(format!("{error:#}").contains("audience mismatch"));
+        assert!(format!("{error:#}").contains("authenticated endpoint origin mismatch"));
         assert_eq!(resolver.0.load(Ordering::SeqCst), 0);
         assert!(matches!(
             listener.accept().unwrap_err().kind(),
@@ -832,5 +832,13 @@ mod tests {
             ),
             "https://models.example/v1/models"
         );
+    }
+
+    #[test]
+    fn catalog_profile_debug_redacts_api_key() {
+        let profile = profile("https://models.example", "openai", CatalogAuth::Bearer);
+        let debug = format!("{profile:?}");
+        assert!(!debug.contains("secret-that-must-not-be-cached"));
+        assert!(debug.contains("[REDACTED]"));
     }
 }
