@@ -389,6 +389,7 @@ fn build_subagent_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ---------------------------------------------------------------------------
     // Shared mock helpers
@@ -421,22 +422,36 @@ mod tests {
         }
     }
 
-    /// Echo provider — immediately returns a text response with no tool calls.
-    struct EchoProvider(String);
+    /// Echo provider — attests tool calls and immediately returns final text.
+    struct EchoProvider {
+        response: String,
+        backend_calls: AtomicUsize,
+    }
+
+    impl EchoProvider {
+        fn new(response: impl Into<String>) -> Self {
+            Self {
+                response: response.into(),
+                backend_calls: AtomicUsize::new(0),
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl crate::providers::ProviderBackend for EchoProvider {
         async fn send_message_validated(
             &self,
-            _req: crate::providers::ValidatedProviderRequest,
+            req: crate::providers::ValidatedProviderRequest,
         ) -> anyhow::Result<crate::providers::ProviderResponse> {
             use crate::claude::types::ContentBlock;
             use crate::providers::ProviderResponse;
+            let _req = req.into_request_for(self)?;
+            self.backend_calls.fetch_add(1, Ordering::SeqCst);
             Ok(ProviderResponse {
                 id: "test".to_string(),
                 model: "echo".to_string(),
                 content: vec![ContentBlock::Text {
-                    text: self.0.clone(),
+                    text: self.response.clone(),
                 }],
                 stop_reason: Some("end_turn".to_string()),
                 role: "assistant".to_string(),
@@ -456,6 +471,56 @@ mod tests {
         }
         fn default_model(&self) -> &str {
             "echo"
+        }
+
+        fn capabilities(&self, model: &str) -> crate::providers::ModelCapabilities {
+            use crate::providers::{CapabilitySupport, ModelCapabilities, ModelFeature};
+
+            let mut capabilities = ModelCapabilities::unknown(self.name(), model);
+            if model == self.default_model() {
+                capabilities.tools = ModelFeature::static_metadata(
+                    CapabilitySupport::Supported,
+                    "2026-08-27",
+                    "spawn test fixture",
+                );
+            }
+            capabilities
+        }
+    }
+
+    /// Provider with no capability attestation; its hooks must remain unreachable.
+    struct UnattestedProvider {
+        backend_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::ProviderBackend for UnattestedProvider {
+        async fn send_message_validated(
+            &self,
+            req: crate::providers::ValidatedProviderRequest,
+        ) -> anyhow::Result<crate::providers::ProviderResponse> {
+            let _req = req.into_request_for(self)?;
+            self.backend_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("unattested provider backend must not run")
+        }
+
+        async fn send_message_stream_validated(
+            &self,
+            req: crate::providers::ValidatedProviderRequest,
+        ) -> anyhow::Result<
+            tokio::sync::mpsc::Receiver<anyhow::Result<crate::providers::StreamChunk>>,
+        > {
+            let _req = req.into_request_for(self)?;
+            self.backend_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("unattested provider backend must not run")
+        }
+
+        fn name(&self) -> &str {
+            "unattested"
+        }
+
+        fn default_model(&self) -> &str {
+            "unattested"
         }
     }
 
@@ -479,6 +544,25 @@ mod tests {
         assert_eq!(SubagentType::from_str("general"), SubagentType::General);
         assert_eq!(SubagentType::from_str("unknown"), SubagentType::General);
         assert_eq!(SubagentType::from_str(""), SubagentType::General);
+    }
+
+    #[test]
+    fn test_echo_provider_attests_only_tools_for_exact_model() {
+        use crate::providers::{CapabilitySupport, ProviderBackend};
+
+        let provider = EchoProvider::new("done");
+        let capabilities = provider.capabilities(provider.default_model());
+        assert_eq!(capabilities.tools.support, CapabilitySupport::Supported);
+        assert_eq!(
+            capabilities.streaming.support,
+            CapabilitySupport::Unknown,
+            "the fixture must not imply unused streaming support"
+        );
+        assert_eq!(
+            provider.capabilities("other-model").tools.support,
+            CapabilitySupport::Unknown,
+            "the fixture attestation must not cover other models"
+        );
     }
 
     #[test]
@@ -582,19 +666,30 @@ mod tests {
     async fn test_fork_100_tasks_exit_codes_sum_to_zero() {
         use futures::future::join_all;
 
-        let provider: Arc<dyn crate::providers::LlmProvider> =
-            Arc::new(EchoProvider("done".to_string()));
+        const TASK_COUNT: usize = 100;
+        const MAX_TURNS: usize = 10;
 
-        let handles: Vec<_> = (0..100)
+        let provider = Arc::new(EchoProvider::new("done"));
+
+        let handles: Vec<_> = (0..TASK_COUNT)
             .map(|i| {
-                let p = Arc::clone(&provider);
+                let p: Arc<dyn crate::providers::LlmProvider> = provider.clone();
                 tokio::spawn(async move {
-                    run_subagent(p, &format!("task {i}"), SubagentType::General, None, 10, 0).await
+                    run_subagent(
+                        p,
+                        &format!("task {i}"),
+                        SubagentType::General,
+                        None,
+                        MAX_TURNS,
+                        0,
+                    )
+                    .await
                 })
             })
             .collect();
 
         let results = join_all(handles).await;
+        assert_eq!(results.len(), TASK_COUNT, "all spawned tasks were joined");
 
         let exit_code_sum: i32 = results
             .into_iter()
@@ -606,5 +701,44 @@ mod tests {
             .sum();
 
         assert_eq!(exit_code_sum, 0, "all 100 tasks must exit 0");
+        assert_eq!(
+            provider.backend_calls.load(Ordering::SeqCst),
+            TASK_COUNT,
+            "each bounded task must take one turn without recursive fan-out"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_provider_rejected_before_backend_invocation() {
+        use crate::providers::{CapabilitySupport, ProviderBackend};
+
+        let provider = Arc::new(UnattestedProvider {
+            backend_calls: AtomicUsize::new(0),
+        });
+        assert_eq!(
+            provider
+                .capabilities(provider.default_model())
+                .tools
+                .support,
+            CapabilitySupport::Unknown,
+            "the provider must inherit fail-closed tool capabilities"
+        );
+        let subagent_provider: Arc<dyn crate::providers::LlmProvider> = provider.clone();
+
+        let result = run_subagent(
+            subagent_provider,
+            "must remain fail closed",
+            SubagentType::General,
+            None,
+            1,
+            0,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "unknown tool capabilities must reject the subagent request"
+        );
+        assert_eq!(provider.backend_calls.load(Ordering::SeqCst), 0);
     }
 }

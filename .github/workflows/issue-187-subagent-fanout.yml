@@ -1,0 +1,39 @@
+name: Issue 187 Subagent Fan-out
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/tools/implementations/spawn.rs"
+      - ".github/workflows/issue-187-subagent-fanout.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  focused-spawn-tests:
+    name: Focused spawn tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install capnproto (Ubuntu)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+
+      - name: Install capnproto (macOS)
+        if: runner.os == 'macOS'
+        run: brew install capnp
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run focused spawn regressions
+        run: cargo test --lib tools::implementations::spawn::tests -- --nocapture
