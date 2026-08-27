@@ -1536,13 +1536,18 @@ mod tests {
         let (report, manifest_path) = report.unwrap();
 
         assert_eq!(report.output_path, output);
-        assert_eq!(report.diagnostic_record_count, 0);
-        assert_eq!(report.placement_record_count, 0);
+        assert!(report.diagnostic_record_count >= report.placement_record_count);
         assert!(!report.truncated);
         assert_eq!(
             fs::metadata(output).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(manifest_path.exists());
+        let manifest: CoreMlDiagnosticManifest =
+            serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest.placement_records_observed,
+            report.placement_record_count
+        );
+        assert_eq!(manifest.fallback_observed, None);
     }
 }
