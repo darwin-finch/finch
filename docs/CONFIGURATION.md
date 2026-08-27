@@ -121,6 +121,11 @@ profile_compute_plan = false
 # Whether CoreML may take nodes inside Loop, Scan, and If subgraphs.
 enable_subgraphs = false
 
+# These options currently apply to generative ONNX sessions. The semantic-
+# memory embedder remains explicitly CPU-only; evaluate that fixed-shape
+# workload separately before changing its provider default or claiming ANE
+# placement.
+
 # Storage Configuration
 [storage]
 # Base directory for Shammah data
