@@ -748,10 +748,13 @@ fn map_runner_registration_error(error: capnp::Error) -> anyhow::Error {
 }
 
 fn ensure_compatible_protocol(protocol_version: u32) -> Result<()> {
+    ensure_protocol_generation(protocol_version, crate::ipc::IPC_PROTOCOL_VERSION)
+}
+
+fn ensure_protocol_generation(protocol_version: u32, required_version: u32) -> Result<()> {
     anyhow::ensure!(
-        protocol_version == crate::ipc::IPC_PROTOCOL_VERSION,
-        "the running Finch daemon uses IPC protocol {protocol_version}, but this frontend requires {}; restart the daemon with the rebuilt Finch binary",
-        crate::ipc::IPC_PROTOCOL_VERSION,
+        protocol_version == required_version,
+        "the running Finch daemon uses IPC protocol {protocol_version}, but this frontend requires {required_version}; restart the daemon with the rebuilt Finch binary",
     );
     Ok(())
 }
@@ -1610,6 +1613,45 @@ fn read_query_response(
 mod tests {
     use super::*;
 
+    struct ProtocolFixtureDaemon {
+        protocol_version: u32,
+        query_calls: std::rc::Rc<std::cell::Cell<u32>>,
+    }
+
+    impl finch_daemon::Server for ProtocolFixtureDaemon {
+        fn query(
+            &mut self,
+            _params: finch_daemon::QueryParams,
+            _results: finch_daemon::QueryResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            self.query_calls.set(self.query_calls.get() + 1);
+            capnp::capability::Promise::err(capnp::Error::failed(
+                "protocol fixture must not receive a query".into(),
+            ))
+        }
+
+        fn query_stream(
+            &mut self,
+            _params: finch_daemon::QueryStreamParams,
+            _results: finch_daemon::QueryStreamResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            self.query_calls.set(self.query_calls.get() + 1);
+            capnp::capability::Promise::err(capnp::Error::failed(
+                "protocol fixture must not receive a stream".into(),
+            ))
+        }
+
+        fn ping(
+            &mut self,
+            _params: finch_daemon::PingParams,
+            mut results: finch_daemon::PingResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            results.get().set_version("protocol-fixture");
+            results.get().set_protocol_version(self.protocol_version);
+            capnp::capability::Promise::ok(())
+        }
+    }
+
     #[test]
     fn ipc_protocol_handshake_accepts_only_the_current_generation() {
         ensure_compatible_protocol(crate::ipc::IPC_PROTOCOL_VERSION).unwrap();
@@ -1617,6 +1659,45 @@ mod tests {
         let error = ensure_compatible_protocol(0).unwrap_err().to_string();
         assert!(error.contains("restart the daemon"));
         assert!(error.contains("protocol 0"));
+    }
+
+    #[test]
+    fn mixed_ipc_generations_reject_before_query_or_stream_use() {
+        assert_eq!(crate::ipc::IPC_PROTOCOL_VERSION, 4);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let old_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let daemon: finch_daemon::Client = capnp_rpc::new_client(ProtocolFixtureDaemon {
+                protocol_version: 3,
+                query_calls: std::rc::Rc::clone(&old_daemon_calls),
+            });
+            let client = IpcClient::from_test_client(daemon);
+            let error = client.ping().await.unwrap_err().to_string();
+            assert!(error.contains("protocol 3"));
+            assert!(error.contains("requires 4"));
+            assert!(error.contains("restart the daemon"));
+            assert_eq!(old_daemon_calls.get(), 0);
+
+            let new_daemon_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let daemon: finch_daemon::Client = capnp_rpc::new_client(ProtocolFixtureDaemon {
+                protocol_version: 4,
+                query_calls: std::rc::Rc::clone(&new_daemon_calls),
+            });
+            let request = daemon.ping_request();
+            let reply = request.send().promise.await.unwrap();
+            let protocol_version = reply.get().unwrap().get_protocol_version();
+            let error = ensure_protocol_generation(protocol_version, 3)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("protocol 4"));
+            assert!(error.contains("requires 3"));
+            assert!(error.contains("restart the daemon"));
+            assert_eq!(new_daemon_calls.get(), 0);
+        }));
     }
 
     #[test]

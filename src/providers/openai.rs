@@ -1232,6 +1232,15 @@ impl OpenAIProvider {
                         }
                     }
 
+                    if rule == TransportRule::CanonicalGpt56ChatCompletions
+                        && !content_parts.is_empty()
+                        && !tool_results.is_empty()
+                    {
+                        anyhow::bail!(
+                            "OpenAI user messages cannot mix tool results with user content"
+                        );
+                    }
+
                     let content = match rule {
                         TransportRule::CanonicalGpt56ChatCompletions => {
                             if content_parts.is_empty() {
@@ -3164,6 +3173,37 @@ mod tests {
         ] {
             let error = provider.send_message(&request).await.unwrap_err();
             assert!(error.to_string().len() < 256);
+        }
+        for blocks in [
+            vec![
+                ContentBlock::tool_result("call_x".into(), "ok".into(), None),
+                ContentBlock::text("next"),
+            ],
+            vec![
+                ContentBlock::text("next"),
+                ContentBlock::tool_result("call_x".into(), "ok".into(), None),
+            ],
+        ] {
+            let request = ProviderRequest::new(vec![
+                crate::claude::Message::with_content(
+                    "assistant",
+                    vec![ContentBlock::ToolUse {
+                        id: "call_x".into(),
+                        name: "read".into(),
+                        input: serde_json::json!({}),
+                    }],
+                ),
+                crate::claude::Message::with_content("user", blocks),
+            ])
+            .with_model("gpt-5.6-sol");
+            assert_eq!(
+                provider
+                    .send_message(&request)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "OpenAI user messages cannot mix tool results with user content"
+            );
         }
         assert!(
             tokio::time::timeout(Duration::from_millis(1), listener.accept())
