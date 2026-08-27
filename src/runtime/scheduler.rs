@@ -264,9 +264,7 @@ impl AgentContextReference {
                 bail!("agent context reference {name} exceeds {MAX_CONTEXT_FIELD_BYTES} bytes");
             }
         }
-        if self.sha256.len() != 64
-            || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
+        if self.sha256.len() != 64 || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             bail!("agent context reference sha256 must be exactly 64 hexadecimal digits");
         }
         Ok(())
@@ -535,12 +533,9 @@ impl AgentScheduler {
             &grant_ceiling,
         )?;
         let brain_run_id = if let Some(parent_run_id) = parent_brain_run_id {
-            let control = self
-                .brain_control
-                .read()
-                .await
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("named-Brain child lifecycle channel is unavailable"))?;
+            let control = self.brain_control.read().await.clone().ok_or_else(|| {
+                anyhow::anyhow!("named-Brain child lifecycle channel is unavailable")
+            })?;
             let (response_tx, response_rx) = oneshot::channel();
             control
                 .send(AgentBrainControlRequest::Start {
@@ -773,12 +768,9 @@ impl AgentScheduler {
                 result.final_message.clone()
             };
             let publication = async {
-                let control = self
-                    .brain_control
-                    .read()
-                    .await
-                    .clone()
-                    .ok_or_else(|| "named-Brain child lifecycle channel is unavailable".to_string())?;
+                let control = self.brain_control.read().await.clone().ok_or_else(|| {
+                    "named-Brain child lifecycle channel is unavailable".to_string()
+                })?;
                 let (response_tx, response_rx) = oneshot::channel();
                 control
                     .send(AgentBrainControlRequest::Finish {
@@ -1330,9 +1322,7 @@ mod tests {
                         kind: crate::brain::store::BrainRunKind::Subagent,
                         parent_run_id: Some(parent),
                         request_seq: 9,
-                        initiating_attachment_id: crate::brain::store::AttachmentId(
-                            Uuid::new_v4(),
-                        ),
+                        initiating_attachment_id: crate::brain::store::AttachmentId(Uuid::new_v4()),
                         initiated_by: "alice".into(),
                         status,
                         started_ms: 1,
@@ -1879,7 +1869,11 @@ mod tests {
         let tasks = scheduler.tasks.read().await;
         let task = tasks.values().next().expect("one structured child task");
         assert_eq!(task.snapshot.role, AgentRole::Explore);
-        let result = task.snapshot.result.as_ref().expect("completed child result");
+        let result = task
+            .snapshot
+            .result
+            .as_ref()
+            .expect("completed child result");
         assert!(result.final_message.contains("focus on typed effects"));
         assert_eq!(result.identity.provider_model, "echo");
     }
@@ -2119,8 +2113,7 @@ mod tests {
                 && value == &crate::programs::ProgramValue::String("inspect the VM".to_string())
         }));
         assert!(fields.iter().any(|(name, value)| {
-            name == "role"
-                && value == &crate::programs::ProgramValue::String("general".to_string())
+            name == "role" && value == &crate::programs::ProgramValue::String("general".to_string())
         }));
         assert!(fields.iter().any(|(name, value)| {
             name == "complete" && matches!(value, crate::programs::ProgramValue::Bool(_))
