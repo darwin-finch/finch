@@ -871,8 +871,9 @@ impl OpenAIProvider {
                                     "OpenAI returned an invalid or duplicate function call ID/name"
                                 );
                             }
-                            let input = serde_json::from_str(&tool_call.function.arguments)
-                                .context("OpenAI returned malformed JSON function arguments")?;
+                            let input: serde_json::Value =
+                                serde_json::from_str(&tool_call.function.arguments)
+                                    .context("OpenAI returned malformed JSON function arguments")?;
                             if !input.is_object() {
                                 anyhow::bail!("OpenAI function arguments were not a JSON object");
                             }
