@@ -25,6 +25,7 @@ CURRENT_DOCS = (
     Path("docs/MCP_USER_GUIDE.md"),
     Path("docs/MACOS_GUI_AUTOMATION.md"),
     Path("docs/chatgpt-subscription-provider.md"),
+    Path("docs/REPOSITORY_HYGIENE.md"),
 )
 
 # These are precise remnants of superseded public copy, rather than broad words
