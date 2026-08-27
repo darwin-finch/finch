@@ -1529,7 +1529,7 @@ impl BrainStore {
     /// Mint daemon-local authority for the currently active runner lease.
     pub(crate) fn issue_effect_audit_authority(
         &self, name: &str, run_id: RunId, lease_id: RunnerLeaseId,
-        connection_id: Option<ConnectionId>,
+        _connection_id: Option<ConnectionId>,
     ) -> Result<EffectAuditAuthorityGrant> {
         let name = Self::validate_name(name)?;
         self.ensure_loaded(name)?;
@@ -1544,15 +1544,73 @@ impl BrainStore {
                 && lease.expires_ms > unix_millis(),
             "runner lease is stale or belongs to a successor"
         );
+        let authority_name = format!(
+            "{}\0{}\0{}\0{}\0{}\0{}",
+            state.brain_id.0,
+            run_id.0,
+            run.request_seq,
+            lease_id.0,
+            lease.subject,
+            self.environment.generation,
+        );
         Ok(EffectAuditAuthorityGrant {
             brain: name.to_string(), run_id,
             authority: crate::runtime::effect_log::EffectAuditAuthority {
-                authority_id: uuid::Uuid::new_v4(), runner_lease_id: lease_id.0,
+                authority_id: uuid::Uuid::new_v5(
+                    &uuid::Uuid::NAMESPACE_OID,
+                    authority_name.as_bytes(),
+                ),
+                runner_lease_id: lease_id.0,
                 runner_subject: lease.subject.clone(),
-                connection_id: connection_id.map(|id| id.0),
+                // Connection generations are enforced by the live reverse
+                // capability, not persisted in replay identity. A lost
+                // reserve response may be retried after reconnect without
+                // minting a conflicting durable authority.
+                connection_id: None,
                 environment_generation: self.environment.generation,
             },
         })
+    }
+
+    /// Resolve every still-open intent owned by one completed or disconnected
+    /// runner request. An unbegun reservation is known not to have reached a
+    /// physical binding; a begun permit is conservatively uncertain.
+    pub(crate) fn reconcile_effect_audit_authority(
+        &self,
+        grant: &EffectAuditAuthorityGrant,
+    ) -> Result<usize> {
+        let name = Self::validate_name(&grant.brain)?;
+        self.ensure_loaded(name)?;
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        let unresolved = state.effect_audits.entries().values().filter_map(|entry| {
+            (entry.intent.identity.run_id == grant.run_id.0
+                && entry.authority.authority_id == grant.authority.authority_id)
+                .then(|| match &entry.state {
+                    crate::runtime::effect_log::EffectAuditState::IntentAccepted => Some((
+                        entry.intent.identity,
+                        crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied,
+                    )),
+                    crate::runtime::effect_log::EffectAuditState::AwaitingHostResult => Some((
+                        entry.intent.identity,
+                        crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss,
+                    )),
+                    crate::runtime::effect_log::EffectAuditState::Terminal { .. } => None,
+                })
+                .flatten()
+        }).collect::<Vec<_>>();
+        for (identity, outcome) in &unresolved {
+            self.append_effect_audit_transition_locked(
+                name,
+                state,
+                crate::runtime::effect_log::EffectAuditTransition::Finish {
+                    identity: *identity,
+                    authority_id: grant.authority.authority_id,
+                    outcome: outcome.clone(),
+                },
+            )?;
+        }
+        Ok(unresolved.len())
     }
 
     /// Durably accept an effect intent without permitting physical application.
@@ -9765,6 +9823,55 @@ mod tests {
         let _permit = store.begin_effect_audit(&grant, identity).unwrap();
         assert!(store.begin_effect_audit(&grant, identity).unwrap_err().to_string()
             .contains("already begun"));
+    }
+
+    #[test]
+    fn effect_audit_reconnect_reuses_request_authority_and_exact_reservation() {
+        let store = BrainStore::with_root("box.local", None);
+        let (run, lease, first) = audit_run_fixture(&store);
+        let second = store.issue_effect_audit_authority(
+            "shared",
+            run.run_id,
+            lease.lease_id,
+            Some(ConnectionId(uuid::Uuid::new_v4())),
+        ).unwrap();
+        assert_eq!(first.authority, second.authority);
+        assert_eq!(first.authority.connection_id, None);
+        let execution_id = uuid::Uuid::new_v4();
+        let effect = audit_effect(0, "replayed reserve");
+        let first_identity = store.reserve_effect_audit(
+            &first, execution_id, effect.clone(),
+        ).unwrap();
+        let replayed_identity = store.reserve_effect_audit(
+            &second, execution_id, effect,
+        ).unwrap();
+        assert_eq!(first_identity, replayed_identity);
+    }
+
+    #[test]
+    fn effect_audit_request_end_reconciles_before_and_after_physical_boundary() {
+        let store = BrainStore::with_root("box.local", None);
+        let (_run, _lease, grant) = audit_run_fixture(&store);
+        let unbegun = store.reserve_effect_audit(
+            &grant, uuid::Uuid::new_v4(), audit_effect(0, "before"),
+        ).unwrap();
+        let begun = store.reserve_effect_audit(
+            &grant, uuid::Uuid::new_v4(), audit_effect(1, "after"),
+        ).unwrap();
+        let _permit = store.begin_effect_audit(&grant, begun).unwrap();
+        assert_eq!(store.reconcile_effect_audit_authority(&grant).unwrap(), 2);
+        assert_eq!(store.reconcile_effect_audit_authority(&grant).unwrap(), 0);
+        let snapshot = store.snapshot("shared").unwrap();
+        assert!(snapshot.effect_audits.iter().any(|entry|
+            entry.intent.identity == unbegun && matches!(entry.state,
+                crate::runtime::effect_log::EffectAuditState::Terminal {
+                    outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
+                })));
+        assert!(snapshot.effect_audits.iter().any(|entry|
+            entry.intent.identity == begun && matches!(entry.state,
+                crate::runtime::effect_log::EffectAuditState::Terminal {
+                    outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss
+                })));
     }
 
     #[test]

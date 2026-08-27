@@ -96,10 +96,15 @@ struct BrainEffectAuditRpcAuthority {
     brain: String,
     lease_id: crate::brain::store::RunnerLeaseId,
     connection_id: Option<uuid::Uuid>,
+    active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BrainEffectAuditRpcAuthority {
     fn validate_new_work(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.active.load(std::sync::atomic::Ordering::Acquire),
+            "effect audit authority is no longer active"
+        );
         if let Some(connection_id) = self.connection_id {
             self.runners.require_connection_lease(
                 connection_id, &self.brain, self.lease_id,
@@ -1962,6 +1967,8 @@ async fn forward_runner_request(
                     return false;
                 }
             };
+            let reconciliation_grant = audit_grant.clone();
+            let audit_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
             let mut call = runner.run_program_request();
             {
                 let mut payload = call.get().init_request();
@@ -2001,17 +2008,25 @@ async fn forward_runner_request(
                             brain: request.brain.clone(),
                             lease_id,
                             connection_id: connection_id.map(|id| id.0),
+                            active: std::sync::Arc::clone(&audit_active),
                         }),
                     });
                 payload.set_control(control);
             }
-            let (result, disconnected) = match call.send().promise.await {
+            let (mut result, disconnected) = match call.send().promise.await {
                 Ok(reply) => (
                     decode_runner_program_result(reply.get().and_then(|r| r.get_result())),
                     false,
                 ),
                 Err(error) => (Err(error.to_string().into()), true),
             };
+            audit_active.store(false, std::sync::atomic::Ordering::Release);
+            if let Err(error) = server
+                .brain_store()
+                .reconcile_effect_audit_authority(&reconciliation_grant)
+            {
+                result = Err(error.to_string().into());
+            }
             let _ = request.response_tx.send(result);
             disconnected
         }
@@ -2025,7 +2040,9 @@ async fn forward_runner_request(
                     return false;
                 }
             };
-            let (result, disconnected) = {
+            let reconciliation_grant = audit_grant.clone();
+            let audit_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let (mut result, disconnected) = {
                 let mut call = runner.run_turn_request();
                 let encoded = {
                     let mut payload = call.get().init_request();
@@ -2059,6 +2076,7 @@ async fn forward_runner_request(
                                     brain: request.brain.clone(),
                                     lease_id,
                                     connection_id: connection_id.map(|id| id.0),
+                                    active: std::sync::Arc::clone(&audit_active),
                                 }),
                             });
                         payload.set_control(control);
@@ -2076,6 +2094,13 @@ async fn forward_runner_request(
                     Err(error) => (Err(error.into()), false),
                 }
             };
+            audit_active.store(false, std::sync::atomic::Ordering::Release);
+            if let Err(error) = server
+                .brain_store()
+                .reconcile_effect_audit_authority(&reconciliation_grant)
+            {
+                result = Err(error.to_string().into());
+            }
             let _ = request.response_tx.send(result);
             disconnected
         }
@@ -2383,6 +2408,7 @@ mod tests {
                 store: store.clone(), grant,
                 runners: server.brain_runners().clone(),
                 brain: "shared".into(), lease_id: lease.lease_id, connection_id: None,
+                active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             };
             let control: super::finch_ipc_capnp::brain_program_control::Client =
                 capnp_rpc::new_client(super::BrainProgramControlImpl {
@@ -2463,6 +2489,136 @@ mod tests {
                 event.kind, crate::brain::store::BrainEventKind::ToolResult { .. }
             )));
         }));
+    }
+
+    struct EffectEofRunner {
+        begin: bool,
+    }
+
+    impl super::finch_ipc_capnp::brain_runner::Server for EffectEofRunner {
+        fn run_program(
+            &mut self,
+            params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            let request = match params.get().and_then(|params| params.get_request()) {
+                Ok(request) => request,
+                Err(error) => return capnp::capability::Promise::err(error),
+            };
+            let control = match request.get_control() {
+                Ok(control) => control,
+                Err(error) => return capnp::capability::Promise::err(error),
+            };
+            let begin = self.begin;
+            capnp::capability::Promise::from_future(async move {
+                let mut reserve = control.reserve_effect_request();
+                reserve.get().set_execution_id(&uuid::Uuid::new_v4().to_string());
+                crate::ipc::checkpoint_codec::encode_vm_side_effect(
+                    reserve.get().init_effect(),
+                    &crate::vm::VmSideEffect {
+                        protocol_version: 1,
+                        sequence: 0,
+                        requirement: crate::vm::CapabilityRequirement {
+                            capability: crate::vm::CapabilityKind::SessionEmit,
+                            selector: crate::vm::ResourceSelector::None,
+                        },
+                        output: Vec::new(),
+                        event: crate::vm::HostSideEffect::Emit { text: "eof".into() },
+                        origin: crate::vm::SourceOrigin::generated("raw-eof-effect-audit"),
+                    },
+                ).map_err(|error| capnp::Error::failed(error.to_string()))?;
+                let reservation = reserve.send().promise.await?
+                    .get()?.get_reservation()?;
+                if begin {
+                    let _permit = reservation.begin_request().send().promise.await?
+                        .get()?.get_permit()?;
+                }
+                Err(capnp::Error::disconnected("synthetic raw frontend EOF".into()))
+            })
+        }
+
+        fn run_turn(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
+        }
+
+        fn cancel_run(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
+            _results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
+        }
+
+        fn project_memory(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
+            _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
+        }
+    }
+
+    async fn raw_effect_eof_state(begin: bool) -> crate::runtime::effect_log::EffectAuditState {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local", Some(temp.path().join("brains")),
+        );
+        let attachment = store.attach(
+            "shared", "alice", crate::brain::store::AttachmentRole::Driver, None,
+        ).unwrap();
+        let prompt = store.push(
+            "shared", "alice",
+            crate::brain::store::BrainEventKind::Prompt { text: "effect eof".into() },
+        ).unwrap();
+        let run = store.start_run(
+            "shared", "alice", crate::brain::store::BrainRunKind::Interactive,
+            prompt.seq, attachment.attachment_id,
+            crate::brain::store::BrainRunStatus::Running,
+        ).unwrap();
+        store.acquire_runner_lease("shared", "runner", 1, None, 300_000).unwrap();
+        let server = std::sync::Arc::new(
+            crate::server::AgentServer::for_brain_protocol_test(
+                store.clone(),
+                crate::brain::credential::BrainCredentialAuthority::ephemeral([45; 32]),
+                "test-password".into(), temp.path(),
+            ).unwrap(),
+        );
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let request = crate::server::RunnerProgramRequest {
+            brain: "shared".into(),
+            run_id: run.run_id,
+            request_seq: prompt.seq,
+            language: crate::brain::store::ProgramLanguage::Forth,
+            source: "noop".into(),
+            interaction: crate::server::RunnerProgramInteraction::Interactive,
+            grant_ceiling: None,
+            control_tx: None,
+            effect_audit: None,
+            response_tx,
+        };
+        let runner: super::finch_ipc_capnp::brain_runner::Client =
+            capnp_rpc::new_client(EffectEofRunner { begin });
+        assert!(super::forward_test_runner_request(
+            runner, server, crate::server::RunnerRequest::Program(request),
+        ).await);
+        assert!(response_rx.await.unwrap().is_err());
+        store.snapshot("shared").unwrap().effect_audits[0].state.clone()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn effect_audit_raw_frontend_eof_reconciles_before_and_after_application_boundary() {
+        assert!(matches!(raw_effect_eof_state(false).await,
+            crate::runtime::effect_log::EffectAuditState::Terminal {
+                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
+            }));
+        assert!(matches!(raw_effect_eof_state(true).await,
+            crate::runtime::effect_log::EffectAuditState::Terminal {
+                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss
+            }));
     }
 
     struct SocketApprovalRunner {
