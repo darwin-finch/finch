@@ -933,10 +933,191 @@ fn isolated_test_peer_process_is_owned(peer_pid: nix::libc::pid_t) -> bool {
 mod isolation_tests {
     use super::*;
 
+    const HOSTILE_MODE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+    const HOSTILE_MODE_OUTPUT_LIMIT: usize = 64 * 1024;
+
     fn supervisor_contract_present() -> bool {
         // The permanent Brain-isolation CI gate runs these entries through
         // scripts/test_brains.sh, which supplies the authenticated contract.
         std::env::var_os("FINCH_BRAIN_TEST_TOKEN").is_some()
+    }
+
+    fn drain_bounded<R: std::io::Read>(reader: &mut R, output: &mut Vec<u8>) {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(count) => {
+                    let remaining = HOSTILE_MODE_OUTPUT_LIMIT.saturating_sub(output.len());
+                    output.extend_from_slice(&buffer[..count.min(remaining)]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(error) => panic!("could not drain hostile proof-mode output: {error}"),
+            }
+        }
+    }
+
+    fn set_nonblocking<T: std::os::fd::AsRawFd>(descriptor: &T) {
+        let flags = unsafe { nix::libc::fcntl(descriptor.as_raw_fd(), nix::libc::F_GETFL) };
+        assert!(flags >= 0, "could not read hostile proof-mode pipe flags");
+        assert_eq!(
+            unsafe {
+                nix::libc::fcntl(
+                    descriptor.as_raw_fd(),
+                    nix::libc::F_SETFL,
+                    flags | nix::libc::O_NONBLOCK,
+                )
+            },
+            0,
+            "could not make hostile proof-mode pipe nonblocking"
+        );
+    }
+
+    fn terminate_mode_group(group: nix::libc::pid_t, signal: nix::libc::c_int) {
+        let result = unsafe { nix::libc::kill(-group, signal) };
+        assert!(
+            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(nix::libc::ESRCH),
+            "could not signal timed-out hostile proof-mode process group"
+        );
+    }
+
+    fn mode_group_has_descendants(group: nix::libc::pid_t) -> Result<bool, String> {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-axo", "pid=,pgid="])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err("could not inspect hostile proof-mode process group".to_owned());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next().and_then(|value| value.parse().ok());
+            let pgid = fields.next().and_then(|value| value.parse().ok());
+            matches!((pid, pgid), (Some(pid), Some(pgid)) if pgid == group && pid != group)
+        }))
+    }
+
+    fn mode_leader_exited(child: &std::process::Child) -> Result<bool, String> {
+        let mut information: nix::libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            nix::libc::waitid(
+                nix::libc::P_PID,
+                child.id(),
+                &mut information,
+                nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+            )
+        };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(unsafe { information.si_pid() } != 0)
+    }
+
+    fn run_hostile_proof_mode_with_deadline(
+        mode: &str,
+        mode_deadline: std::time::Duration,
+    ) -> Result<std::process::Output, String> {
+        use std::os::unix::process::CommandExt as _;
+
+        let proof = isolated_test_proof().map_err(|error| error.to_string())?;
+        let mut command = supervised_test_subprocess_command();
+        command
+            .args([
+                "--exact",
+                "brain::isolation_tests::isolated_proof_rejects_self_issued_environment_authority",
+                "--nocapture",
+            ])
+            .env("FINCH_TEST_FORGED_PROOF_MODE", mode)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if nix::libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
+        let group = child.id() as nix::libc::pid_t;
+        let mut stdout = child.stdout.take().expect("hostile mode stdout was not piped");
+        let mut stderr = child.stderr.take().expect("hostile mode stderr was not piped");
+        set_nonblocking(&stdout);
+        set_nonblocking(&stderr);
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let deadline = std::time::Instant::now() + mode_deadline;
+        let status = loop {
+            drain_bounded(&mut stdout, &mut stdout_bytes);
+            drain_bounded(&mut stderr, &mut stderr_bytes);
+            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                terminate_mode_group(group, nix::libc::SIGTERM);
+                let grace = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                while std::time::Instant::now() < grace {
+                    drain_bounded(&mut stdout, &mut stdout_bytes);
+                    drain_bounded(&mut stderr, &mut stderr_bytes);
+                    if mode_leader_exited(&child)? && !mode_group_has_descendants(group)? {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                if !mode_leader_exited(&child)? || mode_group_has_descendants(group)? {
+                    terminate_mode_group(group, nix::libc::SIGKILL);
+                }
+                let kill_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::time::Instant::now() < kill_deadline {
+                    drain_bounded(&mut stdout, &mut stdout_bytes);
+                    drain_bounded(&mut stderr, &mut stderr_bytes);
+                    if mode_leader_exited(&child)? && !mode_group_has_descendants(group)? {
+                        let status = child.wait().map_err(|error| error.to_string())?;
+                        let redact = |bytes: &[u8]| {
+                            String::from_utf8_lossy(bytes)
+                                .replace(proof.home.to_string_lossy().as_ref(), "<isolated-home>")
+                                .replace(
+                                    proof.socket_root.to_string_lossy().as_ref(),
+                                    "<socket-root>",
+                                )
+                                .replace(&proof.brain_addr, "<brain-address>")
+                                .replace(&proof.daemon_addr, "<daemon-address>")
+                        };
+                        return Err(format!(
+                            "timed out after {mode_deadline:?} (terminated with {status}); stdout={} stderr={}",
+                            redact(&stdout_bytes),
+                            redact(&stderr_bytes)
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                return Err(format!(
+                    "timed out after {mode_deadline:?}; SIGKILL did not quiesce and reap the owned process group"
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        drain_bounded(&mut stdout, &mut stdout_bytes);
+        drain_bounded(&mut stderr, &mut stderr_bytes);
+        let redact = |bytes: Vec<u8>| {
+            String::from_utf8_lossy(&bytes)
+                .replace(proof.home.to_string_lossy().as_ref(), "<isolated-home>")
+                .replace(proof.socket_root.to_string_lossy().as_ref(), "<socket-root>")
+                .replace(&proof.brain_addr, "<brain-address>")
+                .replace(&proof.daemon_addr, "<daemon-address>")
+                .into_bytes()
+        };
+        Ok(std::process::Output {
+            status,
+            stdout: redact(stdout_bytes),
+            stderr: redact(stderr_bytes),
+        })
+    }
+
+    fn run_hostile_proof_mode(mode: &str) -> Result<std::process::Output, String> {
+        run_hostile_proof_mode_with_deadline(mode, HOSTILE_MODE_DEADLINE)
     }
 
     #[cfg(target_os = "macos")]
@@ -1027,6 +1208,11 @@ mod isolation_tests {
                 return;
             }
             let valid = isolated_test_proof().unwrap();
+            if mode == "deadline-probe" {
+                loop {
+                    std::thread::park();
+                }
+            }
             let start_attacker_responder = |key: [u8; 32],
                                             marker: &std::path::Path|
              -> (
@@ -1274,6 +1460,18 @@ mod isolation_tests {
             return;
         }
 
+        let timeout_started = std::time::Instant::now();
+        let timeout_error = run_hostile_proof_mode_with_deadline(
+            "deadline-probe",
+            std::time::Duration::from_millis(100),
+        )
+        .expect_err("hostile proof-mode deadline probe escaped its wall-clock bound");
+        assert!(timeout_error.contains("timed out after"));
+        assert!(
+            timeout_started.elapsed() < std::time::Duration::from_secs(3),
+            "hostile proof-mode timeout and reap exceeded its bounded grace"
+        );
+
         for mode in [
             "self",
             "writable",
@@ -1286,16 +1484,14 @@ mod isolation_tests {
             "clobbered-low-proof-is-restored",
             "stale-supervisor-pid",
         ] {
-            let status = supervised_test_subprocess_command()
-                .args([
-                    "--exact",
-                    "brain::isolation_tests::isolated_proof_rejects_self_issued_environment_authority",
-                    "--nocapture",
-                ])
-                .env(MODE_ENV, mode)
-                .status()
-                .unwrap();
-            assert!(status.success(), "{mode} proof rejection subprocess failed");
+            let output = run_hostile_proof_mode(mode)
+                .unwrap_or_else(|error| panic!("{mode} proof rejection subprocess: {error}"));
+            assert!(
+                output.status.success(),
+                "{mode} proof rejection subprocess failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
