@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CURRENT_DOCS = (
     Path("README.md"),
     Path("CONTRIBUTING.md"),
+    Path("CLAUDE.md"),
     Path("docs/README.md"),
     Path("docs/AUTOMATIC_TRAINING.md"),
     Path("docs/MCP_USER_GUIDE.md"),
