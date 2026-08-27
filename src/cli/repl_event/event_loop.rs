@@ -4639,6 +4639,7 @@ Rules:\n\
                         submission,
                         effect_sink,
                         fixed_grant_ceiling.clone(),
+                        request.effect_audit.clone(),
                     )
                     .await
                     .map_err(|error| crate::server::RunnerProgramError::from(error.to_string()))?;
