@@ -74,14 +74,6 @@ jobs:
     - name: Build binary (all features)
       run: cargo build --bin finch --all-features --verbose
 
-    - name: Run runtime authority regressions (Ubuntu)
-      if: runner.os == 'Linux'
-      run: cargo test --lib runtime::tests -- --nocapture
-
-    - name: Test all targets (Ubuntu)
-      if: runner.os == 'Linux'
-      run: cargo test --all-targets
-
     - name: Build binary (with candle)
       run: cargo build --bin finch --features candle --verbose
       if: matrix.os == 'macos-latest'
@@ -95,6 +87,26 @@ jobs:
           echo "✗ Binary not found"
           exit 1
         fi
+
+  runtime-authority:
+    name: Runtime Authority (Ubuntu)
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install capnproto
+      run: sudo apt-get update && sudo apt-get install -y capnproto
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Run runtime authority regressions
+      run: cargo test --lib runtime::tests -- --nocapture
+
+    - name: Test all targets
+      run: cargo test --all-targets
 
   build:
     name: Build Release
