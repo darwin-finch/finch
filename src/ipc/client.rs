@@ -53,23 +53,61 @@ pub struct IpcClient {
     _rpc_handle: std::rc::Rc<RpcTask>,
 }
 
-struct RpcTask(tokio::task::JoinHandle<()>);
+type ActiveBrainTurns = std::rc::Rc<
+    std::cell::RefCell<
+        std::collections::HashMap<
+            (String, crate::brain::store::RunId),
+            tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
+        >,
+    >,
+>;
+
+struct RpcTask {
+    handle: tokio::task::JoinHandle<()>,
+    active_brain_turns: ActiveBrainTurns,
+}
+
+fn send_disconnected_brain_turn_cancel(
+    event_tx: &tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
+    brain: String,
+    run_id: crate::brain::store::RunId,
+) {
+    let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+    let _ = event_tx.send(
+        crate::cli::repl_event::ReplEvent::NamedBrainRunCancelRequested(
+            crate::server::RunnerCancelRequest {
+                brain,
+                run_id,
+                response_tx,
+            },
+        ),
+    );
+}
 
 impl Drop for RpcTask {
     fn drop(&mut self) {
+        for ((brain, run_id), event_tx) in self.active_brain_turns.borrow_mut().drain() {
+            send_disconnected_brain_turn_cancel(&event_tx, brain, run_id);
+        }
         // Dropping JoinHandle detaches rather than cancels. Abort when the
         // final IpcClient clone disappears so the daemon observes connection
         // loss and releases connection-scoped identities/callbacks promptly.
-        self.0.abort();
+        self.handle.abort();
     }
 }
 
 impl IpcClient {
     #[cfg(test)]
     pub(crate) fn from_test_client(client: finch_daemon::Client) -> Self {
+        let active_brain_turns = std::rc::Rc::new(std::cell::RefCell::new(
+            std::collections::HashMap::new(),
+        ));
         Self {
             client,
-            _rpc_handle: std::rc::Rc::new(RpcTask(tokio::task::spawn_local(async {}))),
+            _rpc_handle: std::rc::Rc::new(RpcTask {
+                handle: tokio::task::spawn_local(async {}),
+                active_brain_turns,
+            }),
         }
     }
 
@@ -84,7 +122,15 @@ impl IpcClient {
         let stream = tokio::net::UnixStream::connect(&path)
             .await
             .with_context(|| format!("IPC connect failed: {}", path.display()))?;
+        Self::connect_stream(stream).await
+    }
 
+    #[cfg(test)]
+    pub(crate) async fn connect_test_stream(stream: tokio::net::UnixStream) -> Result<Self> {
+        Self::connect_stream(stream).await
+    }
+
+    async fn connect_stream(stream: tokio::net::UnixStream) -> Result<Self> {
         let (reader, writer) = stream.into_split();
         let network = twoparty::VatNetwork::new(
             reader.compat(),
@@ -99,10 +145,16 @@ impl IpcClient {
         let handle = tokio::task::spawn_local(async move {
             let _ = rpc_system.await;
         });
+        let active_brain_turns = std::rc::Rc::new(std::cell::RefCell::new(
+            std::collections::HashMap::new(),
+        ));
 
         let client = Self {
             client,
-            _rpc_handle: std::rc::Rc::new(RpcTask(handle)),
+            _rpc_handle: std::rc::Rc::new(RpcTask {
+                handle,
+                active_brain_turns,
+            }),
         };
         client.verify_protocol_compatibility().await?;
         Ok(client)
@@ -643,7 +695,10 @@ impl IpcClient {
         lease_id: crate::brain::store::RunnerLeaseId,
         event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
     ) -> Result<BrainRunnerBootstrap> {
-        let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl { event_tx });
+        let runner: brain_runner::Client = capnp_rpc::new_client(BrainRunnerImpl {
+            event_tx,
+            active_brain_turns: std::rc::Rc::clone(&self._rpc_handle.active_brain_turns),
+        });
         let mut request = self.client.register_brain_runner_request();
         {
             let mut params = request.get();
@@ -743,6 +798,24 @@ fn ensure_compatible_protocol(protocol_version: u32) -> Result<()> {
 
 struct BrainRunnerImpl {
     event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
+    active_brain_turns: ActiveBrainTurns,
+}
+
+struct BrainTurnDisconnectGuard {
+    active_brain_turns: ActiveBrainTurns,
+    key: (String, crate::brain::store::RunId),
+    armed: bool,
+}
+
+impl Drop for BrainTurnDisconnectGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(event_tx) = self.active_brain_turns.borrow_mut().remove(&self.key) {
+            send_disconnected_brain_turn_cancel(&event_tx, self.key.0.clone(), self.key.1);
+        }
+    }
 }
 
 struct BrainTurnCommitAckImpl {
@@ -1075,11 +1148,15 @@ impl brain_runner::Server for BrainRunnerImpl {
             }
         });
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let turn_key = (brain.clone(), run_id);
+        self.active_brain_turns
+            .borrow_mut()
+            .insert(turn_key.clone(), self.event_tx.clone());
         if self
             .event_tx
             .send(crate::cli::repl_event::ReplEvent::NamedBrainTurnRequested(
                 crate::server::RunnerTurnRequest {
-                    brain,
+                    brain: brain.clone(),
                     run_id,
                     request_seq: request.get_request_seq(),
                     prompt,
@@ -1091,12 +1168,24 @@ impl brain_runner::Server for BrainRunnerImpl {
             ))
             .is_err()
         {
+            self.active_brain_turns.borrow_mut().remove(&turn_key);
             return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));
         }
+        let active_brain_turns = std::rc::Rc::clone(&self.active_brain_turns);
         Promise::from_future(async move {
+            let mut disconnect_guard = BrainTurnDisconnectGuard {
+                active_brain_turns,
+                key: turn_key,
+                armed: true,
+            };
             let response = response_rx
                 .await
                 .map_err(|_| capnp::Error::failed("frontend dropped runner response".into()))?;
+            disconnect_guard.armed = false;
+            disconnect_guard
+                .active_brain_turns
+                .borrow_mut()
+                .remove(&disconnect_guard.key);
             let mut result = results.get().init_result();
             let turn_events = match &response {
                 Ok(response) => &response.turn_events,
@@ -1573,6 +1662,30 @@ mod tests {
         let error = ensure_compatible_protocol(0).unwrap_err().to_string();
         assert!(error.contains("restart the daemon"));
         assert!(error.contains("protocol 0"));
+    }
+
+    #[tokio::test]
+    async fn dropped_runner_turn_future_requests_correlated_frontend_cancellation() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let run_id = crate::brain::store::RunId(uuid::Uuid::new_v4());
+        let active_brain_turns = std::rc::Rc::new(std::cell::RefCell::new(
+            std::collections::HashMap::from([(
+                ("shared-brain".to_string(), run_id),
+                event_tx,
+            )]),
+        ));
+        drop(BrainTurnDisconnectGuard {
+            active_brain_turns,
+            key: ("shared-brain".into(), run_id),
+            armed: true,
+        });
+
+        let event = event_rx.recv().await.expect("disconnect cancellation");
+        let crate::cli::repl_event::ReplEvent::NamedBrainRunCancelRequested(request) = event else {
+            panic!("disconnect emitted an unrelated event");
+        };
+        assert_eq!(request.brain, "shared-brain");
+        assert_eq!(request.run_id, run_id);
     }
 
     struct BlockingBrainRunner {

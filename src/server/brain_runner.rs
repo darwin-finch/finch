@@ -7,9 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::brain::store::{
-    AttachmentId, ConnectionId, ProgramLanguage, RunId, RunnerLeaseId,
-};
+use crate::brain::store::{AttachmentId, ConnectionId, ProgramLanguage, RunId, RunnerLeaseId};
 
 #[derive(Debug)]
 pub enum RunnerRequest {
@@ -230,6 +228,7 @@ struct Registration {
     lease_id: RunnerLeaseId,
     connection_id: Option<uuid::Uuid>,
     tx: mpsc::UnboundedSender<RunnerRequest>,
+    disconnect: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Default)]
@@ -237,6 +236,8 @@ struct ConnectionAuthority {
     identities: HashMap<String, uuid::Uuid>,
     leases: HashMap<(String, RunnerLeaseId), uuid::Uuid>,
     attachments: HashMap<(String, AttachmentId, ConnectionId), uuid::Uuid>,
+    registration_disconnects:
+        HashMap<(uuid::Uuid, uuid::Uuid), tokio_util::sync::CancellationToken>,
 }
 
 /// Registrations contain only Tokio channels and portable values. Cap'n Proto
@@ -266,6 +267,7 @@ impl BrainRunnerBroker {
                     lease_id,
                     connection_id: None,
                     tx,
+                    disconnect: tokio_util::sync::CancellationToken::new(),
                 },
             );
         id
@@ -373,11 +375,7 @@ impl BrainRunnerBroker {
         attachment_id: AttachmentId,
         attachment_connection_id: ConnectionId,
     ) -> Result<()> {
-        let key = (
-            brain.to_string(),
-            attachment_id,
-            attachment_connection_id,
-        );
+        let key = (brain.to_string(), attachment_id, attachment_connection_id);
         let mut authority = self
             .connection_authority
             .lock()
@@ -404,11 +402,10 @@ impl BrainRunnerBroker {
             .connection_authority
             .lock()
             .expect("runner connection-authority lock poisoned");
-        if authority.attachments.get(&(
-            brain.to_string(),
-            attachment_id,
-            attachment_connection_id,
-        )) != Some(&connection_id)
+        if authority
+            .attachments
+            .get(&(brain.to_string(), attachment_id, attachment_connection_id))
+            != Some(&connection_id)
         {
             anyhow::bail!("Brain attachment is not owned by this IPC connection");
         }
@@ -422,11 +419,7 @@ impl BrainRunnerBroker {
         attachment_id: AttachmentId,
         attachment_connection_id: ConnectionId,
     ) {
-        let key = (
-            brain.to_string(),
-            attachment_id,
-            attachment_connection_id,
-        );
+        let key = (brain.to_string(), attachment_id, attachment_connection_id);
         let mut authority = self
             .connection_authority
             .lock()
@@ -444,8 +437,22 @@ impl BrainRunnerBroker {
         tx: mpsc::UnboundedSender<RunnerRequest>,
     ) -> Result<RunnerRegistrationId> {
         let brain = brain.into();
-        self.require_connection_lease(connection_id, &brain, lease_id)?;
         let id = RunnerRegistrationId(uuid::Uuid::new_v4());
+        let disconnect = tokio_util::sync::CancellationToken::new();
+        // Serialize registration admission with connection teardown. Once the
+        // token is published under this authority lock, a physical disconnect
+        // must either cancel this exact registration or happen before it can
+        // become visible in the broker map.
+        let mut authority = self
+            .connection_authority
+            .lock()
+            .expect("runner connection-authority lock poisoned");
+        if authority.leases.get(&(brain.clone(), lease_id)) != Some(&connection_id) {
+            anyhow::bail!("runner lease is not owned by this IPC connection");
+        }
+        authority
+            .registration_disconnects
+            .insert((connection_id, id.0), disconnect.clone());
         self.registrations
             .write()
             .expect("runner broker lock poisoned")
@@ -456,8 +463,10 @@ impl BrainRunnerBroker {
                     lease_id,
                     connection_id: Some(connection_id),
                     tx,
+                    disconnect,
                 },
             );
+        drop(authority);
         Ok(id)
     }
 
@@ -472,15 +481,12 @@ impl BrainRunnerBroker {
         let attachments = authority
             .attachments
             .iter()
-            .filter_map(|((brain, attachment_id, attachment_connection_id), owner)| {
-                (*owner == connection_id).then(|| {
-                    (
-                        brain.clone(),
-                        *attachment_id,
-                        *attachment_connection_id,
-                    )
-                })
-            })
+            .filter_map(
+                |((brain, attachment_id, attachment_connection_id), owner)| {
+                    (*owner == connection_id)
+                        .then(|| (brain.clone(), *attachment_id, *attachment_connection_id))
+                },
+            )
             .collect();
         authority
             .identities
@@ -489,6 +495,17 @@ impl BrainRunnerBroker {
         authority
             .attachments
             .retain(|_, owner| *owner != connection_id);
+        let disconnects = authority
+            .registration_disconnects
+            .iter()
+            .filter_map(|((owner, _), token)| (*owner == connection_id).then(|| token.clone()))
+            .collect::<Vec<_>>();
+        authority
+            .registration_disconnects
+            .retain(|(owner, _), _| *owner != connection_id);
+        for disconnect in disconnects {
+            disconnect.cancel();
+        }
         drop(authority);
         self.registrations
             .write()
@@ -553,10 +570,15 @@ impl BrainRunnerBroker {
                 response_tx,
             }))
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
-        response_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
-            .map_err(anyhow::Error::new)
+        tokio::select! {
+            biased;
+            _ = registration.disconnect.cancelled() => {
+                anyhow::bail!("named Brain '{brain}' runner callback disconnected")
+            }
+            response = response_rx => response
+                .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
+                .map_err(anyhow::Error::new),
+        }
     }
 
     pub async fn dispatch_turn(
@@ -593,10 +615,15 @@ impl BrainRunnerBroker {
                 response_tx,
             }))
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
-        response_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
-            .map_err(anyhow::Error::new)
+        tokio::select! {
+            biased;
+            _ = registration.disconnect.cancelled() => {
+                anyhow::bail!("named Brain '{brain}' runner callback disconnected")
+            }
+            response = response_rx => response
+                .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner dropped its response"))?
+                .map_err(anyhow::Error::new),
+        }
     }
 
     pub async fn cancel_run(
@@ -657,15 +684,17 @@ impl BrainRunnerBroker {
         let (response_tx, response_rx) = oneshot::channel();
         registration
             .tx
-            .send(RunnerRequest::ProjectMemory(RunnerMemoryProjectionRequest {
-                brain_id,
-                brain: brain.to_string(),
-                run_id,
-                request_seq,
-                prompt,
-                source,
-                response_tx,
-            }))
+            .send(RunnerRequest::ProjectMemory(
+                RunnerMemoryProjectionRequest {
+                    brain_id,
+                    brain: brain.to_string(),
+                    run_id,
+                    request_seq,
+                    prompt,
+                    source,
+                    response_tx,
+                },
+            ))
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
         response_rx
             .await
@@ -726,12 +755,7 @@ mod tests {
         assert!(broker.has_registration("brain", lease_id));
 
         broker
-            .claim_connection_attachment(
-                owner,
-                "brain",
-                attachment_id,
-                attachment_connection_id,
-            )
+            .claim_connection_attachment(owner, "brain", attachment_id, attachment_connection_id)
             .unwrap();
         assert!(broker
             .require_connection_attachment(
@@ -745,11 +769,7 @@ mod tests {
         let disconnected = broker.disconnect_connection(owner);
         assert_eq!(
             disconnected,
-            vec![(
-                "brain".to_string(),
-                attachment_id,
-                attachment_connection_id,
-            )]
+            vec![("brain".to_string(), attachment_id, attachment_connection_id,)]
         );
         assert!(!broker.has_registration("brain", lease_id));
         assert!(broker
@@ -759,12 +779,7 @@ mod tests {
             .claim_connection_identity(intruder, "runner-a@box.local")
             .unwrap();
         assert!(broker
-            .require_connection_attachment(
-                owner,
-                "brain",
-                attachment_id,
-                attachment_connection_id,
-            )
+            .require_connection_attachment(owner, "brain", attachment_id, attachment_connection_id,)
             .is_err());
     }
 
@@ -782,10 +797,7 @@ mod tests {
             assert_eq!(request.request_seq, 7);
             assert_eq!(request.run_id, run_id);
             assert_eq!(request.source, "21 2 *");
-            assert_eq!(
-                request.interaction,
-                RunnerProgramInteraction::Interactive
-            );
+            assert_eq!(request.interaction, RunnerProgramInteraction::Interactive);
             assert!(request.grant_ceiling.is_none());
             let runtime = crate::runtime::ProgramRuntime::new();
             let checkpoint = runtime
@@ -820,6 +832,129 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.output, "42");
+    }
+
+    #[tokio::test]
+    async fn physical_connection_loss_interrupts_the_exact_pending_turn_dispatch() {
+        let broker = BrainRunnerBroker::default();
+        let connection_id = uuid::Uuid::new_v4();
+        let lease_id = lease();
+        broker
+            .claim_connection_lease(connection_id, "brain", lease_id)
+            .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        broker
+            .register_for_connection(connection_id, "brain", lease_id, tx)
+            .unwrap();
+        let dispatch_broker = broker.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_broker
+                .dispatch_turn(
+                    "brain",
+                    lease_id,
+                    RunId(uuid::Uuid::new_v4()),
+                    7,
+                    "wait for disconnect".into(),
+                    Vec::new(),
+                    test_approval_audience(),
+                )
+                .await
+        });
+        let RunnerRequest::Turn(_pending_request) = rx.recv().await.unwrap() else {
+            panic!("expected turn request")
+        };
+
+        broker.disconnect_connection(connection_id);
+        let error = dispatch.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("runner callback disconnected"));
+        assert!(!broker.has_registration("brain", lease_id));
+    }
+
+    #[tokio::test]
+    async fn delayed_old_disconnect_interrupts_old_turn_but_preserves_replacement_runner() {
+        let broker = BrainRunnerBroker::default();
+        let old_connection = uuid::Uuid::new_v4();
+        let replacement_connection = uuid::Uuid::new_v4();
+        let lease_id = lease();
+        broker
+            .claim_connection_lease(old_connection, "brain", lease_id)
+            .unwrap();
+        let (old_tx, mut old_rx) = mpsc::unbounded_channel();
+        broker
+            .register_for_connection(old_connection, "brain", lease_id, old_tx)
+            .unwrap();
+        let old_broker = broker.clone();
+        let old_dispatch = tokio::spawn(async move {
+            old_broker
+                .dispatch_turn(
+                    "brain",
+                    lease_id,
+                    RunId(uuid::Uuid::new_v4()),
+                    8,
+                    "old turn".into(),
+                    Vec::new(),
+                    test_approval_audience(),
+                )
+                .await
+        });
+        let RunnerRequest::Turn(_old_request) = old_rx.recv().await.unwrap() else {
+            panic!("expected old turn request")
+        };
+
+        broker.release_connection_lease(old_connection, "brain", lease_id);
+        broker
+            .claim_connection_lease(replacement_connection, "brain", lease_id)
+            .unwrap();
+        let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel();
+        broker
+            .register_for_connection(replacement_connection, "brain", lease_id, replacement_tx)
+            .unwrap();
+        broker.disconnect_connection(old_connection);
+        assert!(broker.has_registration("brain", lease_id));
+        let old_error = old_dispatch.await.unwrap().unwrap_err();
+        assert!(old_error
+            .to_string()
+            .contains("runner callback disconnected"));
+
+        let checkpoint = crate::runtime::ProgramRuntime::new()
+            .revision_history()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let replacement = tokio::spawn(async move {
+            let RunnerRequest::Turn(request) = replacement_rx.recv().await.unwrap() else {
+                panic!("expected replacement turn request")
+            };
+            request
+                .response_tx
+                .send(Ok(RunnerTurnResult {
+                    source: "(say \"replacement completed\")".into(),
+                    language: ProgramLanguage::Lisp,
+                    output: "replacement completed".into(),
+                    turn_events: Vec::new(),
+                    runtime_revision: 0,
+                    checkpoint,
+                    effect_journal: Vec::new(),
+                    commit_ack: None,
+                }))
+                .unwrap();
+        });
+        let result = broker
+            .dispatch_turn(
+                "brain",
+                lease_id,
+                RunId(uuid::Uuid::new_v4()),
+                9,
+                "replacement turn".into(),
+                Vec::new(),
+                test_approval_audience(),
+            )
+            .await
+            .unwrap();
+        replacement.await.unwrap();
+        assert_eq!(result.output, "replacement completed");
     }
 
     #[tokio::test]

@@ -1784,6 +1784,7 @@ impl Repl {
                 .map(|c| c.base_url().to_string()),
             provider_resolver,
             agent_scheduler,
+            true,
         );
 
         // Run the event loop

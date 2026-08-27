@@ -29,6 +29,38 @@ use super::query_processor::{process_query_with_tools, ActiveToolUsesMap};
 use super::query_state::{QueryState, QueryStateManager};
 use super::tool_execution::ToolExecutionCoordinator;
 
+#[cfg(test)]
+pub(super) struct ProviderRetirementBarrier {
+    pub(super) reached: tokio::sync::Notify,
+    pub(super) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ProviderRetirementBarrier {
+    pub(super) fn new() -> Self {
+        Self {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) struct SpawnAcknowledgementBarrier {
+    pub(super) reached: tokio::sync::Notify,
+    pub(super) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl SpawnAcknowledgementBarrier {
+    pub(super) fn new() -> Self {
+        Self {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
 /// LLM worker loop — owns AI generation concerns, runs as its own Tokio task.
 pub struct LlmLoop {
     /// Receive LLM requests from the TUI event loop.
@@ -76,6 +108,10 @@ pub struct LlmLoop {
     enable_summarization: bool,
     auto_compact_enabled: bool,
     wire_metrics_logger: Option<Arc<crate::metrics::MetricsLogger>>,
+    #[cfg(test)]
+    provider_retirement_barrier: Option<Arc<ProviderRetirementBarrier>>,
+    #[cfg(test)]
+    spawn_acknowledgement_barrier: Option<Arc<SpawnAcknowledgementBarrier>>,
 }
 
 impl LlmLoop {
@@ -148,7 +184,29 @@ impl LlmLoop {
             enable_summarization,
             auto_compact_enabled,
             wire_metrics_logger,
+            #[cfg(test)]
+            provider_retirement_barrier: None,
+            #[cfg(test)]
+            spawn_acknowledgement_barrier: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_provider_retirement_barrier(
+        mut self,
+        barrier: Arc<ProviderRetirementBarrier>,
+    ) -> Self {
+        self.provider_retirement_barrier = Some(barrier);
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_spawn_acknowledgement_barrier(
+        mut self,
+        barrier: Arc<SpawnAcknowledgementBarrier>,
+    ) -> Self {
+        self.spawn_acknowledgement_barrier = Some(barrier);
+        self
     }
 
     /// Run the LLM worker loop.  Consumes `self`; returns when the request
@@ -156,8 +214,38 @@ impl LlmLoop {
     pub async fn run(mut self) {
         while let Some(req) = self.llm_rx.recv().await {
             match req {
-                LlmRequest::Query { id, text, no_tools } => {
-                    self.spawn_query(id, text, no_tools).await;
+                LlmRequest::Query {
+                    id,
+                    text,
+                    no_tools,
+                    admission,
+                    admission_ready,
+                    spawned,
+                } => {
+                    let reserved_generation = if let Some(ready) = admission_ready {
+                        self.query_states.wait_for_provider_task(id).await;
+                        let Some(generation) = self.query_states.begin_provider_task(id).await
+                        else {
+                            continue;
+                        };
+                        if ready.send(()).is_err() {
+                            self.query_states.end_provider_task(id, generation).await;
+                            continue;
+                        }
+                        Some(generation)
+                    } else {
+                        None
+                    };
+                    if let Some(admission) = admission {
+                        if admission.await.is_err() {
+                            if let Some(generation) = reserved_generation {
+                                self.query_states.end_provider_task(id, generation).await;
+                            }
+                            continue;
+                        }
+                    }
+                    self.spawn_query(id, text, no_tools, reserved_generation, spawned)
+                        .await;
                 }
             }
         }
@@ -167,7 +255,23 @@ impl LlmLoop {
     ///
     /// `query = ""` for tool-continuation turns (graph is not reset).
     /// `no_tools = true` suppresses tool definitions for conversational turns.
-    async fn spawn_query(&self, query_id: Uuid, query: String, no_tools: bool) {
+    async fn spawn_query(
+        &self,
+        query_id: Uuid,
+        query: String,
+        no_tools: bool,
+        provider_generation: Option<u64>,
+        spawned: Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
+        let provider_generation = match provider_generation {
+            Some(generation) => generation,
+            None => {
+                let Some(generation) = self.query_states.begin_provider_task(query_id).await else {
+                    return;
+                };
+                generation
+            }
+        };
         // Reset the execution graph on fresh queries (not tool continuations).
         if !query.is_empty() {
             let mut g = self.current_graph.lock().await;
@@ -216,41 +320,76 @@ impl LlmLoop {
         let tool_call_history = Arc::clone(&self.tool_call_history);
         let pinned_generators = Arc::clone(&self.pinned_generators);
         let terminal_query_states = Arc::clone(&query_states);
+        #[cfg(test)]
+        let provider_retirement_barrier = self.provider_retirement_barrier.clone();
+        #[cfg(test)]
+        let spawn_acknowledgement_barrier = self.spawn_acknowledgement_barrier.clone();
 
         tokio::spawn(async move {
-            process_query_with_tools(
-                query_id,
-                query,
-                event_tx,
-                claude_gen,
-                qwen_gen,
-                router,
-                generator_state,
-                tool_defs,
-                conversation,
-                query_states,
-                tool_coordinator,
-                program_runtime,
-                tui_renderer,
-                mode,
-                output_manager,
-                status_bar,
-                active_tool_uses,
-                memory_system,
-                session_label,
-                cwd,
-                context_lines,
-                max_verbatim,
-                recall_k,
-                streaming_enabled,
-                enable_summarization,
-                auto_compact_enabled,
-                summary_gen,
-                tool_call_history,
-                wire_metrics_logger,
-                persona_system_prompt,
-            )
-            .await;
+            #[cfg(test)]
+            if let Some(barrier) = spawn_acknowledgement_barrier {
+                barrier.reached.notify_one();
+                barrier.release.notified().await;
+            }
+            if let Some(spawned) = spawned {
+                if spawned.send(()).is_err() {
+                    terminal_query_states
+                        .end_provider_task(query_id, provider_generation)
+                        .await;
+                    pinned_generators.release(query_id).await;
+                    return;
+                }
+            }
+            let terminal_event_tx = event_tx.clone();
+            let provider_task = tokio::spawn(async move {
+                process_query_with_tools(
+                    query_id,
+                    query,
+                    event_tx,
+                    claude_gen,
+                    qwen_gen,
+                    router,
+                    generator_state,
+                    tool_defs,
+                    conversation,
+                    query_states,
+                    tool_coordinator,
+                    program_runtime,
+                    tui_renderer,
+                    mode,
+                    output_manager,
+                    status_bar,
+                    active_tool_uses,
+                    memory_system,
+                    session_label,
+                    cwd,
+                    context_lines,
+                    max_verbatim,
+                    recall_k,
+                    streaming_enabled,
+                    enable_summarization,
+                    auto_compact_enabled,
+                    summary_gen,
+                    tool_call_history,
+                    wire_metrics_logger,
+                    persona_system_prompt,
+                )
+                .await;
+            });
+            if let Err(error) = provider_task.await {
+                let _ = terminal_event_tx.send(ReplEvent::QueryFailed {
+                    query_id,
+                    error: format!("provider task terminated unexpectedly: {error}"),
+                });
+            }
+            #[cfg(test)]
+            if let Some(barrier) = provider_retirement_barrier {
+                barrier.reached.notify_one();
+                barrier.release.notified().await;
+            }
+            terminal_query_states
+                .end_provider_task(query_id, provider_generation)
+                .await;
 
             // Returning in ExecutingTools means another turn with the same ID
             // is imminent. Every other return is terminal (including transport

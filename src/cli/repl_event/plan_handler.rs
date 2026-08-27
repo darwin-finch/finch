@@ -91,6 +91,9 @@ pub(crate) async fn handle_present_plan(
     if !matches!(tool_use.name.as_str(), "present_plan" | "PresentPlan") {
         return None;
     }
+    if cancel.is_cancelled() {
+        return Some(Ok(dismissed_plan_msg()));
+    }
 
     tracing::debug!("[EVENT_LOOP] Detected PresentPlan tool call - showing approval dialog");
 
@@ -118,6 +121,10 @@ pub(crate) async fn handle_present_plan(
             }
         }
     };
+
+    if cancel.is_cancelled() {
+        return Some(Ok(dismissed_plan_msg()));
+    }
 
     // Save plan to file
     if let Err(e) = std::fs::write(&plan_path, plan_content) {
@@ -284,11 +291,9 @@ pub(crate) async fn handle_present_plan(
 /// Returns `Some(tool_result)` when the tool call is an `AskUserQuestion`
 /// invocation; returns `None` for every other tool name.
 ///
-/// Single-question dialogs use the non-blocking async overlay path (same as
-/// `handle_present_plan`) so `spawn_input_task` can deliver keyboard events
-/// while the dialog is open.  Multi-question dialogs fall back to the blocking
-/// `show_tabbed_dialog` which takes over the full alternate screen — a separate
-/// issue to fix later.
+/// Questions use the non-blocking async overlay path (same as
+/// `handle_present_plan`) so `spawn_input_task` can deliver keyboard events and
+/// cancellation can dismiss the current question without resuming later tools.
 pub(crate) async fn handle_ask_user_question(
     tool_use: &ToolUse,
     tui_renderer: Arc<tokio::sync::Mutex<TuiRenderer>>,
@@ -296,8 +301,14 @@ pub(crate) async fn handle_ask_user_question(
     event_tx: &mpsc::UnboundedSender<ReplEvent>,
 ) -> Option<Result<String>> {
     // Accept the canonical wire name and the dispatch-only legacy spelling.
-    if !matches!(tool_use.name.as_str(), "ask_user_question" | "AskUserQuestion") {
+    if !matches!(
+        tool_use.name.as_str(),
+        "ask_user_question" | "AskUserQuestion"
+    ) {
         return None;
+    }
+    if cancel.is_cancelled() {
+        return Some(Ok(dismissed_msg()));
     }
 
     tracing::debug!("[EVENT_LOOP] Detected AskUserQuestion tool call");
@@ -317,22 +328,50 @@ pub(crate) async fn handle_ask_user_question(
     use crate::cli::llm_dialogs;
     use std::collections::HashMap;
 
-    // Multi-question path: show_tabbed_dialog takes over the alternate screen,
-    // so the normal event loop is not active.  We still hold the mutex for the
-    // duration — this is a known limitation; single-question is the common case.
+    // Keep multi-question interaction on the cancellable overlay path. The old
+    // synchronous tabbed dialog held the renderer lock and could not observe a
+    // query cancellation, allowing the remaining tool batch to resume after a
+    // named-Brain turn had already published its terminal callback.
     if input.questions.len() > 1 {
-        let mut tui = tui_renderer.lock().await;
-        let tabbed = crate::cli::tui::TabbedDialog::new(input.questions.clone(), None);
-        let result = match tui.show_tabbed_dialog(tabbed) {
-            Ok(r) => r,
-            Err(e) => return Some(Err(anyhow::anyhow!("Failed to show dialog: {}", e))),
-        };
-        drop(tui);
-
-        let answers = match result {
-            crate::cli::tui::TabbedDialogResult::Completed(a) => a,
-            crate::cli::tui::TabbedDialogResult::Cancelled => HashMap::new(),
-        };
+        let mut answers = HashMap::new();
+        for question in &input.questions {
+            if cancel.is_cancelled() {
+                return Some(Ok(dismissed_msg()));
+            }
+            let dialog = llm_dialogs::question_to_dialog(question);
+            {
+                let mut tui = tui_renderer.lock().await;
+                tui.active_dialog = Some(dialog.clone());
+                tui.pending_dialog_result = None;
+                let _ = tui.erase_live_area();
+                let _ = tui.draw_live_area();
+            }
+            let (dialog_tx, dialog_rx) = tokio::sync::oneshot::channel();
+            if event_tx
+                .send(ReplEvent::ShowDialog {
+                    dialog,
+                    response_tx: dialog_tx,
+                })
+                .is_err()
+            {
+                return Some(Ok(dismissed_msg()));
+            }
+            let result = tokio::select! {
+                result = dialog_rx => result.unwrap_or(crate::cli::tui::DialogResult::Cancelled),
+                _ = cancel.cancelled() => {
+                    let mut tui = tui_renderer.lock().await;
+                    tui.active_dialog = None;
+                    tui.pending_dialog_result = None;
+                    crate::cli::tui::DialogResult::Cancelled
+                }
+            };
+            if matches!(result, crate::cli::tui::DialogResult::Cancelled) {
+                return Some(Ok(dismissed_msg()));
+            }
+            if let Some(answer) = llm_dialogs::extract_answer(question, &result) {
+                answers.insert(question.question.clone(), answer);
+            }
+        }
         let annotations = llm_dialogs::build_annotations(&input.questions, &answers);
         let output = crate::cli::AskUserQuestionOutput {
             questions: input.questions.clone(),
