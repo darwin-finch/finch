@@ -44,19 +44,19 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: issue-158-linux-${{ hashFiles('Cargo.lock') }}
+          key: issue-158-linux-${{ hashFiles('Cargo.toml') }}
 
       - name: Check scoped formatting
         run: rustfmt --edition 2021 --check src/config/backend.rs src/config/settings.rs src/models/common.rs src/models/loaders/onnx.rs src/models/loaders/onnx_config.rs src/cli/setup_wizard.rs
 
       - name: Check non-macOS library, binaries, and tests
-        run: cargo check --locked --lib --bins --tests
+        run: cargo check --lib --bins --tests
 
       - name: Run CoreML config and setup regressions
-        run: cargo test --locked --lib coreml -- --nocapture
+        run: cargo test --lib coreml -- --nocapture
 
       - name: Run all setup entry-point persistence regression
-        run: cargo test --locked --lib test_first_run_command_and_repl_adapters_share_public_ceremony -- --nocapture
+        run: cargo test --lib test_first_run_command_and_repl_adapters_share_public_ceremony -- --nocapture
 
   macos-policy:
     name: macOS CoreML policy and diagnostic contract
@@ -82,13 +82,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: issue-158-macos-${{ hashFiles('Cargo.lock') }}
+          key: issue-158-macos-${{ hashFiles('Cargo.toml') }}
 
       - name: Check macOS library, binaries, and tests
-        run: cargo check --locked --lib --bins --tests
+        run: cargo check --lib --bins --tests
 
       - name: Run CoreML policy and isolated diagnostic regressions
-        run: cargo test --locked --lib coreml -- --nocapture
+        run: cargo test --lib coreml -- --nocapture
 
       - name: Run production log-stream smoke boundary
-        run: cargo test --locked --lib test_coreml_profile_capture_production_log_stream_smoke -- --ignored --nocapture
+        run: cargo test --lib test_coreml_profile_capture_production_log_stream_smoke -- --ignored --nocapture
