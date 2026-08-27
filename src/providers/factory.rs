@@ -8,7 +8,11 @@ use super::claude::ClaudeProvider;
 use super::gemini::GeminiProvider;
 use super::openai::OpenAIProvider;
 use super::LlmProvider;
-use crate::config::{Config, ProviderEntry, TeacherEntry};
+use crate::config::{
+    Config, CredentialProvider, CredentialResolver, EnvironmentCredentialResolver, ProviderEntry,
+    ResolvedCredential, TeacherEntry,
+};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const LEGACY_CHATGPT_MIGRATION_ERROR: &str = "Legacy chatgpt_subscription profiles are unsupported because Finch no longer launches Codex app-server. Run `finch setup` and configure OpenAI Platform with an API key or another supported provider; subscription credentials are not API keys";
@@ -78,6 +82,9 @@ impl ProviderGraph {
 /// (`create_local_generator`).
 pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmProvider>> {
     match entry {
+        ProviderEntry::Credentialed { .. } => {
+            bail!("Named credential profiles must be created from the complete Config graph so their references can be validated; use create_provider_from_config")
+        }
         ProviderEntry::LegacyChatgptSubscription { .. } => {
             bail!(LEGACY_CHATGPT_MIGRATION_ERROR)
         }
@@ -217,6 +224,162 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
     }
 }
 
+fn create_provider_from_resolved_entry(
+    entry: &ProviderEntry,
+    resolved: &ResolvedCredential,
+) -> Result<Box<dyn LlmProvider>> {
+    let ProviderEntry::Credentialed {
+        provider,
+        model,
+        base_url,
+        chat_path,
+        models_path,
+        reasoning_effort,
+        ..
+    } = entry
+    else {
+        return create_provider_from_entry(entry);
+    };
+    let secret = resolved.secret.expose().to_string();
+    match provider {
+        CredentialProvider::Anthropic => {
+            let mut provider = ClaudeProvider::new_with_endpoints(
+                secret,
+                base_url.as_deref().unwrap_or("https://api.anthropic.com"),
+                chat_path.as_deref().unwrap_or("/v1/messages"),
+                models_path.as_deref().unwrap_or("/v1/models"),
+            )?;
+            if let Some(model) = model {
+                provider = provider.with_model(model.clone());
+            }
+            Ok(Box::new(provider))
+        }
+        CredentialProvider::OpenaiPlatform
+        | CredentialProvider::Xai
+        | CredentialProvider::Mistral
+        | CredentialProvider::Groq => {
+            let (default_base, default_model, provider_name) = match provider {
+                CredentialProvider::OpenaiPlatform => ("https://api.openai.com", "gpt-4o", "openai"),
+                CredentialProvider::Xai => ("https://api.x.ai", "grok-4.6", "grok"),
+                CredentialProvider::Mistral => ("https://api.mistral.ai", "mistral-large-2512", "mistral"),
+                CredentialProvider::Groq => ("https://api.groq.com/openai", "openai/gpt-oss-120b", "groq"),
+                _ => unreachable!("outer match limits provider"),
+            };
+            let mut provider = OpenAIProvider::new_compatible(
+                secret,
+                base_url.clone().unwrap_or_else(|| default_base.to_string()),
+                chat_path.as_deref().unwrap_or("/v1/chat/completions"),
+                models_path.as_deref().unwrap_or("/v1/models"),
+                default_model.to_string(),
+                provider_name.to_string(),
+            )?;
+            if let Some(model) = model {
+                provider = provider.with_model(model.clone());
+            }
+            if let Some(effort) = reasoning_effort {
+                provider = provider.with_reasoning_effort(*effort);
+            }
+            Ok(Box::new(provider))
+        }
+        CredentialProvider::GeminiAiStudio => {
+            if base_url.is_some() || chat_path.is_some() || models_path.is_some() {
+                bail!("Gemini AI Studio custom endpoints are not supported by this transport")
+            }
+            let mut provider = GeminiProvider::new(secret)?;
+            if let Some(model) = model {
+                provider = provider.with_model(model.clone());
+            }
+            Ok(Box::new(provider))
+        }
+        CredentialProvider::ChatgptSubscription => bail!(
+            "ChatGPT subscription credentials are distinct from OpenAI Platform credentials, but no documented Finch-native subscription transport is currently available"
+        ),
+        CredentialProvider::GoogleVertex => bail!(
+            "Google Vertex named credentials are modeled but its cloud-identity transport is not implemented"
+        ),
+    }
+}
+
+fn resolve_named_graph(
+    config: &Config,
+    resolver: &dyn CredentialResolver,
+) -> Result<BTreeMap<String, ResolvedCredential>> {
+    config.validate()?;
+    let credentials = crate::config::credential::credential_index(&config.credentials)?;
+    let mut resolved = BTreeMap::new();
+    for entry in &config.providers {
+        let Some(binding) = entry.credential_binding() else {
+            continue;
+        };
+        if resolved.contains_key(&binding.credential_ref) {
+            continue;
+        }
+        let credential = credentials
+            .get(binding.credential_ref.as_str())
+            .expect("Config::validate checked every named credential reference");
+        let handle = resolver.resolve(credential).with_context(|| {
+            format!(
+                "Failed to resolve named credential '{}'",
+                binding.credential_ref
+            )
+        })?;
+        if handle.credential_name != binding.credential_ref {
+            bail!(
+                "credential resolver returned handle '{}' for requested credential '{}'",
+                handle.credential_name,
+                binding.credential_ref
+            );
+        }
+        resolved.insert(binding.credential_ref.clone(), handle);
+    }
+    Ok(resolved)
+}
+
+fn create_named_profiles_from_config_with_resolver(
+    config: &Config,
+    resolver: &dyn CredentialResolver,
+) -> Result<Vec<(String, Box<dyn LlmProvider>)>> {
+    // Complete graph validation and local secret resolution happen before the
+    // first provider constructor is called.
+    let resolved = resolve_named_graph(config, resolver)?;
+    if let Some((index, _)) = config
+        .providers
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| matches!(entry, ProviderEntry::LegacyChatgptSubscription { .. }))
+    {
+        bail!(
+            "Provider #{} is invalid: {}",
+            index + 1,
+            LEGACY_CHATGPT_MIGRATION_ERROR
+        );
+    }
+    let cloud: Vec<_> = config
+        .providers
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| !entry.is_local())
+        .collect();
+    if cloud.is_empty() {
+        bail!("No cloud provider entries configured");
+    }
+    cloud
+        .into_iter()
+        .map(|(index, entry)| {
+            let provider = if let Some(handle) = entry
+                .credential_binding()
+                .and_then(|binding| resolved.get(&binding.credential_ref))
+            {
+                create_provider_from_resolved_entry(entry, handle)
+            } else {
+                create_provider_from_entry(entry)
+            }
+            .with_context(|| format!("Failed to create provider #{}", index + 1))?;
+            Ok((entry.profile_name(), provider))
+        })
+        .collect()
+}
+
 /// Create providers from a slice of unified `ProviderEntry` values.
 /// Only cloud entries are included; `Local` variants are silently skipped.
 pub fn create_providers_from_entries(
@@ -318,7 +481,7 @@ fn graph_from_boxed_profiles(
 /// Legacy teacher-only configuration remains supported.
 pub fn create_provider_graph_from_config(config: &Config) -> Result<ProviderGraph> {
     let profiles = if config.providers.iter().any(|entry| !entry.is_local()) {
-        create_named_providers_from_entries_with(&config.providers, create_provider_from_entry)?
+        create_named_profiles_from_config_with_resolver(config, &EnvironmentCredentialResolver)?
     } else {
         if config.teachers.is_empty() {
             bail!("No teacher providers configured");
@@ -348,11 +511,31 @@ pub fn create_provider_graph_from_config(config: &Config) -> Result<ProviderGrap
     graph_from_boxed_profiles(profiles)
 }
 
+/// Construct a provider graph using an injected local credential resolver.
+/// Tests and alternate secret stores use this exact production validation path.
+pub fn create_provider_graph_from_config_with_resolver(
+    config: &Config,
+    resolver: &dyn CredentialResolver,
+) -> Result<ProviderGraph> {
+    if !config.providers.iter().any(|entry| !entry.is_local()) {
+        return create_provider_graph_from_config(config);
+    }
+    graph_from_boxed_profiles(create_named_profiles_from_config_with_resolver(
+        config, resolver,
+    )?)
+}
+
 /// Create the ordered cloud provider pool from unified configuration, falling back to legacy
 /// teacher entries only when no cloud `[[providers]]` entries exist.
 pub fn create_providers_from_config(config: &Config) -> Result<Vec<Box<dyn LlmProvider>>> {
     if config.providers.iter().any(|entry| !entry.is_local()) {
-        return create_providers_from_entries(&config.providers);
+        return Ok(create_named_profiles_from_config_with_resolver(
+            config,
+            &EnvironmentCredentialResolver,
+        )?
+        .into_iter()
+        .map(|(_, provider)| provider)
+        .collect());
     }
     create_providers(&config.teachers)
 }
@@ -503,9 +686,14 @@ pub fn create_provider(teachers: &[TeacherEntry]) -> Result<Box<dyn LlmProvider>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ExecutionTarget;
+    use crate::config::{
+        AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle,
+        CredentialProvider, EndpointFamily, ExecutionTarget, ProviderCredential, ResolvedSecret,
+    };
     use crate::config::{ProviderEntry, TeacherEntry};
     use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -533,6 +721,56 @@ mod tests {
 
     fn pentry(variant: ProviderEntry) -> ProviderEntry {
         variant
+    }
+
+    struct CountingResolver {
+        calls: AtomicUsize,
+    }
+
+    impl CredentialResolver for CountingResolver {
+        fn resolve(&self, credential: &ProviderCredential) -> Result<ResolvedCredential> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ResolvedCredential {
+                credential_name: credential.name.clone(),
+                secret: ResolvedSecret::new("test-only-secret")?,
+            })
+        }
+    }
+
+    fn named_openai(profile_name: &str, credential_ref: &str, model: &str) -> ProviderEntry {
+        ProviderEntry::Credentialed {
+            provider: CredentialProvider::OpenaiPlatform,
+            credential: CredentialBinding {
+                credential_ref: credential_ref.into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: BTreeSet::new(),
+            },
+            model: Some(model.into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some(profile_name.into()),
+            reasoning_effort: None,
+        }
+    }
+
+    fn named_openai_credential(name: &str, account: &str) -> ProviderCredential {
+        ProviderCredential {
+            name: name.into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::OpenaiPlatform,
+            issuer: "openai-platform".into(),
+            audience: AudienceBinding::standard(EndpointFamily::OpenaiPlatform),
+            tenant: None,
+            project: None,
+            account: Some(account.into()),
+            scopes: BTreeSet::new(),
+            secret_ref: format!("test:{name}"),
+            lifecycle: CredentialLifecycle::default(),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -568,6 +806,59 @@ mod tests {
 
         assert_eq!(provider.name(), "openai");
         assert_eq!(provider.default_model(), "gpt-4o-mini");
+    }
+
+    #[test]
+    fn test_complete_graph_rejects_before_secret_resolution_or_provider_construction() {
+        let mut invalid = named_openai("primary", "work", "gpt-4o");
+        if let ProviderEntry::Credentialed { credential, .. } = &mut invalid {
+            credential.account = Some("different-account".into());
+        }
+        let config = Config::with_providers(vec![invalid])
+            .with_credentials(vec![named_openai_credential("work", "account-1")]);
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+
+        let error = create_provider_graph_from_config_with_resolver(&config, &resolver)
+            .err()
+            .expect("account mismatch must reject the graph");
+        assert!(error.to_string().contains("incompatible credential"));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_shared_compatible_credential_constructs_multiple_model_profiles_once_each() {
+        let config = Config::with_providers(vec![
+            named_openai("fast", "work", "gpt-4o"),
+            named_openai("reasoning", "work", "gpt-5.6-sol"),
+        ])
+        .with_credentials(vec![named_openai_credential("work", "account-1")]);
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let graph = create_provider_graph_from_config_with_resolver(&config, &resolver).unwrap();
+        assert_eq!(graph.profiles().len(), 2);
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(graph.profiles()[0].profile_name(), "fast");
+        assert_eq!(graph.profiles()[1].profile_name(), "reasoning");
+    }
+
+    #[test]
+    fn test_missing_named_account_never_falls_back_to_another_credential() {
+        let config = Config::with_providers(vec![named_openai("primary", "missing", "gpt-4o")])
+            .with_credentials(vec![
+                named_openai_credential("personal", "account-1"),
+                named_openai_credential("work", "account-2"),
+            ]);
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let error = create_provider_graph_from_config_with_resolver(&config, &resolver)
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("missing credential 'missing'"));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

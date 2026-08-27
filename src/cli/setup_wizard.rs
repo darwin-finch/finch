@@ -458,7 +458,11 @@ impl ModelConfig {
     fn is_configured(&self) -> bool {
         match self {
             Self::Local { .. } => true, // Local models are always "configured"
-            Self::Remote { api_key, .. } => !api_key.is_empty(),
+            Self::Remote {
+                api_key, persisted, ..
+            } => {
+                !api_key.is_empty() || matches!(persisted, Some(ProviderEntry::Credentialed { .. }))
+            }
         }
     }
 }
@@ -468,6 +472,21 @@ impl ModelConfig {
 /// `teachers` projection.
 fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
     match provider {
+        ProviderEntry::Credentialed {
+            provider,
+            model,
+            name,
+            ..
+        } => Some(ModelConfig::Remote {
+            provider: provider.as_str().to_string(),
+            name: name
+                .clone()
+                .unwrap_or_else(|| provider.as_str().to_string()),
+            api_key: String::new(),
+            model: model.clone().unwrap_or_default(),
+            enabled: true,
+            persisted: Some(provider.clone()),
+        }),
         ProviderEntry::LegacyChatgptSubscription { .. } => None,
         ProviderEntry::Local {
             inference_provider,
@@ -526,6 +545,24 @@ fn provider_entry_from_remote_model(
     let model = (!model.is_empty()).then(|| model.to_string());
     let name = Some(name.to_string());
     match persisted {
+        Some(ProviderEntry::Credentialed {
+            provider,
+            credential,
+            base_url,
+            chat_path,
+            models_path,
+            reasoning_effort,
+            ..
+        }) if api_key.is_empty() => ProviderEntry::Credentialed {
+            provider: *provider,
+            credential: credential.clone(),
+            model,
+            base_url: base_url.clone(),
+            chat_path: chat_path.clone(),
+            models_path: models_path.clone(),
+            name,
+            reasoning_effort: *reasoning_effort,
+        },
         Some(ProviderEntry::Claude {
             base_url,
             chat_path,
@@ -630,6 +667,9 @@ struct WizardState {
     catalog_cache_dir: Option<std::path::PathBuf>,
     /// Typed CoreML policy provenance from the loaded configuration.
     coreml: CoreMlConfig,
+    /// Named credential metadata is preserved unchanged by the compact model
+    /// editor; it contains no secret material.
+    credentials: Vec<crate::config::ProviderCredential>,
 }
 
 impl WizardState {
@@ -873,6 +913,9 @@ impl WizardState {
             coreml: existing_config
                 .map(|config| config.backend.coreml)
                 .unwrap_or_default(),
+            credentials: existing_config
+                .map(|config| config.credentials.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -928,6 +971,9 @@ pub struct SetupResult {
 
     // Unified providers list (new format)
     pub providers: Vec<ProviderEntry>,
+
+    /// Secret-free named credential records preserved by setup.
+    pub credentials: Vec<crate::config::ProviderCredential>,
 
     // Backward compatibility fields (mapped from primary_model)
     pub claude_api_key: String,
@@ -1144,7 +1190,10 @@ fn config_from_setup_result(result: &SetupResult) -> crate::config::Config {
     use crate::config::Config;
 
     let providers = result.providers.clone();
-    apply_setup_result_to_config(result, Config::with_providers(providers))
+    apply_setup_result_to_config(
+        result,
+        Config::with_providers(providers).with_credentials(result.credentials.clone()),
+    )
 }
 
 #[cfg(test)]
@@ -1158,7 +1207,8 @@ fn config_from_setup_result_with_paths(
     let providers = result.providers.clone();
     apply_setup_result_to_config(
         result,
-        Config::with_providers_and_paths(providers, metrics_dir, constitution_path),
+        Config::with_providers_and_paths(providers, metrics_dir, constitution_path)
+            .with_credentials(result.credentials.clone()),
     )
 }
 
@@ -3281,6 +3331,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         primary_model,
         tool_models,
         providers,
+        credentials: state.credentials.clone(),
         claude_api_key,
         hf_token: hf_token_val,
         backend_enabled,

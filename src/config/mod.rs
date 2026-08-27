@@ -4,6 +4,7 @@
 mod backend;
 mod colors;
 pub mod constants;
+pub mod credential;
 mod loader;
 pub mod persona;
 pub mod provider;
@@ -15,6 +16,11 @@ pub use backend::{BackendConfig, CoreMlComputeUnits, CoreMlConfig, ExecutionTarg
 pub use colors::{
     ColorScheme, ColorSpec, ColorTheme, DialogColors, MessageBand, MessageColors, StatusColors,
     UiColors,
+};
+pub use credential::{
+    AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle, CredentialProvider,
+    CredentialResolver, EndpointFamily, EnvironmentCredentialResolver, ProviderCredential,
+    ResolvedCredential, ResolvedSecret,
 };
 pub use loader::load_config;
 #[cfg(test)]

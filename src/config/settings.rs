@@ -3,6 +3,7 @@
 use super::backend::{BackendConfig, CoreMlConfig};
 use super::colors::ColorScheme;
 use super::provider::ProviderEntry;
+use super::ProviderCredential;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -159,6 +160,10 @@ pub struct Config {
     /// are also mirrored in `backend`. Use `with_providers()` to construct
     /// from this list, or `new()` to construct from the legacy fields.
     pub providers: Vec<ProviderEntry>,
+
+    /// Secret-free named provider credential records. Secret material is
+    /// resolved through an injected credential store only after graph validation.
+    pub credentials: Vec<ProviderCredential>,
 
     /// Teacher LLM provider configuration (array of teachers in priority order)
     pub teachers: Vec<TeacherEntry>,
@@ -400,7 +405,8 @@ impl ProviderEntry {
                 base_url: None,
                 name: name.clone(),
             }),
-            Self::LegacyChatgptSubscription { .. }
+            Self::Credentialed { .. }
+            | Self::LegacyChatgptSubscription { .. }
             | Self::Ollama { .. }
             | Self::RemoteDaemon { .. }
             | Self::Local { .. } => None,
@@ -533,6 +539,39 @@ impl Config {
     /// Validate configuration and return helpful errors
     pub fn validate(&self) -> anyhow::Result<()> {
         use crate::errors;
+
+        // Validate the complete named-credential graph before any provider,
+        // fallback, catalogue, or transport object is constructed.
+        let credentials = super::credential::credential_index(&self.credentials)
+            .context("Invalid named credential records")?;
+        for provider in &self.providers {
+            let Some(binding) = provider.credential_binding() else {
+                continue;
+            };
+            let credential = credentials.get(binding.credential_ref.as_str()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provider profile '{}' references missing credential '{}'; run `finch setup` to choose an existing named credential",
+                    provider.profile_name(),
+                    binding.credential_ref
+                )
+            })?;
+            super::credential::validate_binding(
+                provider
+                    .credential_provider()
+                    .expect("credentialed profiles declare provider namespace"),
+                provider.credential_base_url(),
+                binding,
+                credential,
+                chrono::Utc::now(),
+            )
+            .with_context(|| {
+                format!(
+                    "provider profile '{}' has incompatible credential '{}'",
+                    provider.profile_name(),
+                    binding.credential_ref
+                )
+            })?;
+        }
 
         // Allow empty teachers — the app can start and will show an error
         // only when an actual API call is attempted (better UX than crashing on startup).
@@ -795,6 +834,7 @@ impl Config {
             colors: ColorScheme::default(),
             teachers,
             providers,
+            credentials: Vec::new(),
             features,
             mcp_servers: HashMap::new(),
             memory: crate::memory::MemoryConfig::default(),
@@ -805,6 +845,12 @@ impl Config {
     /// Get the active provider (first in the unified providers list).
     pub fn active_provider(&self) -> Option<&ProviderEntry> {
         self.providers.first()
+    }
+
+    /// Attach secret-free named credential metadata to this configuration.
+    pub fn with_credentials(mut self, credentials: Vec<ProviderCredential>) -> Self {
+        self.credentials = credentials;
+        self
     }
 
     /// Get the active teacher (first cloud provider in priority list).
@@ -837,6 +883,9 @@ impl Config {
     /// Save configuration to an explicit path owned by the caller.
     pub(crate) fn save_to(&self, config_path: &std::path::Path) -> anyhow::Result<()> {
         use std::fs;
+
+        self.validate()
+            .context("Configuration validation failed before save")?;
 
         let config_dir = config_path
             .parent()
@@ -873,6 +922,7 @@ impl Config {
             client: Some(self.client.clone()),
             server: Some(self.server.clone()),
             providers,
+            credentials: self.credentials.clone(),
             coreml: Some(self.backend.coreml),
             colors: Some(self.colors.clone()),
             features: Some(self.features.clone()),
@@ -904,6 +954,8 @@ struct TomlConfig {
     server: Option<ServerConfig>,
     #[serde(default)]
     providers: Vec<ProviderEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    credentials: Vec<ProviderCredential>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     coreml: Option<CoreMlConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -942,6 +994,7 @@ mod tests {
             client: None,
             server: None,
             providers: Vec::new(),
+            credentials: Vec::new(),
             coreml: None,
             colors: None,
             features: None,
