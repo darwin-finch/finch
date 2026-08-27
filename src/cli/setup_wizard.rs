@@ -76,14 +76,14 @@ const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
     (
         "gemini",
         "Gemini (Google)",
-        "gemini-2.0-flash",
+        "gemini-2.5-flash",
         "get key at aistudio.google.com",
     ),
     ("mistral", "Mistral AI", "", "get key at console.mistral.ai"),
     (
         "groq",
         "Groq (fast cloud)",
-        "llama-3.3-70b-versatile",
+        "openai/gpt-oss-120b",
         "get key at console.groq.com",
     ),
 ];
@@ -8461,6 +8461,48 @@ for line in sys.stdin:
         } else {
             panic!("expected Remote primary model");
         }
+    }
+
+    #[test]
+    fn gemini_25_default_survives_save_load_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let metrics_dir = directory.path().join("metrics");
+        let gemini_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, _, _, _)| *id == "gemini")
+            .unwrap();
+        let canonical_model = "gemini-2.5-flash";
+        assert_eq!(CLOUD_PROVIDERS[gemini_idx].2, canonical_model);
+        assert_eq!(known_models_for("gemini"), vec![canonical_model]);
+
+        let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+            provider_idx: gemini_idx,
+            name: "gemini".to_string(),
+            model: canonical_model.to_string(),
+            api_key: "gemini-test-key-that-is-long-enough-123456".to_string(),
+            focused_field: 3,
+            editing_idx: None,
+        });
+        handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+        let result = build_setup_result(&state).unwrap();
+        config_from_setup_result_with_paths(&result, metrics_dir.clone(), None)
+            .save_to(&config_path)
+            .unwrap();
+
+        let loaded =
+            crate::config::load_config_from_path_with_paths(&config_path, metrics_dir, None)
+                .unwrap();
+        assert!(matches!(
+            loaded.providers.first(),
+            Some(ProviderEntry::Gemini { model: Some(model), .. }) if model == canonical_model
+        ));
+        let reopened = WizardState::new_with_catalog_cache_dir(Some(&loaded), None);
+        assert!(matches!(
+            get_primary(&reopened),
+            Some(ModelConfig::Remote { provider, model, .. })
+                if provider == "gemini" && model == canonical_model
+        ));
     }
 
     #[test]
