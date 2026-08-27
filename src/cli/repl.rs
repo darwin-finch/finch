@@ -192,6 +192,7 @@ mod disabled_training_tests {
         features.streaming_enabled = false;
         #[allow(deprecated)]
         let config = Config {
+            credentials: Vec::new(),
             metrics_dir: temp.path().join("metrics"),
             streaming_enabled: false,
             tui_enabled: false,
@@ -669,9 +670,7 @@ impl Repl {
                             .sync_program_files(root, crate::programs::ProgramScope::Project)
                             .await
                         {
-                            tracing::warn!(
-                                "Failed to index project program vocabulary: {error}"
-                            );
+                            tracing::warn!("Failed to index project program vocabulary: {error}");
                         }
                     }
                     let root = system.program_source_root();

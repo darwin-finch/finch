@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::endpoints::ProviderEndpoints;
+use crate::config::{Config, CredentialProvider, CredentialResolver, ProviderEntry};
 
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CATALOG_BODY_BYTES: usize = 1_048_576;
@@ -215,6 +216,93 @@ pub async fn refresh(profile: &ModelCatalogProfile, cache_dir: &Path) -> Result<
     Ok(catalog)
 }
 
+/// Revalidate and resolve a named provider profile immediately before model
+/// discovery. Invalid graphs return before the HTTP client is constructed.
+pub async fn refresh_from_config(
+    config: &Config,
+    profile_name: &str,
+    resolver: &dyn CredentialResolver,
+    cache_dir: &Path,
+) -> Result<ModelCatalog> {
+    config.validate()?;
+    let entry = config
+        .providers
+        .iter()
+        .find(|entry| entry.profile_name() == profile_name)
+        .with_context(|| format!("provider profile '{profile_name}' was not found"))?;
+    let ProviderEntry::Credentialed {
+        provider,
+        credential,
+        base_url,
+        chat_path,
+        models_path,
+        ..
+    } = entry
+    else {
+        bail!("provider profile '{profile_name}' does not use a named credential");
+    };
+    let credentials = crate::config::credential::credential_index(&config.credentials)?;
+    let metadata = credentials
+        .get(credential.credential_ref.as_str())
+        .expect("Config::validate checked the named credential reference");
+    let resolved = resolver.resolve(metadata)?;
+    if resolved.credential_name != credential.credential_ref {
+        bail!("credential resolver returned a handle for the wrong named credential");
+    }
+    let (default_base, default_chat, default_models, auth, provider_name) = match provider {
+        CredentialProvider::Anthropic => (
+            "https://api.anthropic.com",
+            "/v1/messages",
+            "/v1/models",
+            CatalogAuth::AnthropicApiKey,
+            "claude",
+        ),
+        CredentialProvider::OpenaiPlatform => (
+            "https://api.openai.com",
+            "/v1/chat/completions",
+            "/v1/models",
+            CatalogAuth::Bearer,
+            "openai",
+        ),
+        CredentialProvider::Xai => (
+            "https://api.x.ai",
+            "/v1/chat/completions",
+            "/v1/models",
+            CatalogAuth::Bearer,
+            "grok",
+        ),
+        CredentialProvider::Mistral => (
+            "https://api.mistral.ai",
+            "/v1/chat/completions",
+            "/v1/models",
+            CatalogAuth::Bearer,
+            "mistral",
+        ),
+        CredentialProvider::Groq => (
+            "https://api.groq.com/openai",
+            "/v1/chat/completions",
+            "/v1/models",
+            CatalogAuth::Bearer,
+            "groq",
+        ),
+        _ => bail!(
+            "provider profile '{profile_name}' does not have a supported named-credential catalogue transport"
+        ),
+    };
+    let profile = ModelCatalogProfile::new(
+        provider_name,
+        profile_name,
+        resolved.secret.expose(),
+        ProviderEndpoints::new(
+            base_url.as_deref().unwrap_or(default_base),
+            chat_path.as_deref().unwrap_or(default_chat),
+            models_path.as_deref().unwrap_or(default_models),
+        ),
+        auth,
+    );
+    refresh(&profile, cache_dir).await
+}
+
 /// Use a successful live refresh, then the matching cache, then a visibly
 /// labelled static fallback. A failed refresh is returned alongside fallback
 /// data so callers can tell the user discovery did not succeed.
@@ -341,7 +429,25 @@ fn validate_models(provider: &str, models: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle, EndpointFamily,
+        ProviderCredential, ResolvedCredential, ResolvedSecret,
+    };
     use mockito::Matcher;
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingResolver(AtomicUsize);
+
+    impl CredentialResolver for CountingResolver {
+        fn resolve(&self, credential: &ProviderCredential) -> Result<ResolvedCredential> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ResolvedCredential {
+                credential_name: credential.name.clone(),
+                secret: ResolvedSecret::new("not-sent")?,
+            })
+        }
+    }
 
     fn profile(server_url: &str, provider: &str, auth: CatalogAuth) -> ModelCatalogProfile {
         ModelCatalogProfile::new(
@@ -351,6 +457,58 @@ mod tests {
             ProviderEndpoints::new(server_url, "/v1/chat/completions", "/custom/catalog/models"),
             auth,
         )
+    }
+
+    #[tokio::test]
+    async fn rejected_catalog_binding_has_zero_resolution_or_socket_activity() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let profile = ProviderEntry::Credentialed {
+            provider: CredentialProvider::OpenaiPlatform,
+            credential: CredentialBinding {
+                credential_ref: "work".into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: BTreeSet::new(),
+            },
+            model: Some("gpt-4o".into()),
+            base_url: Some(endpoint),
+            chat_path: None,
+            models_path: None,
+            name: Some("primary".into()),
+            reasoning_effort: None,
+        };
+        let credential = ProviderCredential {
+            name: "work".into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::OpenaiPlatform,
+            issuer: "openai-platform".into(),
+            // Host substitution: the profile points at the listener while the
+            // credential remains bound to the Platform audience.
+            audience: AudienceBinding::standard(EndpointFamily::OpenaiPlatform),
+            tenant: None,
+            project: None,
+            account: None,
+            scopes: BTreeSet::new(),
+            secret_ref: "test:work".into(),
+            lifecycle: CredentialLifecycle::default(),
+        };
+        let config = Config::with_providers(vec![profile]).with_credentials(vec![credential]);
+        let resolver = CountingResolver(AtomicUsize::new(0));
+        let cache = tempfile::tempdir().unwrap();
+
+        let error = refresh_from_config(&config, "primary", &resolver, cache.path())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("audience mismatch"));
+        assert_eq!(resolver.0.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[tokio::test]

@@ -473,15 +473,15 @@ impl ModelConfig {
 fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
     match provider {
         ProviderEntry::Credentialed {
-            provider,
+            provider: credential_provider,
             model,
             name,
             ..
         } => Some(ModelConfig::Remote {
-            provider: provider.as_str().to_string(),
+            provider: credential_provider.as_str().to_string(),
             name: name
                 .clone()
-                .unwrap_or_else(|| provider.as_str().to_string()),
+                .unwrap_or_else(|| credential_provider.as_str().to_string()),
             api_key: String::new(),
             model: model.clone().unwrap_or_default(),
             enabled: true,
