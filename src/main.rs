@@ -13,7 +13,6 @@ use finch::cli::{ConversationHistory, Repl};
 use finch::config::{load_config, Config};
 use finch::metrics::MetricsLogger;
 use finch::models::ThresholdRouter;
-use finch::providers::create_provider_from_config;
 use finch::router::Router;
 use tracing_subscriber::prelude::*;
 
@@ -328,8 +327,8 @@ fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
 /// This function creates a provider based on the teacher configuration
 /// and wraps it in a ClaudeClient for backwards compatibility.
 fn create_claude_client_with_provider(config: &Config) -> Result<ClaudeClient> {
-    let provider = create_provider_from_config(config)?;
-    Ok(ClaudeClient::with_provider(provider))
+    let graph = finch::providers::create_provider_graph_from_config(config)?;
+    Ok(ClaudeClient::with_shared_provider(graph.default_provider()))
 }
 
 /// Execute a Finch script using only the shared typed runtime. Script headers
@@ -1055,8 +1054,10 @@ async fn main() -> Result<()> {
     // Create router
     let router = Router::new(threshold_router);
 
-    // Create Claude client
-    let claude_client = create_claude_client_with_provider(&config)?;
+    // Construct the named provider graph once. The compatibility client and daemon profile
+    // router share these exact instances, including any staged ChatGPT app-server binary.
+    let provider_graph = finch::providers::create_provider_graph_from_config(&config)?;
+    let claude_client = ClaudeClient::with_shared_provider(provider_graph.default_provider());
 
     // Create metrics logger
     let metrics_logger = MetricsLogger::new(config.metrics_dir.clone())?;
@@ -1637,8 +1638,10 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     // Create router
     let router = Router::new(threshold_router);
 
-    // Create Claude client
-    let claude_client = create_claude_client_with_provider(&config)?;
+    // Construct once, then share the same provider instances between compatibility forwarding
+    // and named daemon profile routing.
+    let provider_graph = finch::providers::create_provider_graph_from_config(&config)?;
+    let claude_client = ClaudeClient::with_shared_provider(provider_graph.default_provider());
 
     // Create metrics logger
     let metrics_logger = MetricsLogger::new(config.metrics_dir.clone())?;
@@ -1722,12 +1725,6 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         brain_password: config.server.brain_password.clone(),
     };
 
-    // Build the multi-provider pool from [[providers]] config (cloud providers only).
-    // Falls back gracefully to the legacy ClaudeClient path when empty.
-    let providers: Vec<Box<dyn finch::providers::LlmProvider>> = {
-        finch::providers::create_providers_from_config(&config)?
-    };
-
     // Create and start agent server (with LocalGenerator support)
     let server = AgentServer::new(
         config.clone(),
@@ -1738,7 +1735,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
         local_generator,
         bootstrap_loader,
         generator_state,
-        providers,
+        provider_graph,
     )?;
 
     // Set up mDNS service advertisement if enabled

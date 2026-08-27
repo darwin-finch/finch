@@ -10,6 +10,45 @@ use super::gemini::GeminiProvider;
 use super::openai::OpenAIProvider;
 use super::LlmProvider;
 use crate::config::{Config, ProviderEntry, TeacherEntry};
+use std::sync::Arc;
+
+/// A successfully constructed cloud provider paired with its configured selector.
+#[derive(Clone)]
+pub struct ProviderProfile {
+    profile_name: String,
+    provider: Arc<dyn LlmProvider>,
+}
+
+impl ProviderProfile {
+    /// The stable configured selector for this provider.
+    pub fn profile_name(&self) -> &str {
+        &self.profile_name
+    }
+
+    /// The shared provider instance owned by this profile.
+    pub fn provider(&self) -> &Arc<dyn LlmProvider> {
+        &self.provider
+    }
+}
+
+/// A cloud provider graph constructed exactly once from configuration.
+#[derive(Clone)]
+pub struct ProviderGraph {
+    profiles: Vec<ProviderProfile>,
+    default_provider: Arc<dyn LlmProvider>,
+}
+
+impl ProviderGraph {
+    /// Successfully constructed named profiles in configured fallback order.
+    pub fn profiles(&self) -> &[ProviderProfile] {
+        &self.profiles
+    }
+
+    /// Shared primary/fallback provider used by compatibility clients.
+    pub fn default_provider(&self) -> Arc<dyn LlmProvider> {
+        Arc::clone(&self.default_provider)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // New API: ProviderEntry-based (unified)
@@ -170,13 +209,18 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
 pub fn create_providers_from_entries(
     entries: &[ProviderEntry],
 ) -> Result<Vec<Box<dyn LlmProvider>>> {
-    create_providers_from_entries_with(entries, create_provider_from_entry)
+    Ok(
+        create_named_providers_from_entries_with(entries, create_provider_from_entry)?
+            .into_iter()
+            .map(|(_, provider)| provider)
+            .collect(),
+    )
 }
 
-fn create_providers_from_entries_with<F>(
+fn create_named_providers_from_entries_with<F>(
     entries: &[ProviderEntry],
     mut create: F,
-) -> Result<Vec<Box<dyn LlmProvider>>>
+) -> Result<Vec<(String, Box<dyn LlmProvider>)>>
 where
     F: FnMut(&ProviderEntry) -> Result<Box<dyn LlmProvider>>,
 {
@@ -188,7 +232,7 @@ where
     let mut skipped_chatgpt = Vec::new();
     for (idx, entry) in cloud.into_iter().enumerate() {
         match create(entry) {
-            Ok(provider) => providers.push(provider),
+            Ok(provider) => providers.push((entry.profile_name(), provider)),
             Err(error) if matches!(entry, ProviderEntry::ChatgptSubscription { .. }) => {
                 tracing::warn!(
                     provider_index = idx + 1,
@@ -228,6 +272,69 @@ pub fn create_provider_from_entries(entries: &[ProviderEntry]) -> Result<Box<dyn
         use super::FallbackChain;
         Ok(Box::new(FallbackChain::new(providers)))
     }
+}
+
+fn graph_from_boxed_profiles(
+    profiles: Vec<(String, Box<dyn LlmProvider>)>,
+) -> Result<ProviderGraph> {
+    if profiles.is_empty() {
+        bail!("No usable cloud provider entries configured");
+    }
+    let profiles: Vec<_> = profiles
+        .into_iter()
+        .map(|(profile_name, provider)| ProviderProfile {
+            profile_name,
+            provider: Arc::from(provider),
+        })
+        .collect();
+    let default_provider = if profiles.len() == 1 {
+        Arc::clone(profiles[0].provider())
+    } else {
+        Arc::new(super::FallbackChain::from_shared(
+            profiles
+                .iter()
+                .map(|profile| Arc::clone(profile.provider()))
+                .collect(),
+        ))
+    };
+    Ok(ProviderGraph {
+        profiles,
+        default_provider,
+    })
+}
+
+/// Construct the named cloud provider graph once, preserving profile/provider identity when an
+/// unusable ChatGPT entry is skipped. Legacy teacher-only configuration remains supported.
+pub fn create_provider_graph_from_config(config: &Config) -> Result<ProviderGraph> {
+    let profiles = if config.providers.iter().any(|entry| !entry.is_local()) {
+        create_named_providers_from_entries_with(&config.providers, create_provider_from_entry)?
+    } else {
+        if config.teachers.is_empty() {
+            bail!("No teacher providers configured");
+        }
+        config
+            .teachers
+            .iter()
+            .enumerate()
+            .map(|(idx, teacher)| {
+                let profile_name = teacher
+                    .name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+                    .or_else(|| {
+                        teacher
+                            .model
+                            .clone()
+                            .filter(|model| !model.trim().is_empty())
+                    })
+                    .unwrap_or_else(|| teacher.provider.clone());
+                create_provider_from_teacher(teacher)
+                    .map(|provider| (profile_name, provider))
+                    .with_context(|| format!("Failed to create teacher provider #{}", idx + 1))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    graph_from_boxed_profiles(profiles)
 }
 
 /// Create the ordered cloud provider pool from unified configuration, falling back to legacy
@@ -674,9 +781,18 @@ schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandbo
         let path = directory.path().join("config.toml");
         Config::with_providers(entries).save_to(&path).unwrap();
         let config = crate::config::load_config_from_path(&path).unwrap();
-        let provider = create_provider_from_config(&config).unwrap();
-        assert_eq!(provider.name(), "grok");
-        assert_eq!(provider.default_model(), "grok-code-fast-1");
+        let graph = create_provider_graph_from_config(&config).unwrap();
+        assert_eq!(graph.profiles().len(), 1);
+        assert_eq!(graph.profiles()[0].profile_name(), "fallback");
+        assert_eq!(graph.profiles()[0].provider().name(), "grok");
+        assert_eq!(
+            graph.profiles()[0].provider().default_model(),
+            "grok-code-fast-1"
+        );
+        assert!(graph
+            .profiles()
+            .iter()
+            .all(|profile| profile.profile_name() != "subscription"));
     }
 
     #[test]
@@ -694,8 +810,15 @@ schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandbo
 
         let config = crate::config::load_config_from_path(&path).unwrap();
         assert!(config.teachers.is_empty());
-        let provider = create_provider_from_config(&config).unwrap();
-        assert_eq!(provider.name(), "chatgpt_subscription");
+        let graph = create_provider_graph_from_config(&config).unwrap();
+        assert_eq!(graph.profiles().len(), 1);
+        assert_eq!(graph.profiles()[0].profile_name(), "subscription");
+        let default_provider = graph.default_provider();
+        assert!(Arc::ptr_eq(
+            &default_provider,
+            graph.profiles()[0].provider()
+        ));
+        assert_eq!(default_provider.name(), "chatgpt_subscription");
     }
 
     #[test]

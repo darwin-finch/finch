@@ -10,12 +10,17 @@ use super::{LlmProvider, ProviderRequest, ProviderResponse, StreamChunk};
 
 /// A chain of providers to try in order
 pub struct FallbackChain {
-    providers: Arc<Vec<Box<dyn LlmProvider>>>,
+    providers: Arc<Vec<Arc<dyn LlmProvider>>>,
 }
 
 impl FallbackChain {
     /// Create a new fallback chain with providers in priority order
     pub fn new(providers: Vec<Box<dyn LlmProvider>>) -> Self {
+        Self::from_shared(providers.into_iter().map(Arc::from).collect())
+    }
+
+    /// Create a fallback chain without reconstructing already validated providers.
+    pub fn from_shared(providers: Vec<Arc<dyn LlmProvider>>) -> Self {
         Self {
             providers: Arc::new(providers),
         }
@@ -44,7 +49,10 @@ impl FallbackChain {
         let mut last_error = None;
 
         for (idx, provider) in self.providers.iter().enumerate() {
-            if request.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+            if request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| !tools.is_empty())
                 && !provider.supports_tools()
             {
                 tracing::info!(
@@ -131,7 +139,10 @@ impl FallbackChain {
         let mut last_error = None;
 
         for (idx, provider) in self.providers.iter().enumerate() {
-            if request.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+            if request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| !tools.is_empty())
                 && !provider.supports_tools()
             {
                 tracing::info!(
@@ -241,7 +252,9 @@ impl LlmProvider for FallbackChain {
     }
 
     fn supports_tools(&self) -> bool {
-        self.providers.iter().any(|provider| provider.supports_tools())
+        self.providers
+            .iter()
+            .any(|provider| provider.supports_tools())
     }
 }
 
@@ -270,9 +283,15 @@ mod tests {
         ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
             panic!("provider without tools must be skipped before invocation")
         }
-        fn name(&self) -> &str { "no-tools" }
-        fn default_model(&self) -> &str { "no-tools-model" }
-        fn supports_tools(&self) -> bool { false }
+        fn name(&self) -> &str {
+            "no-tools"
+        }
+        fn default_model(&self) -> &str {
+            "no-tools-model"
+        }
+        fn supports_tools(&self) -> bool {
+            false
+        }
     }
 
     impl MockProvider {

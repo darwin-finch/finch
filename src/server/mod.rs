@@ -41,7 +41,7 @@ use crate::feedback::FeedbackLogger;
 use crate::local::LocalGenerator;
 use crate::metrics::MetricsLogger;
 use crate::models::{BootstrapLoader, GeneratorState};
-use crate::providers::LlmProvider;
+use crate::providers::{LlmProvider, ProviderGraph};
 use crate::router::Router;
 
 struct ProviderSlot {
@@ -193,8 +193,8 @@ impl AgentServer {
 
     /// Create a new agent server.
     ///
-    /// `providers` is the ordered list of cloud providers from `[[providers]]` config.
-    /// If empty, the server falls back to `claude_client` for all cloud forwarding.
+    /// `provider_graph` is the already validated named cloud graph shared with
+    /// `claude_client`; provider construction must not be repeated here.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
@@ -205,19 +205,14 @@ impl AgentServer {
         local_generator: Arc<RwLock<LocalGenerator>>,
         bootstrap_loader: Arc<BootstrapLoader>,
         generator_state: Arc<RwLock<GeneratorState>>,
-        providers: Vec<Box<dyn LlmProvider>>,
+        provider_graph: ProviderGraph,
     ) -> Result<Self> {
-        let profile_names = config
-            .providers
+        let providers: Vec<ProviderSlot> = provider_graph
+            .profiles()
             .iter()
-            .filter(|entry| !entry.is_local())
-            .map(|entry| entry.profile_name());
-        let providers: Vec<ProviderSlot> = providers
-            .into_iter()
-            .zip(profile_names)
-            .map(|(provider, profile_name)| ProviderSlot {
-                profile_name,
-                provider: Arc::from(provider),
+            .map(|profile| ProviderSlot {
+                profile_name: profile.profile_name().to_string(),
+                provider: Arc::clone(profile.provider()),
             })
             .collect();
 

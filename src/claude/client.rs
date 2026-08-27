@@ -31,6 +31,11 @@ impl ClaudeClient {
         }
     }
 
+    /// Create a compatibility client around an already validated shared provider graph.
+    pub fn with_shared_provider(provider: std::sync::Arc<dyn LlmProvider>) -> Self {
+        Self { provider }
+    }
+
     /// Share the already validated provider with other compatibility facades.
     pub(crate) fn shared_provider(&self) -> std::sync::Arc<dyn LlmProvider> {
         std::sync::Arc::clone(&self.provider)

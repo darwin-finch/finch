@@ -35,8 +35,9 @@ pub use alignment::{with_alignment, UNIVERSAL_ALIGNMENT_PROMPT};
 pub use codex_app_server::{CodexAppServerAuth, CodexAppServerProvider};
 pub use factory::{
     create_provider, create_provider_from_config, create_provider_from_entries,
-    create_provider_from_entry, create_provider_from_teacher, create_providers,
-    create_providers_from_config, create_providers_from_entries,
+    create_provider_from_entry, create_provider_from_teacher, create_provider_graph_from_config,
+    create_providers, create_providers_from_config, create_providers_from_entries, ProviderGraph,
+    ProviderProfile,
 };
 pub use fallback_chain::FallbackChain;
 pub use teacher_session::{
