@@ -623,12 +623,19 @@ impl ProgramRuntime {
     }
 
     pub fn with_automation(enabled: bool) -> Self {
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::with_automation_in_workspace(enabled, workspace_root)
+    }
+
+    pub(crate) fn with_automation_in_workspace(
+        enabled: bool,
+        workspace_root: PathBuf,
+    ) -> Self {
         let automation = Arc::new(AutomationBroker::new(enabled));
         let typed_runtime = TypedRuntime::new();
         let checkpoint = typed_runtime
             .checkpoint()
             .expect("a fresh typed runtime is checkpointable");
-        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let project_id = workspace_root
             .canonicalize()
             .unwrap_or_else(|_| workspace_root.clone())

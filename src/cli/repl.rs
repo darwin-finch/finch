@@ -221,6 +221,8 @@ mod disabled_training_tests {
         let router = Router::new(crate::models::ThresholdRouter::default());
         let ambient_input_calls = Arc::new(AtomicUsize::new(0));
         let poisoned_input_calls = Arc::clone(&ambient_input_calls);
+        let workspace_root = temp.path().join("workspace");
+        std::fs::create_dir(&workspace_root).unwrap();
         let initialization = ReplInitialization {
             // The regression boundary is noninteractive regardless of whether
             // the test harness itself owns a TTY. Calling this factory would
@@ -234,6 +236,7 @@ mod disabled_training_tests {
             patterns_path: temp.path().join("tool-patterns.json"),
             conversation_log_path: temp.path().join("unused-conversations.jsonl"),
             active_persona: crate::config::Persona::load_builtin("default"),
+            workspace_root,
             project_program_root: None,
         };
         let mut repl = Repl::new_with_initialization(
@@ -559,6 +562,7 @@ struct ReplInitialization {
     patterns_path: PathBuf,
     conversation_log_path: PathBuf,
     active_persona: Result<crate::config::Persona>,
+    workspace_root: PathBuf,
     project_program_root: Option<PathBuf>,
 }
 
@@ -566,6 +570,7 @@ impl ReplInitialization {
     fn from_user_environment(config: &Config) -> Self {
         let home = dirs::home_dir();
         let is_interactive = io::stdout().is_terminal();
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             is_interactive,
             input_handler_factory: is_interactive
@@ -579,9 +584,8 @@ impl ReplInitialization {
                 .map(|root| root.join(".finch/conversations.jsonl"))
                 .unwrap_or_else(|| PathBuf::from(".finch/conversations.jsonl")),
             active_persona: crate::config::Persona::load_by_name(&config.active_persona),
-            project_program_root: std::env::current_dir()
-                .ok()
-                .and_then(|cwd| crate::programs::project_program_root(&cwd)),
+            project_program_root: crate::programs::project_program_root(&workspace_root),
+            workspace_root,
         }
     }
 }
@@ -625,6 +629,7 @@ impl Repl {
             patterns_path,
             conversation_log_path,
             active_persona,
+            workspace_root,
             project_program_root,
         } = initialization;
 
@@ -690,16 +695,21 @@ impl Repl {
 
         // Initialize tool execution system
         let mut tool_registry = ToolRegistry::new();
-        let program_runtime = Arc::new(crate::runtime::ProgramRuntime::with_automation({
-            #[cfg(target_os = "macos")]
-            {
-                config.features.gui_automation
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                false
-            }
-        }));
+        let program_runtime = Arc::new(
+            crate::runtime::ProgramRuntime::with_automation_in_workspace(
+                {
+                    #[cfg(target_os = "macos")]
+                    {
+                        config.features.gui_automation
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        false
+                    }
+                },
+                workspace_root,
+            ),
+        );
         #[cfg(target_os = "macos")]
         if config.features.gui_automation && is_interactive {
             let permission_context_matches =
