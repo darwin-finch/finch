@@ -20,7 +20,7 @@
 use anyhow::{Context, Result};
 use crossterm::{
     cursor,
-    event::{self, Event},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{
@@ -50,6 +50,7 @@ mod tabbed_dialog_widget; // kept for wizard helpers
 
 pub use async_input::{spawn_input_task, InputEvent};
 pub use autocomplete_widget::AutocompleteState;
+use autocomplete_widget::{completion_pane_lines, replace_command_prefix};
 pub use dialog::{Dialog, DialogOption, DialogResult, DialogType};
 pub use dialog_widget::DialogWidget;
 pub use shadow_buffer::visible_length;
@@ -439,11 +440,14 @@ fn live_viewport_lines(
     row_budget: usize,
 ) -> (Vec<String>, usize) {
     let width = terminal_width.max(1);
-    let budget = row_budget.max(1);
     let total_rows = lines
         .iter()
         .map(|line| shadow_buffer::physical_rows(line, width))
         .sum::<usize>();
+    if row_budget == 0 {
+        return (Vec::new(), total_rows);
+    }
+    let budget = row_budget;
     if total_rows <= budget {
         return (lines.to_vec(), 0);
     }
@@ -481,7 +485,7 @@ fn live_viewport_lines(
 /// Finch's live region. Keeping the whole region within the terminal prevents
 /// redraws from scrolling their own clipped prefix into permanent scrollback.
 fn live_message_row_budget(terminal_height: usize, reserved_rows: usize) -> usize {
-    terminal_height.saturating_sub(reserved_rows).max(1)
+    terminal_height.saturating_sub(reserved_rows)
 }
 
 fn input_physical_rows(lines: &[String], terminal_width: usize) -> usize {
@@ -491,15 +495,29 @@ fn input_physical_rows(lines: &[String], terminal_width: usize) -> usize {
 }
 
 fn input_line_physical_rows(lines: &[String], terminal_width: usize) -> Vec<usize> {
+    input_line_physical_rows_with_ghost(lines, terminal_width, None)
+}
+
+fn input_line_physical_rows_with_ghost(
+    lines: &[String],
+    terminal_width: usize,
+    ghost_text: Option<&str>,
+) -> Vec<usize> {
     let width = terminal_width.max(1);
     if lines.is_empty() {
         return vec![1];
     }
     lines
         .iter()
-        .map(|line| {
+        .enumerate()
+        .map(|(index, line)| {
             let prefix_width = 2; // `❯ ` and continuation indentation are both two columns.
-            (prefix_width + shadow_buffer::visible_length(line))
+            let ghost_width = if lines.len() == 1 && index == 0 {
+                ghost_text.map(shadow_buffer::visible_length).unwrap_or(0)
+            } else {
+                0
+            };
+            (prefix_width + shadow_buffer::visible_length(line) + ghost_width)
                 .max(1)
                 .div_ceil(width)
         })
@@ -552,7 +570,10 @@ fn session_separator_line(width: usize, cwd: &str, session: &str) -> String {
         String::new()
     };
     let used = prefix.chars().count() + cwd_part.chars().count() + right.chars().count();
-    format!("{prefix}{cwd_part}{}{right}", "─".repeat(width.saturating_sub(used)))
+    format!(
+        "{prefix}{cwd_part}{}{right}",
+        "─".repeat(width.saturating_sub(used))
+    )
 }
 
 /// Return a plain visible suffix small enough to fit in `columns`. This is
@@ -619,11 +640,168 @@ pub(crate) fn compute_ghost_text(
     })
 }
 
+fn ghost_for_command(input: &str, command_name: &str) -> Option<String> {
+    if command_name.len() <= input.len()
+        || !command_name
+            .to_ascii_lowercase()
+            .starts_with(&input.to_ascii_lowercase())
+    {
+        return None;
+    }
+    Some(command_name[input.len()..].to_string())
+}
+
+fn selected_completion_ghost(
+    lines: &[String],
+    cursor: (usize, usize),
+    autocomplete: &AutocompleteState,
+) -> Option<String> {
+    let (cursor_row, cursor_col) = cursor;
+    if cursor_row != 0
+        || lines.len() != 1
+        || lines
+            .first()
+            .map_or(true, |line| cursor_col != line.chars().count())
+    {
+        return None;
+    }
+    let prefix = lines[0].chars().take(cursor_col).collect::<String>();
+    autocomplete
+        .get_selected()
+        .and_then(|command| ghost_for_command(&prefix, command.name))
+}
+
+fn command_completion_at_cursor(
+    lines: &[String],
+    cursor: (usize, usize),
+    registry: &crate::cli::command_autocomplete::CommandRegistry,
+) -> (
+    Vec<crate::cli::command_autocomplete::CommandSpec>,
+    Option<String>,
+) {
+    let (cursor_row, cursor_col) = cursor;
+    let prefix = if cursor_row == 0 {
+        lines
+            .first()
+            .map(|line| line.chars().take(cursor_col).collect::<String>())
+            .filter(|line| line.starts_with('/'))
+    } else {
+        None
+    };
+    let Some(prefix) = prefix else {
+        return (Vec::new(), None);
+    };
+    let matches = registry.match_prefix(&prefix);
+    let ghost = if lines.len() == 1
+        && lines
+            .first()
+            .is_some_and(|line| cursor_col == line.chars().count())
+    {
+        matches
+            .first()
+            .and_then(|command| ghost_for_command(&prefix, command.name))
+    } else {
+        None
+    };
+    (matches, ghost)
+}
+
+fn replace_textarea_command(textarea: &mut TextArea<'static>, command_name: &str) -> bool {
+    use tui_textarea::CursorMove;
+
+    let Some((lines, target_cursor)) =
+        replace_command_prefix(textarea.lines(), textarea.cursor(), command_name)
+    else {
+        return false;
+    };
+    *textarea = TuiRenderer::create_clean_textarea_with_text(&lines.join("\n"));
+    textarea.move_cursor(CursorMove::Top);
+    let (_, column) = textarea.cursor();
+    if column > 0 {
+        textarea.move_cursor(CursorMove::Head);
+    }
+    for _ in 0..target_cursor.1 {
+        textarea.move_cursor(CursorMove::Forward);
+    }
+    true
+}
+
+fn dispatch_completion_key(
+    textarea: &mut TextArea<'static>,
+    autocomplete: &mut AutocompleteState,
+    ghost_text: &mut Option<String>,
+    code: KeyCode,
+) -> bool {
+    if code == KeyCode::Tab && autocomplete.visible && !autocomplete.is_interactive() {
+        // A completion context exists, but critical UI or a tiny viewport hid
+        // its pane. Consume Tab without applying stale ghost text or inserting
+        // a literal tab into the user's draft.
+        *ghost_text = None;
+        return true;
+    }
+    if !autocomplete.is_interactive() {
+        return false;
+    }
+    match code {
+        KeyCode::Up => autocomplete.select_previous(),
+        KeyCode::Down => autocomplete.select_next(),
+        KeyCode::Tab => {
+            let Some(command_name) = autocomplete
+                .get_selected()
+                .map(|command| command.name.to_string())
+            else {
+                return false;
+            };
+            if !replace_textarea_command(textarea, &command_name) {
+                return false;
+            }
+            autocomplete.hide();
+            *ghost_text = None;
+            return true;
+        }
+        KeyCode::Esc => {
+            autocomplete.hide();
+            *ghost_text = None;
+            return true;
+        }
+        _ => return false,
+    }
+    *ghost_text = selected_completion_ghost(textarea.lines(), textarea.cursor(), autocomplete);
+    true
+}
+
+fn route_tab_key(
+    textarea: &mut TextArea<'static>,
+    autocomplete: &mut AutocompleteState,
+    ghost_text: &mut Option<String>,
+    key: KeyEvent,
+) -> bool {
+    if dispatch_completion_key(textarea, autocomplete, ghost_text, KeyCode::Tab) {
+        return false;
+    }
+    textarea.input(Event::Key(key));
+    true
+}
+
+fn apply_viewport_resize(
+    autocomplete: &mut AutocompleteState,
+    pending_viewport_size: &mut Option<(u16, u16)>,
+    viewport_invalidated: &mut bool,
+    live_area_dirty: &mut bool,
+    width: u16,
+    height: u16,
+) {
+    autocomplete.invalidate_rendered_rows();
+    *pending_viewport_size = Some((width, height));
+    *viewport_invalidated = true;
+    *live_area_dirty = true;
+}
+
 /// Compute what to display in the status bar.
 ///
 /// Priority:
-/// 1. User is typing a `/command` with ghost text → show the command's description.
-/// 2. A live stat / operation is set (`raw_status` non-empty) → show that.
+/// 1. A live stat / operation is set (`raw_status` non-empty) → show that.
+/// 2. User is typing a `/command` with ghost text → show the command's description.
 /// 3. Idle → show the keyboard shortcut reminder.
 pub(crate) fn compute_effective_status(
     ghost_text: Option<&str>,
@@ -631,6 +809,11 @@ pub(crate) fn compute_effective_status(
     current_input: &str,
     registry: &crate::cli::command_autocomplete::CommandRegistry,
 ) -> String {
+    // Operational and error state is never hidden by command help. The
+    // completion pane carries command descriptions in its own rows.
+    if !raw_status.is_empty() {
+        return raw_status.to_string();
+    }
     if ghost_text.is_some() {
         let desc = registry
             .match_prefix(current_input)
@@ -648,10 +831,158 @@ pub(crate) fn compute_effective_status(
             return desc;
         }
     }
-    if !raw_status.is_empty() {
-        return raw_status.to_string();
-    }
     "↑↓ history  ·  Tab complete  ·  /help for commands  ·  Ctrl+C cancel".to_string()
+}
+
+/// Allocate zero to nine rows to completion after fixed UI, preserving one
+/// live-output row when a stream is active. Critical UI suppresses completion.
+fn completion_row_budget(
+    terminal_rows: usize,
+    fixed_rows: usize,
+    has_live_output: bool,
+    visible: bool,
+    critical_ui_active: bool,
+) -> usize {
+    if !visible || critical_ui_active {
+        return 0;
+    }
+    let live_reserve = usize::from(has_live_output);
+    terminal_rows
+        .saturating_sub(fixed_rows + live_reserve)
+        .min(autocomplete_widget::MAX_VISIBLE_SUGGESTIONS + 1)
+}
+
+fn write_completion_pane(out: &mut impl Write, lines: &[String]) -> Result<usize> {
+    for line in lines {
+        execute!(out, Print("\r\n"), Print(line))?;
+    }
+    Ok(lines.len())
+}
+
+fn write_live_area_erase(
+    out: &mut impl Write,
+    active_rows: usize,
+    cursor_row_from_top: usize,
+) -> Result<()> {
+    execute!(out, BeginSynchronizedUpdate)?;
+    if active_rows == 0 && cursor_row_from_top == 0 {
+        return Ok(());
+    }
+    execute!(out, cursor::MoveToColumn(0))?;
+    if cursor_row_from_top > 0 {
+        execute!(out, cursor::MoveUp(cursor_row_from_top as u16))?;
+    }
+    for row in 0..active_rows {
+        execute!(out, Clear(ClearType::CurrentLine))?;
+        if row + 1 < active_rows {
+            execute!(out, cursor::MoveDown(1), cursor::MoveToColumn(0))?;
+        }
+    }
+    if active_rows > 1 {
+        execute!(out, cursor::MoveUp((active_rows - 1) as u16))?;
+        execute!(out, cursor::MoveToColumn(0))?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LiveContentFrame {
+    live_lines: Vec<String>,
+    completion_lines: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TinyLiveFrame {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+fn plan_tiny_live_frame(
+    input_lines: &[String],
+    cursor: (usize, usize),
+    status: &str,
+    terminal_rows: usize,
+    terminal_width: usize,
+) -> TinyLiveFrame {
+    if terminal_rows == 0 {
+        return TinyLiveFrame {
+            lines: Vec::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+        };
+    }
+    let width = terminal_width.max(1);
+    let (input_row, input_col) = cursor;
+    let line = input_lines.get(input_row).map(String::as_str).unwrap_or("");
+    let prompt = if input_row == 0 { "❯ " } else { "  " };
+    let input = ellipsize(&format!("{prompt}{line}"), width);
+    let cursor_col = (2 + line.chars().take(input_col).count()).min(width.saturating_sub(1));
+
+    let mut lines = Vec::with_capacity(terminal_rows);
+    if terminal_rows >= 2 {
+        lines.push("─".repeat(width));
+    }
+    let cursor_row = lines.len();
+    lines.push(input);
+    if terminal_rows >= 3 {
+        lines.push(ellipsize(status.lines().next().unwrap_or(""), width));
+    }
+    TinyLiveFrame {
+        lines,
+        cursor_row,
+        cursor_col,
+    }
+}
+
+fn write_tiny_live_frame(out: &mut impl Write, frame: &TinyLiveFrame) -> Result<usize> {
+    // Dialogs hide the terminal cursor. The tiny path can be the first frame
+    // after a dialog closes, so it must restore visibility just like the
+    // normal editable-input renderer.
+    execute!(out, cursor::Show)?;
+    for (index, line) in frame.lines.iter().enumerate() {
+        execute!(out, Print(line))?;
+        if index + 1 < frame.lines.len() {
+            execute!(out, Print("\r\n"))?;
+        }
+    }
+    let rows_below = frame
+        .lines
+        .len()
+        .saturating_sub(frame.cursor_row.saturating_add(1));
+    if rows_below > 0 {
+        execute!(out, cursor::MoveUp(rows_below as u16))?;
+    }
+    execute!(out, cursor::MoveToColumn(frame.cursor_col as u16))?;
+    Ok(frame.lines.len())
+}
+
+fn plan_live_content_frame(
+    autocomplete: &mut AutocompleteState,
+    terminal_rows: usize,
+    terminal_width: usize,
+    fixed_rows: usize,
+    all_live_lines: &[String],
+    critical_ui_active: bool,
+) -> LiveContentFrame {
+    let completion_budget = completion_row_budget(
+        terminal_rows,
+        fixed_rows,
+        !all_live_lines.is_empty(),
+        autocomplete.visible,
+        critical_ui_active,
+    );
+    let completion_lines = completion_pane_lines(autocomplete, terminal_width, completion_budget);
+    let live_budget = live_message_row_budget(terminal_rows, fixed_rows + completion_lines.len());
+    let live_lines = if all_live_lines.is_empty() {
+        Vec::new()
+    } else {
+        live_viewport_lines(all_live_lines, terminal_width, live_budget).0
+    };
+    LiveContentFrame {
+        live_lines,
+        completion_lines,
+    }
 }
 
 // ─── Poset panel view mode ─────────────────────────────────────────────────────
@@ -966,7 +1297,7 @@ impl TuiRenderer {
 
     pub fn create_clean_textarea_with_text(text: &str) -> TextArea<'static> {
         let mut ta = Self::create_clean_textarea();
-        for (i, line) in text.lines().enumerate() {
+        for (i, line) in text.split('\n').enumerate() {
             if i > 0 {
                 ta.insert_newline();
             }
@@ -1008,28 +1339,14 @@ impl TuiRenderer {
         let mut stdout = io::stdout();
         // Begin the synchronized update here so erase + draw are one atomic
         // terminal operation — eliminates the blank-flash between them.
-        execute!(stdout, BeginSynchronizedUpdate)?;
-        if self.active_rows == 0 && self.cursor_row_from_top == 0 {
-            return Ok(()); // Nothing to erase; sync block closed by draw_live_area
-        }
-        execute!(stdout, cursor::MoveToColumn(0))?;
-        if self.cursor_row_from_top > 0 {
-            execute!(stdout, cursor::MoveUp(self.cursor_row_from_top as u16))?;
-        }
         // Never clear from the cursor to the bottom of the terminal here. A
         // one-row accounting error (especially around a wrapping streamed
         // program) would then erase committed scrollback above the live area.
         // Clear only the rows this renderer previously owned. If accounting is
         // ever short, a stale live row is recoverable; lost transcript is not.
-        for row in 0..self.active_rows {
-            execute!(stdout, Clear(ClearType::CurrentLine))?;
-            if row + 1 < self.active_rows {
-                execute!(stdout, cursor::MoveDown(1), cursor::MoveToColumn(0))?;
-            }
-        }
-        if self.active_rows > 1 {
-            execute!(stdout, cursor::MoveUp((self.active_rows - 1) as u16))?;
-            execute!(stdout, cursor::MoveToColumn(0))?;
+        write_live_area_erase(&mut stdout, self.active_rows, self.cursor_row_from_top)?;
+        if self.active_rows == 0 && self.cursor_row_from_top == 0 {
+            return Ok(()); // Sync block is closed by the following draw.
         }
         self.active_rows = 0;
         self.cursor_row_from_top = 0;
@@ -1059,35 +1376,70 @@ impl TuiRenderer {
             &current_input,
             &self.command_registry,
         );
+        if term_h <= 3 && self.active_dialog.is_none() {
+            completion_pane_lines(&mut self.autocomplete_state, term_width, 0);
+            let frame = plan_tiny_live_frame(
+                &input_lines,
+                self.input_textarea.cursor(),
+                &effective_status,
+                term_h,
+                term_width,
+            );
+            let rows = write_tiny_live_frame(&mut stdout, &frame)?;
+            execute!(stdout, EndSynchronizedUpdate)?;
+            stdout.flush()?;
+            self.active_rows = rows;
+            self.cursor_row_from_top = frame.cursor_row;
+            return Ok(());
+        }
         let todo_rows = self
             .todo_list
             .as_ref()
             .and_then(|todo| todo.try_read().ok().map(|todo| todo.active_items().len()))
             .unwrap_or(0);
-        let status_rows = 1
-            + effective_status
-                .lines()
-                .map(|line| shadow_buffer::physical_rows(line, term_width))
-                .sum::<usize>();
-        let reserved_rows = 1 // upper separator
-            + input_physical_rows(&input_lines, term_width)
-            + status_rows
-            + todo_rows
-            + self.agent_tasks.len();
-        let max_live_rows = live_message_row_budget(term_h, reserved_rows);
+        let status_rows = 1 + effective_status
+            .lines()
+            .map(|line| shadow_buffer::physical_rows(line, term_width))
+            .sum::<usize>();
+        let input_rows = input_line_physical_rows_with_ghost(
+            &input_lines,
+            term_width,
+            self.ghost_text.as_deref(),
+        )
+        .into_iter()
+        .sum::<usize>();
+        let dialog_active = self.active_dialog.is_some();
+        let base_reserved_rows = if dialog_active {
+            // A critical dialog owns the viewport. Streaming, tasks, draft,
+            // status, and completion remain retained in structured state but
+            // cannot compete with the bounded approval/error surface.
+            term_h
+        } else {
+            1 // upper separator
+                + input_rows
+                + status_rows
+                + todo_rows
+                + self.agent_tasks.len()
+        };
         let live_messages = self.find_live_messages();
-        if !live_messages.is_empty() {
+        let mut all_live_lines = Vec::new();
+        for message in live_messages {
+            all_live_lines.extend(message.format(&self.colors).split('\n').map(str::to_owned));
+        }
+        let content_frame = plan_live_content_frame(
+            &mut self.autocomplete_state,
+            term_h,
+            term_width,
+            base_reserved_rows,
+            &all_live_lines,
+            dialog_active || self.last_render_error.is_some(),
+        );
+        if !content_frame.live_lines.is_empty() {
             // A Brain can have more than one live work unit (for example a
             // streamed VM program alongside a child task or output handle).
             // Rendering only the newest one made earlier source appear, then
             // vanish on the next redraw. Keep the uncommitted suffix ordered.
-            let mut all_lines = Vec::new();
-            for message in live_messages {
-                all_lines.extend(message.format(&self.colors).split('\n').map(str::to_owned));
-            }
-            let (visible_lines, _) =
-                live_viewport_lines(&all_lines, term_width, max_live_rows);
-            for line in &visible_lines {
+            for line in &content_frame.live_lines {
                 let line = line.trim_end_matches('\r');
                 execute!(stdout, Print(line), Print("\r\n"))?;
                 rows += shadow_buffer::physical_rows(line, term_width);
@@ -1095,39 +1447,45 @@ impl TuiRenderer {
         }
 
         // ── 1b. Session task list (active items only) ─────────────────────────
-        if let Some(ref todo_arc) = self.todo_list {
-            if let Ok(todo) = todo_arc.try_read() {
-                let active = todo.active_items();
-                if !active.is_empty() {
-                    let term_w = term_width;
-                    for item in &active {
-                        let (symbol, color) = match item.status {
-                            crate::tools::todo::TodoStatus::InProgress => ("●", CYAN),
-                            crate::tools::todo::TodoStatus::Pending => ("○", DIM_GRAY),
-                            crate::tools::todo::TodoStatus::Completed => unreachable!(),
-                        };
-                        let priority_tag = match item.priority {
-                            crate::tools::todo::TodoPriority::High => " [!]",
-                            _ => "",
-                        };
-                        // Truncate: "● " prefix (2 chars) + optional " [!]" suffix
-                        let max_content = term_w.saturating_sub(2 + priority_tag.len());
-                        let content: String = item.content.chars().take(max_content).collect();
-                        execute!(
-                            stdout,
-                            Print(format!(
-                                "{}{} {}{}{}\r\n",
-                                color, symbol, content, priority_tag, RESET
-                            ))
-                        )?;
-                        rows += shadow_buffer::physical_rows(&content, term_w);
+        if !dialog_active {
+            if let Some(ref todo_arc) = self.todo_list {
+                if let Ok(todo) = todo_arc.try_read() {
+                    let active = todo.active_items();
+                    if !active.is_empty() {
+                        let term_w = term_width;
+                        for item in &active {
+                            let (symbol, color) = match item.status {
+                                crate::tools::todo::TodoStatus::InProgress => ("●", CYAN),
+                                crate::tools::todo::TodoStatus::Pending => ("○", DIM_GRAY),
+                                crate::tools::todo::TodoStatus::Completed => unreachable!(),
+                            };
+                            let priority_tag = match item.priority {
+                                crate::tools::todo::TodoPriority::High => " [!]",
+                                _ => "",
+                            };
+                            // Truncate: "● " prefix (2 chars) + optional " [!]" suffix
+                            let max_content = term_w.saturating_sub(2 + priority_tag.len());
+                            let content: String = item.content.chars().take(max_content).collect();
+                            execute!(
+                                stdout,
+                                Print(format!(
+                                    "{}{} {}{}{}\r\n",
+                                    color, symbol, content, priority_tag, RESET
+                                ))
+                            )?;
+                            rows += shadow_buffer::physical_rows(&content, term_w);
+                        }
                     }
                 }
             }
         }
 
         // ── 1c. Child-agent task tree ─────────────────────────────────────────
-        let mut agent_tasks = self.agent_tasks.values().collect::<Vec<_>>();
+        let mut agent_tasks = if dialog_active {
+            Vec::new()
+        } else {
+            self.agent_tasks.values().collect::<Vec<_>>()
+        };
         agent_tasks.sort_by_key(|task| (task.identity.depth, task.identity.task_id));
         for task in agent_tasks {
             let indent = "  ".repeat(task.identity.depth);
@@ -1186,11 +1544,13 @@ impl TuiRenderer {
             .filter(|label| !label.is_empty())
             .unwrap_or_else(|| self.session_label.clone());
         let separator = session_separator_line(term_width, &cwd_label, &session_label);
-        execute!(
-            stdout,
-            Print(format!("{}{}{}\r\n", DIM_GRAY, separator, RESET))
-        )?;
-        rows += 1;
+        if rows < term_h {
+            execute!(
+                stdout,
+                Print(format!("{}{}{}\r\n", DIM_GRAY, separator, RESET))
+            )?;
+            rows += 1;
+        }
 
         // ── 3. Dialog or input ────────────────────────────────────────────────
         let cursor_row_from_top;
@@ -1199,7 +1559,12 @@ impl TuiRenderer {
             // visible after its final `\r\n` produces a stray black cursor cell
             // on the row below the modal on dark terminals.
             execute!(stdout, cursor::Hide)?;
-            let dialog_rows = Self::draw_dialog_inline_static(&mut stdout, dialog)?;
+            let dialog_rows = Self::draw_dialog_inline_bounded(
+                &mut stdout,
+                dialog,
+                term_width,
+                term_h.saturating_sub(rows),
+            )?;
             rows += dialog_rows;
             // Dialog drawing ends each line with \r\n, so the cursor is one row
             // PAST the last drawn row (at row `rows`, 0-indexed from the start of
@@ -1224,7 +1589,8 @@ impl TuiRenderer {
             let rows_before_input = rows;
 
             // Track physical terminal rows consumed by each input line (accounts for wrapping).
-            let input_phys_rows = input_line_physical_rows(&lines, term_width);
+            let input_phys_rows =
+                input_line_physical_rows_with_ghost(&lines, term_width, self.ghost_text.as_deref());
 
             if lines.is_empty() {
                 execute!(stdout, Print(&prompt))?;
@@ -1238,7 +1604,6 @@ impl TuiRenderer {
                     if i < lines.len() - 1 {
                         execute!(stdout, Print("\r\n"))?;
                     }
-
                 }
             }
 
@@ -1250,6 +1615,12 @@ impl TuiRenderer {
                 execute!(stdout, Print(format!("{}{}{}", DIM_GRAY, ghost, RESET)))?;
                 // ghost text is on the same row as the last input line — no extra row
             }
+
+            // ── 4c. Slash-command completion pane ────────────────────────────
+            // Plain text is deliberate: the raw/no-color path remains fully
+            // speakable, and every line is width-bounded before it reaches the
+            // terminal so it cannot wrap and corrupt live-row accounting.
+            rows += write_completion_pane(&mut stdout, &content_frame.completion_lines)?;
 
             // ── 5. Status line(s) (smart: command hint > live stats > idle hint)
             //
@@ -1323,7 +1694,8 @@ impl TuiRenderer {
                 input_phys_rows.iter().skip(cursor_row + 1).sum::<usize>()
                     + rows_in_cursor_line_below;
 
-            let rows_below_cursor = input_below_phys + status_phys_rows;
+            let rows_below_cursor =
+                input_below_phys + content_frame.completion_lines.len() + status_phys_rows;
             if rows_below_cursor > 0 {
                 execute!(stdout, cursor::MoveUp(rows_below_cursor as u16))?;
             }
@@ -1502,7 +1874,9 @@ impl TuiRenderer {
                     to_commit.push(msg);
                     self.printed_ids.insert(id);
                 }
-                MessageStatus::InProgress => unreachable!("committable prefix excludes live messages"),
+                MessageStatus::InProgress => {
+                    unreachable!("committable prefix excludes live messages")
+                }
             }
         }
 
@@ -1723,6 +2097,14 @@ impl TuiRenderer {
 
             if event::poll(Duration::from_millis(100))? {
                 match event::read()? {
+                    Event::Key(key)
+                        if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE =>
+                    {
+                        self.handle_tab_key(key);
+                    }
+                    Event::Key(key)
+                        if key.modifiers == KeyModifiers::NONE
+                            && self.handle_completion_key(key.code) => {}
                     Event::Key(key) => match (key.code, key.modifiers) {
                         // Shift+Enter or Alt/Option+Enter: insert newline instead of submit.
                         // Standard VT100 raw mode never sends SHIFT for Enter on macOS —
@@ -1745,17 +2127,6 @@ impl TuiRenderer {
                         }
                         (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             return Ok(None);
-                        }
-                        (KeyCode::Tab, KeyModifiers::NONE) => {
-                            if let Some(ghost) = self.ghost_text.take() {
-                                let current = self.input_textarea.lines().join("\n");
-                                let completed = format!("{}{}", current, ghost);
-                                self.input_textarea =
-                                    Self::create_clean_textarea_with_text(&completed);
-                            } else {
-                                self.input_textarea.input(Event::Key(key));
-                            }
-                            self.update_ghost_text();
                         }
                         _ => {
                             self.input_textarea.input(Event::Key(key));
@@ -1789,17 +2160,33 @@ impl TuiRenderer {
         // relative MoveUp/Clear operations can never reach them. Do not touch
         // the reflowed bytes here. The next render replaces the complete visible
         // screen from retained structured state using absolute coordinates.
-        self.pending_viewport_size = Some((w, h));
-        self.viewport_invalidated = true;
-        self.live_area_dirty = true;
+        apply_viewport_resize(
+            &mut self.autocomplete_state,
+            &mut self.pending_viewport_size,
+            &mut self.viewport_invalidated,
+            &mut self.live_area_dirty,
+            w,
+            h,
+        );
         Ok(())
     }
 
     fn live_geometry(&self, width: u16, height: u16) -> Option<(usize, usize)> {
-        if self.active_dialog.is_some() {
-            // Dialog geometry is computed by its renderer. Keep the last known
-            // dimensions rather than guessing and risking transcript erasure.
-            return None;
+        if let Some(dialog) = self.active_dialog.as_ref() {
+            let terminal_rows = usize::from(height);
+            if terminal_rows == 0 {
+                return Some((0, 0));
+            }
+            let mut sink = Vec::new();
+            let dialog_rows = Self::draw_dialog_inline_bounded(
+                &mut sink,
+                dialog,
+                usize::from(width).max(1),
+                terminal_rows.saturating_sub(1),
+            )
+            .ok()?;
+            let rows = 1 + dialog_rows;
+            return Some((rows, rows));
         }
         let term_width = usize::from(width).max(1);
         let draw_width = term_width;
@@ -1814,36 +2201,55 @@ impl TuiRenderer {
             &input_lines.join("\n"),
             &self.command_registry,
         );
+        if draw_height <= 3 {
+            let frame = plan_tiny_live_frame(
+                &input_lines,
+                self.input_textarea.cursor(),
+                &effective_status,
+                draw_height,
+                draw_width,
+            );
+            return Some((frame.lines.len(), frame.cursor_row));
+        }
         let todo_rows = self
             .todo_list
             .as_ref()
             .and_then(|todo| todo.try_read().ok().map(|todo| todo.active_items().len()))
             .unwrap_or(0);
-        let drawn_status_rows = 1
-            + effective_status
-                .lines()
-                .map(|line| shadow_buffer::physical_rows(line, draw_width))
-                .sum::<usize>();
-        let drawn_input_rows = input_physical_rows(&input_lines, draw_width);
-        let reserved_rows = 1
-            + drawn_input_rows
-            + drawn_status_rows
-            + todo_rows
-            + self.agent_tasks.len();
-        let max_live_rows = live_message_row_budget(draw_height, reserved_rows);
-        let mut rows = 0;
+        let drawn_status_rows = 1 + effective_status
+            .lines()
+            .map(|line| shadow_buffer::physical_rows(line, draw_width))
+            .sum::<usize>();
+        let drawn_input_rows = input_line_physical_rows_with_ghost(
+            &input_lines,
+            draw_width,
+            self.ghost_text.as_deref(),
+        )
+        .into_iter()
+        .sum::<usize>();
+        let base_reserved_rows =
+            1 + drawn_input_rows + drawn_status_rows + todo_rows + self.agent_tasks.len();
         let live_messages = self.find_live_messages();
-        if !live_messages.is_empty() {
-            let mut all_lines = Vec::new();
-            for message in live_messages {
-                all_lines.extend(message.format(&self.colors).split('\n').map(str::to_owned));
-            }
-            let (visible_lines, _) = live_viewport_lines(&all_lines, draw_width, max_live_rows);
-            rows += visible_lines
-                .iter()
-                .map(|line| shadow_buffer::physical_rows(line.trim_end_matches('\r'), term_width))
-                .sum::<usize>();
+        let mut all_live_lines = Vec::new();
+        for message in live_messages {
+            all_live_lines.extend(message.format(&self.colors).split('\n').map(str::to_owned));
         }
+        let mut autocomplete = self.autocomplete_state.clone();
+        let content_frame = plan_live_content_frame(
+            &mut autocomplete,
+            draw_height,
+            draw_width,
+            base_reserved_rows,
+            &all_live_lines,
+            self.last_render_error.is_some(),
+        );
+        let completion_rows = content_frame.completion_lines.len();
+        let mut rows = 0;
+        rows += content_frame
+            .live_lines
+            .iter()
+            .map(|line| shadow_buffer::physical_rows(line.trim_end_matches('\r'), term_width))
+            .sum::<usize>();
 
         if let Some(ref todo_arc) = self.todo_list {
             if let Ok(todo) = todo_arc.try_read() {
@@ -1884,13 +2290,17 @@ impl TuiRenderer {
         let rows_before_input = rows;
 
         let (cursor_row, cursor_col) = self.input_textarea.cursor();
-        let input_phys_rows = input_line_physical_rows(&input_lines, term_width);
+        let input_phys_rows = input_line_physical_rows_with_ghost(
+            &input_lines,
+            term_width,
+            self.ghost_text.as_deref(),
+        );
         let status_rows = shadow_buffer::physical_rows(&"─".repeat(draw_width), term_width)
             + effective_status
                 .lines()
                 .map(|line| shadow_buffer::physical_rows(line, term_width))
                 .sum::<usize>();
-        rows += input_phys_rows.iter().sum::<usize>() + status_rows;
+        rows += input_phys_rows.iter().sum::<usize>() + completion_rows + status_rows;
         let cursor_text_width = input_lines
             .get(cursor_row)
             .map(|line| {
@@ -1963,10 +2373,73 @@ impl TuiRenderer {
 // ─── Ghost text / suggestions ─────────────────────────────────────────────────
 
 impl TuiRenderer {
+    fn sync_ghost_to_selected_completion(&mut self) {
+        self.ghost_text = selected_completion_ghost(
+            self.input_textarea.lines(),
+            self.input_textarea.cursor(),
+            &self.autocomplete_state,
+        );
+    }
+
     pub fn update_ghost_text(&mut self) {
-        let current = self.input_textarea.lines().join("\n");
-        self.ghost_text = compute_ghost_text(&current, &self.command_registry);
+        let (matches, ghost) = command_completion_at_cursor(
+            self.input_textarea.lines(),
+            self.input_textarea.cursor(),
+            &self.command_registry,
+        );
+        if matches.is_empty() {
+            self.autocomplete_state.hide();
+            self.ghost_text = None;
+        } else {
+            self.autocomplete_state.show_matches(matches);
+            self.ghost_text = ghost;
+            self.sync_ghost_to_selected_completion();
+        }
         self.live_area_dirty = true;
+    }
+
+    /// Replace only the command prefix before the cursor. Multiline draft
+    /// content and text after the cursor are retained byte-for-byte.
+    pub(crate) fn accept_selected_completion(&mut self) -> bool {
+        let Some(command) = self.autocomplete_state.get_selected() else {
+            return false;
+        };
+        let command_name = command.name.to_string();
+        if !replace_textarea_command(&mut self.input_textarea, &command_name) {
+            return false;
+        }
+        self.autocomplete_state.hide();
+        self.ghost_text = None;
+        self.live_area_dirty = true;
+        true
+    }
+
+    pub(crate) fn handle_completion_key(&mut self, code: KeyCode) -> bool {
+        if !dispatch_completion_key(
+            &mut self.input_textarea,
+            &mut self.autocomplete_state,
+            &mut self.ghost_text,
+            code,
+        ) {
+            return false;
+        }
+        self.mark_dirty();
+        true
+    }
+
+    pub(crate) fn handle_tab_key(&mut self, key: KeyEvent) -> bool {
+        let modified = route_tab_key(
+            &mut self.input_textarea,
+            &mut self.autocomplete_state,
+            &mut self.ghost_text,
+            key,
+        );
+        if modified {
+            self.update_ghost_text();
+        } else {
+            self.mark_dirty();
+        }
+        modified
     }
 }
 
@@ -2169,7 +2642,10 @@ impl TuiRenderer {
                 let below = total_lines.saturating_sub(offset + content_rows);
                 let indicator = match (above > 0, below > 0) {
                     (true, true) => {
-                        format!("↑ {} above · ↓ {} below  (Ctrl-U/D or PgUp/PgDn)", above, below)
+                        format!(
+                            "↑ {} above · ↓ {} below  (Ctrl-U/D or PgUp/PgDn)",
+                            above, below
+                        )
                     }
                     (true, false) => format!("↑ {} lines above  (Ctrl-U or PgUp)", above),
                     (false, true) => format!("↓ {} lines below  (Ctrl-D or PgDn)", below),
@@ -2373,10 +2849,37 @@ impl TuiRenderer {
 
     fn draw_dialog_inline_static(out: &mut impl io::Write, dialog: &Dialog) -> Result<usize> {
         let term_width = crossterm::terminal::size().unwrap_or((80, 24)).0 as usize;
-        // Borderless dialogs span the full terminal width. Keep a sane floor for
-        // very narrow terminals so wrapping still has room to work.
-        let box_width = term_width.max(20);
+        let box_width = term_width.max(1);
         Self::draw_dialog_inline_static_with_width(out, dialog, box_width)
+    }
+
+    fn draw_dialog_inline_bounded(
+        out: &mut impl io::Write,
+        dialog: &Dialog,
+        width: usize,
+        max_rows: usize,
+    ) -> Result<usize> {
+        if max_rows == 0 {
+            return Ok(0);
+        }
+        let mut rendered = Vec::new();
+        let total_rows =
+            Self::draw_dialog_inline_static_with_width(&mut rendered, dialog, width.max(1))?;
+        if total_rows <= max_rows {
+            out.write_all(&rendered)?;
+            return Ok(total_rows);
+        }
+
+        let retained_rows = max_rows.saturating_sub(1);
+        for line in rendered
+            .split_inclusive(|byte| *byte == b'\n')
+            .take(retained_rows)
+        {
+            out.write_all(line)?;
+        }
+        let marker = ellipsize("… dialog clipped to viewport; use navigation keys …", width);
+        execute!(out, Print(marker), Print("\r\n"))?;
+        Ok(max_rows)
     }
 
     /// Show a blocking dialog (used when no async event loop is running).
@@ -2963,10 +3466,10 @@ mod tests {
     }
 
     #[test]
-    fn live_budget_accounts_for_every_reserved_terminal_row() {
+    fn test_live_budget_accounts_for_every_reserved_terminal_row() {
         assert_eq!(live_message_row_budget(24, 9), 15);
         assert_eq!(live_message_row_budget(24, 23), 1);
-        assert_eq!(live_message_row_budget(24, 30), 1);
+        assert_eq!(live_message_row_budget(24, 30), 0);
     }
 
     #[test]
@@ -2991,8 +3494,7 @@ mod tests {
 
     #[test]
     fn session_separator_never_wraps_at_narrow_widths() {
-        let session =
-            "◆ brain: golden-crest-9a83c1@Shammahs-MacBook-Air.local · runner · driver";
+        let session = "◆ brain: golden-crest-9a83c1@Shammahs-MacBook-Air.local · runner · driver";
         for width in 1..160 {
             let line = session_separator_line(width, "~/repos/finch", session);
             assert_eq!(line.chars().count(), width, "width {width}: {line:?}");
@@ -3018,7 +3520,9 @@ mod tests {
 
     #[test]
     fn live_viewport_uses_physical_rows_and_marks_a_clipped_prefix() {
-        let lines = (0..12).map(|index| format!("line {index}")).collect::<Vec<_>>();
+        let lines = (0..12)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>();
         let (visible, omitted) = live_viewport_lines(&lines, 80, 5);
 
         assert_eq!(omitted, 8);
@@ -3102,11 +3606,26 @@ mod tests {
             .expect("paint commands");
 
         let commands = String::from_utf8(bytes).expect("ANSI commands are UTF-8");
-        assert!(commands.contains("\x1b[2J"), "clear visible viewport: {commands:?}");
-        assert!(!commands.contains("\x1b[3J"), "must not purge scrollback: {commands:?}");
-        assert!(commands.contains("\x1b[5;1H"), "transcript row is absolute: {commands:?}");
-        assert!(commands.contains("\x1b[7;1H"), "live row is absolute: {commands:?}");
-        assert!(!commands.contains("\x1b[1A"), "must not repair with MoveUp: {commands:?}");
+        assert!(
+            commands.contains("\x1b[2J"),
+            "clear visible viewport: {commands:?}"
+        );
+        assert!(
+            !commands.contains("\x1b[3J"),
+            "must not purge scrollback: {commands:?}"
+        );
+        assert!(
+            commands.contains("\x1b[5;1H"),
+            "transcript row is absolute: {commands:?}"
+        );
+        assert!(
+            commands.contains("\x1b[7;1H"),
+            "live row is absolute: {commands:?}"
+        );
+        assert!(
+            !commands.contains("\x1b[1A"),
+            "must not repair with MoveUp: {commands:?}"
+        );
     }
 
     #[test]
@@ -3321,12 +3840,10 @@ mod tests {
     }
 
     #[test]
-    fn status_ghost_takes_priority_over_raw_status() {
+    fn test_critical_or_operational_status_takes_priority_over_command_help() {
         let reg = CommandRegistry::new();
-        // Even with raw_status set, ghost text description wins
         let s = compute_effective_status(Some("tical"), "⏺ Generating…", "/cri", &reg);
-        // Should NOT be the raw status — should be the command description
-        assert_ne!(s, "⏺ Generating…", "ghost description should win: {}", s);
+        assert_eq!(s, "⏺ Generating…");
     }
 
     #[test]
@@ -3337,6 +3854,438 @@ mod tests {
         let s = compute_effective_status(Some("xyz"), "⏺ Live stat", "/zzz", &reg);
         // Falls back to raw status since description is empty
         assert_eq!(s, "⏺ Live stat");
+    }
+
+    #[test]
+    fn test_completion_frame_keeps_large_stream_clipped_and_uses_free_rows() {
+        let registry = CommandRegistry::new();
+        let mut autocomplete = AutocompleteState::new();
+        autocomplete.show_matches(registry.match_prefix("/brain "));
+        assert!(autocomplete.matches.len() >= 8);
+
+        let draft = vec![
+            "/brain ".to_string(),
+            "keep this multiline draft".to_string(),
+            "and preserve its cursor".to_string(),
+        ];
+        let terminal_rows = 60;
+        let terminal_width = 120;
+        let fixed_rows = 1 + input_physical_rows(&draft, terminal_width) + 2;
+        let stream = (0..1_050)
+            .map(|row| format!("live Brain row {row}"))
+            .collect::<Vec<_>>();
+        let frame = plan_live_content_frame(
+            &mut autocomplete,
+            terminal_rows,
+            terminal_width,
+            fixed_rows,
+            &stream,
+            false,
+        );
+
+        assert_eq!(
+            frame.completion_lines.len(),
+            9,
+            "heading plus eight matches"
+        );
+        assert!(frame.live_lines[0].contains("earlier live rows clipped"));
+        assert!(
+            fixed_rows + frame.completion_lines.len() + frame.live_lines.len() <= terminal_rows
+        );
+        assert!(frame
+            .completion_lines
+            .iter()
+            .any(|line| line.contains("/brain list")));
+    }
+
+    #[test]
+    fn test_multiline_command_draft_has_matches_but_no_misplaced_ghost() {
+        let registry = CommandRegistry::new();
+        let lines = vec![
+            "/bra".to_string(),
+            "a second line that nearly fills the terminal".to_string(),
+        ];
+
+        let (matches, ghost) = command_completion_at_cursor(&lines, (0, 4), &registry);
+
+        assert!(matches.iter().any(|command| command.name == "/brain list"));
+        assert_eq!(
+            ghost, None,
+            "a row-zero ghost must not be emitted after the last line"
+        );
+        assert_eq!(input_physical_rows(&lines, 48), 2);
+    }
+
+    #[test]
+    fn test_production_accept_restores_multiline_textarea_cursor_exactly() {
+        use tui_textarea::CursorMove;
+
+        let mut textarea = TuiRenderer::create_clean_textarea_with_text(
+            "/bra --later\nkeep this draft\nand this too",
+        );
+        textarea.move_cursor(CursorMove::Top);
+        if textarea.cursor().1 > 0 {
+            textarea.move_cursor(CursorMove::Head);
+        }
+        for _ in 0..4 {
+            textarea.move_cursor(CursorMove::Forward);
+        }
+
+        assert!(replace_textarea_command(&mut textarea, "/brain list"));
+        assert_eq!(
+            textarea.lines(),
+            ["/brain list --later", "keep this draft", "and this too"]
+        );
+        assert_eq!(textarea.cursor(), (0, "/brain list".chars().count()));
+    }
+
+    #[test]
+    fn test_production_accept_preserves_trailing_blank_draft_lines() {
+        use tui_textarea::CursorMove;
+
+        let mut textarea = TuiRenderer::create_clean_textarea_with_text("/bra --later\n\n");
+        textarea.move_cursor(CursorMove::Top);
+        if textarea.cursor().1 > 0 {
+            textarea.move_cursor(CursorMove::Head);
+        }
+        for _ in 0..4 {
+            textarea.move_cursor(CursorMove::Forward);
+        }
+
+        assert!(replace_textarea_command(&mut textarea, "/brain list"));
+        assert_eq!(textarea.lines(), ["/brain list --later", "", ""]);
+        assert_eq!(textarea.cursor(), (0, "/brain list".chars().count()));
+    }
+
+    #[test]
+    fn test_cursor_middle_draft_has_no_misplaced_ghost() {
+        let registry = CommandRegistry::new();
+        let lines = vec!["/heXYZ".to_string()];
+
+        let (matches, ghost) = command_completion_at_cursor(&lines, (0, 3), &registry);
+
+        assert!(matches.iter().any(|command| command.name == "/help"));
+        assert_eq!(ghost, None);
+    }
+
+    #[test]
+    fn test_initial_input_loop_tab_preserves_hidden_cursor_middle_draft() {
+        use tui_textarea::CursorMove;
+
+        let registry = CommandRegistry::new();
+        let mut textarea = TuiRenderer::create_clean_textarea_with_text("/heXYZ");
+        textarea.move_cursor(CursorMove::Head);
+        for _ in 0..3 {
+            textarea.move_cursor(CursorMove::Forward);
+        }
+        let mut autocomplete = AutocompleteState::new();
+        autocomplete.show_matches(registry.match_prefix("/he"));
+        assert!(completion_pane_lines(&mut autocomplete, 80, 0).is_empty());
+        let mut ghost = Some("lp".to_string());
+        let original_lines = textarea.lines().to_vec();
+        let original_cursor = textarea.cursor();
+
+        assert!(!route_tab_key(
+            &mut textarea,
+            &mut autocomplete,
+            &mut ghost,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        ));
+        assert_eq!(textarea.lines(), original_lines);
+        assert_eq!(textarea.cursor(), original_cursor);
+        assert_eq!(ghost, None);
+    }
+
+    #[test]
+    fn test_batched_input_loop_tab_preserves_critical_hidden_completion() {
+        use tui_textarea::CursorMove;
+
+        let registry = CommandRegistry::new();
+        let mut textarea = TuiRenderer::create_clean_textarea_with_text("/bra --suffix\n\n");
+        textarea.move_cursor(CursorMove::Top);
+        textarea.move_cursor(CursorMove::Head);
+        for _ in 0..4 {
+            textarea.move_cursor(CursorMove::Forward);
+        }
+        let mut autocomplete = AutocompleteState::new();
+        autocomplete.show_matches(registry.match_prefix("/bra"));
+        assert!(completion_pane_lines(&mut autocomplete, 80, 0).is_empty());
+        let mut ghost = Some("in list".to_string());
+        let original_lines = textarea.lines().to_vec();
+        let original_cursor = textarea.cursor();
+
+        assert!(!route_tab_key(
+            &mut textarea,
+            &mut autocomplete,
+            &mut ghost,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        ));
+        assert_eq!(textarea.lines(), original_lines);
+        assert_eq!(textarea.cursor(), original_cursor);
+        assert_eq!(ghost, None);
+    }
+
+    #[test]
+    fn test_resize_then_batched_tab_cannot_accept_stale_painted_completion() {
+        use tui_textarea::CursorMove;
+
+        let registry = CommandRegistry::new();
+        let mut textarea = TuiRenderer::create_clean_textarea_with_text("/bra --suffix\n\n");
+        textarea.move_cursor(CursorMove::Top);
+        textarea.move_cursor(CursorMove::Head);
+        for _ in 0..4 {
+            textarea.move_cursor(CursorMove::Forward);
+        }
+        let mut autocomplete = AutocompleteState::new();
+        autocomplete.show_matches(registry.match_prefix("/bra"));
+        completion_pane_lines(&mut autocomplete, 80, 9);
+        assert!(autocomplete.is_interactive());
+        let selected = autocomplete.get_selected().unwrap().name;
+        let mut ghost = Some(selected[4..].to_string());
+        let original_lines = textarea.lines().to_vec();
+        let original_cursor = textarea.cursor();
+        let mut pending = None;
+        let mut invalidated = false;
+        let mut dirty = false;
+
+        apply_viewport_resize(
+            &mut autocomplete,
+            &mut pending,
+            &mut invalidated,
+            &mut dirty,
+            20,
+            2,
+        );
+        assert_eq!(pending, Some((20, 2)));
+        assert!(invalidated && dirty);
+        assert!(!autocomplete.is_interactive());
+        assert!(!route_tab_key(
+            &mut textarea,
+            &mut autocomplete,
+            &mut ghost,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        ));
+        assert_eq!(textarea.lines(), original_lines);
+        assert_eq!(textarea.cursor(), original_cursor);
+        assert_eq!(ghost, None);
+    }
+
+    #[test]
+    fn test_production_dispatch_accepts_case_insensitive_visible_match() {
+        let registry = CommandRegistry::new();
+        let mut textarea = TuiRenderer::create_clean_textarea_with_text("/BRA");
+        let mut autocomplete = AutocompleteState::new();
+        autocomplete.show_matches(registry.match_prefix("/BRA"));
+        completion_pane_lines(&mut autocomplete, 100, 9);
+        let selected = autocomplete.get_selected().unwrap().name.to_string();
+        let mut ghost =
+            selected_completion_ghost(textarea.lines(), textarea.cursor(), &autocomplete);
+
+        assert!(dispatch_completion_key(
+            &mut textarea,
+            &mut autocomplete,
+            &mut ghost,
+            KeyCode::Tab,
+        ));
+        assert_eq!(textarea.lines(), [selected]);
+        assert_eq!(ghost, None);
+        assert!(!autocomplete.visible);
+    }
+
+    #[test]
+    fn test_navigation_ghost_matches_selected_command() {
+        let registry = CommandRegistry::new();
+        let lines = vec!["/brain ".to_string()];
+        let mut autocomplete = AutocompleteState::new();
+        autocomplete.show_matches(registry.match_prefix("/brain "));
+        completion_pane_lines(&mut autocomplete, 100, 9);
+        let first = selected_completion_ghost(&lines, (0, 7), &autocomplete);
+        let mut textarea = TuiRenderer::create_clean_textarea_with_text("/brain ");
+        let mut second = first.clone();
+
+        assert!(dispatch_completion_key(
+            &mut textarea,
+            &mut autocomplete,
+            &mut second,
+            KeyCode::Down,
+        ));
+        let selected = autocomplete.get_selected().unwrap().name;
+
+        assert_ne!(first, second);
+        assert_eq!(format!("/brain {}", second.unwrap()), selected);
+    }
+
+    #[test]
+    fn test_single_line_ghost_wrapping_is_counted_in_live_frame_geometry() {
+        let lines = vec!["/bra".to_string()];
+        let without_ghost = input_line_physical_rows_with_ghost(&lines, 8, None);
+        let with_ghost = input_line_physical_rows_with_ghost(&lines, 8, Some("in archive now"));
+
+        assert_eq!(without_ghost, vec![1]);
+        assert_eq!(with_ghost, vec![3]);
+    }
+
+    #[test]
+    fn test_completion_budget_is_resize_stable_and_yields_to_dialogs_and_errors() {
+        let normal = |height| completion_row_budget(height, 5, true, true, false);
+        assert_eq!(normal(4), 0);
+        assert_eq!(normal(8), 2);
+        assert_eq!(normal(40), 9);
+        assert_eq!(normal(8), 2, "repeated resize returns the same frame");
+        assert_eq!(normal(40), 9, "grow after shrink restores free rows");
+
+        assert_eq!(completion_row_budget(40, 5, true, true, true), 0);
+        assert_eq!(completion_row_budget(40, 5, false, true, true), 0);
+        assert_eq!(completion_row_budget(40, 5, true, false, false), 0);
+    }
+
+    #[test]
+    fn test_one_to_three_row_viewports_never_create_an_invisible_interactive_pane() {
+        let registry = CommandRegistry::new();
+        for height in 1..=3 {
+            let mut autocomplete = AutocompleteState::new();
+            autocomplete.show_matches(registry.match_prefix("/brain "));
+            let frame = plan_live_content_frame(
+                &mut autocomplete,
+                height,
+                20,
+                3,
+                &["stream".to_string()],
+                false,
+            );
+
+            assert!(frame.completion_lines.is_empty(), "height {height}");
+            assert!(frame.live_lines.is_empty(), "height {height}");
+            assert!(
+                frame.completion_lines.len() + frame.live_lines.len() <= height,
+                "height {height}"
+            );
+            assert!(!autocomplete.is_interactive(), "height {height}");
+
+            let tiny = plan_tiny_live_frame(
+                &["/brain keep this draft".to_string()],
+                (0, 7),
+                "critical status that must not wrap",
+                height,
+                12,
+            );
+            let mut output = Vec::new();
+            execute!(output, cursor::Hide).unwrap();
+            let written = write_tiny_live_frame(&mut output, &tiny).unwrap();
+            let raw = String::from_utf8(output).unwrap();
+            assert_eq!(written, height, "height {height}");
+            assert_eq!(tiny.lines.len(), height, "height {height}");
+            assert!(tiny.lines.iter().all(|line| line.chars().count() <= 12));
+            assert_eq!(raw.matches("\r\n").count(), height.saturating_sub(1));
+            assert!(!raw.contains("\x1b[3J"));
+            let hide = raw.find("\x1b[?25l").expect("dialog hid cursor");
+            let show = raw.find("\x1b[?25h").expect("tiny input restored cursor");
+            assert!(hide < show, "height {height}: cursor must be restored");
+        }
+    }
+
+    #[test]
+    fn test_production_dialog_writer_is_viewport_bounded_and_suppresses_stream() {
+        let options = (0..24)
+            .map(|index| DialogOption::new(format!("approval choice {index}")))
+            .collect();
+        let dialog = Dialog::select("Critical approval", options);
+        let mut output = Vec::new();
+
+        let rows = TuiRenderer::draw_dialog_inline_bounded(&mut output, &dialog, 40, 5).unwrap();
+        let raw = String::from_utf8(output).unwrap();
+        assert_eq!(rows, 5);
+        assert_eq!(raw.matches("\r\n").count(), 5);
+        assert!(raw.contains("Critical approval"));
+        assert!(raw.contains("dialog clipped to viewport"));
+        assert!(!raw.contains("\x1b[3J"));
+
+        let mut autocomplete = AutocompleteState::new();
+        autocomplete.show_matches(CommandRegistry::new().match_prefix("/brain "));
+        let live = (0..1_050)
+            .map(|row| format!("stream row {row}"))
+            .collect::<Vec<_>>();
+        let frame = plan_live_content_frame(&mut autocomplete, 6, 40, 6, &live, true);
+        assert!(frame.live_lines.is_empty());
+        assert!(frame.completion_lines.is_empty());
+        assert!(!autocomplete.is_interactive());
+    }
+
+    #[test]
+    fn test_stream_resize_reconnect_and_dialog_repaint_preserve_selection() {
+        let registry = CommandRegistry::new();
+        let mut autocomplete = AutocompleteState::new();
+        autocomplete.show_matches(registry.match_prefix("/brain "));
+        for _ in 0..9 {
+            autocomplete.select_next();
+        }
+        let selected = autocomplete.get_selected().unwrap().full_syntax();
+
+        for (height, width, stream_rows, critical) in [
+            (60, 120, 1_001, false),
+            (18, 32, 1_040, false),
+            (60, 200, 1_080, false),
+            (60, 120, 1_080, true),
+            (60, 120, 1_100, false),
+        ] {
+            let live = (0..stream_rows)
+                .map(|row| format!("rapid stream row {row}"))
+                .collect::<Vec<_>>();
+            let frame =
+                plan_live_content_frame(&mut autocomplete, height, width, 5, &live, critical);
+            assert_eq!(autocomplete.get_selected().unwrap().full_syntax(), selected);
+            assert!(frame.live_lines.first().unwrap().contains("clipped"));
+            if critical {
+                assert!(frame.completion_lines.is_empty());
+                assert!(!autocomplete.is_interactive());
+            } else {
+                assert!(frame
+                    .completion_lines
+                    .iter()
+                    .any(|line| line.contains(&format!("> {selected}"))));
+                assert!(autocomplete.is_interactive());
+            }
+        }
+    }
+
+    #[test]
+    fn test_production_raw_completion_writer_is_plain_live_region_output() {
+        let registry = CommandRegistry::new();
+        let mut autocomplete = AutocompleteState::new();
+        autocomplete.show_matches(registry.match_prefix("/brain list"));
+        let lines = completion_pane_lines(&mut autocomplete, 100, 9);
+        let mut output = Vec::new();
+
+        let rows = write_completion_pane(&mut output, &lines).unwrap();
+
+        let raw = String::from_utf8(output).unwrap();
+        assert_eq!(rows, lines.len());
+        assert!(raw.contains("\r\nCommands 1-1 of 1"));
+        assert!(raw.contains("\r\n> /brain list - List named Brain sessions"));
+        assert!(
+            !raw.contains('\x1b'),
+            "no-color output must contain no ANSI"
+        );
+        assert!(!raw.contains("\x1b[3J"), "must not clear native scrollback");
+        assert!(
+            !raw.contains("\n\n"),
+            "must not emit committed-message spacing"
+        );
+    }
+
+    #[test]
+    fn test_production_live_erase_removes_every_owned_completion_row_only() {
+        let mut output = Vec::new();
+
+        write_live_area_erase(&mut output, 17, 6).unwrap();
+
+        let raw = String::from_utf8(output).unwrap();
+        assert_eq!(raw.matches("\x1b[2K").count(), 17);
+        assert!(!raw.contains("\x1b[3J"), "must preserve native scrollback");
+        assert!(
+            !raw.contains("\x1b[J"),
+            "must not clear below the owned frame"
+        );
     }
 
     #[test]

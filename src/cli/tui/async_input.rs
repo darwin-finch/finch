@@ -81,6 +81,15 @@ fn should_accept_key_event(key: &KeyEvent) -> bool {
     }
 }
 
+fn dialog_owns_key(has_dialog: bool, key: &KeyEvent, input: &str) -> bool {
+    has_dialog
+        && !(key.code == KeyCode::Enter
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+            && !input.trim().is_empty())
+}
+
 /// Encode a Cap'n Proto `ControlMessage { quit }` into bytes.
 ///
 /// Used to send a quit signal through the out-of-band quit channel.
@@ -169,13 +178,11 @@ pub fn spawn_input_task(
                             // dismissed with Cancelled so the brain gets "[no answer]" and
                             // the user's input is not blocked.  Tool-approval dialogs still
                             // block submission because the input is empty while they are open.
-                            else if tui.active_dialog.is_some()
-                                && !(key.code == KeyCode::Enter
-                                    && !key
-                                        .modifiers
-                                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
-                                    && !tui.input_textarea.lines().join("").trim().is_empty())
-                            {
+                            else if dialog_owns_key(
+                                tui.active_dialog.is_some(),
+                                &key,
+                                &tui.input_textarea.lines().join(""),
+                            ) {
                                 let dialog_result = if let Some(dialog) = tui.active_dialog.as_mut()
                                 {
                                     dialog.handle_key_event(key)
@@ -193,6 +200,20 @@ pub fn spawn_input_task(
                                 first_event_modified_input = true;
 
                                 Ok(None) // Don't submit input while dialog is active
+                            } else if key.code == KeyCode::Tab
+                                && key.modifiers == KeyModifiers::NONE
+                            {
+                                if tui.handle_tab_key(key) {
+                                    first_event_modified_input = true;
+                                } else {
+                                    first_event_needs_render = true;
+                                }
+                                Ok(None)
+                            } else if key.modifiers == KeyModifiers::NONE
+                                && tui.handle_completion_key(key.code)
+                            {
+                                first_event_needs_render = true;
+                                Ok(None)
                             } else if key.code == KeyCode::Enter {
                                 // Check if Shift or Alt is held (inserts newline, Enter submits).
                                 // Standard VT100 raw mode never sets SHIFT for Enter on macOS
@@ -418,24 +439,6 @@ pub fn spawn_input_task(
                                         }
                                         Ok(None)
                                     }
-                                    (KeyCode::Tab, KeyModifiers::NONE) => {
-                                        // Tab: Accept ghost text suggestion if available
-                                        if let Some(ghost) = tui.ghost_text.take() {
-                                            // Append ghost text to current input
-                                            let current = tui.input_textarea.lines().join("\n");
-                                            let completed = format!("{}{}", current, ghost);
-                                            tui.input_textarea =
-                                                TuiRenderer::create_clean_textarea_with_text(
-                                                    &completed,
-                                                );
-                                            first_event_modified_input = true;
-                                        } else {
-                                            // No ghost text - pass Tab to textarea (insert tab char)
-                                            tui.input_textarea.input(Event::Key(key));
-                                            first_event_modified_input = true;
-                                        }
-                                        Ok(None)
-                                    }
                                     _ => {
                                         // Pass key event to textarea (with sanitization)
                                         if should_accept_key_event(&key) {
@@ -491,10 +494,48 @@ pub fn spawn_input_task(
                     let mut had_input = first_event_modified_input;
                     let mut needs_render = first_event_needs_render;
                     let mut batch_submit: Option<String> = None;
+                    if first_event_modified_input {
+                        // Do not let later keys in the same terminal batch act
+                        // on matches for the pre-edit draft.
+                        tui.update_ghost_text();
+                    }
                     while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
                         match crossterm::event::read() {
                             Ok(Event::Key(key)) => {
-                                if key.code == KeyCode::Enter {
+                                let dialog_owns_key = dialog_owns_key(
+                                    tui.active_dialog.is_some(),
+                                    &key,
+                                    &tui.input_textarea.lines().join(""),
+                                );
+                                if dialog_owns_key {
+                                    let result = tui
+                                        .active_dialog
+                                        .as_mut()
+                                        .and_then(|dialog| dialog.handle_key_event(key));
+                                    if let Some(result) = result {
+                                        tui.active_dialog = None;
+                                        tui.pending_dialog_result = Some(result);
+                                    }
+                                    tui.mark_dirty();
+                                    needs_render = true;
+                                    continue;
+                                }
+                                if tui.active_dialog.is_some() {
+                                    tui.active_dialog = None;
+                                    tui.pending_dialog_result =
+                                        Some(crate::cli::tui::DialogResult::Cancelled);
+                                }
+
+                                if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
+                                    if tui.handle_tab_key(key) {
+                                        had_input = true;
+                                    }
+                                    needs_render = true;
+                                } else if key.modifiers == KeyModifiers::NONE
+                                    && tui.handle_completion_key(key.code)
+                                {
+                                    needs_render = true;
+                                } else if key.code == KeyCode::Enter {
                                     if key
                                         .modifiers
                                         .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
@@ -502,6 +543,7 @@ pub fn spawn_input_task(
                                         // Shift/Alt+Enter in batch: insert newline
                                         tui.input_textarea.input(Event::Key(key));
                                         had_input = true;
+                                        tui.update_ghost_text();
                                     } else {
                                         // Plain Enter: collect submission and stop draining.
                                         let input = tui.input_textarea.lines().join("\n");
@@ -519,6 +561,7 @@ pub fn spawn_input_task(
                                 } else if should_accept_key_event(&key) {
                                     tui.input_textarea.input(Event::Key(key));
                                     had_input = true;
+                                    tui.update_ghost_text();
                                 }
                             }
                             Ok(Event::Resize(w, h)) => {
@@ -776,6 +819,16 @@ mod tests {
         // A key event carrying a private-use-area character should be rejected
         let event = key(KeyCode::Char('\u{E000}'));
         assert!(!should_accept_key_event(&event));
+    }
+
+    #[test]
+    fn test_active_dialog_owns_batched_completion_keys() {
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Tab, KeyCode::Esc] {
+            assert!(dialog_owns_key(true, &key(code), "/brain "));
+        }
+        assert!(!dialog_owns_key(false, &key(KeyCode::Tab), "/brain "));
+        assert!(dialog_owns_key(true, &key(KeyCode::Enter), ""));
+        assert!(!dialog_owns_key(true, &key(KeyCode::Enter), "draft"));
     }
 
     #[test]

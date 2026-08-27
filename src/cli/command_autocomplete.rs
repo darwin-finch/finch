@@ -435,12 +435,44 @@ impl CommandRegistry {
         }
 
         let prefix_lower = prefix.to_lowercase();
-
-        self.commands
+        let direct = self
+            .commands
             .iter()
             .filter(|cmd| cmd.name.to_lowercase().starts_with(&prefix_lower))
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        if !direct.is_empty() {
+            return direct;
+        }
+
+        // Once arguments begin, keep the longest matching command visible so
+        // its parameter syntax and description remain contextual. A longer
+        // subcommand prefix always wins through the direct-match path above.
+        let command_len = self
+            .commands
+            .iter()
+            .filter(|command| {
+                let name = command.name.to_lowercase();
+                prefix_lower.starts_with(&format!("{name} "))
+            })
+            .map(|command| command.name.len())
+            .max();
+        let Some(command_len) = command_len else {
+            return Vec::new();
+        };
+        let mut contextual = self
+            .commands
+            .iter()
+            .filter(|command| {
+                command.name.len() == command_len
+                    && prefix_lower.starts_with(&format!("{} ", command.name.to_lowercase()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if contextual.iter().any(|command| command.params.is_some()) {
+            contextual.retain(|command| command.params.is_some());
+        }
+        contextual
     }
 
     /// Get all commands in a category
@@ -488,6 +520,33 @@ mod tests {
         let matches = registry.match_prefix("/mcp");
         assert!(matches.iter().any(|cmd| cmd.name == "/mcp"));
         assert!(matches.iter().any(|cmd| cmd.name == "/mcp list"));
+    }
+
+    #[test]
+    fn test_match_prefix_keeps_context_for_command_arguments() {
+        let registry = CommandRegistry::new();
+
+        let matches = registry.match_prefix("/brain archive old-session");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "/brain archive");
+        assert_eq!(matches[0].params, Some("<name>"));
+
+        let exact_with_space = registry.match_prefix("/brain list ");
+        assert_eq!(exact_with_space.len(), 1);
+        assert_eq!(exact_with_space[0].name, "/brain list");
+    }
+
+    #[test]
+    fn test_match_prefix_prefers_a_matching_nested_subcommand_over_parent_arguments() {
+        let registry = CommandRegistry::new();
+        let matches = registry.match_prefix("/brain handoff c");
+
+        assert!(matches
+            .iter()
+            .all(|command| command.name.starts_with("/brain handoff c")));
+        assert!(matches
+            .iter()
+            .any(|command| command.name == "/brain handoff cancel"));
     }
 
     #[test]
