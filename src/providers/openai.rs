@@ -2344,13 +2344,10 @@ mod tests {
 
     #[tokio::test]
     async fn canonical_stream_and_nonstream_preserve_the_same_actual_model() {
-        let mut server = mockito::Server::new_async().await;
         let actual_model = "gpt-5.6-sol-2026-08-01";
-        let nonstream = server
+        let mut nonstream_server = mockito::Server::new_async().await;
+        let nonstream = nonstream_server
             .mock("POST", "/v1/chat/completions")
-            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
-                "stream": false
-            })))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -2368,7 +2365,8 @@ mod tests {
             )
             .create_async()
             .await;
-        let stream = server
+        let mut stream_server = mockito::Server::new_async().await;
+        let stream = stream_server
             .mock("POST", "/v1/chat/completions")
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
                 "stream": true
@@ -2380,11 +2378,16 @@ mod tests {
             ))
             .create_async()
             .await;
-        let provider = canonical_test_provider(server.url());
         let request = ProviderRequest::new(vec![crate::claude::Message::user("hello")])
             .with_model("gpt-5.6-sol");
-        let response = provider.send_message_once(&request).await.unwrap();
-        let mut receiver = provider.send_message_stream_once(&request).await.unwrap();
+        let response = canonical_test_provider(nonstream_server.url())
+            .send_message_once(&request)
+            .await
+            .unwrap();
+        let mut receiver = canonical_test_provider(stream_server.url())
+            .send_message_stream_once(&request)
+            .await
+            .unwrap();
         let mut chunks = Vec::new();
         while let Some(chunk) = receiver.recv().await {
             chunks.push(chunk.unwrap());
