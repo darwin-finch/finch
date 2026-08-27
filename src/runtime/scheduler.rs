@@ -219,7 +219,7 @@ impl ProviderResolver {
                 ),
             ));
         }
-        let provider = if let Some(config) = &self.config {
+        let provider: Arc<dyn crate::providers::LlmProvider> = if let Some(config) = &self.config {
             crate::providers::create_provider_profile_from_config(config, &entry.profile_name())?
         } else {
             Arc::from(crate::providers::create_provider_from_entry(entry)?)

@@ -856,8 +856,9 @@ mod tests {
         let resolver = CountingResolver {
             calls: AtomicUsize::new(0),
         };
-        let error =
-            create_provider_graph_from_config_with_resolver(&config, &resolver).unwrap_err();
+        let error = create_provider_graph_from_config_with_resolver(&config, &resolver)
+            .err()
+            .unwrap();
         assert!(format!("{error:#}").contains("authenticated endpoint origin mismatch"));
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
     }
@@ -866,8 +867,9 @@ mod tests {
     fn test_resolver_errors_are_sanitized_at_factory_boundary() {
         let config = Config::with_providers(vec![named_openai("primary", "work", "gpt-4o")])
             .with_credentials(vec![named_openai_credential("work", "account-1")]);
-        let error =
-            create_provider_graph_from_config_with_resolver(&config, &LeakyResolver).unwrap_err();
+        let error = create_provider_graph_from_config_with_resolver(&config, &LeakyResolver)
+            .err()
+            .unwrap();
         let displayed = format!("{error:#}");
         assert!(!displayed.contains("sentinel-secret"));
         assert!(displayed.contains("Failed to resolve named credential 'work'"));
@@ -905,6 +907,46 @@ mod tests {
             .unwrap();
         assert!(format!("{error:#}").contains("missing credential 'missing'"));
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_revoke_reports_all_dependents_and_invalidates_complete_graph() {
+        let mut config = Config::with_providers(vec![
+            named_openai("primary", "work", "gpt-4o"),
+            named_openai("tools", "work", "gpt-5.6-sol"),
+        ])
+        .with_credentials(vec![named_openai_credential("work", "account-1")]);
+        assert_eq!(
+            config.revoke_credential("work").unwrap(),
+            vec!["primary", "tools"]
+        );
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let error = create_provider_graph_from_config_with_resolver(&config, &resolver)
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("revoked"));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_duplicate_profile_names_cannot_ambiguously_select_accounts() {
+        let mut second = named_openai("WORK", "account-two", "gpt-5.6-sol");
+        if let ProviderEntry::Credentialed { credential, .. } = &mut second {
+            credential.account = Some("account-2".into());
+        }
+        let config =
+            Config::with_providers(vec![named_openai("work", "account-one", "gpt-4o"), second])
+                .with_credentials(vec![
+                    named_openai_credential("account-one", "account-1"),
+                    named_openai_credential("account-two", "account-2"),
+                ]);
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate provider profile name"));
     }
 
     #[test]

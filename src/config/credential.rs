@@ -547,39 +547,43 @@ mod tests {
 
     #[test]
     fn test_provider_kind_audience_matrix() {
-        let cases = [
-            (CredentialProvider::Anthropic, CredentialKind::ApiKey, true),
-            (
-                CredentialProvider::OpenaiPlatform,
-                CredentialKind::ApiKey,
-                true,
-            ),
-            (
-                CredentialProvider::ChatgptSubscription,
-                CredentialKind::OauthDevice,
-                true,
-            ),
-            (CredentialProvider::Xai, CredentialKind::Bearer, false),
-            (
-                CredentialProvider::GeminiAiStudio,
-                CredentialKind::OauthDevice,
-                false,
-            ),
-            (
-                CredentialProvider::GoogleVertex,
-                CredentialKind::CloudIdentity,
-                true,
-            ),
-            (CredentialProvider::Mistral, CredentialKind::ApiKey, true),
-            (CredentialProvider::Groq, CredentialKind::LocalSocket, false),
+        let providers = [
+            CredentialProvider::Anthropic,
+            CredentialProvider::OpenaiPlatform,
+            CredentialProvider::ChatgptSubscription,
+            CredentialProvider::Xai,
+            CredentialProvider::GeminiAiStudio,
+            CredentialProvider::GoogleVertex,
+            CredentialProvider::Mistral,
+            CredentialProvider::Groq,
         ];
-        for (provider, kind, accepted) in cases {
-            let credential = credential(provider, kind);
-            assert_eq!(
-                validate_binding(provider, None, &binding(), &credential, Utc::now()).is_ok(),
-                accepted,
-                "provider={provider:?} kind={kind:?}"
+        let kinds = [
+            CredentialKind::ApiKey,
+            CredentialKind::Bearer,
+            CredentialKind::OauthDevice,
+            CredentialKind::OauthBrowserPkce,
+            CredentialKind::CloudIdentity,
+            CredentialKind::LocalSocket,
+            CredentialKind::None,
+        ];
+        for provider in providers {
+            for kind in kinds {
+                let value = credential(provider, kind);
+                assert_eq!(
+                    validate_binding(provider, None, &binding(), &value, Utc::now()).is_ok(),
+                    descriptor(provider).kinds.contains(&kind),
+                    "provider={provider:?} kind={kind:?}"
+                );
+            }
+            let mut wrong = credential(provider, descriptor(provider).kinds[0]);
+            wrong.audience = AudienceBinding::standard(
+                if descriptor(provider).family == EndpointFamily::AnthropicApi {
+                    EndpointFamily::OpenaiPlatform
+                } else {
+                    EndpointFamily::AnthropicApi
+                },
             );
+            assert!(validate_binding(provider, None, &binding(), &wrong, Utc::now()).is_err());
         }
     }
 
