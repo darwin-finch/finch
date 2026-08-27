@@ -2162,27 +2162,54 @@ mod tests {
 
     async fn retrying_stalling_http_server(
         attempts: usize,
-    ) -> (String, tokio::sync::oneshot::Receiver<()>) {
+    ) -> (
+        String,
+        mpsc::UnboundedReceiver<usize>,
+        mpsc::UnboundedReceiver<usize>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let (accepted_tx, accepted_rx) = mpsc::unbounded_channel();
+        let (closed_tx, closed_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            let mut connection_tasks = Vec::new();
-            for _ in 0..attempts {
+            for attempt in 0..attempts {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                connection_tasks.push(tokio::spawn(async move {
+                let accepted_tx = accepted_tx.clone();
+                let closed_tx = closed_tx.clone();
+                tokio::spawn(async move {
                     let mut request = vec![0u8; 16 * 1024];
                     let _ = socket.read(&mut request).await;
+                    let _ = accepted_tx.send(attempt);
                     let mut byte = [0u8; 1];
                     while matches!(socket.read(&mut byte).await, Ok(1)) {}
-                }));
+                    let _ = closed_tx.send(attempt);
+                });
             }
-            for task in connection_tasks {
-                let _ = task.await;
-            }
-            let _ = closed_tx.send(());
         });
-        (format!("http://{}", address), closed_rx)
+        (format!("http://{}", address), accepted_rx, closed_rx)
+    }
+
+    async fn recv_without_advancing_time(
+        receiver: &mut mpsc::UnboundedReceiver<usize>,
+        event: &str,
+    ) -> usize {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match receiver.try_recv() {
+                Ok(attempt) => return attempt,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("server disconnected before reporting {event}")
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server did not report {event} before the wall-clock deadline"
+            );
+            // Keeping a task runnable prevents Tokio's paused clock from
+            // auto-advancing the client timeout before TCP accept/readiness.
+            tokio::task::yield_now().await;
+        }
     }
 
     async fn canonical_stream_outcome(body: String) -> (bool, Vec<String>) {
@@ -2545,28 +2572,42 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn public_validated_dispatch_enforces_request_timeout() {
-        let (url, attempts_observed) = retrying_stalling_http_server(3).await;
+        let (url, mut accepted, mut closed) = retrying_stalling_http_server(3).await;
         let mut provider = public_canonical_test_provider(url);
         provider.client = Client::builder()
             .timeout(Duration::from_millis(50))
             .build()
             .unwrap();
-        let error = provider
-            .send_message(
-                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
-                    .with_model("gpt-5.6-sol"),
-            )
-            .await
-            .unwrap_err();
+        let request = tokio::spawn(async move {
+            provider
+                .send_message(
+                    &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                        .with_model("gpt-5.6-sol"),
+                )
+                .await
+        });
+
+        for attempt in 0..3 {
+            assert_eq!(
+                recv_without_advancing_time(&mut accepted, "an accepted request").await,
+                attempt
+            );
+            tokio::time::advance(Duration::from_millis(51)).await;
+            assert_eq!(
+                recv_without_advancing_time(&mut closed, "a released transport").await,
+                attempt
+            );
+            if attempt < 2 {
+                // Let with_retry register its backoff before advancing it.
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::advance(Duration::from_millis(1_001 * (1 << attempt))).await;
+            }
+        }
+
+        let error = request.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("Failed to send request"));
-        // Retry backoff uses paused time, but socket teardown is OS-driven.
-        // Resume the clock so the cleanup deadline cannot auto-advance ahead
-        // of macOS delivering the final connection-close readiness event.
-        tokio::time::resume();
-        tokio::time::timeout(Duration::from_secs(2), attempts_observed)
-            .await
-            .expect("validated dispatch did not release all timed-out attempts")
-            .unwrap();
     }
 
     #[tokio::test]
