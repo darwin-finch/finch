@@ -1874,10 +1874,33 @@ pub async fn validate_repl_and_apply(result: &SetupResult) -> Result<SetupApplyO
 /// in-REPL `/setup` command cannot silently persist different subsets of the
 /// settings shown by the wizard.
 fn config_from_setup_result(result: &SetupResult) -> crate::config::Config {
-    use crate::config::{Config, FeaturesConfig};
+    use crate::config::Config;
 
     let providers = result.providers.clone();
-    let mut new_config = Config::with_providers(providers);
+    apply_setup_result_to_config(result, Config::with_providers(providers))
+}
+
+#[cfg(test)]
+fn config_from_setup_result_with_paths(
+    result: &SetupResult,
+    metrics_dir: std::path::PathBuf,
+    constitution_path: Option<std::path::PathBuf>,
+) -> crate::config::Config {
+    use crate::config::Config;
+
+    let providers = result.providers.clone();
+    apply_setup_result_to_config(
+        result,
+        Config::with_providers_and_paths(providers, metrics_dir, constitution_path),
+    )
+}
+
+fn apply_setup_result_to_config(
+    result: &SetupResult,
+    mut new_config: crate::config::Config,
+) -> crate::config::Config {
+    use crate::config::FeaturesConfig;
+
     apply_daemon_api_key(&mut new_config, &result.finch_api_key);
     new_config.active_theme = result.active_theme.clone();
     new_config.active_persona = result.default_persona.clone();
@@ -6965,14 +6988,18 @@ for line in sys.stdin:
     }
 
     fn state_with_step(step: AddProviderStep) -> WizardState {
-        let hermetic_config = crate::config::Config::with_providers(vec![ProviderEntry::Claude {
-            api_key: String::new(),
-            model: None,
-            base_url: None,
-            chat_path: None,
-            models_path: None,
-            name: Some("claude".to_string()),
-        }]);
+        let hermetic_config = crate::config::Config::with_providers_and_paths(
+            vec![ProviderEntry::Claude {
+                api_key: String::new(),
+                model: None,
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: Some("claude".to_string()),
+            }],
+            std::path::PathBuf::from("unused-test-metrics"),
+            None,
+        );
         let mut state = WizardState::new_with_catalog_cache_dir(Some(&hermetic_config), None);
         if let Some(SectionState::Models {
             adding_provider,
@@ -7544,7 +7571,11 @@ for line in sys.stdin:
         handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
 
         let first_save = build_setup_result(&state).unwrap();
-        let config = config_from_setup_result(&first_save);
+        let config = config_from_setup_result_with_paths(
+            &first_save,
+            directory.path().join("metrics"),
+            None,
+        );
         config.save_to(&config_path).unwrap();
         let loaded = crate::config::load_config_from_path(&config_path).unwrap();
         assert!(matches!(
@@ -7597,7 +7628,7 @@ for line in sys.stdin:
 
         handle_models_input(&mut reopened, key(KeyCode::Enter)).unwrap();
         let second_save = build_setup_result(&reopened).unwrap();
-        config_from_setup_result(&second_save)
+        config_from_setup_result_with_paths(&second_save, directory.path().join("metrics"), None)
             .save_to(&config_path)
             .unwrap();
         let reloaded = crate::config::load_config_from_path(&config_path).unwrap();
@@ -7737,7 +7768,11 @@ for line in sys.stdin:
             name: Some("openai-work".to_string()),
             reasoning_effort: None,
         };
-        let config = crate::config::Config::with_providers(vec![persisted.clone()]);
+        let config = crate::config::Config::with_providers_and_paths(
+            vec![persisted.clone()],
+            std::path::PathBuf::from("unused-test-metrics"),
+            None,
+        );
         let mut state = WizardState::new_with_catalog_cache_dir(Some(&config), None);
         handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
         assert_eq!(

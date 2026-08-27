@@ -670,6 +670,21 @@ impl Config {
     /// Automatically derives the legacy `teachers` and `backend` fields so
     /// existing code continues to work without changes.
     pub fn with_providers(providers: Vec<ProviderEntry>) -> Self {
+        let home = dirs::home_dir().expect("Could not determine home directory");
+        let constitution_path = home.join(".finch/constitution.md");
+        let constitution_path = constitution_path.exists().then_some(constitution_path);
+        Self::with_providers_and_paths(providers, home.join(".finch/metrics"), constitution_path)
+    }
+
+    /// Construct from providers with every filesystem path supplied explicitly.
+    ///
+    /// This internal constructor avoids probing the user's home directory and is
+    /// intended for callers, such as hermetic tests, that own their path roots.
+    pub(crate) fn with_providers_and_paths(
+        providers: Vec<ProviderEntry>,
+        metrics_dir: PathBuf,
+        constitution_path: Option<PathBuf>,
+    ) -> Self {
         let teachers: Vec<TeacherEntry> = providers
             .iter()
             .filter_map(ProviderEntry::to_teacher_entry)
@@ -681,7 +696,7 @@ impl Config {
                 enabled: false,
                 ..BackendConfig::default()
             });
-        Self::new_with_all(teachers, backend, providers)
+        Self::new_with_all_and_paths(teachers, backend, providers, metrics_dir, constitution_path)
     }
 
     #[allow(deprecated)]
@@ -700,10 +715,27 @@ impl Config {
             None
         };
 
+        Self::new_with_all_and_paths(
+            teachers,
+            backend,
+            providers,
+            home.join(".finch/metrics"),
+            constitution_path,
+        )
+    }
+
+    #[allow(deprecated)]
+    fn new_with_all_and_paths(
+        teachers: Vec<TeacherEntry>,
+        backend: BackendConfig,
+        providers: Vec<ProviderEntry>,
+        metrics_dir: PathBuf,
+        constitution_path: Option<PathBuf>,
+    ) -> Self {
         let features = FeaturesConfig::default();
 
         Self {
-            metrics_dir: home.join(".finch/metrics"),
+            metrics_dir,
             streaming_enabled: features.streaming_enabled,
             tui_enabled: true,
             constitution_path,
@@ -979,6 +1011,24 @@ mod tests {
             !config.backend.enabled,
             "cloud-only provider lists must not start a local model"
         );
+    }
+
+    #[test]
+    fn test_with_providers_and_paths_does_not_probe_or_replace_explicit_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let metrics_dir = directory.path().join("metrics-not-created");
+        let constitution_path = directory.path().join("constitution-not-created.md");
+        assert!(!metrics_dir.exists());
+        assert!(!constitution_path.exists());
+
+        let config = Config::with_providers_and_paths(
+            vec![],
+            metrics_dir.clone(),
+            Some(constitution_path.clone()),
+        );
+
+        assert_eq!(config.metrics_dir, metrics_dir);
+        assert_eq!(config.constitution_path, Some(constitution_path));
     }
 
     #[test]
