@@ -1,0 +1,36 @@
+name: Issue 166 bounded regression
+
+on:
+  push:
+    branches: [codex/issue-166-metrics-structural]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  metrics-source-privacy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: issue-166-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: issue-166-${{ runner.os }}-
+      - name: Check focused formatting and whitespace
+        run: |
+          rustfmt --edition 2021 --check src/metrics/types.rs
+          git diff --check
+      - name: Check library and test targets
+        run: cargo check --lib --tests
+      - name: Run metrics structural privacy regressions
+        run: cargo test --lib metrics::types::tests
