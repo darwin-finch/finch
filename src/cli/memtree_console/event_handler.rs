@@ -48,7 +48,9 @@ impl EventHandler {
                 self.handle_query_complete(console, *query_id, response)?;
             }
 
-            ReplEvent::QueryFailed { query_id, error } => {
+            ReplEvent::QueryFailed {
+                query_id, error, ..
+            } => {
                 self.handle_query_failed(console, *query_id, error)?;
             }
 
@@ -56,6 +58,7 @@ impl EventHandler {
                 query_id,
                 tool_id,
                 result,
+                ..
             } => {
                 self.handle_tool_result(console, *query_id, tool_id, result)?;
             }

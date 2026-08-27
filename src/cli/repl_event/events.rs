@@ -38,6 +38,15 @@ pub enum ConfirmationResult {
     Deny,
 }
 
+/// Machine-readable identity for failures that cross the provider task boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryFailureKind {
+    /// An ordinary provider, parsing, or frontend failure.
+    Ordinary,
+    /// The spawned provider task itself panicked or was cancelled unexpectedly.
+    ProviderTaskTerminated,
+}
+
 /// Events that flow through the REPL event loop
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -57,11 +66,13 @@ pub enum ReplEvent {
     QueryFailed {
         query_id: Uuid,
         error: String,
+        kind: QueryFailureKind,
     },
 
     /// A tool execution completed
     ToolResult {
         query_id: Uuid,
+        round_token: crate::cli::conversation::ToolRoundToken,
         tool_id: String,
         result: Result<String>,
     },
@@ -85,6 +96,7 @@ pub enum ReplEvent {
     /// boundary. The dialog returns a structured scope choice; the provider
     /// source is never replayed after approval.
     VmApprovalNeeded {
+        query_id: Option<Uuid>,
         prompt: crate::vm::ApprovalPrompt,
         response_tx: oneshot::Sender<crate::vm::ApprovalChoice>,
     },
@@ -102,6 +114,7 @@ pub enum ReplEvent {
     /// order for this per-run sender, while the envelope retains the durable
     /// `(execution_id, sequence)` identity for replay-capable hosts.
     VmEffect {
+        query_id: Option<Uuid>,
         projection: VmOutputProjection,
         envelope: VmEffectEnvelope,
     },
@@ -257,6 +270,11 @@ pub enum LlmRequest {
         id: Uuid,
         text: String,
         no_tools: bool,
+        /// Tool continuations wait for the atomic history commit before
+        /// reading shared conversation state.
+        admission: Option<tokio::sync::oneshot::Receiver<()>>,
+        admission_ready: Option<tokio::sync::oneshot::Sender<()>>,
+        spawned: Option<tokio::sync::oneshot::Sender<()>>,
     },
 }
 
@@ -306,6 +324,7 @@ mod tests {
         let event = ReplEvent::QueryFailed {
             query_id: id,
             error: "network timeout".to_string(),
+            kind: QueryFailureKind::Ordinary,
         };
         match event {
             ReplEvent::QueryFailed { error, .. } => assert_eq!(error, "network timeout"),

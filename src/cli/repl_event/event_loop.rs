@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::claude::ContentBlock;
 use crate::cli::commands::{format_help, Command};
-use crate::cli::conversation::ConversationHistory;
+use crate::cli::conversation::{ConversationHistory, ToolRoundProgress, ToolRoundToken};
 use crate::cli::output_manager::{OutputManager, VmOutputProjection};
 use crate::cli::repl::ReplMode;
 use crate::cli::status_bar::StatusBar;
@@ -34,12 +34,12 @@ use crate::local::LocalGenerator;
 use crate::memory::NeuralEmbeddingEngine;
 use crate::models::bootstrap::GeneratorState;
 use crate::models::tokenizer::TextTokenizer;
-use crate::router::Router;
 use crate::review::store::DiffStore;
+use crate::router::Router;
 use crate::tools::executor::ToolExecutor;
 use crate::tools::types::ToolDefinition;
 
-use super::events::{LlmRequest, ReplEvent, RunnerReconnectTarget};
+use super::events::{LlmRequest, QueryFailureKind, ReplEvent, RunnerReconnectTarget};
 use super::llm_loop::LlmLoop;
 use super::model_selection::{activate_local_when_ready, LocalActivationOutcome, ModelSelection};
 use super::query_processor::{refresh_context_strip, ActiveToolUsesMap};
@@ -50,7 +50,6 @@ use super::tool_execution::ToolExecutionCoordinator;
 // refresh_context_strip, dispatch_tool_uses, process_query_with_tools,
 // ActiveToolUsesMap, and apply_sliding_window live in query_processor.rs.
 
-type ToolResultsMap = Arc<RwLock<std::collections::HashMap<Uuid, Vec<(String, Result<String>)>>>>;
 type PendingApprovalsMap = Arc<
     RwLock<
         std::collections::HashMap<
@@ -62,6 +61,58 @@ type PendingApprovalsMap = Arc<
         >,
     >,
 >;
+
+async fn commit_tool_round_and_continue(
+    conversation: &Arc<RwLock<ConversationHistory>>,
+    query_id: Uuid,
+    round_token: ToolRoundToken,
+    llm_tx: &mpsc::UnboundedSender<LlmRequest>,
+) -> std::result::Result<(), crate::cli::conversation::ToolRoundError> {
+    let (admit_tx, admit_rx) = tokio::sync::oneshot::channel();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (spawned_tx, spawned_rx) = tokio::sync::oneshot::channel();
+    llm_tx
+        .send(LlmRequest::Query {
+            id: query_id,
+            text: String::new(),
+            no_tools: false,
+            admission: Some(admit_rx),
+            admission_ready: Some(ready_tx),
+            spawned: Some(spawned_tx),
+        })
+        .map_err(|_| crate::cli::conversation::ToolRoundError::ContinuationUnavailable)?;
+    tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+        .await
+        .map_err(|_| crate::cli::conversation::ToolRoundError::ContinuationUnavailable)?
+        .map_err(|_| crate::cli::conversation::ToolRoundError::ContinuationUnavailable)?;
+    conversation
+        .write()
+        .await
+        .commit_tool_round(query_id, round_token)?;
+    let _ = admit_tx.send(());
+    if !matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), spawned_rx).await,
+        Ok(Ok(()))
+    ) {
+        conversation
+            .write()
+            .await
+            .rollback_last_tool_round(query_id, round_token)?;
+        return Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable);
+    }
+    Ok(())
+}
+
+fn install_live_dialog_sender(
+    pending: &mut Option<tokio::sync::oneshot::Sender<crate::cli::tui::DialogResult>>,
+    response_tx: tokio::sync::oneshot::Sender<crate::cli::tui::DialogResult>,
+) -> bool {
+    if response_tx.is_closed() {
+        return false;
+    }
+    *pending = Some(response_tx);
+    true
+}
 
 pub(crate) fn resolve_provider_profile(
     providers: &[crate::config::ProviderEntry],
@@ -113,17 +164,16 @@ pub(crate) fn resolve_provider_profile(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BrainAttachmentRoute {
-    LocalIpc { brain: String },
+    LocalIpc {
+        brain: String,
+    },
     RemoteInvitation {
         target: crate::brain::remote::RemoteBrainTarget,
         invitation: String,
     },
 }
 
-fn brain_attachment_route(
-    value: &str,
-    invitation: Option<String>,
-) -> Result<BrainAttachmentRoute> {
+fn brain_attachment_route(value: &str, invitation: Option<String>) -> Result<BrainAttachmentRoute> {
     if value.contains('@') {
         let invitation = invitation.context(
             "remote Brain attachments require `/brain join NAME@MACHINE[:PORT] INVITE`; use `/brain attach NAME` for a Brain on this daemon",
@@ -213,9 +263,6 @@ pub struct EventLoop {
     /// through this field.
     program_runtime: Arc<crate::runtime::ProgramRuntime>,
     agent_scheduler: Arc<crate::runtime::scheduler::AgentScheduler>,
-
-    /// Tool results collected per query (query_id -> Vec<(tool_id, result)>)
-    tool_results: ToolResultsMap,
 
     /// Currently active query ID (for cancellation)
     active_query_id: Arc<RwLock<Option<Uuid>>>,
@@ -444,7 +491,11 @@ fn participant_subject_from(user: &str, machine: &str) -> String {
     let value = format!(
         "{}@{}",
         if user.is_empty() { "user" } else { user },
-        if machine.is_empty() { "machine" } else { machine }
+        if machine.is_empty() {
+            "machine"
+        } else {
+            machine
+        }
     );
     value
         .chars()
@@ -490,9 +541,7 @@ fn finch_addressed_prompt(input: &str) -> Option<&str> {
     (!prompt.is_empty()).then_some(prompt)
 }
 
-fn approval_audience_summary(
-    audience: &crate::brain::store::BrainApprovalAudience,
-) -> String {
+fn approval_audience_summary(audience: &crate::brain::store::BrainApprovalAudience) -> String {
     format!(
         "Brain: {} ({})\nApproval audience: {} ({:?}, attachment {})\nEnvironment generation: {}",
         audience.brain,
@@ -608,18 +657,59 @@ struct PendingNamedBrainTurn {
     /// boundary and all execute-once effects have been collected.
     cancellation_requested: bool,
     approval_audience: crate::brain::store::BrainApprovalAudience,
-    approval_tx: Option<
-        tokio::sync::mpsc::UnboundedSender<crate::server::RunnerApprovalRequest>,
-    >,
+    approval_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::server::RunnerApprovalRequest>>,
     restart: Option<crate::tools::implementations::restart::DeferredFrontendRestart>,
+    local_conversation_snapshot: Vec<crate::claude::Message>,
+}
+
+struct CancelledNamedBrainTurn {
+    run_id: crate::brain::store::RunId,
+    response_tx: tokio::sync::oneshot::Sender<
+        std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError>,
+    >,
+    turn_events: Vec<crate::server::RunnerTurnEvent>,
+    effect_journal: Vec<crate::server::RunnerEffectRecord>,
+    local_conversation_snapshot: Vec<crate::claude::Message>,
+}
+
+fn take_cancelled_named_brain_turn(
+    pending_turns: &mut std::collections::HashMap<Uuid, PendingNamedBrainTurn>,
+    query_id: Uuid,
+) -> Option<CancelledNamedBrainTurn> {
+    let mut pending = pending_turns.remove(&query_id)?;
+    pending.cancellation_requested = true;
+    Some(CancelledNamedBrainTurn {
+        run_id: pending.run_id,
+        response_tx: pending.response_tx,
+        turn_events: pending.turn_events,
+        effect_journal: pending.effect_journal,
+        local_conversation_snapshot: pending.local_conversation_snapshot,
+    })
+}
+
+fn publish_cancelled_named_brain_turn(cancelled: CancelledNamedBrainTurn) {
+    let _ = cancelled
+        .response_tx
+        .send(Err(crate::server::RunnerTurnError {
+            kind: crate::server::RunnerTurnErrorKind::RunCancelled,
+            message: "named Brain run cancelled".into(),
+            turn_events: cancelled.turn_events,
+            effect_journal: cancelled.effect_journal,
+        }));
+}
+
+fn clear_matching_active_query(active_query_id: &mut Option<Uuid>, query_id: Uuid) -> bool {
+    if *active_query_id != Some(query_id) {
+        return false;
+    }
+    *active_query_id = None;
+    true
 }
 
 async fn resume_named_brain_program_boundaries(
     runtime: &crate::runtime::ProgramRuntime,
     event_tx: mpsc::UnboundedSender<ReplEvent>,
-    control_tx: Option<
-        mpsc::UnboundedSender<crate::server::RunnerProgramControlRequest>,
-    >,
+    control_tx: Option<mpsc::UnboundedSender<crate::server::RunnerProgramControlRequest>>,
     language: crate::brain::store::ProgramLanguage,
     interaction: crate::server::RunnerProgramInteraction,
     fixed_grant_ceiling: Option<crate::vm::EffectSet>,
@@ -633,6 +723,7 @@ async fn resume_named_brain_program_boundaries(
                     runtime,
                     event_tx.clone(),
                     outcome,
+                    None,
                 )
                 .await?
             }
@@ -641,8 +732,7 @@ async fn resume_named_brain_program_boundaries(
             }
         };
         let Some(crate::runtime::PendingTypedExecutionInfo {
-            reason:
-                crate::runtime::PendingTypedReason::AwaitingHostEffect { requirement },
+            reason: crate::runtime::PendingTypedReason::AwaitingHostEffect { requirement },
             resume_effect_sequence: Some(sequence),
             ..
         }) = runtime.pending_typed_execution(outcome.execution_id)?
@@ -668,8 +758,7 @@ async fn resume_named_brain_program_boundaries(
                     anyhow::bail!("named Brain schedule effect stream closed")
                 }
             };
-            if envelope.execution_id == outcome.execution_id
-                && envelope.effect.sequence == sequence
+            if envelope.execution_id == outcome.execution_id && envelope.effect.sequence == sequence
             {
                 break envelope;
             }
@@ -723,7 +812,9 @@ async fn execute_named_brain_schedule_effect(
             let next_due_ms = u64::try_from(*timestamp)
                 .ok()
                 .and_then(|timestamp| timestamp.checked_mul(1_000))
-                .ok_or_else(|| anyhow::anyhow!("schedule timestamp is outside the supported range"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("schedule timestamp is outside the supported range")
+                })?;
             let grant_ceiling = match fixed_grant_ceiling {
                 Some(grant_ceiling) => grant_ceiling.clone(),
                 None => runtime.effective_grants_for(None)?,
@@ -736,8 +827,7 @@ async fn execute_named_brain_schedule_effect(
                     grant_ceiling,
                     next_due_ms,
                     interval_ms: None,
-                    delivery_policy:
-                        crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce,
+                    delivery_policy: crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce,
                     response_tx,
                 })
                 .map_err(|_| anyhow::anyhow!("named Brain schedule control disconnected"))?;
@@ -755,10 +845,12 @@ async fn execute_named_brain_schedule_effect(
             let schedule_id = schedule_id_argument(arguments)?;
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
             control_tx
-                .send(crate::server::RunnerProgramControlRequest::InspectSchedule {
-                    schedule_id,
-                    response_tx,
-                })
+                .send(
+                    crate::server::RunnerProgramControlRequest::InspectSchedule {
+                        schedule_id,
+                        response_tx,
+                    },
+                )
                 .map_err(|_| anyhow::anyhow!("named Brain schedule control disconnected"))?;
             let schedule = response_rx
                 .await
@@ -809,7 +901,9 @@ fn schedule_id_argument(
         anyhow::bail!("schedule operation requires one schedule resource");
     };
     anyhow::ensure!(kind == "schedule", "resource is not a schedule");
-    Ok(crate::brain::store::ScheduleId(uuid::Uuid::parse_str(handle)?))
+    Ok(crate::brain::store::ScheduleId(uuid::Uuid::parse_str(
+        handle,
+    )?))
 }
 
 #[derive(Clone)]
@@ -922,13 +1016,8 @@ fn project_remote_brain_run_event(
         | BrainEventKind::Result { .. } => (None, BrainRunStatus::Running),
         _ => return false,
     };
-    let projection = ensure_remote_brain_run_projection(
-        output_manager,
-        projections,
-        run_id,
-        kind,
-        status,
-    );
+    let projection =
+        ensure_remote_brain_run_projection(output_manager, projections, run_id, kind, status);
 
     match &event.kind {
         BrainEventKind::RunStarted { .. } => {}
@@ -965,15 +1054,18 @@ fn project_remote_brain_run_event(
             if projection.locally_rendered_tool_ids.contains(tool_id) {
                 return true;
             }
-            projection.tool_rows.entry(tool_id.clone()).or_insert_with(|| {
-                let input = input.to_string();
-                let input = if input.chars().count() > 80 {
-                    format!("{}…", input.chars().take(79).collect::<String>())
-                } else {
-                    input
-                };
-                projection.unit.add_row(format!("{name} {input}"))
-            });
+            projection
+                .tool_rows
+                .entry(tool_id.clone())
+                .or_insert_with(|| {
+                    let input = input.to_string();
+                    let input = if input.chars().count() > 80 {
+                        format!("{}…", input.chars().take(79).collect::<String>())
+                    } else {
+                        input
+                    };
+                    projection.unit.add_row(format!("{name} {input}"))
+                });
         }
         BrainEventKind::ToolResult {
             tool_id,
@@ -1151,10 +1243,7 @@ fn failed_local_brain_projection(
 fn register_named_brain_turn_projection(
     projections: &mut std::collections::VecDeque<LocalBrainProjection>,
     run_id: crate::brain::store::RunId,
-    result: &std::result::Result<
-        crate::server::RunnerTurnResult,
-        crate::server::RunnerTurnError,
-    >,
+    result: &std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError>,
     transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
 ) {
     match result {
@@ -1211,12 +1300,8 @@ fn named_brain_wire_source(
         .filter(|source| !source.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("named Brain turn produced no wire source"))?;
     let language = match crate::programs::ProgramLanguage::infer_wire_source(&source)? {
-        crate::programs::ProgramLanguage::Forth => {
-            crate::brain::store::ProgramLanguage::Forth
-        }
-        crate::programs::ProgramLanguage::Lisp => {
-            crate::brain::store::ProgramLanguage::Lisp
-        }
+        crate::programs::ProgramLanguage::Forth => crate::brain::store::ProgramLanguage::Forth,
+        crate::programs::ProgramLanguage::Lisp => crate::brain::store::ProgramLanguage::Lisp,
     };
     Ok((source, language))
 }
@@ -1242,9 +1327,7 @@ fn assemble_named_brain_turn(
             .find(|snapshot| snapshot.revision == runtime_revision)
             .and_then(|snapshot| snapshot.checkpoint)
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "named Brain revision {runtime_revision} is not checkpointable"
-                )
+                anyhow::anyhow!("named Brain revision {runtime_revision} is not checkpointable")
             })?;
         Ok(crate::server::RunnerTurnResult {
             source,
@@ -1258,16 +1341,12 @@ fn assemble_named_brain_turn(
         })
     })()
     .map_err(|error| crate::server::RunnerTurnError {
+        kind: crate::server::RunnerTurnErrorKind::RunnerAuthored,
         message: error.to_string(),
         turn_events,
         effect_journal,
     });
-    register_named_brain_turn_projection(
-        projections,
-        run_id,
-        &result,
-        transient_output_unit,
-    );
+    register_named_brain_turn_projection(projections, run_id, &result, transient_output_unit);
     result
 }
 
@@ -1364,9 +1443,8 @@ fn project_remote_brain_live_run_event(
     if projected && projection_match == LocalProjectionMatch::SuppressAndComplete {
         if let Some(local) = local_projections.pop_front() {
             if let Some(output_unit) = local.transient_output_unit {
-                output_manager.remove_message(crate::cli::messages::Message::id(
-                    output_unit.as_ref(),
-                ));
+                output_manager
+                    .remove_message(crate::cli::messages::Message::id(output_unit.as_ref()));
             }
         }
     }
@@ -1399,9 +1477,7 @@ fn runner_effect_records_from_tool_result(
         .unwrap_or_default()
 }
 
-fn deferred_proposal_from_tool_result(
-    result: &anyhow::Result<String>,
-) -> Option<DeferredProposal> {
+fn deferred_proposal_from_tool_result(result: &anyhow::Result<String>) -> Option<DeferredProposal> {
     let content = result.as_ref().ok()?;
     let outcome: crate::runtime::outcome::ExecutionOutcome = serde_json::from_str(content).ok()?;
     if outcome.status != crate::runtime::outcome::ExecutionStatus::Suspended {
@@ -1414,11 +1490,8 @@ fn deferred_proposal_from_tool_result(
     let crate::vm::HostSideEffect::Request { arguments } = &effect.event else {
         return None;
     };
-    let [
-        crate::vm::TypedValue::String(language),
-        crate::vm::TypedValue::String(intent),
-        crate::vm::TypedValue::String(source),
-    ] = arguments.as_slice()
+    let [crate::vm::TypedValue::String(language), crate::vm::TypedValue::String(intent), crate::vm::TypedValue::String(source)] =
+        arguments.as_slice()
     else {
         return None;
     };
@@ -1513,8 +1586,9 @@ mod deferred_proposal_tests {
             )
             .await
             .unwrap();
-        let proposal = deferred_proposal_from_tool_result(&Ok(serde_json::to_string(&outcome).unwrap()))
-            .expect("suspended proposal effect");
+        let proposal =
+            deferred_proposal_from_tool_result(&Ok(serde_json::to_string(&outcome).unwrap()))
+                .expect("suspended proposal effect");
         assert_eq!(proposal.handle.execution_id, outcome.execution_id);
         assert_eq!(proposal.handle.sequence, 0);
         assert_eq!(proposal.language, "python");
@@ -1549,10 +1623,9 @@ mod deferred_proposal_tests {
             )
             .await
             .unwrap();
-        let approval = deferred_vm_approval_from_tool_result(&Ok(
-            serde_json::to_string(&outcome).unwrap(),
-        ))
-        .expect("authorization-required tool outcome");
+        let approval =
+            deferred_vm_approval_from_tool_result(&Ok(serde_json::to_string(&outcome).unwrap()))
+                .expect("authorization-required tool outcome");
 
         assert_eq!(approval.prompt.request.execution_id, outcome.execution_id);
         assert_eq!(approval.prompt.request.effect_sequence, Some(0));
@@ -1591,8 +1664,9 @@ mod deferred_proposal_tests {
             )
             .await
             .unwrap();
-        let proposal = deferred_proposal_from_tool_result(&Ok(serde_json::to_string(&outcome).unwrap()))
-            .expect("suspended proposal effect");
+        let proposal =
+            deferred_proposal_from_tool_result(&Ok(serde_json::to_string(&outcome).unwrap()))
+                .expect("suspended proposal effect");
 
         let completed = resume_deferred_proposal(
             runtime.as_ref(),
@@ -1624,6 +1698,57 @@ mod deferred_proposal_tests {
 }
 
 impl EventLoop {
+    fn take_llm_worker(&mut self) -> LlmLoop {
+        let llm_rx = self.llm_rx.take().expect("LlmLoop already started");
+        LlmLoop::new(
+            llm_rx,
+            self.event_tx.clone(),
+            self.model_selection.generator_handle(),
+            Arc::clone(&self.qwen_gen),
+            Arc::clone(&self.router),
+            Arc::clone(&self.generator_state),
+            Arc::clone(&self.tool_definitions),
+            self.tool_coordinator.clone(),
+            Arc::clone(&self.program_runtime),
+            Arc::clone(&self.tool_call_history),
+            Arc::clone(&self.conversation),
+            Arc::clone(&self.query_states),
+            Arc::clone(&self.mode),
+            Arc::clone(&self.output_manager),
+            Arc::clone(&self.status_bar),
+            Arc::clone(&self.tui_renderer),
+            Arc::clone(&self.active_tool_uses),
+            self.memory_system.clone(),
+            Arc::clone(&self.current_graph),
+            Arc::clone(&self.active_persona),
+            self.session_label.clone(),
+            self.cwd.clone(),
+            self.context_lines,
+            self.max_verbatim_messages,
+            self.context_recall_k,
+            self.streaming_enabled,
+            self.enable_summarization,
+            self.auto_compact_enabled,
+            self.metrics_logger.clone(),
+        )
+    }
+
+    fn start_llm_worker(&mut self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(self.take_llm_worker().run())
+    }
+
+    #[cfg(test)]
+    fn start_llm_worker_with_retirement_barrier(
+        &mut self,
+        barrier: Arc<super::llm_loop::ProviderRetirementBarrier>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(
+            self.take_llm_worker()
+                .with_provider_retirement_barrier(barrier)
+                .run(),
+        )
+    }
+
     /// Create a new event loop with unified generators
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1661,29 +1786,34 @@ impl EventLoop {
         daemon_base_url: Option<String>,
         provider_resolver: crate::runtime::scheduler::ProviderResolver,
         agent_scheduler: Arc<crate::runtime::scheduler::AgentScheduler>,
+        interactive_frontend: bool,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        todo_journal_receiver.spawn();
+        if interactive_frontend {
+            todo_journal_receiver.spawn();
+        }
         let (llm_tx, llm_rx) = mpsc::unbounded_channel::<LlmRequest>();
 
-        let mut agent_events = agent_scheduler.subscribe();
-        let agent_event_tx = event_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                match agent_events.recv().await {
-                    Ok(event) => {
-                        if agent_event_tx
-                            .send(ReplEvent::AgentLifecycle(event))
-                            .is_err()
-                        {
-                            break;
+        if interactive_frontend {
+            let mut agent_events = agent_scheduler.subscribe();
+            let agent_event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match agent_events.recv().await {
+                        Ok(event) => {
+                            if agent_event_tx
+                                .send(ReplEvent::AgentLifecycle(event))
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
-            }
-        });
+            });
+        }
 
         // Create Co-Forth shared stack before TUI so both hold the same Arc.
         let stack: Arc<tokio::sync::Mutex<Vec<String>>> =
@@ -1705,35 +1835,38 @@ impl EventLoop {
         // ControlMessage { quit } and exits the process immediately.
         // This runs independently of the event loop so /quit always works even
         // when the loop is blocked mid-streaming or mid-tool execution.
-        let (quit_tx, mut quit_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        tokio::spawn(async move {
-            while let Some(bytes) = quit_rx.recv().await {
-                let mut cursor = std::io::Cursor::new(bytes);
-                let ok = capnp::serialize::read_message(
-                    &mut cursor,
-                    capnp::message::ReaderOptions::new(),
-                )
-                .and_then(|reader| {
-                    reader
-                        .get_root::<crate::finch_ipc_capnp::control_message::Reader>()
-                        .map(|ctrl| {
-                            matches!(
-                                ctrl.which(),
-                                Ok(crate::finch_ipc_capnp::control_message::Which::Quit(_))
-                            )
-                        })
-                })
-                .unwrap_or(false);
+        let input_rx = if interactive_frontend {
+            let (quit_tx, mut quit_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            tokio::spawn(async move {
+                while let Some(bytes) = quit_rx.recv().await {
+                    let mut cursor = std::io::Cursor::new(bytes);
+                    let ok = capnp::serialize::read_message(
+                        &mut cursor,
+                        capnp::message::ReaderOptions::new(),
+                    )
+                    .and_then(|reader| {
+                        reader
+                            .get_root::<crate::finch_ipc_capnp::control_message::Reader>()
+                            .map(|ctrl| {
+                                matches!(
+                                    ctrl.which(),
+                                    Ok(crate::finch_ipc_capnp::control_message::Which::Quit(_))
+                                )
+                            })
+                    })
+                    .unwrap_or(false);
 
-                if ok {
-                    crate::cli::tui::emergency_restore_terminal();
-                    std::process::exit(0);
+                    if ok {
+                        crate::cli::tui::emergency_restore_terminal();
+                        std::process::exit(0);
+                    }
                 }
-            }
-        });
-
-        // Spawn input handler task
-        let input_rx = spawn_input_task(Arc::clone(&tui_renderer), quit_tx);
+            });
+            spawn_input_task(Arc::clone(&tui_renderer), quit_tx)
+        } else {
+            let (_input_tx, input_rx) = mpsc::unbounded_channel();
+            input_rx
+        };
 
         // Initialize plan content storage
         let plan_content = Arc::new(RwLock::new(None));
@@ -1793,7 +1926,6 @@ impl EventLoop {
             tool_coordinator,
             program_runtime,
             agent_scheduler,
-            tool_results: Arc::new(RwLock::new(std::collections::HashMap::new())),
             active_query_id: Arc::new(RwLock::new(None)),
             pending_queries: std::collections::VecDeque::new(),
             pending_named_brain_turns: std::collections::HashMap::new(),
@@ -1816,11 +1948,17 @@ impl EventLoop {
             memtree_handler,
             view_mode: Arc::new(RwLock::new(ViewMode::List)), // Start in list view
             active_tool_uses: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            feedback_logger: FeedbackLogger::new().ok(),
-            metrics_logger: dirs::home_dir()
-                .map(|h| h.join(".finch").join("metrics"))
-                .and_then(|p| crate::metrics::MetricsLogger::new(p).ok())
-                .map(Arc::new),
+            feedback_logger: interactive_frontend
+                .then(|| FeedbackLogger::new().ok())
+                .flatten(),
+            metrics_logger: if interactive_frontend {
+                dirs::home_dir()
+                    .map(|h| h.join(".finch").join("metrics"))
+                    .and_then(|p| crate::metrics::MetricsLogger::new(p).ok())
+                    .map(Arc::new)
+            } else {
+                None
+            },
             memory_system,
             session_label,
             participant_subject,
@@ -1858,6 +1996,11 @@ impl EventLoop {
             llm_tx,
             llm_rx: Some(llm_rx),
         }
+    }
+
+    #[cfg(test)]
+    async fn drive_one(&mut self, event: ReplEvent) -> Result<()> {
+        self.handle_event(event).await
     }
 
     /// Run the event loop
@@ -1899,9 +2042,7 @@ impl EventLoop {
         self.home_runner_lease_active = home_runner_state
             .as_ref()
             .is_some_and(|state| state.registration.is_ok());
-        self.runner_reconnect_target = home_runner_state
-            .as_ref()
-            .map(|state| state.target.clone());
+        self.runner_reconnect_target = home_runner_state.as_ref().map(|state| state.target.clone());
         self.runner_brain = home_runner_state.as_ref().and_then(|state| {
             state
                 .registration
@@ -2049,41 +2190,7 @@ impl EventLoop {
         // ── Spawn LLM worker loop ─────────────────────────────────────────────
         // Hand the receiver half of the channel to LlmLoop so it runs as its own
         // Tokio task, decoupled from TUI select! timing.
-        {
-            let llm_rx = self.llm_rx.take().expect("LlmLoop already started");
-            let llm_loop = LlmLoop::new(
-                llm_rx,
-                self.event_tx.clone(),
-                self.model_selection.generator_handle(),
-                Arc::clone(&self.qwen_gen),
-                Arc::clone(&self.router),
-                Arc::clone(&self.generator_state),
-                Arc::clone(&self.tool_definitions),
-                self.tool_coordinator.clone(),
-                Arc::clone(&self.program_runtime),
-                Arc::clone(&self.tool_call_history),
-                Arc::clone(&self.conversation),
-                Arc::clone(&self.query_states),
-                Arc::clone(&self.mode),
-                Arc::clone(&self.output_manager),
-                Arc::clone(&self.status_bar),
-                Arc::clone(&self.tui_renderer),
-                Arc::clone(&self.active_tool_uses),
-                self.memory_system.clone(),
-                Arc::clone(&self.current_graph),
-                Arc::clone(&self.active_persona),
-                self.session_label.clone(),
-                self.cwd.clone(),
-                self.context_lines,
-                self.max_verbatim_messages,
-                self.context_recall_k,
-                self.streaming_enabled,
-                self.enable_summarization,
-                self.auto_compact_enabled,
-                self.metrics_logger.clone(),
-            );
-            tokio::spawn(llm_loop.run());
-        }
+        self.start_llm_worker();
 
         // Render interval (33ms ≈ 30fps) — smooth streaming without terminal flicker.
         // 60fps (16ms) caused visual artifacts on most terminal emulators; 30fps is the
@@ -2685,12 +2792,10 @@ Rules:\n\
                     Command::PersonaSelect(name) => {
                         match crate::config::Persona::load_by_name(&name) {
                             Ok(persona) => {
-                                let old_name =
-                                    self.active_persona.read().await.name().to_string();
+                                let old_name = self.active_persona.read().await.name().to_string();
                                 *self.active_persona.write().await = persona;
-                                self.output_manager.write_info(format!(
-                                    "Switched persona: {old_name} → {name}"
-                                ));
+                                self.output_manager
+                                    .write_info(format!("Switched persona: {old_name} → {name}"));
                                 match crate::config::load_config() {
                                     Ok(mut config) => {
                                         config.active_persona = name.clone();
@@ -2705,9 +2810,9 @@ Rules:\n\
                                     )),
                                 }
                             }
-                            Err(error) => self.output_manager.write_info(format!(
-                                "Failed to load persona '{name}': {error}"
-                            )),
+                            Err(error) => self
+                                .output_manager
+                                .write_info(format!("Failed to load persona '{name}': {error}")),
                         }
                         self.render_tui().await?;
                     }
@@ -2715,7 +2820,8 @@ Rules:\n\
                         let persona = self.active_persona.read().await;
                         self.output_manager.write_info(format!(
                             "Current persona: {}\n\n{}",
-                            persona.name(), persona.behavior.system_prompt
+                            persona.name(),
+                            persona.behavior.system_prompt
                         ));
                         drop(persona);
                         self.render_tui().await?;
@@ -3090,13 +3196,15 @@ Rules:\n\
                     }
                     Command::BrainSay(text) => {
                         if let Err(error) = self.handle_brain_say(text).await {
-                            self.output_manager.write_info(format!("brain say: {error}"));
+                            self.output_manager
+                                .write_info(format!("brain say: {error}"));
                             self.render_tui().await?;
                         }
                     }
                     Command::BrainWho => {
                         if let Err(error) = self.handle_brain_who().await {
-                            self.output_manager.write_info(format!("brain who: {error}"));
+                            self.output_manager
+                                .write_info(format!("brain who: {error}"));
                             self.render_tui().await?;
                         }
                     }
@@ -3227,10 +3335,7 @@ Rules:\n\
                     .await;
             }
             return self
-                .execute_interactive_typed_program(
-                    crate::programs::ProgramLanguage::Lisp,
-                    input,
-                )
+                .execute_interactive_typed_program(crate::programs::ProgramLanguage::Lisp, input)
                 .await;
         }
 
@@ -3261,6 +3366,7 @@ Rules:\n\
         let event_tx = self.event_tx.clone();
         let sink: crate::runtime::TypedEffectSink = Arc::new(move |envelope| {
             let _ = event_tx.send(ReplEvent::VmEffect {
+                query_id: None,
                 projection: projection.clone(),
                 envelope,
             });
@@ -3287,6 +3393,7 @@ Rules:\n\
                     &runtime,
                     event_tx.clone(),
                     outcome,
+                    None,
                 )
                 .await
             }
@@ -3380,6 +3487,9 @@ Rules:\n\
             id: query_id,
             text: input,
             no_tools: chat_only,
+            admission: None,
+            admission_ready: None,
+            spawned: None,
         });
 
         Ok(())
@@ -3832,6 +3942,12 @@ Rules:\n\
             }
 
             ReplEvent::QueryComplete { query_id, response } => {
+                if !self.query_states.begin_finalization(query_id).await {
+                    tracing::debug!(
+                        "Ignoring completion without terminal authority for {query_id}"
+                    );
+                    return Ok(());
+                }
                 // Add response to conversation
                 self.conversation
                     .write()
@@ -3855,19 +3971,18 @@ Rules:\n\
                 self.output_manager.write_response(&response);
             }
 
-            ReplEvent::QueryFailed { query_id, error } => {
+            ReplEvent::QueryFailed {
+                query_id,
+                error,
+                kind,
+            } => {
+                if !self.query_states.fail_query(query_id, error.clone()).await {
+                    tracing::debug!("Ignoring failure without terminal authority for {query_id}");
+                    return Ok(());
+                }
+                self.quiesce_cancelled_tool_round(query_id).await;
                 // DON'T remove streaming message here - fallback providers need it!
                 // The message will be removed on StreamingComplete or stays for final error display
-
-                // Update query state
-                self.query_states
-                    .update_state(
-                        query_id,
-                        QueryState::Failed {
-                            error: error.clone(),
-                        },
-                    )
-                    .await;
 
                 let transient_output_unit =
                     self.query_states.brain_output_work_unit(query_id).await;
@@ -3885,18 +4000,31 @@ Rules:\n\
 
                 if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
                     self.agent_scheduler.set_active_brain_parent(None).await;
+                    self.conversation
+                        .write()
+                        .await
+                        .restore_snapshot(pending.local_conversation_snapshot.clone());
                     self.local_brain_projections
                         .push_back(failed_local_brain_projection(
                             pending.run_id,
                             &pending.turn_events,
                             transient_output_unit,
                         ));
-                    let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
-                        message: error.clone(),
-                        turn_events: pending.turn_events,
-                        effect_journal: pending.effect_journal,
-                    }));
+                    let _ = pending
+                        .response_tx
+                        .send(Err(crate::server::RunnerTurnError {
+                            kind: match kind {
+                                QueryFailureKind::Ordinary => {
+                                    crate::server::RunnerTurnErrorKind::RunnerAuthored
+                                }
+                                QueryFailureKind::ProviderTaskTerminated => crate::server::RunnerTurnErrorKind::InfrastructureProviderTaskTerminated,
+                            },
+                            message: error.clone(),
+                            turn_events: pending.turn_events,
+                            effect_journal: pending.effect_journal,
+                        }));
                 }
+                self.tool_call_history.write().await.remove(&query_id);
 
                 // Render TUI to ensure viewport is redrawn after error message
                 if let Err(e) = self.render_tui().await {
@@ -3915,9 +4043,23 @@ Rules:\n\
 
             ReplEvent::ToolResult {
                 query_id,
+                round_token,
                 tool_id,
                 mut result,
             } => {
+                if let Err(error) = self.conversation.read().await.validate_tool_result(
+                    query_id,
+                    round_token,
+                    &tool_id,
+                ) {
+                    tracing::warn!(
+                        "Ignoring fenced tool event for query {} tool {}: {}",
+                        query_id,
+                        tool_id,
+                        error
+                    );
+                    return Ok(());
+                }
                 if let Some(restart) =
                     crate::tools::implementations::restart::deferred_frontend_restart_from_tool_result(
                         &result,
@@ -3950,18 +4092,35 @@ Rules:\n\
                         .map(|turn| turn.approval_audience.clone());
                     self.spawn_deferred_proposal(
                         query_id,
+                        round_token,
                         tool_id,
                         proposal,
                         approval_audience,
+                        self.query_states
+                            .get_metadata(query_id)
+                            .await
+                            .map(|metadata| metadata.cancellation_token)
+                            .unwrap_or_default(),
                     );
                 } else if let Some(approval) = deferred_vm_approval_from_tool_result(&result) {
                     self.output_manager.write_status(format!(
                         "VM capability request {} is awaiting approval",
                         approval.prompt.request.id
                     ));
-                    self.spawn_deferred_vm_approval(query_id, tool_id, approval);
+                    self.spawn_deferred_vm_approval(
+                        query_id,
+                        round_token,
+                        tool_id,
+                        approval,
+                        self.query_states
+                            .get_metadata(query_id)
+                            .await
+                            .map(|metadata| metadata.cancellation_token)
+                            .unwrap_or_default(),
+                    );
                 } else {
-                    self.handle_tool_result(query_id, tool_id, result).await?;
+                    self.handle_tool_result(query_id, round_token, tool_id, result)
+                        .await?;
                 }
             }
 
@@ -3970,13 +4129,14 @@ Rules:\n\
                 tool_uses,
             } => {
                 if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
-                    turn.turn_events.extend(tool_uses.into_iter().map(|tool_use| {
-                        crate::server::RunnerTurnEvent::Call {
-                            tool_id: tool_use.id,
-                            name: tool_use.name,
-                            input: tool_use.input,
-                        }
-                    }));
+                    turn.turn_events
+                        .extend(tool_uses.into_iter().map(|tool_use| {
+                            crate::server::RunnerTurnEvent::Call {
+                                tool_id: tool_use.id,
+                                name: tool_use.name,
+                                input: tool_use.input,
+                            }
+                        }));
                 }
             }
 
@@ -3985,14 +4145,31 @@ Rules:\n\
                 tool_use,
                 response_tx,
             } => {
+                if matches!(
+                    self.query_states.get_state(query_id).await,
+                    Some(QueryState::Cancelled)
+                ) {
+                    let _ = response_tx.send(super::events::ConfirmationResult::Deny);
+                    return Ok(());
+                }
                 self.handle_tool_approval_request(query_id, tool_use, response_tx)
                     .await?;
             }
 
             ReplEvent::VmApprovalNeeded {
+                query_id,
                 prompt,
                 response_tx,
             } => {
+                if let Some(query_id) = query_id {
+                    if matches!(
+                        self.query_states.get_state(query_id).await,
+                        Some(QueryState::Cancelled | QueryState::Failed { .. })
+                    ) {
+                        let _ = response_tx.send(crate::vm::ApprovalChoice::Deny);
+                        return Ok(());
+                    }
+                }
                 self.handle_vm_approval_request(prompt, response_tx).await?;
             }
 
@@ -4001,9 +4178,18 @@ Rules:\n\
             }
 
             ReplEvent::VmEffect {
+                query_id,
                 projection,
                 envelope,
             } => {
+                if let Some(query_id) = query_id {
+                    if matches!(
+                        self.query_states.get_state(query_id).await,
+                        Some(QueryState::Cancelled)
+                    ) {
+                        return Ok(());
+                    }
+                }
                 // A reconnecting application may deliver a journal suffix
                 // more than once. Let the client-local projection reject
                 // duplicates/gaps before rendering notices or mutating a
@@ -4054,11 +4240,13 @@ Rules:\n\
             } => {
                 match result {
                     Ok(outcome)
-                        if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {}
+                        if outcome.status
+                            == crate::runtime::outcome::ExecutionStatus::Completed => {}
                     Ok(outcome) => {
-                        let detail = outcome.diagnostics.first().cloned().unwrap_or_else(|| {
-                            format!("VM program ended as {:?}", outcome.status)
-                        });
+                        let detail =
+                            outcome.diagnostics.first().cloned().unwrap_or_else(|| {
+                                format!("VM program ended as {:?}", outcome.status)
+                            });
                         output_unit.append_response(&format!("VM error: {detail}"));
                     }
                     Err(error) => output_unit.append_response(&format!("VM error: {error}")),
@@ -4071,6 +4259,16 @@ Rules:\n\
                 query_id,
                 full_response,
             } => {
+                if matches!(
+                    self.query_states.get_state(query_id).await,
+                    Some(QueryState::Cancelled)
+                ) {
+                    tracing::debug!(
+                        "Ignoring late streaming completion for cancelled query {}",
+                        query_id
+                    );
+                    return Ok(());
+                }
                 tracing::debug!("[EVENT_LOOP] Handling StreamingComplete event");
 
                 // Check if this query is executing tools
@@ -4207,17 +4405,16 @@ Rules:\n\
                 if let Some(qid) = query_id {
                     // Fire the per-query cancellation token so handle_present_plan
                     // (and any other token-aware loops) can detect the cancel immediately.
-                    self.query_states.cancel_query(qid).await;
-                    let named_turn = if let Some(pending) =
-                        self.pending_named_brain_turns.get_mut(&qid)
-                    {
-                        pending.cancellation_requested = true;
-                        true
-                    } else {
-                        false
-                    };
+                    if !self.query_states.cancel_query(qid).await {
+                        tracing::debug!("Query {qid} already owns terminal completion");
+                        return Ok(());
+                    }
+                    let named_turn = self.pending_named_brain_turns.contains_key(&qid);
 
-                    if !named_turn {
+                    if named_turn {
+                        self.terminate_cancelled_named_brain_turn(qid).await;
+                    } else {
+                        self.quiesce_cancelled_tool_round(qid).await;
                         *self.active_query_id.write().await = None;
                         self.tool_call_history.write().await.remove(&qid);
                     }
@@ -4234,7 +4431,7 @@ Rules:\n\
 
                     // Show cancellation message
                     self.output_manager.write_info(if named_turn {
-                        "⚠️  Cancellation requested; waiting for the named Brain turn to reach a safe boundary"
+                        "⚠️  Named Brain turn cancelled at a safe terminal boundary"
                     } else {
                         "⚠️  Query cancelled by user (Ctrl+C)"
                     });
@@ -4295,9 +4492,7 @@ Rules:\n\
                 let is_current = self.selected_brain_matches(&target);
                 if is_current {
                     let acknowledged_seq = match &message {
-                        crate::brain::store::BrainWireMessage::Snapshot { brain } => {
-                            brain.revision
-                        }
+                        crate::brain::store::BrainWireMessage::Snapshot { brain } => brain.revision,
                         crate::brain::store::BrainWireMessage::Event { event } => event.seq,
                     };
                     self.render_remote_brain_message(message).await?;
@@ -4375,7 +4570,11 @@ Rules:\n\
                         format!(
                             "◆ {} · {} · event watch reconnecting",
                             self.session_label,
-                            if self.home_runner_lease_active { "runner" } else { "runner offline" },
+                            if self.home_runner_lease_active {
+                                "runner"
+                            } else {
+                                "runner offline"
+                            },
                         ),
                     );
                     self.render_tui().await?;
@@ -4391,7 +4590,11 @@ Rules:\n\
                         self.output_manager.write_info(format!(
                             "{}: home event watch reconnected; runner callback {}",
                             self.session_label,
-                            if self.home_runner_lease_active { "registered" } else { "still retrying" },
+                            if self.home_runner_lease_active {
+                                "registered"
+                            } else {
+                                "still retrying"
+                            },
                         ));
                         self.render_tui().await?;
                     }
@@ -4477,11 +4680,7 @@ Rules:\n\
                 }
                 let registration = match (lease_id, self.ipc_client.as_ref()) {
                     (Some(lease_id), Some(ipc)) => match ipc
-                        .register_brain_runner(
-                            &brain,
-                            lease_id,
-                            self.event_tx.clone(),
-                        )
+                        .register_brain_runner(&brain, lease_id, self.event_tx.clone())
                         .await
                     {
                         Ok(bootstrap) => {
@@ -4601,7 +4800,10 @@ Rules:\n\
                 // handle_present_plan / handle_ask_user_question), so the dialog is
                 // on-screen before the event is even enqueued — no race window.
                 // Just store the response channel for the render tick to route the result.
-                self.pending_dialog_tx = Some(response_tx);
+                // Cancellation can win after the producer enqueues ShowDialog
+                // but before this event is handled. Its receiver is then gone;
+                // do not let that stale sender consume the next dialog result.
+                install_live_dialog_sender(&mut self.pending_dialog_tx, response_tx);
             }
         }
 
@@ -4629,12 +4831,10 @@ Rules:\n\
             .insert(run_id, cancel.clone());
         tokio::task::spawn_local(async move {
             agent_scheduler
-                .set_active_brain_parent(Some(
-                    crate::runtime::scheduler::AgentBrainContext {
-                        run_id,
-                        request_seq,
-                    },
-                ))
+                .set_active_brain_parent(Some(crate::runtime::scheduler::AgentBrainContext {
+                    run_id,
+                    request_seq,
+                }))
                 .await;
             let brain_language = request.language;
             let language = match brain_language {
@@ -4753,28 +4953,35 @@ Rules:\n\
         if self.runner_brain.as_deref() != Some(request.brain.as_str())
             || !self.home_runner_lease_active
         {
-            let _ = request.response_tx.send(Err(crate::server::RunnerTurnError {
-                message: format!(
-                    "frontend does not hold the runner lease for named Brain '{}'",
-                    request.brain
-                ),
-                turn_events: Vec::new(),
-                effect_journal: Vec::new(),
-            }));
+            let _ = request
+                .response_tx
+                .send(Err(crate::server::RunnerTurnError {
+                    kind: crate::server::RunnerTurnErrorKind::RunnerAuthored,
+                    message: format!(
+                        "frontend does not hold the runner lease for named Brain '{}'",
+                        request.brain
+                    ),
+                    turn_events: Vec::new(),
+                    effect_journal: Vec::new(),
+                }));
             return Ok(());
         }
         if self.active_query_id.read().await.is_some() {
-            let _ = request.response_tx.send(Err(crate::server::RunnerTurnError {
-                message: format!(
-                    "named Brain '{}' runner is already executing a turn",
-                    request.brain
-                ),
-                turn_events: Vec::new(),
-                effect_journal: Vec::new(),
-            }));
+            let _ = request
+                .response_tx
+                .send(Err(crate::server::RunnerTurnError {
+                    kind: crate::server::RunnerTurnErrorKind::RunnerAuthored,
+                    message: format!(
+                        "named Brain '{}' runner is already executing a turn",
+                        request.brain
+                    ),
+                    turn_events: Vec::new(),
+                    effect_journal: Vec::new(),
+                }));
             return Ok(());
         }
 
+        let local_conversation_snapshot = self.conversation.read().await.snapshot();
         let mut context = request.context;
         if context.is_empty() {
             context.push(crate::claude::Message::user(request.prompt.clone()));
@@ -4818,15 +5025,14 @@ Rules:\n\
                 approval_audience: request.approval_audience,
                 approval_tx: request.approval_tx,
                 restart: None,
+                local_conversation_snapshot,
             },
         );
         self.agent_scheduler
-            .set_active_brain_parent(Some(
-                crate::runtime::scheduler::AgentBrainContext {
-                    run_id: request.run_id,
-                    request_seq: request.request_seq,
-                },
-            ))
+            .set_active_brain_parent(Some(crate::runtime::scheduler::AgentBrainContext {
+                run_id: request.run_id,
+                request_seq: request.request_seq,
+            }))
             .await;
         self.update_compaction_status().await;
         if self
@@ -4835,17 +5041,27 @@ Rules:\n\
                 id: query_id,
                 text: request.prompt,
                 no_tools: false,
+                admission: None,
+                admission_ready: None,
+                spawned: None,
             })
             .is_err()
         {
             *self.active_query_id.write().await = None;
             self.agent_scheduler.set_active_brain_parent(None).await;
             if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
-                let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
-                    message: "frontend LLM worker is unavailable".to_string(),
-                    turn_events: pending.turn_events,
-                    effect_journal: pending.effect_journal,
-                }));
+                self.conversation
+                    .write()
+                    .await
+                    .restore_snapshot(pending.local_conversation_snapshot.clone());
+                let _ = pending
+                    .response_tx
+                    .send(Err(crate::server::RunnerTurnError {
+                        kind: crate::server::RunnerTurnErrorKind::RunnerAuthored,
+                        message: "frontend LLM worker is unavailable".to_string(),
+                        turn_events: pending.turn_events,
+                        effect_journal: pending.effect_journal,
+                    }));
             }
         }
         Ok(())
@@ -4866,18 +5082,126 @@ Rules:\n\
             let _ = request.response_tx.send(Ok(true));
             return;
         }
-        let query_id = self.pending_named_brain_turns.iter().find_map(|(query_id, turn)| {
-            (turn.run_id == request.run_id).then_some(*query_id)
-        });
+        let query_id = self
+            .pending_named_brain_turns
+            .iter()
+            .find_map(|(query_id, turn)| (turn.run_id == request.run_id).then_some(*query_id));
         let Some(query_id) = query_id else {
             let _ = request.response_tx.send(Ok(false));
             return;
         };
-        self.query_states.cancel_query(query_id).await;
-        if let Some(pending) = self.pending_named_brain_turns.get_mut(&query_id) {
-            pending.cancellation_requested = true;
+        let cancelled = self.query_states.cancel_query(query_id).await;
+        if cancelled {
+            self.terminate_cancelled_named_brain_turn(query_id).await;
         }
-        let _ = request.response_tx.send(Ok(true));
+        let _ = request.response_tx.send(Ok(cancelled));
+    }
+
+    /// End a cancelled named-Brain provider turn exactly once. Aborting the
+    /// staged round before removing its correlation record fences every late
+    /// tool result, while returning the collected events/effects lets the
+    /// daemon publish the canonical cancellation outcome.
+    async fn terminate_cancelled_named_brain_turn(&mut self, query_id: Uuid) -> bool {
+        self.quiesce_cancelled_tool_round(query_id).await;
+        if let Some(unit) = self.query_states.tool_work_unit(query_id).await {
+            unit.set_failed();
+        }
+        let transient_output_unit = self.query_states.brain_output_work_unit(query_id).await;
+        self.query_states.set_tool_work_unit(query_id, None).await;
+        self.query_states
+            .set_brain_output_work_unit(query_id, None)
+            .await;
+        let Some(cancelled) =
+            take_cancelled_named_brain_turn(&mut self.pending_named_brain_turns, query_id)
+        else {
+            return false;
+        };
+        self.agent_scheduler.set_active_brain_parent(None).await;
+        self.conversation
+            .write()
+            .await
+            .restore_snapshot(cancelled.local_conversation_snapshot.clone());
+        self.local_brain_projections
+            .push_back(failed_local_brain_projection(
+                cancelled.run_id,
+                &cancelled.turn_events,
+                transient_output_unit,
+            ));
+        self.tool_call_history.write().await.remove(&query_id);
+        {
+            let mut active_query_id = self.active_query_id.write().await;
+            clear_matching_active_query(&mut active_query_id, query_id);
+        }
+        publish_cancelled_named_brain_turn(cancelled);
+        true
+    }
+
+    async fn quiesce_cancelled_tool_round(&mut self, query_id: Uuid) {
+        let aborted_round = self.conversation.write().await.abort_staged_round(query_id);
+        if self
+            .pending_vm_approval
+            .as_ref()
+            .is_some_and(|approval| approval.query_id == Some(query_id))
+        {
+            if let Some(approval) = self.pending_vm_approval.take() {
+                let _ = approval.response_tx.send(crate::vm::ApprovalChoice::Deny);
+            }
+            let mut tui = self.tui_renderer.lock().await;
+            tui.active_dialog = None;
+            tui.pending_dialog_result = None;
+        }
+        if let Some((_tool_use, response_tx)) =
+            self.pending_approvals.write().await.remove(&query_id)
+        {
+            let _ = response_tx.send(super::events::ConfirmationResult::Deny);
+            let mut tui = self.tui_renderer.lock().await;
+            tui.active_dialog = None;
+            tui.pending_dialog_result = None;
+        }
+        // Inline AskUserQuestion/PresentPlan dialogs use this separate response
+        // slot. The query cancellation token wakes their dispatcher; dropping
+        // the queued sender and clearing the overlay prevents a stale result
+        // from reviving the remainder of the tool batch.
+        self.pending_dialog_tx = None;
+        {
+            let mut tui = self.tui_renderer.lock().await;
+            tui.active_dialog = None;
+            tui.pending_dialog_result = None;
+        }
+        if let Some((round_token, tool_ids)) = aborted_round {
+            {
+                let mut active = self.active_tool_uses.write().await;
+                for tool_id in tool_ids {
+                    active.remove(&tool_id);
+                }
+            }
+            let coordinator = self.tool_coordinator.clone();
+            let drain = tokio::spawn(async move {
+                coordinator
+                    .close_and_wait_for_round(query_id, round_token)
+                    .await;
+            });
+            if tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+                .await
+                .is_err()
+            {
+                tracing::warn!("Detached slow cancelled tool round {query_id}");
+            }
+        }
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.query_states.wait_for_provider_task(query_id),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("Detached slow cancelled provider task {query_id}");
+            self.query_states.detach_provider_task(query_id).await;
+        }
+        let completed_effects = self.tool_coordinator.take_cancelled_effects(query_id);
+        if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
+            turn.effect_journal.extend(completed_effects);
+        }
     }
 
     async fn project_named_brain_memory(
@@ -4938,6 +5262,11 @@ Rules:\n\
             return;
         };
         self.agent_scheduler.set_active_brain_parent(None).await;
+        let messages = self
+            .conversation
+            .try_read()
+            .map(|conversation| conversation.get_messages())
+            .map_err(|_| anyhow::anyhow!("named Brain conversation is busy"));
         let PendingNamedBrainTurn {
             brain,
             run_id,
@@ -4946,10 +5275,16 @@ Rules:\n\
             effect_journal,
             cancellation_requested,
             restart,
+            local_conversation_snapshot,
             ..
         } = pending;
+        self.conversation
+            .write()
+            .await
+            .restore_snapshot(local_conversation_snapshot);
         if cancellation_requested {
             let _ = response_tx.send(Err(crate::server::RunnerTurnError {
+                kind: crate::server::RunnerTurnErrorKind::RunCancelled,
                 message: "named Brain run cancelled".into(),
                 turn_events,
                 effect_journal,
@@ -4957,9 +5292,8 @@ Rules:\n\
             return;
         }
         let commit_ack = restart.map(|restart| {
-            let (commit_tx, mut commit_rx) = tokio::sync::mpsc::unbounded_channel::<
-                crate::server::RunnerTurnCommitNotice,
-            >();
+            let (commit_tx, mut commit_rx) =
+                tokio::sync::mpsc::unbounded_channel::<crate::server::RunnerTurnCommitNotice>();
             let event_tx = self.event_tx.clone();
             tokio::spawn(async move {
                 let Some(notice) = commit_rx.recv().await else {
@@ -4982,11 +5316,6 @@ Rules:\n\
             });
             crate::server::RunnerTurnCommitAck::new(commit_tx)
         });
-        let messages = self
-            .conversation
-            .try_read()
-            .map(|conversation| conversation.get_messages())
-            .map_err(|_| anyhow::anyhow!("named Brain conversation is busy"));
         let result = assemble_named_brain_turn(
             &mut self.local_brain_projections,
             run_id,
@@ -5012,15 +5341,14 @@ Rules:\n\
         restart: crate::tools::implementations::restart::DeferredFrontendRestart,
     ) -> Result<()> {
         anyhow::ensure!(
-            self.runner_brain.as_deref() == Some(brain.as_str())
-                && self.home_runner_lease_active,
+            self.runner_brain.as_deref() == Some(brain.as_str()) && self.home_runner_lease_active,
             "cannot restart after Brain run {}: this frontend no longer owns '{}'",
             run_id.0,
             brain
         );
-        let lease_id = self.home_runner_lease_id.context(
-            "cannot restart the frontend without its exact runner lease identity",
-        )?;
+        let lease_id = self
+            .home_runner_lease_id
+            .context("cannot restart the frontend without its exact runner lease identity")?;
         let ipc = self
             .ipc_client
             .as_ref()
@@ -5088,11 +5416,7 @@ Rules:\n\
                 error
             );
             let error = self
-                .fail_handoff_and_restore_runner(
-                    &ipc,
-                    Some((brain, environment)),
-                    error,
-                )
+                .fail_handoff_and_restore_runner(&ipc, Some((brain, environment)), error)
                 .await;
             crate::set_tui_active(true);
             self.tui_renderer
@@ -5119,40 +5443,69 @@ Rules:\n\
     fn spawn_deferred_proposal(
         &self,
         query_id: Uuid,
+        round_token: ToolRoundToken,
         tool_id: String,
         proposal: DeferredProposal,
         approval_audience: Option<crate::brain::store::BrainApprovalAudience>,
+        cancellation_token: tokio_util::sync::CancellationToken,
     ) {
+        let Some(round_permit) = self
+            .tool_coordinator
+            .register_round_work(query_id, round_token)
+        else {
+            return;
+        };
         let event_tx = self.event_tx.clone();
         let runtime = Arc::clone(&self.program_runtime);
-        tokio::spawn(async move {
-            let result = async {
-                let intent = approval_audience
-                    .as_ref()
-                    .map(|audience| {
-                        format!(
-                            "{}\n\n{}",
-                            proposal.intent,
-                            approval_audience_summary(audience)
-                        )
-                    })
-                    .unwrap_or_else(|| proposal.intent.clone());
-                let decision = crate::tools::implementations::propose::propose_artifact_with_decision(
-                    &proposal.language,
-                    &intent,
-                    &proposal.source,
-                )
-                .await?;
-                let outcome = resume_deferred_proposal(runtime.as_ref(), &proposal, decision).await?;
-                Ok::<_, anyhow::Error>(serde_json::to_string(&outcome)?)
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _round_permit = round_permit;
+            let _ = start_rx.await;
+            if cancellation_token.is_cancelled() {
+                return;
             }
+            let intent = approval_audience
+                .as_ref()
+                .map(|audience| {
+                    format!(
+                        "{}\n\n{}",
+                        proposal.intent,
+                        approval_audience_summary(audience)
+                    )
+                })
+                .unwrap_or_else(|| proposal.intent.clone());
+            // Once the editor is open, keep this task live until it exits. A
+            // dropped child wait does not guarantee that the editor process
+            // stopped, so terminal cancellation joins it before publishing.
+            let decision = crate::tools::implementations::propose::propose_artifact_with_decision(
+                &proposal.language,
+                &intent,
+                &proposal.source,
+            )
             .await;
+            let result = match decision {
+                Ok(decision) if !cancellation_token.is_cancelled() => {
+                    resume_deferred_proposal(runtime.as_ref(), &proposal, decision)
+                        .await
+                        .and_then(|outcome| {
+                            serde_json::to_string(&outcome).map_err(anyhow::Error::from)
+                        })
+                }
+                Ok(_) => return,
+                Err(error) => Err(error),
+            };
+            if cancellation_token.is_cancelled() {
+                return;
+            }
             let _ = event_tx.send(ReplEvent::ToolResult {
                 query_id,
+                round_token,
                 tool_id,
                 result,
             });
         });
+        drop(handle);
+        let _ = start_tx.send(());
     }
 
     /// Resolve a capability prompt emitted through provider-native
@@ -5162,39 +5515,61 @@ Rules:\n\
     fn spawn_deferred_vm_approval(
         &self,
         query_id: Uuid,
+        round_token: ToolRoundToken,
         tool_id: String,
         approval: DeferredVmApproval,
+        cancellation_token: tokio_util::sync::CancellationToken,
     ) {
+        let Some(round_permit) = self
+            .tool_coordinator
+            .register_round_work(query_id, round_token)
+        else {
+            return;
+        };
         let event_tx = self.event_tx.clone();
         let runtime = Arc::clone(&self.program_runtime);
-        tokio::spawn(async move {
-            let result = async {
-                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-                event_tx
-                    .send(ReplEvent::VmApprovalNeeded {
-                        prompt: approval.prompt.clone(),
-                        response_tx,
-                    })
-                    .map_err(|_| anyhow::anyhow!("VM approval UI is unavailable"))?;
-                let choice = response_rx
-                    .await
-                    .map_err(|_| anyhow::anyhow!("VM approval dialog was cancelled"))?;
-                let outcome = runtime
-                    .resolve_typed_approval(
-                        &approval.prompt,
-                        choice,
-                        "interactive-tool-user",
-                    )
-                    .await?;
-                Ok::<_, anyhow::Error>(serde_json::to_string(&outcome)?)
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _round_permit = round_permit;
+            let _ = start_rx.await;
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            if event_tx
+                .send(ReplEvent::VmApprovalNeeded {
+                    query_id: Some(query_id),
+                    prompt: approval.prompt.clone(),
+                    response_tx,
+                })
+                .is_err()
+            {
+                return;
             }
-            .await;
+            let choice = tokio::select! {
+                biased;
+                _ = cancellation_token.cancelled() => return,
+                choice = response_rx => match choice {
+                    Ok(choice) => choice,
+                    Err(_) => return,
+                },
+            };
+            if cancellation_token.is_cancelled() {
+                return;
+            }
+            let result = runtime
+                .resolve_typed_approval(&approval.prompt, choice, "interactive-tool-user")
+                .await
+                .and_then(|outcome| serde_json::to_string(&outcome).map_err(anyhow::Error::from));
+            if cancellation_token.is_cancelled() {
+                return;
+            }
             let _ = event_tx.send(ReplEvent::ToolResult {
                 query_id,
+                round_token,
                 tool_id,
                 result,
             });
         });
+        drop(handle);
+        let _ = start_tx.send(());
     }
 
     // ── Diff proposal rendering ───────────────────────────────────────────────
@@ -5437,9 +5812,10 @@ Rules:\n\
         };
         let (target, mut client, invited) = match route {
             BrainAttachmentRoute::LocalIpc { brain } => {
-                let ipc = self.ipc_client.clone().context(
-                    "local Brain attachment requires the connected daemon IPC socket",
-                )?;
+                let ipc = self
+                    .ipc_client
+                    .clone()
+                    .context("local Brain attachment requires the connected daemon IPC socket")?;
                 let mut target = self
                     .home_brain
                     .as_ref()
@@ -5559,11 +5935,7 @@ Rules:\n\
         Ok(())
     }
 
-    async fn handle_brain_invite(
-        &mut self,
-        role: String,
-        ttl_minutes: Option<u64>,
-    ) -> Result<()> {
+    async fn handle_brain_invite(&mut self, role: String, ttl_minutes: Option<u64>) -> Result<()> {
         if self.active_remote_brain.is_some() {
             anyhow::bail!(
                 "issue invitations from the Brain owner's home console, not through a guest attachment"
@@ -5583,10 +5955,8 @@ Rules:\n\
             .daemon_base_url
             .as_deref()
             .context("this console is not connected to its local daemon")?;
-        let target = crate::brain::remote::RemoteBrainTarget::local(
-            &home.target.brain,
-            daemon_base_url,
-        )?;
+        let target =
+            crate::brain::remote::RemoteBrainTarget::local(&home.target.brain, daemon_base_url)?;
         let config = crate::config::load_config().context("load Brain collaboration settings")?;
         anyhow::ensure!(
             config.server.advertise,
@@ -5640,11 +6010,9 @@ Rules:\n\
         self.todo_journal_target.set(self.home_brain.clone());
         if let Some(home) = self.home_brain.as_ref() {
             let snapshot = home.snapshot().await?;
-            self.render_remote_brain_message(
-                crate::brain::store::BrainWireMessage::Snapshot {
-                    brain: snapshot.clone(),
-                },
-            )
+            self.render_remote_brain_message(crate::brain::store::BrainWireMessage::Snapshot {
+                brain: snapshot.clone(),
+            })
             .await?;
             if let Some(home) = self.home_brain.as_mut() {
                 home.acknowledge(snapshot.revision).await?;
@@ -5731,10 +6099,7 @@ Rules:\n\
             .is_some_and(|client| client.target.display_name() == target)
     }
 
-    async fn push_remote_brain(
-        &mut self,
-        kind: crate::brain::store::BrainEventKind,
-    ) -> Result<()> {
+    async fn push_remote_brain(&mut self, kind: crate::brain::store::BrainEventKind) -> Result<()> {
         let Some(client) = self.selected_brain().cloned() else {
             return Ok(());
         };
@@ -5882,9 +6247,9 @@ Rules:\n\
                             .unwrap_or(serde_json::Value::Null),
                     }),
                     "vm_capability" => {
-                        let Ok(prompt) = serde_json::from_value::<crate::vm::ApprovalPrompt>(
-                            detail.clone(),
-                        ) else {
+                        let Ok(prompt) =
+                            serde_json::from_value::<crate::vm::ApprovalPrompt>(detail.clone())
+                        else {
                             self.output_manager.write_error(format!(
                                 "approval {approval_id} has an invalid VM capability prompt"
                             ));
@@ -5945,9 +6310,11 @@ Rules:\n\
                 summary.push_str(&approval_audience_summary(&pending.audience));
                 crate::cli::tui::Dialog::tool_approval(&tool_use.name, &summary)
             }
-            RemoteBrainApprovalKind::Vm { prompt, .. } => {
-                vm_approval_dialog(prompt, Some(&pending.audience), self.program_runtime.as_ref())
-            }
+            RemoteBrainApprovalKind::Vm { prompt, .. } => vm_approval_dialog(
+                prompt,
+                Some(&pending.audience),
+                self.program_runtime.as_ref(),
+            ),
         };
         self.active_remote_brain_approval = Some(pending);
         tui.active_dialog = Some(dialog);
@@ -6380,6 +6747,9 @@ Rules:\n\
             return Ok(());
         }
         let mut tui = self.tui_renderer.lock().await;
+        if !tui.is_active() {
+            return Ok(());
+        }
 
         // After returning from an external editor, call resume() to reset
         // active_rows so the TUI live area repaints from scratch.
@@ -6437,9 +6807,28 @@ Rules:\n\
     async fn handle_tool_result(
         &mut self,
         query_id: Uuid,
+        round_token: ToolRoundToken,
         tool_id: String,
         result: Result<String>,
     ) -> Result<()> {
+        let progress = match self.conversation.write().await.record_tool_result(
+            query_id,
+            round_token,
+            &tool_id,
+            &result,
+        ) {
+            Ok(progress) => progress,
+            Err(error) => {
+                tracing::warn!(
+                    "Ignoring rejected tool result for query {} tool {}: {}",
+                    query_id,
+                    tool_id,
+                    error
+                );
+                return Ok(());
+            }
+        };
+
         // Look up the tool's WorkUnit and row index
         let (tool_name, tool_input, work_unit, row_idx) = {
             let mut map = self.active_tool_uses.write().await;
@@ -6479,9 +6868,8 @@ Rules:\n\
                         .get("language")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("inferred");
-                    if let Some(source) = tool_input
-                        .get("source")
-                        .and_then(serde_json::Value::as_str)
+                    if let Some(source) =
+                        tool_input.get("source").and_then(serde_json::Value::as_str)
                     {
                         let mut source_body = vec![format!("VM source ({language}):")];
                         source_body.extend(source.lines().map(str::to_owned));
@@ -6536,33 +6924,20 @@ Rules:\n\
         let current_mode = self.mode.read().await.clone();
         self.update_plan_mode_indicator(&current_mode);
 
-        // Store tool result
-        self.tool_results
-            .write()
-            .await
-            .entry(query_id)
-            .or_insert_with(Vec::new)
-            .push((tool_id, result));
-
         // Check if all tools for this query have completed
         let metadata = self.query_states.get_metadata(query_id).await;
         if let Some(meta) = metadata {
-            if let QueryState::ExecutingTools { tools_pending, .. } = meta.state {
-                let results_count = self
-                    .tool_results
-                    .read()
-                    .await
-                    .get(&query_id)
-                    .map(|v| v.len())
-                    .unwrap_or(0);
-
-                if results_count >= tools_pending {
-                    // Keep the query-level Tools unit live while the provider
-                    // consumes these results. A later tool round appends rows
-                    // to the same unit; a final wire program closes it before
-                    // opening the distinct program-source unit.
-                    self.finalize_tool_execution(query_id).await?;
-                }
+            if matches!(meta.state, QueryState::ExecutingTools { .. })
+                && progress == ToolRoundProgress::Complete
+            {
+                self.tool_coordinator
+                    .close_and_wait_for_round(query_id, round_token)
+                    .await;
+                // Keep the query-level Tools unit live while the provider
+                // consumes these results. A later tool round appends rows
+                // to the same unit; a final wire program closes it before
+                // opening the distinct program-source unit.
+                self.finalize_tool_execution(query_id, round_token).await?;
             }
         }
 
@@ -6570,14 +6945,27 @@ Rules:\n\
     }
 
     /// Finalize tool execution (all tools complete, re-invoke Claude)
-    async fn finalize_tool_execution(&mut self, query_id: Uuid) -> Result<()> {
-        // Get all tool results for this query
-        let results = self
-            .tool_results
-            .write()
+    async fn finalize_tool_execution(
+        &mut self,
+        query_id: Uuid,
+        round_token: ToolRoundToken,
+    ) -> Result<()> {
+        let results = match self
+            .conversation
+            .read()
             .await
-            .remove(&query_id)
-            .unwrap_or_default();
+            .completed_tool_results(query_id, round_token)
+        {
+            Ok(results) => results,
+            Err(error) => {
+                tracing::warn!(
+                    "Tool round {} was not ready to finalize: {}",
+                    query_id,
+                    error
+                );
+                return Ok(());
+            }
+        };
 
         // Sync the plan mode status bar.  handle_present_plan() updates the mode Arc
         // but is a free function without &self access, so the indicator update happens here.
@@ -6590,13 +6978,9 @@ Rules:\n\
         // task and re-explores instead of implementing). Reset to a clean context
         // with just the execution directive.
         if matches!(current_mode, ReplMode::Executing { .. }) {
-            let plan_directive = results.iter().find_map(|(_, r)| {
-                if let Ok(content) = r {
-                    if content.starts_with("Plan approved by user.") {
-                        Some(content.clone())
-                    } else {
-                        None
-                    }
+            let plan_directive = results.iter().find_map(|result| {
+                if !result.is_error && result.content.starts_with("Plan approved by user.") {
+                    Some(result.content.clone())
                 } else {
                     None
                 }
@@ -6607,61 +6991,82 @@ Rules:\n\
                 // trigger loop detection when Claude calls them again during execution.
                 self.tool_call_history.write().await.remove(&query_id);
 
-                // Reset conversation to a single clear execution prompt.
+                let (admit_tx, admit_rx) = tokio::sync::oneshot::channel();
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                let (spawned_tx, spawned_rx) = tokio::sync::oneshot::channel();
+                if self
+                    .llm_tx
+                    .send(LlmRequest::Query {
+                        id: query_id,
+                        text: String::new(),
+                        no_tools: false,
+                        admission: Some(admit_rx),
+                        admission_ready: Some(ready_tx),
+                        spawned: Some(spawned_tx),
+                    })
+                    .is_err()
+                {
+                    self.conversation.write().await.abort_staged(query_id);
+                    let _ = self.event_tx.send(ReplEvent::QueryFailed {
+                        query_id,
+                        error: "frontend LLM worker is unavailable".into(),
+                        kind: QueryFailureKind::Ordinary,
+                    });
+                    return Ok(());
+                }
+                if !matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx).await,
+                    Ok(Ok(()))
+                ) {
+                    self.conversation.write().await.abort_staged(query_id);
+                    let _ = self.event_tx.send(ReplEvent::QueryFailed {
+                        query_id,
+                        error: "frontend LLM worker stopped before continuation admission".into(),
+                        kind: QueryFailureKind::Ordinary,
+                    });
+                    return Ok(());
+                }
+
+                // Reset conversation to a single clear execution prompt only
+                // after continuation admission is guaranteed.
                 {
                     let mut conv = self.conversation.write().await;
                     conv.clear();
                     conv.add_user_message(directive);
                 }
-
-                let _ = self.llm_tx.send(LlmRequest::Query {
-                    id: query_id,
-                    text: String::new(),
-                    no_tools: false,
-                });
+                let _ = admit_tx.send(());
+                if !matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), spawned_rx).await,
+                    Ok(Ok(()))
+                ) {
+                    let _ = self.event_tx.send(ReplEvent::QueryFailed {
+                        query_id,
+                        error: "frontend LLM worker stopped before continuation spawn".into(),
+                        kind: QueryFailureKind::Ordinary,
+                    });
+                }
                 return Ok(());
             }
         }
 
-        // ── Normal path: build ToolResult message and continue ────────────────
-        // Create a user message with proper ToolResult content blocks
-        let mut content_blocks = Vec::new();
-        for (tool_id, result) in results {
-            match result {
-                Ok(content) => {
-                    content_blocks.push(ContentBlock::ToolResult {
-                        tool_use_id: tool_id,
-                        content,
-                        is_error: None,
-                    });
-                }
-                Err(e) => {
-                    content_blocks.push(ContentBlock::ToolResult {
-                        tool_use_id: tool_id,
-                        content: e.to_string(),
-                        is_error: Some(true),
-                    });
-                }
+        let committed =
+            commit_tool_round_and_continue(&self.conversation, query_id, round_token, &self.llm_tx)
+                .await;
+        if let Err(error) = committed {
+            tracing::warn!(
+                "Ignoring rejected tool-round commit for query {}: {}",
+                query_id,
+                error
+            );
+            if error == crate::cli::conversation::ToolRoundError::ContinuationUnavailable {
+                let _ = self.event_tx.send(ReplEvent::QueryFailed {
+                    query_id,
+                    error: error.to_string(),
+                    kind: QueryFailureKind::Ordinary,
+                });
             }
+            return Ok(());
         }
-
-        // Add tool results to conversation as a proper message
-        let tool_result_message = crate::claude::Message {
-            role: "user".to_string(),
-            content: content_blocks,
-        };
-
-        self.conversation
-            .write()
-            .await
-            .add_message(tool_result_message);
-
-        // Send tool-continuation turn to the LLM worker loop
-        let _ = self.llm_tx.send(LlmRequest::Query {
-            id: query_id,
-            text: String::new(),
-            no_tools: false,
-        });
 
         Ok(())
     }
@@ -6708,8 +7113,7 @@ Rules:\n\
             crate::poset::NodeAuthor::User,
         );
 
-        self.tui_renderer.lock().await.poset_panel_mode =
-            crate::cli::tui::PosetPanelMode::Graph;
+        self.tui_renderer.lock().await.poset_panel_mode = crate::cli::tui::PosetPanelMode::Graph;
         self.render_tui().await
     }
 
@@ -6956,11 +7360,10 @@ Rules:\n\
         } else {
             removed.label
         };
-        self.output_manager
-            .write_info(format!(
-                "📚 removed W{} → \"{preview}\"   nodes:{depth}",
-                removed.id
-            ));
+        self.output_manager.write_info(format!(
+            "📚 removed W{} → \"{preview}\"   nodes:{depth}",
+            removed.id
+        ));
         self.render_tui().await
     }
 
@@ -7148,9 +7551,7 @@ Rules:\n\
             .pending_named_brain_turns
             .get(&query_id)
             .and_then(|turn| turn.approval_tx.clone());
-        if let (Some(approval_tx), Some(audience)) =
-            (approval_tx, approval_audience.as_ref())
-        {
+        if let (Some(approval_tx), Some(audience)) = (approval_tx, approval_audience.as_ref()) {
             let event = crate::server::RunnerTurnEvent::ApprovalRequested {
                 approval_id: tool_use.id.clone(),
                 approval_kind: "tool".to_string(),
@@ -7174,9 +7575,7 @@ Rules:\n\
                     .await
                     .ok()
                     .and_then(|result| result.ok())
-                    .and_then(|decision| {
-                        confirmation_from_audit_value(&decision, &tool_use).ok()
-                    })
+                    .and_then(|decision| confirmation_from_audit_value(&decision, &tool_use).ok())
                     .unwrap_or(super::events::ConfirmationResult::Deny);
                 let _ = response_tx.send(confirmation);
             });
@@ -7263,8 +7662,9 @@ Rules:\n\
                 approval_kind: "vm_capability".to_string(),
                 subject: format!("{:?}", prompt.exact.capability),
                 audience,
-                detail: serde_json::to_value(&prompt)
-                    .unwrap_or_else(|_| serde_json::json!({"reason": prompt.request.reason.clone()})),
+                detail: serde_json::to_value(&prompt).unwrap_or_else(
+                    |_| serde_json::json!({"reason": prompt.request.reason.clone()}),
+                ),
             };
             let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
             if approval_tx
@@ -7296,9 +7696,9 @@ Rules:\n\
                         approval_kind: "vm_capability".to_string(),
                         subject: format!("{:?}", prompt.exact.capability),
                         audience: turn.approval_audience.clone(),
-                        detail: serde_json::to_value(&prompt).unwrap_or_else(|_| {
-                            serde_json::json!({"reason": prompt.request.reason.clone()})
-                        }),
+                        detail: serde_json::to_value(&prompt).unwrap_or_else(
+                            |_| serde_json::json!({"reason": prompt.request.reason.clone()}),
+                        ),
                     });
             }
         }
@@ -7691,7 +8091,9 @@ fn project_brain_context(
         );
     }
     for index in count..8 {
-        status_bar.remove_line(&crate::cli::status_bar::StatusLineType::BrainContextLine(index));
+        status_bar.remove_line(&crate::cli::status_bar::StatusLineType::BrainContextLine(
+            index,
+        ));
     }
 }
 
@@ -8113,9 +8515,7 @@ pub(crate) fn dialog_result_to_confirmation(
     }
 }
 
-fn confirmation_audit_value(
-    confirmation: &super::events::ConfirmationResult,
-) -> serde_json::Value {
+fn confirmation_audit_value(confirmation: &super::events::ConfirmationResult) -> serde_json::Value {
     use super::events::ConfirmationResult;
 
     match confirmation {
@@ -8289,6 +8689,2326 @@ fn parse_hunk_header(line: &str) -> anyhow::Result<(usize, usize)> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct AtomicRoundGenerator {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::generators::Generator for AtomicRoundGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let (text, content_blocks, tool_uses) = if call == 0 {
+                let tool_use = crate::generators::ToolUse {
+                    id: "atomic-tool-1".into(),
+                    name: "atomic_echo".into(),
+                    input: serde_json::json!({"text": "hello"}),
+                };
+                (
+                    String::new(),
+                    vec![crate::claude::ContentBlock::ToolUse {
+                        id: tool_use.id.clone(),
+                        name: tool_use.name.clone(),
+                        input: tool_use.input.clone(),
+                    }],
+                    vec![tool_use],
+                )
+            } else {
+                let text = "(say \"done\")".to_string();
+                (
+                    text.clone(),
+                    vec![crate::claude::ContentBlock::text(text)],
+                    Vec::new(),
+                )
+            };
+            Ok(crate::generators::GeneratorResponse {
+                text,
+                content_blocks,
+                tool_uses,
+                metadata: crate::generators::ResponseMetadata {
+                    generator: "atomic-test".into(),
+                    model: "atomic-test".into(),
+                    confidence: None,
+                    stop_reason: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                },
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<
+            Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+        > {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPABILITIES: crate::generators::GeneratorCapabilities =
+                crate::generators::GeneratorCapabilities {
+                    supports_streaming: false,
+                    supports_tools: true,
+                    supports_conversation: true,
+                    max_context_messages: Some(32),
+                };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "atomic-test"
+        }
+    }
+
+    struct AtomicToolBarrier {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        returned: tokio::sync::Notify,
+    }
+
+    struct AtomicEchoTool {
+        barrier: Option<Arc<AtomicToolBarrier>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::registry::Tool for AtomicEchoTool {
+        fn name(&self) -> &str {
+            "atomic_echo"
+        }
+
+        fn description(&self) -> &str {
+            "Return the supplied text"
+        }
+
+        fn input_schema(&self) -> crate::tools::types::ToolInputSchema {
+            crate::tools::types::ToolInputSchema::simple(vec![("text", "Text to return")])
+        }
+
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _context: &crate::tools::types::ToolContext<'_>,
+        ) -> anyhow::Result<String> {
+            if let Some(barrier) = &self.barrier {
+                barrier.started.notify_one();
+                barrier.release.notified().await;
+                barrier.returned.notify_one();
+                let execution_id = uuid::Uuid::new_v4();
+                let effect = crate::vm::VmSideEffect {
+                    protocol_version: crate::vm::VM_TYPE_SYSTEM_VERSION,
+                    sequence: 0,
+                    requirement: crate::vm::CapabilityRequirement {
+                        capability: crate::vm::CapabilityKind::SessionEmit,
+                        selector: crate::vm::ResourceSelector::None,
+                    },
+                    event: crate::vm::HostSideEffect::Emit {
+                        text: "completed once".into(),
+                    },
+                    output: Vec::new(),
+                    origin: crate::vm::SourceOrigin::generated("cancelled-tool-test"),
+                };
+                let outcome = crate::runtime::outcome::ExecutionOutcome {
+                    execution_id,
+                    status: crate::runtime::outcome::ExecutionStatus::Completed,
+                    values: Vec::new(),
+                    output: "hello".into(),
+                    output_chunks: Vec::new(),
+                    side_effects: vec![effect.event.clone()],
+                    vm_side_effects: vec![effect.clone()],
+                    effect_journal: vec![crate::vm::EffectJournalEntry {
+                        effect,
+                        state: crate::vm::EffectJournalState::Acknowledged { values: Vec::new() },
+                    }],
+                    diagnostics: Vec::new(),
+                    vm_diagnostics: Vec::new(),
+                    inferred_capabilities: Vec::new(),
+                    required_capabilities: Vec::new(),
+                    approval_prompts: Vec::new(),
+                    input_revision: 0,
+                    output_revision: 0,
+                    effect: crate::programs::ExecutionEffect::ExternalWrite,
+                    backend: crate::runtime::outcome::ExecutionBackend::TypedVm,
+                    elapsed_ms: 0,
+                };
+                return serde_json::to_string(&outcome).map_err(anyhow::Error::from);
+            }
+            Ok(input["text"].as_str().unwrap_or_default().to_string())
+        }
+    }
+
+    struct DisconnectStreamingGenerator {
+        stream_calls: AtomicUsize,
+        started: tokio::sync::Notify,
+        held_streams: std::sync::Mutex<
+            Vec<tokio::sync::mpsc::Sender<anyhow::Result<crate::generators::StreamChunk>>>,
+        >,
+    }
+
+    struct DisconnectRepairGenerator {
+        calls: AtomicUsize,
+        repair_started: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::generators::Generator for DisconnectRepairGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Ok(generator_response(
+                    "```lisp\n(say \"must not run\")\n```",
+                    Vec::new(),
+                ));
+            }
+            if call == 1 {
+                self.repair_started.notify_one();
+                return std::future::pending().await;
+            }
+            Ok(generator_response("(say \"next query works\")", Vec::new()))
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<
+            Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+        > {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            nonstreaming_test_capabilities()
+        }
+
+        fn name(&self) -> &str {
+            "disconnect-repair"
+        }
+    }
+
+    struct NamedApprovalGenerator {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::generators::Generator for NamedApprovalGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) != 0 {
+                return Ok(generator_response("(say \"next query works\")", Vec::new()));
+            }
+            let tool = crate::generators::ToolUse {
+                id: "approval-tool".into(),
+                name: "atomic_echo".into(),
+                input: serde_json::json!({"text": "must not execute"}),
+            };
+            Ok(crate::generators::GeneratorResponse {
+                text: String::new(),
+                content_blocks: vec![crate::claude::ContentBlock::ToolUse {
+                    id: tool.id.clone(),
+                    name: tool.name.clone(),
+                    input: tool.input.clone(),
+                }],
+                tool_uses: vec![tool],
+                metadata: test_response_metadata("named-approval"),
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<
+            Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+        > {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            nonstreaming_test_capabilities()
+        }
+
+        fn name(&self) -> &str {
+            "named-approval"
+        }
+    }
+
+    struct NamedPanicGenerator {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::generators::Generator for NamedPanicGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("scripted named provider panic")
+            }
+            Ok(generator_response("(say \"next query works\")", Vec::new()))
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<
+            Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+        > {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            nonstreaming_test_capabilities()
+        }
+
+        fn name(&self) -> &str {
+            "named-panic"
+        }
+    }
+
+    struct NamedSuccessGenerator;
+
+    #[async_trait::async_trait]
+    impl crate::generators::Generator for NamedSuccessGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            Ok(generator_response("(say \"named success\")", Vec::new()))
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<
+            Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+        > {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            nonstreaming_test_capabilities()
+        }
+
+        fn name(&self) -> &str {
+            "named-success"
+        }
+    }
+
+    fn test_response_metadata(name: &str) -> crate::generators::ResponseMetadata {
+        crate::generators::ResponseMetadata {
+            generator: name.into(),
+            model: name.into(),
+            confidence: None,
+            stop_reason: None,
+            input_tokens: None,
+            output_tokens: None,
+            latency_ms: None,
+        }
+    }
+
+    fn generator_response(
+        text: &str,
+        tool_uses: Vec<crate::generators::ToolUse>,
+    ) -> crate::generators::GeneratorResponse {
+        crate::generators::GeneratorResponse {
+            text: text.into(),
+            content_blocks: vec![crate::claude::ContentBlock::text(text)],
+            tool_uses,
+            metadata: test_response_metadata("physical-named-test"),
+        }
+    }
+
+    fn nonstreaming_test_capabilities() -> &'static crate::generators::GeneratorCapabilities {
+        static CAPABILITIES: crate::generators::GeneratorCapabilities =
+            crate::generators::GeneratorCapabilities {
+                supports_streaming: false,
+                supports_tools: true,
+                supports_conversation: true,
+                max_context_messages: Some(32),
+            };
+        &CAPABILITIES
+    }
+
+    #[async_trait::async_trait]
+    impl crate::generators::Generator for DisconnectStreamingGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            let text = "(say \"next query works\")".to_string();
+            Ok(crate::generators::GeneratorResponse {
+                text: text.clone(),
+                content_blocks: vec![crate::claude::ContentBlock::text(text)],
+                tool_uses: Vec::new(),
+                metadata: crate::generators::ResponseMetadata {
+                    generator: "disconnect-stream".into(),
+                    model: "disconnect-stream".into(),
+                    confidence: None,
+                    stop_reason: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    latency_ms: None,
+                },
+            })
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<crate::tools::types::ToolDefinition>>,
+        ) -> anyhow::Result<
+            Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+        > {
+            if self.stream_calls.fetch_add(1, Ordering::SeqCst) != 0 {
+                return Ok(None);
+            }
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            self.held_streams.lock().unwrap().push(tx);
+            self.started.notify_one();
+            Ok(Some(rx))
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPABILITIES: crate::generators::GeneratorCapabilities =
+                crate::generators::GeneratorCapabilities {
+                    supports_streaming: true,
+                    supports_tools: true,
+                    supports_conversation: true,
+                    max_context_messages: Some(32),
+                };
+            &CAPABILITIES
+        }
+
+        fn name(&self) -> &str {
+            "disconnect-stream"
+        }
+    }
+
+    async fn atomic_boundary_event_loop(
+        generator: Arc<dyn crate::generators::Generator>,
+        tool_barrier: Option<Arc<AtomicToolBarrier>>,
+    ) -> super::EventLoop {
+        let conversation = Arc::new(tokio::sync::RwLock::new(
+            crate::cli::conversation::ConversationHistory::new(),
+        ));
+        let output = Arc::new(crate::cli::OutputManager::default());
+        output.disable_stdout();
+        let status = Arc::new(crate::cli::StatusBar::new());
+        let tui = crate::cli::tui::TuiRenderer::new_headless(
+            Arc::clone(&output),
+            Arc::clone(&status),
+            crate::config::ColorScheme::default(),
+        );
+        let mut registry = crate::tools::registry::ToolRegistry::new();
+        registry.register(Box::new(AtomicEchoTool {
+            barrier: tool_barrier,
+        }));
+        let executor = crate::tools::executor::ToolExecutor::new(
+            registry,
+            crate::tools::permissions::PermissionManager::new()
+                .with_default_rule(crate::tools::permissions::PermissionRule::Allow),
+            tempfile::NamedTempFile::new().unwrap().path().to_path_buf(),
+        )
+        .unwrap();
+        let runtime = Arc::new(crate::runtime::ProgramRuntime::new());
+        let generator_dyn = generator;
+        let resolver = crate::runtime::scheduler::ProviderResolver::new(Arc::clone(&generator_dyn));
+        let scheduler =
+            crate::runtime::scheduler::AgentScheduler::new(resolver.clone(), Arc::clone(&runtime));
+        let todo = Arc::new(tokio::sync::RwLock::new(
+            crate::tools::todo::TodoList::default(),
+        ));
+        let (_todo_writer, todo_target, todo_receiver) =
+            crate::tools::todo::todo_journal(Arc::clone(&todo));
+        super::EventLoop::new(
+            conversation,
+            Arc::new(tokio::sync::RwLock::new(crate::config::Persona::default())),
+            Arc::clone(&generator_dyn),
+            Arc::clone(&generator_dyn),
+            Arc::new(crate::router::Router::new(
+                crate::models::ThresholdRouter::new(),
+            )),
+            Arc::new(tokio::sync::RwLock::new(
+                crate::models::GeneratorState::NotAvailable,
+            )),
+            vec![crate::tools::types::ToolDefinition {
+                name: "atomic_echo".into(),
+                description: "Return the supplied text".into(),
+                input_schema: crate::tools::types::ToolInputSchema::simple(vec![(
+                    "text",
+                    "Text to return",
+                )]),
+            }],
+            Arc::new(tokio::sync::Mutex::new(executor)),
+            runtime,
+            tui,
+            output,
+            status,
+            false,
+            Arc::new(tokio::sync::RwLock::new(crate::local::LocalGenerator::new())),
+            Arc::new(crate::models::TextTokenizer::stub().unwrap()),
+            None,
+            None,
+            Arc::new(tokio::sync::RwLock::new(crate::cli::repl::ReplMode::Normal)),
+            None,
+            "atomic-boundary".into(),
+            Vec::new(),
+            0,
+            None,
+            0,
+            0,
+            0,
+            todo,
+            todo_target,
+            todo_receiver,
+            false,
+            false,
+            None,
+            resolver,
+            scheduler,
+            false,
+        )
+    }
+
+    struct PhysicalNamedHarness {
+        event_loop: super::EventLoop,
+        memory: Arc<crate::memory::MemorySystem>,
+        client: Option<crate::ipc::IpcClient>,
+        attachment: crate::brain::store::BrainAttachment,
+        lease: crate::brain::store::BrainRunnerLease,
+        server: Arc<crate::server::AgentServer>,
+        _observer_client: Option<crate::ipc::IpcClient>,
+        _runner_watch: tokio::sync::mpsc::UnboundedReceiver<
+            anyhow::Result<crate::brain::store::BrainWireMessage>,
+        >,
+        _observer_watch: tokio::sync::mpsc::UnboundedReceiver<
+            anyhow::Result<crate::brain::store::BrainWireMessage>,
+        >,
+        observer_attachment: crate::brain::store::BrainAttachment,
+        local_snapshot: Vec<crate::claude::Message>,
+        worker: tokio::task::JoinHandle<()>,
+        server_task: tokio::task::JoinHandle<anyhow::Result<()>>,
+        _observer_server_task: tokio::task::JoinHandle<anyhow::Result<()>>,
+        _memory_file: tempfile::NamedTempFile,
+        _state_root: tempfile::TempDir,
+        phase: Arc<AtomicUsize>,
+    }
+
+    const PHYSICAL_SETUP: usize = 1;
+    const PHYSICAL_RUNNER_TRANSPORT: usize = 2;
+    const PHYSICAL_OBSERVER_TRANSPORT: usize = 3;
+    const PHYSICAL_RUNNER_IDENTITY: usize = 4;
+    const PHYSICAL_RUNNER_LEASE: usize = 5;
+    const PHYSICAL_DRIVER_ATTACHMENT: usize = 6;
+    const PHYSICAL_RUNNER_READY: usize = 7;
+    const PHYSICAL_NAMED_REQUEST: usize = 8;
+    const PHYSICAL_PROVIDER_CUT: usize = 9;
+    const PHYSICAL_APPROVAL_CUT: usize = 10;
+    const PHYSICAL_TOOL_START_CUT: usize = 11;
+    const PHYSICAL_RPC_DROPPED: usize = 12;
+    const PHYSICAL_CANCEL_EVENT: usize = 13;
+    const PHYSICAL_CANCEL_DRIVEN: usize = 14;
+    const PHYSICAL_DURABLE_TERMINAL: usize = 15;
+    const PHYSICAL_NEXT_QUERY: usize = 16;
+    const PHYSICAL_DONE: usize = 17;
+    const PHYSICAL_SUCCESS_TURN_COMPLETE: usize = 18;
+    const PHYSICAL_SUCCESS_MEMORY_PROJECTION: usize = 19;
+    const PHYSICAL_SUCCESS_CALLBACK_COMPLETE: usize = 20;
+
+    async fn drive_event_with_deadline(
+        event_loop: &mut super::EventLoop,
+        event: super::ReplEvent,
+        phase: &'static str,
+    ) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            event_loop.drive_one(event),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("event-loop drive timed out during {phase}"))
+        .unwrap();
+    }
+
+    impl PhysicalNamedHarness {
+        async fn new(
+            generator: Arc<dyn crate::generators::Generator>,
+            streaming: bool,
+            tool_barrier: Option<Arc<AtomicToolBarrier>>,
+            phase: Arc<AtomicUsize>,
+        ) -> Self {
+            phase.store(PHYSICAL_SETUP, Ordering::SeqCst);
+            let mut event_loop = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                atomic_boundary_event_loop(generator, tool_barrier),
+            )
+            .await
+            .expect("physical fixture EventLoop construction timed out");
+            let memory_file = tempfile::NamedTempFile::new().unwrap();
+            let memory = Arc::new(
+                crate::memory::MemorySystem::new(crate::memory::MemoryConfig {
+                    db_path: memory_file.path().to_path_buf(),
+                    use_neural_embeddings: false,
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+            event_loop.memory_system = Some(Arc::clone(&memory));
+            event_loop.streaming_enabled = streaming;
+            event_loop
+                .conversation
+                .write()
+                .await
+                .add_user_message("local history sentinel".into());
+            let local_snapshot = event_loop.conversation.read().await.snapshot();
+            let state_root = tempfile::tempdir().unwrap();
+            let store = crate::brain::store::BrainStore::with_root(
+                "box.local",
+                Some(state_root.path().join("brains")),
+            );
+            let initial = store.snapshot("shared").unwrap();
+            let server = Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    store,
+                    crate::brain::credential::BrainCredentialAuthority::ephemeral([23; 32]),
+                    "test-password".into(),
+                    state_root.path(),
+                )
+                .unwrap(),
+            );
+            let (client_stream, server_stream) = tokio::net::UnixStream::pair().unwrap();
+            let server_for_connection = Arc::clone(&server);
+            let server_task = tokio::task::spawn_local(async move {
+                crate::ipc::server::handle_connection(server_stream, server_for_connection).await
+            });
+            phase.store(PHYSICAL_RUNNER_TRANSPORT, Ordering::SeqCst);
+            let client = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::ipc::IpcClient::connect_test_stream(client_stream),
+            )
+            .await
+            .expect("physical runner transport handshake timed out")
+            .expect("physical runner transport handshake failed");
+            let (observer_stream, observer_server_stream) = tokio::net::UnixStream::pair().unwrap();
+            let observer_server = Arc::clone(&server);
+            let observer_server_task = tokio::task::spawn_local(async move {
+                crate::ipc::server::handle_connection(observer_server_stream, observer_server).await
+            });
+            phase.store(PHYSICAL_OBSERVER_TRANSPORT, Ordering::SeqCst);
+            let observer_client = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::ipc::IpcClient::connect_test_stream(observer_stream),
+            )
+            .await
+            .expect("physical observer transport handshake timed out")
+            .expect("physical observer transport handshake failed");
+            let observer_attachment = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                observer_client.brain_attach(
+                    "shared",
+                    "observer",
+                    crate::brain::store::AttachmentRole::Observer,
+                    None,
+                ),
+            )
+            .await
+            .expect("physical observer attachment timed out")
+            .expect("physical observer attachment failed");
+            let observer_watch = observer_client
+                .brain_watch("shared", &observer_attachment)
+                .await
+                .expect("physical observer watch failed");
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if server
+                        .brain_store()
+                        .snapshot("shared")
+                        .expect("physical observer activation snapshot")
+                        .attachments
+                        .iter()
+                        .any(|attachment| {
+                            attachment.attachment_id == observer_attachment.attachment_id
+                                && attachment.connected
+                        })
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("physical observer watch activation timed out");
+            phase.store(PHYSICAL_RUNNER_IDENTITY, Ordering::SeqCst);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.brain_claim_runner_identity("runner"),
+            )
+            .await
+            .expect("physical runner identity claim timed out")
+            .expect("physical runner identity claim failed");
+            phase.store(PHYSICAL_RUNNER_LEASE, Ordering::SeqCst);
+            let lease = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.brain_acquire_runner("shared", "runner", &initial.environment, None, 60_000),
+            )
+            .await
+            .expect("physical runner lease acquisition timed out")
+            .expect("physical runner lease acquisition failed");
+            phase.store(PHYSICAL_DRIVER_ATTACHMENT, Ordering::SeqCst);
+            let attachment = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.brain_attach(
+                    "shared",
+                    "runner",
+                    crate::brain::store::AttachmentRole::Driver,
+                    None,
+                ),
+            )
+            .await
+            .expect("physical driver attachment timed out")
+            .expect("physical driver attachment failed");
+            let runner_watch = client
+                .brain_watch("shared", &attachment)
+                .await
+                .expect("physical driver watch failed");
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if server
+                        .brain_store()
+                        .snapshot("shared")
+                        .expect("physical driver activation snapshot")
+                        .attachments
+                        .iter()
+                        .any(|candidate| {
+                            candidate.attachment_id == attachment.attachment_id
+                                && candidate.connected
+                        })
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("physical driver watch activation timed out");
+            event_loop.runner_brain = Some("shared".into());
+            event_loop.home_runner_lease_active = true;
+            event_loop.home_runner_lease_id = Some(lease.lease_id);
+            event_loop.runner_reconnect_target = Some(super::RunnerReconnectTarget {
+                brain: "shared".into(),
+                environment: initial.environment,
+                lease_id: Some(lease.lease_id),
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.register_brain_runner("shared", lease.lease_id, event_loop.event_tx.clone()),
+            )
+            .await
+            .expect("physical runner callback registration timed out")
+            .expect("physical runner callback registration failed");
+            let worker = event_loop.start_llm_worker();
+            phase.store(PHYSICAL_RUNNER_READY, Ordering::SeqCst);
+            Self {
+                event_loop,
+                memory,
+                client: Some(client),
+                attachment,
+                lease,
+                server,
+                _observer_client: Some(observer_client),
+                _runner_watch: runner_watch,
+                _observer_watch: observer_watch,
+                observer_attachment,
+                local_snapshot,
+                worker,
+                server_task,
+                _observer_server_task: observer_server_task,
+                _memory_file: memory_file,
+                _state_root: state_root,
+                phase,
+            }
+        }
+
+        fn submit(&self, prompt: &'static str) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+            let client = self.client.as_ref().unwrap().clone();
+            let attachment = self.attachment.clone();
+            tokio::task::spawn_local(async move {
+                client
+                    .brain_submit(
+                        "shared",
+                        &attachment,
+                        crate::brain::store::BrainEventKind::Prompt {
+                            text: prompt.into(),
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+            })
+        }
+
+        async fn drive_named_request(
+            &mut self,
+            submit_task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+        ) -> uuid::Uuid {
+            self.phase.store(PHYSICAL_NAMED_REQUEST, Ordering::SeqCst);
+            loop {
+                let event = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    async {
+                        tokio::select! {
+                            result = &mut *submit_task => {
+                                match result {
+                                    Ok(Ok(())) => panic!("physical submit completed successfully before the runner callback"),
+                                    Ok(Err(error)) => panic!("physical submit failed before the runner callback: {error:#}"),
+                                    Err(error) => panic!("physical submit task terminated before the runner callback: {error}"),
+                                }
+                            }
+                            event = self.event_loop.event_rx.recv() => event,
+                        }
+                    },
+                )
+                .await
+                .expect("physical named request produced no frontend event")
+                .expect("physical named request closed the frontend event channel");
+                let is_turn = matches!(&event, super::ReplEvent::NamedBrainTurnRequested(_));
+                drive_event_with_deadline(&mut self.event_loop, event, "named request").await;
+                if is_turn {
+                    return self.event_loop.active_query_id.read().await.unwrap();
+                }
+            }
+        }
+
+        async fn disconnect_and_drive_cancel(
+            &mut self,
+            submit_task: tokio::task::JoinHandle<anyhow::Result<()>>,
+        ) {
+            submit_task.abort();
+            let _ = submit_task.await;
+            drop(self.client.take());
+            self.phase.store(PHYSICAL_RPC_DROPPED, Ordering::SeqCst);
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let event = self
+                        .event_loop
+                        .event_rx
+                        .recv()
+                        .await
+                        .expect("physical RPC drop closed the frontend event channel");
+                    let is_disconnect =
+                        matches!(&event, super::ReplEvent::NamedBrainRunCancelRequested(_));
+                    if is_disconnect {
+                        self.phase.store(PHYSICAL_CANCEL_EVENT, Ordering::SeqCst);
+                    }
+                    drive_event_with_deadline(
+                        &mut self.event_loop,
+                        event,
+                        "disconnect cancellation",
+                    )
+                    .await;
+                    if is_disconnect {
+                        self.phase.store(PHYSICAL_CANCEL_DRIVEN, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("physical RPC drop did not drive correlated cancellation within its budget");
+        }
+
+        async fn drive_until_named_tool_approval(
+            &mut self,
+        ) -> (crate::brain::store::BrainId, u64, String) {
+            self.phase.store(PHYSICAL_APPROVAL_CUT, Ordering::SeqCst);
+            loop {
+                let event = self.event_loop.event_rx.recv().await.unwrap();
+                let is_approval = matches!(&event, super::ReplEvent::ToolApprovalNeeded { .. });
+                drive_event_with_deadline(&mut self.event_loop, event, "named approval request")
+                    .await;
+                if is_approval {
+                    break;
+                }
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let snapshot = self.server.brain_store().snapshot("shared").unwrap();
+                    if let Some((request_seq, approval_id)) =
+                        snapshot.events.iter().find_map(|event| match &event.kind {
+                            crate::brain::store::BrainEventKind::ApprovalRequested {
+                                request_seq,
+                                approval_id,
+                                ..
+                            } => Some((*request_seq, approval_id.clone())),
+                            _ => None,
+                        })
+                    {
+                        break (snapshot.brain_id, request_seq, approval_id);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("named approval never crossed the physical IPC boundary")
+        }
+
+        async fn approve_named_tool(&self, request_seq: u64, approval_id: String) {
+            self.client
+                .as_ref()
+                .unwrap()
+                .brain_submit(
+                    "shared",
+                    &self.attachment,
+                    crate::brain::store::BrainEventKind::ApprovalDecided {
+                        request_seq,
+                        approval_id,
+                        decision: serde_json::json!({"choice": "approve_once"}),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn assert_restored_and_lease_preserved(&self, query_id: uuid::Uuid) {
+            assert!(matches!(
+                self.event_loop.query_states.get_state(query_id).await,
+                Some(super::QueryState::Cancelled)
+            ));
+            assert_eq!(
+                serde_json::to_value(self.event_loop.conversation.read().await.snapshot()).unwrap(),
+                serde_json::to_value(&self.local_snapshot).unwrap()
+            );
+            assert!(self.event_loop.pending_named_brain_turns.is_empty());
+            assert_eq!(
+                self.memory.stats().await.unwrap().conversation_count,
+                0,
+                "a cancelled named turn must not persist provider or tool output"
+            );
+            assert_eq!(self.event_loop.runner_brain.as_deref(), Some("shared"));
+            assert!(self.event_loop.home_runner_lease_active);
+            assert_eq!(
+                self.event_loop.home_runner_lease_id,
+                Some(self.lease.lease_id)
+            );
+            let durable = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let snapshot = self.server.brain_store().snapshot("shared").unwrap();
+                    if snapshot.runs.iter().any(|run| run.status.is_terminal()) {
+                        break snapshot;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                let snapshot = self.server.brain_store().snapshot("shared").unwrap();
+                panic!(
+                    "physical runner disconnect left its durable run non-terminal: runs={:?}, server_connection_finished={}",
+                    snapshot.runs,
+                    self.server_task.is_finished(),
+                )
+            });
+            self.phase
+                .store(PHYSICAL_DURABLE_TERMINAL, Ordering::SeqCst);
+            assert_eq!(durable.runs.len(), 1);
+            assert_eq!(
+                durable.runs[0].status,
+                crate::brain::store::BrainRunStatus::Cancelled
+            );
+            assert_eq!(
+                durable
+                    .events
+                    .iter()
+                    .filter(|event| matches!(
+                        &event.kind,
+                        crate::brain::store::BrainEventKind::RunStatusChanged {
+                            status: crate::brain::store::BrainRunStatus::Cancelled,
+                            ..
+                        }
+                    ))
+                    .count(),
+                1,
+                "physical callback loss must publish one cancelled terminal transition"
+            );
+            assert_eq!(
+                durable.runner_lease.as_ref().map(|lease| lease.lease_id),
+                Some(self.lease.lease_id)
+            );
+            assert!(durable.attachments.iter().any(|attachment| {
+                attachment.attachment_id == self.observer_attachment.attachment_id
+                    && attachment.connected
+            }));
+            assert!(
+                durable.events.iter().all(|event| {
+                    !matches!(
+                        &event.kind,
+                        crate::brain::store::BrainEventKind::ToolResult { .. }
+                            | crate::brain::store::BrainEventKind::Result { .. }
+                            | crate::brain::store::BrainEventKind::RuntimeCommitted { .. }
+                            | crate::brain::store::BrainEventKind::EffectRecorded { .. }
+                    )
+                }),
+                "cancelled named turns must not durably publish results or effects"
+            );
+        }
+
+        async fn assert_next_local_query_succeeds(&mut self) {
+            self.phase.store(PHYSICAL_NEXT_QUERY, Ordering::SeqCst);
+            drive_event_with_deadline(
+                &mut self.event_loop,
+                super::ReplEvent::UserInput {
+                    input: "next local query".into(),
+                },
+                "next local query admission",
+            )
+            .await;
+            let next_query = self.event_loop.active_query_id.read().await.unwrap();
+            for _ in 0..24 {
+                if matches!(
+                    self.event_loop.query_states.get_state(next_query).await,
+                    Some(super::QueryState::Completed { .. })
+                ) {
+                    break;
+                }
+                let event = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    self.event_loop.event_rx.recv(),
+                )
+                .await
+                .expect("next local query produced no frontend event")
+                .expect("next local query closed the frontend event channel");
+                drive_event_with_deadline(&mut self.event_loop, event, "next local query").await;
+            }
+            assert!(matches!(
+                self.event_loop.query_states.get_state(next_query).await,
+                Some(super::QueryState::Completed { .. })
+            ));
+            let messages = self.event_loop.conversation.read().await.get_messages();
+            assert_eq!(
+                serde_json::to_value(&messages[..self.local_snapshot.len()]).unwrap(),
+                serde_json::to_value(&self.local_snapshot).unwrap()
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .skip(self.local_snapshot.len())
+                    .filter(|message| message.role == "assistant")
+                    .count(),
+                1
+            );
+            self.phase.store(PHYSICAL_DONE, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn real_event_and_llm_loops_admit_one_immediate_tool_continuation_after_retirement() {
+        let generator = Arc::new(AtomicRoundGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let generator_dyn: Arc<dyn crate::generators::Generator> = generator.clone();
+        let mut event_loop = atomic_boundary_event_loop(generator_dyn, None).await;
+        let conversation = Arc::clone(&event_loop.conversation);
+        let retirement =
+            Arc::new(crate::cli::repl_event::llm_loop::ProviderRetirementBarrier::new());
+        let worker = event_loop.start_llm_worker_with_retirement_barrier(Arc::clone(&retirement));
+        let phase = Arc::new(AtomicUsize::new(0));
+        let observed_query = Arc::new(std::sync::Mutex::new(None));
+        let running_phase = Arc::clone(&phase);
+        let running_query = Arc::clone(&observed_query);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            running_phase.store(1, Ordering::SeqCst);
+            drive_event_with_deadline(
+                &mut event_loop,
+                super::ReplEvent::UserInput {
+                    input: "use the atomic echo tool".into(),
+                },
+                "initial provider admission",
+            )
+            .await;
+            let query_id = *event_loop.active_query_id.read().await;
+            *running_query.lock().unwrap() = query_id;
+            running_phase.store(2, Ordering::SeqCst);
+
+            let mut saw_blocked_tool_result = false;
+            let mut saw_final_completion = false;
+            for iteration in 0..32 {
+                running_phase.store(10 + iteration, Ordering::SeqCst);
+                let event = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    event_loop.event_rx.recv(),
+                )
+                .await
+                .expect("provider/event loop stalled")
+                .expect("event channel closed");
+                let event = match event {
+                    super::ReplEvent::ToolApprovalNeeded { response_tx, .. } => {
+                        running_phase.store(100, Ordering::SeqCst);
+                        response_tx
+                            .send(crate::cli::repl_event::ConfirmationResult::ApproveOnce)
+                            .expect("approval receiver");
+                        continue;
+                    }
+                    event => event,
+                };
+                if matches!(&event, super::ReplEvent::ToolResult { .. }) {
+                    running_phase.store(200, Ordering::SeqCst);
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        retirement.reached.notified(),
+                    )
+                    .await
+                    .expect("provider wrapper never reached retirement barrier");
+                    let drive = event_loop.drive_one(event);
+                    tokio::pin!(drive);
+                    assert!(
+                        matches!(futures::poll!(&mut drive), std::task::Poll::Pending),
+                        "continuation must wait for the retiring provider wrapper"
+                    );
+                    let messages = tokio::time::timeout(
+                        std::time::Duration::from_millis(250),
+                        conversation.read(),
+                    )
+                    .await
+                    .expect("tool continuation held the conversation lock before retirement")
+                    .get_messages();
+                    assert_eq!(
+                        messages.len(),
+                        1,
+                        "staged tool rounds are provider-invisible"
+                    );
+                    retirement.release.notify_one();
+                    running_phase.store(201, Ordering::SeqCst);
+                    tokio::time::timeout(std::time::Duration::from_secs(2), drive)
+                        .await
+                        .expect("continuation was not admitted after provider retirement")
+                        .unwrap();
+                    saw_blocked_tool_result = true;
+                    running_phase.store(202, Ordering::SeqCst);
+                    let messages = conversation.read().await.get_messages();
+                    assert_eq!(messages.len(), 3);
+                    assert!(matches!(
+                        messages[1].content.as_slice(),
+                        [crate::claude::ContentBlock::ToolUse { id, .. }] if id == "atomic-tool-1"
+                    ));
+                    assert!(matches!(
+                        messages[2].content.as_slice(),
+                        [crate::claude::ContentBlock::ToolResult { tool_use_id, .. }]
+                            if tool_use_id == "atomic-tool-1"
+                    ));
+                    continue;
+                }
+                if matches!(&event, super::ReplEvent::StreamingComplete { .. }) {
+                    saw_final_completion = true;
+                }
+                running_phase.store(300, Ordering::SeqCst);
+                drive_event_with_deadline(&mut event_loop, event, "provider completion").await;
+                if saw_blocked_tool_result
+                    && saw_final_completion
+                    && generator.calls.load(Ordering::SeqCst) == 2
+                {
+                    break;
+                }
+            }
+
+            assert!(saw_blocked_tool_result);
+            assert!(saw_final_completion);
+            assert_eq!(generator.calls.load(Ordering::SeqCst), 2);
+            let messages = conversation.read().await.get_messages();
+            assert_eq!(messages.len(), 4);
+            assert_eq!(messages[0].role, "user");
+            assert_eq!(messages[1].role, "assistant");
+            assert_eq!(messages[2].role, "user");
+            assert_eq!(messages[3].role, "assistant");
+
+            running_phase.store(400, Ordering::SeqCst);
+            retirement.release.notify_one();
+            tokio::task::yield_now().await;
+        })
+        .await;
+        worker.abort();
+        if result.is_err() {
+            let query_id = *observed_query.lock().unwrap();
+            let query_state = if let Some(query_id) = query_id {
+                event_loop.query_states.get_state(query_id).await
+            } else {
+                None
+            };
+            let provider = if let Some(query_id) = query_id {
+                event_loop.query_states.provider_task_debug(query_id).await
+            } else {
+                None
+            };
+            let round = if let Some(query_id) = query_id {
+                conversation.read().await.staged_round_debug(query_id)
+            } else {
+                None
+            };
+            panic!(
+                "real EventLoop/LlmLoop tool continuation exceeded its deadline: phase={}, calls={}, query={query_id:?}, state={query_state:?}, provider={provider:?}, staged_round={round:?}, committed_messages={}",
+                phase.load(Ordering::SeqCst),
+                generator.calls.load(Ordering::SeqCst),
+                conversation.read().await.message_count(),
+            );
+        }
+    }
+
+    #[test]
+    fn physical_ipc_disconnect_cancels_streaming_named_turn_and_preserves_runner_lease() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let phase = Arc::new(AtomicUsize::new(PHYSICAL_SETUP));
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                let generator = Arc::new(DisconnectStreamingGenerator {
+                    stream_calls: AtomicUsize::new(0),
+                    started: tokio::sync::Notify::new(),
+                    held_streams: std::sync::Mutex::new(Vec::new()),
+                });
+                let generator_dyn: Arc<dyn crate::generators::Generator> = generator.clone();
+                let mut harness =
+                    PhysicalNamedHarness::new(generator_dyn, true, None, Arc::clone(&phase)).await;
+                let mut submit = harness.submit("hold this stream");
+                let query_id = harness.drive_named_request(&mut submit).await;
+                phase.store(PHYSICAL_PROVIDER_CUT, Ordering::SeqCst);
+                generator.started.notified().await;
+
+                harness.disconnect_and_drive_cancel(submit).await;
+                harness.assert_restored_and_lease_preserved(query_id).await;
+                assert_eq!(generator.stream_calls.load(Ordering::SeqCst), 1);
+                harness.assert_next_local_query_succeeds().await;
+                harness.worker.abort();
+                harness.server_task.abort();
+            })
+            .await;
+            outcome.unwrap_or_else(|_| {
+                panic!(
+                    "physical disconnect teardown exceeded its bounded deadline at phase {}",
+                    phase.load(Ordering::SeqCst)
+                )
+            });
+        }));
+    }
+
+    #[test]
+    fn physical_ipc_disconnect_cancels_named_turn_during_provider_repair() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let phase = Arc::new(AtomicUsize::new(PHYSICAL_SETUP));
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                let generator = Arc::new(DisconnectRepairGenerator {
+                    calls: AtomicUsize::new(0),
+                    repair_started: tokio::sync::Notify::new(),
+                });
+                let generator_dyn: Arc<dyn crate::generators::Generator> = generator.clone();
+                let mut harness =
+                    PhysicalNamedHarness::new(generator_dyn, false, None, Arc::clone(&phase)).await;
+                let mut submit = harness.submit("repair this malformed response");
+                let query_id = harness.drive_named_request(&mut submit).await;
+                phase.store(PHYSICAL_PROVIDER_CUT, Ordering::SeqCst);
+                generator.repair_started.notified().await;
+
+                harness.disconnect_and_drive_cancel(submit).await;
+                harness.assert_restored_and_lease_preserved(query_id).await;
+                assert_eq!(generator.calls.load(Ordering::SeqCst), 2);
+                assert!(harness.event_loop.pending_vm_approval.is_none());
+                harness.assert_next_local_query_succeeds().await;
+                harness.worker.abort();
+                harness.server_task.abort();
+            })
+            .await;
+            outcome.unwrap_or_else(|_| {
+                panic!(
+                    "repair disconnect teardown exceeded its bounded deadline at phase {}",
+                    phase.load(Ordering::SeqCst)
+                )
+            });
+        }));
+    }
+
+    #[test]
+    fn physical_ipc_disconnect_denies_pending_named_tool_approval() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let phase = Arc::new(AtomicUsize::new(PHYSICAL_SETUP));
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                let generator: Arc<dyn crate::generators::Generator> =
+                    Arc::new(NamedApprovalGenerator {
+                        calls: AtomicUsize::new(0),
+                    });
+                let mut harness =
+                    PhysicalNamedHarness::new(generator, false, None, Arc::clone(&phase)).await;
+                let mut submit = harness.submit("request a tool approval");
+                let query_id = harness.drive_named_request(&mut submit).await;
+                phase.store(PHYSICAL_PROVIDER_CUT, Ordering::SeqCst);
+                let (brain_id, request_seq, approval_id) =
+                    harness.drive_until_named_tool_approval().await;
+                assert!(harness
+                    .server
+                    .brain_approvals()
+                    .inspect(
+                        brain_id,
+                        request_seq,
+                        &approval_id,
+                        harness.attachment.attachment_id,
+                    )
+                    .is_ok());
+
+                harness.disconnect_and_drive_cancel(submit).await;
+                harness.assert_restored_and_lease_preserved(query_id).await;
+                assert!(harness.event_loop.pending_approvals.read().await.is_empty());
+                assert!(harness.event_loop.pending_dialog_tx.is_none());
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        if harness
+                            .server
+                            .brain_approvals()
+                            .inspect(
+                                brain_id,
+                                request_seq,
+                                &approval_id,
+                                harness.attachment.attachment_id,
+                            )
+                            .is_err()
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("physical disconnect left the named approval live");
+                harness.assert_next_local_query_succeeds().await;
+                harness.worker.abort();
+                harness.server_task.abort();
+            })
+            .await;
+            outcome.unwrap_or_else(|_| {
+                panic!(
+                    "approval disconnect teardown exceeded its bounded deadline at phase {}",
+                    phase.load(Ordering::SeqCst)
+                )
+            });
+        }));
+    }
+
+    #[test]
+    fn physical_ipc_disconnect_bounds_running_tool_and_fences_its_late_result() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let phase = Arc::new(AtomicUsize::new(PHYSICAL_SETUP));
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                let barrier = Arc::new(AtomicToolBarrier {
+                    started: tokio::sync::Notify::new(),
+                    release: tokio::sync::Notify::new(),
+                    returned: tokio::sync::Notify::new(),
+                });
+                let generator: Arc<dyn crate::generators::Generator> =
+                    Arc::new(NamedApprovalGenerator {
+                        calls: AtomicUsize::new(0),
+                    });
+                let mut harness = PhysicalNamedHarness::new(
+                    generator,
+                    false,
+                    Some(Arc::clone(&barrier)),
+                    Arc::clone(&phase),
+                )
+                .await;
+                let mut submit = harness.submit("run a tool until disconnect");
+                let query_id = harness.drive_named_request(&mut submit).await;
+                phase.store(PHYSICAL_PROVIDER_CUT, Ordering::SeqCst);
+                let (_, request_seq, approval_id) = harness.drive_until_named_tool_approval().await;
+                harness.approve_named_tool(request_seq, approval_id).await;
+                phase.store(PHYSICAL_TOOL_START_CUT, Ordering::SeqCst);
+                barrier.started.notified().await;
+
+                let release = Arc::clone(&barrier);
+                let query_states = Arc::clone(&harness.event_loop.query_states);
+                tokio::spawn(async move {
+                    while !matches!(
+                        query_states.get_state(query_id).await,
+                        Some(super::QueryState::Cancelled)
+                    ) {
+                        tokio::task::yield_now().await;
+                    }
+                    release.release.notify_one();
+                });
+                harness.disconnect_and_drive_cancel(submit).await;
+                harness.assert_restored_and_lease_preserved(query_id).await;
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    barrier.returned.notified(),
+                )
+                .await
+                .expect("detached tool did not finish after its test barrier released");
+                tokio::task::yield_now().await;
+                while let Ok(Some(event)) = tokio::time::timeout(
+                    std::time::Duration::from_millis(20),
+                    harness.event_loop.event_rx.recv(),
+                )
+                .await
+                {
+                    assert!(
+                        !matches!(
+                            &event,
+                            super::ReplEvent::ToolResult {
+                                query_id: late_query,
+                                ..
+                            } if *late_query == query_id
+                        ),
+                        "cancelled tool published a late provider-visible result"
+                    );
+                    harness.event_loop.drive_one(event).await.unwrap();
+                }
+                assert_eq!(
+                    serde_json::to_value(harness.event_loop.conversation.read().await.snapshot())
+                        .unwrap(),
+                    serde_json::to_value(&harness.local_snapshot).unwrap()
+                );
+                let durable = harness.server.brain_store().snapshot("shared").unwrap();
+                assert_eq!(
+                    durable
+                        .events
+                        .iter()
+                        .filter(|event| matches!(
+                            &event.kind,
+                            crate::brain::store::BrainEventKind::EffectRecorded { .. }
+                        ))
+                        .count(),
+                    1,
+                    "a physically completed execute-once effect must be audited exactly once"
+                );
+                assert!(durable.events.iter().all(|event| !matches!(
+                    &event.kind,
+                    crate::brain::store::BrainEventKind::ToolResult { .. }
+                )));
+                harness.assert_next_local_query_succeeds().await;
+                harness.worker.abort();
+                harness.server_task.abort();
+            })
+            .await;
+            outcome.unwrap_or_else(|_| {
+                panic!(
+                    "running-tool disconnect teardown exceeded its bounded deadline at phase {}",
+                    phase.load(Ordering::SeqCst)
+                )
+            });
+        }));
+    }
+
+    #[test]
+    fn physical_stale_attachment_rejection_does_not_spawn_or_create_run() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                let generator: Arc<dyn crate::generators::Generator> =
+                    Arc::new(NamedSuccessGenerator);
+                let mut harness = PhysicalNamedHarness::new(
+                    generator,
+                    false,
+                    None,
+                    Arc::new(AtomicUsize::new(PHYSICAL_SETUP)),
+                )
+                .await;
+                let stale_attachment = harness.attachment.clone();
+                harness
+                    .client
+                    .as_ref()
+                    .unwrap()
+                    .brain_detach("shared", &stale_attachment)
+                    .await
+                    .unwrap();
+
+                let submission = harness
+                    .client
+                    .as_ref()
+                    .unwrap()
+                    .brain_submit(
+                        "shared",
+                        &stale_attachment,
+                        crate::brain::store::BrainEventKind::Prompt {
+                            text: "must not be admitted".into(),
+                        },
+                    )
+                    .await;
+                let error = match submission {
+                    Err(error) => error,
+                    Ok(_) => panic!("stale physical attachment unexpectedly admitted a run"),
+                };
+                assert!(
+                    error.to_string().contains("not owned")
+                        || error.to_string().contains("no longer current")
+                );
+                tokio::task::yield_now().await;
+                let durable = harness.server.brain_store().snapshot("shared").unwrap();
+                assert!(durable.runs.is_empty());
+                assert!(harness.event_loop.event_rx.try_recv().is_err());
+                harness.worker.abort();
+                harness.server_task.abort();
+            })
+            .await
+            .expect("stale physical submit rejection exceeded its bounded deadline");
+        }));
+    }
+
+    #[test]
+    fn named_provider_panic_crosses_physical_ipc_once_and_restores_local_history() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                let generator: Arc<dyn crate::generators::Generator> =
+                    Arc::new(NamedPanicGenerator {
+                        calls: AtomicUsize::new(0),
+                    });
+                let mut harness = PhysicalNamedHarness::new(
+                    generator,
+                    false,
+                    None,
+                    Arc::new(AtomicUsize::new(PHYSICAL_SETUP)),
+                )
+                .await;
+                let mut submit = harness.submit("panic at the provider boundary");
+                let query_id = harness.drive_named_request(&mut submit).await;
+                let mut failures = 0;
+                loop {
+                    let event = harness.event_loop.event_rx.recv().await.unwrap();
+                    if matches!(&event, super::ReplEvent::QueryFailed { .. }) {
+                        failures += 1;
+                    }
+                    harness.event_loop.drive_one(event).await.unwrap();
+                    if matches!(
+                        harness.event_loop.query_states.get_state(query_id).await,
+                        Some(super::QueryState::Failed { .. })
+                    ) {
+                        break;
+                    }
+                }
+                let callback_error = submit
+                    .await
+                    .expect("physical submit task panicked")
+                    .expect_err("provider panic must cross the callback as an error");
+                assert!(callback_error
+                    .to_string()
+                    .contains("provider task terminated unexpectedly"));
+                assert_eq!(failures, 1);
+                assert_eq!(
+                    serde_json::to_value(harness.event_loop.conversation.read().await.snapshot())
+                        .unwrap(),
+                    serde_json::to_value(&harness.local_snapshot).unwrap()
+                );
+                assert_eq!(
+                    harness.memory.stats().await.unwrap().conversation_count,
+                    0,
+                    "provider panic must not persist the failed named turn"
+                );
+                assert!(harness.event_loop.pending_named_brain_turns.is_empty());
+                let durable = harness.server.brain_store().snapshot("shared").unwrap();
+                assert_eq!(durable.runs.len(), 1);
+                assert_eq!(
+                    durable.runs[0].status,
+                    crate::brain::store::BrainRunStatus::Failed
+                );
+                assert_eq!(
+                    durable
+                        .events
+                        .iter()
+                        .filter(|event| matches!(
+                            &event.kind,
+                            crate::brain::store::BrainEventKind::RunStatusChanged {
+                                status: crate::brain::store::BrainRunStatus::Failed,
+                                ..
+                            }
+                        ))
+                        .count(),
+                    1,
+                    "provider panic must publish one failed terminal transition"
+                );
+                assert_eq!(
+                    durable.runner_lease.map(|lease| lease.lease_id),
+                    Some(harness.lease.lease_id)
+                );
+                assert!(durable.events.iter().all(|event| {
+                    !matches!(
+                        &event.kind,
+                        crate::brain::store::BrainEventKind::Result { .. }
+                            | crate::brain::store::BrainEventKind::RuntimeCommitted { .. }
+                            | crate::brain::store::BrainEventKind::EffectRecorded { .. }
+                    )
+                }));
+                harness.assert_next_local_query_succeeds().await;
+                harness.worker.abort();
+                harness.server_task.abort();
+            })
+            .await
+            .expect("provider panic callback exceeded its bounded deadline");
+        }));
+    }
+
+    #[test]
+    fn successful_named_turn_crosses_physical_ipc_and_restores_local_history() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let phase = Arc::new(AtomicUsize::new(PHYSICAL_SETUP));
+            let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                let generator: Arc<dyn crate::generators::Generator> =
+                    Arc::new(NamedSuccessGenerator);
+                let mut harness = PhysicalNamedHarness::new(
+                    generator,
+                    false,
+                    None,
+                    Arc::clone(&phase),
+                )
+                .await;
+                let mut submit = harness.submit("complete this named turn");
+                let query_id = harness.drive_named_request(&mut submit).await;
+                let submission = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        tokio::select! {
+                            result = &mut submit => break result,
+                            event = harness.event_loop.event_rx.recv() => {
+                                let event = event.expect("successful named turn closed the frontend event channel");
+                                if matches!(&event, super::ReplEvent::NamedBrainMemoryProjectionRequested(_)) {
+                                    phase.store(PHYSICAL_SUCCESS_MEMORY_PROJECTION, Ordering::SeqCst);
+                                }
+                                drive_event_with_deadline(
+                                    &mut harness.event_loop,
+                                    event,
+                                    "successful named turn",
+                                )
+                                .await;
+                                if harness.event_loop.pending_named_brain_turns.is_empty()
+                                    && phase.load(Ordering::SeqCst)
+                                        < PHYSICAL_SUCCESS_MEMORY_PROJECTION
+                                {
+                                    phase.store(PHYSICAL_SUCCESS_TURN_COMPLETE, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    }
+                })
+                .await;
+                if submission.is_err() {
+                    panic!(
+                        "successful named submission stalled: phase={}, state={:?}, pending_turns={}, submit_finished={}, server_connection_finished={}",
+                        phase.load(Ordering::SeqCst),
+                        harness.event_loop.query_states.get_state(query_id).await,
+                        harness.event_loop.pending_named_brain_turns.len(),
+                        submit.is_finished(),
+                        harness.server_task.is_finished(),
+                    );
+                }
+                submission.unwrap().unwrap().unwrap();
+                phase.store(PHYSICAL_SUCCESS_CALLBACK_COMPLETE, Ordering::SeqCst);
+                assert!(matches!(
+                    harness.event_loop.query_states.get_state(query_id).await,
+                    Some(super::QueryState::Completed { .. })
+                ));
+                assert_eq!(
+                    serde_json::to_value(harness.event_loop.conversation.read().await.snapshot())
+                        .unwrap(),
+                    serde_json::to_value(&harness.local_snapshot).unwrap()
+                );
+                let durable = harness.server.brain_store().snapshot("shared").unwrap();
+                assert_eq!(
+                    durable.runner_lease.map(|lease| lease.lease_id),
+                    Some(harness.lease.lease_id)
+                );
+                assert_eq!(
+                    durable
+                        .events
+                        .iter()
+                        .filter(|event| {
+                            matches!(
+                                &event.kind,
+                                crate::brain::store::BrainEventKind::Result { .. }
+                            )
+                        })
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    durable
+                        .events
+                        .iter()
+                        .filter(|event| matches!(
+                            &event.kind,
+                            crate::brain::store::BrainEventKind::Program { .. }
+                        ))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    durable
+                        .events
+                        .iter()
+                        .filter(|event| matches!(
+                            &event.kind,
+                            crate::brain::store::BrainEventKind::RuntimeCommitted { .. }
+                        ))
+                        .count(),
+                    1
+                );
+                assert_eq!(durable.runs.len(), 1);
+                assert_eq!(
+                    durable.runs[0].status,
+                    crate::brain::store::BrainRunStatus::Completed
+                );
+                harness.assert_next_local_query_succeeds().await;
+                harness.worker.abort();
+                harness.server_task.abort();
+            })
+            .await;
+            if result.is_err() {
+                panic!(
+                    "successful physical named turn exceeded its bounded deadline: phase={}",
+                    phase.load(Ordering::SeqCst)
+                );
+            }
+        }));
+    }
+
+    fn admitting_llm_channel() -> (
+        tokio::sync::mpsc::UnboundedSender<super::LlmRequest>,
+        tokio::sync::mpsc::UnboundedReceiver<uuid::Uuid>,
+    ) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (observed_tx, observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(super::LlmRequest::Query {
+                id,
+                admission,
+                admission_ready,
+                spawned,
+                ..
+            }) = rx.recv().await
+            {
+                if let Some(ready) = admission_ready {
+                    let _ = ready.send(());
+                }
+                if let Some(admission) = admission {
+                    if admission.await.is_err() {
+                        continue;
+                    }
+                }
+                if let Some(spawned) = spawned {
+                    let _ = spawned.send(());
+                }
+                let _ = observed_tx.send(id);
+            }
+        });
+        (tx, observed_rx)
+    }
+
+    #[test]
+    fn cancelled_dialog_event_cannot_capture_the_next_dialog_result() {
+        let mut pending = None;
+        let (stale_tx, stale_rx) = tokio::sync::oneshot::channel();
+        drop(stale_rx);
+        assert!(!super::install_live_dialog_sender(&mut pending, stale_tx));
+        assert!(pending.is_none());
+
+        let (live_tx, mut live_rx) = tokio::sync::oneshot::channel();
+        assert!(super::install_live_dialog_sender(&mut pending, live_tx));
+        pending
+            .take()
+            .unwrap()
+            .send(crate::cli::tui::DialogResult::Cancelled)
+            .unwrap();
+        assert!(matches!(
+            live_rx.try_recv(),
+            Ok(crate::cli::tui::DialogResult::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn continuation_is_sent_exactly_once_for_one_complete_validated_round() {
+        use crate::claude::{ContentBlock, Message};
+        use crate::cli::conversation::ToolRoundProgress;
+
+        let query_id = uuid::Uuid::new_v4();
+        let mut conversation = crate::cli::conversation::ConversationHistory::new();
+        let token = conversation
+            .stage_assistant(
+                query_id,
+                Message {
+                    role: "assistant".into(),
+                    content: ["A", "B"]
+                        .into_iter()
+                        .map(|id| ContentBlock::ToolUse {
+                            id: id.into(),
+                            name: "Read".into(),
+                            input: serde_json::json!({}),
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+        let (llm_tx, mut llm_rx) = admitting_llm_channel();
+
+        conversation
+            .record_tool_result(query_id, token, "A", &Ok("a".into()))
+            .unwrap();
+        let conversation = Arc::new(tokio::sync::RwLock::new(conversation));
+        assert!(
+            super::commit_tool_round_and_continue(&conversation, query_id, token, &llm_tx)
+                .await
+                .is_err()
+        );
+        assert!(
+            llm_rx.try_recv().is_err(),
+            "incomplete round must send zero continuations"
+        );
+
+        assert_eq!(
+            conversation
+                .write()
+                .await
+                .record_tool_result(query_id, token, "B", &Ok("b".into()))
+                .unwrap(),
+            ToolRoundProgress::Complete
+        );
+        super::commit_tool_round_and_continue(&conversation, query_id, token, &llm_tx)
+            .await
+            .unwrap();
+        assert!(matches!(
+            llm_rx.try_recv(),
+            Ok(id) if id == query_id
+        ));
+        assert!(
+            super::commit_tool_round_and_continue(&conversation, query_id, token, &llm_tx)
+                .await
+                .is_err()
+        );
+        assert!(
+            llm_rx.try_recv().is_err(),
+            "completed round must send only one continuation"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_llm_worker_leaves_completed_tool_round_staged_and_invisible() {
+        use crate::claude::{ContentBlock, Message};
+
+        let query_id = uuid::Uuid::new_v4();
+        let mut conversation = crate::cli::conversation::ConversationHistory::new();
+        let token = conversation
+            .stage_assistant(
+                query_id,
+                Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: "A".into(),
+                        name: "Read".into(),
+                        input: serde_json::json!({}),
+                    }],
+                },
+            )
+            .unwrap();
+        conversation
+            .record_tool_result(query_id, token, "A", &Ok("a".into()))
+            .unwrap();
+        let conversation = Arc::new(tokio::sync::RwLock::new(conversation));
+        let (llm_tx, llm_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(llm_rx);
+
+        assert_eq!(
+            super::commit_tool_round_and_continue(&conversation, query_id, token, &llm_tx).await,
+            Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable)
+        );
+        assert!(conversation.read().await.get_messages().is_empty());
+        assert!(conversation
+            .read()
+            .await
+            .completed_tool_results(query_id, token)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn continuation_exit_before_ready_never_commits_history() {
+        use crate::claude::{ContentBlock, Message};
+        let query_id = uuid::Uuid::new_v4();
+        let mut conversation = crate::cli::conversation::ConversationHistory::new();
+        let token = conversation
+            .stage_assistant(
+                query_id,
+                Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: "A".into(),
+                        name: "Read".into(),
+                        input: serde_json::json!({}),
+                    }],
+                },
+            )
+            .unwrap();
+        conversation
+            .record_tool_result(query_id, token, "A", &Ok("a".into()))
+            .unwrap();
+        let conversation = Arc::new(tokio::sync::RwLock::new(conversation));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let _ = rx.recv().await;
+        });
+        assert_eq!(
+            super::commit_tool_round_and_continue(&conversation, query_id, token, &tx).await,
+            Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable)
+        );
+        assert!(conversation.read().await.get_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuation_exit_after_commit_rolls_history_back_to_stage() {
+        use crate::claude::{ContentBlock, Message};
+        let query_id = uuid::Uuid::new_v4();
+        let mut conversation = crate::cli::conversation::ConversationHistory::new();
+        let token = conversation
+            .stage_assistant(
+                query_id,
+                Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: "A".into(),
+                        name: "Read".into(),
+                        input: serde_json::json!({}),
+                    }],
+                },
+            )
+            .unwrap();
+        conversation
+            .record_tool_result(query_id, token, "A", &Ok("a".into()))
+            .unwrap();
+        let conversation = Arc::new(tokio::sync::RwLock::new(conversation));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            if let Some(super::LlmRequest::Query {
+                admission,
+                admission_ready,
+                spawned,
+                ..
+            }) = rx.recv().await
+            {
+                let _ = admission_ready.unwrap().send(());
+                let _ = admission.unwrap().await;
+                drop(spawned);
+            }
+        });
+        assert_eq!(
+            super::commit_tool_round_and_continue(&conversation, query_id, token, &tx).await,
+            Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable)
+        );
+        assert!(conversation.read().await.get_messages().is_empty());
+        assert!(conversation
+            .read()
+            .await
+            .completed_tool_results(query_id, token)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn late_worker_after_spawn_ack_timeout_rolls_back_without_provider_side_effects() {
+        use crate::claude::{ContentBlock, Message};
+
+        let generator = Arc::new(AtomicRoundGenerator {
+            calls: AtomicUsize::new(0),
+        });
+        let generator_dyn: Arc<dyn crate::generators::Generator> = generator.clone();
+        let mut event_loop = atomic_boundary_event_loop(generator_dyn, None).await;
+        let query_id = event_loop.query_states.create_query(Vec::new()).await;
+        assert!(
+            event_loop
+                .query_states
+                .begin_tool_execution(query_id, 1)
+                .await
+        );
+        let conversation = Arc::clone(&event_loop.conversation);
+        let token = {
+            let mut history = conversation.write().await;
+            history.add_user_message("run the delayed continuation".into());
+            let token = history
+                .stage_assistant(
+                    query_id,
+                    Message {
+                        role: "assistant".into(),
+                        content: vec![ContentBlock::ToolUse {
+                            id: "A".into(),
+                            name: "atomic_echo".into(),
+                            input: serde_json::json!({"text": "hello"}),
+                        }],
+                    },
+                )
+                .unwrap();
+            history
+                .record_tool_result(query_id, token, "A", &Ok("hello".into()))
+                .unwrap();
+            token
+        };
+        let llm_tx = event_loop.llm_tx.clone();
+        let barrier =
+            Arc::new(crate::cli::repl_event::llm_loop::SpawnAcknowledgementBarrier::new());
+        let worker = tokio::spawn(
+            event_loop
+                .take_llm_worker()
+                .with_spawn_acknowledgement_barrier(Arc::clone(&barrier))
+                .run(),
+        );
+        let commit_conversation = Arc::clone(&conversation);
+        let commit = tokio::spawn(async move {
+            super::commit_tool_round_and_continue(&commit_conversation, query_id, token, &llm_tx)
+                .await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            barrier.reached.notified(),
+        )
+        .await
+        .expect("LLM worker never reached the pre-ack cut point");
+        assert_eq!(
+            conversation.read().await.message_count(),
+            3,
+            "the round is committed only while continuation spawn is pending"
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), commit)
+                .await
+                .expect("spawn acknowledgement timeout did not resolve")
+                .unwrap(),
+            Err(crate::cli::conversation::ToolRoundError::ContinuationUnavailable)
+        );
+        assert_eq!(conversation.read().await.message_count(), 1);
+        assert!(conversation
+            .read()
+            .await
+            .completed_tool_results(query_id, token)
+            .is_ok());
+
+        barrier.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    event_loop.query_states.provider_task_debug(query_id).await,
+                    Some((_, None))
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late worker did not retire its reserved provider generation");
+        assert_eq!(generator.calls.load(Ordering::SeqCst), 0);
+        assert!(event_loop.event_rx.try_recv().is_err());
+        assert!(matches!(
+            event_loop.query_states.get_state(query_id).await,
+            Some(super::QueryState::ExecutingTools {
+                tools_pending: 1,
+                tools_completed: 0
+            })
+        ));
+        assert_eq!(conversation.read().await.message_count(), 1);
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn mixed_success_failure_and_denial_commit_as_one_provider_batch() {
+        use crate::claude::{ContentBlock, Message};
+        use crate::cli::conversation::ToolRoundProgress;
+
+        let query_id = uuid::Uuid::new_v4();
+        let mut conversation = crate::cli::conversation::ConversationHistory::new();
+        conversation.add_user_message("run the batch".into());
+        let token = conversation
+            .stage_assistant(
+                query_id,
+                Message {
+                    role: "assistant".into(),
+                    content: ["success", "failure", "denied"]
+                        .into_iter()
+                        .map(|id| ContentBlock::ToolUse {
+                            id: id.into(),
+                            name: "Read".into(),
+                            input: serde_json::json!({}),
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            conversation.record_tool_result(query_id, token, "success", &Ok("contents".into()),),
+            Ok(ToolRoundProgress::Pending)
+        );
+        assert_eq!(
+            conversation.record_tool_result(
+                query_id,
+                token,
+                "failure",
+                &Err(anyhow::anyhow!("malformed tool input")),
+            ),
+            Ok(ToolRoundProgress::Pending)
+        );
+        assert_eq!(conversation.message_count(), 1);
+        assert_eq!(
+            conversation.record_tool_result(
+                query_id,
+                token,
+                "denied",
+                &Err(anyhow::anyhow!("Tool execution denied by user")),
+            ),
+            Ok(ToolRoundProgress::Complete)
+        );
+
+        let (llm_tx, mut llm_rx) = admitting_llm_channel();
+        let conversation = Arc::new(tokio::sync::RwLock::new(conversation));
+        super::commit_tool_round_and_continue(&conversation, query_id, token, &llm_tx)
+            .await
+            .unwrap();
+        let messages = conversation.read().await.get_messages();
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            llm_rx.try_recv(),
+            Ok(id) if id == query_id
+        ));
+        let results = messages[2]
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => (tool_use_id.as_str(), content.as_str(), *is_error),
+                other => panic!("unexpected provider result block: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results,
+            vec![
+                ("success", "contents", None),
+                ("failure", "malformed tool input", Some(true)),
+                ("denied", "Tool execution denied by user", Some(true)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn named_brain_cancellation_terminates_staged_round_and_fences_late_results() {
+        use crate::brain::store::{
+            AttachmentId, AttachmentRole, BrainApprovalAudience, BrainId, RunId,
+        };
+        use crate::claude::{ContentBlock, Message};
+        use crate::cli::conversation::ToolRoundError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        for cancel_after_partial_result in [false, true] {
+            let query_id = uuid::Uuid::new_v4();
+            let run_id = RunId(uuid::Uuid::new_v4());
+            let mut conversation = crate::cli::conversation::ConversationHistory::new();
+            let token = conversation
+                .stage_assistant(
+                    query_id,
+                    Message {
+                        role: "assistant".into(),
+                        content: ["A", "B"]
+                            .into_iter()
+                            .map(|id| ContentBlock::ToolUse {
+                                id: id.into(),
+                                name: "Read".into(),
+                                input: serde_json::json!({}),
+                            })
+                            .collect(),
+                    },
+                )
+                .unwrap();
+            if cancel_after_partial_result {
+                conversation
+                    .record_tool_result(query_id, token, "A", &Ok("a".into()))
+                    .unwrap();
+            }
+
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            let mut pending = std::collections::HashMap::new();
+            pending.insert(
+                query_id,
+                super::PendingNamedBrainTurn {
+                    brain: "shared".into(),
+                    run_id,
+                    response_tx,
+                    turn_events: if cancel_after_partial_result {
+                        vec![crate::server::RunnerTurnEvent::Result {
+                            tool_id: "A".into(),
+                            output: "a".into(),
+                            is_error: false,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    effect_journal: Vec::new(),
+                    cancellation_requested: false,
+                    approval_audience: BrainApprovalAudience {
+                        brain_id: BrainId(uuid::Uuid::new_v4()),
+                        brain: "shared".into(),
+                        attachment_id: AttachmentId(uuid::Uuid::new_v4()),
+                        subject: "driver@box.local".into(),
+                        role: AttachmentRole::Driver,
+                        environment_generation: 1,
+                    },
+                    approval_tx: None,
+                    restart: None,
+                    local_conversation_snapshot: vec![Message::user("local")],
+                },
+            );
+            let mut active = Some(query_id);
+
+            // Exercise the same round-task registry used by real tool,
+            // proposal, and VM continuations. One task is still awaiting
+            // approval while another effect has already begun. Cancellation
+            // must fence the former and join the latter before the terminal
+            // callback is published.
+            let tasks = super::super::tool_execution::ToolRoundTasks::default();
+            let dispatch_permit = tasks.open_dispatch(query_id, token).unwrap();
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let approved_after_cancel = Arc::new(AtomicUsize::new(0));
+            let effect_finished = Arc::new(AtomicUsize::new(0));
+            let (approval_tx, approval_rx) = tokio::sync::oneshot::channel::<()>();
+            let approval_cancellation = cancellation.clone();
+            let approval_counter = Arc::clone(&approved_after_cancel);
+            let approval_permit = tasks.register(query_id, token).unwrap();
+            tokio::spawn(async move {
+                let _round_permit = approval_permit;
+                tokio::select! {
+                    biased;
+                    _ = approval_cancellation.cancelled() => {}
+                    result = approval_rx => if result.is_ok() {
+                        approval_counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+            let (effect_started_tx, effect_started_rx) = tokio::sync::oneshot::channel();
+            let effect_counter = Arc::clone(&effect_finished);
+            let effect_permit = tasks.register(query_id, token).unwrap();
+            tokio::spawn(async move {
+                let _round_permit = effect_permit;
+                let _ = effect_started_tx.send(());
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                effect_counter.fetch_add(1, Ordering::SeqCst);
+            });
+            effect_started_rx.await.unwrap();
+            assert!(tasks.contains(query_id, token));
+            cancellation.cancel();
+
+            assert!(conversation.abort_staged(query_id));
+            let _ = approval_tx.send(());
+            let closing_tasks = tasks.clone();
+            let close = tokio::spawn(async move {
+                closing_tasks.close_and_wait(query_id, token).await;
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while tasks.registration_is_open(query_id, token) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("round registration did not close");
+            assert!(tasks.register(query_id, token).is_none());
+            assert!(
+                !close.is_finished(),
+                "dispatcher must quiesce before cancellation completes"
+            );
+            drop(dispatch_permit);
+            close.await.unwrap();
+            assert_eq!(approved_after_cancel.load(Ordering::SeqCst), 0);
+            assert_eq!(effect_finished.load(Ordering::SeqCst), 1);
+            assert!(!tasks.contains(query_id, token));
+            assert!(super::clear_matching_active_query(&mut active, query_id));
+            let cancelled = super::take_cancelled_named_brain_turn(&mut pending, query_id).unwrap();
+            assert!(super::take_cancelled_named_brain_turn(&mut pending, query_id).is_none());
+            super::publish_cancelled_named_brain_turn(cancelled);
+            let terminal = response_rx.await.unwrap().unwrap_err();
+            assert_eq!(terminal.message, "named Brain run cancelled");
+            assert_eq!(
+                terminal.turn_events.len(),
+                usize::from(cancel_after_partial_result)
+            );
+            assert!(pending.is_empty());
+            assert_eq!(active, None);
+
+            for tool_id in ["A", "B"] {
+                assert_eq!(
+                    conversation.record_tool_result(
+                        query_id,
+                        token,
+                        tool_id,
+                        &Ok(format!("late-{tool_id}")),
+                    ),
+                    Err(ToolRoundError::NoActiveStage)
+                );
+            }
+            let conversation = Arc::new(tokio::sync::RwLock::new(conversation));
+            let (llm_tx, llm_rx) = tokio::sync::mpsc::unbounded_channel();
+            drop(llm_rx);
+            assert!(
+                super::commit_tool_round_and_continue(&conversation, query_id, token, &llm_tx,)
+                    .await
+                    .is_err()
+            );
+
+            // A subsequent prompt is no longer rejected by the single-active-
+            // turn gate and can establish a fresh query correlation.
+            let later_query = uuid::Uuid::new_v4();
+            assert!(active.is_none());
+            active = Some(later_query);
+            assert_eq!(active, Some(later_query));
+        }
+    }
+
     #[test]
     fn bare_brain_attach_routes_only_to_local_ipc() {
         assert_eq!(
@@ -8407,9 +11127,8 @@ mod tests {
 
     #[test]
     fn approval_audit_value_preserves_the_decision_scope() {
-        let decision = super::confirmation_audit_value(
-            &super::super::events::ConfirmationResult::ApproveOnce,
-        );
+        let decision =
+            super::confirmation_audit_value(&super::super::events::ConfirmationResult::ApproveOnce);
         assert_eq!(decision, serde_json::json!({"choice": "approve_once"}));
     }
 
@@ -8485,7 +11204,13 @@ mod tests {
     fn snapshot_replay_keeps_conversation_and_hides_presence_churn() {
         use crate::brain::store::{AttachmentId, AttachmentRole, BrainEventKind, ConnectionId};
 
-        let prompt = brain_event(1, "alice", BrainEventKind::Prompt { text: "hello".into() });
+        let prompt = brain_event(
+            1,
+            "alice",
+            BrainEventKind::Prompt {
+                text: "hello".into(),
+            },
+        );
         let attached = brain_event(
             2,
             "daemon",
@@ -8756,9 +11481,8 @@ mod tests {
             RunId,
         };
 
-        let output = crate::cli::output_manager::OutputManager::new(
-            crate::config::ColorScheme::default(),
-        );
+        let output =
+            crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
         output.disable_stdout();
         let run_id = RunId(uuid::Uuid::new_v4());
         let run = BrainRun {
@@ -8843,14 +11567,9 @@ mod tests {
         .unit
         .clone();
         let tool_row = local_unit.add_row("read_cache {\"key\":\"alpha\"}");
-        local_unit.complete_row_with_body(
-            tool_row,
-            "cache hit",
-            vec!["value=7".to_string()],
-        );
-        let approval_row = local_unit.add_row(
-            "approval (tool) for legacy audience unspecified: write_cache",
-        );
+        local_unit.complete_row_with_body(tool_row, "cache hit", vec!["value=7".to_string()]);
+        let approval_row =
+            local_unit.add_row("approval (tool) for legacy audience unspecified: write_cache");
         local_unit.complete_row(approval_row, "approve_once by daemon");
         local_unit.set_program_source("lisp");
         local_unit.set_response("(say \"cache checked\")");
@@ -8916,9 +11635,8 @@ mod tests {
             AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
         };
 
-        let output = crate::cli::output_manager::OutputManager::new(
-            crate::config::ColorScheme::default(),
-        );
+        let output =
+            crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
         output.disable_stdout();
         let run_id = RunId(uuid::Uuid::new_v4());
         let run = BrainRun {
@@ -9086,8 +11804,15 @@ mod tests {
             "approval (tool)",
             "named Brain turn produced no wire source",
         ] {
-            assert!(rendered.contains(expected), "missing {expected:?}:\n{rendered}");
-            assert_eq!(rendered.matches(expected).count(), 1, "duplicated {expected:?}");
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}:\n{rendered}"
+            );
+            assert_eq!(
+                rendered.matches(expected).count(),
+                1,
+                "duplicated {expected:?}"
+            );
         }
         assert_eq!(rendered.matches("result").count(), 1);
     }
@@ -9113,10 +11838,7 @@ mod tests {
             },
         );
         program.run_id = Some(projection.run_id);
-        assert_eq!(
-            projection.observe(&program),
-            LocalProjectionMatch::Suppress
-        );
+        assert_eq!(projection.observe(&program), LocalProjectionMatch::Suppress);
         assert_eq!(projection.program_seq, Some(12));
 
         let mut result = brain_event(
@@ -10117,7 +12839,6 @@ mod tests {
             result
         );
     }
-
 }
 
 /// Open `content` in `$VISUAL` or `$EDITOR` (falling back to `vi`), let the user

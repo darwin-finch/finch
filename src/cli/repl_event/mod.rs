@@ -38,7 +38,7 @@ pub mod tool_display;
 pub mod tool_execution;
 
 pub use event_loop::EventLoop;
-pub use events::{ConfirmationResult, LlmRequest, ReplEvent};
+pub use events::{ConfirmationResult, LlmRequest, QueryFailureKind, ReplEvent};
 pub use llm_loop::LlmLoop;
 pub use query_state::{QueryMetadata, QueryState, QueryStateManager};
 pub use tool_execution::ToolExecutionCoordinator;

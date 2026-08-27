@@ -33,6 +33,10 @@ pub enum QueryState {
         tools_completed: usize,
     },
 
+    /// Provider/VM output has won terminal admission. Cancellation may still
+    /// stop presentation, but cannot replace this already-admitted outcome.
+    Finalizing,
+
     /// Query completed successfully
     Completed { response: String },
 
@@ -72,6 +76,9 @@ pub struct QueryMetadata {
     /// publishes the correlated Result, EventLoop folds this into the run
     /// group and removes the transient unit without losing live updates.
     pub brain_output_work_unit: Option<Arc<WorkUnit>>,
+    provider_task_generation: u64,
+    active_provider_task: Option<u64>,
+    provider_task_drained: Arc<tokio::sync::Notify>,
 }
 
 /// Manages state for all in-flight queries
@@ -99,6 +106,9 @@ impl QueryStateManager {
             created_at: std::time::Instant::now(),
             tool_work_unit: None,
             brain_output_work_unit: None,
+            provider_task_generation: 0,
+            active_provider_task: None,
+            provider_task_drained: Arc::new(tokio::sync::Notify::new()),
         };
 
         self.states.write().await.insert(id, metadata);
@@ -121,6 +131,23 @@ impl QueryStateManager {
         if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
             metadata.state = state;
         }
+    }
+
+    /// Enter tool execution unless cancellation already won the race with a
+    /// provider completion.
+    pub async fn begin_tool_execution(&self, query_id: Uuid, tools_pending: usize) -> bool {
+        let mut states = self.states.write().await;
+        let Some(metadata) = states.get_mut(&query_id) else {
+            return false;
+        };
+        if matches!(metadata.state, QueryState::Cancelled) {
+            return false;
+        }
+        metadata.state = QueryState::ExecutingTools {
+            tools_pending,
+            tools_completed: 0,
+        };
+        true
     }
 
     /// Get the current state of a query
@@ -151,11 +178,7 @@ impl QueryStateManager {
             .and_then(|metadata| metadata.tool_work_unit.clone())
     }
 
-    pub async fn set_brain_output_work_unit(
-        &self,
-        query_id: Uuid,
-        unit: Option<Arc<WorkUnit>>,
-    ) {
+    pub async fn set_brain_output_work_unit(&self, query_id: Uuid, unit: Option<Arc<WorkUnit>>) {
         if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
             metadata.brain_output_work_unit = unit;
         }
@@ -170,11 +193,142 @@ impl QueryStateManager {
     }
 
     /// Cancel a query
-    pub async fn cancel_query(&self, query_id: Uuid) {
-        if let Some(metadata) = self.states.read().await.get(&query_id) {
-            metadata.cancellation_token.cancel();
+    pub async fn cancel_query(&self, query_id: Uuid) -> bool {
+        let mut states = self.states.write().await;
+        let Some(metadata) = states.get_mut(&query_id) else {
+            return false;
+        };
+        metadata.cancellation_token.cancel();
+        if matches!(
+            metadata.state,
+            QueryState::Finalizing | QueryState::Completed { .. } | QueryState::Failed { .. }
+        ) {
+            return false;
         }
-        self.update_state(query_id, QueryState::Cancelled).await;
+        metadata.state = QueryState::Cancelled;
+        true
+    }
+
+    /// Atomically reserve the only terminal-completion mutation path.
+    pub async fn begin_finalization(&self, query_id: Uuid) -> bool {
+        let mut states = self.states.write().await;
+        let Some(metadata) = states.get_mut(&query_id) else {
+            return false;
+        };
+        if metadata.cancellation_token.is_cancelled()
+            || matches!(
+                metadata.state,
+                QueryState::Cancelled
+                    | QueryState::Finalizing
+                    | QueryState::Completed { .. }
+                    | QueryState::Failed { .. }
+            )
+        {
+            return false;
+        }
+        metadata.state = QueryState::Finalizing;
+        true
+    }
+
+    pub async fn fail_query(&self, query_id: Uuid, error: String) -> bool {
+        let mut states = self.states.write().await;
+        let Some(metadata) = states.get_mut(&query_id) else {
+            return false;
+        };
+        if matches!(
+            metadata.state,
+            QueryState::Cancelled
+                | QueryState::Finalizing
+                | QueryState::Completed { .. }
+                | QueryState::Failed { .. }
+        ) {
+            return false;
+        }
+        metadata.cancellation_token.cancel();
+        metadata.state = QueryState::Failed { error };
+        true
+    }
+
+    pub async fn begin_provider_task(&self, query_id: Uuid) -> Option<u64> {
+        let mut states = self.states.write().await;
+        let Some(metadata) = states.get_mut(&query_id) else {
+            return None;
+        };
+        if metadata.cancellation_token.is_cancelled() || metadata.active_provider_task.is_some() {
+            return None;
+        }
+        metadata.provider_task_generation = metadata.provider_task_generation.wrapping_add(1);
+        let generation = metadata.provider_task_generation;
+        metadata.active_provider_task = Some(generation);
+        Some(generation)
+    }
+
+    pub async fn end_provider_task(&self, query_id: Uuid, generation: u64) {
+        let notify = {
+            let mut states = self.states.write().await;
+            let Some(metadata) = states.get_mut(&query_id) else {
+                return;
+            };
+            if metadata.active_provider_task != Some(generation) {
+                return;
+            }
+            metadata.active_provider_task = None;
+            Arc::clone(&metadata.provider_task_drained)
+        };
+        notify.notify_waiters();
+    }
+
+    pub async fn wait_for_provider_task(&self, query_id: Uuid) {
+        loop {
+            let (active, notify) = {
+                let states = self.states.read().await;
+                let Some(metadata) = states.get(&query_id) else {
+                    return;
+                };
+                (
+                    metadata.active_provider_task.is_some(),
+                    Arc::clone(&metadata.provider_task_drained),
+                )
+            };
+            if !active {
+                return;
+            }
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .states
+                .read()
+                .await
+                .get(&query_id)
+                .is_none_or(|metadata| metadata.active_provider_task.is_none())
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn provider_task_debug(&self, query_id: Uuid) -> Option<(u64, Option<u64>)> {
+        self.states.read().await.get(&query_id).map(|metadata| {
+            (
+                metadata.provider_task_generation,
+                metadata.active_provider_task,
+            )
+        })
+    }
+
+    pub async fn detach_provider_task(&self, query_id: Uuid) {
+        let notify = {
+            let mut states = self.states.write().await;
+            let Some(metadata) = states.get_mut(&query_id) else {
+                return;
+            };
+            metadata.active_provider_task = None;
+            Arc::clone(&metadata.provider_task_drained)
+        };
+        notify.notify_waiters();
     }
 
     /// Remove a completed/failed/cancelled query (cleanup)
@@ -330,6 +484,52 @@ mod tests {
         assert!(matches!(
             manager.get_state(id).await.unwrap(),
             QueryState::Cancelled
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_finalization_have_one_atomic_winner() {
+        let manager = QueryStateManager::new();
+        let cancelled = manager.create_query(vec![]).await;
+        assert!(manager.cancel_query(cancelled).await);
+        assert!(!manager.begin_finalization(cancelled).await);
+
+        let completed = manager.create_query(vec![]).await;
+        assert!(manager.begin_finalization(completed).await);
+        assert!(!manager.cancel_query(completed).await);
+        assert!(matches!(
+            manager.get_state(completed).await,
+            Some(QueryState::Finalizing)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_until_the_provider_task_is_quiescent() {
+        let manager = Arc::new(QueryStateManager::new());
+        let query_id = manager.create_query(vec![]).await;
+        let generation = manager.begin_provider_task(query_id).await.unwrap();
+        assert!(manager.cancel_query(query_id).await);
+
+        let waiting = Arc::clone(&manager);
+        let wait = tokio::spawn(async move {
+            waiting.wait_for_provider_task(query_id).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+        manager.end_provider_task(query_id, generation).await;
+        wait.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_query_cannot_reenter_tool_execution() {
+        let manager = QueryStateManager::new();
+        let id = manager.create_query(vec![]).await;
+        manager.cancel_query(id).await;
+
+        assert!(!manager.begin_tool_execution(id, 2).await);
+        assert!(matches!(
+            manager.get_state(id).await,
+            Some(QueryState::Cancelled)
         ));
     }
 

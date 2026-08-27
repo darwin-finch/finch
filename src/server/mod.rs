@@ -15,8 +15,8 @@ pub use brain_runner::{
     BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerEffectRecord,
     RunnerMemoryProjectionRequest, RunnerProgramControlRequest, RunnerProgramError,
     RunnerProgramInteraction, RunnerProgramRequest, RunnerProgramResult, RunnerRegistrationId,
-    RunnerRequest, RunnerTurnCommitAck, RunnerTurnCommitNotice, RunnerTurnError, RunnerTurnEvent,
-    RunnerTurnRequest, RunnerTurnResult,
+    RunnerRequest, RunnerTurnCommitAck, RunnerTurnCommitNotice, RunnerTurnError,
+    RunnerTurnErrorKind, RunnerTurnEvent, RunnerTurnRequest, RunnerTurnResult,
 };
 pub use brain_service::{
     BrainLifecycleService, BrainSubmissionError, BrainSubmissionOutcome, BrainWatch,
