@@ -34,11 +34,11 @@ jobs:
 
     - name: Install capnproto (Ubuntu)
       if: runner.os == 'Linux'
-      run: sudo apt-get update && sudo apt-get install -y capnproto
+      run: sudo apt-get update && sudo apt-get install -y capnproto ripgrep
 
     - name: Install capnproto (macOS)
       if: runner.os == 'macOS'
-      run: brew install capnp
+      run: brew install capnp ripgrep
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
