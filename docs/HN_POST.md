@@ -1,5 +1,8 @@
 # Hacker News — Show HN
 
+> **Archived draft:** This is historical marketing copy, not current product documentation or a
+> verified capability statement.
+
 ## Title
 
 Show HN: Finch – open-source agentic coding assistant that works with any LLM (Grok, Claude, GPT-4, or local ONNX)

@@ -1,5 +1,8 @@
 # Shammah User Guide
 
+> **Archived:** This guide describes an earlier product version and is not current user
+> documentation. Start with the [README](../README.md) and [documentation map](README.md).
+
 **Version:** 0.7.4
 **Last Updated:** 2026-02-24
 

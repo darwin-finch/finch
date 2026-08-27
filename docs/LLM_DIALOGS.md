@@ -1,5 +1,8 @@
 # LLM-Prompted User Dialogs - Implementation Guide
 
+> **Archived implementation note:** Verify dialog behavior against the current TUI source and
+> tests; this document is not current user documentation.
+
 ## Overview
 
 This document describes Shammah's implementation of Claude Code-style LLM-prompted user dialogs, allowing the AI to request clarification or gather user preferences during execution.

@@ -1,5 +1,8 @@
 # Development Guide
 
+> **Archived broad guide:** This document contains useful historical context but is not the current
+> contributor setup. Start with [CONTRIBUTING.md](../CONTRIBUTING.md) and the CI workflows.
+
 This guide covers setting up a development environment and contributing to Shammah.
 
 ## Prerequisites

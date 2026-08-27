@@ -1,5 +1,10 @@
 # Model Backend Status
 
+> **Dated implementation investigation:** This records backend experiments, not a promise that a
+> configured model is selected or works end to end. Local routing and provider parity remain
+> unresolved under [#74](https://github.com/darwin-finch/finch/issues/74) and
+> [#98](https://github.com/darwin-finch/finch/issues/98).
+
 **Last Updated**: 2026-08-25
 **Purpose**: Document what works, what doesn't, and why — for both local inference and LoRA fine-tuning.
 

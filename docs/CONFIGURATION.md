@@ -1,5 +1,9 @@
 # Configuration Guide
 
+> **Archived:** This guide describes older configuration behavior. Use `finch setup` and the
+> current [configuration types](../src/config/settings.rs) and
+> [provider profiles](../src/config/provider.rs).
+
 This document describes how to configure Shammah for your environment.
 
 ## Configuration Files

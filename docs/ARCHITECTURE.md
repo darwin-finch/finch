@@ -1,5 +1,8 @@
 # Architecture
 
+> **Archived:** This project-wide architecture predates the current Finch runtime and is retained
+> for history. Use the [documentation map](README.md) to find current implementation references.
+
 This document describes the technical architecture of Shammah, a local-first AI coding assistant that uses pre-trained ONNX models and cloud fallback.
 
 ## Overview

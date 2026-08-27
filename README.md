@@ -1,244 +1,214 @@
-# finch
+# Finch
 
-A terminal AI coding assistant with persistent memory and tool use.
+Finch is an experimental terminal coding assistant written in Rust. It provides an interactive
+REPL, provider-backed chat, code and shell tools with an approval boundary, local persistence, an
+MCP client, a typed Lisp/Co-Forth runtime, and named shared Brain sessions.
 
-## What it does
+Finch is under active development. This README describes the current `main` branch, not a promise
+that every configured provider, local model, or experimental collaboration path is production
+ready. See [Current limitations](#current-limitations) before relying on it.
 
-- Answers coding questions, reads your files, runs commands, and searches your codebase — with your permission before every action
-- Remembers context across sessions using a hierarchical memory tree (MemTree) with neural semantic search — a tiny `all-MiniLM-L6-v2` model (~23MB) runs locally to embed conversations so retrieval finds relevant past context even when phrasing differs
-- Works with any of the major AI providers: Grok, Claude, GPT-4, Gemini, Mistral, Groq
-- Optionally runs a local model on your machine for offline use — Qwen, Llama, Gemma, Mistral, Phi, DeepSeek via ONNX Runtime
+## Quick start from source
 
-## Quick Start
+The most reliable way to try the current code is to build a clean checkout. Supported CI targets
+are Apple Silicon macOS and x86-64 Linux. Install the stable Rust toolchain, Git, and the Cap'n Proto
+compiler first.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/darwin-finch/finch/main/scripts/install.sh | bash
-```
-
-That's it. The script detects your platform (Apple Silicon or Linux x86_64), downloads the binary, clears the macOS quarantine flag, and walks you through entering an API key.
-
-You'll need an API key from one of: [Grok](https://console.x.ai) · [Claude](https://console.anthropic.com) · [GPT-4](https://platform.openai.com) · [Gemini](https://aistudio.google.com) · [Groq](https://console.groq.com)
-
-**Grok is the fastest free option** — X Premium+ subscribers get free API access at [console.x.ai](https://console.x.ai).
-
-Then:
+macOS (Apple Silicon):
 
 ```bash
-finch
+xcode-select --install
+brew install capnp
+git clone https://github.com/darwin-finch/finch.git
+cd finch
+cargo build --release --bin finch
+./target/release/finch setup
+./target/release/finch --cloud-only
 ```
 
-Ask anything in plain English.
+Ubuntu/Debian Linux (x86-64):
 
-<details>
-<summary>Manual install</summary>
-
-**Apple Silicon (M1/M2/M3/M4):**
 ```bash
-curl -L https://github.com/darwin-finch/finch/releases/latest/download/finch-macos-arm64.tar.gz | tar xz
-sudo mv finch /usr/local/bin/finch
-xattr -dr com.apple.quarantine /usr/local/bin/finch   # macOS security
-finch setup
+sudo apt-get update
+sudo apt-get install -y build-essential capnproto pkg-config libssl-dev
+git clone https://github.com/darwin-finch/finch.git
+cd finch
+cargo build --release --bin finch
+./target/release/finch setup
+./target/release/finch --cloud-only
 ```
 
-**Linux (x86_64):**
-```bash
-curl -L https://github.com/darwin-finch/finch/releases/latest/download/finch-linux-x86_64.tar.gz | tar xz
-sudo mv finch /usr/local/bin/finch
-finch setup
-```
+`finch setup` writes provider profiles and settings to `~/.finch/config.toml`. The setup UI
+currently offers API-key profiles for Anthropic, OpenAI, xAI, Google Gemini, Mistral, and Groq, as
+well as local-model configuration. Use a provider model returned by the setup catalog or enter one
+explicitly; model availability changes independently of Finch.
 
-</details>
+GitHub release assets currently exist for Apple Silicon macOS and x86-64 Linux, but they can lag
+behind `main`. Release and installer reliability are being tracked in
+[#119](https://github.com/darwin-finch/finch/issues/119) and
+[#144](https://github.com/darwin-finch/finch/issues/144), so this first truthful refresh does not
+recommend the one-line installer as the canonical path.
 
----
+## Current interfaces
 
-## What you can ask it
-
-Ask questions in plain English. finch has access to tools and will ask your permission before using them.
-
-**Read and explain code:**
-```
-> Read src/main.rs and explain what the startup sequence does
-```
-
-**Find things in your codebase:**
-```
-> Find all uses of unwrap() in Rust files and list the file names
-```
-
-**Run your tests:**
-```
-> Run cargo test and tell me which tests failed
-```
-
-**Get documentation:**
-```
-> Fetch the tokio docs for spawn_blocking and show me an example
-```
-
----
-
-## External tools with MCP
-
-Finch is an MCP client and can start configured stdio servers automatically. Add
-servers to `~/.finch/config.toml`:
-
-```toml
-[mcp_servers.filesystem]
-transport = "stdio"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/project"]
-env = { API_TOKEN = "$API_TOKEN" }
-timeout_secs = 300
-enabled = true
-```
-
-Use `/mcp list`, `/mcp tools`, `/mcp refresh`, and `/mcp reload` in the REPL.
-Configured tools are also available to `finch query`. See
-[the MCP client guide](docs/MCP_USER_GUIDE.md) for configuration and troubleshooting.
-
-Finch's OpenAI-compatible HTTP endpoint is the interface for clients that drive
-Finch as a model; Finch does not expose an MCP server.
-
-On macOS, optional GUI automation requires both Finch capability consent and a
-separate operating-system Accessibility grant. See the
-[macOS GUI automation permission guide](docs/MACOS_GUI_AUTOMATION.md).
-
----
-
-## Shared brains (experimental)
-
-A named Brain keeps one ordered conversation and one persistent typed Lisp/Co-Forth VM across
-multiple terminals and daemon restarts. Start the daemon, open Finch in two terminals, and attach
-both to the same local name:
+These commands are defined by the current CLI:
 
 ```text
-finch daemon-start
-finch
-
-/brain attach demo@127.0.0.1
+finch                         interactive terminal UI
+finch --raw                   interactive line-oriented UI
+finch --cloud-only            skip local-model loading and the daemon
+finch query "explain this"    run one provider-backed query
+finch setup                   configure provider profiles and settings
+finch daemon                  foreground HTTP server on 127.0.0.1:8000 by default
+finch daemon-start            background daemon on 127.0.0.1:11435 by default
+finch daemon-status           report background-daemon status
+finch daemon-stop             stop the background daemon
+finch --forth "1 2 +"         evaluate typed Co-Forth without an LLM
+finch --lisp "(+ 1 2)"        evaluate typed Finch Lisp without an LLM
+finch --exec path/to/file      execute a typed Finch script
 ```
 
-The second `finch` process uses the same `/brain attach` command. Programs, provider responses, VM
-output, and errors appear in both consoles. For example, define a word in one terminal:
+Run `finch --help` and `finch <command> --help` for the full generated CLI reference. In the REPL,
+`/help` shows the slash commands present in that build. `/provider` is the canonical provider
+selector; `/model` and `/teacher` remain compatibility aliases.
 
-```lisp
-(define (triple (n : int)) (* n 3))
+### Tools and approval
+
+Finch can inspect files, search source, propose changes, run commands, and call configured MCP
+tools. Approval is policy-dependent: known read-only operations may run without a prompt, while
+mutating or otherwise sensitive operations normally require review or are denied. Enabling an
+auto-approval setting changes that boundary. The implementation contract is documented in
+[`src/tools/EXECUTION.md`](src/tools/EXECUTION.md); treat generated diffs and commands as untrusted
+until reviewed.
+
+### Configuration and providers
+
+The authoritative configuration types live in
+[`src/config/settings.rs`](src/config/settings.rs) and
+[`src/config/provider.rs`](src/config/provider.rs). A minimal API-key profile looks like:
+
+```toml
+[[providers]]
+type = "claude"
+name = "work"
+api_key = "sk-ant-..."
 ```
 
-and invoke it from the other:
+Provider profiles may have user-defined names and model overrides. The code also contains profile
+types for Ollama, a remote Finch daemon, and local inference. Configuration support is not the
+same as end-to-end conformance: provider routing and model selection are still being reconciled in
+[#51](https://github.com/darwin-finch/finch/issues/51),
+[#74](https://github.com/darwin-finch/finch/issues/74),
+[#98](https://github.com/darwin-finch/finch/issues/98), and
+[#104](https://github.com/darwin-finch/finch/issues/104).
 
-```lisp
-(say (int-to-string (triple 14)))
-```
+ChatGPT consumer subscriptions are not an authentication mechanism for Finch. Legacy
+`chatgpt_subscription` configuration is rejected with migration guidance; subscription/device
+authentication remains unresolved and must not be inferred from OpenAI API-key support.
 
-Use `/brain detach` to return that console to its local session. Named-Brain workspace/process
-effects and scoped participant roles are still under development; the current compatibility path
-is intended for shared conversation and pure/session-output VM testing.
+### Local inference
 
----
+The source contains ONNX Runtime and Candle loaders plus local profiles for several model families.
+Local artifacts can be large and may require Hugging Face access. A configured local profile does
+not currently guarantee that a query is routed locally; local bootstrap, selection, and provider
+parity remain experimental under [#74](https://github.com/darwin-finch/finch/issues/74) and
+[#98](https://github.com/darwin-finch/finch/issues/98). Use `--cloud-only` when you need to avoid a
+local download attempt.
 
-## Local model (offline use)
+### HTTP daemon
 
-If you want finch to run without any cloud provider, it can download and run a local model via ONNX Runtime. Six model families are supported (Qwen, Llama, Gemma, Mistral, Phi, DeepSeek). Qwen 2.5 is the default, selected automatically based on your available RAM:
+`finch daemon` binds the foreground HTTP server to `127.0.0.1:8000` unless `--bind` is supplied.
+The separately managed background daemon uses `127.0.0.1:11435`. The server implements
+`POST /v1/chat/completions`, `GET /v1/models`, `POST /v1/messages`, health/metrics endpoints, and
+Finch-specific feedback, node, and Brain routes. It does **not** implement the complete OpenAI API
+or the Responses API. Integration conformance is tracked in
+[#130](https://github.com/darwin-finch/finch/issues/130),
+[#133](https://github.com/darwin-finch/finch/issues/133), and
+[#134](https://github.com/darwin-finch/finch/issues/134).
 
-| RAM    | Model  | Download size |
-|--------|--------|---------------|
-| 8 GB   | 1.5B   | ~1.5 GB       |
-| 16 GB  | 3B     | ~3 GB         |
-| 32 GB  | 7B     | ~7 GB         |
-| 64 GB+ | 14B    | ~14 GB        |
+When explicitly enabled, remote Brain collaboration uses a distinct TLS listener whose configured
+default is `0.0.0.0:11436`. That listener exposes a restricted Brain route set; it is not the
+OpenAI-compatible endpoint.
 
-The download happens in the background on first run. On Apple Silicon, inference uses ONNX Runtime's CoreML execution provider, which dispatches ops to ANE or GPU where supported.
+### MCP client
 
-To use the local model, run `finch` without `--cloud-only`. The REPL starts immediately; queries fall back to your cloud provider while the model loads.
+Finch can start configured stdio MCP servers and import their tools. It does not expose an MCP
+server. See the [MCP client guide](docs/MCP_USER_GUIDE.md) for configuration and troubleshooting.
 
----
+### Brains, typed programs, and subagents
 
-## Commands reference
+The typed Lisp/Co-Forth runtime and named Brain persistence have extensive implementation and test
+coverage, but their user workflows are experimental. A Brain is a named, durable conversation and
+program environment owned by the daemon; local and remote attachment have different transport and
+authority boundaries. Subagent and remote-collaboration behavior is still evolving under
+[#57](https://github.com/darwin-finch/finch/issues/57),
+[#107](https://github.com/darwin-finch/finch/issues/107),
+[#140](https://github.com/darwin-finch/finch/issues/140),
+[#145](https://github.com/darwin-finch/finch/issues/145), and
+[#146](https://github.com/darwin-finch/finch/issues/146).
 
-| Command / Key        | What it does                                           |
-|----------------------|--------------------------------------------------------|
-| `finch`              | Start the interactive REPL (with local model if ready) |
-| `finch setup`        | Run the interactive setup wizard                       |
-| `finch --cloud-only` | Start REPL using only cloud providers, no local model  |
-| `/plan <task>`       | Run iterative planning loop (7-persona critique, 3 rounds) |
-| `/model`             | Show the active named model profile                     |
-| `/model list`        | List configured cloud, Ollama, and local profiles       |
-| `/model <name>`      | Switch profiles without clearing conversation context  |
-| `/provider …`        | Compatibility alias for `/model …`                     |
-| `/teacher …`         | Compatibility alias for `/model …`                     |
-| `/brain attach NAME@HOST` | Attach this console to a named shared Brain      |
-| `/brain detach`      | Return this console to its local session                 |
-| `/license status`    | Show current license type                              |
-| `/license activate <key>` | Activate a commercial license key                 |
-| `/help`              | Show available commands                                |
-| `spawn_task`         | (tool) Delegate a subtask to an isolated subagent loop |
-| `Ctrl+C`             | Cancel the current query                               |
-| `Ctrl+G`             | Save a private good-response feedback rating            |
-| `Ctrl+B`             | Save a private bad-response feedback rating             |
-| **In dialogs:** ↑↓   | Navigate between options                               |
-| **In dialogs:** Space | Toggle selection (MultiSelect)                        |
-| **In dialogs:** o/O  | Jump to "Other" row and start typing                   |
-| **In dialogs:** Shift+Enter | Insert newline in custom text field             |
-
-Explicit feedback is private metadata, not an automatic training signal. Finch
-stops appending to `~/.finch/feedback.jsonl` at 16 MiB; at the limit, new
-ratings are rejected without deleting or rotating existing feedback. A legacy
-file already over the ceiling is preserved unchanged and rejects new ratings.
-
----
-
-## Privacy
-
-- All configuration is stored locally at `~/.finch/config.toml`
-- Conversation memory is stored locally at `~/.finch/memory.db` (SQLite)
-- No account required, no telemetry, no cloud sync
-- When using a cloud provider, your queries are sent to that provider's API under your own API key
-- When using the local model, nothing leaves your machine
-
----
-
-## Build from source
-
-Requires Rust 1.70 or later.
+Use direct typed-runtime commands for bounded experiments:
 
 ```bash
-git clone https://github.com/darwin-finch/finch
-cd finch
-cargo build --release
-./target/release/finch --version
+./target/release/finch --forth "1 2 +" --json
+./target/release/finch --lisp "(+ 1 2)" --json
 ```
 
----
+## Persistence and privacy
+
+Finch stores configuration and application state under `~/.finch/`, including SQLite memory,
+sessions, named Brains, feedback, and approval patterns as applicable. Explicit good/bad response
+feedback is private durable metadata; it does not authorize or trigger training. Legacy training
+queues and adapters may be preserved but are not processed automatically.
+
+Local storage does not make a cloud-backed session offline: prompts, selected context, and tool
+results sent to a configured cloud provider leave the machine and are governed by that provider.
+Configured MCP servers and remote Finch peers can also receive data as directed by their tools and
+capabilities. Finch has no automatic LoRA training path; see
+[#139](https://github.com/darwin-finch/finch/issues/139).
+
+## Current limitations
+
+- Finch is experimental and is not presented as release-ready or production-ready.
+- Provider and local-model behavior is not yet uniform; verify the exact profile and model you use.
+- There is no supported ChatGPT subscription/device-auth flow and no live-model claim for any
+  unreleased or unverified model.
+- The server supports a small endpoint subset, not the full OpenAI API and not `/v1/responses`.
+- Image-input/output support is not documented as available.
+- Finch does not automatically update itself, train LoRA adapters, or turn feedback into training.
+- Brain, remote collaboration, typed-agent, and subagent workflows remain experimental.
+
+The issue tracker is the source for planned work. In particular, do not treat design documents as
+implemented behavior unless current source or tests say so.
+
+## Development
+
+After installing the prerequisites from [Quick start from source](#quick-start-from-source):
+
+```bash
+cargo fmt --all -- --check
+cargo check --lib --bins --tests
+cargo test
+python3 scripts/check_docs.py
+```
+
+Some full builds and tests are memory-intensive. Narrow commands to the module under change when
+appropriate, then rely on CI for the supported platform matrix. See [CONTRIBUTING.md](CONTRIBUTING.md)
+before submitting work and [docs/README.md](docs/README.md) for the documentation map.
+
+## Maintainer and development assistance
+
+Finch was created and is maintained by **Shammah Chancellor**. Substantial portions of the project
+have been developed with assistance from Anthropic Claude and OpenAI Codex. Those products are
+development tools, not legal authors, maintainers, people, or GitHub identities. Commit authorship
+should identify the human responsible for the change; optional assistance trailers must be
+truthful. Existing contributor displays are a consequence of historical commit metadata and cannot
+be repaired without rewriting history, which this project does not do for attribution cleanup.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the attribution policy.
 
 ## License
 
-Finch is **source-available** under the [PolyForm Noncommercial License 1.0.0](LICENSE).
-
-| Use case | License needed |
-|---|---|
-| Personal projects, learning, research | Free (Noncommercial) |
-| Academic / educational | Free (Noncommercial) |
-| Internal company use, client work, SaaS | **Commercial** — $10/yr |
-
-**Purchase a commercial key:** https://polar.sh/darwin-finch
-
-**Activate your key:**
-```bash
-finch license activate --key FINCH-...
-```
-
-**Check status:**
-```bash
-finch license status
-```
-
----
-
-## Sponsors
-
-If finch saves you API costs or you want to support continued development, consider a commercial license or GitHub Sponsors.
-
-[![GitHub Sponsors](https://img.shields.io/github/sponsors/darwin-finch?label=Sponsor&logo=GitHub&color=ea4aaa)](https://github.com/sponsors/darwin-finch)
-
-Available for **consulting and contract work** — open an issue or reach out via GitHub if interested.
+Finch is source-available under the
+[PolyForm Noncommercial License 1.0.0](LICENSE). Review the license text for the authoritative
+terms. Commercial licensing information is available at <https://polar.sh/darwin-finch>.

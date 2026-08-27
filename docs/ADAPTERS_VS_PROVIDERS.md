@@ -1,5 +1,8 @@
 # LocalModelAdapters vs TeacherProviders
 
+> **Archived terminology note:** This predates the current unified provider configuration. It is
+> retained for implementation history and is not a current capability matrix.
+
 **Clear Separation of Concerns**
 
 ## Two Distinct Systems

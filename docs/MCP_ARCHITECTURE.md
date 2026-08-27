@@ -1,5 +1,8 @@
 # MCP (Model Context Protocol) Architecture
 
+> **Archived status document:** Use the current [MCP client guide](MCP_USER_GUIDE.md) and source;
+> the phase/version statements below are historical.
+
 **Status**: 🚧 Infrastructure complete, connection layer in progress
 **Target Version**: 0.6.0
 **Last Updated**: February 2026

@@ -1,5 +1,8 @@
 # TUI Architecture - Terminal User Interface Design Document
 
+> **Archived expanded design:** Verify current renderer behavior against the co-located
+> [TUI implementation notes](../src/cli/tui/ARCHITECTURE.md), source, and tests.
+
 ## Overview
 
 The Shammah TUI is a sophisticated terminal user interface that provides a Claude Code-like experience with:
