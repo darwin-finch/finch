@@ -7,6 +7,7 @@
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
@@ -24,7 +25,7 @@ use std::thread;
 use std::time::Duration as StdDuration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 
 use super::types::{ProviderRequest, ProviderResponse, StreamChunk};
@@ -1265,6 +1266,15 @@ pub struct ChatGptDeviceLogin {
     client: Option<RpcClient>,
 }
 
+/// Terminal outcome from waiting for a Codex-owned device authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceLoginOutcome {
+    /// Codex authenticated the managed ChatGPT profile.
+    Completed,
+    /// Finch requested cancellation and Codex acknowledged it.
+    Cancelled,
+}
+
 impl std::fmt::Debug for PendingChatGptLogin {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1401,7 +1411,26 @@ impl CodexAppServerAuth {
         })
     }
 
-    pub async fn finish_device_login(&self, mut login: ChatGptDeviceLogin) -> Result<()> {
+    pub async fn finish_device_login(&self, login: ChatGptDeviceLogin) -> Result<()> {
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        match self.finish_device_login_or_cancel(login, cancel_rx).await? {
+            DeviceLoginOutcome::Completed => Ok(()),
+            DeviceLoginOutcome::Cancelled => {
+                bail!("ChatGPT device login was cancelled")
+            }
+        }
+    }
+
+    /// Wait for device authorization while retaining an exact, acknowledged cancel path.
+    ///
+    /// The caller may update `cancel` to `true` from its TUI event loop. This method owns the
+    /// app-server session until either the correlated terminal notification arrives or Codex
+    /// acknowledges `account/login/cancel`; dropping a UI task cannot orphan the login child.
+    pub async fn finish_device_login_or_cancel(
+        &self,
+        mut login: ChatGptDeviceLogin,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<DeviceLoginOutcome> {
         let mut client = login
             .client
             .take()
@@ -1411,7 +1440,18 @@ impl CodexAppServerAuth {
             let mut completed = false;
             let mut updated = false;
             loop {
-                let event = client.next_event().await?;
+                let event = tokio::select! {
+                    event = client.next_event() => event?,
+                    cancelled = wait_for_login_cancel(&mut cancel) => {
+                        cancelled?;
+                        cancel_login_and_wait(
+                            &mut client,
+                            &login.details.login_id,
+                            Instant::now() + CHILD_EXIT_TIMEOUT,
+                        ).await?;
+                        return Ok(DeviceLoginOutcome::Cancelled);
+                    }
+                };
                 match event.get("method").and_then(Value::as_str) {
                     Some("account/updated") => {
                         if updated
@@ -1423,7 +1463,7 @@ impl CodexAppServerAuth {
                         updated = true;
                         if completed {
                             client.require_no_post_terminal_message().await?;
-                            return Ok(());
+                            return Ok(DeviceLoginOutcome::Completed);
                         }
                         continue;
                     }
@@ -1446,12 +1486,12 @@ impl CodexAppServerAuth {
                     completed = true;
                     if updated {
                         client.require_no_post_terminal_message().await?;
-                        return Ok(());
+                        return Ok(DeviceLoginOutcome::Completed);
                     }
                     continue;
                 }
                 client.require_no_post_terminal_message().await?;
-                bail!("ChatGPT login did not complete successfully");
+                bail!(safe_login_failure(params));
             }
         })
         .await
@@ -1504,6 +1544,32 @@ impl CodexAppServerAuth {
         };
         client.shutdown().await;
         outcome
+    }
+}
+
+fn safe_login_failure(params: &Value) -> &'static str {
+    let error = params
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if error.contains("denied") || error.contains("declined") || error.contains("access_denied") {
+        "ChatGPT device login was denied"
+    } else if error.contains("expired") || error.contains("expiry") {
+        "ChatGPT device login expired"
+    } else {
+        "ChatGPT login did not complete successfully"
+    }
+}
+
+async fn wait_for_login_cancel(cancel: &mut watch::Receiver<bool>) -> Result<()> {
+    loop {
+        if *cancel.borrow() {
+            return Ok(());
+        }
+        if cancel.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
     }
 }
 
@@ -1565,6 +1631,85 @@ fn required_string(value: &Value, field: &str) -> Result<String> {
         .with_context(|| format!("Codex app-server omitted {field}"))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelCatalogEntry {
+    id: String,
+    model: String,
+    #[serde(default)]
+    hidden: bool,
+    #[serde(default)]
+    default_reasoning_effort: Option<String>,
+    #[serde(default)]
+    supported_reasoning_efforts: Vec<ReasoningEffortEntry>,
+    #[serde(default = "legacy_input_modalities")]
+    input_modalities: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReasoningEffortEntry {
+    reasoning_effort: String,
+}
+
+fn legacy_input_modalities() -> Vec<String> {
+    vec!["text".into(), "image".into()]
+}
+
+fn validate_sol_catalog_entry(model: &ModelCatalogEntry) -> Result<bool> {
+    if model.id != GPT_5_6_SOL && model.model != GPT_5_6_SOL {
+        return Ok(false);
+    }
+    if model.hidden {
+        bail!("GPT-5.6 Sol is hidden from the signed-in ChatGPT account");
+    }
+    if !model.input_modalities.iter().any(|value| value == "text") {
+        bail!("GPT-5.6 Sol does not advertise text input support");
+    }
+    if let Some(default) = model.default_reasoning_effort.as_deref() {
+        if !model.supported_reasoning_efforts.is_empty()
+            && !model
+                .supported_reasoning_efforts
+                .iter()
+                .any(|effort| effort.reasoning_effort == default)
+        {
+            bail!("GPT-5.6 Sol returned an invalid default reasoning effort");
+        }
+    }
+    Ok(true)
+}
+
+fn catalog_page_has_usable_sol(page: &Value) -> Result<bool> {
+    let models: Vec<ModelCatalogEntry> = serde_json::from_value(
+        page.get("data")
+            .cloned()
+            .context("Codex model catalog omitted data")?,
+    )
+    .context("Codex model catalog returned an invalid model entry")?;
+    for model in &models {
+        if validate_sol_catalog_entry(model)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn catalog_next_cursor(page: &Value, seen: &mut HashSet<String>) -> Result<Option<String>> {
+    let Some(value) = page.get("nextCursor").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let next = value
+        .as_str()
+        .context("Codex model catalog returned an invalid pagination cursor")?;
+    if next.is_empty() {
+        return Ok(None);
+    }
+    if !seen.insert(next.to_string()) {
+        bail!("Codex model catalog repeated a pagination cursor");
+    }
+    Ok(Some(next.to_string()))
+}
+
 async fn require_visible_sol(rpc: &mut RpcClient) -> Result<()> {
     let mut cursor: Option<String> = None;
     let mut seen = HashSet::new();
@@ -1574,30 +1719,12 @@ async fn require_visible_sol(rpc: &mut RpcClient) -> Result<()> {
             params["cursor"] = json!(cursor);
         }
         let page = rpc.request("model/list", params).await?;
-        if page
-            .get("data")
-            .and_then(Value::as_array)
-            .is_some_and(|models| {
-                models.iter().any(|model| {
-                    model.get("hidden").and_then(Value::as_bool) != Some(true)
-                        && (model.get("id").and_then(Value::as_str) == Some(GPT_5_6_SOL)
-                            || model.get("model").and_then(Value::as_str) == Some(GPT_5_6_SOL))
-                })
-            })
-        {
+        if catalog_page_has_usable_sol(&page)? {
             return Ok(());
         }
-        let Some(next) = page
-            .get("nextCursor")
-            .and_then(Value::as_str)
-            .filter(|cursor| !cursor.is_empty())
-            .map(str::to_string)
-        else {
+        let Some(next) = catalog_next_cursor(&page, &mut seen)? else {
             bail!("GPT-5.6 Sol is not available to the signed-in ChatGPT account");
         };
-        if !seen.insert(next.clone()) {
-            bail!("Codex model catalog repeated a pagination cursor");
-        }
         cursor = Some(next);
     }
     bail!("Codex model catalog exceeded the page limit")
@@ -2475,10 +2602,15 @@ for line in sys.stdin:
         if thread_event == 'duplicate':
             print(json.dumps({'method': 'thread/started', 'params': {'thread': {'id': started_id}}}), flush=True)
     if method == 'account/login/start' and thread_event != 'pending_login':
-        print(json.dumps({'method': 'account/login/completed', 'params': {'loginId': 'login-1', 'success': True}}), flush=True)
-        print(json.dumps({'method': 'account/updated', 'params': {'authMode': 'chatgpt', 'planType': 'plus'}}), flush=True)
+        completed = {'method': 'account/login/completed', 'params': {'loginId': 'wrong-login' if thread_event == 'login_mismatch' else 'login-1', 'success': thread_event not in ['login_denied', 'login_expired'], 'error': 'access_denied' if thread_event == 'login_denied' else ('expired_token' if thread_event == 'login_expired' else None)}}
+        updated = {'method': 'account/updated', 'params': {'authMode': 'chatgpt', 'planType': 'plus'}}
+        if thread_event == 'login_updated_first': print(json.dumps(updated), flush=True)
+        print(json.dumps(completed), flush=True)
+        if thread_event not in ['login_denied', 'login_expired', 'login_updated_first']: print(json.dumps(updated), flush=True)
+        if thread_event in ['login_duplicate', 'login_late']: print(json.dumps(completed), flush=True)
     if method == 'account/login/cancel':
         print(json.dumps({'method':'account/login/completed','params':{'loginId':'login-1','success':False,'error':'cancelled'}}), flush=True)
+        if thread_event == 'cancel_duplicate': print(json.dumps({'method':'account/login/completed','params':{'loginId':'login-1','success':False,'error':'cancelled'}}), flush=True)
     if method == 'account/logout':
         print(json.dumps({'method': 'account/updated', 'params': {'authMode': None, 'planType': None}}), flush=True)
     if method == 'turn/start':
@@ -3200,6 +3332,45 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn login_accepts_account_update_before_completion() {
+        let (_directory, command) =
+            mock_app_server_with_thread_event("chatgpt", "login_updated_first");
+        let auth = CodexAppServerAuth::with_command(command);
+        let login = auth.begin_device_login().await.unwrap();
+        auth.finish_device_login(login).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn login_rejects_denial_expiry_mismatch_duplicate_and_late_completion() {
+        for (mode, expected) in [
+            ("login_denied", "denied"),
+            ("login_expired", "expired"),
+            ("login_mismatch", "did not match"),
+            ("login_duplicate", "after terminal state"),
+            ("login_late", "after terminal state"),
+        ] {
+            let (_directory, command) = mock_app_server_with_thread_event("chatgpt", mode);
+            let auth = CodexAppServerAuth::with_command(command);
+            let login = auth.begin_device_login().await.unwrap();
+            let error = auth.finish_device_login(login).await.unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "{mode} produced {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_login_rejects_duplicate_terminal_notification() {
+        let (_directory, command) =
+            mock_app_server_with_thread_event("chatgpt", "cancel_duplicate");
+        let auth = CodexAppServerAuth::with_command(command);
+        let login = auth.begin_device_login().await.unwrap();
+        let error = auth.cancel_device_login(login).await.unwrap_err();
+        assert!(error.to_string().contains("after terminal state"));
+    }
+
+    #[tokio::test]
     async fn api_key_account_is_not_accepted_as_subscription_auth() {
         let (_directory, command) = mock_app_server("apiKey");
         let provider = CodexAppServerProvider::with_command(command, GPT_5_6_SOL, false);
@@ -3295,6 +3466,147 @@ for line in sys.stdin:
         assert!(error
             .to_string()
             .contains("unexpected notification unknown/event during initialize"));
+    }
+
+    #[tokio::test]
+    async fn jsonl_transport_rejects_malformed_oversized_truncated_and_invalid_utf8() {
+        async fn failure(payload: &str) -> String {
+            let command = AppServerCommand::test(
+                PathBuf::from("python3"),
+                vec![
+                    "-c".into(),
+                    format!(
+                        "import sys\nsys.stdin.readline()\nsys.stdout.buffer.write({payload})\nsys.stdout.buffer.flush()"
+                    ),
+                ],
+            );
+            match RpcClient::spawn(&command).await {
+                Ok(mut client) => {
+                    client.shutdown().await;
+                    panic!("hostile JSONL fixture unexpectedly initialized")
+                }
+                Err(error) => error.to_string(),
+            }
+        }
+
+        assert!(failure("b'{malformed}\\n'").await.contains("invalid JSON"));
+        assert!(failure("b'{' + (b'x' * (2 * 1024 * 1024)) + b'}\\n'")
+            .await
+            .contains("size limit"));
+        assert!(failure("b'{\"id\": 1, \"result\": {}'")
+            .await
+            .contains("exited unexpectedly"));
+        assert!(failure("b'\\xff\\n'").await.contains("invalid JSON"));
+    }
+
+    #[tokio::test]
+    async fn jsonl_transport_accepts_crlf_and_withholds_noisy_stderr() {
+        let command = AppServerCommand::test(
+            PathBuf::from("python3"),
+            vec![
+                "-c".into(),
+                "import json,sys\nm=json.loads(sys.stdin.readline())\nsys.stderr.write('Bearer secret.jwt.value password=hunter2?token=sk-test\\n')\nsys.stderr.flush()\nsys.stdout.buffer.write((json.dumps({'id':m['id'],'result':{}})+'\\r\\n').encode())\nsys.stdout.buffer.flush()\nsys.stdin.readline()"
+                    .into(),
+            ],
+        );
+        let mut client = RpcClient::spawn(&command).await.unwrap();
+        client.shutdown().await;
+    }
+
+    #[test]
+    fn sol_catalog_requires_visible_text_model_and_consistent_effort_metadata() {
+        let legacy: ModelCatalogEntry = serde_json::from_value(json!({
+            "id": GPT_5_6_SOL,
+            "model": GPT_5_6_SOL,
+            "hidden": false
+        }))
+        .unwrap();
+        assert!(validate_sol_catalog_entry(&legacy).unwrap());
+        assert_eq!(legacy.input_modalities, ["text", "image"]);
+
+        let hidden: ModelCatalogEntry = serde_json::from_value(json!({
+            "id": GPT_5_6_SOL, "model": GPT_5_6_SOL, "hidden": true
+        }))
+        .unwrap();
+        assert!(validate_sol_catalog_entry(&hidden)
+            .unwrap_err()
+            .to_string()
+            .contains("hidden"));
+
+        let no_text: ModelCatalogEntry = serde_json::from_value(json!({
+            "id": GPT_5_6_SOL, "model": GPT_5_6_SOL,
+            "inputModalities": ["image"]
+        }))
+        .unwrap();
+        assert!(validate_sol_catalog_entry(&no_text)
+            .unwrap_err()
+            .to_string()
+            .contains("text input"));
+
+        let invalid_effort: ModelCatalogEntry = serde_json::from_value(json!({
+            "id": GPT_5_6_SOL, "model": GPT_5_6_SOL,
+            "defaultReasoningEffort": "high",
+            "supportedReasoningEfforts": [{"reasoningEffort": "low"}],
+            "inputModalities": ["text"]
+        }))
+        .unwrap();
+        assert!(validate_sol_catalog_entry(&invalid_effort)
+            .unwrap_err()
+            .to_string()
+            .contains("reasoning effort"));
+
+        assert!(!catalog_page_has_usable_sol(&json!({
+            "data": [{"id":"other", "model":"other"}],
+            "nextCursor":"page-2"
+        }))
+        .unwrap());
+        assert!(catalog_page_has_usable_sol(&json!({
+            "data": [{
+                "id": GPT_5_6_SOL,
+                "model": GPT_5_6_SOL,
+                "supportedReasoningEfforts": [{"reasoningEffort":"low"}],
+                "defaultReasoningEffort":"low",
+                "inputModalities":["text", "image"]
+            }],
+            "nextCursor":null
+        }))
+        .unwrap());
+
+        let mut seen = HashSet::new();
+        assert_eq!(
+            catalog_next_cursor(&json!({"nextCursor":"page-2"}), &mut seen).unwrap(),
+            Some("page-2".into())
+        );
+        assert!(
+            catalog_next_cursor(&json!({"nextCursor":"page-2"}), &mut seen)
+                .unwrap_err()
+                .to_string()
+                .contains("repeated")
+        );
+        assert_eq!(
+            catalog_next_cursor(&json!({"nextCursor":null}), &mut seen).unwrap(),
+            None
+        );
+        assert!(catalog_next_cursor(&json!({"nextCursor":42}), &mut seen)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid pagination cursor"));
+    }
+
+    #[test]
+    fn login_denial_and_expiry_are_classified_without_reflecting_server_text() {
+        assert_eq!(
+            safe_login_failure(&json!({"error":"access_denied bearer secret"})),
+            "ChatGPT device login was denied"
+        );
+        assert_eq!(
+            safe_login_failure(&json!({"error":"expired_token sk-secret"})),
+            "ChatGPT device login expired"
+        );
+        assert_eq!(
+            safe_login_failure(&json!({"error":"https://bad.invalid/?token=secret"})),
+            "ChatGPT login did not complete successfully"
+        );
     }
 
     #[tokio::test]

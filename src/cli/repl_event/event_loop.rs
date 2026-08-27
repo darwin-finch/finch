@@ -2584,10 +2584,6 @@ impl EventLoop {
                         let wizard_result =
                             tokio::task::spawn_blocking(crate::cli::setup_wizard::run_setup_wizard)
                                 .await;
-                        {
-                            let mut tui = self.tui_renderer.lock().await;
-                            tui.resume().ok();
-                        }
                         match wizard_result {
                             Ok(Ok(Some(result))) => {
                                 match crate::cli::setup_wizard::validate_and_apply(&result).await {
@@ -2615,6 +2611,13 @@ impl EventLoop {
                                 self.output_manager
                                     .write_info("Setup wizard exited.".to_string());
                             }
+                        }
+                        // The setup wizard and ChatGPT ceremony own terminal modes for their
+                        // complete lifetime. Reacquire the REPL only after every async setup
+                        // state is terminal, including cancellation and error recovery.
+                        {
+                            let mut tui = self.tui_renderer.lock().await;
+                            tui.resume().ok();
                         }
                         self.render_tui().await?;
                     }

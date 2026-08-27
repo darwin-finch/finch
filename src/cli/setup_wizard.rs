@@ -1,7 +1,7 @@
 // Setup Wizard - First-run configuration
 
 use crate::service::discovery_client::{DiscoveredService, ServiceDiscoveryClient};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -12,7 +12,10 @@ use ratatui::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::Duration;
 
 /// Step in the "Add Provider" flow (overlay inside Models section)
@@ -1000,13 +1003,16 @@ impl SetupResult {
 fn cleanup_terminal(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
 ) -> Result<()> {
-    crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(
+    let raw_result = crossterm::terminal::disable_raw_mode();
+    let screen_result = crossterm::execute!(
         terminal.backend_mut(),
         crossterm::terminal::LeaveAlternateScreen,
         crossterm::event::DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    );
+    let cursor_result = terminal.show_cursor();
+    raw_result?;
+    screen_result?;
+    cursor_result?;
     Ok(())
 }
 
@@ -1113,6 +1119,8 @@ enum ChatGptSetupAction {
     LoginSucceeded,
     Fallback,
     Cancel,
+    Keep,
+    Logout,
 }
 
 impl ChatGptSetupState {
@@ -1136,6 +1144,308 @@ impl ChatGptSetupState {
     }
 }
 
+struct SetupAuthUi {
+    terminal: ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+    events: tokio::sync::mpsc::Receiver<Event>,
+    stop_events: Arc<AtomicBool>,
+    event_thread: Option<std::thread::JoinHandle<()>>,
+    restored: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceUiAction {
+    Cancel,
+    Copy,
+    Open,
+    Redraw,
+    Ignore,
+}
+
+fn device_ui_action(event: &Event) -> DeviceUiAction {
+    match event {
+        Event::Resize(_, _) => DeviceUiAction::Redraw,
+        Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => match key.code {
+            KeyCode::Esc => DeviceUiAction::Cancel,
+            KeyCode::Char('c' | 'C') => DeviceUiAction::Copy,
+            KeyCode::Char('o' | 'O') => DeviceUiAction::Open,
+            _ => DeviceUiAction::Ignore,
+        },
+        _ => DeviceUiAction::Ignore,
+    }
+}
+
+fn device_login_remaining(started: std::time::Instant) -> Duration {
+    Duration::from_secs(10 * 60).saturating_sub(started.elapsed())
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+impl SetupAuthUi {
+    fn enter() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        if let Err(error) = crossterm::execute!(
+            stdout,
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture
+        ) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            return Err(error.into());
+        }
+        let backend = ratatui::backend::CrosstermBackend::new(stdout);
+        let terminal = match ratatui::Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = crossterm::execute!(
+                    io::stdout(),
+                    crossterm::terminal::LeaveAlternateScreen,
+                    crossterm::event::DisableMouseCapture
+                );
+                let _ = crossterm::terminal::disable_raw_mode();
+                return Err(error).context("Failed to open setup terminal");
+            }
+        };
+        let (event_tx, events) = tokio::sync::mpsc::channel(32);
+        let stop_events = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stop_events);
+        let event_thread = match std::thread::Builder::new()
+            .name("finch-setup-events".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    match event::poll(Duration::from_millis(50)) {
+                        Ok(true) => match event::read() {
+                            Ok(event) if event_tx.blocking_send(event).is_ok() => {}
+                            Ok(_) | Err(_) => break,
+                        },
+                        Ok(false) => {}
+                        Err(_) => break,
+                    }
+                }
+            }) {
+            Ok(thread) => thread,
+            Err(error) => {
+                let _ = cleanup_terminal(&mut terminal);
+                return Err(error).context("Could not start setup input reader");
+            }
+        };
+        Ok(Self {
+            terminal,
+            events,
+            stop_events,
+            event_thread: Some(event_thread),
+            restored: false,
+        })
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        self.restored = true;
+        self.stop_events.store(true, Ordering::Release);
+        if let Some(thread) = self.event_thread.take() {
+            let _ = thread.join();
+        }
+        cleanup_terminal(&mut self.terminal)
+    }
+
+    fn draw(&mut self, title: &str, body: &[Line<'static>], footer: &str) -> Result<()> {
+        self.terminal.draw(|frame| {
+            let area = frame.area();
+            let panel = centered_rect(76, 70, area);
+            frame.render_widget(ratatui::widgets::Clear, panel);
+            let block = Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan));
+            let inner = block.inner(panel);
+            frame.render_widget(block, panel);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(2)])
+                .split(inner);
+            frame.render_widget(
+                Paragraph::new(body.to_vec()).wrap(Wrap { trim: false }),
+                chunks[0],
+            );
+            frame.render_widget(
+                Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+                chunks[1],
+            );
+        })?;
+        Ok(())
+    }
+
+    async fn choose(
+        &mut self,
+        title: &str,
+        message: &str,
+        choices: &[(char, ChatGptSetupAction, &str)],
+    ) -> Result<ChatGptSetupAction> {
+        loop {
+            let options = choices
+                .iter()
+                .map(|(key, _, label)| format!("[{key}] {label}"))
+                .collect::<Vec<_>>()
+                .join("    ");
+            self.draw(
+                title,
+                &[
+                    Line::from(message.to_string()),
+                    Line::from(""),
+                    Line::from(options),
+                ],
+                "Esc cancels · the provider selector will be restored on exit",
+            )?;
+            let event = self.next_event().await?;
+            match event {
+                Event::Resize(_, _) => continue,
+                Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
+                    if matches!(key.code, KeyCode::Esc) {
+                        return Ok(ChatGptSetupAction::Cancel);
+                    }
+                    if let KeyCode::Char(value) = key.code {
+                        if let Some((_, action, _)) = choices
+                            .iter()
+                            .find(|(candidate, _, _)| candidate.eq_ignore_ascii_case(&value))
+                        {
+                            return Ok(*action);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn wait_for_device_login(
+        &mut self,
+        auth: &crate::providers::CodexAppServerAuth,
+        login: crate::providers::codex_app_server::ChatGptDeviceLogin,
+    ) -> Result<crate::providers::codex_app_server::DeviceLoginOutcome> {
+        let details = login.details.clone();
+        let started = std::time::Instant::now();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let wait = auth.finish_device_login_or_cancel(login, cancel_rx);
+        tokio::pin!(wait);
+        let mut notice = "Pending authorization".to_string();
+        loop {
+            let remaining = device_login_remaining(started);
+            self.draw(
+                "ChatGPT device sign-in",
+                &[
+                    Line::from(format!("Open: {}", details.verification_url)),
+                    Line::from(format!("Code: {}", details.user_code)),
+                    Line::from(""),
+                    Line::from(format!(
+                        "{notice} · {:02}:{:02} remaining",
+                        remaining.as_secs() / 60,
+                        remaining.as_secs() % 60
+                    )),
+                    Line::from("Codex owns polling and honors authorization slow-down responses."),
+                ],
+                "[C] copy code  [O] open browser  [Esc] cancel",
+            )?;
+            tokio::select! {
+                result = &mut wait => return result,
+                event = self.next_event() => match device_ui_action(&event?) {
+                            DeviceUiAction::Cancel => {
+                                let _ = cancel_tx.send(true);
+                                notice = "Cancelling with Codex…".into();
+                            }
+                            DeviceUiAction::Copy => {
+                                notice = match copy_device_code(&details.user_code) {
+                                    Ok(()) => "Code copied to clipboard".into(),
+                                    Err(_) => "Clipboard unavailable; use the displayed code".into(),
+                                };
+                            }
+                            DeviceUiAction::Open => {
+                                notice = match open_verification_url(&details.verification_url) {
+                                    Ok(()) => "Browser opened".into(),
+                                    Err(_) => "Could not open a browser; use the displayed URL".into(),
+                                };
+                            }
+                            DeviceUiAction::Redraw | DeviceUiAction::Ignore => {}
+                }
+            }
+        }
+    }
+
+    async fn next_event(&mut self) -> Result<Event> {
+        self.events
+            .recv()
+            .await
+            .context("Setup terminal input reader stopped")
+    }
+}
+
+impl Drop for SetupAuthUi {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+fn copy_device_code(code: &str) -> Result<()> {
+    let mut clipboard = arboard::Clipboard::new().context("Clipboard is unavailable")?;
+    clipboard
+        .set_text(code.to_string())
+        .context("Could not copy the device code")
+}
+
+fn open_verification_url(url: &str) -> Result<()> {
+    if !url.starts_with("https://") {
+        anyhow::bail!("Refusing to open a non-HTTPS verification URL");
+    }
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("/usr/bin/open");
+    #[cfg(target_os = "linux")]
+    let mut command = std::process::Command::new("/usr/bin/xdg-open");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    anyhow::bail!("Opening a browser is unsupported on this platform");
+    command
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("Could not open the verification URL")?;
+    Ok(())
+}
+
+fn configured_provider_is_usable(provider: &ProviderEntry) -> bool {
+    match provider {
+        ProviderEntry::ChatgptSubscription { .. } => true,
+        ProviderEntry::Claude { api_key, .. }
+        | ProviderEntry::Openai { api_key, .. }
+        | ProviderEntry::Grok { api_key, .. }
+        | ProviderEntry::Gemini { api_key, .. }
+        | ProviderEntry::Mistral { api_key, .. }
+        | ProviderEntry::Groq { api_key, .. } => !api_key.trim().is_empty(),
+        ProviderEntry::Ollama {
+            model, base_url, ..
+        } => !model.trim().is_empty() && !base_url.trim().is_empty(),
+        ProviderEntry::RemoteDaemon { address, .. } => !address.trim().is_empty(),
+        ProviderEntry::Local { enabled, .. } => *enabled,
+    }
+}
+
 /// Validate ChatGPT authentication and Sol availability before atomically committing setup.
 ///
 /// This is the single post-wizard state machine used by all three setup entry points. Finch
@@ -1154,6 +1464,7 @@ pub async fn validate_and_apply(result: &SetupResult) -> Result<SetupApplyOutcom
     }
 
     let auth = CodexAppServerAuth::new()?;
+    let mut ui = SetupAuthUi::enter()?;
     let status = auth.status(false).await?;
     let had_existing_account = status.signed_in;
     let mut state = if status.signed_in {
@@ -1163,67 +1474,87 @@ pub async fn validate_and_apply(result: &SetupResult) -> Result<SetupApplyOutcom
     };
 
     if state == ChatGptSetupState::SignedIn {
-        let choice = read_setup_choice(
-            "ChatGPT is already signed in. [R]euse, [L]og in to replace it, [F]allback without ChatGPT, or [C]ancel setup: ",
-            &[('r', ChatGptSetupAction::Reuse), ('l', ChatGptSetupAction::Replace), ('f', ChatGptSetupAction::Fallback), ('c', ChatGptSetupAction::Cancel)],
-        )?;
-        state = state.transition(choice)?;
-        if choice == ChatGptSetupAction::Replace {
-            auth.logout().await?;
-        }
-    } else {
-        let choice = read_setup_choice(
-            "ChatGPT is signed out. [L]og in, [F]allback without ChatGPT, or [C]ancel setup: ",
+        let choice = ui.choose(
+            "ChatGPT subscription",
+            "An account is already signed in. Replacement keeps it active until the new login succeeds.",
             &[
-                ('l', ChatGptSetupAction::Login),
-                ('f', ChatGptSetupAction::Fallback),
-                ('c', ChatGptSetupAction::Cancel),
+                ('r', ChatGptSetupAction::Reuse, "reuse account"),
+                ('l', ChatGptSetupAction::Replace, "sign in to replace"),
+                ('f', ChatGptSetupAction::Fallback, "remove ChatGPT from this setup"),
+                ('c', ChatGptSetupAction::Cancel, "cancel setup"),
             ],
-        )?;
+        ).await?;
+        state = state.transition(choice)?;
+    } else {
+        let choice = ui
+            .choose(
+                "ChatGPT subscription",
+                "No account is signed in.",
+                &[
+                    ('l', ChatGptSetupAction::Login, "sign in"),
+                    (
+                        'f',
+                        ChatGptSetupAction::Fallback,
+                        "remove ChatGPT from this setup",
+                    ),
+                    ('c', ChatGptSetupAction::Cancel, "cancel setup"),
+                ],
+            )
+            .await?;
         state = state.transition(choice)?;
     }
 
     while state == ChatGptSetupState::LoginPending {
         let login = auth.begin_device_login().await?;
-        println!("Open: {}", login.details.verification_url);
-        println!("Enter code: {}", login.details.user_code);
-        println!("This code expires; complete it within the displayed ten-minute sign-in window.");
-        let choice = read_setup_choice(
-            "Complete sign-in in your browser, then [W]ait; or [C]ancel setup: ",
-            &[
-                ('w', ChatGptSetupAction::LoginSucceeded),
-                ('c', ChatGptSetupAction::Cancel),
-            ],
-        )?;
-        if choice == ChatGptSetupAction::Cancel {
-            auth.cancel_device_login(login).await?;
-            state = state.transition(ChatGptSetupAction::Cancel)?;
-        } else {
-            match auth.finish_device_login(login).await {
-                Ok(()) => state = state.transition(ChatGptSetupAction::LoginSucceeded)?,
-                Err(error) => {
-                    eprintln!("ChatGPT sign-in was not completed: {error}");
-                    let recovery = read_setup_choice(
-                        "[R]etry sign-in, [F]allback without ChatGPT, or [C]ancel setup: ",
+        match ui.wait_for_device_login(&auth, login).await {
+            Ok(crate::providers::codex_app_server::DeviceLoginOutcome::Completed) => {
+                state = state.transition(ChatGptSetupAction::LoginSucceeded)?
+            }
+            Ok(crate::providers::codex_app_server::DeviceLoginOutcome::Cancelled) => {
+                state = state.transition(ChatGptSetupAction::Cancel)?
+            }
+            Err(error) => {
+                let recovery = ui
+                    .choose(
+                        "ChatGPT sign-in did not complete",
+                        &format!("{error}"),
                         &[
-                            ('r', ChatGptSetupAction::Login),
-                            ('f', ChatGptSetupAction::Fallback),
-                            ('c', ChatGptSetupAction::Cancel),
+                            ('r', ChatGptSetupAction::Login, "retry"),
+                            ('f', ChatGptSetupAction::Fallback, "remove ChatGPT"),
+                            ('c', ChatGptSetupAction::Cancel, "cancel setup"),
                         ],
-                    )?;
-                    state = match recovery {
-                        ChatGptSetupAction::Login => ChatGptSetupState::LoginPending,
-                        action => state.transition(action)?,
-                    };
-                }
+                    )
+                    .await?;
+                state = match recovery {
+                    ChatGptSetupAction::Login => ChatGptSetupState::LoginPending,
+                    action => state.transition(action)?,
+                };
             }
         }
     }
 
     match state {
         ChatGptSetupState::Ready => {
-            auth.validate_sol_access().await?;
-            apply_and_save(result)?;
+            let validation = auth.validate_sol_access().await;
+            let saved = validation.and_then(|_| apply_and_save(result));
+            if let Err(error) = saved {
+                let decision = ui
+                    .choose(
+                        "ChatGPT setup could not be saved",
+                        &format!("{error}\n\nThe managed sign-in remains opaque to Finch."),
+                        &[
+                            ('k', ChatGptSetupAction::Keep, "retain sign-in"),
+                            ('o', ChatGptSetupAction::Logout, "log out"),
+                        ],
+                    )
+                    .await?;
+                if decision == ChatGptSetupAction::Logout {
+                    auth.logout().await?;
+                }
+                ui.restore()?;
+                return Err(error);
+            }
+            ui.restore()?;
             Ok(SetupApplyOutcome::Saved)
         }
         ChatGptSetupState::Fallback => {
@@ -1231,6 +1562,12 @@ pub async fn validate_and_apply(result: &SetupResult) -> Result<SetupApplyOutcom
             config
                 .providers
                 .retain(|provider| !matches!(provider, ProviderEntry::ChatgptSubscription { .. }));
+            if !config.providers.iter().any(configured_provider_is_usable) {
+                ui.restore()?;
+                anyhow::bail!(
+                    "Setup cannot remove ChatGPT because no other usable provider is configured"
+                );
+            }
             config.save()?;
             if let Some(prompt) = result.custom_system_prompt.as_deref() {
                 crate::config::Persona::save_system_prompt_override(
@@ -1238,47 +1575,31 @@ pub async fn validate_and_apply(result: &SetupResult) -> Result<SetupApplyOutcom
                     prompt,
                 )?;
             }
+            ui.restore()?;
             Ok(SetupApplyOutcome::Saved)
         }
         ChatGptSetupState::Cancelled => {
             if had_existing_account {
-                let decision = read_setup_choice(
-                    "Keep the existing ChatGPT sign-in? [K]eep or [O]log out: ",
-                    &[
-                        ('k', ChatGptSetupAction::Reuse),
-                        ('o', ChatGptSetupAction::Replace),
-                    ],
-                )?;
-                if decision == ChatGptSetupAction::Replace {
+                let decision = ui
+                    .choose(
+                        "Cancel ChatGPT setup",
+                        "Keep the existing managed ChatGPT sign-in?",
+                        &[
+                            ('k', ChatGptSetupAction::Keep, "keep sign-in"),
+                            ('o', ChatGptSetupAction::Logout, "log out"),
+                        ],
+                    )
+                    .await?;
+                if decision == ChatGptSetupAction::Logout {
                     auth.logout().await?;
                 }
             }
+            ui.restore()?;
             Ok(SetupApplyOutcome::Cancelled)
         }
         _ => Err(anyhow::anyhow!(
             "ChatGPT setup did not reach a terminal state"
         )),
-    }
-}
-
-fn read_setup_choice(
-    prompt: &str,
-    choices: &[(char, ChatGptSetupAction)],
-) -> Result<ChatGptSetupAction> {
-    loop {
-        print!("{prompt}");
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let choice = input
-            .trim()
-            .chars()
-            .next()
-            .map(|value| value.to_ascii_lowercase());
-        if let Some((_, action)) = choices.iter().find(|(key, _)| Some(*key) == choice) {
-            return Ok(*action);
-        }
-        println!("Please choose one of the displayed options.");
     }
 }
 
@@ -7727,5 +8048,64 @@ mod tests {
         assert!(ChatGptSetupState::SignedOut
             .transition(ChatGptSetupAction::Reuse)
             .is_err());
+    }
+
+    #[test]
+    fn chatgpt_fallback_requires_another_configured_provider() {
+        let chatgpt = ProviderEntry::ChatgptSubscription {
+            credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF.into(),
+            model: Some("gpt-5.6-sol".into()),
+            name: None,
+        };
+        let empty_remote = ProviderEntry::RemoteDaemon {
+            address: "  ".into(),
+            name: None,
+        };
+        let usable_remote = ProviderEntry::RemoteDaemon {
+            address: "http://127.0.0.1:11435".into(),
+            name: None,
+        };
+        assert!(configured_provider_is_usable(&chatgpt));
+        assert!(!configured_provider_is_usable(&empty_remote));
+        assert!(configured_provider_is_usable(&usable_remote));
+        assert!(![chatgpt]
+            .iter()
+            .filter(|provider| !matches!(provider, ProviderEntry::ChatgptSubscription { .. }))
+            .any(|provider| configured_provider_is_usable(provider)));
+    }
+
+    #[test]
+    fn device_setup_events_cover_copy_open_cancel_resize_and_countdown() {
+        use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
+
+        let key = |code| {
+            Event::Key(KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            })
+        };
+        assert_eq!(
+            device_ui_action(&key(KeyCode::Char('c'))),
+            DeviceUiAction::Copy
+        );
+        assert_eq!(
+            device_ui_action(&key(KeyCode::Char('O'))),
+            DeviceUiAction::Open
+        );
+        assert_eq!(device_ui_action(&key(KeyCode::Esc)), DeviceUiAction::Cancel);
+        assert_eq!(
+            device_ui_action(&Event::Resize(120, 40)),
+            DeviceUiAction::Redraw
+        );
+        let started = std::time::Instant::now() - Duration::from_secs(125);
+        let remaining = device_login_remaining(started);
+        assert!(remaining <= Duration::from_secs(475));
+        assert!(remaining >= Duration::from_secs(474));
+        assert!(open_verification_url("http://example.invalid")
+            .unwrap_err()
+            .to_string()
+            .contains("non-HTTPS"));
     }
 }
