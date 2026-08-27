@@ -1028,6 +1028,23 @@ mod isolation_tests {
             if mode == "rewrite-restore" {
                 use std::os::fd::FromRawFd as _;
 
+                #[cfg(target_os = "macos")]
+                let proof_path = {
+                    use std::os::unix::ffi::OsStrExt as _;
+
+                    let mut path = [0_i8; nix::libc::PATH_MAX as usize];
+                    assert_eq!(
+                        unsafe { nix::libc::fcntl(9, nix::libc::F_GETPATH, path.as_mut_ptr()) },
+                        0,
+                        "could not resolve the proof backing path: {}",
+                        std::io::Error::last_os_error()
+                    );
+                    let path = unsafe { std::ffi::CStr::from_ptr(path.as_ptr()) };
+                    std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes()))
+                };
+                #[cfg(not(target_os = "macos"))]
+                let proof_path = std::path::PathBuf::from("/proc/self/fd/9");
+
                 let duplicate = unsafe { nix::libc::dup(9) };
                 assert!(duplicate >= 0);
                 let reader = unsafe { std::fs::File::from_raw_fd(duplicate) };
@@ -1038,7 +1055,7 @@ mod isolation_tests {
                 let mut rewrite = std::fs::OpenOptions::new()
                     .write(true)
                     .truncate(true)
-                    .open("/dev/fd/9")
+                    .open(&proof_path)
                     .unwrap();
                 rewrite.write_all(&forged).unwrap();
                 rewrite.sync_all().unwrap();
@@ -1050,7 +1067,7 @@ mod isolation_tests {
                 let mut restore = std::fs::OpenOptions::new()
                     .write(true)
                     .truncate(true)
-                    .open("/dev/fd/9")
+                    .open(&proof_path)
                     .unwrap();
                 restore.write_all(&original).unwrap();
                 restore.sync_all().unwrap();
