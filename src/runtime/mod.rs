@@ -6023,8 +6023,11 @@ fn ensure_effective_execute_permission(
     if !executable {
         return Err("process-run executable is not executable by the effective user".into());
     }
-    access(path, AccessFlags::X_OK)
-        .map_err(|error| format!("process executable fails launch access check: {error}"))
+    access(path, AccessFlags::X_OK).map_err(|error| {
+        format!(
+            "process-run executable is not executable by the effective user: launch access check failed: {error}"
+        )
+    })
 }
 
 #[cfg(any(
@@ -10913,7 +10916,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
     async fn kernel_rejected_launch_does_not_consume_or_audit_once_grant() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let executable = directory.path().join("invalid-executable");
         std::fs::write(&executable, b"not an executable image").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
