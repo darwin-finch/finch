@@ -492,23 +492,6 @@ impl ToolExecutionCoordinator {
 
             // Tool approved (or doesn't need approval), execute it
             if cancellation_token.is_cancelled() {
-                if let Ok(Ok(tool_result)) = &result {
-                    let records =
-                        serde_json::from_str::<crate::runtime::outcome::ExecutionOutcome>(
-                            &tool_result.content,
-                        )
-                        .ok()
-                        .map(|outcome| super::query_processor::runner_effect_records(&outcome))
-                        .unwrap_or_default();
-                    if !records.is_empty() {
-                        cancelled_effects
-                            .lock()
-                            .expect("cancelled effect journal lock poisoned")
-                            .entry(query_id)
-                            .or_default()
-                            .extend(records);
-                    }
-                }
                 return;
             }
             let conversation_snapshot = tokio::select! {
@@ -553,6 +536,23 @@ impl ToolExecutionCoordinator {
             // underlying effect stopped. The stage is already fenced, so no
             // result from a cancelled round is published back to the event loop.
             if cancellation_token.is_cancelled() {
+                if let Ok(Ok(tool_result)) = &result {
+                    let records =
+                        serde_json::from_str::<crate::runtime::outcome::ExecutionOutcome>(
+                            &tool_result.content,
+                        )
+                        .ok()
+                        .map(|outcome| super::query_processor::runner_effect_records(&outcome))
+                        .unwrap_or_default();
+                    if !records.is_empty() {
+                        cancelled_effects
+                            .lock()
+                            .expect("cancelled effect journal lock poisoned")
+                            .entry(query_id)
+                            .or_default()
+                            .extend(records);
+                    }
+                }
                 return;
             }
 

@@ -1937,9 +1937,15 @@ fn decode_runner_turn_result(
     )?;
     if !error.is_empty() {
         let kind = match result.get_error_kind().map_err(|error| error.to_string())? {
-            finch_ipc_capnp::BrainTurnErrorKind::RunnerAuthored => crate::server::RunnerTurnErrorKind::RunnerAuthored,
-            finch_ipc_capnp::BrainTurnErrorKind::InfrastructureProviderTaskTerminated => crate::server::RunnerTurnErrorKind::InfrastructureProviderTaskTerminated,
-            finch_ipc_capnp::BrainTurnErrorKind::RunCancelled => crate::server::RunnerTurnErrorKind::RunCancelled,
+            finch_ipc_capnp::BrainTurnErrorKind::RunnerAuthored => {
+                crate::server::RunnerTurnErrorKind::RunnerAuthored
+            }
+            finch_ipc_capnp::BrainTurnErrorKind::InfrastructureProviderTaskTerminated => {
+                crate::server::RunnerTurnErrorKind::InfrastructureProviderTaskTerminated
+            }
+            finch_ipc_capnp::BrainTurnErrorKind::RunCancelled => {
+                crate::server::RunnerTurnErrorKind::RunCancelled
+            }
         };
         return Err(crate::server::RunnerTurnError {
             kind,
