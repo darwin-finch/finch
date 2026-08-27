@@ -686,6 +686,27 @@ full_refresh_viewport() (show new layout)
 
 ## Future Enhancements
 
+## Retained Transcript Disclosure
+
+Completed and live `WorkUnit` messages expose a nested semantic tree: unit,
+tool call, input, and output. Each row is identified by the owning `MessageId`
+plus an append-only semantic path, so wrapping, streaming appends, reconnect
+projection, and resize cannot renumber an existing row.
+
+Disclosure state belongs to `TuiRenderer`; it is not written into a WorkUnit.
+Permanent terminal scrollback is written once from `Message::complete_transcript`
+and therefore contains the complete copyable record. The visible viewport is a
+projection of that same retained message set and may omit collapsed descendants.
+Expanding a row reconstructs the viewport without rewriting or clearing native
+scrollback above it.
+
+`accordion.rs` records full-width semantic hit regions from physical terminal
+rows after Unicode-aware wrapping. Regions are recomputed after every render and
+resize. `F6` and `Shift+F6` provide mouse-independent focus; Left/Right,
+Enter/Space, and Escape operate the focused disclosure. Labels state
+`[expanded]` or `[collapsed]`, so raw/no-color and assistive reading do not rely
+on color or triangle direction alone.
+
 ### Planned Features
 
 **Search in Scrollback:**
