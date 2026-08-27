@@ -88,6 +88,57 @@ jobs:
           exit 1
         fi
 
+  brain-lifecycle-macos:
+    name: Brain Lifecycle (macOS)
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_PROFILE_TEST_DEBUG: 0
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install capnproto
+      run: brew install capnp
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-registry-
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('Cargo.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-index-
+
+    - name: Run atomic Brain lifecycle regressions
+      run: |
+        set -euo pipefail
+        cargo test --lib server::brain_runner::tests:: -- --nocapture
+        cargo test --lib server::handlers::handler_tests::dropped_named_turn_callback_terminalizes_the_exact_run_once -- --nocapture
+        cargo test --lib cli::repl_event::event_loop::tests::real_event_and_llm_loops_admit_one_immediate_tool_continuation_after_retirement -- --nocapture
+        cargo test --lib cli::repl_event::event_loop::tests::continuation_is_sent_exactly_once_for_one_complete_validated_round -- --nocapture
+        cargo test --lib cli::repl_event::event_loop::tests::continuation_exit_ -- --nocapture
+        cargo test --lib cli::repl_event::event_loop::tests::closed_llm_worker_leaves_completed_tool_round_staged_and_invisible -- --nocapture
+        cargo test --lib cli::repl_event::event_loop::tests::late_worker_after_spawn_ack_timeout_rolls_back_without_provider_side_effects -- --nocapture
+        cargo test --lib cli::repl_event::event_loop::tests::mixed_success_failure_and_denial_commit_as_one_provider_batch -- --nocapture
+        cargo test --lib cli::repl_event::event_loop::tests::named_brain_cancellation_terminates_staged_round_and_fences_late_results -- --nocapture
+        cargo test --lib cli::repl_event::event_loop::tests::physical_ipc_disconnect_ -- --nocapture
+        cargo test --lib cli::repl_event::event_loop::tests::physical_stale_attachment_rejection_does_not_spawn_or_create_run -- --nocapture
+        cargo test --lib cli::repl_event::event_loop::tests::named_provider_panic_crosses_physical_ipc_once_and_restores_local_history -- --nocapture
+        cargo test --lib cli::repl_event::event_loop::tests::successful_named_turn_crosses_physical_ipc_and_restores_local_history -- --nocapture
+
   build:
     name: Build Release
     runs-on: ${{ matrix.os }}
