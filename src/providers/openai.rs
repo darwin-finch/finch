@@ -2548,7 +2548,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("Failed to send request"));
-        tokio::time::timeout(Duration::from_secs(1), attempts_observed)
+        // Retry backoff uses paused time, but socket teardown is OS-driven.
+        // Resume the clock so the cleanup deadline cannot auto-advance ahead
+        // of macOS delivering the final connection-close readiness event.
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(2), attempts_observed)
             .await
             .expect("validated dispatch did not release all timed-out attempts")
             .unwrap();
