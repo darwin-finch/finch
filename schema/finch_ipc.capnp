@@ -1054,6 +1054,13 @@ struct BrainEffectRecorded {
   state @3 :VmEffectJournalState;
 }
 
+# Canonical schema-v15 audit transition. The daemon validates the complete
+# typed transition before append; event-stream clients receive the exact JSON
+# representation for forward-compatible inspection without gaining authority.
+struct BrainEffectAuditTransition {
+  json @0 :Text;
+}
+
 struct BrainClientAttached {
   attachmentId @0 :Text;
   connectionId @1 :Text;
@@ -1206,6 +1213,7 @@ struct BrainEvent {
     taskListReplaced       @28 :BrainTaskList;
     speculativePrompt      @29 :Text;
     mutationRecorded       @34 :BrainMutationOutcome;
+    effectAuditTransition  @35 :BrainEffectAuditTransition;
   }
   hasMutation @32 :Bool;
   mutation    @33 :BrainMutationReceipt;
@@ -1259,6 +1267,7 @@ struct BrainSnapshot {
   schedules        @12 :List(BrainSchedule);
   pendingScheduleDues @13 :List(BrainScheduleDue);
   tasks           @14 :List(BrainTask);
+  effectAudits    @15 :List(Text);
 }
 
 struct BrainWireMessage {

@@ -59,6 +59,11 @@ pub enum EffectAuditTerminalOutcome {
     },
     AbandonedNotApplied,
     UncertainProcessLoss,
+    /// Read-only projection of a schema-v14 `EffectRecorded` event. New
+    /// writers never emit this variant.
+    LegacyV14Snapshot {
+        state: crate::vm::EffectJournalState,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -80,6 +85,33 @@ pub struct EffectAuditEntry {
     pub intent: EffectAuditIntent,
     pub authority: EffectAuditAuthority,
     pub state: EffectAuditState,
+}
+
+/// Proof that the daemon durably committed `AwaitingHostResult`. Host
+/// bindings must require this value immediately before the physical effect.
+/// It is intentionally not serializable and cannot be constructed outside
+/// the crate's daemon-owned audit path.
+#[derive(Debug)]
+pub struct HostEffectPermit {
+    identity: EffectAuditIdentity,
+    authority_id: Uuid,
+}
+
+impl HostEffectPermit {
+    pub(crate) fn new(identity: EffectAuditIdentity, authority_id: Uuid) -> Self {
+        Self {
+            identity,
+            authority_id,
+        }
+    }
+
+    pub fn identity(&self) -> EffectAuditIdentity {
+        self.identity
+    }
+
+    pub(crate) fn authority_id(&self) -> Uuid {
+        self.authority_id
+    }
 }
 
 /// One canonical reducer input. Exact replays are no-ops; any changed
@@ -212,6 +244,7 @@ impl EffectAuditReducer {
                                 outcome,
                                 EffectAuditTerminalOutcome::NotApplied { .. }
                                     | EffectAuditTerminalOutcome::AbandonedNotApplied
+                                    | EffectAuditTerminalOutcome::LegacyV14Snapshot { .. }
                             ),
                             "a host outcome cannot be recorded before durable begin"
                         );

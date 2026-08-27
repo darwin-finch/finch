@@ -6329,6 +6329,7 @@ Rules:\n\
             // projection.
             BrainEventKind::RuntimeCommitted { .. }
             | BrainEventKind::EffectRecorded { .. }
+            | BrainEventKind::EffectAuditTransition { .. }
             | BrainEventKind::ScheduleChanged { .. }
             | BrainEventKind::ScheduleDue { .. } => {}
         }

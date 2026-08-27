@@ -946,6 +946,10 @@ pub(super) fn encode_snapshot(
     for (index, task) in snapshot.tasks.iter().enumerate() {
         encode_task(tasks.reborrow().get(index as u32), task);
     }
+    let mut audits = builder.reborrow().init_effect_audits(snapshot.effect_audits.len() as u32);
+    for (index, audit) in snapshot.effect_audits.iter().enumerate() {
+        audits.set(index as u32, &serde_json::to_string(audit)?);
+    }
     Ok(())
 }
 
@@ -987,6 +991,10 @@ pub(super) fn decode_snapshot(
         .iter()
         .map(decode_task)
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let effect_audits = reader.get_effect_audits()?.iter().map(|encoded| {
+        let encoded = encoded?.to_str()?;
+        serde_json::from_str(encoded).map_err(anyhow::Error::from)
+    }).collect::<anyhow::Result<Vec<_>>>()?;
     Ok(BrainSnapshot {
         brain_id: parse_brain_id(reader.get_brain_id()?)?,
         name: text(reader.get_name()?)?,
@@ -1011,6 +1019,7 @@ pub(super) fn decode_snapshot(
         tasks,
         schedules,
         pending_schedule_dues,
+        effect_audits,
     })
 }
 
@@ -1531,6 +1540,10 @@ pub(super) fn encode_event(
                 state,
             )?;
         }
+        BrainEventKind::EffectAuditTransition { transition } => {
+            let mut encoded = builder.init_effect_audit_transition();
+            encoded.set_json(&serde_json::to_string(transition)?);
+        }
         BrainEventKind::ScheduleChanged { schedule } => {
             encode_schedule(builder.init_schedule_changed(), schedule);
         }
@@ -1741,6 +1754,12 @@ pub(super) fn decode_event(
                 state: crate::ipc::checkpoint_codec::decode_effect_journal_state(
                     recorded.get_state()?,
                 )?,
+            }
+        }
+        Which::EffectAuditTransition(encoded) => {
+            let encoded = encoded?;
+            BrainEventKind::EffectAuditTransition {
+                transition: serde_json::from_str(encoded.get_json()?.to_str()?)?,
             }
         }
         Which::ScheduleChanged(schedule) => BrainEventKind::ScheduleChanged {

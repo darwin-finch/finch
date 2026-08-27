@@ -1160,6 +1160,7 @@ pub(crate) async fn submit_named_brain_event_with_authority_and_receipt(
             | BrainEventKind::ApprovalRequested { .. }
             | BrainEventKind::ApprovalDecided { .. }
             | BrainEventKind::EffectRecorded { .. }
+            | BrainEventKind::EffectAuditTransition { .. }
             | BrainEventKind::Result { .. }
             | BrainEventKind::RuntimeCommitted { .. }
             | BrainEventKind::RunnerLeaseAcquired { .. }
@@ -2385,6 +2386,7 @@ fn named_brain_provider_messages_at(
                     | BrainEventKind::ApprovalRequested { .. }
                     | BrainEventKind::ApprovalDecided { .. }
                     | BrainEventKind::EffectRecorded { .. }
+                    | BrainEventKind::EffectAuditTransition { .. }
                     | BrainEventKind::RunnerLeaseAcquired { .. }
                     | BrainEventKind::RunnerLeaseReleased { .. }
                     | BrainEventKind::RunnerHandoffRequested { .. }
@@ -2480,6 +2482,7 @@ fn named_brain_provider_messages_at(
                 | BrainEventKind::RuntimeCommitted { .. }
                 | BrainEventKind::TaskListReplaced { .. }
                 | BrainEventKind::EffectRecorded { .. }
+                | BrainEventKind::EffectAuditTransition { .. }
                 | BrainEventKind::ApprovalRequested { .. }
                 | BrainEventKind::ApprovalDecided { .. }
                 | BrainEventKind::RunnerLeaseAcquired { .. }
