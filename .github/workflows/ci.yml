@@ -120,53 +120,6 @@ jobs:
     - name: Test all targets
       run: timeout --signal=TERM --kill-after=30s 15m cargo test --all-targets -- --nocapture
 
-  issue-165-poset-determinism:
-    name: Issue 165 poset determinism (Ubuntu)
-    runs-on: ubuntu-24.04
-    env:
-      CARGO_BUILD_JOBS: 1
-      CARGO_PROFILE_TEST_DEBUG: 0
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install capnproto
-      run: sudo apt-get update && sudo apt-get install -y capnproto
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Restore Cargo build cache
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: issue-165-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-build-target-
-
-    - name: Check scoped Rust formatting
-      run: |
-        sed -n '/^fn stable_poset_order_and_depth(/,/^}/p' src/cli/tui/mod.rs > /tmp/poset_plan.rs
-        sed -n '/^fn poset_to_forth_lines(/,/^}/p' src/cli/tui/mod.rs > /tmp/poset_renderer.rs
-        { echo 'mod tests {'; sed -n '/^    fn strip_poset_ansi/,/^}/p' src/cli/tui/mod.rs; } > /tmp/poset_tests.rs
-        rustfmt --check --edition 2021 /tmp/poset_plan.rs /tmp/poset_renderer.rs /tmp/poset_tests.rs
-
-    - name: Check library and tests
-      run: timeout --signal=TERM --kill-after=10s 10m cargo check --lib --tests
-
-    - name: Run all poset renderer tests with normal parallelism
-      run: timeout --signal=TERM --kill-after=10s 15m cargo test --lib cli::tui::tests::test_poset -- --nocapture
-
-    - name: Regress cyclic component before downstream
-      run: timeout --signal=TERM --kill-after=10s 2m cargo test --lib cli::tui::tests::test_poset_cyclic_component_precedes_its_downstream_node_stably -- --exact --nocapture
-
-    - name: Regress ANSI-safe predecessor assertion
-      run: timeout --signal=TERM --kill-after=10s 2m cargo test --lib cli::tui::tests::test_poset_predecessor_calls_appear_in_body -- --exact --nocapture
-
   build:
     name: Build Release
     runs-on: ${{ matrix.os }}
