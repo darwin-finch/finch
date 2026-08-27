@@ -148,6 +148,7 @@ prefer_local = true
         command
             .env("HOME", directory.path().join("home"))
             .env("PATH", &bin_dir)
+            .env("ACCOUNT_A_KEY", "secret-that-must-stay-local")
             .env_remove("OPENAI_API_KEY")
             .env_remove("CODEX_HOME")
             .env_remove("FINCH_LIVE_CHATGPT_APP_SERVER");
@@ -170,6 +171,177 @@ prefer_local = true
     );
     assert_no_connection(&provider_listener, "fallback provider selection/request");
     assert_no_connection(&daemon_listener, "query daemon connection or auto-spawn");
+
+    let endpoint = format!("http://{}", provider_listener.local_addr().unwrap());
+    let named_rejections = [
+        (
+            format!(
+                r#"[[credentials]]
+name = "account-a"
+kind = "api_key"
+provider = "openai_platform"
+issuer = "openai-platform"
+account = "a"
+secret_ref = "env:ACCOUNT_A_KEY"
+
+[credentials.audience]
+family = "custom"
+endpoint = "{endpoint}"
+
+[credentials.lifecycle]
+state = "active"
+refreshable = false
+
+[[providers]]
+type = "credentialed"
+provider = "openai_platform"
+model = "gpt-4o"
+base_url = "{endpoint}"
+name = "missing"
+
+[providers.credential]
+credential_ref = "missing"
+account = "a"
+"#
+            ),
+            "missing credential 'missing'",
+        ),
+        (
+            format!(
+                r#"[[credentials]]
+name = "account-a"
+kind = "api_key"
+provider = "openai_platform"
+issuer = "openai-platform"
+account = "a"
+secret_ref = "env:ACCOUNT_A_KEY"
+
+[credentials.audience]
+family = "custom"
+endpoint = "{endpoint}"
+
+[credentials.lifecycle]
+state = "revoked"
+
+[[providers]]
+type = "credentialed"
+provider = "openai_platform"
+model = "gpt-4o"
+base_url = "{endpoint}"
+name = "revoked"
+
+[providers.credential]
+credential_ref = "account-a"
+account = "a"
+"#
+            ),
+            "is revoked",
+        ),
+        (
+            format!(
+                r#"[[credentials]]
+name = "account-a"
+kind = "api_key"
+provider = "openai_platform"
+issuer = "openai-platform"
+account = "a"
+secret_ref = "env:ACCOUNT_A_KEY"
+
+[credentials.audience]
+family = "custom"
+endpoint = "{endpoint}"
+
+[credentials.lifecycle]
+state = "active"
+refreshable = false
+
+[[providers]]
+type = "credentialed"
+provider = "openai_platform"
+model = "gpt-4o"
+base_url = "{endpoint}"
+chat_path = "HTTPS://evil.example/v1/chat/completions"
+name = "hostile-path"
+
+[providers.credential]
+credential_ref = "account-a"
+account = "a"
+"#
+            ),
+            "origin",
+        ),
+        (
+            format!(
+                r#"[[credentials]]
+name = "account-a"
+kind = "api_key"
+provider = "openai_platform"
+issuer = "openai-platform"
+account = "a"
+secret_ref = "env:ACCOUNT_A_KEY"
+
+[credentials.audience]
+family = "custom"
+endpoint = "{endpoint}"
+
+[credentials.lifecycle]
+state = "active"
+refreshable = false
+
+[[providers]]
+type = "credentialed"
+provider = "openai_platform"
+model = "gpt-4o"
+base_url = "{endpoint}"
+name = "wrong-account"
+
+[providers.credential]
+credential_ref = "account-a"
+account = "b"
+"#
+            ),
+            "incompatible credential",
+        ),
+    ];
+    for (index, (provider_config, expected_error)) in named_rejections.iter().enumerate() {
+        std::fs::write(
+            finch_dir.join("config.toml"),
+            format!(
+                r#"{provider_config}
+
+[client]
+use_daemon = false
+daemon_address = "http://{}"
+auto_spawn = false
+timeout_seconds = 1
+auto_discover = false
+prefer_local = true
+"#,
+                daemon_listener.local_addr().unwrap()
+            ),
+        )
+        .unwrap();
+        let mut command = Command::new(finch);
+        base(&mut command);
+        command.args(["--cloud-only", "query", "reject before external activity"]);
+        let result = run_bounded(command);
+        assert!(
+            !result.timed_out,
+            "named rejection {index} did not terminate"
+        );
+        assert!(
+            !result.status.success(),
+            "named rejection {index} succeeded"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(expected_error),
+            "named rejection {index}: expected {expected_error:?} in {stderr}"
+        );
+        assert_codex_was_not_executed(&marker, "named credential graph rejection");
+        assert_no_connection(&provider_listener, "named credential graph rejection");
+        assert_no_connection(&daemon_listener, "named credential graph rejection");
+    }
 
     let mut auth = Command::new(finch);
     base(&mut auth);

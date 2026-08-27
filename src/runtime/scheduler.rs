@@ -129,6 +129,7 @@ pub struct ProviderResolver {
     profiles: Arc<Vec<crate::config::ProviderEntry>>,
     daemon_client: Option<Arc<crate::client::DaemonClient>>,
     config: Option<Arc<crate::config::Config>>,
+    credential_resolver: Option<Arc<dyn crate::config::CredentialResolver>>,
 }
 
 impl ProviderResolver {
@@ -138,6 +139,7 @@ impl ProviderResolver {
             profiles: Arc::new(Vec::new()),
             daemon_client: None,
             config: None,
+            credential_resolver: None,
         }
     }
 
@@ -151,6 +153,7 @@ impl ProviderResolver {
             profiles: Arc::new(profiles),
             daemon_client,
             config: None,
+            credential_resolver: None,
         }
     }
 
@@ -164,6 +167,22 @@ impl ProviderResolver {
             profiles: Arc::new(config.providers.clone()),
             daemon_client,
             config: Some(Arc::new(config)),
+            credential_resolver: Some(Arc::new(crate::config::EnvironmentCredentialResolver)),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_config_and_credential_resolver(
+        active: Arc<dyn Generator>,
+        config: crate::config::Config,
+        resolver: Arc<dyn crate::config::CredentialResolver>,
+    ) -> Self {
+        Self {
+            active: Arc::new(RwLock::new(active)),
+            profiles: Arc::new(config.providers.clone()),
+            daemon_client: None,
+            config: Some(Arc::new(config)),
+            credential_resolver: Some(resolver),
         }
     }
 
@@ -220,7 +239,15 @@ impl ProviderResolver {
             ));
         }
         let provider: Arc<dyn crate::providers::LlmProvider> = if let Some(config) = &self.config {
-            crate::providers::create_provider_profile_from_config(config, &entry.profile_name())?
+            let resolver = self
+                .credential_resolver
+                .as_deref()
+                .expect("complete config always carries its credential resolver");
+            crate::providers::create_provider_profile_from_config_with_resolver(
+                config,
+                &entry.profile_name(),
+                resolver,
+            )?
         } else {
             Arc::from(crate::providers::create_provider_from_entry(entry)?)
         };
@@ -1009,10 +1036,74 @@ fn truncate(mut value: String, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle,
+        CredentialProvider, CredentialResolver, ProviderCredential, ProviderEntry,
+        ResolvedCredential, ResolvedSecret,
+    };
     use crate::generators::{GeneratorCapabilities, GeneratorResponse, ResponseMetadata};
     use crate::tools::types::ToolDefinition;
     use crate::vm::{CapabilityKind, CapabilityRequirement, ResourceSelector};
     use async_trait::async_trait;
+    use std::collections::BTreeSet;
+
+    struct AccountResolver;
+
+    impl CredentialResolver for AccountResolver {
+        fn resolve(&self, credential: &ProviderCredential) -> Result<ResolvedCredential> {
+            let secret = match credential.name.as_str() {
+                "account-a" => "account-a-key",
+                "account-b" => "account-b-key",
+                other => anyhow::bail!("unexpected credential {other}"),
+            };
+            Ok(ResolvedCredential {
+                credential_name: credential.name.clone(),
+                secret: ResolvedSecret::new(secret)?,
+            })
+        }
+    }
+
+    fn named_account_profile(
+        name: &str,
+        credential_ref: &str,
+        account: &str,
+        endpoint: &str,
+    ) -> ProviderEntry {
+        ProviderEntry::Credentialed {
+            provider: CredentialProvider::OpenaiPlatform,
+            credential: CredentialBinding {
+                credential_ref: credential_ref.into(),
+                audience: Some(AudienceBinding::custom(endpoint).unwrap()),
+                tenant: None,
+                project: None,
+                account: Some(account.into()),
+                required_scopes: BTreeSet::new(),
+            },
+            model: Some("gpt-4o".into()),
+            base_url: Some(endpoint.into()),
+            chat_path: None,
+            models_path: None,
+            name: Some(name.into()),
+            reasoning_effort: None,
+        }
+    }
+
+    fn named_account_credential(name: &str, account: &str, endpoint: &str) -> ProviderCredential {
+        ProviderCredential {
+            name: name.into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::OpenaiPlatform,
+            issuer: "openai-platform".into(),
+            audience: AudienceBinding::custom(endpoint).unwrap(),
+            tenant: None,
+            project: None,
+            account: Some(account.into()),
+            scopes: BTreeSet::new(),
+            secret_ref: format!("test:{name}"),
+            lifecycle: CredentialLifecycle::default(),
+            revocation: Default::default(),
+        }
+    }
 
     fn grant_agent_capabilities(runtime: &ProgramRuntime) {
         for capability in [
@@ -1116,6 +1207,82 @@ mod tests {
         fn name(&self) -> &str {
             "blocking"
         }
+    }
+
+    #[tokio::test]
+    async fn child_model_selection_keeps_named_accounts_isolated() {
+        let mut server_a = mockito::Server::new_async().await;
+        let mut server_b = mockito::Server::new_async().await;
+        let account_a = server_a
+            .mock("POST", "/v1/chat/completions")
+            .match_header("authorization", "Bearer account-a-key")
+            .expect(0)
+            .create_async()
+            .await;
+        let account_b = server_b
+            .mock("POST", "/v1/chat/completions")
+            .match_header("authorization", "Bearer account-b-key")
+            .with_status(200)
+            .with_body(r#"{"id":"chat-1","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"account-b"},"finish_reason":"stop"}]}"#)
+            .create_async()
+            .await;
+        let config = crate::config::Config::with_providers(vec![
+            named_account_profile("profile-a", "account-a", "a", &server_a.url()),
+            named_account_profile("profile-b", "account-b", "b", &server_b.url()),
+        ])
+        .with_credentials(vec![
+            named_account_credential("account-a", "a", &server_a.url()),
+            named_account_credential("account-b", "b", &server_b.url()),
+        ]);
+        let resolver = ProviderResolver::with_config_and_credential_resolver(
+            Arc::new(EchoGenerator),
+            config,
+            Arc::new(AccountResolver),
+        );
+
+        let selected = resolver.resolve(Some("profile-b"), None).await.unwrap();
+        let response = selected
+            .generate(vec![Message::user("use the selected account")], None)
+            .await
+            .unwrap();
+
+        assert_eq!(response.text, "account-b");
+        account_a.assert_async().await;
+        account_b.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn child_model_selection_rejects_invalid_complete_graph_before_resolution_or_http() {
+        struct PanicResolver;
+        impl CredentialResolver for PanicResolver {
+            fn resolve(&self, _: &ProviderCredential) -> Result<ResolvedCredential> {
+                panic!("invalid child graph reached credential resolution")
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let valid = named_account_profile("profile-a", "account-a", "a", &endpoint);
+        let invalid = named_account_profile("profile-b", "missing", "b", &endpoint);
+        let config = crate::config::Config::with_providers(vec![valid, invalid])
+            .with_credentials(vec![named_account_credential("account-a", "a", &endpoint)]);
+        let resolver = ProviderResolver::with_config_and_credential_resolver(
+            Arc::new(EchoGenerator),
+            config,
+            Arc::new(PanicResolver),
+        );
+
+        let error = resolver
+            .resolve(Some("profile-a"), None)
+            .await
+            .err()
+            .expect("invalid sibling binding must reject child model selection");
+        assert!(format!("{error:#}").contains("missing credential 'missing'"));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[tokio::test]

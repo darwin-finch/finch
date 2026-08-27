@@ -9,7 +9,10 @@ use chrono::{DateTime, Utc};
 use super::claude::ClaudeProvider;
 use super::gemini::GeminiProvider;
 use super::openai::OpenAIProvider;
-use super::{LlmProvider, ProviderBackend, ProviderRequest, ProviderResponse, StreamChunk, ValidatedProviderRequest};
+use super::{
+    LlmProvider, ProviderBackend, ProviderRequest, ProviderResponse, StreamChunk,
+    ValidatedProviderRequest,
+};
 use crate::config::{
     Config, CredentialProvider, CredentialResolver, EnvironmentCredentialResolver, ProviderEntry,
     ResolvedCredential, TeacherEntry,
@@ -28,10 +31,7 @@ struct CredentialBoundProvider {
 }
 
 impl CredentialBoundProvider {
-    fn new(
-        inner: Box<dyn LlmProvider>,
-        credential: &crate::config::ProviderCredential,
-    ) -> Self {
+    fn new(inner: Box<dyn LlmProvider>, credential: &crate::config::ProviderCredential) -> Self {
         let expires_at = match &credential.lifecycle {
             crate::config::CredentialLifecycle::Active { expires_at, .. } => *expires_at,
             crate::config::CredentialLifecycle::Revoked
@@ -52,7 +52,10 @@ impl CredentialBoundProvider {
                 self.credential_name
             );
         }
-        if self.expires_at.is_some_and(|expires_at| expires_at <= Utc::now()) {
+        if self
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= Utc::now())
+        {
             bail!(
                 "credential '{}' expired after provider construction; reconnect or reselect the profile after updating it",
                 self.credential_name
@@ -488,8 +491,7 @@ fn create_named_profiles_from_config_with_resolver(
                 let metadata = credentials
                     .get(binding.credential_ref.as_str())
                     .expect("validated credential index contains every profile reference");
-                Ok(Box::new(CredentialBoundProvider::new(inner, metadata))
-                    as Box<dyn LlmProvider>)
+                Ok(Box::new(CredentialBoundProvider::new(inner, metadata)) as Box<dyn LlmProvider>)
             } else {
                 create_provider_from_entry(entry)
             }
@@ -655,7 +657,22 @@ pub fn create_provider_profile_from_config(
     config: &Config,
     profile_name: &str,
 ) -> Result<Arc<dyn LlmProvider>> {
-    let graph = create_provider_graph_from_config(config)?;
+    create_provider_profile_from_config_with_resolver(
+        config,
+        profile_name,
+        &EnvironmentCredentialResolver,
+    )
+}
+
+/// Revalidate the complete graph with an injected credential resolver and
+/// return one configured profile. Model switching and child-agent selection
+/// use this same boundary as startup.
+pub fn create_provider_profile_from_config_with_resolver(
+    config: &Config,
+    profile_name: &str,
+    resolver: &dyn CredentialResolver,
+) -> Result<Arc<dyn LlmProvider>> {
+    let graph = create_provider_graph_from_config_with_resolver(config, resolver)?;
     graph
         .profiles()
         .iter()
@@ -688,8 +705,7 @@ pub fn create_provider_from_config(config: &Config) -> Result<Box<dyn LlmProvide
             .iter()
             .any(|entry| matches!(entry, ProviderEntry::Credentialed { .. }))
     {
-        return Ok(providers
-            .remove(0));
+        return Ok(providers.remove(0));
     }
     Ok(Box::new(super::FallbackChain::new(providers)))
 }
@@ -871,6 +887,8 @@ mod tests {
 
     struct LeakyResolver;
 
+    struct NamedAccountResolver;
+
     impl CredentialResolver for LeakyResolver {
         fn resolve(&self, _credential: &ProviderCredential) -> Result<ResolvedCredential> {
             anyhow::bail!("resolver accidentally included sentinel-secret")
@@ -883,6 +901,20 @@ mod tests {
             Ok(ResolvedCredential {
                 credential_name: credential.name.clone(),
                 secret: ResolvedSecret::new("test-only-secret")?,
+            })
+        }
+    }
+
+    impl CredentialResolver for NamedAccountResolver {
+        fn resolve(&self, credential: &ProviderCredential) -> Result<ResolvedCredential> {
+            let secret = match credential.name.as_str() {
+                "account-a" => "account-a-key",
+                "account-b" => "account-b-key",
+                other => anyhow::bail!("unexpected credential '{other}'"),
+            };
+            Ok(ResolvedCredential {
+                credential_name: credential.name.clone(),
+                secret: ResolvedSecret::new(secret)?,
             })
         }
     }
@@ -922,6 +954,32 @@ mod tests {
             lifecycle: CredentialLifecycle::default(),
             revocation: Default::default(),
         }
+    }
+
+    fn named_openai_at(
+        profile_name: &str,
+        credential_ref: &str,
+        account: &str,
+        endpoint: &str,
+    ) -> ProviderEntry {
+        let mut profile = named_openai(profile_name, credential_ref, "gpt-4o");
+        if let ProviderEntry::Credentialed {
+            credential,
+            base_url,
+            ..
+        } = &mut profile
+        {
+            credential.account = Some(account.into());
+            credential.audience = Some(AudienceBinding::custom(endpoint).unwrap());
+            *base_url = Some(endpoint.into());
+        }
+        profile
+    }
+
+    fn named_openai_credential_at(name: &str, account: &str, endpoint: &str) -> ProviderCredential {
+        let mut credential = named_openai_credential(name, account);
+        credential.audience = AudienceBinding::custom(endpoint).unwrap();
+        credential
     }
 
     // -----------------------------------------------------------------------
@@ -1037,6 +1095,87 @@ mod tests {
         assert!(Arc::ptr_eq(&default, graph.profiles()[0].provider()));
     }
 
+    #[tokio::test]
+    async fn test_startup_default_uses_first_named_account_without_implicit_fallback() {
+        let mut server_a = mockito::Server::new_async().await;
+        let mut server_b = mockito::Server::new_async().await;
+        let account_a = server_a
+            .mock("POST", "/v1/chat/completions")
+            .match_header("authorization", "Bearer account-a-key")
+            .with_status(200)
+            .with_body(r#"{"id":"chat-a","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"account-a"},"finish_reason":"stop"}]}"#)
+            .create_async()
+            .await;
+        let account_b = server_b
+            .mock("POST", "/v1/chat/completions")
+            .match_header("authorization", "Bearer account-b-key")
+            .expect(0)
+            .create_async()
+            .await;
+        let config = Config::with_providers(vec![
+            named_openai_at("profile-a", "account-a", "a", &server_a.url()),
+            named_openai_at("profile-b", "account-b", "b", &server_b.url()),
+        ])
+        .with_credentials(vec![
+            named_openai_credential_at("account-a", "a", &server_a.url()),
+            named_openai_credential_at("account-b", "b", &server_b.url()),
+        ]);
+
+        create_provider_graph_from_config_with_resolver(&config, &NamedAccountResolver)
+            .unwrap()
+            .default_provider()
+            .send_message(&ProviderRequest::new(vec![
+                crate::claude::types::Message::user("startup"),
+            ]))
+            .await
+            .unwrap();
+
+        account_a.assert_async().await;
+        account_b.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_model_switch_selects_exact_named_account_without_fallback() {
+        let mut server_a = mockito::Server::new_async().await;
+        let mut server_b = mockito::Server::new_async().await;
+        let account_a = server_a
+            .mock("POST", "/v1/chat/completions")
+            .match_header("authorization", "Bearer account-a-key")
+            .expect(0)
+            .create_async()
+            .await;
+        let account_b = server_b
+            .mock("POST", "/v1/chat/completions")
+            .match_header("authorization", "Bearer account-b-key")
+            .with_status(200)
+            .with_body(r#"{"id":"chat-b","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"account-b"},"finish_reason":"stop"}]}"#)
+            .create_async()
+            .await;
+        let config = Config::with_providers(vec![
+            named_openai_at("profile-a", "account-a", "a", &server_a.url()),
+            named_openai_at("profile-b", "account-b", "b", &server_b.url()),
+        ])
+        .with_credentials(vec![
+            named_openai_credential_at("account-a", "a", &server_a.url()),
+            named_openai_credential_at("account-b", "b", &server_b.url()),
+        ]);
+
+        create_provider_profile_from_config_with_resolver(
+            &config,
+            "profile-b",
+            &NamedAccountResolver,
+        )
+        .unwrap()
+        .send_message(&ProviderRequest::new(vec![
+            crate::claude::types::Message::user("switch"),
+        ]))
+        .await
+        .unwrap();
+
+        account_a.assert_async().await;
+        account_b.assert_async().await;
+    }
+
     #[test]
     fn test_unsupported_named_transports_reject_before_secret_resolution() {
         let cases = [
@@ -1123,8 +1262,7 @@ mod tests {
         }
         let mut credential = named_openai_credential("work", "account-1");
         credential.audience = AudienceBinding::custom(&origin).unwrap();
-        let mut config =
-            Config::with_providers(vec![profile]).with_credentials(vec![credential]);
+        let mut config = Config::with_providers(vec![profile]).with_credentials(vec![credential]);
         let resolver = CountingResolver {
             calls: AtomicUsize::new(0),
         };
@@ -1137,7 +1275,9 @@ mod tests {
             .send_message(&ProviderRequest::new(Vec::new()).with_model("gpt-4o"))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("revoked after provider construction"));
+        assert!(error
+            .to_string()
+            .contains("revoked after provider construction"));
         assert!(matches!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
@@ -1155,8 +1295,7 @@ mod tests {
         }
         let mut credential = named_openai_credential("work", "account-1");
         credential.audience = AudienceBinding::custom(&origin).unwrap();
-        let mut config =
-            Config::with_providers(vec![profile]).with_credentials(vec![credential]);
+        let mut config = Config::with_providers(vec![profile]).with_credentials(vec![credential]);
         let resolver = CountingResolver {
             calls: AtomicUsize::new(0),
         };
