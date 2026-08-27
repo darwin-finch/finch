@@ -1,0 +1,44 @@
+name: Issue 180 OpenAI Sol Transport
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - src/providers/openai.rs
+      - docs/OPENAI_TRANSPORT.md
+      - .github/workflows/issue-180-openai-sol-transport.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-180-openai-sol-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  provider-protocol:
+    name: Provider protocol (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Cap'n Proto on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y capnproto
+      - name: Install Cap'n Proto on macOS
+        if: runner.os == 'macOS'
+        run: brew install capnp
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check provider compilation
+        run: cargo test --lib providers::openai::tests --no-run
+      - name: Run OpenAI provider protocol regressions
+        run: cargo test --lib providers::openai::tests -- --nocapture
+      - name: Check formatting
+        run: cargo fmt --all -- --check
