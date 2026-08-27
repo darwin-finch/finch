@@ -112,19 +112,22 @@ compute_units = "all"
 
 # Opt-in placement diagnostics. Finch asks CoreML for its compute plan and
 # attempts to capture only this Finch process's matching Apple unified-log
-# records in a private ~/.finch/diagnostics/coreml-compute-plan-*.ndjson file.
-# Operator/model details may be present in that file. Finch reports whether any
-# operation placement records were actually received; an empty capture or an
-# error-only diagnostic record is not placement evidence.
+# records in a private ~/.finch/diagnostics/coreml-compute-plan-*.ndjson file,
+# alongside a 0600 JSON manifest of the requested policy, runtime/model facts,
+# session-creation latency and memory samples, and explicitly unavailable
+# evidence. Operator/model details may be present in these files. Finch reports
+# whether operation placement records were actually received; an empty capture
+# or an error-only diagnostic record is not placement or fallback evidence.
 profile_compute_plan = false
 
 # Whether CoreML may take nodes inside Loop, Scan, and If subgraphs.
 enable_subgraphs = false
 
 # These options currently apply to generative ONNX sessions. The semantic-
-# memory embedder remains explicitly CPU-only; evaluate that fixed-shape
-# workload separately before changing its provider default or claiming ANE
-# placement.
+# memory embedder remains explicitly CPU-only. Its current batch is fixed at 1
+# but sequence length varies from 1 to 256 tokens. CoreML latency and placement
+# remain unmeasured, so evaluate that workload separately before changing its
+# provider default or claiming ANE placement.
 
 # Storage Configuration
 [storage]

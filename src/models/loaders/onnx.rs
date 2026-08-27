@@ -12,6 +12,8 @@ use ort::{
     session::{builder::GraphOptimizationLevel, Session, SessionOutputs},
     value::{DynValue, Value},
 };
+#[cfg(target_os = "macos")]
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 #[cfg(target_os = "macos")]
@@ -21,7 +23,7 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     process::{Child, Command, Stdio},
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
@@ -93,6 +95,35 @@ struct CoreMlProfileCaptureReport {
     diagnostic_record_count: usize,
     placement_record_count: usize,
     truncated: bool,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct CoreMlDiagnosticManifest {
+    schema_version: u32,
+    hardware_arch: String,
+    hardware_model: Option<String>,
+    hardware_model_unavailable_reason: Option<String>,
+    model_name: String,
+    model_repository: String,
+    model_input_shapes: Option<Vec<String>>,
+    model_input_shapes_unavailable_reason: Option<String>,
+    ort_crate_version: String,
+    onnx_runtime_version: String,
+    coreml_framework_version: Option<String>,
+    coreml_framework_version_unavailable_reason: Option<String>,
+    requested_compute_units: String,
+    requested_subgraphs: bool,
+    requested_profile_compute_plan: bool,
+    session_created: bool,
+    session_creation_latency_ms: u128,
+    process_memory_before_bytes: Option<u64>,
+    process_memory_after_bytes: Option<u64>,
+    process_memory_unavailable_reason: Option<String>,
+    placement_records_observed: usize,
+    fallback_observed: Option<bool>,
+    fallback_unavailable_reason: Option<String>,
+    capture_truncated: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -322,6 +353,7 @@ fn open_private_profile_output(path: &Path) -> Result<File> {
     let parent = path
         .parent()
         .context("CoreML compute-plan output has no parent directory")?;
+    reject_symlinked_existing_ancestors(parent)?;
     let parent_existed = parent.exists();
     fs::create_dir_all(parent).with_context(|| {
         format!(
@@ -391,6 +423,75 @@ fn open_private_profile_output(path: &Path) -> Result<File> {
 }
 
 #[cfg(target_os = "macos")]
+fn reject_symlinked_existing_ancestors(path: &Path) -> Result<()> {
+    for ancestor in path.ancestors() {
+        let metadata = match fs::symlink_metadata(ancestor) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to inspect CoreML diagnostic ancestor {}",
+                        ancestor.display()
+                    )
+                });
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "CoreML diagnostic path contains symlinked ancestor {}",
+                ancestor.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn process_memory_bytes() -> Option<u64> {
+    let system = sysinfo::System::new_all();
+    let pid = sysinfo::get_current_pid().ok()?;
+    system.process(pid).map(sysinfo::Process::memory)
+}
+
+#[cfg(target_os = "macos")]
+fn hardware_model() -> Option<String> {
+    let output = Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.model"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn coreml_manifest_path(output_path: &Path) -> PathBuf {
+    output_path.with_extension("manifest.json")
+}
+
+#[cfg(target_os = "macos")]
+fn write_coreml_manifest(
+    output_path: &Path,
+    manifest: &CoreMlDiagnosticManifest,
+) -> Result<PathBuf> {
+    let manifest_path = coreml_manifest_path(output_path);
+    let mut output = open_private_profile_output(&manifest_path)?;
+    serde_json::to_writer_pretty(&mut output, manifest)
+        .context("Failed to serialize private CoreML diagnostic manifest")?;
+    output
+        .write_all(b"\n")
+        .context("Failed to terminate private CoreML diagnostic manifest")?;
+    output
+        .flush()
+        .context("Failed to flush private CoreML diagnostic manifest")?;
+    Ok(manifest_path)
+}
+
+#[cfg(target_os = "macos")]
 fn coreml_provider_requested(config: &OnnxLoadConfig) -> bool {
     config
         .execution_providers
@@ -398,6 +499,83 @@ fn coreml_provider_requested(config: &OnnxLoadConfig) -> bool {
         .map_or(true, |providers| {
             providers.contains(&ConfigExecutionProvider::CoreML)
         })
+}
+
+#[cfg(target_os = "macos")]
+fn commit_with_coreml_diagnostics<T, Start, Commit, Describe>(
+    config: &OnnxLoadConfig,
+    start_capture: Start,
+    commit: Commit,
+    describe_inputs: Describe,
+) -> Result<(T, Option<(CoreMlProfileCaptureReport, PathBuf)>)>
+where
+    Start: FnOnce(PathBuf) -> Result<CoreMlProfileCapture>,
+    Commit: FnOnce() -> std::result::Result<T, ort::Error>,
+    Describe: FnOnce(&T) -> Vec<String>,
+{
+    let capture = if config.coreml.profile_compute_plan && coreml_provider_requested(config) {
+        let output_path = config
+            .coreml_profile_output
+            .clone()
+            .context("CoreML compute-plan profiling requires a private diagnostic output path")?;
+        Some(start_capture(output_path)?)
+    } else {
+        None
+    };
+    let memory_before = process_memory_bytes();
+    let started = Instant::now();
+    let committed = commit();
+    let input_shapes = committed.as_ref().ok().map(describe_inputs);
+    let latency_ms = started.elapsed().as_millis();
+    let memory_after = process_memory_bytes();
+    let capture_report = capture.map(CoreMlProfileCapture::finish).transpose()?;
+
+    let report_and_manifest = if let Some(report) = capture_report {
+        let hardware_model = hardware_model();
+        let manifest = CoreMlDiagnosticManifest {
+            schema_version: 1,
+            hardware_arch: std::env::consts::ARCH.to_string(),
+            hardware_model: hardware_model.clone(),
+            hardware_model_unavailable_reason: hardware_model
+                .is_none()
+                .then(|| "hw.model was unavailable from sysctl".to_string()),
+            model_name: config.model_name.clone(),
+            model_repository: config.repo_id.clone(),
+            model_input_shapes: input_shapes,
+            model_input_shapes_unavailable_reason: committed.is_err().then(|| {
+                "Session creation failed before ONNX input metadata was available".to_string()
+            }),
+            ort_crate_version: "2.0.0-rc.11".to_string(),
+            onnx_runtime_version: "1.23.2".to_string(),
+            coreml_framework_version: None,
+            coreml_framework_version_unavailable_reason: Some(
+                "CoreML does not expose a framework version through the pinned ort API".to_string(),
+            ),
+            requested_compute_units: config.coreml.compute_units.name().to_string(),
+            requested_subgraphs: config.coreml.enable_subgraphs,
+            requested_profile_compute_plan: config.coreml.profile_compute_plan,
+            session_created: committed.is_ok(),
+            session_creation_latency_ms: latency_ms,
+            process_memory_before_bytes: memory_before,
+            process_memory_after_bytes: memory_after,
+            process_memory_unavailable_reason: (memory_before.is_none() || memory_after.is_none())
+                .then(|| "Process memory was unavailable from sysinfo".to_string()),
+            placement_records_observed: report.placement_record_count,
+            fallback_observed: None,
+            fallback_unavailable_reason: Some(
+                "CoreML compute-plan records do not provide a reliable fallback verdict"
+                    .to_string(),
+            ),
+            capture_truncated: report.truncated,
+        };
+        let manifest_path = write_coreml_manifest(&report.output_path, &manifest)?;
+        Some((report, manifest_path))
+    } else {
+        None
+    };
+
+    let value = committed.context("Failed to create ONNX session")?;
+    Ok((value, report_and_manifest))
 }
 
 impl OnnxLoader {
@@ -426,35 +604,33 @@ impl OnnxLoader {
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
 
-        #[cfg(target_os = "macos")]
-        let capture = if config.coreml.profile_compute_plan && coreml_provider_requested(config) {
-            let output_path = config.coreml_profile_output.clone().context(
-                "CoreML compute-plan profiling requires a private diagnostic output path",
-            )?;
-            let capture = CoreMlProfileCapture::start(output_path.clone())?;
-            info!(
-                output = %output_path.display(),
-                "CoreML compute-plan capture started; placement remains unobserved until matching records arrive"
-            );
-            Some(capture)
-        } else {
-            None
-        };
-
         // CoreML emits compute-plan details through Apple unified logging
         // during session creation, so the scoped capture must span this call.
-        let session_result = builder.commit_from_file(model_path);
+        #[cfg(target_os = "macos")]
+        let (session, capture_result) = commit_with_coreml_diagnostics(
+            config,
+            CoreMlProfileCapture::start,
+            || builder.commit_from_file(model_path),
+            |session| {
+                session
+                    .inputs()
+                    .iter()
+                    .map(|input| format!("{}: {:?}", input.name(), input.dtype()))
+                    .collect()
+            },
+        )?;
+
+        #[cfg(not(target_os = "macos"))]
+        let session = builder
+            .commit_from_file(model_path)
+            .context("Failed to create ONNX session")?;
 
         #[cfg(target_os = "macos")]
-        let capture_result = capture.map(CoreMlProfileCapture::finish).transpose();
-
-        let session = session_result.context("Failed to create ONNX session")?;
-
-        #[cfg(target_os = "macos")]
-        if let Some(report) = capture_result? {
+        if let Some((report, manifest_path)) = capture_result {
             if report.placement_record_count == 0 {
                 warn!(
                     output = %report.output_path.display(),
+                    manifest = %manifest_path.display(),
                     diagnostic_records = report.diagnostic_record_count,
                     truncated = report.truncated,
                     "CoreML compute-plan capture received no operation placement records; placement remains unobserved"
@@ -462,6 +638,7 @@ impl OnnxLoader {
             } else {
                 info!(
                     output = %report.output_path.display(),
+                    manifest = %manifest_path.display(),
                     placement_records = report.placement_record_count,
                     diagnostic_records = report.diagnostic_record_count,
                     truncated = report.truncated,
@@ -1227,20 +1404,35 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn test_coreml_profile_record_reaches_only_private_isolated_output() {
+    fn test_create_session_boundary_wires_policy_capture_and_structured_manifest() {
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("diagnostics/compute-plan.ndjson");
         let unrelated_output = directory.path().join("general-finch.log");
         let ort_log_before = std::env::var_os("ORT_LOG");
         let rust_log_before = std::env::var_os("RUST_LOG");
 
-        let mut source = Command::new("/bin/sh");
-        source.args([
-            "-c",
-            "printf '%s\\n' '{\"composedMessage\":\"Operation: test_add, Device Usage: test_device, Estimated Cost: 0.5\"}'; exec sleep 5",
-        ]);
-        let capture = CoreMlProfileCapture::start_with_command(output.clone(), source).unwrap();
-        let report = capture.finish().unwrap();
+        let mut config = OnnxLoadConfig::with_size(ModelSize::Small, directory.path().into());
+        config.coreml = CoreMlConfig {
+            compute_units: CoreMlComputeUnits::CpuAndNeuralEngine,
+            profile_compute_plan: true,
+            enable_subgraphs: true,
+        };
+        config.coreml_profile_output = Some(output.clone());
+        let (_, report) = commit_with_coreml_diagnostics(
+            &config,
+            |path| {
+                let mut source = Command::new("/bin/sh");
+                source.args([
+                    "-c",
+                    "printf '%s\\n' '{\"composedMessage\":\"Operation: test_add, Device Usage: test_device, Estimated Cost: 0.5\"}'; exec sleep 5",
+                ]);
+                CoreMlProfileCapture::start_with_command(path, source)
+            },
+            || Ok(()),
+            |_| vec!["input_ids: Tensor<Int64>[1, dynamic]".to_string()],
+        )
+        .unwrap();
+        let (report, manifest_path) = report.unwrap();
 
         assert_eq!(report.diagnostic_record_count, 1);
         assert_eq!(report.placement_record_count, 1);
@@ -1253,6 +1445,23 @@ mod tests {
         assert_eq!(std::env::var_os("RUST_LOG"), rust_log_before);
         assert_eq!(
             fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let manifest: CoreMlDiagnosticManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.requested_compute_units, "CPU + ANE");
+        assert!(manifest.requested_subgraphs);
+        assert!(manifest.requested_profile_compute_plan);
+        assert!(manifest.session_created);
+        assert_eq!(manifest.placement_records_observed, 1);
+        assert_eq!(manifest.fallback_observed, None);
+        assert_eq!(
+            manifest.model_input_shapes,
+            Some(vec!["input_ids: Tensor<Int64>[1, dynamic]".to_string()])
+        );
+        assert!(manifest.model_input_shapes_unavailable_reason.is_none());
+        assert_eq!(
+            fs::metadata(manifest_path).unwrap().permissions().mode() & 0o777,
             0o600
         );
     }
@@ -1293,12 +1502,38 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn test_coreml_profile_output_rejects_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        let linked = directory.path().join("linked");
+        fs::create_dir(&real).unwrap();
+        symlink(&real, &linked).unwrap();
+
+        let error =
+            open_private_profile_output(&linked.join("nested/compute-plan.ndjson")).unwrap_err();
+        assert!(error.to_string().contains("symlinked ancestor"));
+        assert!(!real.join("nested/compute-plan.ndjson").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     #[ignore = "requires the macOS unified logging service"]
     fn test_coreml_profile_capture_production_log_stream_smoke() {
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("compute-plan.ndjson");
-        let capture = CoreMlProfileCapture::start(output.clone()).unwrap();
-        let report = capture.finish().unwrap();
+        let mut config = OnnxLoadConfig::with_size(ModelSize::Small, directory.path().into());
+        config.coreml.profile_compute_plan = true;
+        config.coreml_profile_output = Some(output.clone());
+        let (_, report) = commit_with_coreml_diagnostics(
+            &config,
+            CoreMlProfileCapture::start,
+            || Ok(()),
+            |_| vec!["synthetic smoke boundary".to_string()],
+        )
+        .unwrap();
+        let (report, manifest_path) = report.unwrap();
 
         assert_eq!(report.output_path, output);
         assert_eq!(report.diagnostic_record_count, 0);
@@ -1308,5 +1543,6 @@ mod tests {
             fs::metadata(output).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        assert!(manifest_path.exists());
     }
 }
