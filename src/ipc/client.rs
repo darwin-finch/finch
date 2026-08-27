@@ -821,7 +821,8 @@ fn host_effect_permit_proxy(
                         outcome.init_acknowledged(values.len() as u32),
                         &values,
                         0,
-                    )?;
+                    )
+                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
                 }
                 crate::server::RunnerHostEffectOutcome::NotApplied { reason } => {
                     outcome.set_not_applied(&reason);

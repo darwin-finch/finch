@@ -15,8 +15,13 @@ pub use brain_runner::{
     BrainRunnerBroker, RunnerApprovalRequest, RunnerCancelRequest, RunnerEffectRecord,
     RunnerMemoryProjectionRequest, RunnerProgramControlRequest, RunnerProgramError,
     RunnerProgramInteraction, RunnerProgramRequest, RunnerProgramResult, RunnerRegistrationId,
-    RunnerRequest, RunnerTurnCommitAck, RunnerTurnCommitNotice, RunnerTurnError, RunnerTurnEvent,
-    RunnerTurnRequest, RunnerTurnResult,
+    RunnerEffectAuditControl, RunnerEffectAuditReservation, RunnerHostEffectOutcome,
+    RunnerHostEffectPermit, RunnerRequest, RunnerTurnCommitAck, RunnerTurnCommitNotice,
+    RunnerTurnError, RunnerTurnEvent, RunnerTurnRequest, RunnerTurnResult,
+};
+pub(crate) use brain_runner::{
+    RunnerEffectAuditControlRequest, RunnerEffectAuditReservationRequest,
+    RunnerHostEffectFinishRequest,
 };
 pub use brain_service::{
     BrainLifecycleService, BrainSubmissionError, BrainSubmissionOutcome, BrainWatch,
