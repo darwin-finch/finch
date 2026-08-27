@@ -213,17 +213,23 @@ impl ProviderResolver {
                 requested == entry.profile_name() || entry.model() == Some(requested)
             })
         };
-        let Some(entry) = self
+        let mut matches = self
             .profiles
             .iter()
-            .find(|entry| matches_provider(entry) && matches_model(entry))
-        else {
+            .filter(|entry| matches_provider(entry) && matches_model(entry));
+        let Some(entry) = matches.next() else {
             let requested = model.or(provider).unwrap_or("unknown");
             if requested == active.name() {
                 return Ok(active);
             }
             bail!("NoEligibleModel: no configured profile matches '{requested}'");
         };
+        if matches.next().is_some() {
+            let requested = model.or(provider).unwrap_or("unknown");
+            bail!(
+                "NoEligibleModel: configured profile selection '{requested}' is ambiguous; select an exact profile name so Finch cannot choose an implicit credential account"
+            );
+        }
         if entry.profile_name() == active.name() {
             return Ok(active);
         }
@@ -1279,6 +1285,45 @@ mod tests {
             .err()
             .expect("invalid sibling binding must reject child model selection");
         assert!(format!("{error:#}").contains("missing credential 'missing'"));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[tokio::test]
+    async fn child_model_selection_rejects_ambiguous_account_without_resolution_or_http() {
+        struct PanicResolver;
+        impl CredentialResolver for PanicResolver {
+            fn resolve(&self, _: &ProviderCredential) -> Result<ResolvedCredential> {
+                panic!("ambiguous child selection reached credential resolution")
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let config = crate::config::Config::with_providers(vec![
+            named_account_profile("profile-a", "account-a", "a", &endpoint),
+            named_account_profile("profile-b", "account-b", "b", &endpoint),
+        ])
+        .with_credentials(vec![
+            named_account_credential("account-a", "a", &endpoint),
+            named_account_credential("account-b", "b", &endpoint),
+        ]);
+        let resolver = ProviderResolver::with_config_and_credential_resolver(
+            Arc::new(EchoGenerator),
+            config,
+            Arc::new(PanicResolver),
+        );
+
+        let error = resolver
+            .resolve(None, Some("gpt-4o"))
+            .await
+            .err()
+            .expect("model-only selection must not choose an implicit account");
+        assert!(error.to_string().contains("ambiguous"));
+        assert!(error.to_string().contains("exact profile name"));
         assert!(matches!(
             listener.accept(),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
