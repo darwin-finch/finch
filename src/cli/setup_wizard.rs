@@ -8315,15 +8315,15 @@ for line in sys.stdin:
 
     #[test]
     fn test_configure_remote_right_on_model_field_cycles_to_next_known_model() {
-        // Use claude (idx 1) so we have a known model list
-        let claude_idx = CLOUD_PROVIDERS
+        // OpenAI's deliberately small fallback has multiple choices to cycle.
+        let openai_idx = CLOUD_PROVIDERS
             .iter()
-            .position(|(id, _, _, _)| *id == "claude")
+            .position(|(id, _, _, _)| *id == "openai")
             .unwrap();
-        let first_model = known_models_for("claude")[0].clone();
+        let first_model = known_models_for("openai")[0].clone();
         let mut state = state_with_step(AddProviderStep::ConfigureRemote {
-            provider_idx: claude_idx,
-            name: "claude".to_string(),
+            provider_idx: openai_idx,
+            name: "openai".to_string(),
             model: first_model,
             api_key: String::new(),
             focused_field: 2, // Model field
@@ -8331,7 +8331,7 @@ for line in sys.stdin:
         });
         handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
         if let Some(AddProviderStep::ConfigureRemote { model, .. }) = get_step(&state) {
-            let models = known_models_for("claude");
+            let models = known_models_for("openai");
             assert_eq!(model, &models[1]);
         } else {
             panic!("expected ConfigureRemote");
