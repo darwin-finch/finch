@@ -108,6 +108,12 @@ jobs:
     - name: Compile all targets
       run: cargo test --all-targets --no-run
 
+    - name: Regress scheduler completion and isolate prior collateral stall
+      run: |
+        timeout --signal=TERM --kill-after=10s 2m cargo test --lib runtime::scheduler::tests::wait_rechecks_completion_after_registering_notification -- --exact --nocapture
+        timeout --signal=TERM --kill-after=10s 2m cargo test --lib runtime::scheduler::tests::agent_spawn_reenters_authority_to_snapshot_grants_without_deadlock -- --exact --nocapture
+        timeout --signal=TERM --kill-after=10s 2m cargo test --lib runtime::scheduler::tests::typed_agent_spec_attenuates_to_selected_opaque_grant -- --exact --nocapture
+
     - name: Test all targets
       run: timeout --signal=TERM --kill-after=30s 15m cargo test --all-targets -- --nocapture
 
