@@ -11,7 +11,7 @@ use ratatui::{
     Frame,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
+use std::io;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -167,6 +167,9 @@ fn detect_xai_api_key() -> Option<String> {
 
 /// Known model names for cloud providers (used for cycling in ConfigureRemote dialog)
 fn known_models_for(provider: &str) -> Vec<String> {
+    if provider == "chatgpt_subscription" {
+        return vec![crate::providers::codex_app_server::GPT_5_6_SOL.to_string()];
+    }
     model_catalog::static_fallback(provider)
 }
 
@@ -1210,7 +1213,7 @@ impl SetupAuthUi {
             return Err(error.into());
         }
         let backend = ratatui::backend::CrosstermBackend::new(stdout);
-        let terminal = match ratatui::Terminal::new(backend) {
+        let mut terminal = match ratatui::Terminal::new(backend) {
             Ok(terminal) => terminal,
             Err(error) => {
                 let _ = crossterm::execute!(
@@ -1230,10 +1233,14 @@ impl SetupAuthUi {
             .spawn(move || {
                 while !stop.load(Ordering::Acquire) {
                     match event::poll(Duration::from_millis(50)) {
-                        Ok(true) => match event::read() {
-                            Ok(event) if event_tx.blocking_send(event).is_ok() => {}
-                            Ok(_) | Err(_) => break,
-                        },
+                        Ok(true) => {
+                            let Ok(event) = event::read() else {
+                                break;
+                            };
+                            if event_tx.blocking_send(event).is_err() {
+                                break;
+                            }
+                        }
                         Ok(false) => {}
                         Err(_) => break,
                     }
@@ -6581,10 +6588,14 @@ mod tests {
     }
 
     fn default_configure_remote(focused_field: usize) -> AddProviderStep {
+        let provider_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, _, _, _)| *id == "grok")
+            .unwrap();
         AddProviderStep::ConfigureRemote {
-            provider_idx: 0, // grok
+            provider_idx,
             name: "grok".to_string(),
-            model: CLOUD_PROVIDERS[0].2.to_string(),
+            model: CLOUD_PROVIDERS[provider_idx].2.to_string(),
             api_key: String::new(),
             focused_field,
             editing_idx: None,
@@ -7331,7 +7342,11 @@ mod tests {
     #[test]
     fn test_configure_remote_right_cycles_provider_forward() {
         let mut state = state_with_step(default_configure_remote(0)); // focused Provider
-        let initial_idx = 0usize; // grok
+        let initial_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, _, _, _)| *id == "grok")
+            .unwrap();
+        let expected_idx = (initial_idx + 1) % CLOUD_PROVIDERS.len();
         handle_models_input(&mut state, key(KeyCode::Right)).unwrap();
         if let Some(AddProviderStep::ConfigureRemote {
             provider_idx,
@@ -7339,9 +7354,9 @@ mod tests {
             ..
         }) = get_step(&state)
         {
-            assert_eq!(*provider_idx, initial_idx + 1);
+            assert_eq!(*provider_idx, expected_idx);
             // model should reset to default for new provider
-            let expected_model = CLOUD_PROVIDERS[initial_idx + 1].2;
+            let expected_model = CLOUD_PROVIDERS[expected_idx].2;
             assert_eq!(model.as_str(), expected_model);
             assert_eq!(
                 catalog_model_provenance(&state),
@@ -7354,7 +7369,12 @@ mod tests {
 
     #[test]
     fn test_configure_remote_left_wraps_provider_to_last() {
-        let mut state = state_with_step(default_configure_remote(0)); // provider_idx=0, focused
+        let mut state = state_with_step(default_configure_remote(0));
+        let initial_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, _, _, _)| *id == "grok")
+            .unwrap();
+        let expected_idx = (initial_idx + CLOUD_PROVIDERS.len() - 1) % CLOUD_PROVIDERS.len();
         handle_models_input(&mut state, key(KeyCode::Left)).unwrap();
         if let Some(AddProviderStep::ConfigureRemote {
             provider_idx,
@@ -7362,8 +7382,8 @@ mod tests {
             ..
         }) = get_step(&state)
         {
-            assert_eq!(*provider_idx, CLOUD_PROVIDERS.len() - 1);
-            let expected_model = CLOUD_PROVIDERS[CLOUD_PROVIDERS.len() - 1].2;
+            assert_eq!(*provider_idx, expected_idx);
+            let expected_model = CLOUD_PROVIDERS[expected_idx].2;
             assert_eq!(model.as_str(), expected_model);
             assert_eq!(
                 catalog_model_provenance(&state),
@@ -7455,8 +7475,12 @@ mod tests {
 
     #[test]
     fn test_configure_remote_backspace_removes_from_api_key() {
+        let grok_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, _, _, _)| *id == "grok")
+            .unwrap();
         let mut state = state_with_step(AddProviderStep::ConfigureRemote {
-            provider_idx: 0,
+            provider_idx: grok_idx,
             name: "grok".to_string(),
             model: "grok-code-fast-1".to_string(),
             api_key: "abc".to_string(),

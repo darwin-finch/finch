@@ -2601,7 +2601,7 @@ for line in sys.stdin:
         print(json.dumps({'method': 'thread/started', 'params': {'thread': {'id': started_id}}}), flush=True)
         if thread_event == 'duplicate':
             print(json.dumps({'method': 'thread/started', 'params': {'thread': {'id': started_id}}}), flush=True)
-    if method == 'account/login/start' and thread_event != 'pending_login':
+    if method == 'account/login/start' and thread_event not in ['pending_login', 'cancel_duplicate']:
         completed = {'method': 'account/login/completed', 'params': {'loginId': 'wrong-login' if thread_event == 'login_mismatch' else 'login-1', 'success': thread_event not in ['login_denied', 'login_expired'], 'error': 'access_denied' if thread_event == 'login_denied' else ('expired_token' if thread_event == 'login_expired' else None)}}
         updated = {'method': 'account/updated', 'params': {'authMode': 'chatgpt', 'planType': 'plus'}}
         if thread_event == 'login_updated_first': print(json.dumps(updated), flush=True)
