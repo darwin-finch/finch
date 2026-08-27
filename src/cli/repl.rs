@@ -219,11 +219,22 @@ mod disabled_training_tests {
         };
         let metrics = MetricsLogger::new(config.metrics_dir.clone()).unwrap();
         let router = Router::new(crate::models::ThresholdRouter::default());
+        let ambient_input_calls = Arc::new(AtomicUsize::new(0));
+        let poisoned_input_calls = Arc::clone(&ambient_input_calls);
         let initialization = ReplInitialization {
+            // The regression boundary is noninteractive regardless of whether
+            // the test harness itself owns a TTY. Calling this factory would
+            // let InputHandler resolve the user's real history path.
+            is_interactive: false,
+            input_handler_factory: Some(Box::new(move || {
+                poisoned_input_calls.fetch_add(1, Ordering::SeqCst);
+                panic!("hermetic fallback regression touched ambient input/history state")
+            })),
             models_dir: Some(temp.path().join("models")),
             patterns_path: temp.path().join("tool-patterns.json"),
             conversation_log_path: temp.path().join("unused-conversations.jsonl"),
             active_persona: crate::config::Persona::load_builtin("default"),
+            project_program_root: None,
         };
         let mut repl = Repl::new_with_initialization(
             config,
@@ -235,6 +246,7 @@ mod disabled_training_tests {
             initialization,
         )
         .await;
+        assert_eq!(ambient_input_calls.load(Ordering::SeqCst), 0);
         repl.conversation_logger = Arc::new(tokio::sync::Mutex::new(
             crate::logging::ConversationLogger::new(legacy_conversations.clone()).unwrap(),
         ));
@@ -244,6 +256,7 @@ mod disabled_training_tests {
         assert_eq!(actual, SENSITIVE_RESPONSE);
         assert_eq!(buffered_calls.load(Ordering::SeqCst), 1);
         assert_eq!(streaming_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ambient_input_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             repl.teacher_session.read().await.provider_name(),
             "hermetic-fallback"
@@ -540,16 +553,23 @@ pub struct Repl {
 }
 
 struct ReplInitialization {
+    is_interactive: bool,
+    input_handler_factory: Option<Box<dyn FnOnce() -> Result<InputHandler>>>,
     models_dir: Option<PathBuf>,
     patterns_path: PathBuf,
     conversation_log_path: PathBuf,
     active_persona: Result<crate::config::Persona>,
+    project_program_root: Option<PathBuf>,
 }
 
 impl ReplInitialization {
     fn from_user_environment(config: &Config) -> Self {
         let home = dirs::home_dir();
+        let is_interactive = io::stdout().is_terminal();
         Self {
+            is_interactive,
+            input_handler_factory: is_interactive
+                .then(|| Box::new(InputHandler::new) as Box<dyn FnOnce() -> Result<InputHandler>>),
             models_dir: home.as_ref().map(|root| root.join(".finch/models")),
             patterns_path: home
                 .as_ref()
@@ -559,6 +579,9 @@ impl ReplInitialization {
                 .map(|root| root.join(".finch/conversations.jsonl"))
                 .unwrap_or_else(|| PathBuf::from(".finch/conversations.jsonl")),
             active_persona: crate::config::Persona::load_by_name(&config.active_persona),
+            project_program_root: std::env::current_dir()
+                .ok()
+                .and_then(|cwd| crate::programs::project_program_root(&cwd)),
         }
     }
 }
@@ -595,14 +618,18 @@ impl Repl {
         session_label: String,
         initialization: ReplInitialization,
     ) -> Self {
-        // Detect if we're in interactive mode (stdout is a TTY)
-        let is_interactive = io::stdout().is_terminal();
+        let ReplInitialization {
+            is_interactive,
+            input_handler_factory,
+            models_dir,
+            patterns_path,
+            conversation_log_path,
+            active_persona,
+            project_program_root,
+        } = initialization;
 
         // Determine if we're in daemon mode (suppress local model logs)
         let daemon_mode = daemon_client.is_some();
-
-        // Set up models directory
-        let models_dir = initialization.models_dir;
 
         // Load validator only (router is now in Router)
         let threshold_validator =
@@ -610,13 +637,17 @@ impl Repl {
 
         // Initialize input handler for interactive mode
         let input_handler = if is_interactive {
-            match InputHandler::new() {
-                Ok(handler) => Some(handler),
-                Err(e) => {
-                    output_status!("⚠️  Failed to initialize readline: {}", e);
-                    output_status!("   Falling back to basic input mode");
-                    None
+            if let Some(factory) = input_handler_factory {
+                match factory() {
+                    Ok(handler) => Some(handler),
+                    Err(e) => {
+                        output_status!("⚠️  Failed to initialize readline: {}", e);
+                        output_status!("   Falling back to basic input mode");
+                        None
+                    }
                 }
+            } else {
+                None
             }
         } else {
             None
@@ -628,16 +659,14 @@ impl Repl {
                 Ok(system) => {
                     let system = Arc::new(system);
                     // Plain-text program files are canonical; SQLite is their discovery index.
-                    if let Ok(cwd) = std::env::current_dir() {
-                        if let Some(root) = crate::programs::project_program_root(&cwd) {
-                            if let Err(error) = system
-                                .sync_program_files(&root, crate::programs::ProgramScope::Project)
-                                .await
-                            {
-                                tracing::warn!(
-                                    "Failed to index project program vocabulary: {error}"
-                                );
-                            }
+                    if let Some(root) = project_program_root.as_ref() {
+                        if let Err(error) = system
+                            .sync_program_files(root, crate::programs::ProgramScope::Project)
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to index project program vocabulary: {error}"
+                            );
                         }
                     }
                     let root = system.program_source_root();
@@ -865,8 +894,6 @@ impl Repl {
         }
 
         // Determine patterns path
-        let patterns_path = initialization.patterns_path;
-
         // Create tool executor
         let executor =
             ToolExecutor::new(tool_registry, permissions, patterns_path).unwrap_or_else(|e| {
@@ -1051,16 +1078,15 @@ impl Repl {
 
         // Legacy collector construction is side-effect free and persistence is
         // disabled. Keep the value only for API compatibility.
-        let log_path = initialization.conversation_log_path;
         let conversation_logger = Arc::new(tokio::sync::Mutex::new(
-            crate::logging::ConversationLogger::new(log_path).unwrap_or_else(|e| {
+            crate::logging::ConversationLogger::new(conversation_log_path).unwrap_or_else(|e| {
                 output_status!("⚠️  Failed to create conversation logger: {}", e);
                 panic!("Cannot create conversation logger")
             }),
         ));
 
         // Phase 2: Load active persona
-        let active_persona = match initialization.active_persona {
+        let active_persona = match active_persona {
             Ok(persona) => Arc::new(RwLock::new(persona)),
             Err(e) => {
                 output_status!(
