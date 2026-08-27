@@ -40,12 +40,13 @@ brain_isolation_resolve_store() {
 
 brain_test_isolation_is_active() {
   local proof token home root home_identity root_identity brain_addr daemon_addr
-  local password_digest socket socket_root socket_root_identity supervisor_pid supervisor_executable supervisor_identity
+  local password_digest socket socket_root socket_root_identity supervisor_pid supervisor_executable supervisor_identity signature
   local links proof_uid proof_mode proof_type actual_password_digest ancestor actual_supervisor_executable
   local library_root expected_supervisor
   [[ "${FINCH_BRAIN_TEST_ISOLATED:-}" == 1 ]] || return 1
   [[ "${FINCH_BRAIN_TEST_PROOF_FD:-}" == 9 ]] || return 1
-  proof="$(perl -e 'sysseek(STDIN, 0, 0) or exit 1; print while <STDIN>' <&9 2>/dev/null)" || return 1
+  [[ -n "${FINCH_TEST_SUPERVISOR_BIN:-}" ]] || return 1
+  proof="$("$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof 2>/dev/null)" || return 1
   token="$(printf '%s\n' "$proof" | sed -n '1p')"
   home="$(printf '%s\n' "$proof" | sed -n '2p')"
   root="$(printf '%s\n' "$proof" | sed -n '3p')"
@@ -60,7 +61,9 @@ brain_test_isolation_is_active() {
   supervisor_pid="$(printf '%s\n' "$proof" | sed -n '12p')"
   supervisor_executable="$(printf '%s\n' "$proof" | sed -n '13p')"
   supervisor_identity="$(printf '%s\n' "$proof" | sed -n '14p')"
-  [[ "$(printf '%s\n' "$proof" | sed -n '15p')" == '' ]] || return 1
+  signature="$(printf '%s\n' "$proof" | sed -n '15p')"
+  [[ "$signature" =~ ^[0-9a-f]{128}$ ]] || return 1
+  [[ "$(printf '%s\n' "$proof" | sed -n '16p')" == '' ]] || return 1
   [[ "$token" == "${FINCH_BRAIN_TEST_TOKEN:-}" ]] || return 1
   [[ "$home" == "${HOME:-}" && "$home" == "${FINCH_BRAIN_TEST_HOME:-}" ]] || return 1
   [[ "$root" == "$home/.finch/brains" && "$root" == "${FINCH_BRAIN_TEST_ROOT:-}" ]] || return 1
@@ -97,7 +100,7 @@ brain_test_isolation_is_active() {
   [[ "$supervisor_executable" == "${FINCH_TEST_SUPERVISOR_BIN:-}" ]] || return 1
   ancestor="$$"
   while [[ "$ancestor" -gt 1 && "$ancestor" != "$supervisor_pid" ]]; do
-    ancestor="$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d ' ')" || return 1
+    ancestor="$(/bin/ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d ' ')" || return 1
   done
   [[ "$ancestor" == "$supervisor_pid" ]] || return 1
   case "$(uname -s)" in
@@ -134,6 +137,7 @@ brain_test_isolation_is_active() {
   [[ "$proof_type" == 'Regular File' || "$proof_type" == 'regular file' ]] || return 1
   [[ "$(cd "$home" 2>/dev/null && pwd -P)" == "$home" ]] || return 1
   [[ "$(brain_isolation_resolve_store "$home" 2>/dev/null)" == "$root" ]] || return 1
+  [[ "${FINCH_BRAIN_TEST_AUTH_FD:-}" == 109 ]] || return 1
 }
 
 brain_test_isolation_require_finch_profile() {

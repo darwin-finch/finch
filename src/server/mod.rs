@@ -1200,6 +1200,96 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn production_constructor_rejects_rewritten_proof_and_accepts_exact_restore() {
+        const CHILD_ENV: &str = "FINCH_TEST_CONSTRUCTOR_REWRITTEN_PROOF_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            use std::io::Write as _;
+            use std::os::fd::FromRawFd as _;
+            use std::os::unix::fs::FileExt as _;
+
+            let proof = crate::brain::isolated_test_proof().unwrap();
+            let duplicate = unsafe { nix::libc::dup(9) };
+            assert!(duplicate >= 0);
+            let reader = unsafe { std::fs::File::from_raw_fd(duplicate) };
+            let length = reader.metadata().unwrap().len() as usize;
+            let mut original = vec![0_u8; length];
+            let mut offset = 0;
+            while offset < original.len() {
+                let count = reader
+                    .read_at(&mut original[offset..], offset as u64)
+                    .unwrap();
+                assert!(count > 0);
+                offset += count;
+            }
+            let mut forged = original.clone();
+            forged[0] = if forged[0] == b'a' { b'b' } else { b'a' };
+            assert_eq!(unsafe { nix::libc::fchmod(9, 0o600) }, 0);
+            let mut writer = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open("/dev/fd/9")
+                .unwrap();
+            writer.write_all(&forged).unwrap();
+            writer.sync_all().unwrap();
+            drop(writer);
+            assert_eq!(unsafe { nix::libc::fchmod(9, 0o400) }, 0);
+
+            let state_before = std::fs::read_dir(proof.home.join(".finch"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>();
+            let generator_state = Arc::new(RwLock::new(GeneratorState::NotAvailable));
+            let result = AgentServer::new(
+                crate::config::Config::with_providers(Vec::new()),
+                ServerConfig::default(),
+                ClaudeClient::new("constructor-rewrite".to_owned()).unwrap(),
+                Router::new(crate::models::ThresholdRouter::new()),
+                MetricsLogger::new(proof.home.join("constructor-rewrite-metrics")).unwrap(),
+                Arc::new(RwLock::new(LocalGenerator::new())),
+                Arc::new(BootstrapLoader::new(Arc::clone(&generator_state), None)),
+                generator_state,
+                Vec::new(),
+            );
+            assert!(
+                result.is_err(),
+                "rewritten proof reached AgentServer construction"
+            );
+            let state_after = std::fs::read_dir(proof.home.join(".finch"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                state_after, state_before,
+                "constructor mutated Finch state before rejecting rewritten authority"
+            );
+
+            assert_eq!(unsafe { nix::libc::fchmod(9, 0o600) }, 0);
+            let mut writer = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open("/dev/fd/9")
+                .unwrap();
+            writer.write_all(&original).unwrap();
+            writer.sync_all().unwrap();
+            drop(writer);
+            assert_eq!(unsafe { nix::libc::fchmod(9, 0o400) }, 0);
+            crate::brain::isolated_test_proof().unwrap();
+            return;
+        }
+        let status = crate::brain::supervised_test_subprocess_command()
+            .args([
+                "--exact",
+                "server::tests::production_constructor_rejects_rewritten_proof_and_accepts_exact_restore",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn isolated_address_publication_replaces_final_symlink_without_following_it() {
         let state = tempfile::tempdir().unwrap();
         let parent = state.path().join("private");

@@ -138,14 +138,52 @@ phase=ordinary-nonzero-cleanup
 if run_isolated bash -c 'exit 23'; then exit 1; else test "$?" -eq 23; fi
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
-# If the supervisor cannot prove group quiescence, it fails closed and leaves
-# HOME intact for diagnosis instead of reaping the PGID leader and cleaning.
+# A caller-controlled PATH cannot hide a live group member from the
+# supervisor. The external observer proves HOME exists for the descendant's
+# entire lifetime; cleanup happens only after the trusted /bin/ps inspection
+# sees the group quiesce.
 inspection_bin="$scratch/inspection-bin"
-phase=inspection-failure-preserves-home
+inspection_called="$scratch/shadow-ps-called"
+inspection_pid="$scratch/inspection-descendant.pid"
+inspection_home="$scratch/inspection-home"
+inspection_observer="$scratch/inspection-observer"
+phase=successful-empty-shadow-ps-cannot-hide-descendant
 mkdir "$inspection_bin"
-printf '%s\n' '#!/bin/sh' 'exit 91' >"$inspection_bin/ps"
+printf '%s\n' '#!/bin/sh' ': >"$FINCH_SHADOW_PS_CALLED"' 'exit 0' >"$inspection_bin/ps"
 chmod +x "$inspection_bin/ps"
-if PATH="$inspection_bin:$PATH" run_isolated true 2>"$scratch/inspection.err"; then
+(
+  while [[ ! -s "$inspection_pid" || ! -s "$inspection_home" ]]; do sleep 0.01; done
+  observed_pid="$(cat "$inspection_pid")"
+  observed_home="$(cat "$inspection_home")"
+  while /bin/ps -p "$observed_pid" -o pid= 2>/dev/null | grep -q '[0-9]'; do
+    test -d "$observed_home" || exit 1
+    sleep 0.01
+  done
+  printf survived >"$inspection_observer"
+) &
+inspection_observer_pid=$!
+if FINCH_DESCENDANT_PID_FILE="$inspection_pid" FINCH_OBSERVED_HOME="$inspection_home" \
+  FINCH_SHADOW_PS_CALLED="$inspection_called" PATH="$inspection_bin:$PATH" \
+  run_isolated bash -c '
+    printf "%s\n" "$HOME" >"$FINCH_OBSERVED_HOME"
+    (trap "" TERM HUP INT; printf "%s\n" "$BASHPID" >"$FINCH_DESCENDANT_PID_FILE"; sleep 30) &
+    exit 31
+  '; then
+  exit 1
+else
+  test "$?" -eq 31
+fi
+wait "$inspection_observer_pid"
+test "$(cat "$inspection_observer")" = survived
+test ! -e "$inspection_called"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+# An actual inspection error still fails closed and preserves both disposable
+# roots for diagnosis. This is distinct from PATH shadowing, which cannot
+# influence the trusted platform inspection at all.
+phase=inspection-failure-preserves-home
+if FINCH_TEST_FORCE_GROUP_INSPECTION_FAILURE=1 \
+  run_isolated true 2>"$scratch/inspection.err"; then
   exit 1
 else
   test "$?" -eq 70
@@ -173,7 +211,7 @@ else
   test "$?" -eq 29
 fi
 normal_descendant_pid="$(cat "$normal_descendant_pid_file")"
-! ps -p "$normal_descendant_pid" -o pid= 2>/dev/null | grep -q '[0-9]'
+! /bin/ps -p "$normal_descendant_pid" -o pid= 2>/dev/null | grep -q '[0-9]'
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 phase=real-store-manifest-guard

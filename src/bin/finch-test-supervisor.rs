@@ -2,12 +2,14 @@
 
 #![cfg(unix)]
 
+use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixDatagram;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -168,6 +170,7 @@ fn create_proof(
     brain_address: &str,
     daemon_address: &str,
     password: &str,
+    signing_key: &SigningKey,
 ) -> anyhow::Result<(File, String)> {
     let root = home.join(".finch/brains");
     let socket = socket_root.join("daemon.sock");
@@ -180,41 +183,47 @@ fn create_proof(
         uuid::Uuid::new_v4().simple()
     );
     let path = home.join(format!(".proof-{token}"));
+    let mut contents = String::new();
+    use std::fmt::Write as _;
+    writeln!(contents, "{token}")?;
+    writeln!(contents, "{}", home.display())?;
+    writeln!(contents, "{}", root.display())?;
+    writeln!(contents, "{}:{}", home_metadata.dev(), home_metadata.ino())?;
+    writeln!(contents, "{}:{}", root_metadata.dev(), root_metadata.ino())?;
+    writeln!(contents, "{brain_address}")?;
+    writeln!(contents, "{daemon_address}")?;
+    writeln!(
+        contents,
+        "{}",
+        hex::encode(Sha256::digest(password.as_bytes()))
+    )?;
+    writeln!(contents, "{}", socket.display())?;
+    writeln!(contents, "{}", socket_root.display())?;
+    writeln!(
+        contents,
+        "{}:{}",
+        socket_root_metadata.dev(),
+        socket_root_metadata.ino()
+    )?;
+    writeln!(contents, "{}", std::process::id())?;
+    let supervisor_executable = std::env::current_exe()?.canonicalize()?;
+    let supervisor_metadata = fs::metadata(&supervisor_executable)?;
+    writeln!(contents, "{}", supervisor_executable.display())?;
+    writeln!(
+        contents,
+        "{}:{}",
+        supervisor_metadata.dev(),
+        supervisor_metadata.ino()
+    )?;
+    let signature = signing_key.sign(contents.as_bytes());
+    writeln!(contents, "{}", hex::encode(signature.to_bytes()))?;
+
     let mut writer = OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
         .open(&path)?;
-    writeln!(writer, "{token}")?;
-    writeln!(writer, "{}", home.display())?;
-    writeln!(writer, "{}", root.display())?;
-    writeln!(writer, "{}:{}", home_metadata.dev(), home_metadata.ino())?;
-    writeln!(writer, "{}:{}", root_metadata.dev(), root_metadata.ino())?;
-    writeln!(writer, "{brain_address}")?;
-    writeln!(writer, "{daemon_address}")?;
-    writeln!(
-        writer,
-        "{}",
-        hex::encode(Sha256::digest(password.as_bytes()))
-    )?;
-    writeln!(writer, "{}", socket.display())?;
-    writeln!(writer, "{}", socket_root.display())?;
-    writeln!(
-        writer,
-        "{}:{}",
-        socket_root_metadata.dev(),
-        socket_root_metadata.ino()
-    )?;
-    writeln!(writer, "{}", std::process::id())?;
-    let supervisor_executable = std::env::current_exe()?.canonicalize()?;
-    let supervisor_metadata = fs::metadata(&supervisor_executable)?;
-    writeln!(writer, "{}", supervisor_executable.display())?;
-    writeln!(
-        writer,
-        "{}:{}",
-        supervisor_metadata.dev(),
-        supervisor_metadata.ino()
-    )?;
+    writer.write_all(contents.as_bytes())?;
     writer.sync_all()?;
     writer.set_permissions(fs::Permissions::from_mode(0o400))?;
     drop(writer);
@@ -234,6 +243,7 @@ fn create_proof(
 fn configure_supervised_child(
     command: &mut Command,
     proof_fd: RawFd,
+    auth_fd: RawFd,
     brain_fd: RawFd,
     daemon_fd: RawFd,
 ) {
@@ -246,6 +256,12 @@ fn configure_supervised_child(
                 return Err(io::Error::last_os_error());
             }
             if libc::fcntl(9, libc::F_SETFD, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if auth_fd != 109 && libc::dup2(auth_fd, 109) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(109, libc::F_SETFD, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
             // Cargo uses low-numbered descriptors for its GNU jobserver while
@@ -278,6 +294,31 @@ fn duplicate_above_stdio(fd: RawFd) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(duplicate) })
 }
 
+fn service_proof_authentication(
+    socket: &UnixDatagram,
+    verifying_key: &[u8; 32],
+) -> anyhow::Result<()> {
+    let mut request = [0_u8; 64];
+    loop {
+        match socket.recv(&mut request) {
+            Ok(count) => {
+                anyhow::ensure!(
+                    count == b"finch-proof-key-v1".len(),
+                    "invalid proof-auth request"
+                );
+                anyhow::ensure!(
+                    &request[..count] == b"finch-proof-key-v1",
+                    "invalid proof-auth request"
+                );
+                socket.send(verifying_key)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 fn set_descriptor_flag(fd: RawFd, command: libc::c_int, value: libc::c_int) -> io::Result<()> {
     if unsafe { libc::fcntl(fd, command, value) } == -1 {
         return Err(io::Error::last_os_error());
@@ -302,7 +343,12 @@ fn leader_exited(child: &Child) -> io::Result<bool> {
 }
 
 fn process_group_members(group: libc::pid_t) -> anyhow::Result<Vec<libc::pid_t>> {
-    let output = Command::new("ps")
+    if std::env::var_os("FINCH_TEST_FORCE_GROUP_INSPECTION_FAILURE").is_some() {
+        anyhow::bail!("forced test process-group inspection failure");
+    }
+    // PATH belongs to the supervised child. Process membership is a cleanup
+    // authority decision, so invoke the platform-owned executable directly.
+    let output = Command::new("/bin/ps")
         .args(["-axo", "pid=,pgid="])
         .output()
         .context("inspect supervised process group")?;
@@ -503,13 +549,18 @@ fn run() -> anyhow::Result<i32> {
     let brain_address = brain_listener.local_addr()?.to_string();
     let daemon_address = daemon_listener.local_addr()?.to_string();
     let password = format!("test-{}", uuid::Uuid::new_v4().simple());
+    let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let verifying_key = signing_key.verifying_key().to_bytes();
     let (proof, token) = create_proof(
         isolated.path(),
         socket_root.path(),
         &brain_address,
         &daemon_address,
         &password,
+        &signing_key,
     )?;
+    let (auth_parent, auth_child_socket) = UnixDatagram::pair()?;
+    auth_parent.set_nonblocking(true)?;
     let mut pipes = [0; 2];
     if unsafe { libc::pipe(pipes.as_mut_ptr()) } == -1 {
         return Err(io::Error::last_os_error().into());
@@ -536,6 +587,7 @@ fn run() -> anyhow::Result<i32> {
         .env("FINCH_BRAIN_TEST_ISOLATED", "1")
         .env("FINCH_BRAIN_TEST_TOKEN", &token)
         .env("FINCH_BRAIN_TEST_PROOF_FD", "9")
+        .env("FINCH_BRAIN_TEST_AUTH_FD", "109")
         .env("FINCH_BRAIN_TEST_NO_AUTO_SPAWN", "1")
         .env("FINCH_TEST_BRAIN_ADDR", &brain_address)
         .env("FINCH_TEST_DAEMON_ADDR", &daemon_address)
@@ -564,19 +616,23 @@ fn run() -> anyhow::Result<i32> {
         command.env_remove(name);
     }
     let proof_child = duplicate_above_stdio(proof.as_raw_fd())?;
+    let auth_child = duplicate_above_stdio(auth_child_socket.as_raw_fd())?;
     let brain_child = duplicate_above_stdio(brain_listener.as_raw_fd())?;
     let daemon_child = duplicate_above_stdio(daemon_listener.as_raw_fd())?;
     configure_supervised_child(
         &mut command,
         proof_child.as_raw_fd(),
+        auth_child.as_raw_fd(),
         brain_child.as_raw_fd(),
         daemon_child.as_raw_fd(),
     );
     let mut group = OwnedProcessGroup::new(command.spawn()?);
     let observation = (|| -> anyhow::Result<()> {
         while PENDING_SIGNAL.load(Ordering::Relaxed) == 0 && !leader_exited(&group.child)? {
+            service_proof_authentication(&auth_parent, &verifying_key)?;
             wait_for_event(pipes[0], 25)?;
         }
+        service_proof_authentication(&auth_parent, &verifying_key)?;
         Ok(())
     })();
     let status = match group.finish() {
@@ -614,6 +670,16 @@ fn run() -> anyhow::Result<i32> {
 }
 
 fn main() {
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("--verify-inherited-proof"))
+        && std::env::args_os().nth(2).is_none()
+    {
+        let status = match finch::brain::authenticated_isolated_test_proof_text() {
+            Ok(contents) => io::stdout().write_all(&contents).map(|_| 0).unwrap_or(1),
+            Err(_) => 1,
+        };
+        std::process::exit(status);
+    }
     match run() {
         Ok(status) => std::process::exit(status),
         Err(error) => {

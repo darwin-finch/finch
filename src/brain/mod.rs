@@ -288,7 +288,7 @@ fn restore_supervisor_listener(
 fn process_descends_from(ancestor: u32) -> anyhow::Result<bool> {
     let mut pid = std::process::id();
     let parent = |pid: u32| -> anyhow::Result<u32> {
-        let output = std::process::Command::new("ps")
+        let output = std::process::Command::new("/bin/ps")
             .args(["-o", "ppid=", "-p", &pid.to_string()])
             .output()?;
         anyhow::ensure!(
@@ -307,6 +307,108 @@ fn process_descends_from(ancestor: u32) -> anyhow::Result<bool> {
         pid = parent(pid)?;
     }
     Ok(false)
+}
+
+#[cfg(unix)]
+fn supervisor_verifying_key(expected_pid: u32) -> anyhow::Result<ed25519_dalek::VerifyingKey> {
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::net::UnixDatagram;
+
+    anyhow::ensure!(
+        std::env::var("FINCH_BRAIN_TEST_AUTH_FD").as_deref() == Ok("109"),
+        "live Brain tests require the supervisor authentication descriptor"
+    );
+    let socket_type = unsafe {
+        let mut value: nix::libc::c_int = 0;
+        let mut length = std::mem::size_of_val(&value) as nix::libc::socklen_t;
+        let result = nix::libc::getsockopt(
+            109,
+            nix::libc::SOL_SOCKET,
+            nix::libc::SO_TYPE,
+            (&mut value as *mut nix::libc::c_int).cast(),
+            &mut length,
+        );
+        anyhow::ensure!(
+            result == 0,
+            "supervisor authentication descriptor is unavailable"
+        );
+        value
+    };
+    anyhow::ensure!(
+        socket_type == nix::libc::SOCK_DGRAM,
+        "supervisor authentication descriptor has the wrong type"
+    );
+    #[cfg(target_os = "linux")]
+    let peer_pid = unsafe {
+        let mut credential: nix::libc::ucred = std::mem::zeroed();
+        let mut length = std::mem::size_of_val(&credential) as nix::libc::socklen_t;
+        anyhow::ensure!(
+            nix::libc::getsockopt(
+                109,
+                nix::libc::SOL_SOCKET,
+                nix::libc::SO_PEERCRED,
+                (&mut credential as *mut nix::libc::ucred).cast(),
+                &mut length,
+            ) == 0,
+            "supervisor authentication peer is unavailable"
+        );
+        credential.pid
+    };
+    #[cfg(target_os = "macos")]
+    let peer_pid = unsafe {
+        let mut pid: nix::libc::pid_t = 0;
+        let mut length = std::mem::size_of_val(&pid) as nix::libc::socklen_t;
+        anyhow::ensure!(
+            nix::libc::getsockopt(
+                109,
+                nix::libc::SOL_LOCAL,
+                nix::libc::LOCAL_PEERPID,
+                (&mut pid as *mut nix::libc::pid_t).cast(),
+                &mut length,
+            ) == 0,
+            "supervisor authentication peer is unavailable"
+        );
+        pid
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    anyhow::bail!("supervisor authentication is unsupported on this platform");
+    anyhow::ensure!(
+        peer_pid > 1 && peer_pid as u32 == expected_pid && process_descends_from(expected_pid)?,
+        "proof authentication peer is not the ancestor test supervisor"
+    );
+
+    let duplicate = unsafe { nix::libc::fcntl(109, nix::libc::F_DUPFD_CLOEXEC, 200) };
+    anyhow::ensure!(
+        duplicate >= 0,
+        "could not duplicate proof authentication descriptor"
+    );
+    let socket = unsafe { UnixDatagram::from_raw_fd(duplicate) };
+    let timeout = Some(std::time::Duration::from_secs(2));
+    socket.set_read_timeout(timeout)?;
+    socket.set_write_timeout(timeout)?;
+    socket.send(b"finch-proof-key-v1")?;
+    let mut key = [0_u8; 32];
+    anyhow::ensure!(
+        socket.recv(&mut key)? == key.len(),
+        "supervisor returned an invalid proof-auth response"
+    );
+    Ok(ed25519_dalek::VerifyingKey::from_bytes(&key)?)
+}
+
+#[cfg(unix)]
+fn read_proof_at(proof: &std::fs::File) -> anyhow::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt as _;
+
+    let length: usize = proof.metadata()?.len().try_into()?;
+    anyhow::ensure!(length <= 64 * 1024, "wrapper proof is unexpectedly large");
+    let mut contents = vec![0_u8; length];
+    let mut offset = 0;
+    while offset < contents.len() {
+        let count = proof.read_at(&mut contents[offset..], offset as u64)?;
+        anyhow::ensure!(count != 0, "wrapper proof was truncated while reading");
+        offset += count;
+    }
+    Ok(contents)
 }
 
 fn expected_supervisor_executable() -> anyhow::Result<std::path::PathBuf> {
@@ -350,8 +452,7 @@ fn process_executable(pid: u32) -> anyhow::Result<std::path::PathBuf> {
     )))
 }
 
-#[doc(hidden)]
-pub fn isolated_test_proof() -> anyhow::Result<IsolatedTestProof> {
+fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<u8>)> {
     use anyhow::Context as _;
 
     anyhow::ensure!(
@@ -363,7 +464,7 @@ pub fn isolated_test_proof() -> anyhow::Result<IsolatedTestProof> {
         "live Brain tests require the wrapper proof descriptor"
     );
     #[cfg(unix)]
-    let mut proof = {
+    let proof = {
         use std::os::fd::FromRawFd as _;
         let inherited_flags = unsafe { nix::libc::fcntl(9, nix::libc::F_GETFL) };
         anyhow::ensure!(
@@ -375,7 +476,7 @@ pub fn isolated_test_proof() -> anyhow::Result<IsolatedTestProof> {
         unsafe { std::fs::File::from_raw_fd(duplicate) }
     };
     #[cfg(not(unix))]
-    let mut proof: std::fs::File =
+    let proof: std::fs::File =
         { anyhow::bail!("Brain test supervisor authority is supported only on Unix") };
     #[cfg(unix)]
     {
@@ -389,10 +490,32 @@ pub fn isolated_test_proof() -> anyhow::Result<IsolatedTestProof> {
             "wrapper proof descriptor does not identify the parent-owned sealed file"
         );
     }
-    use std::io::{Read as _, Seek as _};
-    proof.seek(std::io::SeekFrom::Start(0))?;
-    let mut contents = String::new();
-    proof.read_to_string(&mut contents)?;
+    #[cfg(unix)]
+    let encoded = read_proof_at(&proof)?;
+    #[cfg(not(unix))]
+    let encoded: Vec<u8> = unreachable!();
+    let final_newline = encoded
+        .strip_suffix(b"\n")
+        .context("wrapper proof is not newline terminated")?;
+    let signature_start = final_newline
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .context("wrapper proof is missing its signature")?;
+    let signed = &encoded[..signature_start];
+    let signature_hex = std::str::from_utf8(&final_newline[signature_start..])?;
+    let signature_bytes: [u8; 64] = hex::decode(signature_hex)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("wrapper proof has an invalid signature length"))?;
+    let expected_supervisor_pid: u32 = std::env::var("FINCH_TEST_SUPERVISOR_PID")?.parse()?;
+    #[cfg(unix)]
+    {
+        supervisor_verifying_key(expected_supervisor_pid)?.verify_strict(
+            signed,
+            &ed25519_dalek::Signature::from_bytes(&signature_bytes),
+        )?;
+    }
+    let contents = std::str::from_utf8(signed)?;
     let mut lines = contents.lines();
     let token = lines.next().context("wrapper proof is missing its nonce")?;
     let home = std::path::PathBuf::from(
@@ -457,6 +580,7 @@ pub fn isolated_test_proof() -> anyhow::Result<IsolatedTestProof> {
             .ok()
             .and_then(|value| value.parse().ok())
             == Some(supervisor_pid)
+            && expected_supervisor_pid == supervisor_pid
             && process_descends_from(supervisor_pid)?
             && process_executable(supervisor_pid)?.canonicalize()? == supervisor_executable
             && supervisor_executable == expected_supervisor_executable()?,
@@ -554,7 +678,7 @@ pub fn isolated_test_proof() -> anyhow::Result<IsolatedTestProof> {
             .context("wrapper proof has an invalid filesystem identity")?;
         Ok((device.parse()?, inode.parse()?))
     };
-    Ok(IsolatedTestProof {
+    let proof = IsolatedTestProof {
         home,
         root,
         home_identity: parse_identity(home_identity)?,
@@ -566,7 +690,18 @@ pub fn isolated_test_proof() -> anyhow::Result<IsolatedTestProof> {
         socket_root_identity: parse_identity(socket_root_identity)?,
         supervisor_pid,
         password_digest: password_digest.to_owned(),
-    })
+    };
+    Ok((proof, encoded))
+}
+
+#[doc(hidden)]
+pub fn isolated_test_proof() -> anyhow::Result<IsolatedTestProof> {
+    isolated_test_proof_with_encoded().map(|(proof, _)| proof)
+}
+
+#[doc(hidden)]
+pub fn authenticated_isolated_test_proof_text() -> anyhow::Result<Vec<u8>> {
+    isolated_test_proof_with_encoded().map(|(_, encoded)| encoded)
 }
 
 #[doc(hidden)]
@@ -592,6 +727,12 @@ pub(crate) fn supervised_test_subprocess_command() -> std::process::Command {
         "could not duplicate supervisor proof descriptor"
     );
     let proof_fd = unsafe { OwnedFd::from_raw_fd(proof_raw) };
+    let auth_raw = unsafe { nix::libc::fcntl(109, nix::libc::F_DUPFD_CLOEXEC, 200) };
+    assert!(
+        auth_raw >= 0,
+        "could not duplicate supervisor authentication descriptor"
+    );
+    let auth_fd = unsafe { OwnedFd::from_raw_fd(auth_raw) };
     let brain_listener = proof.duplicate_brain_listener().unwrap();
     let daemon_listener = proof.duplicate_daemon_listener().unwrap();
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -599,6 +740,7 @@ pub(crate) fn supervised_test_subprocess_command() -> std::process::Command {
         command.pre_exec(move || {
             for (source, target) in [
                 (proof_fd.as_raw_fd(), 9),
+                (auth_fd.as_raw_fd(), 109),
                 (brain_listener.as_raw_fd(), 10),
                 (daemon_listener.as_raw_fd(), 11),
                 (brain_listener.as_raw_fd(), 110),
@@ -819,6 +961,40 @@ mod isolation_tests {
                 assert!(isolated_test_proof().is_err());
                 return;
             }
+            if mode == "rewrite-restore" {
+                use std::os::fd::FromRawFd as _;
+
+                let duplicate = unsafe { nix::libc::dup(9) };
+                assert!(duplicate >= 0);
+                let reader = unsafe { std::fs::File::from_raw_fd(duplicate) };
+                let original = read_proof_at(&reader).unwrap();
+                let mut forged = original.clone();
+                forged[0] = if forged[0] == b'a' { b'b' } else { b'a' };
+                assert_eq!(unsafe { nix::libc::fchmod(9, 0o600) }, 0);
+                let mut rewrite = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open("/dev/fd/9")
+                    .unwrap();
+                rewrite.write_all(&forged).unwrap();
+                rewrite.sync_all().unwrap();
+                drop(rewrite);
+                assert_eq!(unsafe { nix::libc::fchmod(9, 0o400) }, 0);
+                assert!(isolated_test_proof().is_err());
+
+                assert_eq!(unsafe { nix::libc::fchmod(9, 0o600) }, 0);
+                let mut restore = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open("/dev/fd/9")
+                    .unwrap();
+                restore.write_all(&original).unwrap();
+                restore.sync_all().unwrap();
+                drop(restore);
+                assert_eq!(unsafe { nix::libc::fchmod(9, 0o400) }, 0);
+                isolated_test_proof().unwrap();
+                return;
+            }
             let path = valid.home.join(format!("forged-proof-{mode}"));
             let mut writer = std::fs::OpenOptions::new()
                 .create_new(true)
@@ -889,6 +1065,7 @@ mod isolation_tests {
             "writable",
             "swapped-low-listener",
             "swapped-backup-listener",
+            "rewrite-restore",
         ] {
             let status = supervised_test_subprocess_command()
                 .args([
@@ -900,6 +1077,27 @@ mod isolation_tests {
                 .status()
                 .unwrap();
             assert!(status.success(), "{mode} proof rejection subprocess failed");
+        }
+    }
+
+    #[test]
+    fn isolated_proof_validation_is_offset_independent_under_concurrency() {
+        isolated_test_proof().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let workers = (0..8)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..16 {
+                        isolated_test_proof().unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
         }
     }
 
