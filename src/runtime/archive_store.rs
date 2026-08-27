@@ -344,7 +344,7 @@ mod tests {
         let runtime = ProgramRuntime::new();
         runtime
             .grant_typed_capability(CapabilityRequirement {
-                capability: CapabilityKind::ProcessRun,
+                capability: CapabilityKind::AgentSpawn,
                 selector: ResourceSelector::None,
             })
             .unwrap();
@@ -400,7 +400,7 @@ mod tests {
         runtime
             .issue_typed_capability(
                 CapabilityRequirement {
-                    capability: CapabilityKind::ProcessRun,
+                    capability: CapabilityKind::AgentSpawn,
                     selector: ResourceSelector::None,
                 },
                 GrantScope::Session {
@@ -435,7 +435,7 @@ mod tests {
         runtime
             .issue_typed_capability(
                 CapabilityRequirement {
-                    capability: CapabilityKind::ProcessRun,
+                    capability: CapabilityKind::AgentSpawn,
                     selector: ResourceSelector::None,
                 },
                 GrantScope::Global,
@@ -488,7 +488,7 @@ mod tests {
         let runtime = ProgramRuntime::new();
         runtime
             .grant_typed_capability(CapabilityRequirement {
-                capability: CapabilityKind::ProcessRun,
+                capability: CapabilityKind::AgentSpawn,
                 selector: ResourceSelector::None,
             })
             .unwrap();
