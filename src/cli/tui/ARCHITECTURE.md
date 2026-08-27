@@ -13,8 +13,8 @@ Check: `scrollback.get_message(msg_id).is_none()` before calling.
 
 **Retained transcript accordions** (`accordion.rs`):
 - WorkUnits expose an append-stable semantic row tree (`message id + semantic path`).
-- Native scrollback always receives `complete_transcript()`; disclosure state only
-  changes the reconstructed/live viewport projection.
+- Native scrollback always receives the fully expanded semantic projection;
+  disclosure state only changes later reconstructed/live viewport projections.
 - `F6`/`Shift+F6` moves semantic focus, Left/Right collapses or expands,
   Enter/Space toggles, and Escape returns focus to the draft. Left-click has the
   same toggle behavior when terminal mouse reporting is available.

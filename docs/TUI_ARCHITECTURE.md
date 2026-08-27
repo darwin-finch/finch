@@ -694,9 +694,9 @@ plus an append-only semantic path, so wrapping, streaming appends, reconnect
 projection, and resize cannot renumber an existing row.
 
 Disclosure state belongs to `TuiRenderer`; it is not written into a WorkUnit.
-Permanent terminal scrollback is written once from `Message::complete_transcript`
-and therefore contains the complete copyable record. The visible viewport is a
-projection of that same retained message set and may omit collapsed descendants.
+Permanent terminal scrollback is written once from the fully expanded semantic
+projection and therefore contains the complete copyable record. The visible
+viewport is a projection of that same retained message set and may omit collapsed descendants.
 Expanding a row reconstructs the viewport without rewriting or clearing native
 scrollback above it.
 
