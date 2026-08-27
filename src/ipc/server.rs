@@ -118,6 +118,7 @@ struct BrainEffectReservationImpl {
 struct BrainHostEffectPermitImpl {
     authority: BrainEffectAuditRpcAuthority,
     permit: std::sync::Arc<crate::runtime::effect_log::HostEffectPermit>,
+    finished: Option<crate::runtime::effect_log::EffectAuditTerminalOutcome>,
 }
 
 fn require_approval_connection(
@@ -493,6 +494,11 @@ impl finch_ipc_capnp::brain_effect_reservation::Server for BrainEffectReservatio
         _params: finch_ipc_capnp::brain_effect_reservation::BeginParams,
         mut results: finch_ipc_capnp::brain_effect_reservation::BeginResults,
     ) -> Promise<(), capnp::Error> {
+        if self.begun {
+            return Promise::err(capnp::Error::failed(
+                "effect audit reservation was already begun".into(),
+            ));
+        }
         if let Err(error) = self.authority.validate_new_work() {
             return Promise::err(capnp::Error::failed(error.to_string()));
         }
@@ -505,6 +511,7 @@ impl finch_ipc_capnp::brain_effect_reservation::Server for BrainEffectReservatio
                     capnp_rpc::new_client(BrainHostEffectPermitImpl {
                         authority: self.authority.clone(),
                         permit: std::sync::Arc::new(permit),
+                        finished: None,
                     });
                 results.get().set_permit(permit);
                 Promise::ok(())
@@ -585,10 +592,21 @@ impl finch_ipc_capnp::brain_host_effect_permit::Server for BrainHostEffectPermit
             }
             Err(error) => return Promise::err(error.into()),
         };
+        if let Some(existing) = &self.finished {
+            if existing == &outcome {
+                return Promise::ok(());
+            }
+            return Promise::err(capnp::Error::failed(
+                "host effect permit already finished with a different outcome".into(),
+            ));
+        }
         match self.authority.store.finish_effect_audit(
-            &self.authority.grant, Some(&self.permit), self.permit.identity(), outcome,
+            &self.authority.grant, Some(&self.permit), self.permit.identity(), outcome.clone(),
         ) {
-            Ok(()) => Promise::ok(()),
+            Ok(()) => {
+                self.finished = Some(outcome);
+                Promise::ok(())
+            }
             Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
         }
     }
@@ -2393,6 +2411,9 @@ mod tests {
                 .get().unwrap().get_reservation().unwrap();
             let permit = reservation.begin_request().send().promise.await.unwrap()
                 .get().unwrap().get_permit().unwrap();
+            let repeated_begin = reservation.begin_request().send().promise.await.err()
+                .expect("a raw capability replay must not mint a second permit");
+            assert!(repeated_begin.to_string().contains("already begun"));
             assert!(matches!(
                 store.snapshot("shared").unwrap().effect_audits[0].state,
                 crate::runtime::effect_log::EffectAuditState::AwaitingHostResult
@@ -2424,6 +2445,14 @@ mod tests {
             let mut finish = permit.finish_request();
             finish.get().init_outcome().init_acknowledged(0);
             finish.send().promise.await.unwrap();
+            let mut exact_retry = permit.finish_request();
+            exact_retry.get().init_outcome().init_acknowledged(0);
+            exact_retry.send().promise.await.unwrap();
+            let mut conflicting_retry = permit.finish_request();
+            conflicting_retry.get().init_outcome().set_failed_partial("changed");
+            let conflicting_error = conflicting_retry.send().promise.await.err()
+                .expect("a raw permit replay cannot change its terminal outcome");
+            assert!(conflicting_error.to_string().contains("different outcome"));
 
             let snapshot = store.snapshot("shared").unwrap();
             assert!(matches!(snapshot.effect_audits[0].state,

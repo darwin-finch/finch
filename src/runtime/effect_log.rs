@@ -164,6 +164,16 @@ impl EffectAuditReducer {
             .count()
     }
 
+    /// Forget a terminal projection after its complete transition history has
+    /// been durably removed from the canonical Brain journal. Unresolved
+    /// write-ahead state is never eligible for retention compaction.
+    pub(crate) fn remove_terminal(&mut self, identity: &EffectAuditIdentity) -> Result<()> {
+        let entry = self.entries.get(identity).context("effect audit does not exist")?;
+        anyhow::ensure!(entry.state.is_terminal(), "unresolved effect audit cannot be compacted");
+        self.entries.remove(identity);
+        Ok(())
+    }
+
     /// Validate and apply one monotonic transition. Returns false for an
     /// exact retry and true only when the state changed.
     pub fn apply(&mut self, transition: EffectAuditTransition) -> Result<bool> {

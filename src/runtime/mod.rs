@@ -446,6 +446,7 @@ struct PendingTypedExecution {
     output_chunks: Vec<String>,
     side_effects: Vec<crate::vm::interpreter::HostSideEffect>,
     effect_sink: Option<TypedEffectSink>,
+    effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     deferred_host_effects: DeferredHostEffects,
     /// An execution-specific authority ceiling, used by durable scheduled
     /// callbacks. Ordinary interactive runs intentionally pick up newly
@@ -2757,6 +2758,7 @@ impl ProgramRuntime {
             submission,
             None,
             None,
+            None,
             DeferredHostEffects::None,
             None,
         )
@@ -2777,6 +2779,7 @@ impl ProgramRuntime {
             None,
             DeferredHostEffects::None,
             Some(grant_ceiling),
+            None,
         )
         .await
     }
@@ -2790,6 +2793,7 @@ impl ProgramRuntime {
         submission: ProgramSubmission,
         effect_sink: TypedEffectSink,
         grant_ceiling: Option<EffectSet>,
+        effect_audit: crate::server::RunnerEffectAuditControl,
     ) -> Result<ExecutionOutcome> {
         self.submit_as_with_optional_typed_effect_sink(
             submission,
@@ -2797,6 +2801,7 @@ impl ProgramRuntime {
             Some(effect_sink),
             DeferredHostEffects::Schedules,
             grant_ceiling,
+            Some(effect_audit),
         )
         .await
     }
@@ -2813,7 +2818,9 @@ impl ProgramRuntime {
             submission,
             caller,
             None,
+            None,
             DeferredHostEffects::None,
+            None,
             None,
         )
         .await
@@ -2832,6 +2839,7 @@ impl ProgramRuntime {
             caller,
             Some(effect_sink),
             DeferredHostEffects::None,
+            None,
             None,
         )
         .await
@@ -2861,6 +2869,7 @@ impl ProgramRuntime {
     ) -> Result<ExecutionOutcome> {
         self.submit_as_with_optional_typed_effect_sink(
             submission,
+            None,
             None,
             Some(effect_sink),
             DeferredHostEffects::ProgramInvocations,
@@ -2916,6 +2925,7 @@ impl ProgramRuntime {
         effect_sink: Option<TypedEffectSink>,
         deferred_host_effects: DeferredHostEffects,
         grant_ceiling: Option<EffectSet>,
+        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     ) -> Result<ExecutionOutcome> {
         // This is a per-session state transaction, not a process-wide
         // interpreter lock. Independent runtimes and child model loops remain
@@ -2978,6 +2988,7 @@ impl ProgramRuntime {
                 caller.clone(),
                 effect_sink.clone(),
                 deferred_host_effects,
+                effect_audit.clone(),
             )
             .await?;
         let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -3000,6 +3011,7 @@ impl ProgramRuntime {
                     side_effects: execution.side_effects.clone(),
                     effect_sink,
                     deferred_host_effects,
+                    effect_audit,
                     grant_ceiling: grant_ceiling.clone(),
                 },
             )? {

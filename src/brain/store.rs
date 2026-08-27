@@ -16,6 +16,10 @@ use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const BRAIN_EVENT_SCHEMA_VERSION: u32 = 15;
+/// Completed audit histories retained per named Brain. Together with the
+/// bounded intent/outcome encodings this caps the audit projection and its
+/// share of `events.jsonl`; unresolved write-ahead entries are never pruned.
+const MAX_RETAINED_TERMINAL_EFFECT_AUDITS: usize = 128;
 const BRAIN_METADATA_VERSION: u32 = 1;
 const BRAIN_INITIALIZATION_VERSION: u32 = 1;
 const DEFAULT_INITIALIZATION_MODULE: &str = "finch.brain.initialization";
@@ -1588,6 +1592,10 @@ impl BrainStore {
         self.validate_effect_grant_for_new_work(state, grant)?;
         anyhow::ensure!(identity.brain_id == state.brain_id.0 && identity.run_id == grant.run_id.0,
             "effect audit identity does not belong to this authority");
+        anyhow::ensure!(state.effect_audits.get(&identity).is_some_and(|entry|
+                matches!(entry.state,
+                    crate::runtime::effect_log::EffectAuditState::IntentAccepted)),
+            "effect audit reservation was already begun or terminalized");
         self.append_effect_audit_transition_locked(
             name, state, crate::runtime::effect_log::EffectAuditTransition::Begin {
                 identity, authority_id: grant.authority.authority_id,
@@ -1654,7 +1662,12 @@ impl BrainStore {
         transition: crate::runtime::effect_log::EffectAuditTransition,
     ) -> Result<bool> {
         let mut projected = state.effect_audits.clone();
-        if !projected.apply(transition.clone())? { return Ok(false); }
+        if !projected.apply(transition.clone())? {
+            self.compact_terminal_effect_audits_locked(
+                name, state, MAX_RETAINED_TERMINAL_EFFECT_AUDITS,
+            )?;
+            return Ok(false);
+        }
         let event = BrainEvent {
             schema_version: BRAIN_EVENT_SCHEMA_VERSION, brain_id: state.brain_id,
             seq: state.events.last().map(|event| event.seq + 1).unwrap_or(1),
@@ -1665,8 +1678,49 @@ impl BrainStore {
         };
         self.append_event(name, &event)?;
         state.apply(event.clone());
+        self.compact_terminal_effect_audits_locked(
+            name, state, MAX_RETAINED_TERMINAL_EFFECT_AUDITS,
+        )?;
         let _ = state.tx.send(event);
         Ok(true)
+    }
+
+    fn compact_terminal_effect_audits_locked(
+        &self, name: &str, state: &mut BrainState, retained_limit: usize,
+    ) -> Result<()> {
+        let mut terminal_order = state.events.iter().filter_map(|event| {
+            let BrainEventKind::EffectAuditTransition {
+                transition: crate::runtime::effect_log::EffectAuditTransition::Finish {
+                    identity, ..
+                },
+            } = &event.kind else {
+                return None;
+            };
+            state.effect_audits.get(identity)
+                .is_some_and(|entry| entry.state.is_terminal())
+                .then_some((event.seq, *identity))
+        }).collect::<Vec<_>>();
+        terminal_order.sort_by_key(|(seq, identity)| (*seq, *identity));
+        terminal_order.dedup_by_key(|(_, identity)| *identity);
+        let remove_count = terminal_order.len().saturating_sub(retained_limit);
+        if remove_count == 0 {
+            return Ok(());
+        }
+        let removed = terminal_order.into_iter().take(remove_count)
+            .map(|(_, identity)| identity).collect::<HashSet<_>>();
+        let retained_events = state.events.iter().filter(|event| {
+            let BrainEventKind::EffectAuditTransition { transition } = &event.kind else {
+                return true;
+            };
+            !removed.contains(&transition.identity())
+        }).cloned().collect::<Vec<_>>();
+
+        self.rewrite_events(name, &retained_events)?;
+        for identity in &removed {
+            state.effect_audits.remove_terminal(identity)?;
+        }
+        state.events = retained_events;
+        Ok(())
     }
 
     /// Return the persisted initialization contract without executing it or
@@ -4636,6 +4690,9 @@ impl BrainStore {
             self.append_event(name, &event)?;
             state.apply(event);
         }
+        self.compact_terminal_effect_audits_locked(
+            name, &mut state, MAX_RETAINED_TERMINAL_EFFECT_AUDITS,
+        )?;
         // Queued work has not executed and may be safely offered to the next
         // valid runner lease. A run that was already executing or suspended
         // for approval has unknown external progress after daemon restart and
@@ -5157,6 +5214,34 @@ impl BrainStore {
                 events: events.to_vec(),
             },
         )
+    }
+
+    /// Atomically replace the canonical journal with an equivalent sequence
+    /// of individual events. This is used only for bounded audit-history
+    /// compaction; mutation receipts and every non-audit event are preserved.
+    fn rewrite_events(&self, name: &str, events: &[BrainEvent]) -> Result<()> {
+        let Some(path) = self.event_path(name) else {
+            return Ok(());
+        };
+        let directory = path.parent().context("Brain event log has no parent")?;
+        create_dir_all_durable(directory)?;
+        let temporary = directory.join(format!(".events.{}.tmp", uuid::Uuid::new_v4()));
+        let rewrite = (|| -> Result<()> {
+            let mut file = OpenOptions::new().create_new(true).write(true).open(&temporary)
+                .with_context(|| format!("create {}", temporary.display()))?;
+            for event in events {
+                serde_json::to_writer(&mut file, event)?;
+                file.write_all(b"\n")?;
+            }
+            file.sync_all().with_context(|| format!("sync {}", temporary.display()))?;
+            std::fs::rename(&temporary, &path)
+                .with_context(|| format!("replace {}", path.display()))?;
+            sync_directory(directory)
+        })();
+        if rewrite.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        rewrite
     }
 
     #[cfg(test)]
@@ -9668,6 +9753,55 @@ mod tests {
             }));
         assert!(!snapshot.events.iter().any(|event|
             matches!(event.kind, BrainEventKind::ToolResult { .. })));
+    }
+
+    #[test]
+    fn effect_audit_begin_is_linear_and_never_reissues_a_physical_permit() {
+        let store = BrainStore::with_root("box.local", None);
+        let (_run, _lease, grant) = audit_run_fixture(&store);
+        let identity = store.reserve_effect_audit(
+            &grant, uuid::Uuid::new_v4(), audit_effect(0, "once"),
+        ).unwrap();
+        let _permit = store.begin_effect_audit(&grant, identity).unwrap();
+        assert!(store.begin_effect_audit(&grant, identity).unwrap_err().to_string()
+            .contains("already begun"));
+    }
+
+    #[test]
+    fn effect_audit_compaction_bounds_terminal_history_but_never_unresolved_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let (_run, _lease, grant) = audit_run_fixture(&store);
+        for sequence in 0..3 {
+            let identity = store.reserve_effect_audit(
+                &grant, uuid::Uuid::new_v4(), audit_effect(sequence, "terminal"),
+            ).unwrap();
+            let permit = store.begin_effect_audit(&grant, identity).unwrap();
+            store.finish_effect_audit(
+                &grant, Some(&permit), identity,
+                crate::runtime::effect_log::EffectAuditTerminalOutcome::Acknowledged {
+                    response: crate::runtime::VmResumeResponse::Result { values: Vec::new() },
+                },
+            ).unwrap();
+        }
+        let unresolved = store.reserve_effect_audit(
+            &grant, uuid::Uuid::new_v4(), audit_effect(3, "unresolved"),
+        ).unwrap();
+        {
+            let mut brains = store.brains.write().unwrap();
+            let state = brains.get_mut("shared").unwrap();
+            store.compact_terminal_effect_audits_locked("shared", state, 1).unwrap();
+        }
+        let snapshot = store.snapshot("shared").unwrap();
+        assert_eq!(snapshot.effect_audits.iter().filter(|entry| entry.state.is_terminal()).count(), 1);
+        assert!(snapshot.effect_audits.iter().any(|entry|
+            entry.intent.identity == unresolved && !entry.state.is_terminal()));
+        drop(store);
+
+        let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let snapshot = restarted.snapshot("shared").unwrap();
+        assert_eq!(snapshot.effect_audits.iter().filter(|entry| entry.state.is_terminal()).count(), 2,
+            "restart reconciles the unresolved reservation without restoring compacted history");
     }
 
     #[test]
