@@ -459,7 +459,7 @@ fn spawn_canonical_stream_parser(
     let (tx, rx) = mpsc::channel(100);
     tokio::spawn(async move {
         let mut stream = response.bytes_stream();
-        let mut buffer = Vec::new();
+        let mut buffer: Vec<u8> = Vec::new();
         let mut total = 0usize;
         let mut state = CanonicalStreamState::default();
         loop {
