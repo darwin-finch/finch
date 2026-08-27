@@ -661,16 +661,22 @@ impl brain_service::Server for BrainRpcService {
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
         let lifecycle = self.lifecycle.clone();
+        // Admission above is still owned by the authenticated RPC request.
+        // Once admitted, the exact lifecycle submission is daemon-owned so a
+        // dropped Cap'n Proto response future cannot abandon a durable run
+        // before its terminal publication.
+        let submission = tokio::task::spawn_local(async move {
+            lifecycle
+                .submit(&brain, attachment_id, connection_id, kind)
+                .await
+        });
         Promise::from_future(async move {
-            let outcome = lifecycle
-                .submit(
-                &brain,
-                attachment_id,
-                connection_id,
-                kind,
-            )
-            .await
-            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            let outcome = submission
+                .await
+                .map_err(|error| {
+                    capnp::Error::failed(format!("daemon Brain submission task failed: {error}"))
+                })?
+                .map_err(|error| capnp::Error::failed(error.to_string()))?;
             encode_brain_submission_outcome(
                 results.get().init_outcome(),
                 &outcome.accepted,
@@ -1792,7 +1798,11 @@ async fn forward_runner_request(
                             decode_runner_turn_result(reply.get().and_then(|r| r.get_result())),
                             false,
                         ),
-                        Err(error) => (Err(error.to_string().into()), true),
+                        // A transport failure is not a runner-authored turn
+                        // failure. Drop the response sender so the broker's
+                        // exact registration disconnect path remains distinct
+                        // from RunnerTurnError persistence.
+                        Err(_) => return true,
                     },
                     Err(error) => (Err(error.into()), false),
                 }
@@ -2761,7 +2771,10 @@ pub async fn start_ipc_server(
     Ok(())
 }
 
-async fn handle_connection(stream: tokio::net::UnixStream, server: Arc<AgentServer>) -> Result<()> {
+pub(crate) async fn handle_connection(
+    stream: tokio::net::UnixStream,
+    server: Arc<AgentServer>,
+) -> Result<()> {
     let (reader, writer) = stream.into_split();
 
     let network = twoparty::VatNetwork::new(

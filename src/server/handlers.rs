@@ -1348,6 +1348,13 @@ async fn dispatch_named_brain_run(
     if published.status == BrainRunStatus::Cancelled {
         return Ok(None);
     }
+    if published.status == BrainRunStatus::Failed {
+        if let Err(error) = &execution {
+            if provider_task_terminated_unexpectedly(error) {
+                return Err(anyhow::anyhow!(error.to_string()));
+            }
+        }
+    }
     if execution.is_err() && published.status == BrainRunStatus::Failed {
         return Ok(store
             .snapshot(name)?
@@ -1887,6 +1894,27 @@ async fn dispatch_named_brain_program(
     Ok(result)
 }
 
+fn runner_callback_disconnected(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<crate::server::brain_runner::RunnerDispatchLifecycleError>(),
+        Some(
+            crate::server::brain_runner::RunnerDispatchLifecycleError::CallbackDisconnected {
+                ..
+            } | crate::server::brain_runner::RunnerDispatchLifecycleError::ResponseDropped {
+                ..
+            }
+        )
+    )
+}
+
+fn provider_task_terminated_unexpectedly(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .starts_with("provider task terminated unexpectedly:")
+    })
+}
+
 async fn dispatch_named_brain_turn(
     store: &crate::brain::store::BrainStore,
     runners: &crate::server::BrainRunnerBroker,
@@ -1947,30 +1975,32 @@ async fn dispatch_named_brain_turn(
                     drop(publication);
                     anyhow::bail!("named Brain run cancelled");
                 }
-                persist_named_brain_turn_events(
-                    store,
-                    name,
-                    Some(run_id),
-                    request_seq,
-                    &lease.subject,
-                    &approval_audience,
-                    failure.turn_events.clone(),
-                )?;
-                persist_named_brain_effect_journal(
-                    store,
-                    name,
-                    Some(run_id),
-                    request_seq,
-                    &lease.subject,
-                    &failure.effect_journal,
-                )?;
-                push_named_brain_run_result(
-                    store,
-                    name,
-                    run_id,
-                    request_seq,
-                    Err(anyhow::anyhow!(error.to_string())),
-                )?;
+                if !provider_task_terminated_unexpectedly(&error) {
+                    persist_named_brain_turn_events(
+                        store,
+                        name,
+                        Some(run_id),
+                        request_seq,
+                        &lease.subject,
+                        &approval_audience,
+                        failure.turn_events.clone(),
+                    )?;
+                    persist_named_brain_effect_journal(
+                        store,
+                        name,
+                        Some(run_id),
+                        request_seq,
+                        &lease.subject,
+                        &failure.effect_journal,
+                    )?;
+                    push_named_brain_run_result(
+                        store,
+                        name,
+                        run_id,
+                        request_seq,
+                        Err(anyhow::anyhow!(error.to_string())),
+                    )?;
+                }
                 store.transition_run(
                     name,
                     "daemon",
@@ -1978,6 +2008,30 @@ async fn dispatch_named_brain_turn(
                     crate::brain::store::BrainRunStatus::Failed,
                     Some(error.to_string()),
                 )?;
+                drop(publication);
+                store.prune_run_publication(name, run_id)?;
+            } else if runner_callback_disconnected(&error) {
+                // The physical callback disappeared after the daemon had
+                // already started this run. Serialize with success/failure
+                // publication so a late provider response cannot overwrite a
+                // terminal disconnect, while preserving any terminal outcome
+                // that won before the transport closed.
+                let publication = store.acquire_run_publication(name, run_id).await?;
+                let status = store
+                    .snapshot(name)?
+                    .runs
+                    .into_iter()
+                    .find(|run| run.run_id == run_id)
+                    .map(|run| run.status);
+                if status.is_some_and(|status| !status.is_terminal()) {
+                    store.transition_run(
+                        name,
+                        "daemon",
+                        run_id,
+                        crate::brain::store::BrainRunStatus::Cancelled,
+                        Some(error.to_string()),
+                    )?;
+                }
                 drop(publication);
                 store.prune_run_publication(name, run_id)?;
             }
@@ -7008,6 +7062,94 @@ mod handler_tests {
                             && state == &expected_effect.entry.state
                 )
             }));
+    }
+
+    #[tokio::test]
+    async fn dropped_named_turn_callback_terminalizes_the_exact_run_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local",
+            Some(temp.path().into()),
+        );
+        let prompt_seq = store
+            .push(
+                "shared",
+                "driver@box.local",
+                BrainEventKind::Prompt {
+                    text: "disconnect this turn".into(),
+                },
+            )
+            .unwrap()
+            .seq;
+        let requester = driver_attachment("driver@box.local");
+        let run = store
+            .start_run(
+                "shared",
+                &requester.subject,
+                crate::brain::store::BrainRunKind::Interactive,
+                prompt_seq,
+                requester.attachment_id,
+                crate::brain::store::BrainRunStatus::Running,
+            )
+            .unwrap();
+        let lease = store
+            .acquire_runner_lease(
+                "shared",
+                "runner@box.local",
+                store.environment().generation,
+                None,
+                60_000,
+            )
+            .unwrap();
+        let runners = crate::server::BrainRunnerBroker::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runners.register("shared", lease.lease_id, tx);
+        tokio::spawn(async move {
+            let crate::server::RunnerRequest::Turn(request) = rx.recv().await.unwrap() else {
+                panic!("expected full turn request")
+            };
+            drop(request.response_tx);
+        });
+
+        let error = dispatch_named_brain_turn(
+            &store,
+            &runners,
+            "shared",
+            run.run_id,
+            prompt_seq,
+            "disconnect this turn",
+            &requester,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("dropped its response"));
+        let snapshot = store.snapshot("shared").unwrap();
+        assert_eq!(snapshot.runs.len(), 1);
+        assert_eq!(
+            snapshot.runs[0].status,
+            crate::brain::store::BrainRunStatus::Cancelled
+        );
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    BrainEventKind::RunStatusChanged {
+                        run_id,
+                        status: crate::brain::store::BrainRunStatus::Cancelled,
+                        ..
+                    } if *run_id == run.run_id
+                ))
+                .count(),
+            1
+        );
+        assert!(snapshot.events.iter().all(|event| !matches!(
+            &event.kind,
+            BrainEventKind::Result { .. }
+                | BrainEventKind::RuntimeCommitted { .. }
+                | BrainEventKind::EffectRecorded { .. }
+        )));
     }
 
     #[tokio::test]

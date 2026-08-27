@@ -27,6 +27,7 @@ pub enum ToolRoundError {
     UnknownTool(String),
     DuplicateResult(String),
     MissingResults(Vec<String>),
+    ContinuationUnavailable,
 }
 
 impl std::fmt::Display for ToolRoundError {
@@ -41,6 +42,7 @@ impl std::fmt::Display for ToolRoundError {
             Self::MissingResults(ids) => {
                 write!(formatter, "missing tool results: {}", ids.join(", "))
             }
+            Self::ContinuationUnavailable => write!(formatter, "LLM continuation is unavailable"),
         }
     }
 }
@@ -248,6 +250,16 @@ impl ConversationHistory {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn staged_round_debug(
+        &self,
+        query_id: Uuid,
+    ) -> Option<(ToolRoundToken, usize, usize)> {
+        self.staged_tool_rounds
+            .get(&query_id)
+            .map(|round| (round.token, round.expected_ids.len(), round.results.len()))
+    }
+
     pub fn completed_tool_results(
         &self,
         query_id: Uuid,
@@ -314,6 +326,54 @@ impl ConversationHistory {
         self.staged_tool_rounds
             .remove(&query_id)
             .map(|stage| (stage.token, stage.expected_ids))
+    }
+
+    /// Roll back the immediately preceding atomic commit when continuation
+    /// spawning failed after admission. The round becomes staged again.
+    pub fn rollback_last_tool_round(
+        &mut self,
+        query_id: Uuid,
+        token: ToolRoundToken,
+    ) -> std::result::Result<(), ToolRoundError> {
+        let results_message = self.messages.pop().ok_or(ToolRoundError::NoActiveStage)?;
+        let assistant = self.messages.pop().ok_or(ToolRoundError::NoActiveStage)?;
+        let expected_ids = assistant
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let results = results_message
+            .content
+            .into_iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => Some((
+                    tool_use_id.clone(),
+                    ToolRoundResult {
+                        tool_id: tool_use_id,
+                        content,
+                        is_error: is_error.unwrap_or(false),
+                    },
+                )),
+                _ => None,
+            })
+            .collect();
+        self.staged_tool_rounds.insert(
+            query_id,
+            StagedToolRound {
+                token,
+                assistant,
+                expected_ids,
+                results,
+            },
+        );
+        Ok(())
     }
 
     /// Get all messages for API request
@@ -967,5 +1027,36 @@ mod tests {
         assert_eq!(messages[0].text_content(), "Test message");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].text_content(), "Test response");
+    }
+
+    #[test]
+    fn persistence_exposes_committed_tool_rounds_but_never_staged_rounds() {
+        let query_id = Uuid::new_v4();
+        let mut staged = ConversationHistory::new();
+        staged.add_user_message("inspect".into());
+        let token = staged
+            .stage_assistant(query_id, tool_assistant(&["A"]))
+            .unwrap();
+        staged
+            .record_tool_result(query_id, token, "A", &Ok("value".into()))
+            .unwrap();
+        let staged_file = tempfile::NamedTempFile::new().unwrap();
+        staged.save(staged_file.path()).unwrap();
+        let loaded_staged = ConversationHistory::load(staged_file.path()).unwrap();
+        assert_eq!(loaded_staged.message_count(), 1);
+
+        staged.commit_tool_round(query_id, token).unwrap();
+        let committed_file = tempfile::NamedTempFile::new().unwrap();
+        staged.save(committed_file.path()).unwrap();
+        let loaded_committed = ConversationHistory::load(committed_file.path()).unwrap();
+        assert_eq!(loaded_committed.message_count(), 3);
+        assert!(matches!(
+            loaded_committed.get_messages()[1].content[0],
+            ContentBlock::ToolUse { .. }
+        ));
+        assert!(matches!(
+            loaded_committed.get_messages()[2].content[0],
+            ContentBlock::ToolResult { .. }
+        ));
     }
 }

@@ -72,6 +72,7 @@ async fn execute_direct_wire_response(
     event_tx: mpsc::UnboundedSender<ReplEvent>,
     cancel: tokio_util::sync::CancellationToken,
     source: String,
+    query_id: Option<Uuid>,
 ) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
     let submission = direct_wire_submission(runtime, source)?;
     let projection = VmOutputProjection::new(output_manager, work_unit);
@@ -81,6 +82,7 @@ async fn execute_direct_wire_response(
         // the event-loop task so shadow-buffer mutations and rendering remain
         // serialized with all other client events.
         let _ = effect_event_tx.send(ReplEvent::VmEffect {
+            query_id,
             projection: projection.clone(),
             envelope,
         });
@@ -89,7 +91,9 @@ async fn execute_direct_wire_response(
         .submit_with_deferred_program_effects(submission, sink)
         .await?;
     let execution_id = outcome.execution_id;
-    let mut resumed = Box::pin(resume_interactive_boundaries(runtime, event_tx, outcome));
+    let mut resumed = Box::pin(resume_interactive_boundaries(
+        runtime, event_tx, outcome, query_id,
+    ));
     tokio::select! {
         biased;
         result = &mut resumed => result,
@@ -112,6 +116,7 @@ pub(super) async fn resume_interactive_boundaries(
     runtime: &crate::runtime::ProgramRuntime,
     event_tx: mpsc::UnboundedSender<ReplEvent>,
     mut outcome: crate::runtime::outcome::ExecutionOutcome,
+    query_id: Option<Uuid>,
 ) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
     loop {
         outcome = resume_interactive_yields(runtime, outcome).await?;
@@ -121,7 +126,7 @@ pub(super) async fn resume_interactive_boundaries(
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         event_tx
             .send(ReplEvent::VmApprovalNeeded {
-                query_id: None,
+                query_id,
                 prompt: prompt.clone(),
                 response_tx,
             })
@@ -296,6 +301,7 @@ async fn execute_wire_with_single_repair(
     messages: &[crate::claude::Message],
     source: String,
     metrics_logger: Option<&crate::metrics::MetricsLogger>,
+    query_id: Option<Uuid>,
 ) -> WireExecution {
     let mut metric = crate::metrics::WireAdherenceMetric::first_pass(
         generator.name(),
@@ -319,8 +325,17 @@ async fn execute_wire_with_single_repair(
         event_tx.clone(),
         cancel.clone(),
         source.clone(),
+        query_id,
     )
     .await;
+    if cancel.is_cancelled() {
+        return WireExecution {
+            source_for_history: source,
+            response: String::new(),
+            effect_journal: Vec::new(),
+            output_unit,
+        };
+    }
 
     let mut effect_journal = Vec::new();
     let (diagnostic, repairable) = match initial {
@@ -331,9 +346,6 @@ async fn execute_wire_with_single_repair(
                 metric.terminal_failure = true;
             }
             record_wire_metric(metrics_logger, &metric);
-            let _ = event_tx.send(ReplEvent::VmOutputComplete {
-                output_unit: Arc::clone(&output_unit),
-            });
             let effect_journal = runner_effect_records(&outcome);
             return WireExecution {
                 source_for_history: source,
@@ -365,9 +377,6 @@ async fn execute_wire_with_single_repair(
     if !repairable {
         metric.terminal_failure = true;
         record_wire_metric(metrics_logger, &metric);
-        let _ = event_tx.send(ReplEvent::VmOutputComplete {
-            output_unit: Arc::clone(&output_unit),
-        });
         return WireExecution {
             source_for_history: source,
             response: diagnostic,
@@ -385,7 +394,18 @@ async fn execute_wire_with_single_repair(
         "requesting one corrected ProgramSubmission from the provider…".to_string(),
     ));
     let repair_messages = wire_repair_messages(messages, &source, &diagnostic);
-    let repair = generator.generate(repair_messages, None).await;
+    let repair = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            return WireExecution {
+                source_for_history: source,
+                response: String::new(),
+                effect_journal: Vec::new(),
+                output_unit,
+            };
+        }
+        repair = generator.generate(repair_messages, None) => repair,
+    };
     output_unit.set_transient_status(None);
     let Ok(repair) = repair else {
         metric.terminal_failure = true;
@@ -436,6 +456,7 @@ async fn execute_wire_with_single_repair(
         event_tx.clone(),
         cancel,
         repaired_source.clone(),
+        query_id,
     )
     .await
     {
@@ -444,13 +465,9 @@ async fn execute_wire_with_single_repair(
             metric.repaired_successfully = !outcome.output.is_empty();
             metric.terminal_failure = outcome.output.is_empty();
             if outcome.output.is_empty() {
-                metric.failure_class =
-                    Some(crate::metrics::WireFailureClass::MissingOutputEffect);
+                metric.failure_class = Some(crate::metrics::WireFailureClass::MissingOutputEffect);
             }
             record_wire_metric(metrics_logger, &metric);
-            let _ = event_tx.send(ReplEvent::VmOutputComplete {
-                output_unit: Arc::clone(&repair_output_unit),
-            });
             WireExecution {
                 source_for_history: repaired_source,
                 response: outcome.output,
@@ -466,9 +483,6 @@ async fn execute_wire_with_single_repair(
                 .cloned()
                 .unwrap_or_else(|| format!("VM program ended as {:?}", outcome.status));
             repair_output_unit.append_response(&format!("VM wire error: {detail}"));
-            let _ = event_tx.send(ReplEvent::VmOutputComplete {
-                output_unit: Arc::clone(&repair_output_unit),
-            });
             metric.terminal_failure = true;
             record_wire_metric(metrics_logger, &metric);
             WireExecution {
@@ -481,9 +495,6 @@ async fn execute_wire_with_single_repair(
         Err(error) => {
             let detail = format!("VM wire error: {error}");
             repair_output_unit.append_response(&detail);
-            let _ = event_tx.send(ReplEvent::VmOutputComplete {
-                output_unit: Arc::clone(&repair_output_unit),
-            });
             metric.terminal_failure = true;
             record_wire_metric(metrics_logger, &metric);
             WireExecution {
@@ -646,14 +657,7 @@ async fn persist_completed_turn_memory(
         crate::cli::status_bar::StatusLineType::MemoryContext,
         format!("🧠 recalled {memory_recall_count}"),
     );
-    refresh_context_strip(
-        memory_system,
-        session_label,
-        cwd,
-        status_bar,
-        context_lines,
-    )
-    .await;
+    refresh_context_strip(memory_system, session_label, cwd, status_bar, context_lines).await;
 }
 
 /// Dispatch a batch of tool uses for one query turn.
@@ -684,6 +688,7 @@ pub(super) async fn dispatch_tool_uses(
     output_manager: &Arc<crate::cli::output_manager::OutputManager>,
     query_states: &Arc<super::query_state::QueryStateManager>,
     tool_coordinator: &super::tool_execution::ToolExecutionCoordinator,
+    _round_dispatch: super::tool_execution::ToolRoundPermit,
     memory_system: &Option<Arc<crate::memory::MemorySystem>>,
     memory_recall_count: usize,
     session_label: &str,
@@ -695,14 +700,24 @@ pub(super) async fn dispatch_tool_uses(
         handle_ask_user_question, handle_present_plan, is_tool_allowed_in_mode,
     };
     use super::tool_display::format_tool_label;
-    use tokio_util::sync::CancellationToken;
 
+    let cancellation_token = query_states
+        .get_metadata(query_id)
+        .await
+        .map(|metadata| metadata.cancellation_token)
+        .unwrap_or_default();
+    if cancellation_token.is_cancelled() {
+        return;
+    }
     let _ = event_tx.send(ReplEvent::ToolCallsStarted {
         query_id,
         tool_uses: tool_uses.clone(),
     });
     let current_mode = mode.read().await;
     for tool_use in tool_uses {
+        if cancellation_token.is_cancelled() {
+            break;
+        }
         // Loop detection: a second identical (tool, input) call for this query means
         // the model is stuck; return a terminal error so it breaks out.
         //
@@ -779,15 +794,14 @@ pub(super) async fn dispatch_tool_uses(
         if let Some(result) = handle_ask_user_question(
             &tool_use,
             Arc::clone(tui_renderer),
-            query_states
-                .get_metadata(query_id)
-                .await
-                .map(|m| m.cancellation_token)
-                .unwrap_or_else(CancellationToken::new),
+            cancellation_token.clone(),
             event_tx,
         )
         .await
         {
+            if cancellation_token.is_cancelled() {
+                break;
+            }
             let _ = event_tx.send(ReplEvent::ToolResult {
                 query_id,
                 round_token,
@@ -799,16 +813,15 @@ pub(super) async fn dispatch_tool_uses(
             Arc::clone(tui_renderer),
             Arc::clone(mode),
             Arc::clone(output_manager),
-            query_states
-                .get_metadata(query_id)
-                .await
-                .map(|m| m.cancellation_token)
-                .unwrap_or_else(CancellationToken::new),
+            cancellation_token.clone(),
             Arc::clone(work_unit),
             event_tx,
         )
         .await
         {
+            if cancellation_token.is_cancelled() {
+                break;
+            }
             let _ = event_tx.send(ReplEvent::ToolResult {
                 query_id,
                 round_token,
@@ -817,18 +830,16 @@ pub(super) async fn dispatch_tool_uses(
             });
         } else {
             // Regular tool: run concurrently in a background task
-            tool_coordinator.spawn_tool_execution(
+            if !tool_coordinator.spawn_tool_execution(
                 query_id,
                 round_token,
-                query_states
-                    .get_metadata(query_id)
-                    .await
-                    .map(|metadata| metadata.cancellation_token)
-                    .unwrap_or_default(),
+                cancellation_token.clone(),
                 tool_use,
                 Arc::clone(work_unit),
                 row_idx,
-            );
+            ) {
+                break;
+            }
         }
     }
     drop(current_mode);
@@ -887,6 +898,14 @@ pub(crate) async fn process_query_with_tools(
         "process_query_with_tools starting for query_id: {:?}",
         query_id
     );
+    let query_cancel = query_states
+        .get_metadata(query_id)
+        .await
+        .map(|metadata| metadata.cancellation_token)
+        .unwrap_or_default();
+    if query_cancel.is_cancelled() {
+        return;
+    }
 
     // Step 1: Routing decision
     let generator: Arc<dyn Generator> = {
@@ -979,6 +998,9 @@ pub(crate) async fn process_query_with_tools(
         msgs
     };
     let caps = generator.capabilities();
+    if query_cancel.is_cancelled() {
+        return;
+    }
 
     // Streaming is both a provider capability and a user preference. The
     // setup wizard persists the latter in features.streaming_enabled.
@@ -1017,10 +1039,12 @@ pub(crate) async fn process_query_with_tools(
             );
         }
 
-        match generator
-            .generate_stream(messages.clone(), Some((*tool_definitions).clone()))
-            .await
-        {
+        let stream = tokio::select! {
+            biased;
+            _ = query_cancel.cancelled() => return,
+            stream = generator.generate_stream(messages.clone(), Some((*tool_definitions).clone())) => stream,
+        };
+        match stream {
             Ok(Some(mut rx)) => {
                 tracing::debug!("[EVENT_LOOP] Streaming started, entering receive loop");
                 tracing::debug!("Streaming started successfully");
@@ -1029,7 +1053,13 @@ pub(crate) async fn process_query_with_tools(
                 let mut blocks = Vec::new();
                 let mut text = String::new();
 
-                while let Some(result) = rx.recv().await {
+                loop {
+                    let result = tokio::select! {
+                        biased;
+                        _ = query_cancel.cancelled() => return,
+                        result = rx.recv() => result,
+                    };
+                    let Some(result) = result else { break };
                     match result {
                         Ok(StreamChunk::Usage { input_tokens }) => {
                             input_token_count = Some(input_tokens);
@@ -1143,11 +1173,21 @@ pub(crate) async fn process_query_with_tools(
                             return;
                         }
                     };
+                    let Some(round_dispatch) =
+                        tool_coordinator.open_round_dispatch(query_id, round_token)
+                    else {
+                        conversation.write().await.abort_staged(query_id);
+                        return;
+                    };
                     if !query_states
                         .begin_tool_execution(query_id, tool_uses.len())
                         .await
                     {
                         conversation.write().await.abort_staged(query_id);
+                        drop(round_dispatch);
+                        tool_coordinator
+                            .close_and_wait_for_round(query_id, round_token)
+                            .await;
                         return;
                     }
                     tracing::debug!(
@@ -1168,6 +1208,7 @@ pub(crate) async fn process_query_with_tools(
                         &output_manager,
                         &query_states,
                         &tool_coordinator,
+                        round_dispatch,
                         &memory_system,
                         memory_recall_count,
                         &session_label,
@@ -1211,8 +1252,15 @@ pub(crate) async fn process_query_with_tools(
                     &messages,
                     wire_source.clone(),
                     wire_metrics_logger.as_deref(),
+                    Some(query_id),
                 )
                 .await;
+                if query_cancel.is_cancelled() || !query_states.begin_finalization(query_id).await {
+                    return;
+                }
+                let _ = event_tx.send(ReplEvent::VmOutputComplete {
+                    output_unit: Arc::clone(&wire_execution.output_unit),
+                });
                 if query_states
                     .get_metadata(query_id)
                     .await
@@ -1290,10 +1338,12 @@ pub(crate) async fn process_query_with_tools(
         let verb = crate::cli::messages::random_spinner_verb();
         output_manager.start_work_unit(verb)
     });
-    match generator
-        .generate(messages.clone(), Some((*tool_definitions).clone()))
-        .await
-    {
+    let generated = tokio::select! {
+        biased;
+        _ = query_cancel.cancelled() => return,
+        generated = generator.generate(messages.clone(), Some((*tool_definitions).clone())) => generated,
+    };
+    match generated {
         Ok(response) => {
             // Set response text on the WorkUnit
             if !response.text.is_empty() {
@@ -1354,11 +1404,21 @@ pub(crate) async fn process_query_with_tools(
                         return;
                     }
                 };
+                let Some(round_dispatch) =
+                    tool_coordinator.open_round_dispatch(query_id, round_token)
+                else {
+                    conversation.write().await.abort_staged(query_id);
+                    return;
+                };
                 if !query_states
                     .begin_tool_execution(query_id, tool_uses.len())
                     .await
                 {
                     conversation.write().await.abort_staged(query_id);
+                    drop(round_dispatch);
+                    tool_coordinator
+                        .close_and_wait_for_round(query_id, round_token)
+                        .await;
                     return;
                 }
 
@@ -1376,6 +1436,7 @@ pub(crate) async fn process_query_with_tools(
                     &output_manager,
                     &query_states,
                     &tool_coordinator,
+                    round_dispatch,
                     &memory_system,
                     memory_recall_count,
                     &session_label,
@@ -1415,8 +1476,15 @@ pub(crate) async fn process_query_with_tools(
                 &messages,
                 wire_source.clone(),
                 wire_metrics_logger.as_deref(),
+                Some(query_id),
             )
             .await;
+            if query_cancel.is_cancelled() || !query_states.begin_finalization(query_id).await {
+                return;
+            }
+            let _ = event_tx.send(ReplEvent::VmOutputComplete {
+                output_unit: Arc::clone(&wire_execution.output_unit),
+            });
             if query_states
                 .get_metadata(query_id)
                 .await
@@ -1585,10 +1653,9 @@ pub(crate) fn apply_sliding_window(
         .rev()
         .find(|message| {
             message.role == "user"
-                && message
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()))
+                && message.content.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()),
+                )
                 && !message
                     .content
                     .iter()
@@ -1748,7 +1815,10 @@ mod tests {
 
         assert_eq!(original.len(), 1, "canonical conversation was not mutated");
         assert_eq!(
-            request.iter().filter(|message| message.role == "system").count(),
+            request
+                .iter()
+                .filter(|message| message.role == "system")
+                .count(),
             1
         );
         let system = request[0].text_content();
@@ -1842,14 +1912,17 @@ mod tests {
             .write()
             .await
             .add_user_message("original prompt".into());
-        conversation.write().await.add_message(crate::claude::Message {
-            role: "user".into(),
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: "tool-1".into(),
-                content: "transient tool output".into(),
-                is_error: None,
-            }],
-        });
+        conversation
+            .write()
+            .await
+            .add_message(crate::claude::Message {
+                role: "user".into(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool-1".into(),
+                    content: "transient tool output".into(),
+                    is_error: None,
+                }],
+            });
         let query_states = QueryStateManager::new();
         let query_id = query_states
             .create_query(conversation.read().await.get_messages())
@@ -1888,11 +1961,54 @@ mod tests {
         let recent = memory.get_recent_conversations(10).await.unwrap();
         assert!(!recent.iter().any(|(_, text)| text == "original prompt"));
         assert!(!recent.iter().any(|(_, text)| text == "(say \"done\")"));
-        assert!(!recent.iter().any(|(_, text)| text == "transient tool output"));
+        assert!(!recent
+            .iter()
+            .any(|(_, text)| text == "transient tool output"));
     }
 
     struct SingleRepairGenerator {
         calls: AtomicUsize,
+    }
+
+    struct BlockingRepairGenerator {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl Generator for BlockingRepairGenerator {
+        async fn generate(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<crate::generators::GeneratorResponse> {
+            self.started.notify_waiters();
+            std::future::pending().await
+        }
+
+        async fn generate_stream(
+            &self,
+            _messages: Vec<crate::claude::Message>,
+            _tools: Option<Vec<ToolDefinition>>,
+        ) -> anyhow::Result<
+            Option<tokio::sync::mpsc::Receiver<anyhow::Result<crate::generators::StreamChunk>>>,
+        > {
+            Ok(None)
+        }
+
+        fn capabilities(&self) -> &crate::generators::GeneratorCapabilities {
+            static CAPS: crate::generators::GeneratorCapabilities =
+                crate::generators::GeneratorCapabilities {
+                    supports_streaming: false,
+                    supports_tools: false,
+                    supports_conversation: true,
+                    max_context_messages: Some(8),
+                };
+            &CAPS
+        }
+
+        fn name(&self) -> &str {
+            "blocking-repair"
+        }
     }
 
     #[async_trait::async_trait]
@@ -2058,6 +2174,7 @@ mod tests {
             event_tx.clone(),
             tokio_util::sync::CancellationToken::new(),
             "(begin (say \"one\") (yield) (say \"two\") (yield) (say \"three\"))".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -2078,6 +2195,7 @@ mod tests {
                 ReplEvent::VmEffect {
                     projection,
                     envelope,
+                    ..
                 } => {
                     assert_eq!(work_unit.status(), MessageStatus::InProgress);
                     projection.project_envelope(envelope);
@@ -2113,6 +2231,7 @@ mod tests {
             event_tx,
             cancel,
             "(begin (say \"before\") (yield) (say \"after\"))".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -2147,6 +2266,7 @@ mod tests {
             event_tx,
             tokio_util::sync::CancellationToken::new(),
             "(file-read (path \"Cargo.toml\"))".to_string(),
+            None,
         );
         tokio::pin!(execution);
         loop {
@@ -2195,11 +2315,9 @@ mod tests {
                 crate::vm::FileSelector::parse("./**").unwrap(),
             ))
             .unwrap();
-        let submission = direct_wire_submission(
-            &runtime,
-            "(file-read (path \"Cargo.toml\"))".to_string(),
-        )
-        .unwrap();
+        let submission =
+            direct_wire_submission(&runtime, "(file-read (path \"Cargo.toml\"))".to_string())
+                .unwrap();
         let suspended = runtime
             .submit_typed_only_with_grant_ceiling(submission, crate::vm::EffectSet::pure())
             .await
@@ -2222,10 +2340,10 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(runtime.capability_ledger().unwrap().grants.grants.len(), 1);
-        assert!(denied.effect_journal.iter().any(|entry| matches!(
-            entry.state,
-            crate::vm::EffectJournalState::Denied { .. }
-        )));
+        assert!(denied
+            .effect_journal
+            .iter()
+            .any(|entry| matches!(entry.state, crate::vm::EffectJournalState::Denied { .. })));
     }
 
     #[test]
@@ -2279,6 +2397,7 @@ mod tests {
             &[crate::claude::Message::user("reply")],
             source.clone(),
             Some(&metrics),
+            None,
         )
         .await;
 
@@ -2289,6 +2408,7 @@ mod tests {
         while let Ok(ReplEvent::VmEffect {
             projection,
             envelope,
+            ..
         }) = event_rx.try_recv()
         {
             if !projection.project_envelope(envelope).is_empty() {
@@ -2320,6 +2440,46 @@ mod tests {
         assert!(messages.iter().all(|message| !message
             .format(&crate::config::ColorScheme::default())
             .contains("must not run")));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_provider_repair_suppresses_repair_effects_and_completion() {
+        let runtime = crate::runtime::ProgramRuntime::new();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let generator: Arc<dyn Generator> = Arc::new(BlockingRepairGenerator {
+            started: Arc::clone(&started),
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let waiting = started.notified();
+        tokio::pin!(waiting);
+        waiting.as_mut().enable();
+        let execution = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                execute_wire_with_single_repair(
+                    &runtime,
+                    output,
+                    event_tx,
+                    cancel,
+                    generator,
+                    &[crate::claude::Message::user("reply")],
+                    raw_wire_source("```lisp\n(say \"must not run\")\n```"),
+                    None,
+                    None,
+                )
+                .await
+            }
+        });
+        waiting.await;
+        cancel.cancel();
+        let execution = execution.await.unwrap();
+
+        assert!(execution.response.is_empty());
+        assert!(execution.effect_journal.is_empty());
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[test]

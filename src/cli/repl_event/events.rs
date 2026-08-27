@@ -104,6 +104,7 @@ pub enum ReplEvent {
     /// order for this per-run sender, while the envelope retains the durable
     /// `(execution_id, sequence)` identity for replay-capable hosts.
     VmEffect {
+        query_id: Option<Uuid>,
         projection: VmOutputProjection,
         envelope: VmEffectEnvelope,
     },
@@ -259,6 +260,11 @@ pub enum LlmRequest {
         id: Uuid,
         text: String,
         no_tools: bool,
+        /// Tool continuations wait for the atomic history commit before
+        /// reading shared conversation state.
+        admission: Option<tokio::sync::oneshot::Receiver<()>>,
+        admission_ready: Option<tokio::sync::oneshot::Sender<()>>,
+        spawned: Option<tokio::sync::oneshot::Sender<()>>,
     },
 }
 
