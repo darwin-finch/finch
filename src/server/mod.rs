@@ -227,8 +227,8 @@ impl AgentServer {
         provider_graph: ProviderGraph,
     ) -> Result<Self> {
         // Validate inherited supervisor authority before channels, credential
-        // files, Brain stores, configuration clones, or provider state are
-        // created. A malformed opt-in environment therefore has no effects.
+        // files, Brain stores, or configuration clones are created. A
+        // malformed opt-in environment therefore has no server-side effects.
         let isolated_proof = crate::brain::isolated_test_proof_if_present()?;
         if let Some(proof) = &isolated_proof {
             server_config.bind_address = proof.daemon_address().to_owned();
@@ -780,6 +780,21 @@ mod tests {
         }
     }
 
+    fn isolated_provider_graph() -> ProviderGraph {
+        let config = crate::config::Config::with_providers(vec![
+            crate::config::ProviderEntry::Claude {
+                api_key: "isolated-provider-graph".into(),
+                model: None,
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: Some("isolated-provider-graph".into()),
+            },
+        ]);
+        crate::providers::create_provider_graph_from_config(&config)
+            .expect("isolated tests need an in-memory provider graph")
+    }
+
     async fn submit_feedback_to_daemon(address: SocketAddr, query: &str) {
         let client = reqwest::Client::new();
         let endpoint = format!("http://{address}/v1/feedback");
@@ -1140,7 +1155,7 @@ mod tests {
             Arc::new(RwLock::new(LocalGenerator::new())),
             Arc::new(BootstrapLoader::new(Arc::clone(&generator_state), None)),
             generator_state,
-            Vec::new(),
+            isolated_provider_graph(),
         )
         .unwrap();
         let name = format!("constructor-boundary-{}", uuid::Uuid::new_v4().simple());
@@ -1180,7 +1195,7 @@ mod tests {
                 Arc::new(RwLock::new(LocalGenerator::new())),
                 bootstrap,
                 generator_state,
-                Vec::new(),
+                isolated_provider_graph(),
             );
             assert!(result.is_err());
             assert!(std::fs::read_dir(&forged_home).unwrap().next().is_none());
@@ -1269,7 +1284,7 @@ mod tests {
                 Arc::new(RwLock::new(LocalGenerator::new())),
                 Arc::new(BootstrapLoader::new(Arc::clone(&generator_state), None)),
                 generator_state,
-                Vec::new(),
+                isolated_provider_graph(),
             );
             assert!(
                 result.is_err(),
