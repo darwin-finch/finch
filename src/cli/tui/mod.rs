@@ -103,6 +103,144 @@ fn tilde_cwd() -> String {
     }
 }
 
+fn stable_poset_order_and_depth(
+    node_ids: &std::collections::BTreeSet<usize>,
+    edges: &[(usize, usize)],
+) -> (Vec<usize>, std::collections::BTreeMap<usize, usize>) {
+    use std::cmp::Reverse;
+    use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+
+    fn finish_component(
+        start: usize,
+        adjacency: &BTreeMap<usize, Vec<usize>>,
+        visited: &mut BTreeSet<usize>,
+        finished: &mut Vec<usize>,
+    ) {
+        visited.insert(start);
+        let mut stack = vec![(start, 0usize)];
+        while let Some(&(node, next_index)) = stack.last() {
+            let successors = adjacency.get(&node).map(Vec::as_slice).unwrap_or(&[]);
+            if let Some(&successor) = successors.get(next_index) {
+                stack.last_mut().expect("DFS stack is non-empty").1 += 1;
+                if visited.insert(successor) {
+                    stack.push((successor, 0));
+                }
+                continue;
+            }
+            stack.pop();
+            finished.push(node);
+        }
+    }
+
+    fn collect_component(
+        start: usize,
+        reverse: &BTreeMap<usize, Vec<usize>>,
+        visited: &mut BTreeSet<usize>,
+    ) -> Vec<usize> {
+        visited.insert(start);
+        let mut component = Vec::new();
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            component.push(node);
+            if let Some(predecessors) = reverse.get(&node) {
+                for &predecessor in predecessors.iter().rev() {
+                    if visited.insert(predecessor) {
+                        stack.push(predecessor);
+                    }
+                }
+            }
+        }
+        component.sort_unstable();
+        component
+    }
+
+    let mut adjacency: BTreeMap<usize, Vec<usize>> = node_ids
+        .iter()
+        .copied()
+        .map(|id| (id, Vec::new()))
+        .collect();
+    let mut reverse = adjacency.clone();
+    for &(predecessor, successor) in edges {
+        adjacency.entry(predecessor).or_default().push(successor);
+        reverse.entry(successor).or_default().push(predecessor);
+    }
+
+    // Kosaraju's algorithm over canonical adjacency produces stable SCCs
+    // without recursion, so a corrupt or very deep restored plan cannot grow
+    // the host call stack.
+    let mut visited = BTreeSet::new();
+    let mut finished = Vec::with_capacity(node_ids.len());
+    for &id in node_ids {
+        if !visited.contains(&id) {
+            finish_component(id, &adjacency, &mut visited, &mut finished);
+        }
+    }
+    visited.clear();
+    let mut components = Vec::new();
+    for &id in finished.iter().rev() {
+        if !visited.contains(&id) {
+            components.push(collect_component(id, &reverse, &mut visited));
+        }
+    }
+
+    let mut node_component = BTreeMap::new();
+    for (component_id, component) in components.iter().enumerate() {
+        for &node_id in component {
+            node_component.insert(node_id, component_id);
+        }
+    }
+    let component_edges: BTreeSet<(usize, usize)> = edges
+        .iter()
+        .filter_map(|&(predecessor, successor)| {
+            let before = *node_component.get(&predecessor)?;
+            let after = *node_component.get(&successor)?;
+            (before != after).then_some((before, after))
+        })
+        .collect();
+    let mut successors = vec![Vec::new(); components.len()];
+    let mut in_degree = vec![0usize; components.len()];
+    for &(before, after) in &component_edges {
+        successors[before].push(after);
+        in_degree[after] += 1;
+    }
+
+    // Condensation is a DAG. Prefer the component's smallest node ID whenever
+    // multiple components are ready, and IDs within an SCC are already sorted.
+    let mut ready: BinaryHeap<Reverse<(usize, usize)>> = components
+        .iter()
+        .enumerate()
+        .filter(|(component_id, _)| in_degree[*component_id] == 0)
+        .map(|(component_id, component)| Reverse((component[0], component_id)))
+        .collect();
+    let mut component_order = Vec::with_capacity(components.len());
+    while let Some(Reverse((_, component_id))) = ready.pop() {
+        component_order.push(component_id);
+        for &successor in &successors[component_id] {
+            in_degree[successor] = in_degree[successor].saturating_sub(1);
+            if in_degree[successor] == 0 {
+                ready.push(Reverse((components[successor][0], successor)));
+            }
+        }
+    }
+
+    let mut component_depth = vec![0usize; components.len()];
+    for &component_id in &component_order {
+        let next_depth = component_depth[component_id].saturating_add(1);
+        for &successor in &successors[component_id] {
+            component_depth[successor] = component_depth[successor].max(next_depth);
+        }
+    }
+    let order = component_order
+        .iter()
+        .flat_map(|&component_id| components[component_id].iter().copied())
+        .collect();
+    let depth = node_component
+        .into_iter()
+        .map(|(node_id, component_id)| (node_id, component_depth[component_id]))
+        .collect();
+    (order, depth)
+}
+
 /// Render a `Poset` as compact Forth source lines for the panel overlay.
 ///
 /// Each node becomes one word definition; predecessors are called first.
@@ -146,37 +284,10 @@ fn poset_to_forth_lines(
         preds.entry(succ).or_default().push(pred);
     }
 
-    // Stable topological sort (Kahn's algorithm). A min-heap makes the next
-    // ready node independent of randomized HashMap iteration and edge order.
-    let mut in_degree: std::collections::BTreeMap<usize, usize> =
-        node_ids.iter().copied().map(|id| (id, 0)).collect();
-    for &(_, succ) in &edges {
-        *in_degree.entry(succ).or_insert(0) += 1;
-    }
-    let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>> = in_degree
-        .iter()
-        .filter(|(_, &d)| d == 0)
-        .map(|(&id, _)| std::cmp::Reverse(id))
-        .collect();
-    let mut topo: Vec<usize> = Vec::new();
-    while let Some(std::cmp::Reverse(id)) = ready.pop() {
-        topo.push(id);
-        for &(pred, succ) in &edges {
-            if pred == id {
-                let d = in_degree.entry(succ).or_insert(0);
-                *d = d.saturating_sub(1);
-                if *d == 0 {
-                    ready.push(std::cmp::Reverse(succ));
-                }
-            }
-        }
-    }
-    // Any remaining (cycles) append in id order.
-    for &id in &node_ids {
-        if !topo.contains(&id) {
-            topo.push(id);
-        }
-    }
+    // Collapse cycles into strongly connected components before sorting. This
+    // preserves every satisfiable predecessor edge between components while
+    // retaining a deterministic ID order inside an inherently cyclic SCC.
+    let (topo, depth) = stable_poset_order_and_depth(&node_ids, &edges);
 
     // Word name helper
     let word_name = |id: usize| -> String { format!("W{id}") };
@@ -242,20 +353,6 @@ fn poset_to_forth_lines(
     // Nodes at the same DAG depth with no edges between them run concurrently;
     // we group them on the same line with a `\ concurrent` annotation.
     if lines.len() < max_lines {
-        // Compute depth of each node (longest path from a root).
-        let mut depth: std::collections::BTreeMap<usize, usize> =
-            node_ids.iter().copied().map(|id| (id, 0)).collect();
-        for &id in &topo {
-            let d = depth.get(&id).copied().unwrap_or(0);
-            for &(pred, succ) in &edges {
-                if pred == id {
-                    let entry = depth.entry(succ).or_insert(0);
-                    if d + 1 > *entry {
-                        *entry = d + 1;
-                    }
-                }
-            }
-        }
         // Group node ids by depth level, in topo order within each group.
         let max_depth = depth.values().copied().max().unwrap_or(0);
         let mut program_lines: Vec<String> = vec![format!("{Y}: PROGRAM{RST}")];
@@ -268,7 +365,13 @@ fn poset_to_forth_lines(
             if group.is_empty() {
                 continue;
             }
-            let parallel_note = if group.len() > 1 {
+            let contains_cycle = edges.iter().any(|&(predecessor, successor)| {
+                depth.get(&predecessor).copied() == Some(lvl)
+                    && depth.get(&successor).copied() == Some(lvl)
+            });
+            let parallel_note = if contains_cycle {
+                format!("  {D}\\ cycle{RST}")
+            } else if group.len() > 1 {
                 format!("  {D}\\ concurrent{RST}")
             } else {
                 String::new()
@@ -3798,6 +3901,30 @@ mod tests {
             .join("\n")
     }
 
+    fn rendered_word_position(lines: &[String], id: usize) -> usize {
+        let header = format!(": W{id}");
+        lines
+            .iter()
+            .position(|line| strip_poset_ansi(line).contains(&header))
+            .unwrap_or_else(|| panic!("missing rendered definition for W{id}"))
+    }
+
+    fn rendered_program_lines(lines: &[String]) -> Vec<String> {
+        let start = lines
+            .iter()
+            .position(|line| strip_poset_ansi(line).contains(": PROGRAM"))
+            .expect("missing rendered PROGRAM definition");
+        lines[start..]
+            .iter()
+            .map(|line| {
+                strip_poset_ansi(line)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
     fn shuffle_with_seed<T>(values: &mut [T], seed: u64) {
         let mut state = seed;
         for upper in (1..values.len()).rev() {
@@ -3946,6 +4073,105 @@ mod tests {
         assert!(
             !lines.is_empty(),
             "cyclic graph should still produce output"
+        );
+    }
+
+    #[test]
+    fn test_poset_cyclic_component_precedes_its_downstream_node_stably() {
+        let mut poset = crate::poset::Poset::new();
+        for label in ["downstream", "cycle-a", "cycle-b"] {
+            poset.add_node(
+                label.to_string(),
+                crate::poset::NodeKind::Task,
+                crate::poset::NodeAuthor::User,
+            );
+        }
+        poset.edges = vec![(1, 2), (2, 1), (2, 0)];
+
+        let expected = poset_to_forth_lines(&poset, 80, 80);
+        assert!(
+            rendered_word_position(&expected, 2) < rendered_word_position(&expected, 0),
+            "the cyclic predecessor component must precede its acyclic descendant"
+        );
+        assert!(rendered_word_body(&expected, 0).contains("W2"));
+        assert_eq!(
+            rendered_program_lines(&expected),
+            vec![": PROGRAM", "W1 W2 \\ cycle", "W0 ;"]
+        );
+
+        for seed in 0..64 {
+            let mut shuffled = poset.clone();
+            shuffle_with_seed(&mut shuffled.nodes, seed);
+            shuffle_with_seed(&mut shuffled.edges, seed ^ 0x5a5a_5a5a_5a5a_5a5a);
+            assert_eq!(
+                poset_to_forth_lines(&shuffled, 80, 80),
+                expected,
+                "cyclic rendering changed for storage-order seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_poset_unknown_edges_are_omitted() {
+        let mut baseline = crate::poset::Poset::new();
+        for label in ["root", "child"] {
+            baseline.add_node(
+                label.to_string(),
+                crate::poset::NodeKind::Task,
+                crate::poset::NodeAuthor::User,
+            );
+        }
+        baseline.edges = vec![(0, 1)];
+        let mut with_unknown_edges = baseline.clone();
+        with_unknown_edges.edges.extend([(99, 1), (0, 88)]);
+
+        assert_eq!(
+            poset_to_forth_lines(&with_unknown_edges, 80, 80),
+            poset_to_forth_lines(&baseline, 80, 80)
+        );
+    }
+
+    #[test]
+    fn test_poset_duplicate_edges_do_not_duplicate_calls_or_indegree() {
+        let mut poset = crate::poset::Poset::new();
+        for label in ["left", "right", "join"] {
+            poset.add_node(
+                label.to_string(),
+                crate::poset::NodeKind::Task,
+                crate::poset::NodeAuthor::User,
+            );
+        }
+        poset.edges = vec![(0, 2), (0, 2), (0, 2), (1, 2), (1, 2)];
+        let actual = poset_to_forth_lines(&poset, 80, 80);
+        let body = rendered_word_body(&actual, 2);
+        assert!(body.contains("W0 W1"));
+        assert_eq!(body.matches("W0").count(), 1);
+        assert_eq!(body.matches("W1").count(), 1);
+
+        poset.edges = vec![(0, 2), (1, 2)];
+        assert_eq!(actual, poset_to_forth_lines(&poset, 80, 80));
+    }
+
+    #[test]
+    fn test_poset_program_depth_groups_branching_join_graph() {
+        let mut poset = crate::poset::Poset::new();
+        for label in ["root-a", "root-b", "branch-a", "branch-b", "join"] {
+            poset.add_node(
+                label.to_string(),
+                crate::poset::NodeKind::Task,
+                crate::poset::NodeAuthor::User,
+            );
+        }
+        poset.edges = vec![(0, 2), (1, 2), (0, 3), (1, 3), (2, 4), (3, 4)];
+
+        assert_eq!(
+            rendered_program_lines(&poset_to_forth_lines(&poset, 80, 80)),
+            vec![
+                ": PROGRAM",
+                "W0 W1 \\ concurrent",
+                "W2 W3 \\ concurrent",
+                "W4 ;",
+            ]
         );
     }
 
