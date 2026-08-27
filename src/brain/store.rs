@@ -5432,6 +5432,18 @@ impl BrainStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn exhaust_effect_audit_storage_for_test(&self, name: &str) -> Result<()> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brain_id = self.brains.read().expect("shared brain lock poisoned")
+            .get(name).context("Brain was removed concurrently")?.brain_id;
+        self.with_effect_audit_storage_mut(name, brain_id, |storage| {
+            storage.replay.exhaust_storage_for_test()
+        })?;
+        Ok(())
+    }
+
     fn disconnect_intent_path(&self, name: &str, run_id: RunId) -> Option<PathBuf> {
         self.root.as_ref().map(|root| {
             root.join(name)
@@ -10182,6 +10194,20 @@ mod tests {
             } if outcome_kind == "acknowledged"));
         assert!(!snapshot.events.iter().any(|event|
             matches!(event.kind, BrainEventKind::ToolResult { .. })));
+    }
+
+    #[test]
+    fn effect_audit_archive_exhaustion_fails_before_reserve_or_host_permit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let (_run, _lease, grant) = audit_run_fixture(&store);
+        store.exhaust_effect_audit_storage_for_test("shared").unwrap();
+        let error = store.reserve_effect_audit(
+            &grant, uuid::Uuid::new_v4(), audit_effect(0, "must not execute"),
+        ).unwrap_err();
+        assert!(error.to_string().contains("storage exhausted"));
+        assert!(store.snapshot("shared").unwrap().effect_audits.is_empty(),
+            "storage exhaustion must fail before durable reserve or host permit");
     }
 
     #[test]

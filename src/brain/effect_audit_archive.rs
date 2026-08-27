@@ -752,6 +752,17 @@ impl EffectAuditReplayArchive {
         validate_index_counts(&self.index_path, &self.manifest)?;
         self.persist_manifest()
     }
+
+    #[cfg(test)]
+    pub(crate) fn exhaust_storage_for_test(&self) -> Result<()> {
+        let active = self.manifest.active_epoch as usize;
+        let path = self.directory.join(&self.manifest.epochs[active].file);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_len(MAX_REPLAY_ARCHIVE_BYTES)?;
+        Ok(())
+    }
 }
 
 fn epoch_file_name(generation: u64) -> String {
@@ -1016,6 +1027,7 @@ mod tests {
         let mut invalid = archive.manifest.clone();
         invalid.epochs.push(invalid.epochs[0].clone());
         invalid.active_epoch = 1;
+        invalid.epochs[0].sealed = true;
         std::fs::write(
             &archive.manifest_path,
             serde_json::to_vec(&invalid).unwrap(),
@@ -1114,7 +1126,7 @@ mod tests {
         archive
             .seed_mature_history_for_test(brain_id, 4, 2)
             .unwrap();
-        let old = fence(brain_id, 0);
+        let old = archive.latest(4).unwrap().remove(0);
         let sealed = archive.directory.join(epoch_file_name(0));
         drop(archive);
         std::fs::write(&sealed, b"not a sqlite database").unwrap();
@@ -1130,7 +1142,7 @@ mod tests {
         archive
             .seed_mature_history_for_test(brain_id, 4, 2)
             .unwrap();
-        let old = fence(brain_id, 0);
+        let old = archive.latest(4).unwrap().remove(0);
         let encoded = serde_json::to_vec(&old).unwrap();
         let active = archive.directory.join(epoch_file_name(1));
         let connection = open_epoch(&active).unwrap();
