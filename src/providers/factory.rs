@@ -612,9 +612,21 @@ mod tests {
 
     #[test]
     fn test_unusable_chatgpt_schema_preserves_later_configured_grok_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let fake = directory.path().join("fake_app_server.py");
+        std::fs::write(
+            &fake,
+            "import sys\n# Exit successfully without producing the required restricted schemas.\nsys.exit(0)\n",
+        )
+        .unwrap();
+        crate::providers::codex_app_server::install_test_provider_app_server(
+            std::path::PathBuf::from("python3"),
+            vec![fake.to_string_lossy().into_owned()],
+        );
         let entries = vec![
             ProviderEntry::ChatgptSubscription {
-                credential_ref: "finch-test://unaudited-schema".into(),
+                credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
+                    .into(),
                 model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.into()),
                 name: Some("subscription".into()),
             },

@@ -1758,7 +1758,7 @@ async fn continue_chatgpt_setup_ceremony(
                     ceremony.restore()?;
                     return Ok(SetupApplyOutcome::Saved);
                 }
-                if decision == ChatGptSetupAction::Logout {
+                if decision != ChatGptSetupAction::Keep {
                     ceremony.logout().await?;
                 }
                 ceremony.restore()?;
@@ -1804,7 +1804,7 @@ async fn continue_chatgpt_setup_ceremony(
                         ],
                     )
                     .await?;
-                if decision == ChatGptSetupAction::Logout {
+                if decision != ChatGptSetupAction::Keep {
                     ceremony.logout().await?;
                 }
             }
@@ -5938,10 +5938,137 @@ mod tests {
         result
     }
 
-    fn install_mock_ceremony(mock: MockChatGptCeremony) {
+    fn install_test_ceremony(ceremony: impl ChatGptSetupCeremony + 'static) {
         TEST_CHATGPT_CEREMONY.with(|slot| {
-            assert!(slot.borrow_mut().replace(Box::new(mock)).is_none());
+            assert!(slot.borrow_mut().replace(Box::new(ceremony)).is_none());
         });
+    }
+
+    struct BoundaryChatGptCeremony {
+        auth: crate::providers::CodexAppServerAuth,
+        choices: std::collections::VecDeque<ChatGptSetupAction>,
+        config_path: std::path::PathBuf,
+        restores: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ChatGptSetupCeremony for BoundaryChatGptCeremony {
+        async fn status(
+            &mut self,
+        ) -> Result<crate::providers::codex_app_server::ChatGptAccountStatus> {
+            self.auth.status(false).await
+        }
+
+        async fn choose(
+            &mut self,
+            _title: &str,
+            _message: &str,
+            offered: &[(char, ChatGptSetupAction, &str)],
+        ) -> Result<ChatGptSetupAction> {
+            let choice = self
+                .choices
+                .pop_front()
+                .context("missing boundary choice")?;
+            anyhow::ensure!(
+                choice == ChatGptSetupAction::Cancel
+                    || offered.iter().any(|(_, candidate, _)| *candidate == choice),
+                "boundary selected an action that was not offered"
+            );
+            Ok(choice)
+        }
+
+        async fn login(
+            &mut self,
+        ) -> Result<crate::providers::codex_app_server::DeviceLoginOutcome> {
+            anyhow::bail!("boundary test did not configure device login")
+        }
+
+        async fn validate_sol(&mut self) -> Result<()> {
+            self.auth.validate_sol_access().await.map(|_| ())
+        }
+
+        fn save(&mut self, result: &SetupResult) -> Result<()> {
+            config_from_setup_result(result).save_to(&self.config_path)
+        }
+
+        fn save_fallback(&mut self, result: &SetupResult) -> Result<()> {
+            let mut config = config_from_setup_result(result);
+            config
+                .providers
+                .retain(|provider| !matches!(provider, ProviderEntry::ChatgptSubscription { .. }));
+            anyhow::ensure!(
+                config.providers.iter().any(configured_provider_is_usable),
+                "missing fallback"
+            );
+            config.save_to(&self.config_path)
+        }
+
+        async fn logout(&mut self) -> Result<()> {
+            self.auth.logout().await
+        }
+
+        fn restore(&mut self) -> Result<()> {
+            *self.restores.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    fn boundary_ceremony(
+        directory: &tempfile::TempDir,
+        choices: impl IntoIterator<Item = ChatGptSetupAction>,
+        sol_visible: bool,
+    ) -> (BoundaryChatGptCeremony, Arc<Mutex<usize>>) {
+        let script = directory.path().join("fake_setup_app_server.py");
+        std::fs::write(
+            &script,
+            r#"import json, os, pathlib, sys
+sol_visible = sys.argv[1] == 'sol'
+home = pathlib.Path(os.environ['CODEX_HOME'])
+logout_marker = home / 'logged_out'
+initialized = False
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get('method')
+    if method == 'initialized':
+        initialized = True
+        continue
+    ident = message.get('id')
+    if method == 'initialize': result = {'capabilities': {}}
+    elif method == 'config/read':
+        assert initialized
+        result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'profiles': {}, 'skills': {'config': []}, 'agents': {'enabled': False}, 'apps': {'_default': {'enabled': False, 'destructive_enabled':False, 'open_world_enabled':False, 'default_tools_enabled':False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','memories','skill_mcp_dependency_install']}, 'web_search':'disabled', 'history':{'persistence':'none'}, 'cli_auth_credentials_store':'file', 'memories':{'generate_memories':False,'use_memories':False}, 'allow_login_shell':False, 'shell_environment_policy':{'inherit':'none','set':{}}, 'tools':{'view_image':False,'web_search':False}, 'developer_instructions':'', 'project_doc_fallback_filenames':[], 'project_doc_max_bytes':0}}
+    elif method == 'configRequirements/read': result = {'requirements': None}
+    elif method == 'account/read': result = {'account': None if logout_marker.exists() else {'type':'chatgpt','planType':'plus'}}
+    elif method == 'model/list': result = {'data': ([{'id':'gpt-5.6-sol','model':'gpt-5.6-sol','hidden':False}] if sol_visible else []), 'nextCursor':None}
+    elif method == 'account/logout':
+        logout_marker.write_text('logged out')
+        result = {}
+    else: result = {}
+    print(json.dumps({'id':ident,'result':result}), flush=True)
+    if method == 'account/logout': print(json.dumps({'method':'account/updated','params':{'authMode':None,'planType':None}}), flush=True)
+"#,
+        )
+        .unwrap();
+        let profile = directory.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let auth = crate::providers::CodexAppServerAuth::with_test_app_server(
+            std::path::PathBuf::from("python3"),
+            vec![
+                script.to_string_lossy().into_owned(),
+                if sol_visible { "sol" } else { "no-sol" }.into(),
+            ],
+            profile,
+        );
+        let restores = Arc::new(Mutex::new(0));
+        (
+            BoundaryChatGptCeremony {
+                auth,
+                choices: choices.into_iter().collect(),
+                config_path: directory.path().join("config.toml"),
+                restores: Arc::clone(&restores),
+            },
+            restores,
+        )
     }
 
     #[test]
@@ -8514,16 +8641,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_public_ceremony_validation_failure_saves_configured_fallback() {
-        let observed = Arc::new(Mutex::new(CeremonyObservations::default()));
-        install_mock_ceremony(MockChatGptCeremony {
-            signed_in: true,
-            choices: [ChatGptSetupAction::Reuse, ChatGptSetupAction::Fallback]
-                .into_iter()
-                .collect(),
-            login_outcomes: Default::default(),
-            validation_error: true,
-            observed: Arc::clone(&observed),
-        });
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let (ceremony, restores) = boundary_ceremony(
+            &directory,
+            [ChatGptSetupAction::Reuse, ChatGptSetupAction::Fallback],
+            false,
+        );
+        install_test_ceremony(ceremony);
 
         let outcome =
             validate_and_apply_for(SetupInvocation::Command, &chatgpt_ceremony_result(true))
@@ -8531,11 +8656,10 @@ mod tests {
                 .unwrap();
 
         assert_eq!(outcome, SetupApplyOutcome::Saved);
-        let observed = observed.lock().unwrap();
-        assert_eq!(observed.saves, 0);
-        assert_eq!(observed.fallback_saves, 1);
-        assert_eq!(observed.logouts, 0);
-        assert_eq!(observed.restores, 1);
+        let saved = std::fs::read_to_string(config_path).unwrap();
+        assert!(saved.contains("grok"));
+        assert!(!saved.contains("chatgpt_subscription"));
+        assert_eq!(*restores.lock().unwrap(), 1);
     }
 
     #[tokio::test]
@@ -8546,7 +8670,7 @@ mod tests {
             (ChatGptSetupAction::Cancel, 1),
         ] {
             let observed = Arc::new(Mutex::new(CeremonyObservations::default()));
-            install_mock_ceremony(MockChatGptCeremony {
+            install_test_ceremony(MockChatGptCeremony {
                 signed_in: false,
                 choices: [ChatGptSetupAction::Login, decision].into_iter().collect(),
                 login_outcomes: [
@@ -8571,20 +8695,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_public_ceremony_ambiguous_failure_and_existing_cancel_log_out() {
+        for (choices, validation_error, expect_error) in [
+            (
+                vec![ChatGptSetupAction::Reuse, ChatGptSetupAction::Cancel],
+                true,
+                true,
+            ),
+            (
+                vec![ChatGptSetupAction::Cancel, ChatGptSetupAction::Cancel],
+                false,
+                false,
+            ),
+        ] {
+            let observed = Arc::new(Mutex::new(CeremonyObservations::default()));
+            install_test_ceremony(MockChatGptCeremony {
+                signed_in: true,
+                choices: choices.into_iter().collect(),
+                login_outcomes: Default::default(),
+                validation_error,
+                observed: Arc::clone(&observed),
+            });
+
+            let outcome =
+                validate_and_apply_for(SetupInvocation::Command, &chatgpt_ceremony_result(false))
+                    .await;
+            assert_eq!(outcome.is_err(), expect_error);
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.logouts, 1);
+            assert_eq!(observed.restores, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_existing_account_escape_logs_out_through_real_app_server_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let (ceremony, restores) = boundary_ceremony(
+            &directory,
+            [ChatGptSetupAction::Cancel, ChatGptSetupAction::Cancel],
+            true,
+        );
+        install_test_ceremony(ceremony);
+
+        let outcome = validate_command_and_apply(&chatgpt_ceremony_result(false))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, SetupApplyOutcome::Cancelled);
+        assert!(directory.path().join("profile/logged_out").is_file());
+        assert_eq!(*restores.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn test_first_run_command_and_repl_adapters_share_public_ceremony() {
         for invocation in [
             SetupInvocation::FirstRun,
             SetupInvocation::Command,
             SetupInvocation::Repl,
         ] {
-            let observed = Arc::new(Mutex::new(CeremonyObservations::default()));
-            install_mock_ceremony(MockChatGptCeremony {
-                signed_in: true,
-                choices: [ChatGptSetupAction::Reuse].into_iter().collect(),
-                login_outcomes: Default::default(),
-                validation_error: false,
-                observed: Arc::clone(&observed),
-            });
+            let directory = tempfile::tempdir().unwrap();
+            let config_path = directory.path().join("config.toml");
+            let (ceremony, restores) =
+                boundary_ceremony(&directory, [ChatGptSetupAction::Reuse], true);
+            install_test_ceremony(ceremony);
             let result = chatgpt_ceremony_result(false);
             let outcome = match invocation {
                 SetupInvocation::FirstRun => validate_first_run_and_apply(&result).await,
@@ -8594,9 +8767,9 @@ mod tests {
             .unwrap();
 
             assert_eq!(outcome, SetupApplyOutcome::Saved);
-            let observed = observed.lock().unwrap();
-            assert_eq!(observed.saves, 1, "{invocation:?}");
-            assert_eq!(observed.restores, 1, "{invocation:?}");
+            let saved = std::fs::read_to_string(config_path).unwrap();
+            assert!(saved.contains("chatgpt_subscription"), "{invocation:?}");
+            assert_eq!(*restores.lock().unwrap(), 1, "{invocation:?}");
         }
     }
 }

@@ -576,6 +576,29 @@ impl AppServerCommand {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_PROVIDER_COMMAND: std::cell::RefCell<Option<AppServerCommand>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_provider_app_server(program: PathBuf, args: Vec<String>) {
+    let mut command = AppServerCommand::test(program, args);
+    command.protocol_override = None;
+    TEST_PROVIDER_COMMAND.with(|slot| {
+        assert!(slot.borrow_mut().replace(command).is_none());
+    });
+}
+
+fn provider_app_server_command(credential_ref: &str) -> Result<AppServerCommand> {
+    #[cfg(test)]
+    if let Some(command) = TEST_PROVIDER_COMMAND.with(|slot| slot.borrow_mut().take()) {
+        return Ok(command);
+    }
+    AppServerCommand::production(credential_ref)
+}
+
 fn resolve_trusted_program(name: &str) -> Result<PathBuf> {
     let path = std::env::var_os("PATH").context("PATH is unavailable")?;
     resolve_program_in_path(name, &path)
@@ -1351,6 +1374,17 @@ impl CodexAppServerAuth {
         Self { command }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_app_server(
+        program: PathBuf,
+        args: Vec<String>,
+        codex_home: PathBuf,
+    ) -> Self {
+        let mut command = AppServerCommand::test(program, args);
+        command.codex_home = Some(codex_home);
+        Self { command }
+    }
+
     pub async fn status(&self, refresh: bool) -> Result<ChatGptAccountStatus> {
         self.command.require_audited_identity()?;
         let mut client = RpcClient::spawn(&self.command).await?;
@@ -1803,17 +1837,13 @@ pub struct CodexAppServerProvider {
 
 impl CodexAppServerProvider {
     pub fn new(credential_ref: String, default_model: String) -> Result<Self> {
-        #[cfg(test)]
-        if credential_ref == "finch-test://unaudited-schema" {
-            bail!("Codex app-server restricted schema is unavailable");
-        }
         if credential_ref != MANAGED_CODEX_CREDENTIAL_REF {
             bail!("Unsupported ChatGPT credential reference");
         }
         if default_model != GPT_5_6_SOL {
             bail!("ChatGPT subscription provider requires GPT-5.6 Sol");
         }
-        let command = AppServerCommand::production(&credential_ref)?;
+        let command = provider_app_server_command(&credential_ref)?;
         let capabilities = command
             .protocol_override
             .unwrap_or_else(|| command.detect_protocol_capabilities());
