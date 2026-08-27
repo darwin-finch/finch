@@ -455,12 +455,10 @@ fn preflight_named_transport(entry: &ProviderEntry) -> Result<()> {
     }
 }
 
-fn create_named_profiles_from_config_with_resolver(
-    config: &Config,
-    resolver: &dyn CredentialResolver,
-) -> Result<Vec<(String, Box<dyn LlmProvider>)>> {
-    // Complete graph and transport validation happen before secret resolution
-    // or the first provider constructor.
+/// Validate the complete provider/credential metadata graph and every named
+/// transport before secret resolution, provider construction, or selection
+/// shortcuts can perform external work.
+pub(crate) fn preflight_provider_config(config: &Config) -> Result<()> {
     config.validate()?;
     if let Some((index, _)) = config
         .providers
@@ -478,6 +476,16 @@ fn create_named_profiles_from_config_with_resolver(
         preflight_named_transport(entry)
             .with_context(|| format!("Provider #{} is invalid", index + 1))?;
     }
+    Ok(())
+}
+
+fn create_named_profiles_from_config_with_resolver(
+    config: &Config,
+    resolver: &dyn CredentialResolver,
+) -> Result<Vec<(String, Box<dyn LlmProvider>)>> {
+    // Complete graph and transport validation happen before secret resolution
+    // or the first provider constructor.
+    preflight_provider_config(config)?;
     let resolved = resolve_named_graph(config, resolver)?;
     let credentials = crate::config::credential::credential_index(config.credentials())?;
     let cloud: Vec<_> = config
@@ -693,23 +701,7 @@ pub fn create_provider_profile_from_config_with_resolver(
 
     // Revalidate every profile and transport before resolving even the one
     // selected secret. Selection does not authorize reading other accounts.
-    config.validate()?;
-    if let Some((index, _)) = config
-        .providers
-        .iter()
-        .enumerate()
-        .find(|(_, entry)| matches!(entry, ProviderEntry::LegacyChatgptSubscription { .. }))
-    {
-        bail!(
-            "Provider #{} is invalid: {}",
-            index + 1,
-            LEGACY_CHATGPT_MIGRATION_ERROR
-        );
-    }
-    for (index, entry) in config.providers.iter().enumerate() {
-        preflight_named_transport(entry)
-            .with_context(|| format!("Provider #{} is invalid", index + 1))?;
-    }
+    preflight_provider_config(config)?;
     let entry = config
         .providers
         .iter()

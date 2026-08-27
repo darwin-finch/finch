@@ -238,7 +238,7 @@ pub async fn refresh_from_config(
     resolver: &dyn CredentialResolver,
     cache_dir: &Path,
 ) -> Result<ModelCatalog> {
-    config.validate()?;
+    crate::providers::factory::preflight_provider_config(config)?;
     let entry = config
         .providers
         .iter()
@@ -527,6 +527,67 @@ mod tests {
         Config::with_providers(vec![profile]).with_credentials(vec![credential])
     }
 
+    fn unsupported_catalog_sibling(
+        provider: CredentialProvider,
+        origin: &str,
+    ) -> (ProviderEntry, ProviderCredential) {
+        let (kind, issuer, audience, base_url) = match provider {
+            CredentialProvider::ChatgptSubscription => (
+                CredentialKind::Bearer,
+                "openai-chatgpt",
+                AudienceBinding::standard(EndpointFamily::ChatgptSubscription),
+                None,
+            ),
+            CredentialProvider::GoogleVertex => (
+                CredentialKind::CloudIdentity,
+                "google-cloud",
+                AudienceBinding::standard(EndpointFamily::GoogleVertex),
+                None,
+            ),
+            CredentialProvider::GeminiAiStudio => (
+                CredentialKind::ApiKey,
+                "google-ai-studio",
+                AudienceBinding::custom(origin).unwrap(),
+                Some(origin.to_string()),
+            ),
+            _ => panic!("test helper requires an unsupported sibling transport"),
+        };
+        let credential_name = format!("unsupported-{}", provider.as_str());
+        (
+            ProviderEntry::Credentialed {
+                provider,
+                credential: CredentialBinding {
+                    credential_ref: credential_name.clone(),
+                    audience: None,
+                    tenant: None,
+                    project: None,
+                    account: None,
+                    required_scopes: BTreeSet::new(),
+                },
+                model: Some("unsupported-model".into()),
+                base_url,
+                chat_path: None,
+                models_path: None,
+                name: Some(format!("unsupported-{}", provider.as_str())),
+                reasoning_effort: None,
+            },
+            ProviderCredential {
+                name: credential_name.clone(),
+                kind,
+                provider,
+                issuer: issuer.into(),
+                audience,
+                tenant: None,
+                project: None,
+                account: None,
+                scopes: BTreeSet::new(),
+                secret_ref: format!("test:{credential_name}"),
+                lifecycle: CredentialLifecycle::default(),
+                revocation: Default::default(),
+            },
+        )
+    }
+
     fn start_blocked_catalog_refresh(
         config: Config,
     ) -> (
@@ -617,6 +678,51 @@ mod tests {
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         ));
+    }
+
+    #[tokio::test]
+    async fn catalog_preflights_every_sibling_transport_before_selected_resolution_or_http() {
+        let cases = [
+            (
+                CredentialProvider::ChatgptSubscription,
+                "ChatGPT subscription credentials are distinct",
+            ),
+            (
+                CredentialProvider::GoogleVertex,
+                "Google Vertex named credentials are modeled",
+            ),
+            (
+                CredentialProvider::GeminiAiStudio,
+                "Gemini AI Studio custom endpoints are not supported",
+            ),
+        ];
+        for (provider, expected) in cases {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let selected = live_catalog_config(&endpoint, None);
+            let mut profiles = selected.providers.clone();
+            let mut credentials = selected.credentials().to_vec();
+            let (sibling, sibling_credential) = unsupported_catalog_sibling(provider, &endpoint);
+            profiles.push(sibling);
+            credentials.push(sibling_credential);
+            let config = Config::with_providers(profiles).with_credentials(credentials);
+            let resolver = CountingResolver(AtomicUsize::new(0));
+            let cache = tempfile::tempdir().unwrap();
+
+            let error = refresh_from_config(&config, "primary", &resolver, cache.path())
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "wrong sibling preflight error for {provider:?}: {error:#}"
+            );
+            assert_eq!(resolver.0.load(Ordering::SeqCst), 0);
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        }
     }
 
     #[test]
