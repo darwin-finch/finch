@@ -66,7 +66,7 @@ That's it! Shammah will guide you through setup on first run.
 git clone https://github.com/darwin-finch/finch.git
 cd finch
 
-# Build (requires Rust 1.70+)
+# Build (uses the repository-pinned Rust 1.98.0 toolchain)
 cargo build --release
 
 # Install
@@ -81,7 +81,7 @@ finch --version
 - **RAM:** 8GB minimum (16GB+ recommended)
 - **Disk:** 5-10GB for models
 - **OS:** macOS (Apple Silicon recommended), Linux, Windows
-- **Rust:** 1.70 or newer
+- **Rustup:** installs the repository-pinned Rust 1.98.0 toolchain; no lower MSRV is claimed
 
 ---
 

@@ -202,6 +202,9 @@ implemented behavior unless current source or tests say so.
 
 After installing the prerequisites from [Quick start from source](#quick-start-from-source):
 
+Source builds use the repository-pinned Rust 1.98.0 toolchain. See
+[`docs/RUST_TOOLCHAIN.md`](docs/RUST_TOOLCHAIN.md) for the tested-toolchain and MSRV policy.
+
 ```bash
 cargo fmt --all -- --check
 cargo check --lib --bins --tests

@@ -10,7 +10,7 @@ This guide covers setting up a development environment and contributing to Shamm
 ### Required
 
 - **macOS**: Apple Silicon (M1/M2/M3/M4)
-- **Rust**: 1.70 or later
+- **Rustup**: the repository installs its pinned Rust 1.98.0 toolchain automatically
 - **Xcode**: Latest version (for CoreML tools)
 - **Storage**: ~10GB for development (source + models)
 - **Memory**: 16GB RAM minimum, 32GB recommended
@@ -42,9 +42,12 @@ source $HOME/.cargo/env
 Verify installation:
 
 ```bash
-rustc --version  # Should be 1.70+
+rustc --version  # Should report 1.98.0 in this checkout
 cargo --version
 ```
+
+Rust 1.98.0 is the tested and release compiler, not a claimed MSRV. See
+[`RUST_TOOLCHAIN.md`](RUST_TOOLCHAIN.md) for the complete contract.
 
 ### 3. Install Development Tools
 
@@ -157,7 +160,7 @@ cargo fmt
 Check formatting without modifying:
 
 ```bash
-cargo fmt --check
+cargo fmt --all -- --check
 ```
 
 ### Lint Code
@@ -555,7 +558,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - run: cargo build --verbose
       - run: ./scripts/test_brains.sh cargo test --verbose
-      - run: cargo fmt --check
+      - run: cargo fmt --all -- --check
       - run: cargo clippy -- -D warnings
 ```
 
