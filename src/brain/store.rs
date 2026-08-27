@@ -10062,11 +10062,9 @@ mod tests {
         let snapshot = restarted.snapshot("shared").unwrap();
         assert_eq!(snapshot.effect_audits.len(), 4);
         let (identity, effect) = &completed[0];
-        let authority = snapshot.effect_audits.iter()
-            .find(|entry| entry.intent.identity == *identity).unwrap().authority.clone();
         let exact = crate::runtime::effect_log::EffectAuditTransition::Reserve {
             intent: crate::runtime::effect_log::EffectAuditIntent::from_effect(*identity, effect).unwrap(),
-            authority: authority.clone(),
+            authority: grant.authority.clone(),
         };
         let mut changed_effect = effect.clone();
         changed_effect.event = crate::vm::HostSideEffect::Emit { text: "changed secret".into() };
@@ -10074,7 +10072,7 @@ mod tests {
             intent: crate::runtime::effect_log::EffectAuditIntent::from_effect(
                 *identity, &changed_effect,
             ).unwrap(),
-            authority,
+            authority: grant.authority.clone(),
         };
         let mut brains = restarted.brains.write().unwrap();
         let state = brains.get_mut("shared").unwrap();
