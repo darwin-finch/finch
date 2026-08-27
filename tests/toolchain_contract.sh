@@ -25,19 +25,17 @@ if [[ "$declared_toolchain" != "$expected_toolchain" ]]; then
   exit 1
 fi
 
-for required_component in clippy rustfmt; do
-  if ! grep -Fq "\"$required_component\"" "$toolchain_file"; then
-    echo "rust-toolchain.toml is missing required component '$required_component'" >&2
-    exit 1
-  fi
-done
+if ! grep -Fxq 'components = ["clippy", "rustfmt"]' "$toolchain_file"; then
+  echo "rust-toolchain.toml must install exactly the required clippy and rustfmt components" >&2
+  exit 1
+fi
 
 for required_target in \
   aarch64-apple-darwin \
   x86_64-pc-windows-msvc \
   x86_64-unknown-linux-gnu
 do
-  if ! grep -Fq "\"$required_target\"" "$toolchain_file"; then
+  if ! grep -Fxq "    \"$required_target\"," "$toolchain_file"; then
     echo "rust-toolchain.toml is missing supported target '$required_target'" >&2
     exit 1
   fi
@@ -60,6 +58,36 @@ for workflow in "${authoritative_workflows[@]}"; do
   if [[ -n "$unexpected_pins" ]]; then
     echo "$workflow has a toolchain pin that drifts from Rust $expected_toolchain:" >&2
     echo "$unexpected_pins" >&2
+    exit 1
+  fi
+
+  cargo_jobs_without_pin=$(awk -v expected="dtolnay/rust-toolchain@$expected_toolchain" '
+    function finish_job() {
+      if (job != "" && invokes_cargo && !has_pin) {
+        print job
+      }
+    }
+    /^  [[:alnum:]_-]+:$/ {
+      finish_job()
+      job = $1
+      sub(/:$/, "", job)
+      invokes_cargo = 0
+      has_pin = 0
+      next
+    }
+    job != "" && $0 ~ /(^|[[:space:]])cargo([[:space:]]|$)/ {
+      invokes_cargo = 1
+    }
+    job != "" && index($0, "uses: " expected) != 0 {
+      has_pin = 1
+    }
+    END {
+      finish_job()
+    }
+  ' "$workflow")
+  if [[ -n "$cargo_jobs_without_pin" ]]; then
+    echo "$workflow has Cargo jobs without an explicit Rust $expected_toolchain install:" >&2
+    echo "$cargo_jobs_without_pin" >&2
     exit 1
   fi
 done
