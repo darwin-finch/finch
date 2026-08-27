@@ -1059,6 +1059,23 @@ mod isolation_tests {
                 isolated_test_proof().unwrap();
                 return;
             }
+            if mode == "stale-supervisor-pid" {
+                let state_before = std::fs::read_dir(valid.home.join(".finch"))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<std::collections::BTreeSet<_>>();
+                std::env::set_var("FINCH_TEST_SUPERVISOR_PID", u32::MAX.to_string());
+                assert!(isolated_test_proof().is_err());
+                let state_after = std::fs::read_dir(valid.home.join(".finch"))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    state_after, state_before,
+                    "stale supervisor authority mutated isolated Finch state"
+                );
+                return;
+            }
             if mode == "swapped-low-listener" {
                 assert_eq!(unsafe { nix::libc::dup2(11, 10) }, 10);
                 let repaired = isolated_test_proof().unwrap();
@@ -1254,6 +1271,7 @@ mod isolation_tests {
             "missing-proof-backup",
             "mismatched-proof-backup",
             "clobbered-low-proof-is-restored",
+            "stale-supervisor-pid",
         ] {
             let status = supervised_test_subprocess_command()
                 .args([
