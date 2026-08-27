@@ -1,3 +1,4 @@
+// Modified by Finch: RSA private-key errors/tests removed; see FINCH-RSA-REMOVAL.patch.
 //! This crate contains methods to deal with SSH keys, as defined in
 //! crate Russh. This includes in particular various functions for
 //! opening key files, deciphering encrypted keys, and dealing with
@@ -137,10 +138,6 @@ pub enum Error {
     #[error(transparent)]
     IO(#[from] std::io::Error),
 
-    #[cfg(feature = "rsa")]
-    #[error("Rsa: {0}")]
-    Rsa(#[from] rsa::Error),
-
     #[error(transparent)]
     Pad(#[from] PadError),
 
@@ -153,9 +150,6 @@ pub enum Error {
     Der(#[from] der::Error),
     #[error("Spki: {0}")]
     Spki(#[from] spki::Error),
-    #[cfg(feature = "rsa")]
-    #[error("Pkcs1: {0}")]
-    Pkcs1(#[from] pkcs1::Error),
     #[error("Pkcs8: {0}")]
     Pkcs8(#[from] ::pkcs8::Error),
     #[error("Sec1: {0}")]

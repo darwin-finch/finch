@@ -1,3 +1,4 @@
+// Modified by Finch: RSA private-key decoding removed; see FINCH-RSA-REMOVAL.patch.
 use aes::*;
 use ssh_key::PrivateKey;
 
@@ -15,7 +16,7 @@ pub fn decode_pkcs5(
     use block_padding::Pkcs7;
 
     if let Some(pass) = password {
-        let sec = match enc {
+        let _sec = match enc {
             Encryption::Aes128Cbc(ref iv) => {
                 let mut c = md5::Context::new();
                 c.consume(pass.as_bytes());
@@ -29,18 +30,10 @@ pub fn decode_pkcs5(
             }
             Encryption::Aes256Cbc(_) => unimplemented!(),
         };
-        // TODO: presumably pkcs5 could contain non-RSA keys?
-        #[cfg(feature = "rsa")]
-        {
-            super::decode_rsa_pkcs1_der(&sec).map(Into::into)
-        }
-        #[cfg(not(feature = "rsa"))]
-        {
-            Err(Error::UnsupportedKeyType {
-                key_type_string: "RSA".to_string(),
-                key_type_raw: vec![],
-            })
-        }
+        Err(Error::UnsupportedKeyType {
+            key_type_string: "RSA".to_string(),
+            key_type_raw: vec![],
+        })
     } else {
         Err(Error::KeyIsEncrypted)
     }

@@ -227,7 +227,8 @@ impl SshSession {
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
                     exit_code = exit_status;
                 }
-                Some(ChannelMsg::Eof) | None => break,
+                Some(ChannelMsg::Eof) => {}
+                Some(ChannelMsg::Close) | None => break,
                 _ => {}
             }
         }

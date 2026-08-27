@@ -63,8 +63,9 @@ jobs:
 
       - name: Create tarball
         run: |
+          cp vendor/russh-0.60.3/LICENSE.txt target/${{ matrix.target }}/release/RUSSH-LICENSE.txt
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.asset_name }}.tar.gz finch
+          tar czf ../../../${{ matrix.asset_name }}.tar.gz finch RUSSH-LICENSE.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

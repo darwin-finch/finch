@@ -9,9 +9,11 @@ on:
       - main
     paths:
       - Cargo.toml
+      - vendor/russh-0.60.3/**
       - src/ssh/**
       - tests/ssh_client_test.rs
       - .github/workflows/issue-186-russh-security.yml
+      - .github/workflows/release.yml
   workflow_dispatch:
 
 permissions:
@@ -41,7 +43,7 @@ jobs:
       - name: Checkout exact branch tip
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Install Cap'n Proto (Linux)
         if: runner.os == 'Linux'
@@ -68,25 +70,76 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: issue-186-${{ runner.os }}-${{ hashFiles('Cargo.toml') }}
+          key: issue-186-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'vendor/russh-0.60.3/Cargo.toml') }}
 
       - name: Check formatting
         if: runner.os == 'Linux'
-        run: rustfmt --edition 2021 --check src/ssh/client.rs src/ssh/mod.rs tests/ssh_client_test.rs
+        shell: bash
+        run: |
+          rustfmt --edition 2021 --config skip_children=true --check src/ssh/client.rs src/ssh/mod.rs tests/ssh_client_test.rs
+          # keys/mod.rs has deletion-only changes inside an upstream file with
+          # pre-existing formatting drift; formatting it would alter the exact import.
+          rustfmt --edition 2024 --config skip_children=true --check \
+            vendor/russh-0.60.3/src/helpers.rs \
+            vendor/russh-0.60.3/src/keys/key.rs \
+            vendor/russh-0.60.3/src/keys/format/mod.rs \
+            vendor/russh-0.60.3/src/keys/format/pkcs5.rs \
+            vendor/russh-0.60.3/src/keys/format/pkcs8.rs
 
       - name: Assert isolated migration diff
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          git diff --name-only HEAD^1 HEAD | sort > changed-files.txt
-          printf '%s\n' \
-            .github/workflows/issue-186-russh-security.yml \
-            Cargo.toml \
-            src/ssh/client.rs \
-            src/ssh/mod.rs \
-            tests/ssh_client_test.rs \
-            | sort > expected-files.txt
-          diff -u expected-files.txt changed-files.txt
+          git diff --name-only ca184e08a3e99992f86f3a3d14a260a7f3986760 HEAD > changed-files.txt
+          unexpected="$(grep -Ev '^(.github/workflows/issue-186-russh-security.yml|.github/workflows/release.yml|Cargo.toml|src/ssh/client.rs|src/ssh/mod.rs|tests/ssh_client_test.rs|vendor/russh-0.60.3/)' changed-files.txt || true)"
+          if [ -n "$unexpected" ]; then
+            echo "Unexpected files in the issue #186 migration:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+
+      - name: Verify vendored Russh provenance and patch
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          crate="$(mktemp)"
+          reconstructed="$(mktemp -d)"
+          license="$(mktemp)"
+          curl --fail --location --silent --show-error \
+            https://crates.io/api/v1/crates/russh/0.60.3/download \
+            --output "$crate"
+          echo '324b92f459d3e42da294e14e8eb150d2215fcfb7c966838bc1127cd68bc05a0d  '"$crate" | sha256sum --check
+          tar -xzf "$crate" --strip-components=1 -C "$reconstructed"
+          (cd "$reconstructed" && patch --strip=3 < "$GITHUB_WORKSPACE/vendor/russh-0.60.3/FINCH-RSA-REMOVAL.patch")
+          curl --fail --location --silent --show-error \
+            https://raw.githubusercontent.com/Eugeny/russh/fab67f8ec3e1dbe45fb1caf1362cdd04848ce9d0/LICENSE.txt \
+            --output "$license"
+          echo 'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30  '"$license" | sha256sum --check
+          cmp "$license" vendor/russh-0.60.3/LICENSE.txt
+          diff -ru \
+            --exclude FINCH-VENDOR.md \
+            --exclude FINCH-RSA-REMOVAL.patch \
+            --exclude LICENSE.txt \
+            "$reconstructed" vendor/russh-0.60.3
+
+      - name: Reject reintroduced Russh RSA implementation
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -Eiq '(^|[[:space:]])rsa[[:space:]]*=|dep:rsa|ssh-key/rsa|dependencies\.rsa|dependencies\.pkcs1' \
+            vendor/russh-0.60.3/Cargo.toml vendor/russh-0.60.3/Cargo.toml.orig; then
+            echo 'Vendored Russh reintroduced an RSA feature or dependency'
+            exit 1
+          fi
+          if grep -R -n 'feature = "rsa"' \
+            vendor/russh-0.60.3/src/helpers.rs \
+            vendor/russh-0.60.3/src/keys/key.rs \
+            vendor/russh-0.60.3/src/keys/format; then
+            echo 'Vendored Russh reintroduced an RSA-gated implementation path'
+            exit 1
+          fi
 
       - name: Check default feature targets
         run: cargo check --lib --bins --tests
@@ -94,20 +147,30 @@ jobs:
       - name: Check no-default-feature targets
         run: cargo check --lib --bins --tests --no-default-features
 
+      - name: Check all declared Finch feature targets
+        run: cargo check --lib --bins --tests --all-features
+
       - name: Test SSH production boundary (default features)
         run: cargo test --test ssh_client_test -- --nocapture
 
       - name: Test SSH production boundary (no default features)
         run: cargo test --test ssh_client_test --no-default-features -- --nocapture
 
+      - name: Test SSH production boundary (all declared features)
+        run: cargo test --test ssh_client_test --all-features -- --nocapture
+
+      - name: Test bounded SSH-agent request and response frames
+        run: cargo test --manifest-path vendor/russh-0.60.3/Cargo.toml --no-default-features --features ring oversized_agent_ -- --nocapture
+
       - name: Assert reviewed SSH dependency graph
         shell: bash
         run: |
-          cargo tree --edges normal --format '{p}' | sort -u > ssh-tree-default.txt
-          cargo tree --edges normal --no-default-features --format '{p}' | sort -u > ssh-tree-no-default.txt
-          for tree in ssh-tree-default.txt ssh-tree-no-default.txt; do
-            grep -Eq '^russh v0\.60\.[3-9][0-9]* ' "$tree"
-            grep -Eq '^russh-cryptovec v0\.60\.[3-9][0-9]* ' "$tree"
+          cargo tree --edges normal --prefix none --format '{p}' | sort -u > ssh-tree-default.txt
+          cargo tree --edges normal --no-default-features --prefix none --format '{p}' | sort -u > ssh-tree-no-default.txt
+          cargo tree --edges normal --all-features --prefix none --format '{p}' | sort -u > ssh-tree-all.txt
+          for tree in ssh-tree-default.txt ssh-tree-no-default.txt ssh-tree-all.txt; do
+            grep -Eq '^russh v0\.60\.[3-9][0-9]*( |$)' "$tree"
+            grep -Eq '^russh-cryptovec v0\.60\.[3-9][0-9]*( |$)' "$tree"
             if grep -Eq '^(rsa|russh-keys) v' "$tree"; then
               echo "Forbidden SSH/RSA package remains in $tree"
               grep -E '^(rsa|russh-keys) v' "$tree"

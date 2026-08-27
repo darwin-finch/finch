@@ -1,3 +1,4 @@
+// Modified by Finch: RSA private-key decoding removed; see FINCH-RSA-REMOVAL.patch.
 use std::io::Write;
 
 use data_encoding::{BASE64_MIME, HEXLOWER_PERMISSIVE};
@@ -34,8 +35,6 @@ pub enum Encryption {
 
 #[derive(Clone, Debug)]
 enum Format {
-    #[cfg(feature = "rsa")]
-    Rsa,
     Openssh,
     Pkcs5Encrypted(Encryption),
     Pkcs8Encrypted,
@@ -74,18 +73,10 @@ pub fn decode_secret_key(secret: &str, password: Option<&str>) -> Result<Private
                 started = true;
                 format = Some(Format::Openssh);
             } else if l == "-----BEGIN RSA PRIVATE KEY-----" {
-                #[cfg(feature = "rsa")]
-                {
-                    started = true;
-                    format = Some(Format::Rsa);
-                }
-                #[cfg(not(feature = "rsa"))]
-                {
-                    return Err(Error::UnsupportedKeyType {
-                        key_type_string: "RSA".to_string(),
-                        key_type_raw: vec![],
-                    });
-                }
+                return Err(Error::UnsupportedKeyType {
+                    key_type_string: "RSA".to_string(),
+                    key_type_raw: vec![],
+                });
             } else if l == "-----BEGIN ENCRYPTED PRIVATE KEY-----" {
                 started = true;
                 format = Some(Format::Pkcs8Encrypted);
@@ -100,8 +91,6 @@ pub fn decode_secret_key(secret: &str, password: Option<&str>) -> Result<Private
     let secret = BASE64_MIME.decode(secret.as_bytes())?;
     match format {
         Some(Format::Openssh) => decode_openssh(&secret, password),
-        #[cfg(feature = "rsa")]
-        Some(Format::Rsa) => Ok(decode_rsa_pkcs1_der(&secret)?.into()),
         Some(Format::Pkcs5Encrypted(enc)) => decode_pkcs5(&secret, password, enc),
         Some(Format::Pkcs8Encrypted) | Some(Format::Pkcs8) => {
             let result = self::pkcs8::decode_pkcs8(&secret, password.map(|x| x.as_bytes()));
@@ -140,13 +129,4 @@ pub fn encode_pkcs8_pem_encrypted<W: Write>(
     w.write_all(BASE64_MIME.encode(&x).as_bytes())?;
     w.write_all(b"\n-----END ENCRYPTED PRIVATE KEY-----\n")?;
     Ok(())
-}
-
-#[cfg(feature = "rsa")]
-fn decode_rsa_pkcs1_der(secret: &[u8]) -> Result<ssh_key::private::RsaKeypair, Error> {
-    use std::convert::TryInto;
-
-    use pkcs1::DecodeRsaPrivateKey;
-
-    Ok(rsa::RsaPrivateKey::from_pkcs1_der(secret)?.try_into()?)
 }

@@ -1,3 +1,4 @@
+# Modified by Finch: RSA support and dependencies removed; see FINCH-RSA-REMOVAL.patch.
 [package]
 authors = ["Pierre-Étienne Meunier <pe@pijul.org>"]
 description = "A client and server SSH library."
@@ -13,7 +14,7 @@ version = "0.60.3"
 rust-version = "1.85"
 
 [features]
-default = ["flate2", "aws-lc-rs", "rsa"]
+default = ["flate2", "aws-lc-rs"]
 # Crypto backends: enable at least one of `aws-lc-rs` or `ring`.
 aws-lc-rs = ["dep:aws-lc-rs"] # Default crypto backend.
 async-trait = ["dep:async-trait"]
@@ -23,7 +24,6 @@ des = ["dep:des"]
 # Danger: DSA algorithm is insecure.
 dsa = ["ssh-key/dsa"]
 ring = ["dep:ring"] # Alternative crypto backend.
-rsa = ["dep:rsa", "dep:pkcs1", "ssh-key/rsa", "ssh-key/rsa-sha1"]
 serde = ["ssh-key/serde"]
 _bench = ["dep:criterion"]
 
@@ -83,14 +83,12 @@ p384 = { version = "=0.14.0-rc.7", features = ["ecdh"] }
 p521 = { version = "=0.14.0-rc.7", features = ["ecdh"] }
 pbkdf2 = "0.12"
 pbkdf2_0_13 = { package = "pbkdf2", version = "0.13.0" }
-pkcs1 = { version = "=0.8.0-rc.4", optional = true }
 pkcs5 = "=0.8.0-rc.13"
 pkcs8 = { version = "=0.11.0-rc.11", features = ["encryption", "std"] }
 polyval = "0.7.1" # only pinned due to a cargo-minimal-versions failure in 0.7.0
 rand_core = { version = "0.10.0" }
 rand.workspace = true
 ring = { version = "0.17.14", optional = true }
-rsa = { version = "=0.10.0-rc.16", optional = true }
 russh-cryptovec = { version = "0.60.3", path = "../cryptovec", features = [
   "ssh-encoding",
 ] }
@@ -162,3 +160,4 @@ all-features = true
 [[bench]]
 name = "ciphers"
 harness = false
+[package]

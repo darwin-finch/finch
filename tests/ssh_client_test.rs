@@ -4,6 +4,7 @@ use russh::keys::ssh_key::{HashAlg, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Server as _, Session};
 use russh::{Channel, ChannelId};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,6 +26,15 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_inner(None).await
+    }
+
+    #[cfg(unix)]
+    async fn start_with_shell(cwd: PathBuf) -> Self {
+        Self::start_inner(Some(cwd)).await
+    }
+
+    async fn start_inner(shell_cwd: Option<PathBuf>) -> Self {
         let host_key = private_key_from_seed(&HOST_KEY_SEED);
         let host_key_fingerprint = host_key
             .public_key()
@@ -40,6 +50,7 @@ impl TestServer {
             authorized_key,
             successful_authentications: successful_authentications.clone(),
             commands: commands.clone(),
+            shell_cwd,
         };
         let config = Arc::new(server::Config {
             keys: vec![host_key],
@@ -77,6 +88,7 @@ struct FixtureServer {
     authorized_key: PublicKey,
     successful_authentications: Arc<AtomicUsize>,
     commands: Arc<Mutex<Vec<String>>>,
+    shell_cwd: Option<PathBuf>,
 }
 
 impl server::Server for FixtureServer {
@@ -87,6 +99,7 @@ impl server::Server for FixtureServer {
             authorized_key: self.authorized_key.clone(),
             successful_authentications: self.successful_authentications.clone(),
             commands: self.commands.clone(),
+            shell_cwd: self.shell_cwd.clone(),
         }
     }
 }
@@ -95,6 +108,7 @@ struct FixtureHandler {
     authorized_key: PublicKey,
     successful_authentications: Arc<AtomicUsize>,
     commands: Arc<Mutex<Vec<String>>>,
+    shell_cwd: Option<PathBuf>,
 }
 
 impl server::Handler for FixtureHandler {
@@ -140,7 +154,24 @@ impl server::Handler for FixtureHandler {
         self.commands.lock().unwrap().push(command.clone());
         session.channel_success(channel)?;
 
-        let exit_status = if command == "fixture-command" {
+        let exit_status = if let Some(cwd) = &self.shell_cwd {
+            #[cfg(unix)]
+            {
+                let output = tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .current_dir(cwd)
+                    .output()
+                    .await?;
+                session.data(channel, output.stdout.into())?;
+                session.extended_data(channel, 1, output.stderr.into())?;
+                output.status.code().unwrap_or(255) as u32
+            }
+            #[cfg(not(unix))]
+            {
+                unreachable!("shell fixture is only constructed on Unix")
+            }
+        } else if command == "fixture-command" {
             session.data(channel, b"stdout-data".to_vec())?;
             session.extended_data(channel, 1, b"stderr-data".to_vec())?;
             23
@@ -295,6 +326,34 @@ async fn test_ssh_file_helpers_quote_untrusted_paths() {
         commands[1],
         "cat < 'dir/file'\"'\"'; touch /tmp/pwned; echo '\"'\"''"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_ssh_file_helpers_execute_hostile_path_without_injection() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = TestServer::start_with_shell(directory.path().to_path_buf()).await;
+    let mut session = SshSession::connect_password_with_host_key_policy(
+        "127.0.0.1",
+        server.addr.port(),
+        "finch",
+        "correct horse",
+        server.policy(),
+    )
+    .await
+    .unwrap();
+    let hostile_path = "payload'; touch injected-marker; echo '";
+
+    session
+        .write_file(hostile_path, b"exact file contents")
+        .await
+        .unwrap();
+    assert_eq!(
+        session.read_file(hostile_path).await.unwrap(),
+        b"exact file contents"
+    );
+    assert!(!directory.path().join("injected-marker").exists());
+    session.close().await.unwrap();
 }
 
 #[tokio::test]

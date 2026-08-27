@@ -1,3 +1,4 @@
+// Modified by Finch: RSA-only signing removed; see FINCH-RSA-REMOVAL.patch.
 use std::fmt::Debug;
 
 use ssh_encoding::{Decode, Encode};
@@ -69,13 +70,6 @@ pub(crate) use macros::map_err;
 #[doc(hidden)]
 pub fn sign_with_hash_alg(key: &PrivateKeyWithHashAlg, data: &[u8]) -> ssh_key::Result<Vec<u8>> {
     Ok(match key.key_data() {
-        #[cfg(feature = "rsa")]
-        ssh_key::private::KeypairData::Rsa(rsa_keypair) => {
-            let ssh_key::Algorithm::Rsa { hash } = key.algorithm() else {
-                unreachable!();
-            };
-            signature::Signer::try_sign(&(rsa_keypair, hash), data)?.encoded()?
-        }
         keypair => signature::Signer::try_sign(keypair, data)?.encoded()?,
     })
 }

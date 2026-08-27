@@ -1,3 +1,4 @@
+// Modified by Finch: RSA private-key types removed; see FINCH-RSA-REMOVAL.patch.
 use rand::rng;
 // Copyright 2016 Pierre-Étienne Meunier
 //
@@ -110,16 +111,6 @@ pub const ALL_KEY_TYPES: &[Algorithm] = &[
         curve: EcdsaCurve::NistP521,
     },
     Algorithm::Ed25519,
-    #[cfg(feature = "rsa")]
-    Algorithm::Rsa { hash: None },
-    #[cfg(feature = "rsa")]
-    Algorithm::Rsa {
-        hash: Some(ssh_key::HashAlg::Sha256),
-    },
-    #[cfg(feature = "rsa")]
-    Algorithm::Rsa {
-        hash: Some(ssh_key::HashAlg::Sha512),
-    },
     Algorithm::SkEcdsaSha2NistP256,
     Algorithm::SkEd25519,
 ];
