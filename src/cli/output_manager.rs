@@ -5,13 +5,13 @@
 // into a structured buffer AND writes it to stdout immediately with ANSI colors.
 // This enables terminal scrollback while maintaining TUI compatibility.
 
-use std::io::{self, Write};
 use std::collections::{BTreeMap, HashMap};
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::cli::messages::{
-    BrainParticipantMessage, LiveToolMessage, MessageRef, OperationMessage, StaticMessage,
-    StreamingResponseMessage, UserQueryMessage, WorkUnit,
+    BrainParticipantMessage, LiveToolMessage, MessageId, MessageRef, OperationMessage,
+    StaticMessage, StreamingResponseMessage, UserQueryMessage, WorkUnit,
 };
 use crate::runtime::VmEffectEnvelope;
 use crate::vm::{HostSideEffect, TypedValue, UiOperation, VmSideEffect};
@@ -54,7 +54,11 @@ impl std::fmt::Debug for VmOutputProjection {
             .debug_struct("VmOutputProjection")
             .field(
                 "open_handles",
-                &self.handles.lock().map(|handles| handles.len()).unwrap_or(0),
+                &self
+                    .handles
+                    .lock()
+                    .map(|handles| handles.len())
+                    .unwrap_or(0),
             )
             .finish_non_exhaustive()
     }
@@ -106,7 +110,7 @@ impl VmOutputProjection {
             // guard meaningful even if a non-terminal embedder calls this
             // adapter from several worker threads: later events cannot render
             // ahead of an earlier event that has reserved its sequence.
-            self.project(&next.effect);
+            self.project_for_execution(Some(execution_id), &next.effect);
             projected.push(next);
             *expected += 1;
         }
@@ -120,6 +124,10 @@ impl VmOutputProjection {
     /// ignored here: the typed runtime has already enforced ownership and
     /// generation before an event reaches a host projection.
     pub fn project(&self, effect: &VmSideEffect) {
+        self.project_for_execution(None, effect);
+    }
+
+    fn project_for_execution(&self, execution_id: Option<uuid::Uuid>, effect: &VmSideEffect) {
         match &effect.event {
             HostSideEffect::Emit { text } => self.default_response.append_response(text),
             HostSideEffect::Request { .. } => {}
@@ -128,7 +136,13 @@ impl VmOutputProjection {
                 target,
                 text,
                 progress,
-            } => self.project_ui(*operation, target.as_ref(), text.as_deref(), progress.as_ref()),
+            } => self.project_ui(
+                execution_id,
+                *operation,
+                target.as_ref(),
+                text.as_deref(),
+                progress.as_ref(),
+            ),
         }
     }
 
@@ -142,6 +156,7 @@ impl VmOutputProjection {
 
     fn project_ui(
         &self,
+        execution_id: Option<uuid::Uuid>,
         operation: UiOperation,
         target: Option<&TypedValue>,
         text: Option<&str>,
@@ -152,7 +167,18 @@ impl VmOutputProjection {
         };
         match operation {
             UiOperation::Create => {
-                let unit = self.output.start_work_unit(text.unwrap_or("Working"));
+                let unit = if let Some(execution_id) = execution_id {
+                    let stable = uuid::Uuid::new_v5(
+                        &execution_id,
+                        format!("output-handle:{handle}").as_bytes(),
+                    );
+                    self.output.start_work_unit_with_id(
+                        MessageId::from_uuid(stable),
+                        text.unwrap_or("Working"),
+                    )
+                } else {
+                    self.output.start_work_unit(text.unwrap_or("Working"))
+                };
                 // A handle is a VM-owned reactive artifact, not a second
                 // assistant reply.  Give it the same plain output chrome as
                 // `say` output so progress/status updates never acquire the
@@ -219,9 +245,7 @@ impl VmOutputProjection {
 
 fn output_handle(target: Option<&TypedValue>) -> Option<&str> {
     match target {
-        Some(TypedValue::Resource { kind, handle, .. }) if kind == "output-handle" => {
-            Some(handle)
-        }
+        Some(TypedValue::Resource { kind, handle, .. }) if kind == "output-handle" => Some(handle),
         _ => None,
     }
 }
@@ -407,6 +431,14 @@ impl OutputManager {
         wu
     }
 
+    /// Register a replayable WorkUnit using identity derived from its
+    /// canonical event envelope rather than frontend construction time.
+    pub fn start_work_unit_with_id(&self, id: MessageId, verb: impl Into<String>) -> Arc<WorkUnit> {
+        let wu = Arc::new(WorkUnit::with_id(id, verb));
+        self.add_trait_message(Arc::clone(&wu) as MessageRef);
+        wu
+    }
+
     /// Write status information (deprecated - use write_progress or write_info)
     pub fn write_status(&self, content: impl Into<String>) {
         // Route to progress for backward compatibility
@@ -451,7 +483,10 @@ impl OutputManager {
     /// Remove one transient projection after its contents have been adopted
     /// by a durable grouped work unit.
     pub fn remove_message(&self, id: crate::cli::messages::MessageId) {
-        self.messages.write().unwrap().retain(|message| message.id() != id);
+        self.messages
+            .write()
+            .unwrap()
+            .retain(|message| message.id() != id);
     }
 
     /// Get the number of messages in the buffer
@@ -566,7 +601,12 @@ mod tests {
             output: Vec::new(),
             origin: crate::vm::SourceOrigin::generated("test"),
         });
-        projection.project(&output_effect(UiOperation::Create, "download", Some("Download"), None));
+        projection.project(&output_effect(
+            UiOperation::Create,
+            "download",
+            Some("Download"),
+            None,
+        ));
         projection.project(&output_effect(
             UiOperation::Status,
             "download",
@@ -582,13 +622,21 @@ mod tests {
                 total: Some(5),
             }),
         ));
-        projection.project(&output_effect(UiOperation::Complete, "download", None, None));
+        projection.project(&output_effect(
+            UiOperation::Complete,
+            "download",
+            None,
+            None,
+        ));
 
         let messages = manager.get_messages();
         assert_eq!(messages.len(), 2);
         assert_eq!(response.content(), "answer next");
         assert!(messages[1].content().is_empty());
-        assert_eq!(messages[1].status(), crate::cli::messages::MessageStatus::Complete);
+        assert_eq!(
+            messages[1].status(),
+            crate::cli::messages::MessageStatus::Complete
+        );
         let rendered = messages[1].format(&crate::config::ColorScheme::default());
         assert!(rendered.contains("Download"));
         assert!(rendered.contains("2 / 5"));
@@ -646,6 +694,27 @@ mod tests {
             "the missing event must drain the retained contiguous suffix"
         );
         assert_eq!(response.content(), "first secondthird");
+    }
+
+    #[test]
+    fn replayed_output_handle_reconstructs_the_same_work_unit_id() {
+        let execution_id = uuid::Uuid::from_u128(0x69);
+        let envelope = VmEffectEnvelope {
+            execution_id,
+            effect: VmSideEffect {
+                sequence: 0,
+                ..output_effect(UiOperation::Create, "download", Some("Download"), None)
+            },
+        };
+        let project_once = || {
+            let manager = Arc::new(silent_manager());
+            let response = manager.start_work_unit("Response");
+            let projection = VmOutputProjection::new(Arc::clone(&manager), response);
+            assert_eq!(projection.project_envelope(envelope.clone()).len(), 1);
+            manager.get_messages()[1].id()
+        };
+
+        assert_eq!(project_once(), project_once());
     }
 
     #[test]
@@ -709,5 +778,4 @@ mod tests {
         let _wu = manager.start_work_unit("thinking");
         assert_eq!(manager.len(), 1);
     }
-
 }

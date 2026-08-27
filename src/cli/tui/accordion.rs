@@ -33,21 +33,6 @@ pub struct AccordionState {
 }
 
 impl AccordionState {
-    pub fn expand_all(&mut self, message: &MessageRef, colors: &ColorScheme) {
-        if let Some(root) = message.transcript_row(colors) {
-            self.set_tree_expanded(&root);
-        }
-    }
-
-    fn set_tree_expanded(&mut self, row: &TranscriptRow) {
-        if !row.body.is_empty() || !row.children.is_empty() {
-            self.expanded.insert(row.id.clone(), true);
-        }
-        for child in &row.children {
-            self.set_tree_expanded(child);
-        }
-    }
-
     pub fn is_expanded(&self, row: &TranscriptRow) -> bool {
         self.expanded
             .get(&row.id)
@@ -72,7 +57,20 @@ impl AccordionState {
                 .collect();
         };
         let mut lines = Vec::new();
-        self.render_row(&root, 0, &mut lines);
+        self.render_row(&root, 0, false, &mut lines);
+        lines
+    }
+
+    pub fn render_message_fully_expanded(
+        &self,
+        message: &MessageRef,
+        colors: &ColorScheme,
+    ) -> Vec<RenderedTranscriptLine> {
+        let Some(root) = message.transcript_row(colors) else {
+            return self.render_message(message, colors);
+        };
+        let mut lines = Vec::new();
+        self.render_row(&root, 0, true, &mut lines);
         lines
     }
 
@@ -80,10 +78,11 @@ impl AccordionState {
         &self,
         row: &TranscriptRow,
         depth: usize,
+        force_expanded: bool,
         lines: &mut Vec<RenderedTranscriptLine>,
     ) {
         let expandable = !row.body.is_empty() || !row.children.is_empty();
-        let expanded = expandable && self.is_expanded(row);
+        let expanded = expandable && (force_expanded || self.is_expanded(row));
         let marker = match (expandable, expanded) {
             (true, true) => "▼",
             (true, false) => "▶",
@@ -125,7 +124,7 @@ impl AccordionState {
             });
         }
         for child in &row.children {
-            self.render_row(child, depth + 1, lines);
+            self.render_row(child, depth + 1, force_expanded, lines);
         }
     }
 

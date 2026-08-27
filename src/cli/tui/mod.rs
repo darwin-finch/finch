@@ -1333,20 +1333,25 @@ fn commit_complete_messages(
     printed_ids: &mut HashSet<MessageId>,
 ) -> Result<()> {
     for message in messages {
-        accordion.expand_all(message, colors);
+        if printed_ids.contains(&message.id()) {
+            continue;
+        }
         let complete = accordion
-            .render_message(message, colors)
+            .render_message_fully_expanded(message, colors)
             .into_iter()
             .map(|line| line.text)
             .collect::<Vec<_>>()
             .join("\n");
+        let mut staged = Vec::new();
         for line in complete.split('\n') {
-            execute!(stdout, Print(line.trim_end_matches('\r')), Print("\r\n"))?;
+            execute!(staged, Print(line.trim_end_matches('\r')), Print("\r\n"))?;
         }
-        execute!(stdout, Print("\r\n"))?;
-        stdout.flush()?;
-        // A failed body, delimiter, or flush leaves the message retryable.
+        execute!(staged, Print("\r\n"))?;
+        stdout.write_all(&staged)?;
+        // Once write_all accepts the staged record, retrying it would create a
+        // duplicate if a later flush reports an ambiguous error.
         printed_ids.insert(message.id());
+        stdout.flush()?;
     }
     Ok(())
 }
@@ -1855,7 +1860,7 @@ fn viewport_tail_rendered_lines(
             return selected;
         }
         let mut compact = header.clone();
-        compact.text = visible_prefix(&compact.text, terminal_width.max(1));
+        compact.text = compact_disclosure_label(header, terminal_width.max(1));
         return vec![compact];
     }
     let mut pinned = vec![header.clone()];
@@ -1865,6 +1870,22 @@ fn viewport_tail_rendered_lines(
         row_budget.saturating_sub(header_rows),
     ));
     pinned
+}
+
+fn compact_disclosure_label(header: &RenderedTranscriptLine, width: usize) -> String {
+    let expanded = header.row_expanded.unwrap_or(false);
+    let state = if expanded {
+        if width >= "[expanded]".len() {
+            "[expanded]"
+        } else {
+            "open"
+        }
+    } else if width >= "[collapsed]".len() {
+        "[collapsed]"
+    } else {
+        "closed"
+    };
+    visible_prefix(state, width)
 }
 
 fn rendered_tail_without_pinning(
@@ -3945,7 +3966,15 @@ mod tests {
         let tiny = viewport_tail_rendered_lines(&all, 8, 1);
         assert_eq!(tiny.len(), 1);
         assert!(tiny[0].row_id.is_some());
+        assert!(matches!(tiny[0].text.as_str(), "[expanded]" | "open"));
         assert_eq!(shadow_buffer::physical_rows(&tiny[0].text, 8), 1);
+        let mut collapsed_state = AccordionState::default();
+        collapsed_state.rebuild_hit_regions(&all, 0, 20);
+        assert!(collapsed_state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert!(collapsed_state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
+        let collapsed = collapsed_state.render_message(&message, &colors);
+        let collapsed_tiny = viewport_tail_rendered_lines(&collapsed, 8, 1);
+        assert_eq!(collapsed_tiny[0].text, "closed");
     }
 
     #[test]
@@ -3968,6 +3997,12 @@ mod tests {
         let message: MessageRef = work;
         let colors = ColorScheme::default();
         let mut state = AccordionState::default();
+        let initial = state.render_message(&message, &colors);
+        state.rebuild_hit_regions(&initial, 0, 80);
+        assert!(state.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert!(state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
+        let before = state.render_message(&message, &colors);
+        assert!(before[0].text.contains("[collapsed]"));
         let mut printed = HashSet::new();
         let mut failure = FlushFailure(Vec::new());
         assert!(commit_complete_messages(
@@ -3978,7 +4013,25 @@ mod tests {
             &mut printed,
         )
         .is_err());
-        assert!(printed.is_empty(), "failed commit must remain retryable");
+        assert_eq!(printed.len(), 1, "accepted bytes must not be retried");
+        let accepted_len = failure.0.len();
+        commit_complete_messages(
+            &mut failure,
+            std::slice::from_ref(&message),
+            &mut state,
+            &colors,
+            &mut printed,
+        )
+        .expect("already accepted message skips ambiguous flush retry");
+        assert_eq!(failure.0.len(), accepted_len);
+        assert_eq!(
+            String::from_utf8(failure.0)
+                .unwrap()
+                .matches("secret canonical body")
+                .count(),
+            1
+        );
+        assert_eq!(state.render_message(&message, &colors), before);
 
         let mut bytes = Vec::new();
         begin_full_viewport_paint(
@@ -3987,12 +4040,69 @@ mod tests {
             &["resize projection".into()],
         )
         .unwrap();
-        commit_complete_messages(&mut bytes, &[message], &mut state, &colors, &mut printed)
-            .unwrap();
+        let mut resize_printed = HashSet::new();
+        commit_complete_messages(
+            &mut bytes,
+            &[message],
+            &mut state,
+            &colors,
+            &mut resize_printed,
+        )
+        .unwrap();
         let raw = String::from_utf8(bytes).unwrap();
         assert!(raw.find("\x1b[2J").unwrap() < raw.find("secret canonical body").unwrap());
         assert_eq!(raw.matches("secret canonical body").count(), 1);
-        assert_eq!(printed.len(), 1);
+        assert_eq!(resize_printed.len(), 1);
+
+        struct TerminalHistory {
+            screen: Vec<String>,
+            history: Vec<String>,
+            cursor: usize,
+        }
+        impl TerminalHistory {
+            fn write_line(&mut self, line: &str) {
+                if self.cursor >= self.screen.len() {
+                    self.history.push(self.screen.remove(0));
+                    self.screen.push(String::new());
+                    self.cursor = self.screen.len() - 1;
+                }
+                self.screen[self.cursor] = line.to_string();
+                self.cursor += 1;
+            }
+        }
+        let mut canonical = Vec::new();
+        let mut canonical_printed = HashSet::new();
+        commit_complete_messages(
+            &mut canonical,
+            std::slice::from_ref(&message),
+            &mut state,
+            &colors,
+            &mut canonical_printed,
+        )
+        .unwrap();
+        let mut terminal = TerminalHistory {
+            screen: vec![String::new(); 6],
+            history: Vec::new(),
+            cursor: 4,
+        };
+        for line in String::from_utf8(canonical)
+            .unwrap()
+            .split_terminator("\r\n")
+        {
+            terminal.write_line(line);
+        }
+        // Production draw_live_area writes the complete two-row live region
+        // below the old live origin, forcing every inserted canonical row out
+        // of the visible screen and into terminal history.
+        terminal.write_line("live separator");
+        terminal.write_line("live draft");
+        assert!(terminal
+            .history
+            .iter()
+            .any(|line| line.contains("secret canonical body")));
+        let history_before_clear = terminal.history.clone();
+        terminal.screen.fill(String::new());
+        assert_eq!(terminal.history, history_before_clear);
     }
 
     #[test]
