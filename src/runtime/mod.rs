@@ -6215,7 +6215,7 @@ fn normalize_process_grant(
         return Ok(());
     }
     let ResourceSelector::Process { executables } = &mut requirement.selector else {
-        return Ok(());
+        return Err("process-run grants require a typed process selector".into());
     };
     for executable in executables.iter_mut() {
         if executable.starts_with(PROCESS_IDENTITY_PREFIX) {
@@ -10144,7 +10144,7 @@ mod tests {
             }))
             .unwrap();
         let requirement = CapabilityRequirement {
-            capability: CapabilityKind::ProcessRun,
+            capability: CapabilityKind::AgentSpawn,
             selector: crate::vm::ResourceSelector::None,
         };
         let error = runtime
@@ -10173,21 +10173,53 @@ mod tests {
     }
 
     #[test]
+    fn process_grant_without_process_selector_has_no_authority_effects() {
+        let runtime = ProgramRuntime::new();
+        let sink_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        runtime
+            .set_authority_sink({
+                let sink_calls = Arc::clone(&sink_calls);
+                Arc::new(move |_| {
+                    sink_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+            .unwrap();
+        let before = runtime.capability_ledger().unwrap();
+
+        let error = runtime
+            .issue_typed_capability(
+                CapabilityRequirement {
+                    capability: CapabilityKind::ProcessRun,
+                    selector: crate::vm::ResourceSelector::None,
+                },
+                GrantScope::Global,
+                "test-user",
+                None,
+            )
+            .expect_err("process-run authority must bind an exact process selector");
+
+        assert!(format!("{error:#}").contains("typed process selector"));
+        assert_eq!(runtime.capability_ledger().unwrap(), before);
+        assert_eq!(sink_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn policy_change_revokes_obsolete_and_denied_grants_and_blocks_reissue() {
         let runtime = ProgramRuntime::new();
         let file_read = CapabilityRequirement::file(
             crate::vm::FileOperation::Read,
             crate::vm::FileSelector::parse("./Cargo.toml").unwrap(),
         );
-        let process_run = CapabilityRequirement {
-            capability: CapabilityKind::ProcessRun,
+        let agent_spawn = CapabilityRequirement {
+            capability: CapabilityKind::AgentSpawn,
             selector: crate::vm::ResourceSelector::None,
         };
         let file_grant = runtime
             .issue_typed_capability(file_read.clone(), GrantScope::Global, "test-user", None)
             .unwrap();
-        let process_grant = runtime
-            .issue_typed_capability(process_run, GrantScope::Global, "test-user", None)
+        let agent_grant = runtime
+            .issue_typed_capability(agent_spawn, GrantScope::Global, "test-user", None)
             .unwrap();
 
         let mut denied = std::collections::BTreeSet::new();
@@ -10201,7 +10233,7 @@ mod tests {
                 "policy-admin",
             )
             .unwrap();
-        assert_eq!(revoked, vec![file_grant, process_grant]);
+        assert_eq!(revoked, vec![file_grant, agent_grant]);
         let ledger = runtime.capability_ledger().unwrap();
         assert!(ledger
             .grants
@@ -10215,7 +10247,7 @@ mod tests {
             .grants
             .grants
             .iter()
-            .find(|grant| grant.id == process_grant)
+            .find(|grant| grant.id == agent_grant)
             .unwrap()
             .revoked_at_unix_ms
             .is_some());
@@ -10236,10 +10268,10 @@ mod tests {
             .to_string()
             .contains("cannot be reused"));
 
-        let replacement_process_grant = runtime
+        let replacement_agent_grant = runtime
             .issue_typed_capability(
                 CapabilityRequirement {
-                    capability: CapabilityKind::ProcessRun,
+                    capability: CapabilityKind::AgentSpawn,
                     selector: crate::vm::ResourceSelector::None,
                 },
                 GrantScope::Global,
@@ -10256,7 +10288,7 @@ mod tests {
                 "policy-admin",
             )
             .unwrap();
-        assert_eq!(revoked, vec![replacement_process_grant]);
+        assert_eq!(revoked, vec![replacement_agent_grant]);
         assert_eq!(
             runtime.capability_policy().unwrap().policy_hash,
             "finch-local-runtime-v3"
@@ -10267,7 +10299,7 @@ mod tests {
     fn failed_authority_sink_rolls_back_policy_and_its_revocations() {
         let runtime = ProgramRuntime::new();
         let requirement = CapabilityRequirement {
-            capability: CapabilityKind::ProcessRun,
+            capability: CapabilityKind::AgentSpawn,
             selector: crate::vm::ResourceSelector::None,
         };
         let grant_id = runtime
