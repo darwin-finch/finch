@@ -50,7 +50,7 @@ jobs:
         run: cargo check --lib --bins --tests
 
       - name: Run provider capability and boundary tests
-        run: cargo test --lib providers::
+        run: "cargo test --lib providers::"
 
       - name: Prove validated request tokens cannot be forged
         run: cargo test --doc -- ValidatedProviderRequest
