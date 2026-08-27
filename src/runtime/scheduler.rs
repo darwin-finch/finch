@@ -199,6 +199,9 @@ impl ProviderResolver {
         provider: Option<&str>,
         model: Option<&str>,
     ) -> Result<Arc<dyn Generator>> {
+        if let Some(config) = &self.config {
+            crate::providers::factory::preflight_provider_config(config)?;
+        }
         let active = self.active.read().await.clone();
         if provider.is_none() && model.is_none() {
             return Ok(active);
@@ -1141,6 +1144,85 @@ mod tests {
         }
     }
 
+    fn local_profile() -> ProviderEntry {
+        ProviderEntry::Local {
+            inference_provider: crate::models::unified_loader::InferenceProvider::Onnx,
+            execution_target: crate::config::ExecutionTarget::Auto,
+            model_family: crate::models::unified_loader::ModelFamily::Qwen2,
+            model_size: crate::models::unified_loader::ModelSize::Medium,
+            model_repo: None,
+            model_path: None,
+            enabled: true,
+            name: Some("local".into()),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum SiblingDefect {
+        Missing,
+        Revoked,
+        Unsupported,
+    }
+
+    fn config_with_sibling_defect(
+        endpoint: &str,
+        primary_name: &str,
+        defect: SiblingDefect,
+    ) -> crate::config::Config {
+        let mut profiles = vec![
+            named_account_profile(primary_name, "account-a", "a", endpoint),
+            local_profile(),
+        ];
+        let mut credentials = vec![named_account_credential("account-a", "a", endpoint)];
+        match defect {
+            SiblingDefect::Missing => {
+                profiles.push(named_account_profile("broken", "missing", "b", endpoint));
+            }
+            SiblingDefect::Revoked => {
+                profiles.push(named_account_profile("broken", "account-b", "b", endpoint));
+                let mut revoked = named_account_credential("account-b", "b", endpoint);
+                revoked.lifecycle = CredentialLifecycle::Revoked;
+                credentials.push(revoked);
+            }
+            SiblingDefect::Unsupported => {
+                profiles.push(ProviderEntry::Credentialed {
+                    provider: CredentialProvider::ChatgptSubscription,
+                    credential: CredentialBinding {
+                        credential_ref: "subscription".into(),
+                        audience: None,
+                        tenant: None,
+                        project: None,
+                        account: Some("chat-account".into()),
+                        required_scopes: BTreeSet::new(),
+                    },
+                    model: Some("subscription-model".into()),
+                    base_url: None,
+                    chat_path: None,
+                    models_path: None,
+                    name: Some("broken".into()),
+                    reasoning_effort: None,
+                });
+                credentials.push(ProviderCredential {
+                    name: "subscription".into(),
+                    kind: CredentialKind::Bearer,
+                    provider: CredentialProvider::ChatgptSubscription,
+                    issuer: "openai-chatgpt".into(),
+                    audience: AudienceBinding::standard(
+                        crate::config::EndpointFamily::ChatgptSubscription,
+                    ),
+                    tenant: None,
+                    project: None,
+                    account: Some("chat-account".into()),
+                    scopes: BTreeSet::new(),
+                    secret_ref: "test:subscription".into(),
+                    lifecycle: CredentialLifecycle::default(),
+                    revocation: Default::default(),
+                });
+            }
+        }
+        crate::config::Config::with_providers(profiles).with_credentials(credentials)
+    }
+
     fn grant_agent_capabilities(runtime: &ProgramRuntime) {
         for capability in [
             CapabilityKind::AgentSpawn,
@@ -1319,6 +1401,65 @@ mod tests {
             listener.accept(),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
+    }
+
+    #[tokio::test]
+    async fn complete_graph_preflight_precedes_every_active_and_local_selector_shortcut() {
+        struct PanicResolver;
+        impl CredentialResolver for PanicResolver {
+            fn resolve(&self, _: &ProviderCredential) -> Result<ResolvedCredential> {
+                panic!("selector shortcut reached credential resolution")
+            }
+        }
+
+        let defects = [
+            (SiblingDefect::Missing, "missing credential 'missing'"),
+            (SiblingDefect::Revoked, "revoked"),
+            (
+                SiblingDefect::Unsupported,
+                "ChatGPT subscription credentials are distinct",
+            ),
+        ];
+        let selectors = [
+            ("default", "primary", None, None),
+            ("active-name fallback", "primary", Some("echo"), None),
+            ("exact current", "echo", Some("echo"), None),
+            ("local", "primary", Some("local"), None),
+        ];
+        for (defect, expected) in defects {
+            for (branch, primary_name, provider, model) in selectors {
+                let provider_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                provider_listener.set_nonblocking(true).unwrap();
+                let daemon_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                daemon_listener.set_nonblocking(true).unwrap();
+                let endpoint = format!("http://{}", provider_listener.local_addr().unwrap());
+                let mut config = config_with_sibling_defect(&endpoint, primary_name, defect);
+                config.client.daemon_address = daemon_listener.local_addr().unwrap().to_string();
+                let resolver = ProviderResolver::with_config_and_credential_resolver(
+                    Arc::new(EchoGenerator),
+                    config,
+                    Arc::new(PanicResolver),
+                );
+
+                let error = resolver
+                    .resolve(provider, model)
+                    .await
+                    .err()
+                    .unwrap_or_else(|| panic!("{branch} bypassed the complete graph preflight"));
+                assert!(
+                    format!("{error:#}").contains(expected),
+                    "{branch} returned the wrong preflight error: {error:#}"
+                );
+                assert!(matches!(
+                    provider_listener.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ));
+                assert!(matches!(
+                    daemon_listener.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ));
+            }
+        }
     }
 
     #[tokio::test]
