@@ -479,6 +479,15 @@ fn process_executable(pid: u32) -> anyhow::Result<std::path::PathBuf> {
 fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<u8>)> {
     use anyhow::Context as _;
 
+    // FD9 is the conventional production-facing descriptor and dup2 replaces
+    // it process-wide. Serialize the complete restore and authentication
+    // transaction so concurrent constructors cannot close FD9 between another
+    // thread's fcntl, metadata, proof read, and signature/peer validation.
+    static PROOF_VALIDATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _proof_validation = PROOF_VALIDATION_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("wrapper proof validation lock was poisoned"))?;
+
     anyhow::ensure!(
         std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref() == Ok("1"),
         "live Brain tests require scripts/test_brains.sh"
