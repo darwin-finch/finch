@@ -2704,7 +2704,7 @@ mod tests {
             &script,
             "import os,sys\nopen(sys.argv[1], 'w').write(f'{os.getpid()} {os.getpgid(0)}')\nprint('codex-cli 1.0')\n",
         ).unwrap();
-        let python = resolve_trusted_program("python3").unwrap();
+        let python = PathBuf::from("/usr/bin/python3");
         let output = run_version_bounded(
             &python,
             &[
@@ -2765,7 +2765,7 @@ for line in sys.stdin:
                 &script,
                 "import pathlib,sys\npathlib.Path(sys.argv[1]).write_text('spawned')\nprint('codex-cli 1.0')\n",
             ).unwrap();
-            let python = resolve_trusted_program("python3").unwrap();
+            let python = PathBuf::from("/usr/bin/python3");
             let error = run_version_bounded(
                 &python,
                 &[
@@ -2822,7 +2822,7 @@ while True: time.sleep(1)
 "#,
         )
         .unwrap();
-        let python = resolve_trusted_program("python3").unwrap();
+        let python = PathBuf::from("/usr/bin/python3");
         let error = run_version_bounded(
             &python,
             &[
