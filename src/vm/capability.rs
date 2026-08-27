@@ -248,8 +248,9 @@ impl CapabilityLedger {
     pub fn recorded_authorization(
         &self,
         request: &CapabilityRequest,
+        context: &AuthorizationContext,
     ) -> Option<AuthorizationDecision> {
-        self.authorization_audit
+        let entry = self.authorization_audit
             .iter()
             .rev()
             .find(|entry| {
@@ -258,7 +259,60 @@ impl CapabilityLedger {
                     && entry.effect_sequence == request.effect_sequence
                     && entry.requirement == request.requirement
             })
-            .map(|entry| entry.decision.clone())
+            ?;
+        let decision = entry.decision.clone();
+        if let AuthorizationDecision::Allowed { grant_id } = decision {
+            let still_live = self.grants.grants.iter().any(|grant| {
+                grant.id == grant_id
+                    && grant.revoked_at_unix_ms.is_none()
+                    && grant
+                        .expires_at_unix_ms
+                        .is_none_or(|expires| expires > context.now_unix_ms)
+                    && grant.policy_hash == context.policy_hash
+                    && scope_applies(&grant.scope, request.id, context)
+                    && grant.requirement.covers(&request.requirement)
+                    && (grant.consumed_at_unix_ms.is_none()
+                        || matches!(grant.scope, GrantScope::Once { request_id } if request_id == request.id)
+                            && grant.consumed_at_unix_ms == Some(entry.at_unix_ms))
+            });
+            if !still_live {
+                return None;
+            }
+        }
+        Some(decision)
+    }
+
+    /// Remove an authorization attempt which provably reached no host use.
+    /// This is correlation-targeted so a concurrent, unrelated grant/revoke
+    /// mutation is retained. A once grant consumed solely by this attempt is
+    /// restored together with its matching consumption audit entry.
+    pub fn rollback_authorization(&mut self, request: &CapabilityRequest) -> bool {
+        let Some(index) = self.authorization_audit.iter().rposition(|entry| {
+            entry.request_id == request.id
+                && entry.execution_id == request.execution_id
+                && entry.effect_sequence == request.effect_sequence
+                && entry.requirement == request.requirement
+        }) else {
+            return false;
+        };
+        let entry = self.authorization_audit.remove(index);
+        if let AuthorizationDecision::Allowed { grant_id } = entry.decision {
+            if let Some(grant) = self.grants.grants.iter_mut().find(|grant| {
+                grant.id == grant_id
+                    && matches!(grant.scope, GrantScope::Once { .. })
+                    && grant.consumed_at_unix_ms == Some(entry.at_unix_ms)
+            }) {
+                grant.consumed_at_unix_ms = None;
+                if let Some(consumed) = self.audit.iter().rposition(|audit| {
+                    audit.grant_id == grant_id
+                        && audit.action == CapabilityAuditAction::Consumed
+                        && audit.at_unix_ms == entry.at_unix_ms
+                }) {
+                    self.audit.remove(consumed);
+                }
+            }
+        }
+        true
     }
 
     pub fn issue(
@@ -787,6 +841,75 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<CapabilityLedger>(&encoded).unwrap(),
             ledger
+        );
+    }
+
+    #[test]
+    fn recorded_allowed_authorization_requires_live_grant_expiry_scope_and_policy() {
+        let requirement = CapabilityRequirement::file(
+            FileOperation::Read,
+            FileSelector::parse("./README.md").unwrap(),
+        );
+        let request = request(requirement.clone());
+        let session_id = Uuid::new_v4();
+        let context = AuthorizationContext {
+            now_unix_ms: 11,
+            task_id: None,
+            session_id,
+            project_id: Some("project".into()),
+            policy_hash: "policy-v1".into(),
+        };
+
+        let make_ledger = |expires_at_unix_ms| {
+            let mut ledger = CapabilityLedger::default();
+            let grant_id = ledger
+                .issue(
+                    requirement.clone(),
+                    GrantScope::Session { session_id },
+                    "policy-v1",
+                    "user",
+                    10,
+                    expires_at_unix_ms,
+                )
+                .unwrap();
+            assert_eq!(
+                ledger.authorize(&request, &context, "runtime"),
+                AuthorizationDecision::Allowed { grant_id }
+            );
+            ledger
+        };
+
+        let mut live = make_ledger(None);
+        assert!(matches!(
+            live.recorded_authorization(&request, &context),
+            Some(AuthorizationDecision::Allowed { .. })
+        ));
+        let grant_id = live.grants.grants[0].id;
+        assert!(live.revoke(grant_id, "revoker", 12));
+        assert_eq!(live.recorded_authorization(&request, &context), None);
+
+        let expired = make_ledger(Some(12));
+        let mut after_expiry = context.clone();
+        after_expiry.now_unix_ms = 12;
+        assert_eq!(
+            expired.recorded_authorization(&request, &after_expiry),
+            None
+        );
+
+        let policy_changed = make_ledger(None);
+        let mut replacement_policy = context.clone();
+        replacement_policy.policy_hash = "policy-v2".into();
+        assert_eq!(
+            policy_changed.recorded_authorization(&request, &replacement_policy),
+            None
+        );
+
+        let wrong_session = make_ledger(None);
+        let mut replacement_session = context;
+        replacement_session.session_id = Uuid::new_v4();
+        assert_eq!(
+            wrong_session.recorded_authorization(&request, &replacement_session),
+            None
         );
     }
 }
