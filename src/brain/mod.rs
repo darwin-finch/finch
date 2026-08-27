@@ -936,12 +936,76 @@ mod isolation_tests {
 
     #[test]
     fn isolated_proof_rejects_self_issued_environment_authority() {
+        use ed25519_dalek::Signer as _;
         use std::io::Write as _;
         use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+        use std::os::unix::process::CommandExt as _;
         const MODE_ENV: &str = "FINCH_TEST_FORGED_PROOF_MODE";
+        const RESPONDER_KEY_ENV: &str = "FINCH_TEST_ATTACKER_RESPONDER_KEY";
+        const RESPONDER_MARKER_ENV: &str = "FINCH_TEST_ATTACKER_RESPONDER_MARKER";
         if let Ok(mode) = std::env::var(MODE_ENV) {
+            if mode == "attacker-key-responder" {
+                use std::os::fd::FromRawFd as _;
+
+                let duplicate = unsafe { nix::libc::fcntl(109, nix::libc::F_DUPFD_CLOEXEC, 200) };
+                assert!(duplicate >= 0);
+                let socket = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(duplicate) };
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+                    .unwrap();
+                let mut request = [0_u8; 64];
+                match socket.recv(&mut request) {
+                    Ok(count) => {
+                        assert_eq!(&request[..count], b"finch-proof-key-v1");
+                        let key = hex::decode(std::env::var(RESPONDER_KEY_ENV).unwrap()).unwrap();
+                        assert_eq!(socket.send(&key).unwrap(), 32);
+                        std::fs::write(
+                            std::env::var_os(RESPONDER_MARKER_ENV).unwrap(),
+                            b"consulted",
+                        )
+                        .unwrap();
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => panic!("attacker proof-key responder failed: {error}"),
+                }
+                return;
+            }
             let valid = isolated_test_proof().unwrap();
+            let start_attacker_responder = |key: [u8; 32],
+                                            marker: &std::path::Path|
+             -> (
+                std::os::unix::net::UnixDatagram,
+                std::process::Child,
+            ) {
+                let (validator, responder) = std::os::unix::net::UnixDatagram::pair().unwrap();
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                        .args([
+                            "--exact",
+                            "brain::isolation_tests::isolated_proof_rejects_self_issued_environment_authority",
+                            "--nocapture",
+                        ])
+                        .env(MODE_ENV, "attacker-key-responder")
+                        .env(RESPONDER_KEY_ENV, hex::encode(key))
+                        .env(RESPONDER_MARKER_ENV, marker);
+                unsafe {
+                    command.pre_exec(move || {
+                        if nix::libc::dup2(responder.as_raw_fd(), 109) != 109 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if nix::libc::fcntl(109, nix::libc::F_SETFD, 0) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                (validator, command.spawn().unwrap())
+            };
             if mode == "swapped-low-listener" {
                 assert_eq!(unsafe { nix::libc::dup2(11, 10) }, 10);
                 let repaired = isolated_test_proof().unwrap();
@@ -995,6 +1059,29 @@ mod isolation_tests {
                 isolated_test_proof().unwrap();
                 return;
             }
+            if mode == "auth-key-replay" {
+                let replayed_key = supervisor_verifying_key(valid.supervisor_pid)
+                    .unwrap()
+                    .to_bytes();
+                let marker = valid.home.join("replayed-auth-key-consulted");
+                let (validator, mut responder) = start_attacker_responder(replayed_key, &marker);
+                assert_eq!(unsafe { nix::libc::dup2(validator.as_raw_fd(), 109) }, 109);
+                let error = isolated_test_proof()
+                    .err()
+                    .expect("replayed auth key was accepted");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("proof authentication peer is not the ancestor test supervisor"),
+                    "genuine key replay reached the wrong rejection boundary: {error:#}"
+                );
+                assert!(responder.wait().unwrap().success());
+                assert!(
+                    !marker.exists(),
+                    "validator consumed a replayed key before authenticating its peer"
+                );
+                return;
+            }
             let path = valid.home.join(format!("forged-proof-{mode}"));
             let mut writer = std::fs::OpenOptions::new()
                 .create_new(true)
@@ -1007,41 +1094,46 @@ mod isolation_tests {
                 let token = "self-issued";
                 let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
                 let executable_metadata = std::fs::metadata(&executable).unwrap();
-                writeln!(writer, "{token}").unwrap();
-                writeln!(writer, "{}", valid.home.display()).unwrap();
-                writeln!(writer, "{}", valid.root.display()).unwrap();
+                let attacker_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+                let mut forged = Vec::new();
+                writeln!(forged, "{token}").unwrap();
+                writeln!(forged, "{}", valid.home.display()).unwrap();
+                writeln!(forged, "{}", valid.root.display()).unwrap();
                 writeln!(
-                    writer,
+                    forged,
                     "{}:{}",
                     valid.home_identity.0, valid.home_identity.1
                 )
                 .unwrap();
                 writeln!(
-                    writer,
+                    forged,
                     "{}:{}",
                     valid.root_identity.0, valid.root_identity.1
                 )
                 .unwrap();
-                writeln!(writer, "{}", valid.brain_addr).unwrap();
-                writeln!(writer, "{}", valid.daemon_addr).unwrap();
-                writeln!(writer, "{}", valid.password_digest).unwrap();
-                writeln!(writer, "{}", valid.ipc_socket.display()).unwrap();
-                writeln!(writer, "{}", valid.socket_root.display()).unwrap();
+                writeln!(forged, "{}", valid.brain_addr).unwrap();
+                writeln!(forged, "{}", valid.daemon_addr).unwrap();
+                writeln!(forged, "{}", valid.password_digest).unwrap();
+                writeln!(forged, "{}", valid.ipc_socket.display()).unwrap();
+                writeln!(forged, "{}", valid.socket_root.display()).unwrap();
                 writeln!(
-                    writer,
+                    forged,
                     "{}:{}",
                     valid.socket_root_identity.0, valid.socket_root_identity.1
                 )
                 .unwrap();
-                writeln!(writer, "{}", std::process::id()).unwrap();
-                writeln!(writer, "{}", executable.display()).unwrap();
+                writeln!(forged, "{}", std::process::id()).unwrap();
+                writeln!(forged, "{}", executable.display()).unwrap();
                 writeln!(
-                    writer,
+                    forged,
                     "{}:{}",
                     executable_metadata.dev(),
                     executable_metadata.ino()
                 )
                 .unwrap();
+                let signature = attacker_key.sign(&forged);
+                writeln!(forged, "{}", hex::encode(signature.to_bytes())).unwrap();
+                writer.write_all(&forged).unwrap();
                 writer.sync_all().unwrap();
                 writer
                     .set_permissions(std::fs::Permissions::from_mode(0o400))
@@ -1052,6 +1144,25 @@ mod isolation_tests {
                 assert_eq!(unsafe { nix::libc::dup2(reader.as_raw_fd(), 9) }, 9);
                 std::env::set_var("FINCH_BRAIN_TEST_TOKEN", token);
                 std::env::set_var("FINCH_TEST_SUPERVISOR_PID", std::process::id().to_string());
+                let marker = valid.home.join("self-issued-auth-key-consulted");
+                let (validator, mut responder) =
+                    start_attacker_responder(attacker_key.verifying_key().to_bytes(), &marker);
+                assert_eq!(unsafe { nix::libc::dup2(validator.as_raw_fd(), 109) }, 109);
+                let error = isolated_test_proof()
+                    .err()
+                    .expect("signed self-issued proof was accepted");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("proof authentication peer is not the ancestor test supervisor"),
+                    "signed self-issued proof reached the wrong rejection boundary: {error:#}"
+                );
+                assert!(responder.wait().unwrap().success());
+                assert!(
+                    !marker.exists(),
+                    "validator consumed an attacker key before authenticating its peer"
+                );
+                return;
             } else {
                 std::fs::remove_file(&path).unwrap();
                 assert_eq!(unsafe { nix::libc::dup2(writer.as_raw_fd(), 9) }, 9);
@@ -1066,6 +1177,7 @@ mod isolation_tests {
             "swapped-low-listener",
             "swapped-backup-listener",
             "rewrite-restore",
+            "auth-key-replay",
         ] {
             let status = supervised_test_subprocess_command()
                 .args([
