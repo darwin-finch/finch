@@ -213,23 +213,40 @@ impl ProviderResolver {
                 requested == entry.profile_name() || entry.model() == Some(requested)
             })
         };
-        let mut matches = self
-            .profiles
-            .iter()
-            .filter(|entry| matches_provider(entry) && matches_model(entry));
-        let Some(entry) = matches.next() else {
-            let requested = model.or(provider).unwrap_or("unknown");
-            if requested == active.name() {
-                return Ok(active);
-            }
-            bail!("NoEligibleModel: no configured profile matches '{requested}'");
-        };
-        if matches.next().is_some() {
-            let requested = model.or(provider).unwrap_or("unknown");
-            bail!(
-                "NoEligibleModel: configured profile selection '{requested}' is ambiguous; select an exact profile name so Finch cannot choose an implicit credential account"
-            );
+        let mut exact = self.profiles.iter().filter(|entry| {
+            provider.is_some_and(|requested| requested == entry.profile_name())
+                || model.is_some_and(|requested| requested == entry.profile_name())
+        });
+        let exact_entry = exact.next();
+        if exact.next().is_some() {
+            bail!("NoEligibleModel: provider and model selectors name conflicting exact profiles");
         }
+        let entry = if let Some(entry) = exact_entry {
+            if !matches_provider(entry) || !matches_model(entry) {
+                let requested = model.or(provider).unwrap_or("unknown");
+                bail!("NoEligibleModel: no configured profile matches '{requested}'");
+            }
+            entry
+        } else {
+            let mut matches = self.profiles.iter().filter(|entry| {
+                provider.is_none_or(|requested| requested == entry.provider_type())
+                    && model.is_none_or(|requested| entry.model() == Some(requested))
+            });
+            let Some(entry) = matches.next() else {
+                let requested = model.or(provider).unwrap_or("unknown");
+                if requested == active.name() {
+                    return Ok(active);
+                }
+                bail!("NoEligibleModel: no configured profile matches '{requested}'");
+            };
+            if matches.next().is_some() {
+                let requested = model.or(provider).unwrap_or("unknown");
+                bail!(
+                    "NoEligibleModel: configured profile selection '{requested}' is ambiguous; select an exact profile name so Finch cannot choose an implicit credential account"
+                );
+            }
+            entry
+        };
         if entry.profile_name() == active.name() {
             return Ok(active);
         }
@@ -1324,6 +1341,52 @@ mod tests {
             .expect("model-only selection must not choose an implicit account");
         assert!(error.to_string().contains("ambiguous"));
         assert!(error.to_string().contains("exact profile name"));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[tokio::test]
+    async fn child_exact_profile_name_precedes_provider_and_model_alias_collisions() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let credential = named_account_credential("account-a", "a", &endpoint);
+
+        let provider_collision = crate::config::Config::with_providers(vec![
+            named_account_profile("openai_platform", "account-a", "a", &endpoint),
+            named_account_profile("other-account-profile", "account-a", "a", &endpoint),
+        ])
+        .with_credentials(vec![credential.clone()]);
+        let provider_resolver = ProviderResolver::with_config_and_credential_resolver(
+            Arc::new(EchoGenerator),
+            provider_collision,
+            Arc::new(AccountResolver),
+        );
+        let selected = provider_resolver
+            .resolve(Some("openai_platform"), None)
+            .await
+            .unwrap();
+        assert_eq!(selected.name(), "openai_platform");
+
+        let mut exact_model_profile = named_account_profile("gpt-4o", "account-a", "a", &endpoint);
+        if let ProviderEntry::Credentialed { model, .. } = &mut exact_model_profile {
+            *model = Some("gpt-4o-mini".into());
+        }
+        let model_collision = crate::config::Config::with_providers(vec![
+            exact_model_profile,
+            named_account_profile("model-alias-profile", "account-a", "a", &endpoint),
+        ])
+        .with_credentials(vec![credential]);
+        let model_resolver = ProviderResolver::with_config_and_credential_resolver(
+            Arc::new(EchoGenerator),
+            model_collision,
+            Arc::new(AccountResolver),
+        );
+        let selected = model_resolver.resolve(None, Some("gpt-4o")).await.unwrap();
+        assert_eq!(selected.name(), "gpt-4o");
+
         assert!(matches!(
             listener.accept(),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
