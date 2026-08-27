@@ -74,9 +74,9 @@ fn validate_image_source(source: &ImageSource) -> Result<OpenAIImageUrl> {
     if source.source_type != "base64" {
         anyhow::bail!("OpenAI images must use a base64 source");
     }
-    let expected_magic: &[u8] = match source.media_type.as_str() {
-        "image/png" => b"\x89PNG\r\n\x1a\n",
-        "image/jpeg" => b"\xff\xd8\xff",
+    let validator: fn(&[u8]) -> Result<()> = match source.media_type.as_str() {
+        "image/png" => validate_png,
+        "image/jpeg" => validate_jpeg,
         other => anyhow::bail!(
             "OpenAI image media type '{}' is unsupported; expected image/png or image/jpeg",
             other
@@ -92,12 +92,151 @@ fn validate_image_source(source: &ImageSource) -> Result<OpenAIImageUrl> {
     if bytes.len() > MAX_IMAGE_BYTES {
         anyhow::bail!("OpenAI image exceeded the 10 MiB decoded-size limit");
     }
-    if !bytes.starts_with(expected_magic) {
-        anyhow::bail!("OpenAI image bytes did not match the declared media type");
-    }
+    validator(&bytes)?;
     Ok(OpenAIImageUrl {
         url: format!("data:{};base64,{}", source.media_type, source.data),
     })
+}
+
+fn validate_png(bytes: &[u8]) -> Result<()> {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        anyhow::bail!("OpenAI image bytes did not match the declared media type");
+    }
+    let mut offset = 8usize;
+    let mut saw_ihdr = false;
+    let mut saw_idat = false;
+    while offset < bytes.len() {
+        let header_end = offset.checked_add(8).context("OpenAI PNG was truncated")?;
+        if header_end > bytes.len() {
+            anyhow::bail!("OpenAI PNG was truncated");
+        }
+        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let chunk_type = &bytes[offset + 4..offset + 8];
+        let chunk_end = header_end
+            .checked_add(length)
+            .and_then(|end| end.checked_add(4))
+            .context("OpenAI PNG chunk length overflowed")?;
+        if chunk_end > bytes.len() {
+            anyhow::bail!("OpenAI PNG was truncated");
+        }
+        if !saw_ihdr {
+            if chunk_type != b"IHDR" || length != 13 {
+                anyhow::bail!("OpenAI PNG omitted a valid leading IHDR chunk");
+            }
+            let width = u32::from_be_bytes(bytes[header_end..header_end + 4].try_into().unwrap());
+            let height =
+                u32::from_be_bytes(bytes[header_end + 4..header_end + 8].try_into().unwrap());
+            if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 100_000_000 {
+                anyhow::bail!("OpenAI PNG dimensions were invalid or excessive");
+            }
+            let bit_depth = bytes[header_end + 8];
+            let color_type = bytes[header_end + 9];
+            let valid_depth = match color_type {
+                0 => matches!(bit_depth, 1 | 2 | 4 | 8 | 16),
+                2 | 4 | 6 => matches!(bit_depth, 8 | 16),
+                3 => matches!(bit_depth, 1 | 2 | 4 | 8),
+                _ => false,
+            };
+            if !valid_depth
+                || bytes[header_end + 10] != 0
+                || bytes[header_end + 11] != 0
+                || bytes[header_end + 12] > 1
+            {
+                anyhow::bail!("OpenAI PNG contained an invalid IHDR");
+            }
+            saw_ihdr = true;
+        } else if chunk_type == b"IHDR" {
+            anyhow::bail!("OpenAI PNG contained a duplicate IHDR chunk");
+        }
+        if chunk_type == b"IDAT" && length > 0 {
+            saw_idat = true;
+        }
+        if chunk_type == b"IEND" {
+            if length != 0 || !saw_idat || chunk_end != bytes.len() {
+                anyhow::bail!("OpenAI PNG had an invalid terminal IEND chunk");
+            }
+            return Ok(());
+        }
+        offset = chunk_end;
+    }
+    anyhow::bail!("OpenAI PNG was incomplete")
+}
+
+fn validate_jpeg(bytes: &[u8]) -> Result<()> {
+    if !bytes.starts_with(b"\xff\xd8") || !bytes.ends_with(b"\xff\xd9") {
+        anyhow::bail!("OpenAI image bytes did not match the declared media type");
+    }
+    let mut offset = 2usize;
+    let mut saw_frame = false;
+    while offset + 1 < bytes.len() {
+        if bytes[offset] != 0xff {
+            anyhow::bail!("OpenAI JPEG contained invalid marker framing");
+        }
+        while offset < bytes.len() && bytes[offset] == 0xff {
+            offset += 1;
+        }
+        if offset >= bytes.len() {
+            anyhow::bail!("OpenAI JPEG was truncated");
+        }
+        let marker = bytes[offset];
+        offset += 1;
+        if marker == 0xd9 {
+            anyhow::bail!("OpenAI JPEG omitted scan data");
+        }
+        if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        let length_end = offset.checked_add(2).context("OpenAI JPEG was truncated")?;
+        if length_end > bytes.len() {
+            anyhow::bail!("OpenAI JPEG was truncated");
+        }
+        let length = u16::from_be_bytes(bytes[offset..length_end].try_into().unwrap()) as usize;
+        if length < 2 {
+            anyhow::bail!("OpenAI JPEG contained an invalid segment length");
+        }
+        let segment_end = offset
+            .checked_add(length)
+            .context("OpenAI JPEG segment length overflowed")?;
+        if segment_end > bytes.len() {
+            anyhow::bail!("OpenAI JPEG was truncated");
+        }
+        if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+            if length < 8 {
+                anyhow::bail!("OpenAI JPEG contained an invalid frame header");
+            }
+            let height = u16::from_be_bytes(bytes[offset + 3..offset + 5].try_into().unwrap());
+            let width = u16::from_be_bytes(bytes[offset + 5..offset + 7].try_into().unwrap());
+            if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 100_000_000 {
+                anyhow::bail!("OpenAI JPEG dimensions were invalid or excessive");
+            }
+            saw_frame = true;
+        }
+        if marker == 0xda {
+            if !saw_frame {
+                anyhow::bail!("OpenAI JPEG scan preceded its frame header");
+            }
+            let scan_start = segment_end;
+            let mut scan = scan_start;
+            while scan + 1 < bytes.len() {
+                if bytes[scan] != 0xff {
+                    scan += 1;
+                    continue;
+                }
+                let next = bytes[scan + 1];
+                if next == 0x00 || (0xd0..=0xd7).contains(&next) {
+                    scan += 2;
+                    continue;
+                }
+                if next == 0xd9 && scan > scan_start && scan + 2 == bytes.len() {
+                    return Ok(());
+                }
+                anyhow::bail!("OpenAI JPEG scan data was malformed or truncated");
+            }
+            anyhow::bail!("OpenAI JPEG was incomplete");
+        }
+        offset = segment_end;
+    }
+    anyhow::bail!("OpenAI JPEG was incomplete")
 }
 
 async fn read_api_error(
@@ -337,6 +476,12 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
         anyhow::bail!("OpenAI stream returned an unexpected choice set");
     }
     let choice = &chunk.choices[0];
+    if state.terminal_reason.is_some() {
+        if choice.finish_reason.is_some() {
+            anyhow::bail!("OpenAI stream sent duplicate terminal status");
+        }
+        anyhow::bail!("OpenAI stream sent a choice after terminal status");
+    }
     if let Some(role) = &choice.delta.role {
         if role != "assistant" {
             anyhow::bail!("OpenAI stream returned unknown delta role '{}'", role);
@@ -348,11 +493,6 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
         && choice.finish_reason.is_none()
     {
         anyhow::bail!("OpenAI stream returned an empty non-terminal delta");
-    }
-    if state.terminal_reason.is_some()
-        && (choice.delta.content.is_some() || choice.delta.tool_calls.is_some())
-    {
-        anyhow::bail!("OpenAI stream sent content after terminal status");
     }
     if let Some(content) = &choice.delta.content {
         state.accumulated_text.push_str(content);
@@ -371,12 +511,22 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
                     .tool_calls
                     .push((String::new(), String::new(), String::new()));
             }
-            let call = &mut state.tool_calls[index];
             if let Some(kind) = &delta.tool_type {
                 if kind != "function" {
                     anyhow::bail!("OpenAI stream contained an unknown tool-call type");
                 }
             }
+            if let Some(id) = &delta.id {
+                if state
+                    .tool_calls
+                    .iter()
+                    .enumerate()
+                    .any(|(other_index, other)| other_index != index && other.0 == *id)
+                {
+                    anyhow::bail!("OpenAI stream reused a function-call ID across indices");
+                }
+            }
+            let call = &mut state.tool_calls[index];
             if let Some(id) = &delta.id {
                 if !call.0.is_empty() && call.0 != *id {
                     anyhow::bail!("OpenAI stream changed a function-call ID");
@@ -403,14 +553,14 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
         if state.terminal_reason.replace(reason.clone()).is_some() {
             anyhow::bail!("OpenAI stream sent duplicate terminal status");
         }
-        if !matches!(
-            reason.as_str(),
-            "stop" | "length" | "tool_calls" | "content_filter"
-        ) {
-            anyhow::bail!(
+        match reason.as_str() {
+            "stop" | "tool_calls" => {}
+            "length" => anyhow::bail!("OpenAI stream reached its output-token limit"),
+            "content_filter" => anyhow::bail!("OpenAI stream was stopped by content filtering"),
+            _ => anyhow::bail!(
                 "OpenAI stream returned unknown terminal status '{}'",
                 reason
-            );
+            ),
         }
     }
     Ok(output)
@@ -694,6 +844,14 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
+    fn validate_request_payload(request: &OpenAIRequest) -> Result<()> {
+        let encoded = serde_json::to_vec(request).context("Failed to serialize OpenAI request")?;
+        if encoded.len() > MAX_REQUEST_BYTES {
+            anyhow::bail!("OpenAI request exceeded the 32 MiB payload limit");
+        }
+        Ok(())
+    }
+
     /// Create a new OpenAI provider
     pub fn new_openai(api_key: String) -> Result<Self> {
         Self::new(
@@ -1056,11 +1214,7 @@ impl OpenAIProvider {
                     include_usage: true,
                 }),
         };
-        let encoded =
-            serde_json::to_vec(&openai_request).context("Failed to serialize OpenAI request")?;
-        if encoded.len() > MAX_REQUEST_BYTES {
-            anyhow::bail!("OpenAI request exceeded the 32 MiB payload limit");
-        }
+        Self::validate_request_payload(&openai_request)?;
         Ok(openai_request)
     }
 
@@ -1079,6 +1233,9 @@ impl OpenAIProvider {
             }
             if response.choices.len() != 1 || response.choices[0].index != 0 {
                 anyhow::bail!("OpenAI returned an unexpected choice set");
+            }
+            if response.choices[0].message.role != "assistant" {
+                anyhow::bail!("OpenAI response returned a non-assistant role");
             }
         }
         let choice = response
@@ -1111,6 +1268,9 @@ impl OpenAIProvider {
                                     "OpenAI returned an invalid or duplicate function call ID/name"
                                 );
                             }
+                            if tool_call.function.arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
+                                anyhow::bail!("OpenAI function arguments exceeded the 1 MiB limit");
+                            }
                             let input: serde_json::Value =
                                 serde_json::from_str(&tool_call.function.arguments)
                                     .context("OpenAI returned malformed JSON function arguments")?;
@@ -1140,8 +1300,13 @@ impl OpenAIProvider {
                 .finish_reason
                 .as_deref()
                 .context("OpenAI response omitted terminal status")?;
-            if !matches!(reason, "stop" | "length" | "tool_calls" | "content_filter") {
-                anyhow::bail!("OpenAI returned unknown terminal status '{}'", reason);
+            match reason {
+                "stop" | "tool_calls" => {}
+                "length" => anyhow::bail!("OpenAI response reached its output-token limit"),
+                "content_filter" => {
+                    anyhow::bail!("OpenAI response was stopped by content filtering")
+                }
+                _ => anyhow::bail!("OpenAI returned unknown terminal status '{}'", reason),
             }
         }
 
@@ -1231,6 +1396,7 @@ impl OpenAIProvider {
                 include_usage: true,
             });
         }
+        Self::validate_request_payload(&openai_request)?;
 
         let url = &self.endpoints.chat_url;
 
@@ -1423,10 +1589,7 @@ impl ProviderBackend for OpenAIProvider {
 
     fn capabilities(&self, model: &str) -> ModelCapabilities {
         let canonical_endpoints = match self.provider_name.as_str() {
-            "openai" => {
-                self.endpoints.chat_url == "https://api.openai.com/v1/chat/completions"
-                    && self.endpoints.models_url == "https://api.openai.com/v1/models"
-            }
+            "openai" => self.canonical_openai_endpoint,
             "grok" => {
                 self.endpoints.chat_url == "https://api.x.ai/v1/chat/completions"
                     && self.endpoints.models_url == "https://api.x.ai/v1/models"
@@ -1767,6 +1930,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    const VALID_PNG_BASE64: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+    fn valid_jpeg_base64() -> String {
+        base64::engine::general_purpose::STANDARD.encode([
+            0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11,
+            0x00, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0x01, 0xff, 0xd9,
+        ])
+    }
+
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
     impl Write for CapturedLogs {
@@ -1795,6 +1968,15 @@ mod tests {
         provider
     }
 
+    fn public_canonical_test_provider(base_url: String) -> OpenAIProvider {
+        let mut provider = OpenAIProvider::new_openai("test-secret".to_string())
+            .unwrap()
+            .with_model("gpt-5.6-sol")
+            .with_reasoning_effort(ReasoningEffort::High);
+        provider.endpoints.chat_url = format!("{base_url}/v1/chat/completions");
+        provider
+    }
+
     async fn stalling_http_server(
         send_sse_headers: bool,
     ) -> (String, tokio::sync::oneshot::Receiver<()>) {
@@ -1817,6 +1999,31 @@ mod tests {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {}
                 }
+            }
+            let _ = closed_tx.send(());
+        });
+        (format!("http://{}", address), closed_rx)
+    }
+
+    async fn retrying_stalling_http_server(
+        attempts: usize,
+    ) -> (String, tokio::sync::oneshot::Receiver<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut connection_tasks = Vec::new();
+            for _ in 0..attempts {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                connection_tasks.push(tokio::spawn(async move {
+                    let mut request = vec![0u8; 16 * 1024];
+                    let _ = socket.read(&mut request).await;
+                    let mut byte = [0u8; 1];
+                    while matches!(socket.read(&mut byte).await, Ok(1)) {}
+                }));
+            }
+            for task in connection_tasks {
+                let _ = task.await;
             }
             let _ = closed_tx.send(());
         });
@@ -1858,14 +2065,15 @@ mod tests {
         use crate::tools::types::{ToolDefinition, ToolInputSchema};
 
         let mut server = mockito::Server::new_async().await;
+        let jpeg = valid_jpeg_base64();
         let expected = serde_json::json!({
             "model": "gpt-5.6-sol",
             "messages": [
                 {"role":"developer","content":"guard"},
                 {"role":"user","content":[
                     {"type":"text","text":"inspect"},
-                    {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}},
-                    {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,/9j/"}}
+                    {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{VALID_PNG_BASE64}")}},
+                    {"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{jpeg}")}}
                 ]},
                 {"role":"assistant","tool_calls":[
                     {"id":"call_a","type":"function","function":{"name":"read","arguments":"{\"path\":\"a\"}"}},
@@ -1897,8 +2105,8 @@ mod tests {
                 "user",
                 vec![
                     ContentBlock::text("inspect"),
-                    ContentBlock::image("image/png", "iVBORw0KGgo="),
-                    ContentBlock::image("image/jpeg", "/9j/"),
+                    ContentBlock::image("image/png", VALID_PNG_BASE64),
+                    ContentBlock::image("image/jpeg", jpeg),
                 ],
             ),
             Message::with_content(
@@ -1982,7 +2190,7 @@ mod tests {
             &alias,
             &ProviderRequest::new(vec![crate::claude::Message::with_content(
                 "user",
-                vec![ContentBlock::image("image/png", "iVBORw0KGgo=")],
+                vec![ContentBlock::image("image/png", VALID_PNG_BASE64)],
             )]),
             true,
         )
@@ -2106,6 +2314,56 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn public_validated_dispatch_enforces_request_timeout() {
+        let (url, attempts_observed) = retrying_stalling_http_server(3).await;
+        let mut provider = public_canonical_test_provider(url);
+        provider.client = Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let error = provider
+            .send_message(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("gpt-5.6-sol"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Failed to send request"));
+        tokio::time::timeout(Duration::from_secs(1), attempts_observed)
+            .await
+            .expect("validated dispatch did not release all timed-out attempts")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn canonical_stream_post_header_timeout_errors_and_releases_transport() {
+        let (url, closed) = stalling_http_server(true).await;
+        let mut provider = canonical_test_provider(url);
+        provider.client = Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let mut rx = provider
+            .send_message_stream_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("gpt-5.6-sol"),
+            )
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("post-header stream timeout did not surface")
+            .expect("parser ended without reporting the timeout")
+            .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("post-header timeout did not release transport")
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn canonical_stream_rejects_duplicate_or_late_done_without_completion_block() {
         for trailing in [
@@ -2145,6 +2403,19 @@ mod tests {
             }
             assert!(terminal_error);
             assert!(!complete, "completion published before terminal uniqueness was proven");
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_stream_rejects_incomplete_terminal_and_post_terminal_choice() {
+        for body in [
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+        ] {
+            let (complete, errors) = canonical_stream_outcome(body.to_string()).await;
+            assert!(!complete);
+            assert_eq!(errors.len(), 1);
         }
     }
 
@@ -2249,6 +2520,9 @@ mod tests {
         let mut state = CanonicalStreamState::default();
         canonical_stream_data(&mut state, r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}"#).unwrap();
         assert!(canonical_stream_data(&mut state, r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_b","function":{"arguments":""}}]},"finish_reason":null}]}"#).unwrap_err().to_string().contains("changed a function-call ID"));
+
+        let mut state = CanonicalStreamState::default();
+        assert!(canonical_stream_data(&mut state, r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_same","type":"function","function":{"name":"read","arguments":"{}"}},{"index":1,"id":"call_same","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}"#).unwrap_err().to_string().contains("reused a function-call ID"));
     }
 
     #[test]
@@ -2274,6 +2548,14 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unsupported"));
+        for (media_type, data) in [("image/png", "iVBORw0KGgo="), ("image/jpeg", "/9j/")] {
+            let truncated = ProviderRequest::new(vec![crate::claude::Message::with_content(
+                "user",
+                vec![ContentBlock::image(media_type, data)],
+            )])
+            .with_model("gpt-5.6-sol");
+            assert!(provider.to_openai_request(&truncated).is_err());
+        }
         let mismatch = ProviderRequest::new(vec![crate::claude::Message::with_content(
             "user",
             vec![ContentBlock::tool_result(
@@ -2288,6 +2570,69 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unknown function call ID"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn public_invalid_image_fails_before_any_http_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider =
+            public_canonical_test_provider(format!("http://{}", listener.local_addr().unwrap()));
+        let request = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            "user",
+            vec![ContentBlock::image("image/png", "iVBORw0KGgo=")],
+        )])
+        .with_model("gpt-5.6-sol");
+        let error = provider.send_message(&request).await.unwrap_err();
+        assert!(error.to_string().contains("PNG"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), listener.accept())
+                .await
+                .is_err(),
+            "invalid image reached the HTTP transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_request_and_response_payload_limits_hold_at_http_boundary() {
+        let provider = canonical_test_provider("http://127.0.0.1:1".into());
+        let empty =
+            ProviderRequest::new(vec![crate::claude::Message::user("")]).with_model("gpt-5.6-sol");
+        let empty_size = serde_json::to_vec(&provider.to_openai_request(&empty).unwrap())
+            .unwrap()
+            .len();
+        let exact = ProviderRequest::new(vec![crate::claude::Message::user(
+            "a".repeat(MAX_REQUEST_BYTES - empty_size),
+        )])
+        .with_model("gpt-5.6-sol");
+        assert_eq!(
+            serde_json::to_vec(&provider.to_openai_request(&exact).unwrap())
+                .unwrap()
+                .len(),
+            MAX_REQUEST_BYTES
+        );
+        assert!(provider
+            .send_message_stream_once(&exact)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("payload limit"));
+
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(vec![b'x'; MAX_RESPONSE_BYTES + 1])
+            .create_async()
+            .await;
+        let provider = canonical_test_provider(server.url());
+        let error = provider
+            .send_message_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("gpt-5.6-sol"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("32 MiB payload limit"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2314,13 +2659,36 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
         let provider = canonical_test_provider(server.url());
         let prompt_secret = "PROMPT_PRIVATE_VALUE";
-        let request = ProviderRequest::new(vec![crate::claude::Message::with_content(
-            "user",
-            vec![
-                ContentBlock::text(prompt_secret),
-                ContentBlock::image("image/png", "iVBORw0KGgo="),
-            ],
-        )])
+        let tool_secret = "TOOL_ARGUMENT_PRIVATE_VALUE";
+        let reasoning_secret = "REASONING_PRIVATE_VALUE";
+        let request = ProviderRequest::new(vec![
+            crate::claude::Message::with_content(
+                "user",
+                vec![
+                    ContentBlock::text(prompt_secret),
+                    ContentBlock::image("image/png", VALID_PNG_BASE64),
+                ],
+            ),
+            crate::claude::Message::with_content(
+                "assistant",
+                vec![ContentBlock::ToolUse {
+                    id: "call_secret".into(),
+                    name: "inspect".into(),
+                    input: serde_json::json!({
+                        "argument": tool_secret,
+                        "reasoning": reasoning_secret,
+                    }),
+                }],
+            ),
+            crate::claude::Message::with_content(
+                "user",
+                vec![ContentBlock::tool_result(
+                    "call_secret".into(),
+                    "private result".into(),
+                    None,
+                )],
+            ),
+        ])
         .with_model("gpt-5.6-sol");
         let error = provider.send_message_once(&request).await.unwrap_err();
         let error = error.to_string();
@@ -2331,7 +2699,9 @@ mod tests {
             "test-secret",
             upstream_secret,
             prompt_secret,
-            "iVBORw0KGgo=",
+            tool_secret,
+            reasoning_secret,
+            VALID_PNG_BASE64,
         ] {
             assert!(
                 !logs.contains(secret),
@@ -2351,6 +2721,18 @@ mod tests {
             (
                 r#"{"id":"x","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"mystery"}]}"#,
                 "unknown terminal status",
+            ),
+            (
+                r#"{"id":"x","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":"partial"},"finish_reason":"length"}]}"#,
+                "output-token limit",
+            ),
+            (
+                r#"{"id":"x","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":"partial"},"finish_reason":"content_filter"}]}"#,
+                "content filtering",
+            ),
+            (
+                r#"{"id":"x","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"user","content":"ok"},"finish_reason":"stop"}]}"#,
+                "non-assistant role",
             ),
             (
                 r#"{"id":"x","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":"ok","mystery_item":{}},"finish_reason":"stop"}]}"#,
@@ -2383,6 +2765,48 @@ mod tests {
                 "expected {expected:?}, got {error:#}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_nonstream_bounds_each_tool_argument() {
+        let mut server = mockito::Server::new_async().await;
+        let body = serde_json::json!({
+            "id":"x",
+            "object":"chat.completion",
+            "model":"gpt-5.6-sol",
+            "choices":[{
+                "index":0,
+                "message":{
+                    "role":"assistant",
+                    "content":null,
+                    "tool_calls":[{
+                        "id":"call_x",
+                        "type":"function",
+                        "function":{
+                            "name":"read",
+                            "arguments":"a".repeat(MAX_TOOL_ARGUMENT_BYTES + 1)
+                        }
+                    }]
+                },
+                "finish_reason":"tool_calls"
+            }]
+        })
+        .to_string();
+        server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = canonical_test_provider(server.url());
+        let error = provider
+            .send_message_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("gpt-5.6-sol"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("1 MiB limit"));
     }
 
     #[tokio::test]
