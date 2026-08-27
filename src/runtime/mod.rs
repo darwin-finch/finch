@@ -10702,7 +10702,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
 
         let expected = executable.to_string_lossy().into_owned();
         *PROCESS_BEFORE_EXEC_HOOK
-            .get_or_init(|| Mutex::new(Vec::new()))
+            .get_or_init(|| Mutex::new(None))
             .lock()
             .unwrap() = Some((
             expected,
@@ -10786,7 +10786,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         let original_inode = std::fs::metadata(&executable).unwrap().ino();
         let mutated = executable.clone();
         *PROCESS_BEFORE_EXEC_HOOK
-            .get_or_init(|| Mutex::new(Vec::new()))
+            .get_or_init(|| Mutex::new(None))
             .lock()
             .unwrap() = Some((
             expected_path,
@@ -10954,7 +10954,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         assert!(!ledger
             .audit
             .iter()
-            .any(|entry| entry.action == CapabilityAuditAction::Consumed));
+            .any(|entry| entry.action == crate::vm::CapabilityAuditAction::Consumed));
     }
 
     #[cfg(any(
