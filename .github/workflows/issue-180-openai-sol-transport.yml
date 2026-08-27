@@ -1,0 +1,53 @@
+name: Issue 180 OpenAI Sol Transport
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-180-openai-sol-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  provider-protocol:
+    name: Provider and IPC protocol (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - name: Assert exact source and issue 180 file scope
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ github.sha }}"
+          changed="$(git diff --name-only 8c17c79b9b7cc64ba6337fb60b58f9fdf6086151...HEAD)"
+          unexpected="$(printf '%s\n' "$changed" | grep -Ev '^(src/providers/openai\.rs|src/generators/mod\.rs|schema/finch_ipc\.capnp|src/ipc/(client|server)\.rs|src/cli/repl\.rs|src/cli/repl_event/query_processor\.rs|docs/OPENAI_TRANSPORT\.md|\.github/workflows/issue-180-openai-sol-transport\.yml)$' || true)"
+          test -z "$unexpected" || { printf 'Unexpected issue #180 paths:\n%s\n' "$unexpected"; exit 1; }
+      - name: Install Cap'n Proto on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y capnproto
+      - name: Install Cap'n Proto on macOS
+        if: runner.os == 'macOS'
+        run: brew install capnp
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check provider and IPC compilation
+        run: cargo test --lib providers::openai::tests --no-run
+      - name: Run OpenAI provider protocol regressions
+        run: cargo test --lib providers::openai::tests -- --nocapture
+      - name: Run stream metadata schema regressions
+        run: |
+          cargo test --lib generators::tests::test_stream_chunk_response_metadata_preserves_actual_model -- --exact --nocapture
+          cargo test --lib generators::tests::test_response_model_metadata_is_bounded_and_log_safe -- --exact --nocapture
+          cargo test --lib ipc::client::tests::response_metadata_schema_roundtrips_and_unknown_union_is_ignored -- --exact --nocapture
+      - name: Check owned transport formatting
+        run: rustfmt --edition 2021 --check src/providers/openai.rs src/generators/mod.rs
