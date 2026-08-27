@@ -1273,7 +1273,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "Provider 'openai' model 'gpt-4o' does not support reasoning controls"
+            "Provider 'openai' model 'gpt-4o' has unknown reasoning capability; refusing configured effort 'high'"
         );
     }
 
