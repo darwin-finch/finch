@@ -171,6 +171,9 @@ pub fn spawn_input_task(
                                 let _ = quit_tx.send(encode_quit_message());
                                 // Return Ok(None) — the watcher task will call process::exit(0).
                                 Ok(None)
+                            } else if tui.handle_accordion_key(key) {
+                                first_event_needs_render = true;
+                                Ok(None)
                             }
                             // Priority 1: Handle active dialog (if any).
                             // Exception: plain Enter (no modifier) submits the user's query
@@ -475,6 +478,12 @@ pub fn spawn_input_task(
                             first_event_modified_input = true;
                             Ok(None)
                         }
+                        Ok(Event::Mouse(mouse)) => {
+                            if tui.handle_accordion_mouse(mouse) {
+                                first_event_needs_render = true;
+                            }
+                            Ok(None)
+                        }
                         Ok(Event::Resize(w, h)) => match tui.handle_resize(w, h) {
                             Ok(()) => {
                                 first_event_needs_render = true;
@@ -502,6 +511,10 @@ pub fn spawn_input_task(
                     while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
                         match crossterm::event::read() {
                             Ok(Event::Key(key)) => {
+                                if tui.handle_accordion_key(key) {
+                                    needs_render = true;
+                                    continue;
+                                }
                                 let dialog_owns_key = dialog_owns_key(
                                     tui.active_dialog.is_some(),
                                     &key,
@@ -566,6 +579,11 @@ pub fn spawn_input_task(
                             }
                             Ok(Event::Resize(w, h)) => {
                                 if tui.handle_resize(w, h).is_ok() {
+                                    needs_render = true;
+                                }
+                            }
+                            Ok(Event::Mouse(mouse)) => {
+                                if tui.handle_accordion_mouse(mouse) {
                                     needs_render = true;
                                 }
                             }

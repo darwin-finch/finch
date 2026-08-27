@@ -54,7 +54,7 @@ pub fn random_spinner_verb() -> &'static str {
     SPINNER_WORDS[idx]
 }
 
-use super::{Message, MessageId, MessageStatus};
+use super::{Message, MessageId, MessageStatus, TranscriptRow, TranscriptRowId, TranscriptRowKind};
 use crate::cli::diff::{render_files, DiffColorMode, FileDiff, MAX_DIFF_PREVIEW_LINES};
 use crate::config::{ColorScheme, MessageBand};
 
@@ -618,6 +618,67 @@ impl Message for WorkUnit {
             .clone()
     }
 
+    fn complete_transcript(&self, colors: &ColorScheme) -> String {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let mut out = format_work_unit_header(&inner);
+        for row in &inner.rows {
+            out.push('\n');
+            out.push_str(&format_row_themed(row, colors, DiffColorMode::production()));
+        }
+        out
+    }
+
+    fn transcript_row(&self, colors: &ColorScheme) -> Option<TranscriptRow> {
+        let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let (kind, label, body, default_expanded) = match &inner.presentation {
+            WorkUnitPresentation::Assistant if !inner.rows.is_empty() => (
+                TranscriptRowKind::ToolGroup,
+                format!("Tools ({} calls)", inner.rows.len()),
+                lines(&inner.response_text),
+                true,
+            ),
+            WorkUnitPresentation::Assistant => (
+                TranscriptRowKind::Response,
+                "Assistant response".to_string(),
+                lines(&inner.response_text),
+                true,
+            ),
+            WorkUnitPresentation::ProgramSource { language } => (
+                TranscriptRowKind::Program,
+                format!("Program source ({language})"),
+                lines(&inner.response_text),
+                inner.status == MessageStatus::InProgress
+                    || inner.response_text.lines().count() <= 3,
+            ),
+            WorkUnitPresentation::ProgramOutput { title } => (
+                TranscriptRowKind::Output,
+                title
+                    .clone()
+                    .unwrap_or_else(|| "Program output".to_string()),
+                program_output_lines(&inner),
+                true,
+            ),
+        };
+
+        let children = inner
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| transcript_tool_row(self.id, index, row, colors, inner.status))
+            .collect();
+        Some(TranscriptRow {
+            id: TranscriptRowId {
+                message_id: self.id,
+                path: vec![0],
+            },
+            kind,
+            label,
+            body,
+            children,
+            default_expanded,
+        })
+    }
+
     fn background_style(&self, colors: &ColorScheme) -> Option<ratatui::style::Style> {
         let inner = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let band = match &inner.presentation {
@@ -691,6 +752,101 @@ fn program_output_has_visible_state(inner: &WorkUnitInner) -> bool {
             &inner.presentation,
             WorkUnitPresentation::ProgramOutput { title: Some(_) }
         )
+}
+
+fn lines(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split('\n').map(str::to_owned).collect()
+    }
+}
+
+fn program_output_lines(inner: &WorkUnitInner) -> Vec<String> {
+    let mut body = lines(&inner.response_text);
+    if let Some(status) = &inner.transient_status {
+        body.push(status.clone());
+    }
+    if let Some((completed, total)) = inner.progress {
+        body.push(format_progress(completed, total));
+    }
+    body
+}
+
+fn transcript_tool_row(
+    message_id: MessageId,
+    index: usize,
+    row: &WorkRow,
+    colors: &ColorScheme,
+    unit_status: MessageStatus,
+) -> TranscriptRow {
+    let summary = match &row.status {
+        WorkRowStatus::Running => "running".to_string(),
+        WorkRowStatus::Complete(summary) if summary.is_empty() => "complete".to_string(),
+        WorkRowStatus::Complete(summary) => summary.clone(),
+        WorkRowStatus::Error(error) => format!("failed: {error}"),
+    };
+    let input = TranscriptRow {
+        id: TranscriptRowId {
+            message_id,
+            path: vec![1, index as u32, 0],
+        },
+        kind: TranscriptRowKind::Input,
+        label: "Input".to_string(),
+        body: vec![row.label.clone()],
+        children: Vec::new(),
+        default_expanded: false,
+    };
+    let output_body = if let Some(diffs) = &row.diffs {
+        let mut body = row.body_lines.clone();
+        body.extend(
+            render_files(diffs, colors, DiffColorMode::production())
+                .lines()
+                .map(str::to_owned),
+        );
+        body
+    } else {
+        row.body_lines.clone()
+    };
+    let output = TranscriptRow {
+        id: TranscriptRowId {
+            message_id,
+            path: vec![1, index as u32, 1],
+        },
+        kind: TranscriptRowKind::ToolOutput,
+        label: format!("Output ({})", output_body.len()),
+        body: output_body,
+        children: Vec::new(),
+        default_expanded: matches!(row.status, WorkRowStatus::Running),
+    };
+    TranscriptRow {
+        id: TranscriptRowId {
+            message_id,
+            path: vec![1, index as u32],
+        },
+        kind: TranscriptRowKind::ToolCall,
+        label: format!("{} — {summary}", row.label),
+        body: Vec::new(),
+        children: vec![input, output],
+        default_expanded: unit_status == MessageStatus::InProgress,
+    }
+}
+
+fn format_work_unit_header(inner: &WorkUnitInner) -> String {
+    match &inner.presentation {
+        WorkUnitPresentation::Assistant if inner.response_text.is_empty() => {
+            format!("⏺ Tools ({})", inner.rows.len())
+        }
+        WorkUnitPresentation::Assistant => format!("⏺ {}", inner.response_text),
+        WorkUnitPresentation::ProgramSource { language } => {
+            if inner.response_text.is_empty() {
+                format!("→ program ({language})")
+            } else {
+                format!("→ program ({language})\n{}", inner.response_text)
+            }
+        }
+        WorkUnitPresentation::ProgramOutput { .. } => format_program_output(inner),
+    }
 }
 
 /// Keep reactive output-handle state structurally distinct from the emitted

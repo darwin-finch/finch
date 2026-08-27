@@ -20,7 +20,7 @@
 use anyhow::{Context, Result};
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent},
     execute,
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{
@@ -37,6 +37,7 @@ use tui_textarea::TextArea;
 use super::{OutputManager, StatusBar, StatusLineType};
 use crate::cli::messages::{MessageId, MessageRef, MessageStatus};
 // Sub-modules
+mod accordion;
 mod async_input;
 mod autocomplete_widget;
 mod dialog;
@@ -47,6 +48,8 @@ mod shadow_buffer; // kept – good architecture for future diffing
 mod status_widget;
 mod tabbed_dialog;
 mod tabbed_dialog_widget; // kept for wizard helpers
+
+use accordion::{AccordionState, RenderedTranscriptLine};
 
 pub use async_input::{spawn_input_task, InputEvent};
 pub use autocomplete_widget::AutocompleteState;
@@ -1037,6 +1040,10 @@ pub struct TuiRenderer {
     // Messages already committed to permanent scrollback.
     printed_ids: HashSet<MessageId>,
 
+    // Disclosure state is a projection over retained WorkUnits. It never
+    // mutates canonical message content or permanent native scrollback.
+    accordion: AccordionState,
+
     // Dialog state — tool-approval dialogs shown in the live area.
     pub active_dialog: Option<Dialog>,
     pub active_tabbed_dialog: Option<TabbedDialog>,
@@ -1116,7 +1123,11 @@ impl TuiRenderer {
         // Unlike kitty keyboard enhancement flags, bracketed paste cannot
         // corrupt the terminal on unclean exit — it simply falls back to
         // normal (unbounded) paste mode, which is safe.
-        let _ = execute!(io::stdout(), crossterm::event::EnableBracketedPaste);
+        let _ = execute!(
+            io::stdout(),
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::EnableMouseCapture
+        );
 
         // Enable DISAMBIGUATE_ESCAPE_CODES so terminals that support the kitty
         // keyboard protocol send distinct sequences for Shift+Enter (vs bare Enter).
@@ -1142,7 +1153,11 @@ impl TuiRenderer {
 
         // Panic hook: restore terminal state so the shell is usable after a crash.
         std::panic::set_hook(Box::new(|info| {
-            let _ = execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
+            let _ = execute!(
+                io::stdout(),
+                crossterm::event::DisableMouseCapture,
+                crossterm::event::PopKeyboardEnhancementFlags
+            );
             let _ = crossterm::terminal::disable_raw_mode();
             eprintln!("{info}");
         }));
@@ -1169,6 +1184,7 @@ impl TuiRenderer {
             viewport_invalidated: false,
             cursor_row_from_top: 0,
             printed_ids: HashSet::new(),
+            accordion: AccordionState::default(),
 
             active_dialog: None,
             active_tabbed_dialog: None,
@@ -1390,6 +1406,7 @@ impl TuiRenderer {
             stdout.flush()?;
             self.active_rows = rows;
             self.cursor_row_from_top = frame.cursor_row;
+            self.accordion.rebuild_hit_regions(&[], 0, term_width);
             return Ok(());
         }
         let todo_rows = self
@@ -1422,10 +1439,11 @@ impl TuiRenderer {
                 + self.agent_tasks.len()
         };
         let live_messages = self.find_live_messages();
-        let mut all_live_lines = Vec::new();
-        for message in live_messages {
-            all_live_lines.extend(message.format(&self.colors).split('\n').map(str::to_owned));
-        }
+        let all_live_rendered = self.projected_lines(live_messages);
+        let all_live_lines = all_live_rendered
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>();
         let content_frame = plan_live_content_frame(
             &mut self.autocomplete_state,
             term_h,
@@ -1434,6 +1452,8 @@ impl TuiRenderer {
             &all_live_lines,
             dialog_active || self.last_render_error.is_some(),
         );
+        let visible_live_rendered =
+            rendered_metadata_for_visible(&all_live_rendered, &content_frame.live_lines);
         if !content_frame.live_lines.is_empty() {
             // A Brain can have more than one live work unit (for example a
             // streamed VM program alongside a child task or output handle).
@@ -1720,6 +1740,7 @@ impl TuiRenderer {
 
         self.active_rows = rows;
         self.cursor_row_from_top = cursor_row_from_top;
+        self.rebuild_transcript_hit_regions(&visible_live_rendered, rows, term_width, term_h);
         Ok(())
     }
 
@@ -1799,6 +1820,65 @@ fn viewport_tail_lines(lines: &[String], terminal_width: usize, row_budget: usiz
     }
     selected.reverse();
     selected
+}
+
+fn viewport_tail_rendered_lines(
+    lines: &[RenderedTranscriptLine],
+    terminal_width: usize,
+    row_budget: usize,
+) -> Vec<RenderedTranscriptLine> {
+    if row_budget == 0 {
+        return Vec::new();
+    }
+    let mut remaining = row_budget;
+    let mut selected = Vec::new();
+    for line in lines.iter().rev() {
+        let rows = shadow_buffer::physical_rows(&line.text, terminal_width.max(1));
+        if rows > remaining {
+            let fragment =
+                visible_tail(&line.text, remaining.saturating_mul(terminal_width.max(1)));
+            if !fragment.is_empty() {
+                selected.push(RenderedTranscriptLine {
+                    text: fragment,
+                    row_id: None,
+                    row_expanded: None,
+                });
+            }
+            break;
+        }
+        selected.push(line.clone());
+        remaining -= rows;
+    }
+    selected.reverse();
+    selected
+}
+
+fn rendered_metadata_for_visible(
+    all: &[RenderedTranscriptLine],
+    visible: &[String],
+) -> Vec<RenderedTranscriptLine> {
+    let mut search_end = all.len();
+    let mut matched = visible
+        .iter()
+        .rev()
+        .map(|text| {
+            let found = all[..search_end]
+                .iter()
+                .rposition(|line| line.text == *text);
+            if let Some(index) = found {
+                search_end = index;
+                all[index].clone()
+            } else {
+                RenderedTranscriptLine {
+                    text: text.clone(),
+                    row_id: None,
+                    row_expanded: None,
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    matched.reverse();
+    matched
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1892,12 +1972,14 @@ impl TuiRenderer {
         if !to_commit.is_empty() {
             self.erase_live_area()?;
             for msg in &to_commit {
-                Self::raw_println(&msg.format(&self.colors))?;
+                Self::raw_println(&msg.complete_transcript(&self.colors))?;
                 // Blank line after every committed message so the output area
                 // stays readable (issue #15 — remove clutter between work items).
                 Self::raw_blank_line()?;
             }
-            self.draw_live_area()?;
+            self.pending_viewport_size = Some(crossterm::terminal::size().unwrap_or((80, 24)));
+            self.viewport_invalidated = true;
+            self.redraw_full_viewport()?;
             self.live_area_dirty = false;
         } else {
             // Only redraw when something actually changed: a message is streaming
@@ -2014,6 +2096,7 @@ impl TuiRenderer {
         let _ = execute!(
             io::stdout(),
             crossterm::event::PopKeyboardEnhancementFlags,
+            crossterm::event::DisableMouseCapture,
             crossterm::event::DisableBracketedPaste,
             cursor::Show,
             ResetColor,
@@ -2036,6 +2119,7 @@ impl TuiRenderer {
     /// setup wizard) can take over.  Call `resume()` after it exits.
     pub fn suspend(&self) -> anyhow::Result<()> {
         let _ = io::stdout().flush();
+        let _ = execute!(io::stdout(), crossterm::event::DisableMouseCapture);
         disable_raw_mode()?;
         Ok(())
     }
@@ -2043,6 +2127,7 @@ impl TuiRenderer {
     /// Re-acquire the terminal after a `suspend()`.
     pub fn resume(&mut self) -> anyhow::Result<()> {
         enable_raw_mode()?;
+        let _ = execute!(io::stdout(), crossterm::event::EnableMouseCapture);
         // Force a full redraw so the REPL live area reappears.
         self.active_rows = 0;
         self.pending_viewport_size = None;
@@ -2058,6 +2143,7 @@ impl TuiRenderer {
         enable_raw_mode()?;
         let _ = execute!(
             io::stdout(),
+            crossterm::event::EnableMouseCapture,
             crossterm::event::EnableBracketedPaste,
             crossterm::event::PushKeyboardEnhancementFlags(
                 crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
@@ -2105,6 +2191,9 @@ impl TuiRenderer {
                     Event::Key(key)
                         if key.modifiers == KeyModifiers::NONE
                             && self.handle_completion_key(key.code) => {}
+                    Event::Key(key) if self.handle_accordion_key(key) => {
+                        self.render()?;
+                    }
                     Event::Key(key) => match (key.code, key.modifiers) {
                         // Shift+Enter or Alt/Option+Enter: insert newline instead of submit.
                         // Standard VT100 raw mode never sends SHIFT for Enter on macOS —
@@ -2138,6 +2227,9 @@ impl TuiRenderer {
                         // using the terminal's new dimensions without erasing scrollback.
                         let _ = self.handle_resize(w, h);
                     }
+                    Event::Mouse(mouse) if self.handle_accordion_mouse(mouse) => {
+                        self.render()?;
+                    }
                     _ => {}
                 }
             }
@@ -2148,6 +2240,89 @@ impl TuiRenderer {
 // ─── Message helpers ──────────────────────────────────────────────────────────
 
 impl TuiRenderer {
+    fn projected_message_lines(&self, message: &MessageRef) -> Vec<RenderedTranscriptLine> {
+        self.accordion.render_message(message, &self.colors)
+    }
+
+    fn projected_lines(
+        &self,
+        messages: impl IntoIterator<Item = MessageRef>,
+    ) -> Vec<RenderedTranscriptLine> {
+        let mut rendered = Vec::new();
+        for message in messages {
+            rendered.extend(self.projected_message_lines(&message));
+            rendered.push(RenderedTranscriptLine {
+                text: String::new(),
+                row_id: None,
+                row_expanded: None,
+            });
+        }
+        rendered
+    }
+
+    fn rebuild_transcript_hit_regions(
+        &mut self,
+        live: &[RenderedTranscriptLine],
+        live_rows: usize,
+        width: usize,
+        height: usize,
+    ) {
+        let transcript_budget = height.saturating_sub(live_rows);
+        let printed = self
+            .output_manager
+            .get_messages()
+            .into_iter()
+            .filter(|message| self.printed_ids.contains(&message.id()))
+            .collect::<Vec<_>>();
+        let transcript =
+            viewport_tail_rendered_lines(&self.projected_lines(printed), width, transcript_budget);
+        let transcript_rows = transcript
+            .iter()
+            .map(|line| shadow_buffer::physical_rows(&line.text, width.max(1)))
+            .sum::<usize>();
+        let plan = viewport_redraw_plan(height, live_rows, transcript_rows);
+        let mut combined = transcript;
+        let padding = plan.live_top.saturating_sub(
+            plan.transcript_top
+                + combined
+                    .iter()
+                    .map(|line| shadow_buffer::physical_rows(&line.text, width.max(1)))
+                    .sum::<usize>(),
+        );
+        combined.extend((0..padding).map(|_| RenderedTranscriptLine {
+            text: String::new(),
+            row_id: None,
+            row_expanded: None,
+        }));
+        combined.extend_from_slice(live);
+        self.accordion
+            .rebuild_hit_regions(&combined, plan.transcript_top, width);
+    }
+
+    pub(crate) fn handle_accordion_key(&mut self, key: KeyEvent) -> bool {
+        if self.active_dialog.is_some() || self.active_tabbed_dialog.is_some() {
+            return false;
+        }
+        if !self.accordion.handle_key(key) {
+            return false;
+        }
+        self.viewport_invalidated = true;
+        self.live_area_dirty = true;
+        true
+    }
+
+    pub(crate) fn handle_accordion_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.active_dialog.is_some() || self.active_tabbed_dialog.is_some() {
+            return false;
+        }
+        if !self.accordion.handle_mouse(mouse) {
+            return false;
+        }
+        self.viewport_invalidated = true;
+        self.live_area_dirty = true;
+        true
+    }
+
     pub fn add_trait_message(&mut self, message: MessageRef) -> MessageId {
         let id = message.id();
         self.output_manager.add_trait_message(message);
@@ -2229,11 +2404,11 @@ impl TuiRenderer {
         .sum::<usize>();
         let base_reserved_rows =
             1 + drawn_input_rows + drawn_status_rows + todo_rows + self.agent_tasks.len();
-        let live_messages = self.find_live_messages();
-        let mut all_live_lines = Vec::new();
-        for message in live_messages {
-            all_live_lines.extend(message.format(&self.colors).split('\n').map(str::to_owned));
-        }
+        let all_live_lines = self
+            .projected_lines(self.find_live_messages())
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
         let mut autocomplete = self.autocomplete_state.clone();
         let content_frame = plan_live_content_frame(
             &mut autocomplete,
@@ -2331,13 +2506,16 @@ impl TuiRenderer {
             .min(term_height);
         let transcript_budget = term_height.saturating_sub(live_rows);
 
-        let mut transcript = Vec::new();
-        for message in self.output_manager.get_messages() {
-            if self.printed_ids.contains(&message.id()) {
-                transcript.extend(message.format(&self.colors).split('\n').map(str::to_owned));
-                transcript.push(String::new());
-            }
-        }
+        let transcript = self
+            .projected_lines(
+                self.output_manager
+                    .get_messages()
+                    .into_iter()
+                    .filter(|message| self.printed_ids.contains(&message.id())),
+            )
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
         let transcript = viewport_tail_lines(&transcript, term_width, transcript_budget);
         let transcript_rows = transcript
             .iter()
@@ -3439,7 +3617,7 @@ fn terminal_char_width(ch: char) -> usize {
 mod tests {
     use super::*;
     use crate::cli::command_autocomplete::CommandRegistry;
-    use crate::cli::messages::WorkUnit;
+    use crate::cli::messages::{Message, MessageRef, WorkUnit};
 
     #[test]
     fn startup_header_is_plain_scrollback_content() {
@@ -3626,6 +3804,40 @@ mod tests {
             !commands.contains("\x1b[1A"),
             "must not repair with MoveUp: {commands:?}"
         );
+    }
+
+    #[test]
+    fn production_viewport_projects_collapsed_rows_without_losing_native_transcript() {
+        let work = Arc::new(WorkUnit::new("program"));
+        work.set_program_source("forth");
+        work.set_response("世界 alpha\nline two\nline three\nline four");
+        work.set_complete();
+        let message: MessageRef = work.clone();
+        let colors = ColorScheme::default();
+        let state = AccordionState::default();
+        let projected = state.render_message(&message, &colors);
+
+        assert_eq!(projected.len(), 1);
+        assert!(projected[0].text.contains("[collapsed]"));
+        assert!(!projected[0].text.contains("line four"));
+        assert!(work.complete_transcript(&colors).contains("line four"));
+
+        let wide = viewport_tail_rendered_lines(&projected, 80, 4);
+        let narrow = viewport_tail_rendered_lines(&projected, 8, 8);
+        assert_eq!(wide[0].row_id, narrow[0].row_id);
+        assert!(shadow_buffer::physical_rows(&narrow[0].text, 8) > 1);
+
+        let text = wide
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>();
+        let plan = viewport_redraw_plan(8, 2, 1);
+        let mut bytes = Vec::new();
+        begin_full_viewport_paint(&mut bytes, plan, &text).expect("production viewport paint");
+        let raw = String::from_utf8(bytes).unwrap();
+        assert!(raw.contains("[collapsed]"));
+        assert!(!raw.contains("line four"));
+        assert!(!raw.contains("\x1b[3J"), "must preserve native scrollback");
     }
 
     #[test]
