@@ -376,6 +376,10 @@ pub struct ProgramRuntime {
     /// a Brain/session log, while only the active requirements enter a run.
     capability_ledger: Arc<Mutex<CapabilityLedger>>,
     capability_policy: Arc<RwLock<CapabilityPolicy>>,
+    /// Shared/exclusive authority-use gate. Host operations retain a shared
+    /// lease through dispatch; revoke, policy, and resource-root mutations
+    /// take the exclusive side before they can return to their caller.
+    authority_use_gate: Arc<RwLock<()>>,
     authority_sink: Arc<RwLock<Option<ProgramRuntimeAuthoritySink>>>,
     agent_scheduler: RwLock<Weak<scheduler::AgentScheduler>>,
     /// Daemon-owned typed continuations keyed by the execution id visible in
@@ -671,6 +675,7 @@ impl ProgramRuntime {
             streams: Arc::new(Mutex::new(HashMap::new())),
             capability_ledger: Arc::new(Mutex::new(CapabilityLedger::default())),
             capability_policy: Arc::new(RwLock::new(default_capability_policy())),
+            authority_use_gate: Arc::new(RwLock::new(())),
             authority_sink: Arc::new(RwLock::new(None)),
             agent_scheduler: RwLock::new(Weak::new()),
             pending_typed: Mutex::new(HashMap::new()),
@@ -906,6 +911,10 @@ impl ProgramRuntime {
         {
             bail!("whole-machine binding must be host-machine root '/'");
         }
+        let _authority_use = self
+            .authority_use_gate
+            .write()
+            .map_err(|_| anyhow::anyhow!("authority-use gate poisoned"))?;
         let policy = self
             .capability_policy
             .read()
@@ -992,6 +1001,10 @@ impl ProgramRuntime {
     }
 
     fn clear_resource_root(&self, kind: &crate::vm::ResourceRoot) -> Result<()> {
+        let _authority_use = self
+            .authority_use_gate
+            .write()
+            .map_err(|_| anyhow::anyhow!("authority-use gate poisoned"))?;
         let policy = self
             .capability_policy
             .read()
@@ -1171,6 +1184,10 @@ impl ProgramRuntime {
         &self,
         mutation: impl FnOnce(&CapabilityPolicy, &mut CapabilityLedger) -> Result<T>,
     ) -> Result<T> {
+        let _authority_use = self
+            .authority_use_gate
+            .write()
+            .map_err(|_| anyhow::anyhow!("authority-use gate poisoned"))?;
         let sink = self
             .authority_sink
             .read()
@@ -1219,6 +1236,10 @@ impl ProgramRuntime {
         actor: impl Into<String>,
     ) -> Result<Vec<uuid::Uuid>> {
         policy.validate().map_err(anyhow::Error::msg)?;
+        let _authority_use = self
+            .authority_use_gate
+            .write()
+            .map_err(|_| anyhow::anyhow!("authority-use gate poisoned"))?;
         let actor = actor.into();
         let sink = self
             .authority_sink
@@ -3174,6 +3195,7 @@ impl ProgramRuntime {
         let authorization = HostAuthorizationAudit {
             ledger: Arc::clone(&self.capability_ledger),
             policy: Arc::clone(&self.capability_policy),
+            use_gate: Arc::clone(&self.authority_use_gate),
             sink: self
                 .authority_sink
                 .read()
@@ -3271,6 +3293,7 @@ impl ProgramRuntime {
         let authorization = HostAuthorizationAudit {
             ledger: Arc::clone(&self.capability_ledger),
             policy: Arc::clone(&self.capability_policy),
+            use_gate: Arc::clone(&self.authority_use_gate),
             sink: self
                 .authority_sink
                 .read()
@@ -3357,6 +3380,7 @@ struct HostAuthorizationAttempt {
 struct HostAuthorizationAudit {
     ledger: Arc<Mutex<CapabilityLedger>>,
     policy: Arc<RwLock<CapabilityPolicy>>,
+    use_gate: Arc<RwLock<()>>,
     sink: Option<ProgramRuntimeAuthoritySink>,
     context: AuthorizationContext,
     reason: String,
@@ -4274,6 +4298,10 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         else {
             return self.request(requirement, arguments, origin);
         };
+        let authority_use_gate = Arc::clone(&self.authorization.use_gate);
+        let _authority_use = authority_use_gate
+            .read()
+            .map_err(|_| host_binding_error(origin, "authority-use gate poisoned"))?;
         let policy = self
             .authorization
             .policy
@@ -4325,10 +4353,12 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                 "authorization was revoked, expired, or replaced before host use",
             ));
         }
+        drop(ledger);
 
-        // Holding the ledger lock makes the host use and revoke/policy paths
-        // linearizable. A revocation which wins this lock prevents the use;
-        // one which arrives later is ordered after the completed attempt.
+        // The shared authority-use gate makes host dispatch and revocation or
+        // policy/root mutation linearizable without retaining the non-reentrant
+        // ledger mutex across host code. Agent spawning intentionally re-enters
+        // the ledger to snapshot its grant ceiling.
         let mut result = self.request(requirement, arguments, origin);
         let attempt = self
             .authorization_attempt
@@ -4341,6 +4371,9 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     "host binding completed without finalizing its authority use",
                 ));
             }
+            let mut ledger = ledger_handle
+                .lock()
+                .map_err(|_| host_binding_error(origin, "capability ledger lock poisoned"))?;
             let authorized = ledger.clone();
             ledger.rollback_authorization(&attempt.request);
             if let Some(sink) = &self.authorization.sink {
@@ -7793,6 +7826,7 @@ mod tests {
             HostAuthorizationAudit {
                 ledger: Arc::clone(&runtime.capability_ledger),
                 policy: Arc::clone(&runtime.capability_policy),
+                use_gate: Arc::clone(&runtime.authority_use_gate),
                 sink: None,
                 context: runtime.authorization_context_for(None).unwrap(),
                 reason: "host-boundary regression".into(),
