@@ -337,6 +337,11 @@ pub fn normalize_origin(endpoint: &str) -> Result<String> {
         .host_str()
         .context("endpoint must contain a host")?
         .to_ascii_lowercase();
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
     let port = url
         .port()
         .map(|port| format!(":{port}"))
@@ -374,7 +379,18 @@ pub fn validate_authenticated_endpoints(
     let expected = descriptor(provider);
     let base_origin = normalize_origin(base_url.unwrap_or(expected.standard_origin))?;
     for endpoint in overrides.iter().flatten() {
-        if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        if *endpoint != endpoint.trim() || endpoint.contains('\\') || endpoint.starts_with("//") {
+            bail!("authenticated endpoint override has ambiguous authority syntax");
+        }
+        if endpoint.starts_with('/') {
+            continue;
+        }
+        let has_authority = endpoint.contains("://")
+            || endpoint
+                .split('/')
+                .next()
+                .is_some_and(|segment| segment.contains(':'));
+        if has_authority {
             let origin = normalize_origin(endpoint)?;
             if origin != base_origin {
                 bail!(
@@ -654,6 +670,40 @@ mod tests {
             Utc::now()
         )
         .is_err());
+    }
+
+    #[test]
+    fn test_authenticated_endpoint_parser_rejects_ambiguous_authorities() {
+        assert!(validate_authenticated_endpoints(
+            CredentialProvider::OpenaiPlatform,
+            None,
+            &[Some("HTTPS://API.OPENAI.COM:443/v1/models")]
+        )
+        .is_ok());
+        assert!(validate_authenticated_endpoints(
+            CredentialProvider::OpenaiPlatform,
+            Some("http://[::1]:8080/v1"),
+            &[Some("http://[::1]:8080/models")]
+        )
+        .is_ok());
+        for hostile in [
+            "HTTPS://evil.example/models",
+            "//evil.example/models",
+            r"\\evil.example\models",
+            "https://user:password@api.openai.com/models",
+            "https://évil.example/models",
+            "https://%65vil.example/models",
+        ] {
+            assert!(
+                validate_authenticated_endpoints(
+                    CredentialProvider::OpenaiPlatform,
+                    None,
+                    &[Some(hostile)]
+                )
+                .is_err(),
+                "hostile override was accepted: {hostile}"
+            );
+        }
     }
 
     #[test]

@@ -847,20 +847,30 @@ mod tests {
 
     #[test]
     fn test_absolute_chat_origin_rejects_before_resolution() {
-        let mut profile = named_openai("primary", "work", "gpt-4o");
-        if let ProviderEntry::Credentialed { chat_path, .. } = &mut profile {
-            *chat_path = Some("http://127.0.0.1:9/steal".into());
+        for hostile in [
+            "http://127.0.0.1:9/steal",
+            "HTTPS://evil.example/steal",
+            "//evil.example/steal",
+            r"\\evil.example\steal",
+            "https://user:password@api.openai.com/steal",
+            "https://évil.example/steal",
+        ] {
+            let mut profile = named_openai("primary", "work", "gpt-4o");
+            if let ProviderEntry::Credentialed { chat_path, .. } = &mut profile {
+                *chat_path = Some(hostile.into());
+            }
+            let config = Config::with_providers(vec![profile])
+                .with_credentials(vec![named_openai_credential("work", "account-1")]);
+            let resolver = CountingResolver {
+                calls: AtomicUsize::new(0),
+            };
+            assert!(create_provider_graph_from_config_with_resolver(&config, &resolver).is_err());
+            assert_eq!(
+                resolver.calls.load(Ordering::SeqCst),
+                0,
+                "resolved {hostile}"
+            );
         }
-        let config = Config::with_providers(vec![profile])
-            .with_credentials(vec![named_openai_credential("work", "account-1")]);
-        let resolver = CountingResolver {
-            calls: AtomicUsize::new(0),
-        };
-        let error = create_provider_graph_from_config_with_resolver(&config, &resolver)
-            .err()
-            .unwrap();
-        assert!(format!("{error:#}").contains("authenticated endpoint origin mismatch"));
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
