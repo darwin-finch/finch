@@ -76,7 +76,20 @@ name = "legacy"
 
     let mut setup = Command::new(finch);
     base(&mut setup);
-    let output = setup.args(["setup", "--help"]).output().unwrap();
-    assert!(output.status.success());
-    assert_codex_was_not_executed(&marker, "setup command parsing");
+    let mut child = setup
+        .arg("setup")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if child.try_wait().unwrap().is_none() {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    assert_codex_was_not_executed(&marker, "interactive setup startup");
 }
