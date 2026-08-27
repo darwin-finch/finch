@@ -78,6 +78,10 @@ brain_test_isolation_is_active() {
   [[ "$socket_root_identity" == "$(brain_isolation_file_identity "$socket_root")" ]] || return 1
   [[ "${FINCH_TEST_BRAIN_LISTENER_FD:-}" == 10 && "${FINCH_TEST_DAEMON_LISTENER_FD:-}" == 11 ]] || return 1
   [[ "${FINCH_TEST_BRAIN_LISTENER_BACKUP_FD:-}" == 110 && "${FINCH_TEST_DAEMON_LISTENER_BACKUP_FD:-}" == 111 ]] || return 1
+  # The trusted Rust verifier above restores and authenticates FD10/FD11 from
+  # the sealed backups. Bash may use a low descriptor while reading a script,
+  # so the parent shell independently checks the backups that production will
+  # restore instead of treating Bash's transient FD10/FD11 as authority.
   perl -MSocket=SOL_SOCKET,SO_TYPE,SOCK_STREAM,sockaddr_in,inet_ntoa -e '
     sub verify_listener {
       my ($fd, $expected) = @_;
@@ -89,8 +93,7 @@ brain_test_isolation_is_active() {
       my ($port, $address) = sockaddr_in($name);
       return inet_ntoa($address) . ":" . $port eq $expected;
     }
-    exit(verify_listener(10, $ARGV[0]) && verify_listener(11, $ARGV[1])
-      && verify_listener(110, $ARGV[0]) && verify_listener(111, $ARGV[1]) ? 0 : 1);
+    exit(verify_listener(110, $ARGV[0]) && verify_listener(111, $ARGV[1]) ? 0 : 1);
   ' "$brain_addr" "$daemon_addr" || return 1
   perl -MFcntl=F_GETFL,O_ACCMODE,O_RDONLY -e '
     my $flags = fcntl(STDIN, F_GETFL, 0); exit 1 unless defined $flags;
