@@ -49,6 +49,9 @@ const TURN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const POST_TERMINAL_QUIET: Duration = Duration::from_millis(20);
 const SCHEMA_GENERATION_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const MAX_PACKAGE_METADATA_BYTES: usize = 64 * 1024;
+const MAX_CODEX_LAUNCHER_BYTES: usize = 512 * 1024;
+const MAX_GENERATED_SCHEMA_BYTES: usize = 2 * 1024 * 1024;
 const ADAPTER_INSTRUCTIONS: &str = "You are serving as Finch's model adapter. Do not modify files, run commands, browse, or invoke built-in Codex tools. Answer only from the supplied conversation. When Finch dynamic tools are supplied, invoke only those dynamic tools. Finch/Brain is the durable conversation authority; this Codex thread is ephemeral.";
 const PRIVATE_CONFIG: &str = r#"cli_auth_credentials_store = "file"
 approval_policy = "never"
@@ -154,22 +157,45 @@ impl PinnedExecutable {
 }
 
 fn pin_native_executable(source_path: &Path) -> Result<PinnedExecutable> {
-    validate_trusted_install_location(source_path)?;
-    validate_trusted_ancestors(source_path)?;
-    let mut source = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
-        .open(source_path)?;
-    validate_open_executable(&source)?;
-    stage_open_native(&mut source)
+    let trusted_root = trusted_install_root(source_path)?;
+    pin_codex_candidate_at(source_path, &trusted_root, false)
+}
+
+fn pin_codex_executable(configured: Option<&Path>) -> Result<PinnedExecutable> {
+    let source = match configured {
+        Some(path) => {
+            if !path.is_absolute() {
+                bail!("Configured Codex executable must be an absolute path");
+            }
+            let canonical = std::fs::canonicalize(path)
+                .context("Could not canonicalize the configured Codex executable")?;
+            if canonical != path {
+                bail!("Configured Codex executable must be a canonical non-symlink path");
+            }
+            return pin_native_executable(&canonical);
+        }
+        None => resolve_trusted_program("codex")?,
+    };
+
+    let trusted_root = trusted_install_root(&source)?;
+    pin_codex_candidate_at(&source, &trusted_root, true)
+}
+
+fn pin_codex_candidate_at(
+    source: &Path,
+    trusted_root: &Path,
+    allow_packaged_launcher: bool,
+) -> Result<PinnedExecutable> {
+    let mut held = open_trusted_file(source, trusted_root, true)?;
+    match validate_native_executable(&mut held) {
+        Ok(()) => stage_open_native(&mut held),
+        Err(error) if !allow_packaged_launcher => Err(error),
+        Err(_) => pin_packaged_native_from_launcher(source, trusted_root, &mut held),
+    }
 }
 
 fn stage_open_native(source: &mut std::fs::File) -> Result<PinnedExecutable> {
-    let mut magic = [0_u8; 4];
-    source.read_exact(&mut magic)?;
-    if !is_native_magic(magic) {
-        bail!("Codex executable is an npm/Homebrew launcher; configure/install the self-contained native ELF or Mach-O Codex binary");
-    }
+    validate_native_executable(source)?;
     source.seek(SeekFrom::Start(0))?;
     let directory = tempfile::Builder::new()
         .prefix("finch-codex-native-")
@@ -192,19 +218,317 @@ fn stage_open_native(source: &mut std::fs::File) -> Result<PinnedExecutable> {
     })
 }
 
-fn is_native_magic(magic: [u8; 4]) -> bool {
-    magic == *b"\x7fELF"
-        || matches!(
-            magic,
-            [0xfe, 0xed, 0xfa, 0xce]
-                | [0xce, 0xfa, 0xed, 0xfe]
-                | [0xfe, 0xed, 0xfa, 0xcf]
-                | [0xcf, 0xfa, 0xed, 0xfe]
-                | [0xca, 0xfe, 0xba, 0xbe]
-                | [0xbe, 0xba, 0xfe, 0xca]
-                | [0xca, 0xfe, 0xba, 0xbf]
-                | [0xbf, 0xba, 0xfe, 0xca]
-        )
+fn validate_native_executable(source: &mut std::fs::File) -> Result<()> {
+    let mut header = [0_u8; 4096];
+    source.seek(SeekFrom::Start(0))?;
+    let read = source.read(&mut header)?;
+    source.seek(SeekFrom::Start(0))?;
+    validate_native_header(&header[..read])
+}
+
+fn validate_native_header(header: &[u8]) -> Result<()> {
+    if header.len() < 20 {
+        bail!("Codex executable is not a complete native executable");
+    }
+    if header.starts_with(b"\x7fELF") {
+        #[cfg(not(target_os = "linux"))]
+        bail!("Codex executable has the wrong native format for this platform");
+        #[cfg(target_os = "linux")]
+        {
+            if header[4] != 2 {
+                bail!("Codex executable is not a 64-bit ELF binary");
+            }
+            let machine = match header[5] {
+                1 => u16::from_le_bytes([header[18], header[19]]),
+                2 => u16::from_be_bytes([header[18], header[19]]),
+                _ => bail!("Codex ELF executable has an unsupported byte order"),
+            };
+            #[cfg(target_arch = "x86_64")]
+            const EXPECTED_MACHINE: u16 = 62;
+            #[cfg(target_arch = "aarch64")]
+            const EXPECTED_MACHINE: u16 = 183;
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            bail!("This architecture has no supported Codex native executable");
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            if machine != EXPECTED_MACHINE {
+                bail!("Codex ELF executable targets the wrong architecture");
+            }
+            return Ok(());
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    bail!("Codex executable has the wrong native format for this platform");
+    #[cfg(target_os = "macos")]
+    validate_macho_header(header)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macho_header(header: &[u8]) -> Result<()> {
+    #[cfg(target_arch = "aarch64")]
+    const EXPECTED_CPU: u32 = 0x0100_000c;
+    #[cfg(target_arch = "x86_64")]
+    const EXPECTED_CPU: u32 = 0x0100_0007;
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    bail!("This architecture has no supported Codex native executable");
+
+    let magic: [u8; 4] = header[..4].try_into().expect("header length checked");
+    let read_u32 = |bytes: &[u8], little: bool| {
+        let bytes: [u8; 4] = bytes.try_into().expect("four-byte field");
+        if little {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        }
+    };
+    let thin_little = magic == [0xcf, 0xfa, 0xed, 0xfe];
+    let thin_big = magic == [0xfe, 0xed, 0xfa, 0xcf];
+    if thin_little || thin_big {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if read_u32(&header[4..8], thin_little) == EXPECTED_CPU {
+            return Ok(());
+        }
+        bail!("Codex Mach-O executable targets the wrong architecture");
+    }
+
+    let (little, entry_size) = match magic {
+        [0xca, 0xfe, 0xba, 0xbe] => (false, 20),
+        [0xbe, 0xba, 0xfe, 0xca] => (true, 20),
+        [0xca, 0xfe, 0xba, 0xbf] => (false, 32),
+        [0xbf, 0xba, 0xfe, 0xca] => (true, 32),
+        _ => bail!("Codex executable is not a native Mach-O binary"),
+    };
+    let count = read_u32(&header[4..8], little) as usize;
+    if count == 0 || count > 32 || 8 + count * entry_size > header.len() {
+        bail!("Codex universal Mach-O header is invalid or oversized");
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if (0..count).any(|index| {
+        let offset = 8 + index * entry_size;
+        read_u32(&header[offset..offset + 4], little) == EXPECTED_CPU
+    }) {
+        return Ok(());
+    }
+    bail!("Codex universal Mach-O does not contain this architecture")
+}
+
+#[derive(Clone, Copy)]
+struct CodexPlatformLayout {
+    package: &'static str,
+    target: &'static str,
+    version_suffix: &'static str,
+    os: &'static str,
+    cpu: &'static str,
+}
+
+fn codex_platform_layout() -> Result<CodexPlatformLayout> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    return Ok(CodexPlatformLayout {
+        package: "codex-darwin-arm64",
+        target: "aarch64-apple-darwin",
+        version_suffix: "darwin-arm64",
+        os: "darwin",
+        cpu: "arm64",
+    });
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    return Ok(CodexPlatformLayout {
+        package: "codex-darwin-x64",
+        target: "x86_64-apple-darwin",
+        version_suffix: "darwin-x64",
+        os: "darwin",
+        cpu: "x64",
+    });
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    return Ok(CodexPlatformLayout {
+        package: "codex-linux-arm64",
+        target: "aarch64-unknown-linux-musl",
+        version_suffix: "linux-arm64",
+        os: "linux",
+        cpu: "arm64",
+    });
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    return Ok(CodexPlatformLayout {
+        package: "codex-linux-x64",
+        target: "x86_64-unknown-linux-musl",
+        version_suffix: "linux-x64",
+        os: "linux",
+        cpu: "x64",
+    });
+    #[allow(unreachable_code)]
+    bail!("This platform has no supported packaged Codex native layout")
+}
+
+fn pin_packaged_native_from_launcher(
+    launcher: &Path,
+    trusted_root: &Path,
+    held_launcher: &mut std::fs::File,
+) -> Result<PinnedExecutable> {
+    let launcher_bytes = read_open_file_bounded(held_launcher, MAX_CODEX_LAUNCHER_BYTES)
+        .context("Could not inspect the Codex launcher")?;
+    if !launcher_bytes.starts_with(b"#!/usr/bin/env node\n") {
+        bail!("Codex executable is neither native nor a supported OpenAI package launcher");
+    }
+    let package_root = launcher
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "bin"))
+        .and_then(Path::parent)
+        .filter(|root| root.file_name().is_some_and(|name| name == "codex"))
+        .filter(|root| {
+            root.parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "@openai")
+        })
+        .context("Codex launcher is outside the supported @openai/codex package layout")?;
+    if launcher != package_root.join("bin/codex.js") {
+        bail!("Codex launcher path does not match the supported package entrypoint");
+    }
+
+    let package = read_trusted_json(
+        &package_root.join("package.json"),
+        trusted_root,
+        MAX_PACKAGE_METADATA_BYTES,
+    )?;
+    let version = validate_root_package_metadata(&package)?;
+    let layout = codex_platform_layout()?;
+    let nested_root = package_root
+        .join("node_modules/@openai")
+        .join(layout.package);
+    let nested_native = nested_root
+        .join("vendor")
+        .join(layout.target)
+        .join("bin/codex");
+    let bundled_native = package_root
+        .join("vendor")
+        .join(layout.target)
+        .join("bin/codex");
+    let nested_exists = path_entry_exists(&nested_native)?;
+    let bundled_exists = path_entry_exists(&bundled_native)?;
+    let (native, provenance, platform_metadata) = match (nested_exists, bundled_exists) {
+        (true, false) => (
+            nested_native,
+            nested_root
+                .join("vendor")
+                .join(layout.target)
+                .join("codex-package.json"),
+            Some(nested_root.join("package.json")),
+        ),
+        (false, true) => (
+            bundled_native,
+            package_root
+                .join("vendor")
+                .join(layout.target)
+                .join("codex-package.json"),
+            None,
+        ),
+        (true, true) => bail!("Codex package contains multiple supported native targets"),
+        (false, false) => bail!("Codex package is missing its supported native target"),
+    };
+
+    if let Some(platform_metadata) = platform_metadata {
+        let platform =
+            read_trusted_json(&platform_metadata, trusted_root, MAX_PACKAGE_METADATA_BYTES)?;
+        validate_platform_package_metadata(&platform, version, layout)?;
+    }
+    let provenance = read_trusted_json(&provenance, trusted_root, MAX_PACKAGE_METADATA_BYTES)?;
+    validate_package_provenance(&provenance, version, layout)?;
+    let mut native = open_trusted_file(&native, trusted_root, true)
+        .context("Could not open the packaged Codex native executable")?;
+    validate_native_executable(&mut native)?;
+    stage_open_native(&mut native)
+}
+
+fn validate_root_package_metadata(package: &Value) -> Result<&str> {
+    if package.get("name").and_then(Value::as_str) != Some("@openai/codex")
+        || package.pointer("/bin/codex").and_then(Value::as_str) != Some("bin/codex.js")
+    {
+        bail!("Codex root package metadata does not attest its launcher identity");
+    }
+    let version = package
+        .get("version")
+        .and_then(Value::as_str)
+        .filter(|version| valid_package_version(version))
+        .context("Codex root package has an invalid version")?;
+    let layout = codex_platform_layout()?;
+    let dependency = format!("@openai/{}", layout.package);
+    let expected = format!("npm:@openai/codex@{version}-{}", layout.version_suffix);
+    if package
+        .get("optionalDependencies")
+        .and_then(|dependencies| dependencies.get(&dependency))
+        .and_then(Value::as_str)
+        != Some(expected.as_str())
+    {
+        bail!("Codex root package does not pin the expected platform package");
+    }
+    Ok(version)
+}
+
+fn validate_platform_package_metadata(
+    package: &Value,
+    version: &str,
+    layout: CodexPlatformLayout,
+) -> Result<()> {
+    let expected_version = format!("{version}-{}", layout.version_suffix);
+    if package.get("name").and_then(Value::as_str) != Some("@openai/codex")
+        || package.get("version").and_then(Value::as_str) != Some(expected_version.as_str())
+        || package.get("os").and_then(Value::as_array)
+            != Some(&vec![Value::String(layout.os.to_string())])
+        || package.get("cpu").and_then(Value::as_array)
+            != Some(&vec![Value::String(layout.cpu.to_string())])
+    {
+        bail!("Codex platform package metadata does not match this Finch target");
+    }
+    Ok(())
+}
+
+fn validate_package_provenance(
+    provenance: &Value,
+    version: &str,
+    layout: CodexPlatformLayout,
+) -> Result<()> {
+    if provenance.get("layoutVersion").and_then(Value::as_u64) != Some(1)
+        || provenance.get("version").and_then(Value::as_str) != Some(version)
+        || provenance.get("target").and_then(Value::as_str) != Some(layout.target)
+        || provenance.get("variant").and_then(Value::as_str) != Some("codex")
+        || provenance.get("entrypoint").and_then(Value::as_str) != Some("bin/codex")
+    {
+        bail!("Codex native package provenance does not match its executable");
+    }
+    Ok(())
+}
+
+fn valid_package_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 64
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_trusted_json(path: &Path, trusted_root: &Path, limit: usize) -> Result<Value> {
+    let mut file = open_trusted_file(path, trusted_root, false)?;
+    let bytes = read_open_file_bounded(&mut file, limit)?;
+    serde_json::from_slice(&bytes).context("Codex package metadata is invalid JSON")
+}
+
+fn read_open_file_bounded(file: &mut std::fs::File, limit: usize) -> Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    (&mut *file)
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        bail!("Codex artifact exceeds Finch's size limit");
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(bytes)
 }
 
 fn prepare_managed_codex_home(credential_ref: &str) -> Result<(PathBuf, Arc<std::fs::File>)> {
@@ -438,10 +762,9 @@ fn hardened_app_server_args() -> Vec<String> {
 }
 
 impl AppServerCommand {
-    fn production(credential_ref: &str) -> Result<Self> {
+    fn production(credential_ref: &str, configured_executable: Option<&Path>) -> Result<Self> {
         let (codex_home, profile_directory) = prepare_managed_codex_home(credential_ref)?;
-        let codex = resolve_trusted_program("codex")?;
-        let pinned = Arc::new(pin_native_executable(&codex)?);
+        let pinned = Arc::new(pin_codex_executable(configured_executable)?);
         let program = pinned.path().to_path_buf();
         let args = hardened_app_server_args();
         let version =
@@ -542,13 +865,13 @@ impl AppServerCommand {
             return ProtocolCapabilities::default();
         }
         let thread_schema = directory.path().join("v2").join("ThreadStartParams.json");
-        let dynamic_tools = std::fs::read(&thread_schema)
+        let dynamic_tools = read_generated_schema(&thread_schema, directory.path())
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .and_then(|value| value.pointer("/properties/dynamicTools").cloned())
             .is_some();
         let turn_schema = directory.path().join("v2").join("TurnStartParams.json");
-        let restricted_read_only = std::fs::read(&turn_schema)
+        let restricted_read_only = read_generated_schema(&turn_schema, directory.path())
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .is_some_and(|schema| schema_supports_restricted_read_only(&schema));
@@ -579,6 +902,12 @@ impl AppServerCommand {
     }
 }
 
+fn read_generated_schema(path: &Path, output_root: &Path) -> Result<Vec<u8>> {
+    let mut file = open_trusted_file(path, output_root, false)
+        .context("Codex generated an unsafe schema artifact")?;
+    read_open_file_bounded(&mut file, MAX_GENERATED_SCHEMA_BYTES)
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_PROVIDER_COMMAND: std::cell::RefCell<Option<AppServerCommand>> =
@@ -594,12 +923,15 @@ pub(crate) fn install_test_provider_app_server(program: PathBuf, args: Vec<Strin
     });
 }
 
-fn provider_app_server_command(credential_ref: &str) -> Result<AppServerCommand> {
+fn provider_app_server_command(
+    credential_ref: &str,
+    configured_executable: Option<&Path>,
+) -> Result<AppServerCommand> {
     #[cfg(test)]
     if let Some(command) = TEST_PROVIDER_COMMAND.with(|slot| slot.borrow_mut().take()) {
         return Ok(command);
     }
-    AppServerCommand::production(credential_ref)
+    AppServerCommand::production(credential_ref, configured_executable)
 }
 
 fn resolve_trusted_program(name: &str) -> Result<PathBuf> {
@@ -622,82 +954,99 @@ fn resolve_program_in_path(name: &str, path: &std::ffi::OsStr) -> Result<PathBuf
 }
 
 fn validate_trusted_install_location(path: &Path) -> Result<()> {
-    const ROOTS: &[&str] = &["/usr", "/usr/local", "/opt/homebrew", "/Applications"];
-    if ROOTS.iter().any(|root| path.starts_with(root)) {
-        Ok(())
-    } else {
-        bail!("Codex executable is outside Finch's trusted installation roots")
-    }
+    trusted_install_root(path).map(|_| ())
 }
 
-fn resolve_codex_launcher(codex: &Path) -> Result<(PathBuf, Vec<String>, Vec<FileIdentity>)> {
-    let bytes = std::fs::read(codex).context("Could not inspect the Codex launcher")?;
-    let first = bytes
-        .split(|byte| *byte == b'\n')
-        .next()
-        .unwrap_or_default();
-    let files = vec![file_identity(codex)?];
-    if first == b"#!/usr/bin/env node" {
-        let node = resolve_trusted_program("node")?;
-        return Ok((node, vec![codex.to_string_lossy().into_owned()], files));
-    }
-    Ok((codex.to_path_buf(), Vec::new(), files))
+fn trusted_install_root(path: &Path) -> Result<PathBuf> {
+    const ROOTS: &[&str] = &["/usr/local", "/usr", "/opt/homebrew", "/Applications"];
+    ROOTS
+        .iter()
+        .map(Path::new)
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .map(Path::to_path_buf)
+        .context("Codex executable is outside Finch's trusted installation roots")
 }
 
 fn validate_trusted_file(path: &Path) -> Result<()> {
-    validate_trusted_ancestors(path)?;
+    let trusted_root = trusted_install_root(path)?;
+    open_trusted_file(path, &trusted_root, true).map(|_| ())
+}
+
+fn open_trusted_file(path: &Path, trusted_root: &Path, executable: bool) -> Result<std::fs::File> {
+    validate_trusted_ancestors_to(path, trusted_root)?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
         .open(path)
-        .context("Could not open executable without following links")?;
-    validate_open_executable(&file)
+        .context("Could not open Codex artifact without following links")?;
+    validate_open_file(&file, executable)?;
+    Ok(file)
 }
 
 fn validate_open_executable(file: &std::fs::File) -> Result<()> {
+    validate_open_file(file, true)
+}
+
+fn validate_open_file(file: &std::fs::File, executable: bool) -> Result<()> {
     let metadata = file
         .metadata()
-        .context("Could not inspect executable metadata")?;
+        .context("Could not inspect Codex artifact metadata")?;
     if !metadata.is_file() {
-        bail!("Codex executable is not a regular file");
+        bail!("Codex artifact is not a regular file");
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         let owner = metadata.uid();
         if owner != 0 && owner != nix::unistd::geteuid().as_raw() {
-            bail!("Codex executable is not owned by the current user or root");
+            bail!("Codex artifact is not owned by the current user or root");
         }
         if metadata.permissions().mode() & 0o022 != 0 {
-            bail!("Codex executable is group/world writable");
+            bail!("Codex artifact is group/world writable");
+        }
+        if metadata.nlink() != 1 {
+            bail!("Codex artifact has multiple hard links");
+        }
+        if executable && metadata.permissions().mode() & 0o111 == 0 {
+            bail!("Codex executable is not executable");
         }
     }
     Ok(())
 }
 
 fn validate_trusted_ancestors(path: &Path) -> Result<()> {
+    let trusted_root = trusted_install_root(path)?;
+    validate_trusted_ancestors_to(path, &trusted_root)
+}
+
+fn validate_trusted_ancestors_to(path: &Path, trusted_root: &Path) -> Result<()> {
+    if !path.is_absolute() || !trusted_root.is_absolute() || !path.starts_with(trusted_root) {
+        bail!("Codex artifact is outside Finch's trusted installation root");
+    }
     let mut ancestor = path.parent();
     while let Some(directory) = ancestor {
         let metadata = std::fs::symlink_metadata(directory)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            bail!("Codex executable has a symlinked or non-directory ancestor");
+            bail!("Codex artifact has a symlinked or non-directory ancestor");
         }
         #[cfg(unix)]
-        if metadata.permissions().mode() & 0o022 != 0 {
-            bail!("Codex executable has a group/world-writable ancestor");
-        }
-        if [
-            Path::new("/usr"),
-            Path::new("/opt"),
-            Path::new("/Applications"),
-        ]
-        .contains(&directory)
         {
+            use std::os::unix::fs::MetadataExt;
+            let owner = metadata.uid();
+            if owner != 0 && owner != nix::unistd::geteuid().as_raw() {
+                bail!("Codex artifact has an ancestor owned by another user");
+            }
+            if metadata.permissions().mode() & 0o022 != 0 {
+                bail!("Codex artifact has a group/world-writable ancestor");
+            }
+        }
+        if directory == trusted_root {
             return Ok(());
         }
         ancestor = directory.parent();
     }
-    bail!("Codex executable is outside Finch's trusted installation roots")
+    bail!("Codex artifact is outside Finch's trusted installation root")
 }
 
 fn file_identity(path: &Path) -> Result<FileIdentity> {
@@ -1368,7 +1717,7 @@ pub struct CodexAppServerAuth {
 impl CodexAppServerAuth {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            command: AppServerCommand::production(MANAGED_CODEX_CREDENTIAL_REF)?,
+            command: AppServerCommand::production(MANAGED_CODEX_CREDENTIAL_REF, None)?,
         })
     }
 
@@ -1840,13 +2189,21 @@ pub struct CodexAppServerProvider {
 
 impl CodexAppServerProvider {
     pub fn new(credential_ref: String, default_model: String) -> Result<Self> {
+        Self::new_with_executable(credential_ref, default_model, None)
+    }
+
+    pub fn new_with_executable(
+        credential_ref: String,
+        default_model: String,
+        configured_executable: Option<&Path>,
+    ) -> Result<Self> {
         if credential_ref != MANAGED_CODEX_CREDENTIAL_REF {
             bail!("Unsupported ChatGPT credential reference");
         }
         if default_model != GPT_5_6_SOL {
             bail!("ChatGPT subscription provider requires GPT-5.6 Sol");
         }
-        let command = provider_app_server_command(&credential_ref)?;
+        let command = provider_app_server_command(&credential_ref, configured_executable)?;
         let capabilities = command
             .protocol_override
             .unwrap_or_else(|| command.detect_protocol_capabilities());
@@ -2650,6 +3007,106 @@ mod tests {
     use super::*;
     use crate::claude::types::Message;
 
+    #[cfg(unix)]
+    fn test_native_bytes(marker: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 64];
+        #[cfg(target_os = "macos")]
+        {
+            bytes[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+            #[cfg(target_arch = "aarch64")]
+            bytes[4..8].copy_from_slice(&0x0100_000c_u32.to_le_bytes());
+            #[cfg(target_arch = "x86_64")]
+            bytes[4..8].copy_from_slice(&0x0100_0007_u32.to_le_bytes());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            bytes[..4].copy_from_slice(b"\x7fELF");
+            bytes[4] = 2;
+            bytes[5] = 1;
+            #[cfg(target_arch = "aarch64")]
+            bytes[18..20].copy_from_slice(&183_u16.to_le_bytes());
+            #[cfg(target_arch = "x86_64")]
+            bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        }
+        bytes.extend_from_slice(marker);
+        bytes
+    }
+
+    #[cfg(unix)]
+    struct PackagedCodexFixture {
+        root: tempfile::TempDir,
+        launcher: PathBuf,
+        package_root: PathBuf,
+        native: PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn packaged_codex_fixture() -> PackagedCodexFixture {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let package_root = root.path().join("lib/node_modules/@openai/codex");
+        let layout = codex_platform_layout().unwrap();
+        let platform_root = package_root
+            .join("node_modules/@openai")
+            .join(layout.package);
+        let vendor = platform_root.join("vendor").join(layout.target);
+        std::fs::create_dir_all(package_root.join("bin")).unwrap();
+        std::fs::create_dir_all(vendor.join("bin")).unwrap();
+        let launcher = package_root.join("bin/codex.js");
+        std::fs::write(
+            &launcher,
+            b"#!/usr/bin/env node\n// supported fixture; never executed\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dependency = format!("@openai/{}", layout.package);
+        let dependency_version = format!("npm:@openai/codex@0.149.1-{}", layout.version_suffix);
+        std::fs::write(
+            package_root.join("package.json"),
+            serde_json::to_vec(&json!({
+                "name": "@openai/codex",
+                "version": "0.149.1",
+                "bin": {"codex": "bin/codex.js"},
+                "optionalDependencies": {(dependency): dependency_version}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            platform_root.join("package.json"),
+            serde_json::to_vec(&json!({
+                "name": "@openai/codex",
+                "version": format!("0.149.1-{}", layout.version_suffix),
+                "os": [layout.os],
+                "cpu": [layout.cpu]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            vendor.join("codex-package.json"),
+            serde_json::to_vec(&json!({
+                "layoutVersion": 1,
+                "version": "0.149.1",
+                "target": layout.target,
+                "variant": "codex",
+                "entrypoint": "bin/codex"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let native = vendor.join("bin/codex");
+        std::fs::write(&native, test_native_bytes(b"packaged-native")).unwrap();
+        std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o500)).unwrap();
+        PackagedCodexFixture {
+            root,
+            launcher,
+            package_root,
+            native,
+        }
+    }
+
     fn mock_app_server(account_type: &str) -> (tempfile::TempDir, AppServerCommand) {
         mock_app_server_with_thread_event(account_type, "after")
     }
@@ -2994,12 +3451,153 @@ for line in sys.stdin:
 
     #[cfg(unix)]
     #[test]
+    fn supported_openai_package_launcher_resolves_unique_native_and_stages_it() {
+        let fixture = packaged_codex_fixture();
+        let pinned = pin_codex_candidate_at(&fixture.launcher, fixture.root.path(), true).unwrap();
+        assert_eq!(
+            std::fs::read(pinned.path()).unwrap(),
+            test_native_bytes(b"packaged-native")
+        );
+        assert_ne!(pinned.path(), fixture.native);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_absolute_native_identity_is_accepted_without_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let native = root.path().join("codex");
+        std::fs::write(&native, test_native_bytes(b"explicit-native")).unwrap();
+        std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let pinned = pin_codex_candidate_at(&native, root.path(), false).unwrap();
+        assert_eq!(
+            std::fs::read(pinned.path()).unwrap(),
+            test_native_bytes(b"explicit-native")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaged_resolution_rejects_missing_multiple_and_mismatched_layouts() {
+        let missing = packaged_codex_fixture();
+        std::fs::remove_file(&missing.native).unwrap();
+        assert!(
+            pin_codex_candidate_at(&missing.launcher, missing.root.path(), true)
+                .unwrap_err()
+                .to_string()
+                .contains("missing")
+        );
+
+        let multiple = packaged_codex_fixture();
+        let layout = codex_platform_layout().unwrap();
+        let bundled = multiple.package_root.join("vendor").join(layout.target);
+        std::fs::create_dir_all(bundled.join("bin")).unwrap();
+        std::fs::write(bundled.join("bin/codex"), test_native_bytes(b"duplicate")).unwrap();
+        assert!(
+            pin_codex_candidate_at(&multiple.launcher, multiple.root.path(), true)
+                .unwrap_err()
+                .to_string()
+                .contains("multiple")
+        );
+
+        let mismatched = packaged_codex_fixture();
+        let platform = mismatched.native.ancestors().nth(4).unwrap();
+        let metadata = platform.join("package.json");
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
+        value["version"] = json!("0.149.1-wrong-platform");
+        std::fs::write(metadata, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(
+            pin_codex_candidate_at(&mismatched.launcher, mismatched.root.path(), true)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn packaged_resolution_rejects_symlink_hardlink_and_writable_artifacts() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let symlinked = packaged_codex_fixture();
+        let real = symlinked.native.with_file_name("real-codex");
+        std::fs::rename(&symlinked.native, &real).unwrap();
+        symlink(&real, &symlinked.native).unwrap();
+        assert!(pin_codex_candidate_at(&symlinked.launcher, symlinked.root.path(), true).is_err());
+
+        let hardlinked = packaged_codex_fixture();
+        std::fs::hard_link(
+            &hardlinked.native,
+            hardlinked.native.with_file_name("other"),
+        )
+        .unwrap();
+        assert!(
+            pin_codex_candidate_at(&hardlinked.launcher, hardlinked.root.path(), true)
+                .unwrap_err()
+                .to_string()
+                .contains("hard links")
+        );
+
+        let writable_target = packaged_codex_fixture();
+        std::fs::set_permissions(
+            &writable_target.native,
+            std::fs::Permissions::from_mode(0o722),
+        )
+        .unwrap();
+        assert!(pin_codex_candidate_at(
+            &writable_target.launcher,
+            writable_target.root.path(),
+            true
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("writable"));
+
+        let writable_ancestor = packaged_codex_fixture();
+        let ancestor = writable_ancestor.native.parent().unwrap();
+        std::fs::set_permissions(ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(pin_codex_candidate_at(
+            &writable_ancestor.launcher,
+            writable_ancestor.root.path(),
+            true
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("writable ancestor"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_resolution_rejects_wrong_magic_and_architecture() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let native = root.path().join("codex");
+        std::fs::write(&native, vec![b'x'; 64]).unwrap();
+        std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(pin_codex_candidate_at(&native, root.path(), false).is_err());
+
+        let mut wrong_arch = test_native_bytes(b"wrong-arch");
+        #[cfg(target_os = "macos")]
+        wrong_arch[4..8].copy_from_slice(&0x0100_0007_u32.wrapping_add(5).to_le_bytes());
+        #[cfg(target_os = "linux")]
+        wrong_arch[18..20].copy_from_slice(&3_u16.to_le_bytes());
+        std::fs::write(&native, wrong_arch).unwrap();
+        assert!(pin_codex_candidate_at(&native, root.path(), false)
+            .unwrap_err()
+            .to_string()
+            .contains("wrong architecture"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn executable_copy_uses_held_descriptor_after_path_replacement() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("codex");
-        std::fs::write(&executable, b"\x7fELForiginal").unwrap();
+        std::fs::copy("/usr/bin/true", &executable).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o500)).unwrap();
         let mut held = OpenOptions::new()
             .read(true)
@@ -3007,10 +3605,18 @@ for line in sys.stdin:
             .open(&executable)
             .unwrap();
         let replacement = directory.path().join("replacement");
-        std::fs::write(&replacement, b"\x7fELFreplaced").unwrap();
+        std::fs::copy("/usr/bin/false", &replacement).unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o500)).unwrap();
         std::fs::rename(&replacement, &executable).unwrap();
         let pinned = stage_open_native(&mut held).unwrap();
-        assert_eq!(std::fs::read(pinned.path()).unwrap(), b"\x7fELForiginal");
+        assert!(std::process::Command::new(pinned.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(!std::process::Command::new(&executable)
+            .status()
+            .unwrap()
+            .success());
     }
 
     #[cfg(unix)]
@@ -3268,13 +3874,82 @@ for line in sys.stdin:
             output.status.success()
                 && String::from_utf8_lossy(&output.stdout).contains("codex-cli 0.149.1")
         }) {
-            match AppServerCommand::production(MANAGED_CODEX_CREDENTIAL_REF) {
+            match AppServerCommand::production(MANAGED_CODEX_CREDENTIAL_REF, None) {
                 Ok(command) => {
                     assert!(!command.detect_protocol_capabilities().restricted_read_only)
                 }
                 Err(error) => assert!(error.to_string().contains("writable ancestor")),
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn schema_fixture_command(script_body: &str) -> (tempfile::TempDir, AppServerCommand) {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("codex");
+        let python = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .unwrap();
+        let python = String::from_utf8(python.stdout).unwrap();
+        std::os::unix::fs::symlink(python.trim(), &program).unwrap();
+        let script = directory.path().join("schema_fixture.py");
+        std::fs::write(&script, script_body).unwrap();
+        let command = AppServerCommand::test(program, vec![script.to_string_lossy().into_owned()])
+            .with_test_timeouts(Duration::from_secs(2));
+        (directory, command)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_01491_schema_fixture_remains_fail_closed() {
+        let (_directory, command) = schema_fixture_command(
+            r#"import json, os, pathlib, sys
+assert set(os.environ).issubset({'TMPDIR','USER','LOGNAME'})
+out = pathlib.Path(sys.argv[-1]) / 'v2'
+out.mkdir(parents=True)
+(out / 'ThreadStartParams.json').write_text(json.dumps({'properties': {'dynamicTools': {'type': 'array'}}}))
+(out / 'TurnStartParams.json').write_text(json.dumps({'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnly'}}, 'definitions': {'ReadOnly': {'properties': {'type': {'enum': ['readOnly']}, 'networkAccess': {'type': 'boolean'}}}}}))
+"#,
+        );
+        let capabilities = command.detect_protocol_capabilities();
+        assert!(capabilities.dynamic_tools);
+        assert!(!capabilities.restricted_read_only);
+        assert!(require_restricted_boundary(capabilities).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_and_symlinked_generated_schemas_fail_closed() {
+        let (_directory, oversized) = schema_fixture_command(
+            r#"import os, pathlib, sys
+assert 'HOME' not in os.environ and 'CODEX_HOME' not in os.environ
+out = pathlib.Path(sys.argv[-1]) / 'v2'
+out.mkdir(parents=True)
+payload = ' ' * (2 * 1024 * 1024 + 1)
+(out / 'ThreadStartParams.json').write_text(payload)
+(out / 'TurnStartParams.json').write_text(payload)
+"#,
+        );
+        let started = std::time::Instant::now();
+        let capabilities = oversized.detect_protocol_capabilities();
+        assert!(!capabilities.dynamic_tools);
+        assert!(!capabilities.restricted_read_only);
+        assert!(started.elapsed() < StdDuration::from_secs(3));
+
+        let (_directory, symlinked) = schema_fixture_command(
+            r#"import os, pathlib, sys
+out = pathlib.Path(sys.argv[-1]) / 'v2'
+out.mkdir(parents=True)
+victim = pathlib.Path(sys.argv[-1]) / 'victim.json'
+victim.write_text('{}')
+os.symlink(victim, out / 'ThreadStartParams.json')
+os.symlink(victim, out / 'TurnStartParams.json')
+"#,
+        );
+        let capabilities = symlinked.detect_protocol_capabilities();
+        assert!(!capabilities.dynamic_tools);
+        assert!(!capabilities.restricted_read_only);
     }
 
     #[cfg(unix)]

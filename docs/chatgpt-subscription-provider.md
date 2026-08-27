@@ -38,6 +38,27 @@ runtime processes use that staged identity. Finch also reads the effective confi
 and managed requirements over app-server before authentication or text operations,
 and rejects any enabled or unknown action surface.
 
+Ordinary npm and Homebrew installs expose a JavaScript `codex` launcher. Finch
+does not execute that mutable launcher. It validates the exact `@openai/codex`
+package metadata and target-specific `codex-package.json`, opens the single native
+binary at the documented packaged location, verifies its platform and architecture,
+and stages bytes from that held descriptor. It never recursively searches package
+trees. A self-contained native binary may instead be selected explicitly:
+
+```toml
+[[providers]]
+type = "chatgpt_subscription"
+credential_ref = "codex-app-server:managed"
+app_server_executable = "/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+model = "gpt-5.6-sol"
+```
+
+The explicit path must be absolute, canonical, non-symlinked, inside a trusted
+installation root, and point directly to a native executable for the running
+platform. Launcher/package metadata and staged execution are not authentication:
+the generated protocol schema and effective sandbox/config attestation must still
+pass independently. In particular, Codex CLI 0.149.1 remains rejected.
+
 The profile default is `gpt-5.6-sol`; the official `gpt-5.6` alias currently routes
 to that model. Finch does not substitute the lower-cost Terra tier implicitly.
 

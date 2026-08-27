@@ -1,0 +1,74 @@
+name: Issue 169 Codex Native Resolution
+
+on:
+  push:
+    branches:
+      - codex/issue-169-codex-native-resolution
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-169-native-resolution-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  native-resolution:
+    name: Native resolution (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y capnproto pkg-config libssl-dev
+          else
+            brew install capnp
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Cargo inputs and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: issue-169-${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            issue-169-${{ runner.os }}-cargo-
+
+      - name: Check changed Rust files are formatted
+        run: rustfmt --edition 2021 --check src/providers/codex_app_server.rs src/config/provider.rs src/providers/factory.rs src/cli/setup_wizard.rs src/agent/mod.rs
+
+      - name: Check all library, binary, and test targets
+        run: cargo check --lib --bins --tests
+
+      - name: Run Codex app-server boundary regressions
+        run: cargo test --lib providers::codex_app_server::tests -- --test-threads=1
+
+      - name: Run persisted-path and provider construction regressions
+        run: |
+          cargo test --lib config::provider::tests::chatgpt_subscription_serializes_only_nonsecret_provider_identity -- --exact
+          cargo test --lib cli::setup_wizard::tests::chatgpt_subscription_wizard_roundtrip_preserves_managed_reference -- --exact
+          cargo test --lib providers::factory::tests::test_saved_chatgpt_only_config_constructs_shared_startup_provider -- --exact

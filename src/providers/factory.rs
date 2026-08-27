@@ -79,11 +79,13 @@ pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmPr
     match entry {
         ProviderEntry::ChatgptSubscription {
             credential_ref,
+            app_server_executable,
             model,
             ..
-        } => Ok(Box::new(CodexAppServerProvider::new(
+        } => Ok(Box::new(CodexAppServerProvider::new_with_executable(
             credential_ref.clone(),
             model.clone().unwrap_or_else(|| "gpt-5.6-sol".to_string()),
+            app_server_executable.as_deref(),
         )?)),
         ProviderEntry::Claude {
             api_key,
@@ -797,6 +799,7 @@ schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandbo
             ProviderEntry::ChatgptSubscription {
                 credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
                     .into(),
+                app_server_executable: None,
                 model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.into()),
                 name: Some("subscription".into()),
             },
@@ -833,6 +836,7 @@ schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandbo
         let path = directory.path().join("config.toml");
         Config::with_providers(vec![ProviderEntry::ChatgptSubscription {
             credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF.into(),
+            app_server_executable: None,
             model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.into()),
             name: Some("subscription".into()),
         }])

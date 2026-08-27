@@ -81,6 +81,12 @@ pub enum ProviderEntry {
     ChatgptSubscription {
         #[serde(default = "default_chatgpt_credential_ref")]
         credential_ref: String,
+        /// Optional absolute path to a self-contained native Codex executable.
+        ///
+        /// When omitted, Finch resolves `codex` from `PATH` and accepts either
+        /// a native executable or the supported OpenAI npm package layout.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_server_executable: Option<PathBuf>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -348,14 +354,16 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_subscription_serializes_only_opaque_reference() {
+    fn chatgpt_subscription_serializes_only_nonsecret_provider_identity() {
         let entry = ProviderEntry::ChatgptSubscription {
             credential_ref: default_chatgpt_credential_ref(),
+            app_server_executable: Some(PathBuf::from("/opt/codex/bin/codex")),
             model: Some("gpt-5.6-sol".into()),
             name: Some("subscription".into()),
         };
         let encoded = toml::to_string(&entry).unwrap();
         assert!(encoded.contains("codex-app-server:managed"));
+        assert!(encoded.contains("app_server_executable"));
         assert!(!encoded.contains("api_key"));
         assert_eq!(toml::from_str::<ProviderEntry>(&encoded).unwrap(), entry);
     }

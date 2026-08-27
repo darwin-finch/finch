@@ -547,13 +547,16 @@ fn provider_entry_from_remote_model(
     let model = (!model.is_empty()).then(|| model.to_string());
     let name = Some(name.to_string());
     match persisted {
-        Some(ProviderEntry::ChatgptSubscription { credential_ref, .. }) => {
-            ProviderEntry::ChatgptSubscription {
-                credential_ref: credential_ref.clone(),
-                model,
-                name,
-            }
-        }
+        Some(ProviderEntry::ChatgptSubscription {
+            credential_ref,
+            app_server_executable,
+            ..
+        }) => ProviderEntry::ChatgptSubscription {
+            credential_ref: credential_ref.clone(),
+            app_server_executable: app_server_executable.clone(),
+            model,
+            name,
+        },
         Some(ProviderEntry::Claude {
             base_url,
             chat_path,
@@ -635,6 +638,7 @@ fn provider_entry_from_remote_model(
             ProviderEntry::ChatgptSubscription {
                 credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
                     .to_string(),
+                app_server_executable: None,
                 model,
                 name,
             }
@@ -6000,6 +6004,7 @@ mod tests {
         let mut result = build_setup_result(&WizardState::new(None)).unwrap();
         result.providers = vec![ProviderEntry::ChatgptSubscription {
             credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF.into(),
+            app_server_executable: None,
             model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.into()),
             name: Some("subscription".into()),
         }];
@@ -8979,6 +8984,7 @@ for line in sys.stdin:
         let original = ProviderEntry::ChatgptSubscription {
             credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
                 .to_string(),
+            app_server_executable: Some(PathBuf::from("/opt/codex/bin/codex")),
             model: Some("gpt-5.6-sol".into()),
             name: Some("subscription-primary".into()),
         };
@@ -8998,9 +9004,11 @@ for line in sys.stdin:
             rebuilt,
             ProviderEntry::ChatgptSubscription {
                 credential_ref,
+                app_server_executable: Some(executable),
                 model: Some(model),
                 name: Some(name),
             } if credential_ref == crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
+                && executable == PathBuf::from("/opt/codex/bin/codex")
                 && model == "gpt-5.6-sol"
                 && name == "renamed"
         ));
@@ -9043,6 +9051,7 @@ for line in sys.stdin:
     fn chatgpt_fallback_requires_another_configured_provider() {
         let chatgpt = ProviderEntry::ChatgptSubscription {
             credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF.into(),
+            app_server_executable: None,
             model: Some("gpt-5.6-sol".into()),
             name: None,
         };

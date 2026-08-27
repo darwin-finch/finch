@@ -543,6 +543,7 @@ schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandbo
         Config::with_providers(vec![ProviderEntry::ChatgptSubscription {
             credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
                 .to_string(),
+            app_server_executable: None,
             model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.to_string()),
             name: Some("subscription".to_string()),
         }])
