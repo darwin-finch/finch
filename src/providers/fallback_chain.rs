@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use super::{
     resolve_effective_request, validate_provider_request, CapabilityProvenance, CapabilitySupport,
     LlmProvider, ModelCapabilities, ModelFeature, ProviderBackend, ProviderRequest,
-    ProviderResponse, StreamChunk, ValidatedProviderRequest,
+    ProviderResponse, ReasoningCapability, StreamChunk, ValidatedProviderRequest,
 };
 
 /// A chain of providers to try in order

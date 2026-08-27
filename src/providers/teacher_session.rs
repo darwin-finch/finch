@@ -416,6 +416,10 @@ fn count_tool_results(messages: &[Message]) -> usize {
 mod tests {
     use super::*;
     use crate::claude::types::ContentBlock;
+    use crate::providers::{
+        CapabilitySupport, ModelCapabilities, ProviderBackend, ReasoningCapability,
+        ValidatedProviderRequest,
+    };
 
     // Mock provider for testing
     struct MockProvider;
@@ -459,16 +463,16 @@ mod tests {
             "mock-model"
         }
 
-        fn capabilities(&self, model: &str) -> super::ModelCapabilities {
-            super::ModelCapabilities::static_metadata(
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            ModelCapabilities::static_metadata(
                 self.name(),
                 model,
                 "2026-08-26",
                 "test fixture",
-                super::CapabilitySupport::Supported,
-                super::CapabilitySupport::Supported,
-                super::CapabilitySupport::Unsupported,
-                super::ReasoningCapability::unsupported("2026-08-26", "test fixture"),
+                CapabilitySupport::Supported,
+                CapabilitySupport::Supported,
+                CapabilitySupport::Unsupported,
+                ReasoningCapability::unsupported("2026-08-26", "test fixture"),
                 Some(1_000),
                 Some(10_000),
                 None,
