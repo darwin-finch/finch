@@ -346,12 +346,11 @@ fi
 rm "$fake_home/.finch/brains/secret-fifo"
 
 socket_path="$fake_home/.finch/brains/secret-socket"
-if command -v perl >/dev/null 2>&1 && [[ "${#socket_path}" -lt 100 ]]; then
+if [[ "${#socket_path}" -lt 100 ]]; then
   phase=manifest-socket-status
   socket_status=0
   FINCH_REAL_STORE="$fake_home/.finch/brains" \
-    run_isolated perl -MSocket=AF_UNIX,SOCK_STREAM,sockaddr_un -e \
-    'socket(my $socket, AF_UNIX, SOCK_STREAM, 0) or die $!; bind($socket, sockaddr_un($ENV{FINCH_REAL_STORE}."/secret-socket")) or die $!' \
+    run_isolated "$supervisor" --child-socket-manifest-probe \
     2>"$diagnostic" || socket_status=$?
   [[ "$socket_status" == 70 ]] || {
     echo "socket manifest adversary returned $socket_status, expected 70" >&2
@@ -392,15 +391,7 @@ FINCH_STUBBORN_PID_FILE="$stubborn_pid_file" FINCH_STUBBORN_READY_FILE="$stubbor
 FINCH_STUBBORN_TERM_FILE="$stubborn_term_file" FINCH_STUBBORN_TARGET_FILE="$stubborn_target_file" \
 FINCH_STUBBORN_HOME_FILE="$stubborn_home_file" run_isolated bash -c '
   leader_pid=$BASHPID
-  perl -e '\''
-$SIG{TERM} = sub { open(my $fh, ">", $ENV{FINCH_STUBBORN_TERM_FILE}) or die $!; print {$fh} "term\n"; close($fh) };
-$SIG{HUP} = "IGNORE";
-$SIG{INT} = "IGNORE";
-open(my $ready, ">", $ENV{FINCH_STUBBORN_READY_FILE}) or die $!;
-print {$ready} "ready\n";
-close($ready);
-sleep 1 while 1;
-  '\'' &
+  "$FINCH_TEST_SUPERVISOR_BIN" --child-stubborn-probe &
   while [[ ! -s "$FINCH_STUBBORN_READY_FILE" ]]; do sleep 0.005; done
   printf "%s %s\n" "$FINCH_TEST_SUPERVISOR_PID" "$leader_pid" >"$FINCH_STUBBORN_TARGET_FILE"
   printf "%s\n" "$HOME" >"$FINCH_STUBBORN_HOME_FILE"
@@ -429,6 +420,49 @@ for launcher in "${launchers[@]}"; do
   [[ "$(cat "$launcher_probe")" == "$temp_parent"/finch-brain-test-home.* ]]
 done
 
+# Keep the executable/integration inventory closed. Any newly added script or
+# integration entrypoint that mentions Brain, daemon, IPC, Finch binaries, or
+# Cargo test execution must be classified in tests/BRAIN_TEST_INVENTORY.md and
+# added to the supervised closure before this gate can pass.
+phase=brain-entrypoint-inventory
+script_inventory="$(
+  cd "$repo_root"
+  rg -l -i 'brain|finch daemon|target/(debug|release)/finch|cargo test' \
+    scripts --glob '*.sh' | sort
+)"
+expected_script_inventory="$(cat <<'EOF'
+scripts/demo_boot.sh
+scripts/lib/brain_test_isolation.sh
+scripts/smoke_vm_wire_provider.sh
+scripts/stress_test.sh
+scripts/test_brain_isolation.sh
+scripts/test_brains.sh
+scripts/test_persistence.sh
+scripts/test_server.sh
+scripts/test_tool_passthrough.sh
+scripts/test_tui_debug.sh
+EOF
+)"
+[[ "$script_inventory" == "$expected_script_inventory" ]]
+
+integration_inventory="$(
+  cd "$repo_root"
+  rg -l -i 'brain|daemon|IpcClient' tests --glob '*.rs' | sort
+)"
+expected_integration_inventory="$(cat <<'EOF'
+tests/daemon_integration_test.rs
+tests/daemon_upgrade_preflight_test.rs
+tests/live.rs
+tests/live/impcpd.rs
+tests/live/parity.rs
+tests/live/providers.rs
+tests/no_external_provider_binary_test.rs
+tests/service_discovery_test.rs
+tests/worker_integration_test.rs
+EOF
+)"
+[[ "$integration_inventory" == "$expected_integration_inventory" ]]
+
 # Exercise the maintained HTTP launchers beyond their re-exec probe. The
 # synthetic Finch consumes inherited FD 11, records the exact sealed bind
 # argument, and serves the endpoints each launcher requires.
@@ -438,40 +472,18 @@ mock_release_dir="$scratch/target/release"
 mock_finch="$mock_debug_dir/finch"
 mock_bind_log="$scratch/mock-bind.log"
 mkdir -p "$mock_debug_dir" "$mock_release_dir"
-printf '%s\n' \
-  '#!/usr/bin/env perl' \
-  'use strict; use warnings; use IO::Socket::INET;' \
-  'my $expected = $ENV{FINCH_TEST_DAEMON_ADDR};' \
-  'exit 64 unless @ARGV == 3 && $ARGV[0] eq "daemon" && $ARGV[1] eq "--bind" && $ARGV[2] eq $expected;' \
-  'my $server = IO::Socket::INET->new_from_fd(11, "r+") or die "listener FD11: $!";' \
-  'my $actual = $server->sockhost().":".$server->sockport();' \
-  'exit 65 unless $actual eq $expected;' \
-  'open(my $log, ">>", $ENV{FINCH_MOCK_BIND_LOG}) or die $!; print {$log} "$expected|$actual\n"; close($log);' \
-  'open(my $address, ">", $ENV{FINCH_TEST_BOUND_ADDR_FILE}) or die $!; print {$address} $actual; close($address);' \
-  'while (my $client = $server->accept()) {' \
-  '  my $request = <$client> // next; my ($method, $path) = split(/ /, $request); my $length = 0;' \
-  '  while (defined(my $line = <$client>) && $line ne "\r\n") { $length = $1 if $line =~ /^Content-Length:\s*(\d+)/i; }' \
-  '  my $body = ""; read($client, $body, $length) if $length;' \
-  '  my ($status, $kind, $response) = (200, "application/json", "{}");' \
-  '  if ($method eq "GET" && $path eq "/health") { $response = "{\\\"status\\\":\\\"ok\\\"}"; }' \
-  '  elsif ($method eq "GET" && $path eq "/metrics") { $kind = "text/plain"; $response = "finch_test 1\n"; }' \
-  '  elsif ($method eq "POST" && $body =~ /"role"\s*:\s*"tool"/) { $response = "{\\\"choices\\\":[{\\\"message\\\":{\\\"content\\\":\\\"tool result accepted\\\"}}]}"; }' \
-  '  elsif ($method eq "POST") { $response = "{\\\"choices\\\":[{\\\"message\\\":{\\\"tool_calls\\\":[{\\\"id\\\":\\\"call_test\\\",\\\"type\\\":\\\"function\\\",\\\"function\\\":{\\\"name\\\":\\\"bash\\\",\\\"arguments\\\":\\\"{\\\\\\\"command\\\\\\\":\\\\\\\"ls\\\\\\\"}\\\"}}]}}]}"; }' \
-  '  else { $status = 404; }' \
-  '  print {$client} "HTTP/1.1 $status OK\r\nContent-Type: $kind\r\nContent-Length: ".length($response)."\r\nConnection: close\r\n\r\n$response"; close($client);' \
-  '}' >"$mock_finch"
-chmod +x "$mock_finch"
+cp "$supervisor" "$mock_finch"
 cp "$mock_finch" "$mock_release_dir/finch"
-FINCH_BIN="$mock_finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" \
+FINCH_TEST_HTTP_FIXTURE=1 FINCH_BIN="$mock_finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" \
   run_isolated "$repo_root/scripts/test_server.sh" >/dev/null
-FINCH_BIN="$mock_finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" ANTHROPIC_API_KEY=synthetic \
+FINCH_TEST_HTTP_FIXTURE=1 FINCH_BIN="$mock_finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" ANTHROPIC_API_KEY=synthetic \
   run_isolated "$repo_root/scripts/test_tool_passthrough.sh" >/dev/null
 test "$(wc -l <"$mock_bind_log" | tr -d ' ')" -eq 2
 awk -F '|' '$1 != $2 || $1 ~ /:0$/ { exit 1 }' "$mock_bind_log"
 
 phase=debug-release-profile-mismatch-rejected
 profile_status=0
-FINCH_BIN="$mock_release_dir/finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" \
+FINCH_TEST_HTTP_FIXTURE=1 FINCH_BIN="$mock_release_dir/finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" \
   run_isolated "$repo_root/scripts/test_server.sh" >/dev/null 2>&1 || profile_status=$?
 test "$profile_status" -eq 64
 
@@ -483,7 +495,7 @@ if [[ -x "$release_supervisor" ]]; then
   phase=real-wrapped-release-profile
   FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
     FINCH_TEST_SUPERVISOR_BIN="$release_supervisor" FINCH_BIN="$mock_release_dir/finch" \
-    FINCH_MOCK_BIND_LOG="$mock_bind_log" "$release_supervisor" \
+    FINCH_TEST_HTTP_FIXTURE=1 FINCH_MOCK_BIND_LOG="$mock_bind_log" "$release_supervisor" \
     "$repo_root/scripts/test_server.sh" >/dev/null
   test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 fi

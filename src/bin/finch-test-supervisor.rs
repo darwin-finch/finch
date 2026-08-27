@@ -693,11 +693,151 @@ fn run_child_panic_probe() -> ! {
     panic!("intentional supervised child panic probe");
 }
 
+fn run_child_socket_manifest_probe() -> anyhow::Result<()> {
+    let store = PathBuf::from(
+        std::env::var_os("FINCH_REAL_STORE")
+            .context("socket manifest probe requires FINCH_REAL_STORE")?,
+    );
+    let socket = store.join("secret-socket");
+    let _listener = std::os::unix::net::UnixListener::bind(socket)?;
+    Ok(())
+}
+
+fn run_child_stubborn_probe() -> anyhow::Result<()> {
+    let ready = std::env::var_os("FINCH_STUBBORN_READY_FILE")
+        .context("stubborn probe requires ready path")?;
+    let terminated = std::env::var_os("FINCH_STUBBORN_TERM_FILE")
+        .context("stubborn probe requires termination path")?;
+    let mut pipes = [0; 2];
+    if unsafe { libc::pipe(pipes.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    set_descriptor_flag(pipes[0], libc::F_SETFL, libc::O_NONBLOCK)?;
+    set_descriptor_flag(pipes[1], libc::F_SETFL, libc::O_NONBLOCK)?;
+    install_signal_handlers(pipes[1])?;
+    fs::write(ready, b"ready\n")?;
+    loop {
+        wait_for_event(pipes[0], 1000)?;
+        if PENDING_SIGNAL.swap(0, Ordering::Relaxed) != 0 {
+            fs::write(&terminated, b"term\n")?;
+        }
+    }
+}
+
+fn read_http_fixture_request(
+    stream: &std::net::TcpStream,
+) -> anyhow::Result<(String, String, String)> {
+    use std::io::BufRead as _;
+
+    let mut reader = io::BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut fields = request_line.split_whitespace();
+    let method = fields
+        .next()
+        .context("HTTP fixture request has no method")?;
+    let path = fields.next().context("HTTP fixture request has no path")?;
+    let mut content_length = 0_usize;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_length = value.trim().parse()?;
+        }
+    }
+    let mut body = vec![0_u8; content_length];
+    reader.read_exact(&mut body)?;
+    Ok((method.to_owned(), path.to_owned(), String::from_utf8(body)?))
+}
+
+fn run_child_http_fixture() -> anyhow::Result<()> {
+    let expected = std::env::var("FINCH_TEST_DAEMON_ADDR")?;
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    anyhow::ensure!(
+        arguments == ["daemon", "--bind", expected.as_str()],
+        "HTTP fixture received an unexpected daemon command"
+    );
+    let duplicate = unsafe { libc::dup(11) };
+    anyhow::ensure!(duplicate >= 0, "HTTP fixture listener FD11 is unavailable");
+    let listener = unsafe { TcpListener::from_raw_fd(duplicate) };
+    let actual = listener.local_addr()?.to_string();
+    anyhow::ensure!(
+        actual == expected,
+        "HTTP fixture listener authority mismatch"
+    );
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::env::var_os("FINCH_MOCK_BIND_LOG").context("missing fixture bind log")?)?
+        .write_all(format!("{expected}|{actual}\n").as_bytes())?;
+    fs::write(
+        std::env::var_os("FINCH_TEST_BOUND_ADDR_FILE").context("missing fixture address file")?,
+        actual,
+    )?;
+
+    for connection in listener.incoming() {
+        let mut stream = connection?;
+        let (method, path, body) = read_http_fixture_request(&stream)?;
+        let compact_body = body
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let (status, kind, response) = match (method.as_str(), path.as_str()) {
+            ("GET", "/health") => (200, "application/json", r#"{"status":"ok"}"#),
+            ("GET", "/metrics") => (200, "text/plain", "finch_test 1\n"),
+            ("POST", _) if compact_body.contains(r#""role":"tool""#) => (
+                200,
+                "application/json",
+                r#"{"choices":[{"message":{"content":"tool result accepted"}}]}"#,
+            ),
+            ("POST", _) => (
+                200,
+                "application/json",
+                r#"{"choices":[{"message":{"tool_calls":[{"id":"call_test","type":"function","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#,
+            ),
+            _ => (404, "application/json", "{}"),
+        };
+        write!(
+            stream,
+            "HTTP/1.1 {status} OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+            response.len()
+        )?;
+    }
+    Ok(())
+}
+
+fn exit_fixture(result: anyhow::Result<()>) -> ! {
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("Brain test fixture: {error:#}");
+            std::process::exit(70);
+        }
+    }
+}
+
 fn main() {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--child-panic-probe"))
         && std::env::args_os().nth(2).is_none()
     {
         run_child_panic_probe();
+    }
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("--child-socket-manifest-probe"))
+        && std::env::args_os().nth(2).is_none()
+    {
+        exit_fixture(run_child_socket_manifest_probe());
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--child-stubborn-probe"))
+        && std::env::args_os().nth(2).is_none()
+    {
+        exit_fixture(run_child_stubborn_probe());
+    }
+    if std::env::var("FINCH_TEST_HTTP_FIXTURE").as_deref() == Ok("1") {
+        exit_fixture(run_child_http_fixture());
     }
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new("--verify-inherited-proof"))
