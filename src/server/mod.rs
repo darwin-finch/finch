@@ -837,16 +837,15 @@ mod tests {
     }
 
     fn isolated_provider_graph() -> ProviderGraph {
-        let config = crate::config::Config::with_providers(vec![
-            crate::config::ProviderEntry::Claude {
+        let config =
+            crate::config::Config::with_providers(vec![crate::config::ProviderEntry::Claude {
                 api_key: "isolated-provider-graph".into(),
                 model: None,
                 base_url: None,
                 chat_path: None,
                 models_path: None,
                 name: Some("isolated-provider-graph".into()),
-            },
-        ]);
+            }]);
         crate::providers::create_provider_graph_from_config(&config)
             .expect("isolated tests need an in-memory provider graph")
     }
@@ -1128,6 +1127,12 @@ mod tests {
             .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
     }
 
+    fn supervisor_contract_present() -> bool {
+        // The permanent Brain-isolation CI gate runs these entries through
+        // scripts/test_brains.sh, which supplies the authenticated contract.
+        std::env::var_os("FINCH_BRAIN_TEST_TOKEN").is_some()
+    }
+
     #[tokio::test]
     async fn production_router_health_is_hermetic() {
         use tower::ServiceExt as _;
@@ -1180,6 +1185,9 @@ mod tests {
 
     #[test]
     fn production_constructor_persists_named_brain_only_in_isolated_home() {
+        if !supervisor_contract_present() {
+            return;
+        }
         let proof = crate::brain::isolated_test_proof()
             .expect("production constructor test requires supervisor-issued authority");
         let daemon_address = proof.daemon_address().to_owned();
@@ -1230,6 +1238,9 @@ mod tests {
 
     #[test]
     fn supervised_http_fixture_rejects_parent_traversal_without_external_mutation() {
+        if !supervisor_contract_present() {
+            return;
+        }
         let proof = crate::brain::isolated_test_proof()
             .expect("HTTP containment regression requires supervisor authority");
         let outside = tempfile::tempdir().unwrap();
@@ -1258,6 +1269,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn supervised_http_fixture_rejects_symlinked_ancestor_without_external_mutation() {
+        if !supervisor_contract_present() {
+            return;
+        }
         let proof = crate::brain::isolated_test_proof()
             .expect("HTTP containment regression requires supervisor authority");
         let outside = tempfile::tempdir().unwrap();
@@ -1285,6 +1299,9 @@ mod tests {
     #[test]
     fn production_constructor_rejects_unverified_environment_before_store_mutation() {
         const CHILD_ENV: &str = "FINCH_TEST_CONSTRUCTOR_FORGERY_CHILD";
+        if !supervisor_contract_present() {
+            return;
+        }
         if std::env::var_os(CHILD_ENV).is_some() {
             let proof = crate::brain::isolated_test_proof().unwrap();
             let forged_home = proof.home.join("forged-constructor-home");
@@ -1327,6 +1344,9 @@ mod tests {
     #[test]
     fn production_constructor_rejects_rewritten_proof_and_accepts_exact_restore() {
         const CHILD_ENV: &str = "FINCH_TEST_CONSTRUCTOR_REWRITTEN_PROOF_CHILD";
+        if !supervisor_contract_present() {
+            return;
+        }
         if std::env::var_os(CHILD_ENV).is_some() {
             use std::io::Write as _;
             use std::os::fd::FromRawFd as _;

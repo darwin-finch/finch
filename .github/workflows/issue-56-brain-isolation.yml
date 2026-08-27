@@ -1,15 +1,42 @@
-name: Issue 56 Brain isolation security
+name: Brain isolation security
 
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/issue-56-brain-isolation.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/bin/finch-test-supervisor.rs'
+      - 'src/brain/**'
+      - 'src/daemon/**'
+      - 'src/ipc/**'
+      - 'src/server/**'
+      - 'scripts/lib/brain_test_isolation.sh'
+      - 'scripts/test_brain*.sh'
+      - 'tests/BRAIN_TEST_INVENTORY.md'
+      - 'tests/brain*_test.rs'
   push:
-    branches: [ codex/issue-56-binary-free-isolation ]
+    branches: [ main ]
+    paths:
+      - '.github/workflows/issue-56-brain-isolation.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/bin/finch-test-supervisor.rs'
+      - 'src/brain/**'
+      - 'src/daemon/**'
+      - 'src/ipc/**'
+      - 'src/server/**'
+      - 'scripts/lib/brain_test_isolation.sh'
+      - 'scripts/test_brain*.sh'
+      - 'tests/BRAIN_TEST_INVENTORY.md'
+      - 'tests/brain*_test.rs'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: issue-56-brain-isolation-${{ github.ref }}
+  group: brain-isolation-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -57,7 +84,7 @@ jobs:
       run: cargo check --lib --bins --tests
 
     - name: Build isolation supervisor
-      timeout-minutes: 20
+      timeout-minutes: 40
       run: |
         cargo build --bin finch-test-supervisor
         cargo build --release --bin finch-test-supervisor
