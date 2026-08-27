@@ -297,12 +297,12 @@ fn process_descends_from(ancestor: u32) -> anyhow::Result<bool> {
         let record = std::str::from_utf8(&bytes)?;
         let suffix = record
             .rsplit_once(") ")
-            .context("process ancestry record is malformed")?
+            .ok_or_else(|| anyhow::anyhow!("process ancestry record is malformed"))?
             .1;
         Ok(suffix
             .split_whitespace()
             .nth(1)
-            .context("process ancestry record has no parent")?
+            .ok_or_else(|| anyhow::anyhow!("process ancestry record has no parent"))?
             .parse()?)
     }
 

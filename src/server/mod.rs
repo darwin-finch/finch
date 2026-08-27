@@ -194,11 +194,28 @@ fn supervised_state_root(
     let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
     #[cfg(target_os = "macos")]
     let path = {
+        static DARWIN_FIXTURE_ROOT_CLAIMED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         // Darwin's fdescfs exposes the directory descriptor itself but does
         // not permit `/dev/fd/N/child` traversal. These authenticated fixture
-        // tests run as exact, supervisor-owned subprocesses, so pin their
-        // process-wide working directory to the opened inode and use only
-        // descriptor-relative `.` descendants for the fixture lifetime.
+        // tests must therefore run as one exact, supervisor-owned subprocess.
+        // Fail closed before changing cwd if a caller tries to reuse this seam
+        // in a parallel/broad test process or constructs a second fixture.
+        anyhow::ensure!(
+            std::env::args_os().any(|argument| argument == "--exact"),
+            "Darwin Brain fixtures require a dedicated exact test subprocess"
+        );
+        anyhow::ensure!(
+            DARWIN_FIXTURE_ROOT_CLAIMED
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok(),
+            "Darwin Brain fixture state is already pinned in this process"
+        );
         anyhow::ensure!(
             unsafe { nix::libc::fchdir(directory.as_raw_fd()) } == 0,
             "could not pin the Brain fixture process to its state descriptor"
@@ -1363,6 +1380,24 @@ mod tests {
         assert!(moved.join("metrics").is_dir());
         assert!(moved.join("feedback.jsonl").is_file());
         assert!(moved.join("brains").is_dir());
+
+        #[cfg(target_os = "macos")]
+        {
+            let second = proof
+                .home
+                .join(format!("second-state-{}", uuid::Uuid::new_v4().simple()));
+            std::fs::create_dir(&second).unwrap();
+            let error = match AgentServer::for_supervised_brain_http_test(
+                "containment.local",
+                &second,
+                crate::brain::credential::BrainCredentialAuthority::ephemeral([74; 32]),
+            ) {
+                Ok(_) => panic!("a second Darwin fixture changed the process-relative root"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("already pinned"));
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        }
     }
 
     #[test]
