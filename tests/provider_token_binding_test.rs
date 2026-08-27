@@ -88,8 +88,8 @@ fn test_capabilities(provider: &str, model: &str) -> ModelCapabilities {
         CapabilitySupport::Unsupported,
         CapabilitySupport::Unsupported,
         ReasoningCapability::unsupported("2026-08-26", "test fixture"),
-        Some(1_000),
-        Some(1_000),
+        Some(10_000),
+        Some(10_000),
         None,
     )
 }
