@@ -336,22 +336,13 @@ still blocks the corresponding Brain phase until it is unified.
   fixtures for non-streaming, streaming, tools, tool continuation, reasoning, structured output,
   and each advertised input modality across Claude, OpenAI, Grok, Gemini, Mistral, Groq, Ollama,
   remote daemons, and every new compatible profile.
-- [ ] **P0 — make a native ChatGPT subscription profile usable for Finch dogfooding
-  ([#51](https://github.com/darwin-finch/finch/issues/51)).** Finch has an
-  orphaned `src/providers/chatgpt_auth.rs` device-login implementation, but the module is not exported,
-  no CLI/setup path invokes it, no `ProviderEntry` or factory consumes its refreshable credential, and
-  the ordinary OpenAI provider still requires a Platform API key. Finch owns the browser/device
-  authorization state machine, secure credential lifecycle, refresh/revocation, account discovery,
-  and direct provider transport; an installed Codex CLI or app-server is not a prerequisite. Never
-  scrape, copy, or reinterpret `~/.codex/auth.json`: a ChatGPT subscription session is not a general
-  OpenAI API key. Expose `OpenAI Platform API key` and `ChatGPT subscription` as distinct
-  credential-backed provider profiles in setup and `/provider`. Store only opaque, named
-  secure-store references in config; allow one account credential to serve multiple compatible model
-  profiles while keeping issuer, endpoint audience, account/tenant, and scopes bound; support multiple
-  explicitly named subscriptions without implicit cross-account fallback. Redact every token-bearing
-  error. Add mock login/refresh/revocation tests plus an opt-in live streaming/tool-continuation/
-  Finch-wire conformance run, then make the verified ChatGPT profile selectable as the primary
-  dogfooding model without deleting the configured Grok fallback.
+- [ ] **P0 — support documented direct provider authentication without external binaries
+  ([#51](https://github.com/darwin-finch/finch/issues/51)).** Preserve OpenAI Platform API-key
+  support. Add Finch-native OAuth or device authorization only where the provider publishes a
+  supported third-party contract covering client registration, audience, scopes, refresh/revoke,
+  catalog, and inference transport. Never reuse another application's client identity or credential
+  store, and never call undocumented consumer endpoints. Keep every credential kind and audience
+  distinct; a ChatGPT subscription session must never be reinterpreted as an OpenAI Platform key.
 - [ ] Generalize provider authentication beyond static API tokens. Add secure-store-backed OAuth,
   browser/device authorization, refreshable account sessions, and provider-native subscription
   credentials where their terms and APIs permit them (including ChatGPT/OpenAI and supported Claude

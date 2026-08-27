@@ -78,8 +78,10 @@ fn default_model_size() -> ModelSize {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ProviderEntry {
     #[serde(rename = "chatgpt_subscription")]
-    ChatgptSubscription {
-        #[serde(default = "default_chatgpt_credential_ref")]
+    /// Legacy Codex app-server profile retained only so old configuration can
+    /// be diagnosed without silently treating a subscription as a Platform key.
+    LegacyChatgptSubscription {
+        #[serde(default)]
         credential_ref: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
@@ -214,7 +216,7 @@ impl ProviderEntry {
     /// falling back to the configured model, then to a provider-specific label.
     pub fn profile_name(&self) -> String {
         let explicit_name = match self {
-            Self::ChatgptSubscription { name, .. }
+            Self::LegacyChatgptSubscription { name, .. }
             | Self::Claude { name, .. }
             | Self::Openai { name, .. }
             | Self::Grok { name, .. }
@@ -235,7 +237,7 @@ impl ProviderEntry {
         }
 
         match self {
-            Self::ChatgptSubscription { .. } => "chatgpt-subscription".to_string(),
+            Self::LegacyChatgptSubscription { .. } => "chatgpt-subscription-legacy".to_string(),
             Self::Local {
                 model_family,
                 model_size,
@@ -256,9 +258,9 @@ impl ProviderEntry {
     /// Human-readable name for UI display.
     pub fn display_name(&self) -> &str {
         match self {
-            Self::ChatgptSubscription { name, .. } => {
-                name.as_deref().unwrap_or("ChatGPT Subscription")
-            }
+            Self::LegacyChatgptSubscription { name, .. } => name
+                .as_deref()
+                .unwrap_or("Unsupported legacy ChatGPT subscription"),
             Self::Claude { name, .. } => name.as_deref().unwrap_or("Claude"),
             Self::Openai { name, .. } => name.as_deref().unwrap_or("OpenAI"),
             Self::Grok { name, .. } => name.as_deref().unwrap_or("Grok"),
@@ -274,7 +276,7 @@ impl ProviderEntry {
     /// Short provider-type tag (e.g. "claude", "grok", "local").
     pub fn provider_type(&self) -> &'static str {
         match self {
-            Self::ChatgptSubscription { .. } => "chatgpt_subscription",
+            Self::LegacyChatgptSubscription { .. } => "chatgpt_subscription",
             Self::Claude { .. } => "claude",
             Self::Openai { .. } => "openai",
             Self::Grok { .. } => "grok",
@@ -301,7 +303,7 @@ impl ProviderEntry {
             Self::Gemini { api_key, .. } => Some(api_key.as_str()),
             Self::Mistral { api_key, .. } => Some(api_key.as_str()),
             Self::Groq { api_key, .. } => Some(api_key.as_str()),
-            Self::ChatgptSubscription { .. }
+            Self::LegacyChatgptSubscription { .. }
             | Self::Ollama { .. }
             | Self::RemoteDaemon { .. }
             | Self::Local { .. } => None,
@@ -311,7 +313,7 @@ impl ProviderEntry {
     /// Optional model override (cloud providers only).
     pub fn model(&self) -> Option<&str> {
         match self {
-            Self::ChatgptSubscription { model, .. } => model.as_deref(),
+            Self::LegacyChatgptSubscription { model, .. } => model.as_deref(),
             Self::Claude { model, .. } => model.as_deref(),
             Self::Openai { model, .. } => model.as_deref(),
             Self::Grok { model, .. } => model.as_deref(),
@@ -322,10 +324,6 @@ impl ProviderEntry {
             Self::RemoteDaemon { .. } | Self::Local { .. } => None,
         }
     }
-}
-
-fn default_chatgpt_credential_ref() -> String {
-    crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF.to_string()
 }
 
 #[cfg(test)]
@@ -348,16 +346,41 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_subscription_serializes_only_opaque_reference() {
-        let entry = ProviderEntry::ChatgptSubscription {
-            credential_ref: default_chatgpt_credential_ref(),
-            model: Some("gpt-5.6-sol".into()),
-            name: Some("subscription".into()),
-        };
+    fn legacy_chatgpt_subscription_deserializes_without_reinterpretation() {
+        let encoded = r#"type = "chatgpt_subscription"
+credential_ref = "codex-app-server:managed"
+model = "gpt-5.6-sol"
+name = "subscription"
+"#;
+        let entry = toml::from_str::<ProviderEntry>(encoded).unwrap();
+        assert!(matches!(
+            entry,
+            ProviderEntry::LegacyChatgptSubscription {
+                ref credential_ref,
+                ..
+            } if credential_ref == "codex-app-server:managed"
+        ));
         let encoded = toml::to_string(&entry).unwrap();
         assert!(encoded.contains("codex-app-server:managed"));
         assert!(!encoded.contains("api_key"));
-        assert_eq!(toml::from_str::<ProviderEntry>(&encoded).unwrap(), entry);
+    }
+
+    #[test]
+    fn legacy_chatgpt_subscription_accepts_missing_credential_reference() {
+        let entry = toml::from_str::<ProviderEntry>(
+            r#"type = "chatgpt_subscription"
+model = "gpt-5.6-sol"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            entry,
+            ProviderEntry::LegacyChatgptSubscription {
+                credential_ref: String::new(),
+                model: Some("gpt-5.6-sol".into()),
+                name: None,
+            }
+        );
     }
 
     #[test]
