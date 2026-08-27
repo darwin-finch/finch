@@ -1165,7 +1165,15 @@ async fn main() -> Result<()> {
 async fn run_auth_command(command: AuthCommand) -> Result<()> {
     use finch::providers::CodexAppServerAuth;
 
-    let auth = CodexAppServerAuth::new()?;
+    let config = load_config()?;
+    let executable = config.providers.iter().find_map(|provider| match provider {
+        finch::config::ProviderEntry::ChatgptSubscription {
+            app_server_executable,
+            ..
+        } => app_server_executable.as_deref(),
+        _ => None,
+    });
+    let auth = CodexAppServerAuth::new_with_executable(executable)?;
     match command {
         AuthCommand::Login {
             provider: AuthProvider::Chatgpt,

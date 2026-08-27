@@ -1699,11 +1699,14 @@ pub async fn validate_and_apply_for(
     use crate::config::ProviderEntry;
     tracing::debug!(?invocation, "Starting shared setup commit ceremony");
 
-    let selected = result
-        .providers
-        .iter()
-        .any(|provider| matches!(provider, ProviderEntry::ChatgptSubscription { .. }));
-    if !selected {
+    let chatgpt = result.providers.iter().find_map(|provider| match provider {
+        ProviderEntry::ChatgptSubscription {
+            app_server_executable,
+            ..
+        } => Some(app_server_executable.as_deref()),
+        _ => None,
+    });
+    if chatgpt.is_none() {
         apply_and_save(result)?;
         return Ok(SetupApplyOutcome::Saved);
     }
@@ -1714,7 +1717,7 @@ pub async fn validate_and_apply_for(
     }
 
     let mut ceremony = LiveChatGptSetupCeremony {
-        auth: crate::providers::CodexAppServerAuth::new()?,
+        auth: crate::providers::CodexAppServerAuth::new_with_executable(chatgpt.flatten())?,
         ui: SetupAuthUi::enter()?,
     };
     run_chatgpt_setup_ceremony(result, &mut ceremony).await
