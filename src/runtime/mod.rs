@@ -1488,6 +1488,10 @@ impl ProgramRuntime {
             .lock()
             .map_err(|_| anyhow::anyhow!("stream registry lock poisoned"))?
             .retain(|_, stream| stream.owner != execution_id);
+        self.network
+            .lock()
+            .map_err(|_| anyhow::anyhow!("network socket registry lock poisoned"))?
+            .retain(|_, socket| socket.owner != execution_id);
         Ok(())
     }
 
@@ -3173,6 +3177,7 @@ impl ProgramRuntime {
             .then(|| EffectSet(declared_capabilities.iter().cloned().collect()));
         let fuel = context.budget.forth_fuel.min(u64::MAX as usize) as u64;
         let execution_id = context.execution_id;
+        let resource_generation = context.manifest_generation;
         let authorization = HostAuthorizationAudit {
             ledger: Arc::clone(&self.capability_ledger),
             policy: Arc::clone(&self.capability_policy),
@@ -3205,6 +3210,7 @@ impl ProgramRuntime {
                 output_handles,
                 streams,
                 execution_id,
+                resource_generation,
                 authorization,
                 grants,
                 typed_effect_sink,
@@ -3268,6 +3274,7 @@ impl ProgramRuntime {
             .map(|scheduler| agent_vm::AgentVmBinding::new(&scheduler, pending.caller.clone()));
         let suspension = pending.suspension.clone();
         let execution_id = pending.context.execution_id;
+        let resource_generation = pending.context.manifest_generation;
         let authorization = HostAuthorizationAudit {
             ledger: Arc::clone(&self.capability_ledger),
             policy: Arc::clone(&self.capability_policy),
@@ -3300,6 +3307,7 @@ impl ProgramRuntime {
                 output_handles,
                 streams,
                 execution_id,
+                resource_generation,
                 authorization,
                 grants,
                 typed_effect_sink,
@@ -3339,6 +3347,7 @@ struct TypedHostHandler {
     output_handles: Arc<Mutex<HashMap<String, OutputHandleRecord>>>,
     streams: Arc<Mutex<HashMap<String, HostStream>>>,
     execution_id: uuid::Uuid,
+    resource_generation: u64,
     authorization: HostAuthorizationAudit,
     network_grants: EffectSet,
     typed_effect_sink: Option<TypedEffectSink>,
@@ -3375,6 +3384,7 @@ impl TypedHostHandler {
         output_handles: Arc<Mutex<HashMap<String, OutputHandleRecord>>>,
         streams: Arc<Mutex<HashMap<String, HostStream>>>,
         execution_id: uuid::Uuid,
+        resource_generation: u64,
         authorization: HostAuthorizationAudit,
         network_grants: EffectSet,
         typed_effect_sink: Option<TypedEffectSink>,
@@ -3395,6 +3405,7 @@ impl TypedHostHandler {
             output_handles,
             streams,
             execution_id,
+            resource_generation,
             authorization,
             network_grants,
             typed_effect_sink,
@@ -5199,13 +5210,13 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                                 host: host.clone(),
                                 port,
                                 owner: self.execution_id,
-                                generation: 0,
+                                generation: self.resource_generation,
                             },
                         );
                     return Ok(vec![TypedValue::Resource {
                         kind: "network-socket".into(),
                         handle,
-                        generation: 0,
+                        generation: self.resource_generation,
                     }]);
                 }
                 let [TypedValue::Resource {
@@ -5225,9 +5236,8 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         "resource is not a network socket",
                     ));
                 }
-                self.mark_host_use();
-                let mut sockets = self
-                    .network
+                let network = Arc::clone(&self.network);
+                let mut sockets = network
                     .lock()
                     .map_err(|_| host_binding_error(origin, "network lock poisoned"))?;
                 let socket = sockets
@@ -5255,6 +5265,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         "network socket endpoint is no longer covered by an active grant",
                     ));
                 }
+                self.mark_host_use();
                 socket
                     .stream
                     .write_all(payload)
@@ -7802,6 +7813,7 @@ mod tests {
             Arc::clone(&runtime.output_handles),
             Arc::clone(&runtime.streams),
             execution_id,
+            runtime.manifest_generation(),
             HostAuthorizationAudit {
                 ledger: Arc::clone(&runtime.capability_ledger),
                 policy: Arc::clone(&runtime.capability_policy),
@@ -8030,6 +8042,55 @@ mod tests {
         )
         .expect_err("the production host boundary must reject selector/argument substitution");
         assert_eq!(error.code, "E-HOST-002");
+    }
+
+    #[test]
+    fn network_send_rejects_a_stale_program_run_generation() {
+        let listener = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("failed to bind test listener: {error}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+        let runtime = ProgramRuntime::new();
+        let mut host = production_host_handler(&runtime);
+        let handle = uuid::Uuid::new_v4().to_string();
+        runtime.network.lock().unwrap().insert(
+            handle.clone(),
+            NetworkSocket {
+                stream: client,
+                host: "127.0.0.1".into(),
+                port,
+                owner: host.execution_id,
+                generation: host.resource_generation,
+            },
+        );
+        let requirement = CapabilityRequirement {
+            capability: CapabilityKind::NetworkConnect,
+            selector: ResourceSelector::Network {
+                host: "127.0.0.1".into(),
+                ports: vec![port],
+            },
+        };
+        let stale_generation = host.resource_generation + 1;
+        let error = crate::vm::interpreter::CapabilityHandler::request(
+            &mut host,
+            &requirement,
+            vec![
+                TypedValue::Resource {
+                    kind: "network-socket".into(),
+                    handle,
+                    generation: stale_generation,
+                },
+                TypedValue::Bytes(b"hostile".to_vec()),
+            ],
+            &SourceOrigin::generated("network-send"),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "E-HOST-002");
+        assert!(error.message.contains("stale"));
     }
 
     #[test]
@@ -11528,6 +11589,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         assert_eq!(approved.status, ExecutionStatus::Completed);
         assert_eq!(approved.values, vec![ProgramValue::Bytes(b"pong".to_vec())]);
         server.join().unwrap();
+        assert!(
+            runtime.network.lock().unwrap().is_empty(),
+            "terminal ProgramRun must drop every owned socket"
+        );
     }
 
     #[tokio::test]
@@ -11560,7 +11625,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
     }
 
     #[tokio::test]
-    async fn network_send_rechecks_the_socket_endpoint_against_active_grants() {
+    async fn same_run_revocation_before_network_send_prevents_payload_and_releases_socket() {
         let listener = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
             Ok(listener) => listener,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
@@ -11585,51 +11650,70 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             }
         });
         let runtime = ProgramRuntime::new();
-        let original_grant = runtime
-            .grant_typed_capability(crate::vm::CapabilityRequirement {
-                capability: crate::vm::CapabilityKind::NetworkConnect,
-                selector: crate::vm::ResourceSelector::Network {
-                    host: "127.0.0.1".into(),
-                    ports: vec![port],
-                },
-            })
-            .unwrap();
-        let connected = runtime
+        let pending = runtime
             .submit(submission(
                 ProgramLanguage::Forth,
-                &format!("s\"127.0.0.1\" {port} network-connect"),
+                &format!(
+                    "s\"127.0.0.1\" {port} network-connect s\"ping\" bytes network-send"
+                ),
                 ExecutionEffect::ExternalWrite,
             ))
             .await
             .unwrap();
-        assert_eq!(connected.status, ExecutionStatus::Completed);
+        assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
 
-        // Static verification recognizes the opaque socket type. The host
-        // then replaces its unscoped signature selector with this socket's
-        // exact endpoint before consulting and auditing the live ledger.
-        assert!(runtime.revoke_typed_capability(original_grant).unwrap());
-        runtime
-            .grant_typed_capability(crate::vm::CapabilityRequirement {
-                capability: crate::vm::CapabilityKind::NetworkConnect,
-                selector: crate::vm::ResourceSelector::Network {
-                    host: "example.test".into(),
-                    ports: vec![port],
-                },
-            })
+        // Both hooks target the same ProgramRun and capability. The first
+        // permits connect; the second revokes its freshly issued session
+        // grant at the send lease boundary, after the socket exists but
+        // before any payload syscall can occur.
+        let ledger = Arc::clone(&runtime.capability_ledger);
+        let mut hooks = AUTHORIZATION_BEFORE_USE_HOOK
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
             .unwrap();
+        hooks.push((
+            pending.execution_id,
+            CapabilityKind::NetworkConnect,
+            Box::new(|| {}),
+        ));
+        hooks.push((
+            pending.execution_id,
+            CapabilityKind::NetworkConnect,
+            Box::new(move || {
+                let mut ledger = ledger.lock().unwrap();
+                let grant_id = ledger
+                    .grants
+                    .grants
+                    .iter()
+                    .rev()
+                    .find(|grant| grant.revoked_at_unix_ms.is_none())
+                    .expect("session approval issued an active network grant")
+                    .id;
+                assert!(ledger.revoke(grant_id, "same-run-revoker", unix_time_ms()));
+            }),
+        ));
+        drop(hooks);
+
         let sent = runtime
-            .submit(submission(
-                ProgramLanguage::Forth,
-                "s\"ping\" bytes network-send",
-                ExecutionEffect::ExternalWrite,
-            ))
+            .resolve_typed_approval(
+                &pending.approval_prompts[0],
+                ApprovalChoice::AllowSession,
+                "test-user",
+            )
             .await
             .unwrap();
+        assert_eq!(sent.execution_id, pending.execution_id);
         assert_eq!(sent.status, ExecutionStatus::Failed);
-        assert!(!sent.diagnostics.is_empty());
+        assert!(sent.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("revoked") || diagnostic.contains("replaced")
+        }));
         let ledger = runtime.capability_ledger().unwrap();
         assert_eq!(ledger.authorization_audit.len(), 1);
         server.join().unwrap();
+        assert!(
+            runtime.network.lock().unwrap().is_empty(),
+            "failed terminal ProgramRun must drop its connected socket"
+        );
     }
 
     #[tokio::test]
