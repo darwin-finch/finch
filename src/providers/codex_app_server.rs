@@ -3664,6 +3664,30 @@ for line in sys.stdin:
             test_native_bytes(b"packaged-native")
         );
         assert_ne!(pinned.path(), fixture.native);
+        assert!(!pinned._directory.path().join("codex").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_package_directory_does_not_cross_into_replacement_tree() {
+        let fixture = packaged_codex_fixture();
+        let held = open_trusted_directory(&fixture.package_root, fixture.root.path()).unwrap();
+        let displaced = fixture.root.path().join("original-package");
+        std::fs::rename(&fixture.package_root, &displaced).unwrap();
+        std::fs::create_dir_all(&fixture.package_root).unwrap();
+        std::fs::write(
+            fixture.package_root.join("package.json"),
+            br#"{"name":"attacker-replacement"}"#,
+        )
+        .unwrap();
+
+        let metadata = read_relative_trusted_json(
+            &held,
+            Path::new("package.json"),
+            MAX_PACKAGE_METADATA_BYTES,
+        )
+        .unwrap();
+        assert_eq!(metadata["name"], "@openai/codex");
     }
 
     #[cfg(unix)]
@@ -3814,6 +3838,9 @@ for line in sys.stdin:
         std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o500)).unwrap();
         std::fs::rename(&replacement, &executable).unwrap();
         let pinned = stage_open_native(&mut held).unwrap();
+        let expected_identity = pinned.identity().unwrap();
+        assert!(!pinned._directory.path().join("codex").exists());
+        assert_eq!(pinned.identity().unwrap(), expected_identity);
         assert!(std::process::Command::new(pinned.path())
             .status()
             .unwrap()
@@ -4199,6 +4226,78 @@ os.symlink(victim, out / 'TurnStartParams.json')
                 .is_ok_and(|status| status.success());
             assert!(!alive, "hung schema generator process tree survived");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_version_probe_kills_descendant_without_waiting_for_pipe_eof() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("version.py");
+        let pid_file = directory.path().join("descendant-pid");
+        std::fs::write(
+            &script,
+            "import os, pathlib, sys, time\nchild=os.fork()\nif child == 0:\n pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n while True: time.sleep(1)\nwhile not pathlib.Path(sys.argv[1]).exists(): time.sleep(0.001)\nprint('codex-cli 0.149.1', flush=True)\n",
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let output = run_version_bounded(
+            Path::new("/usr/bin/python3"),
+            &[
+                script.to_string_lossy().into_owned(),
+                pid_file.to_string_lossy().into_owned(),
+            ],
+            StdDuration::from_secs(2),
+            None,
+        )
+        .unwrap();
+        assert_eq!(output, "codex-cli 0.149.1");
+        assert!(started.elapsed() < StdDuration::from_secs(2));
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(
+            !alive,
+            "version probe descendant survived successful parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_schema_generation_kills_lingering_descendant() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("descendant-pid");
+        let script = format!(
+            r#"import json, os, pathlib, sys, time
+out = pathlib.Path(sys.argv[-1]) / 'v2'
+out.mkdir(parents=True)
+(out / 'ThreadStartParams.json').write_text(json.dumps({{'properties': {{'dynamicTools': {{'type': 'array'}}}}}}))
+(out / 'TurnStartParams.json').write_text(json.dumps({{'properties': {{'sandboxPolicy': {{'$ref': '#/definitions/ReadOnly'}}}}, 'definitions': {{'ReadOnly': {{'properties': {{'type': {{'enum': ['readOnly']}}, 'networkAccess': {{'type': 'boolean'}}, 'readableRoots': {{'type':'array'}}}}}}}}}}))
+child = os.fork()
+if child == 0:
+ pathlib.Path({pid:?}).write_text(str(os.getpid()))
+ while True: time.sleep(1)
+while not pathlib.Path({pid:?}).exists(): time.sleep(0.001)
+"#,
+            pid = pid_file.to_string_lossy()
+        );
+        let (_fixture, command) = schema_fixture_command(&script);
+        let capabilities = command.detect_protocol_capabilities();
+        assert!(capabilities.dynamic_tools);
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(
+            !alive,
+            "schema generator descendant survived successful parent"
+        );
     }
 
     #[tokio::test]
