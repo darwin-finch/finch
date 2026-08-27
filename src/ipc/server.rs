@@ -1449,6 +1449,14 @@ impl finch_daemon::Server for FinchDaemonImpl {
                         upd.set_output_tokens(0);
                         r.send().promise.await?;
                     }
+                    Ok(StreamChunk::ResponseMetadata { model }) => {
+                        let mut r = receiver.on_chunk_request();
+                        r.get()
+                            .init_chunk()
+                            .init_response_metadata()
+                            .set_model(model.as_str());
+                        r.send().promise.await?;
+                    }
                     Ok(StreamChunk::ContentBlockComplete(block)) => {
                         if let crate::claude::ContentBlock::ToolUse { id, name, input } = block {
                             let mut r = receiver.on_chunk_request();

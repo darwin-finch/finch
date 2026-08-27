@@ -197,7 +197,8 @@ fn validate_jpeg(bytes: &[u8]) -> Result<()> {
     }
     let mut offset = 2usize;
     let mut saw_frame = false;
-    while offset + 1 < bytes.len() {
+    let mut saw_scan = false;
+    'segments: while offset + 1 < bytes.len() {
         if bytes[offset] != 0xff {
             anyhow::bail!("OpenAI JPEG contained invalid marker framing");
         }
@@ -210,7 +211,10 @@ fn validate_jpeg(bytes: &[u8]) -> Result<()> {
         let marker = bytes[offset];
         offset += 1;
         if marker == 0xd9 {
-            anyhow::bail!("OpenAI JPEG omitted scan data");
+            if saw_scan && offset == bytes.len() {
+                return Ok(());
+            }
+            anyhow::bail!("OpenAI JPEG omitted valid terminal scan data");
         }
         if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
             continue;
@@ -251,15 +255,28 @@ fn validate_jpeg(bytes: &[u8]) -> Result<()> {
                     scan += 1;
                     continue;
                 }
-                let next = bytes[scan + 1];
-                if next == 0x00 || (0xd0..=0xd7).contains(&next) {
-                    scan += 2;
+                let marker_start = scan;
+                while scan < bytes.len() && bytes[scan] == 0xff {
+                    scan += 1;
+                }
+                if scan >= bytes.len() {
+                    anyhow::bail!("OpenAI JPEG was incomplete");
+                }
+                let next = bytes[scan];
+                if next == 0x00 {
+                    scan += 1;
                     continue;
                 }
-                if next == 0xd9 && scan > scan_start && scan + 2 == bytes.len() {
-                    return Ok(());
+                if (0xd0..=0xd7).contains(&next) {
+                    scan += 1;
+                    continue;
                 }
-                anyhow::bail!("OpenAI JPEG scan data was malformed or truncated");
+                if marker_start == scan_start {
+                    anyhow::bail!("OpenAI JPEG contained an empty scan");
+                }
+                saw_scan = true;
+                offset = marker_start;
+                continue 'segments;
             }
             anyhow::bail!("OpenAI JPEG was incomplete");
         }
@@ -378,6 +395,7 @@ struct CanonicalStreamState {
     response_id: Option<String>,
     model: Option<String>,
     terminal_reason: Option<String>,
+    usage_seen: bool,
     done: bool,
     accumulated_text: String,
     tool_calls: Vec<(String, String, String)>,
@@ -474,6 +492,7 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
     } else {
         state.response_id = Some(chunk.id.clone());
     }
+    let first_model = state.model.is_none();
     if let Some(model) = &state.model {
         if model != &chunk.model {
             anyhow::bail!("OpenAI stream changed actual model mid-stream");
@@ -486,7 +505,22 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
     }
 
     let mut output = Vec::new();
+    if first_model {
+        output.push(StreamChunk::ResponseMetadata {
+            model: chunk.model.clone(),
+        });
+    }
     if let Some(usage) = chunk.usage {
+        if !chunk.choices.is_empty() {
+            anyhow::bail!("OpenAI stream attached usage to a choice chunk");
+        }
+        if state.terminal_reason.is_none() {
+            anyhow::bail!("OpenAI stream reported usage before terminal status");
+        }
+        if state.usage_seen {
+            anyhow::bail!("OpenAI stream reported duplicate usage");
+        }
+        state.usage_seen = true;
         output.push(StreamChunk::Usage {
             input_tokens: usage.prompt_tokens,
         });
@@ -599,6 +633,9 @@ fn mark_canonical_done(state: &mut CanonicalStreamState) -> Result<()> {
     }
     if state.terminal_reason.is_none() {
         anyhow::bail!("OpenAI stream ended before terminal status");
+    }
+    if !state.usage_seen {
+        anyhow::bail!("OpenAI stream ended without its requested usage chunk");
     }
     state.done = true;
     Ok(())
@@ -1054,6 +1091,32 @@ impl OpenAIProvider {
         for msg in &request.messages {
             match msg.role.as_str() {
                 "assistant" => {
+                    if rule == TransportRule::CanonicalGpt56ChatCompletions {
+                        for block in &msg.content {
+                            match block {
+                                ContentBlock::Text { .. } => {}
+                                ContentBlock::ToolUse { input, .. } => {
+                                    if !input.is_object() {
+                                        anyhow::bail!(
+                                            "OpenAI function arguments were not a JSON object"
+                                        );
+                                    }
+                                    let arguments = serde_json::to_string(input)
+                                        .context("Failed to serialize OpenAI function arguments")?;
+                                    if arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
+                                        anyhow::bail!(
+                                            "OpenAI function arguments exceeded the 1 MiB limit"
+                                        );
+                                    }
+                                }
+                                ContentBlock::Image { .. } | ContentBlock::ToolResult { .. } => {
+                                    anyhow::bail!(
+                                        "OpenAI assistant message contained an unsupported content block"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     // Collect text and tool_calls into a single assistant message.
                     // The OpenAI API requires tool_calls to be in the assistant message
                     // (not silently dropped), otherwise subsequent tool results are orphaned.
@@ -1148,7 +1211,13 @@ impl OpenAIProvider {
                                     compatible_text_parts.push("[image]");
                                 }
                             },
-                            ContentBlock::ToolUse { .. } => {}
+                            ContentBlock::ToolUse { .. } => {
+                                if rule == TransportRule::CanonicalGpt56ChatCompletions {
+                                    anyhow::bail!(
+                                        "OpenAI user message contained an unsupported content block"
+                                    );
+                                }
+                            }
                         }
                     }
 
@@ -1977,6 +2046,13 @@ mod tests {
 
     const VALID_PNG_BASE64: &str =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    // Public progressive, multi-scan JPEG fixture from corkami/pocs
+    // (SHA 359dd741bd56611e383690bb0483a38b2bfb9584).
+    const VALID_PROGRESSIVE_JPEG_BASE64: &str = "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";
+
+    // Same public fixture advanced through its second progressive scan
+    // (SHA e6b9af95f5bf9d2c8f52ad16ae27c05cc726af85).
+    const VALID_PROGRESSIVE_MULTI_SCAN_JPEG_BASE64: &str = "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";
 
     fn valid_jpeg_base64() -> String {
         base64::engine::general_purpose::STANDARD.encode([
@@ -2267,6 +2343,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonical_stream_and_nonstream_preserve_the_same_actual_model() {
+        let mut server = mockito::Server::new_async().await;
+        let actual_model = "gpt-5.6-sol-2026-08-01";
+        let nonstream = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "stream": false
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "id":"chatcmpl-nonstream",
+                    "object":"chat.completion",
+                    "model":actual_model,
+                    "choices":[{
+                        "index":0,
+                        "message":{"role":"assistant","content":"ok"},
+                        "finish_reason":"stop"
+                    }]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let stream = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "stream": true
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(format!(
+                "data: {{\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"model\":\"{actual_model}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\ndata: {{\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"model\":\"{actual_model}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"ok\"}},\"finish_reason\":null}}]}}\n\ndata: {{\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"model\":\"{actual_model}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: {{\"id\":\"chatcmpl-stream\",\"object\":\"chat.completion.chunk\",\"model\":\"{actual_model}\",\"choices\":[],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}}\n\ndata: [DONE]\n\n"
+            ))
+            .create_async()
+            .await;
+        let provider = canonical_test_provider(server.url());
+        let request = ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+            .with_model("gpt-5.6-sol");
+        let response = provider.send_message_once(&request).await.unwrap();
+        let mut receiver = provider.send_message_stream_once(&request).await.unwrap();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            chunks.push(chunk.unwrap());
+        }
+        let streamed_model = chunks.iter().find_map(|chunk| match chunk {
+            StreamChunk::ResponseMetadata { model } => Some(model.as_str()),
+            _ => None,
+        });
+        assert_eq!(streamed_model, Some(response.model.as_str()));
+        assert!(matches!(
+            chunks.first(),
+            Some(StreamChunk::ResponseMetadata { .. })
+        ));
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, StreamChunk::ResponseMetadata { .. }))
+                .count(),
+            1
+        );
+        nonstream.assert_async().await;
+        stream.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn canonical_stream_preserves_fragmented_parallel_calls_usage_and_terminal() {
         let mut server = mockito::Server::new_async().await;
         let body = concat!(
@@ -2298,16 +2441,19 @@ mod tests {
             .unwrap();
         let mut calls = Vec::new();
         let mut usage = None;
+        let mut actual_model = None;
         while let Some(item) = rx.recv().await {
             match item.unwrap() {
                 StreamChunk::ContentBlockComplete(ContentBlock::ToolUse { id, name, input }) => {
                     calls.push((id, name, input))
                 }
                 StreamChunk::Usage { input_tokens } => usage = Some(input_tokens),
+                StreamChunk::ResponseMetadata { model } => actual_model = Some(model),
                 _ => {}
             }
         }
         assert_eq!(usage, Some(12));
+        assert_eq!(actual_model.as_deref(), Some("gpt-5.6-sol-actual"));
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0, "call_a");
         assert_eq!(calls[0].2, serde_json::json!({"path":"a"}));
@@ -2441,7 +2587,7 @@ mod tests {
         ] {
             let mut server = mockito::Server::new_async().await;
             let body = format!(
-                "data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"provisional\"}},\"finish_reason\":null}}]}}\n\ndata: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n{}",
+                "data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"provisional\"}},\"finish_reason\":null}}]}}\n\ndata: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[],\"usage\":{{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}}}\n\ndata: [DONE]\n\n{}",
                 trailing
             );
             server
@@ -2487,6 +2633,32 @@ mod tests {
             let (complete, errors) = canonical_stream_outcome(body.to_string()).await;
             assert!(!complete);
             assert_eq!(errors.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_stream_requires_one_terminal_usage_only_chunk() {
+        for (body, expected) in [
+            (
+                "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                "without its requested usage",
+            ),
+            (
+                "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                "before terminal status",
+            ),
+            (
+                "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                "attached usage to a choice",
+            ),
+            (
+                "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\ndata: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                "duplicate usage",
+            ),
+        ] {
+            let (complete, errors) = canonical_stream_outcome(body.to_string()).await;
+            assert!(!complete);
+            assert!(errors.iter().any(|error| error.contains(expected)));
         }
     }
 
@@ -2599,6 +2771,34 @@ mod tests {
     #[test]
     fn canonical_images_and_tool_results_fail_closed_before_http() {
         let provider = canonical_test_provider("http://127.0.0.1:1".into());
+        let progressive_single_scan = base64::engine::general_purpose::STANDARD
+            .decode(VALID_PROGRESSIVE_JPEG_BASE64)
+            .unwrap();
+        assert!(progressive_single_scan
+            .windows(2)
+            .any(|marker| marker == [0xff, 0xc2]));
+        validate_jpeg(&progressive_single_scan).unwrap();
+        let progressive = base64::engine::general_purpose::STANDARD
+            .decode(VALID_PROGRESSIVE_MULTI_SCAN_JPEG_BASE64)
+            .unwrap();
+        assert!(
+            progressive
+                .windows(2)
+                .filter(|marker| *marker == [0xff, 0xda])
+                .count()
+                > 1
+        );
+        validate_jpeg(&progressive).unwrap();
+        let progressive_request = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            "user",
+            vec![ContentBlock::image(
+                "image/jpeg",
+                VALID_PROGRESSIVE_MULTI_SCAN_JPEG_BASE64,
+            )],
+        )])
+        .with_model("gpt-5.6-sol");
+        provider.to_openai_request(&progressive_request).unwrap();
+        assert!(validate_jpeg(&progressive[..progressive.len() - 2]).is_err());
         let bad_base64 = ProviderRequest::new(vec![crate::claude::Message::with_content(
             "user",
             vec![ContentBlock::image("image/png", "not base64")],
@@ -2673,6 +2873,119 @@ mod tests {
             .contains("unknown function call ID"));
     }
 
+    #[test]
+    fn canonical_role_blocks_and_replayed_arguments_fail_closed_at_boundaries() {
+        let provider = canonical_test_provider("http://127.0.0.1:1".into());
+        for block in [
+            ContentBlock::image("image/png", VALID_PNG_BASE64),
+            ContentBlock::tool_result("call_x".into(), "result".into(), None),
+        ] {
+            let request = ProviderRequest::new(vec![crate::claude::Message::with_content(
+                "assistant",
+                vec![block],
+            )])
+            .with_model("gpt-5.6-sol");
+            assert!(provider
+                .to_openai_request(&request)
+                .unwrap_err()
+                .to_string()
+                .contains("assistant message contained an unsupported content block"));
+        }
+
+        let user_tool_call = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            "user",
+            vec![ContentBlock::ToolUse {
+                id: "call_x".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+            }],
+        )])
+        .with_model("gpt-5.6-sol");
+        assert!(provider
+            .to_openai_request(&user_tool_call)
+            .unwrap_err()
+            .to_string()
+            .contains("user message contained an unsupported content block"));
+
+        let scalar_arguments = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            "assistant",
+            vec![ContentBlock::ToolUse {
+                id: "call_x".into(),
+                name: "read".into(),
+                input: serde_json::json!("scalar"),
+            }],
+        )])
+        .with_model("gpt-5.6-sol");
+        assert!(provider
+            .to_openai_request(&scalar_arguments)
+            .unwrap_err()
+            .to_string()
+            .contains("not a JSON object"));
+
+        let exact_string_bytes = MAX_TOOL_ARGUMENT_BYTES - r#"{"data":""}"#.len();
+        let exact_input = serde_json::json!({"data": "x".repeat(exact_string_bytes)});
+        assert_eq!(
+            serde_json::to_string(&exact_input).unwrap().len(),
+            MAX_TOOL_ARGUMENT_BYTES
+        );
+        let matched = |input| {
+            ProviderRequest::new(vec![
+                crate::claude::Message::with_content(
+                    "assistant",
+                    vec![ContentBlock::ToolUse {
+                        id: "call_x".into(),
+                        name: "read".into(),
+                        input,
+                    }],
+                ),
+                crate::claude::Message::with_content(
+                    "user",
+                    vec![ContentBlock::tool_result(
+                        "call_x".into(),
+                        "ok".into(),
+                        None,
+                    )],
+                ),
+            ])
+            .with_model("gpt-5.6-sol")
+        };
+        provider.to_openai_request(&matched(exact_input)).unwrap();
+        let over_input = serde_json::json!({"data": "x".repeat(exact_string_bytes + 1)});
+        assert!(provider
+            .to_openai_request(&matched(over_input))
+            .unwrap_err()
+            .to_string()
+            .contains("1 MiB limit"));
+
+        let compatible = OpenAIProvider::new_compatible(
+            "test-secret".into(),
+            "http://127.0.0.1:1".into(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "compatible-model".into(),
+            "compatible".into(),
+        )
+        .unwrap();
+        let compatible_request = compatible
+            .to_openai_request(
+                &ProviderRequest::new(vec![crate::claude::Message::with_content(
+                    "assistant",
+                    vec![ContentBlock::ToolUse {
+                        id: "call_x".into(),
+                        name: "read".into(),
+                        input: serde_json::json!("scalar"),
+                    }],
+                )])
+                .with_model("compatible-model"),
+            )
+            .unwrap();
+        let wire = serde_json::to_value(compatible_request).unwrap();
+        assert_eq!(
+            wire["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            "\"scalar\""
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn public_invalid_image_fails_before_any_http_connection() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2689,6 +3002,36 @@ mod tests {
                 vec![ContentBlock::image("image/png", data)],
             )])
             .with_model("gpt-5.6-sol");
+            let error = provider.send_message(&request).await.unwrap_err();
+            assert!(error.to_string().len() < 256);
+        }
+        for request in [
+            ProviderRequest::new(vec![crate::claude::Message::with_content(
+                "assistant",
+                vec![ContentBlock::image("image/png", VALID_PNG_BASE64)],
+            )])
+            .with_model("gpt-5.6-sol"),
+            ProviderRequest::new(vec![crate::claude::Message::with_content(
+                "user",
+                vec![ContentBlock::ToolUse {
+                    id: "call_x".into(),
+                    name: "read".into(),
+                    input: serde_json::json!({}),
+                }],
+            )])
+            .with_model("gpt-5.6-sol"),
+            ProviderRequest::new(vec![crate::claude::Message::with_content(
+                "assistant",
+                vec![ContentBlock::ToolUse {
+                    id: "call_x".into(),
+                    name: "read".into(),
+                    input: serde_json::json!({
+                        "data": "x".repeat(MAX_TOOL_ARGUMENT_BYTES)
+                    }),
+                }],
+            )])
+            .with_model("gpt-5.6-sol"),
+        ] {
             let error = provider.send_message(&request).await.unwrap_err();
             assert!(error.to_string().len() < 256);
         }

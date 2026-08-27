@@ -1464,6 +1464,17 @@ impl stream_receiver::Server for StreamReceiverImpl {
                     input_tokens: u.get_input_tokens(),
                 })
                 .map_err(|e| anyhow::anyhow!("{}", e)),
+            Ok(Which::ResponseMetadata(metadata)) => metadata
+                .and_then(|metadata| {
+                    metadata
+                        .get_model()?
+                        .to_str()
+                        .map(|model| StreamChunk::ResponseMetadata {
+                            model: model.to_string(),
+                        })
+                        .map_err(|error| capnp::Error::failed(error.to_string()))
+                })
+                .map_err(|error| anyhow::anyhow!("{}", error)),
             Ok(Which::Done(())) => {
                 // Close the channel by dropping tx — but we don't have ownership.
                 // Signal done by sending a synthetic error; caller checks for it.
@@ -1481,12 +1492,23 @@ impl stream_receiver::Server for StreamReceiverImpl {
                     .map_err(|e| capnp::Error::failed(e.to_string())))
                     .unwrap_or_else(|_| "unknown stream error".to_string())
             )),
-            Err(e) => Err(anyhow::anyhow!("{}", e)),
+            Err(error) => match decode_unknown_stream_chunk(error) {
+                Some(result) => result,
+                None => return Promise::ok(()),
+            },
         };
 
         let _ = self.tx.send(result);
         Promise::ok(())
     }
+}
+
+fn decode_unknown_stream_chunk(
+    _error: capnp::NotInSchema,
+) -> Option<anyhow::Result<StreamChunk>> {
+    // Stream metadata is additive. Older clients ignore newer union members
+    // while continuing to decode the text/tool/usage chunks they understand.
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1589,6 +1611,32 @@ mod tests {
         let error = ensure_compatible_protocol(0).unwrap_err().to_string();
         assert!(error.contains("restart the daemon"));
         assert!(error.contains("protocol 0"));
+    }
+
+    #[test]
+    fn response_metadata_schema_roundtrips_and_unknown_union_is_ignored() {
+        use finch_ipc_capnp::stream_chunk::Which;
+
+        let mut message = capnp::message::Builder::new_default();
+        message
+            .init_root::<finch_ipc_capnp::stream_chunk::Builder<'_>>()
+            .init_response_metadata()
+            .set_model("gpt-5.6-sol-served");
+        let reader = message
+            .get_root_as_reader::<finch_ipc_capnp::stream_chunk::Reader<'_>>()
+            .unwrap();
+        let model = match reader.which().unwrap() {
+            Which::ResponseMetadata(metadata) => metadata
+                .unwrap()
+                .get_model()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
+            _ => panic!("expected response metadata"),
+        };
+        assert_eq!(model, "gpt-5.6-sol-served");
+        assert!(decode_unknown_stream_chunk(capnp::NotInSchema(99)).is_none());
     }
 
     struct BlockingBrainRunner {

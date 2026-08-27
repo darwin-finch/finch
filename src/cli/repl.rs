@@ -2017,6 +2017,10 @@ impl Repl {
                 Ok(crate::generators::StreamChunk::Usage { .. }) => {
                     // Usage metadata (input token count) — not used in this path
                 }
+                Ok(crate::generators::StreamChunk::ResponseMetadata { .. }) => {
+                    // This legacy display-only path has no response record to
+                    // attach provider metadata to.
+                }
                 Err(e) => {
                     return Err(e);
                 }

@@ -131,6 +131,10 @@ pub struct ResponseMetadata {
 pub enum StreamChunk {
     TextDelta(String),                  // Incremental text
     ContentBlockComplete(ContentBlock), // Complete tool_use or text block
+    /// Provider-reported model that actually served the streaming response.
+    ResponseMetadata {
+        model: String,
+    },
     /// Usage metadata from message_start — carries the input token count
     /// reported by the API before any text arrives.
     Usage {
@@ -299,6 +303,19 @@ mod tests {
         match chunk {
             StreamChunk::Usage { input_tokens } => assert_eq!(input_tokens, 1024),
             _ => panic!("Expected Usage"),
+        }
+    }
+
+    #[test]
+    fn test_stream_chunk_response_metadata_preserves_actual_model() {
+        let chunk = StreamChunk::ResponseMetadata {
+            model: "gpt-5.6-sol-served".to_string(),
+        };
+        match chunk {
+            StreamChunk::ResponseMetadata { model } => {
+                assert_eq!(model, "gpt-5.6-sol-served");
+            }
+            _ => panic!("Expected ResponseMetadata"),
         }
     }
 

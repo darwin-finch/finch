@@ -9,7 +9,10 @@ not from the provider display name alone.
   function calls/results, and typed PNG/JPEG `image_url` data URLs up to 8 MB.
   PNG CRC and compressed image data are verified before network access.
   Streaming requests disable obfuscation explicitly, and require one known
-  terminal status followed by exactly one `[DONE]` marker.
+  terminal status, one terminal usage-only chunk, and exactly one `[DONE]`
+  marker. The first valid stream event also publishes the provider-reported
+  actual model through the provider-neutral stream metadata chunk; the same
+  model field is returned by the non-streaming path and survives daemon IPC.
 - GPT-4o and OpenAI-compatible xAI, Groq, Mistral, Ollama, remote-Finch, and
   custom endpoints retain the historical compatible request and parser shape.
 
@@ -22,6 +25,9 @@ representation. Adding a provider cursor here would incorrectly make mutable
 upstream state authoritative over Brain history. Responses support must wait
 for the atomic-history and run-provenance abstractions to define that durable
 representation; Finch does not claim Responses continuity in the meantime.
+Consumers without a durable response-provenance owner may explicitly ignore
+the optional stream metadata chunk; it is not a Responses cursor or history
+authority.
 
 The canonical boundary validates images, call IDs, tool arguments, request
 size, SSE line/event/total size, response object, actual model consistency,
