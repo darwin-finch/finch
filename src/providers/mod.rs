@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::any::{Any, TypeId};
 use tokio::sync::mpsc::Receiver;
 
 pub mod endpoints;
@@ -70,6 +71,7 @@ mod validated_boundary {
         request: ProviderRequest,
         capabilities: ModelCapabilities,
         target: usize,
+        target_type: TypeId,
     }
 
     impl ValidatedProviderRequest {
@@ -80,9 +82,11 @@ mod validated_boundary {
             self,
             provider: &(impl ProviderBackend + ?Sized),
         ) -> Result<ProviderRequest> {
-            if self.target != provider_target(provider) {
+            if self.target != provider_target(provider)
+                || self.target_type != ProviderConcreteType::provider_concrete_type_id(provider)
+            {
                 anyhow::bail!(
-                    "Validated provider request was presented to a different provider instance"
+                    "Validated provider request was presented to a different provider instance or concrete backend type"
                 );
             }
             Ok(self.request)
@@ -109,6 +113,7 @@ mod validated_boundary {
             request: effective,
             capabilities,
             target: provider_target(provider),
+            target_type: ProviderConcreteType::provider_concrete_type_id(provider),
         })
     }
 
@@ -120,11 +125,27 @@ mod validated_boundary {
 pub(crate) use validated_boundary::validate_provider_request;
 pub use validated_boundary::ValidatedProviderRequest;
 
+/// Non-overridable concrete type identity used by validated dispatch tokens.
+///
+/// Finch provides the blanket implementation for every `'static` type, so an
+/// external provider can implement [`ProviderBackend`] but cannot spoof this
+/// marker with a conflicting implementation.
+#[doc(hidden)]
+pub trait ProviderConcreteType: Any {
+    fn provider_concrete_type_id(&self) -> TypeId;
+}
+
+impl<T: Any> ProviderConcreteType for T {
+    fn provider_concrete_type_id(&self) -> TypeId {
+        TypeId::of::<T>()
+    }
+}
+
 /// Provider implementation hooks. The raw hooks can only receive an
 /// unforgeable [`ValidatedProviderRequest`].
 #[async_trait]
 #[doc(hidden)]
-pub trait ProviderBackend: Send + Sync {
+pub trait ProviderBackend: ProviderConcreteType + Send + Sync {
     /// Provider implementation called only after capability validation.
     /// Implementations must consume the token with
     /// [`ValidatedProviderRequest::into_request_for`] before any side effect.
