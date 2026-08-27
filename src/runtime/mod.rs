@@ -10884,7 +10884,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             nix::unistd::geteuid().as_raw()
         );
         let source = format!(
-            "(process-run {} (list))",
+            "(process-run {} (list \"unused\"))",
             serde_json::to_string(&executable.to_string_lossy()).unwrap()
         );
         let runtime = ProgramRuntime::new();
@@ -10916,13 +10916,13 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
     async fn kernel_rejected_launch_does_not_consume_or_audit_once_grant() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("invalid-executable");
         std::fs::write(&executable, b"not an executable image").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let executable = std::fs::canonicalize(executable).unwrap();
         let source = format!(
-            "(process-run {} (list))",
+            "(process-run {} (list \"unused\"))",
             serde_json::to_string(&executable.to_string_lossy()).unwrap()
         );
         let runtime = ProgramRuntime::new();
