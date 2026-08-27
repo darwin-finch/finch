@@ -121,6 +121,34 @@ test ! -e "$isolated_home"
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 test "$(cat "$fake_home/.finch/brains/existing/events.jsonl")" = 'keep me'
 
+# Ambient XDG/model-cache/temp and corpus paths are not allowed to redirect
+# isolated reads or writes back into caller-owned state.
+hostile_state="$scratch/hostile-state"
+mkdir -p "$hostile_state"/{config,cache,data,state,hf,hub,transformers,tmp}
+printf 'unchanged\n' >"$hostile_state/sentinel"
+phase=hostile-state-environment-sealed
+XDG_CONFIG_HOME="$hostile_state/config" XDG_CACHE_HOME="$hostile_state/cache" \
+XDG_DATA_HOME="$hostile_state/data" XDG_STATE_HOME="$hostile_state/state" \
+HF_HOME="$hostile_state/hf" HUGGINGFACE_HUB_CACHE="$hostile_state/hub" \
+TRANSFORMERS_CACHE="$hostile_state/transformers" TMPDIR="$hostile_state/tmp" \
+FINCH_WIRE_CORPUS_PATH="$hostile_state/corpus.jsonl" run_isolated bash -c '
+  for variable in XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME XDG_STATE_HOME \
+    HF_HOME HUGGINGFACE_HUB_CACHE TRANSFORMERS_CACHE TMPDIR; do
+    value="${!variable}"
+    case "$value" in "$HOME"/*) ;; *) exit 1 ;; esac
+    printf test >"$value/isolation-probe"
+  done
+  test -z "${FINCH_WIRE_CORPUS_PATH:-}"
+  mkdir -p "$HOME/.finch/metrics"
+  printf test >"$HOME/.finch/config.toml"
+  printf test >"$HOME/.finch/feedback.jsonl"
+  printf test >"$HOME/.finch/metrics/isolation.jsonl"
+'
+test "$(cat "$hostile_state/sentinel")" = unchanged
+test -z "$(find "$hostile_state" -mindepth 2 -print -quit)"
+test ! -e "$hostile_state/corpus.jsonl"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
 # Environment strings plus a caller-created descriptor are not wrapper
 # authority. This linked, caller-owned proof must fail before any launcher can
 # treat the process as isolated.

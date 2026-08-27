@@ -540,6 +540,21 @@ fn run() -> anyhow::Result<i32> {
         isolated.path().join(".finch"),
         fs::Permissions::from_mode(0o700),
     )?;
+    for relative in [
+        ".config",
+        ".cache",
+        ".cache/huggingface",
+        ".cache/huggingface/hub",
+        ".cache/huggingface/transformers",
+        ".local",
+        ".local/share",
+        ".local/state",
+        "tmp",
+    ] {
+        let directory = isolated.path().join(relative);
+        fs::create_dir_all(&directory)?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    }
     let socket_parent = if Path::new("/private/tmp").is_dir() {
         Path::new("/private/tmp")
     } else {
@@ -579,6 +594,20 @@ fn run() -> anyhow::Result<i32> {
     command
         .args(&arguments[1..])
         .env("HOME", isolated.path())
+        .env("XDG_CONFIG_HOME", isolated.path().join(".config"))
+        .env("XDG_CACHE_HOME", isolated.path().join(".cache"))
+        .env("XDG_DATA_HOME", isolated.path().join(".local/share"))
+        .env("XDG_STATE_HOME", isolated.path().join(".local/state"))
+        .env("HF_HOME", isolated.path().join(".cache/huggingface"))
+        .env(
+            "HUGGINGFACE_HUB_CACHE",
+            isolated.path().join(".cache/huggingface/hub"),
+        )
+        .env(
+            "TRANSFORMERS_CACHE",
+            isolated.path().join(".cache/huggingface/transformers"),
+        )
+        .env("TMPDIR", isolated.path().join("tmp"))
         .env("FINCH_BRAIN_TEST_HOME", isolated.path())
         .env(
             "FINCH_BRAIN_TEST_ROOT",
@@ -618,6 +647,7 @@ fn run() -> anyhow::Result<i32> {
         "BRAIN_ADDR",
         "DAEMON_ADDR",
         "BRAIN_PASSWORD",
+        "FINCH_WIRE_CORPUS_PATH",
     ] {
         command.env_remove(name);
     }
