@@ -11,7 +11,7 @@ use finch::claude::ContentBlock;
 use finch::claude::Message;
 use finch::generators::StreamChunk;
 use finch::providers::gemini::GeminiProvider;
-use finch::providers::{LlmProvider, ProviderRequest};
+use finch::providers::{LlmProvider, ProviderBackend, ProviderRequest};
 
 /// Test that Gemini provider supports tools
 #[test]
