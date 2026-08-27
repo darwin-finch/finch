@@ -4152,6 +4152,10 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
             else {
                 unreachable!("checked above")
             };
+            let authority_use_gate = Arc::clone(&self.authorization.use_gate);
+            let _authority_use = authority_use_gate
+                .read()
+                .map_err(|_| host_binding_error(&effect.origin, "authority-use gate poisoned"))?;
             let policy = self
                 .authorization
                 .policy
@@ -4201,6 +4205,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                     "authorization was revoked, expired, or replaced before deferred dispatch",
                 ));
             }
+            drop(ledger);
             self.mark_host_use();
             if let Some(sink) = &self.typed_effect_sink {
                 sink(VmEffectEnvelope {
@@ -11367,6 +11372,48 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             completed.values,
             vec![ProgramValue::Bytes(b"embedder bytes".to_vec())]
         );
+    }
+
+    #[test]
+    fn deferred_effect_sink_can_reenter_authority_without_deadlock() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Read,
+                crate::vm::FileSelector::parse("./**").unwrap(),
+            ))
+            .unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker_runtime = Arc::clone(&runtime);
+        let worker = std::thread::spawn(move || {
+            let sink_runtime = Arc::clone(&worker_runtime);
+            let sink: TypedEffectSink = Arc::new(move |_| {
+                let ledger = sink_runtime
+                    .capability_ledger()
+                    .expect("deferred host sink can reenter public authority inspection");
+                assert_eq!(ledger.authorization_audit.len(), 1);
+            });
+            let tokio = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = tokio.block_on(worker_runtime.submit_with_deferred_host_effects(
+                submission(
+                    ProgramLanguage::Lisp,
+                    "(file-read (path \"host-owned.txt\"))",
+                    ExecutionEffect::WorkspaceRead,
+                ),
+                sink,
+            ));
+            result_tx.send(result).unwrap();
+        });
+
+        let pending = result_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("deferred host dispatch must not retain the ledger lock across its sink")
+            .unwrap();
+        assert_eq!(pending.status, ExecutionStatus::Suspended);
+        worker.join().unwrap();
     }
 
     #[tokio::test]
