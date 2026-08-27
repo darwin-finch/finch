@@ -21,7 +21,8 @@
 
 ### 1. Metal Investigation (Commit: 7fa82c1)
 - ✅ Switched Metal to F16 precision (proper for Apple Silicon)
-- ✅ Added error logging to file (metal_error.txt)
+- ✅ Captured the RMS-norm failure (the loose `metal_error.txt` capture was later removed;
+  recover it from Git blob `638ad6dde5861051ef34e287433aacb5f7063ca0` if historical detail is needed)
 - ✅ Updated Candle 0.8 → 0.9.2
 - ✅ Identified RMS-norm as blocker
 
@@ -167,7 +168,8 @@ objc2-foundation = "0.2"
 ## References
 
 - **Roadmap:** COREML_MULTIBACKEND_ROADMAP.md
-- **Metal Issue:** metal_error.txt (RMS-norm missing)
+- **Metal Issue:** RMS-norm missing; the original loose error capture is recoverable from Git blob
+  `638ad6dde5861051ef34e287433aacb5f7063ca0`
 - **Qwen Models:** https://huggingface.co/Qwen
 - **CoreML Models:** https://huggingface.co/anemll
 - **Previous Work:**

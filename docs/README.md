@@ -38,6 +38,7 @@ authoritative.
   end-to-end routing or conformance evidence; see
   [#74](https://github.com/darwin-finch/finch/issues/74) and
   [#98](https://github.com/darwin-finch/finch/issues/98)
+- [Repository hygiene guard and fixture policy](REPOSITORY_HYGIENE.md)
 
 ## Design and planning documents
 
