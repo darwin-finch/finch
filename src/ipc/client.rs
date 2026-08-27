@@ -1659,7 +1659,9 @@ mod tests {
             }
             _ => panic!("expected response metadata"),
         };
-        assert_eq!(error.to_string(), "IPC response model metadata was invalid");
+        let error = error.to_string();
+        assert!(error.ends_with("IPC response model metadata was invalid"));
+        assert!(!error.contains("bad\nmodel"));
     }
 
     struct BlockingBrainRunner {
