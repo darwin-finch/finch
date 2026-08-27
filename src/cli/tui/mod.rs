@@ -1375,6 +1375,7 @@ fn prepare_canonical_commit(stdout: &mut impl Write) -> Result<()> {
     // append that projection to history a second time.
     execute!(
         stdout,
+        BeginSynchronizedUpdate,
         cursor::MoveTo(0, 0),
         Clear(ClearType::All),
         cursor::MoveTo(0, 0)
@@ -2027,9 +2028,17 @@ fn begin_full_viewport_paint(
     plan: ViewportRedrawPlan,
     transcript: &[String],
 ) -> Result<()> {
+    execute!(stdout, BeginSynchronizedUpdate)?;
+    continue_full_viewport_paint(stdout, plan, transcript)
+}
+
+fn continue_full_viewport_paint(
+    stdout: &mut impl Write,
+    plan: ViewportRedrawPlan,
+    transcript: &[String],
+) -> Result<()> {
     execute!(
         stdout,
-        BeginSynchronizedUpdate,
         cursor::MoveTo(0, 0),
         Clear(ClearType::All),
         cursor::MoveTo(0, plan.transcript_top as u16)
@@ -2089,17 +2098,21 @@ impl TuiRenderer {
             prepare_canonical_commit(&mut stdout)?;
             self.active_rows = 0;
             self.cursor_row_from_top = 0;
-            commit_complete_messages(
+            let commit_result = commit_complete_messages(
                 &mut stdout,
                 &to_commit,
                 &mut self.accordion,
                 &self.colors,
                 &mut self.printed_ids,
                 usize::from(crossterm::terminal::size().unwrap_or((80, 24)).1),
-            )?;
+            );
+            if let Err(error) = commit_result {
+                let _ = execute!(stdout, EndSynchronizedUpdate);
+                return Err(error);
+            }
             self.pending_viewport_size = Some(crossterm::terminal::size().unwrap_or((80, 24)));
             self.viewport_invalidated = true;
-            self.redraw_full_viewport()?;
+            self.redraw_full_viewport_inner(true)?;
             self.live_area_dirty = false;
         } else {
             // Only redraw when something actually changed: a message is streaming
@@ -2614,6 +2627,10 @@ impl TuiRenderer {
     /// reflow. `ClearType::All` clears only the visible screen; terminal-native
     /// scrollback that has already left the viewport remains untouched.
     fn redraw_full_viewport(&mut self) -> Result<()> {
+        self.redraw_full_viewport_inner(false)
+    }
+
+    fn redraw_full_viewport_inner(&mut self, synchronized_update_open: bool) -> Result<()> {
         let (width, height) = self
             .pending_viewport_size
             .take()
@@ -2645,13 +2662,25 @@ impl TuiRenderer {
         let plan = viewport_redraw_plan(term_height, live_rows, transcript_rows);
 
         let mut stdout = io::stdout();
-        begin_full_viewport_paint(&mut stdout, plan, &transcript)?;
+        let paint = if synchronized_update_open {
+            continue_full_viewport_paint(&mut stdout, plan, &transcript)
+        } else {
+            begin_full_viewport_paint(&mut stdout, plan, &transcript)
+        };
+        if let Err(error) = paint {
+            let _ = execute!(stdout, EndSynchronizedUpdate);
+            return Err(error);
+        }
 
         self.active_rows = 0;
         self.cursor_row_from_top = 0;
         self.viewport_invalidated = false;
         // draw_live_area closes the synchronized update begun above.
-        self.draw_live_area()
+        let draw = self.draw_live_area();
+        if draw.is_err() {
+            let _ = execute!(io::stdout(), EndSynchronizedUpdate);
+        }
+        draw
     }
 }
 
@@ -4075,9 +4104,19 @@ mod tests {
             8,
         )
         .unwrap();
+        continue_full_viewport_paint(
+            &mut bytes,
+            viewport_redraw_plan(8, 2, 1),
+            &["final projection".into()],
+        )
+        .unwrap();
+        execute!(bytes, EndSynchronizedUpdate).unwrap();
         let raw = String::from_utf8(bytes).unwrap();
         assert!(raw.find("\x1b[2J").unwrap() < raw.find("secret canonical body").unwrap());
         assert_eq!(raw.matches("secret canonical body").count(), 1);
+        assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
+        assert_eq!(raw.matches("\x1b[?2026l").count(), 1);
+        assert!(raw.find("secret canonical body").unwrap() < raw.find("final projection").unwrap());
         assert_eq!(resize_printed.len(), 1);
 
         struct TerminalHistory {
