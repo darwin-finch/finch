@@ -1208,6 +1208,31 @@ mod tests {
             use std::os::unix::fs::FileExt as _;
 
             let proof = crate::brain::isolated_test_proof().unwrap();
+            let state_before = std::fs::read_dir(proof.home.join(".finch"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>();
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(unsafe { nix::libc::fchmod(9, 0o600) }, 0);
+                let error = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open("/dev/fd/9")
+                    .unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                assert_eq!(unsafe { nix::libc::fchmod(9, 0o400) }, 0);
+                let state_after = std::fs::read_dir(proof.home.join(".finch"))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(
+                    state_after, state_before,
+                    "constructor authority sealing attempt mutated Finch state"
+                );
+                crate::brain::isolated_test_proof().unwrap();
+                return;
+            }
             let duplicate = unsafe { nix::libc::dup(9) };
             assert!(duplicate >= 0);
             let reader = unsafe { std::fs::File::from_raw_fd(duplicate) };
@@ -1234,10 +1259,6 @@ mod tests {
             drop(writer);
             assert_eq!(unsafe { nix::libc::fchmod(9, 0o400) }, 0);
 
-            let state_before = std::fs::read_dir(proof.home.join(".finch"))
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect::<std::collections::BTreeSet<_>>();
             let generator_state = Arc::new(RwLock::new(GeneratorState::NotAvailable));
             let result = AgentServer::new(
                 crate::config::Config::with_providers(Vec::new()),

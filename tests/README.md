@@ -42,6 +42,15 @@ Brain storage therefore relies on the trusted-child contract; it does not claim
 resistance to a malicious same-UID child replacing ancestors. A parent-held
 before/after digest still guards the real Brain store.
 
+The inherited descriptor protocol reserves FD108 for the supervisor's sealed,
+read-only proof backup, FD109 for proof-key peer authentication, and FD110/111
+for the Brain/daemon listener backups. Rust restores the production proof FD9
+from FD108 and then revalidates its access mode, inode metadata, signed content,
+and supervisor ancestry before any constructor may read configuration or create
+state. This explicit restore is required because a script interpreter may use a
+low descriptor while reading a launcher; missing or mismatched backup authority
+fails closed.
+
 Run the isolation harness's own regression checks with:
 
 ```bash

@@ -104,12 +104,15 @@ FINCH_PROOF_HELPER="$repo_root/scripts/lib/brain_test_isolation.sh" run_isolated
   brain_test_isolation_is_active
   test "$FINCH_BRAIN_TEST_ROOT" = "$HOME/.finch/brains"
   test "$FINCH_BRAIN_TEST_NO_AUTO_SPAWN" = 1
+  test "$FINCH_BRAIN_TEST_PROOF_BACKUP_FD" = 108
   test "$FINCH_TEST_BRAIN_ADDR" != 127.0.0.1:11436
   test "$FINCH_TEST_DAEMON_ADDR" != 127.0.0.1:11435
   test "$FINCH_TEST_BRAIN_PASSWORD" != ambient-password
   [[ "$FINCH_TEST_BRAIN_PASSWORD" =~ ^test-[0-9a-f]{32}$ ]]
   ! printf attacker >&9
+  ! printf attacker >&108
   ! sh -c ": >/dev/fd/9"
+  ! sh -c ": >/dev/fd/108"
   printf "%s\n" "$HOME" >"$FINCH_CREATED_HOME"
   printf test >"$FINCH_BRAIN_TEST_ROOT/test-created"
 '

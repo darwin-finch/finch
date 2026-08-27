@@ -411,6 +411,30 @@ fn read_proof_at(proof: &std::fs::File) -> anyhow::Result<Vec<u8>> {
     Ok(contents)
 }
 
+#[cfg(unix)]
+fn duplicate_validated_proof(fd: std::os::fd::RawFd) -> anyhow::Result<std::fs::File> {
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let flags = unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFL) };
+    anyhow::ensure!(
+        flags >= 0 && flags & nix::libc::O_ACCMODE == nix::libc::O_RDONLY,
+        "wrapper proof descriptor is writable or unavailable"
+    );
+    let duplicate = unsafe { nix::libc::dup(fd) };
+    anyhow::ensure!(duplicate >= 0, "wrapper proof descriptor is unavailable");
+    let proof = unsafe { std::fs::File::from_raw_fd(duplicate) };
+    let metadata = proof.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.nlink() == 0
+            && metadata.uid() == nix::unistd::geteuid().as_raw()
+            && metadata.mode() & 0o777 == 0o400,
+        "wrapper proof descriptor does not identify the parent-owned sealed file"
+    );
+    Ok(proof)
+}
+
 fn expected_supervisor_executable() -> anyhow::Result<std::path::PathBuf> {
     let test_executable = std::env::current_exe()?.canonicalize()?;
     let mut directory = test_executable
@@ -465,31 +489,34 @@ fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<
     );
     #[cfg(unix)]
     let proof = {
-        use std::os::fd::FromRawFd as _;
-        let inherited_flags = unsafe { nix::libc::fcntl(9, nix::libc::F_GETFL) };
+        use std::os::unix::fs::MetadataExt as _;
+
         anyhow::ensure!(
-            inherited_flags >= 0 && inherited_flags & nix::libc::O_ACCMODE == nix::libc::O_RDONLY,
-            "inherited wrapper proof descriptor is writable or unavailable"
+            std::env::var("FINCH_BRAIN_TEST_PROOF_BACKUP_FD").as_deref() == Ok("108"),
+            "live Brain tests require the sealed wrapper proof backup"
         );
-        let duplicate = unsafe { nix::libc::dup(9) };
-        anyhow::ensure!(duplicate >= 0, "wrapper proof descriptor is unavailable");
-        unsafe { std::fs::File::from_raw_fd(duplicate) }
+        let backup = duplicate_validated_proof(108)?;
+        anyhow::ensure!(
+            unsafe { nix::libc::dup2(108, 9) } == 9,
+            "could not restore the wrapper proof descriptor"
+        );
+        anyhow::ensure!(
+            unsafe { nix::libc::fcntl(9, nix::libc::F_SETFD, 0) } == 0,
+            "could not make the restored wrapper proof inheritable"
+        );
+        let proof = duplicate_validated_proof(9)?;
+        let backup_metadata = backup.metadata()?;
+        let proof_metadata = proof.metadata()?;
+        anyhow::ensure!(
+            (backup_metadata.dev(), backup_metadata.ino())
+                == (proof_metadata.dev(), proof_metadata.ino()),
+            "restored wrapper proof does not match the sealed backup"
+        );
+        proof
     };
     #[cfg(not(unix))]
     let proof: std::fs::File =
         { anyhow::bail!("Brain test supervisor authority is supported only on Unix") };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let metadata = proof.metadata()?;
-        anyhow::ensure!(
-            metadata.is_file()
-                && metadata.nlink() == 0
-                && metadata.uid() == nix::unistd::geteuid().as_raw()
-                && metadata.mode() & 0o777 == 0o400,
-            "wrapper proof descriptor does not identify the parent-owned sealed file"
-        );
-    }
     #[cfg(unix)]
     let encoded = read_proof_at(&proof)?;
     #[cfg(not(unix))]
@@ -708,6 +735,7 @@ pub fn authenticated_isolated_test_proof_text() -> anyhow::Result<Vec<u8>> {
 pub fn isolated_test_proof_if_present() -> anyhow::Result<Option<IsolatedTestProof>> {
     let present = std::env::var_os("FINCH_BRAIN_TEST_ISOLATED").is_some()
         || std::env::var_os("FINCH_BRAIN_TEST_PROOF_FD").is_some()
+        || std::env::var_os("FINCH_BRAIN_TEST_PROOF_BACKUP_FD").is_some()
         || std::env::var_os("FINCH_TEST_SUPERVISOR_PID").is_some();
     if !present {
         return Ok(None);
@@ -740,6 +768,7 @@ pub(crate) fn supervised_test_subprocess_command() -> std::process::Command {
         command.pre_exec(move || {
             for (source, target) in [
                 (proof_fd.as_raw_fd(), 9),
+                (proof_fd.as_raw_fd(), 108),
                 (auth_fd.as_raw_fd(), 109),
                 (brain_listener.as_raw_fd(), 10),
                 (daemon_listener.as_raw_fd(), 11),
@@ -1006,6 +1035,21 @@ mod isolation_tests {
                 }
                 (validator, command.spawn().unwrap())
             };
+            if mode == "missing-proof-backup" {
+                assert_eq!(unsafe { nix::libc::close(108) }, 0);
+                assert!(isolated_test_proof().is_err());
+                return;
+            }
+            if mode == "mismatched-proof-backup" {
+                assert_eq!(unsafe { nix::libc::dup2(11, 108) }, 108);
+                assert!(isolated_test_proof().is_err());
+                return;
+            }
+            if mode == "clobbered-low-proof-is-restored" {
+                assert_eq!(unsafe { nix::libc::dup2(11, 9) }, 9);
+                isolated_test_proof().unwrap();
+                return;
+            }
             if mode == "swapped-low-listener" {
                 assert_eq!(unsafe { nix::libc::dup2(11, 10) }, 10);
                 let repaired = isolated_test_proof().unwrap();
@@ -1028,14 +1072,16 @@ mod isolation_tests {
             if mode == "rewrite-restore" {
                 #[cfg(target_os = "macos")]
                 {
-                    assert_eq!(unsafe { nix::libc::fchmod(9, 0o600) }, 0);
-                    let error = std::fs::OpenOptions::new()
-                        .write(true)
-                        .truncate(true)
-                        .open("/dev/fd/9")
-                        .unwrap_err();
-                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-                    assert_eq!(unsafe { nix::libc::fchmod(9, 0o400) }, 0);
+                    for fd in [9, 108] {
+                        assert_eq!(unsafe { nix::libc::fchmod(fd, 0o600) }, 0);
+                        let error = std::fs::OpenOptions::new()
+                            .write(true)
+                            .truncate(true)
+                            .open(format!("/dev/fd/{fd}"))
+                            .unwrap_err();
+                        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                        assert_eq!(unsafe { nix::libc::fchmod(fd, 0o400) }, 0);
+                    }
                     isolated_test_proof().unwrap();
                     return;
                 }
@@ -1158,6 +1204,7 @@ mod isolation_tests {
                 let reader = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
                 std::fs::remove_file(&path).unwrap();
                 assert_eq!(unsafe { nix::libc::dup2(reader.as_raw_fd(), 9) }, 9);
+                assert_eq!(unsafe { nix::libc::dup2(reader.as_raw_fd(), 108) }, 108);
                 std::env::set_var("FINCH_BRAIN_TEST_TOKEN", token);
                 std::env::set_var("FINCH_TEST_SUPERVISOR_PID", std::process::id().to_string());
                 let marker = valid.home.join("self-issued-auth-key-consulted");
@@ -1182,6 +1229,7 @@ mod isolation_tests {
             } else {
                 std::fs::remove_file(&path).unwrap();
                 assert_eq!(unsafe { nix::libc::dup2(writer.as_raw_fd(), 9) }, 9);
+                assert_eq!(unsafe { nix::libc::dup2(writer.as_raw_fd(), 108) }, 108);
             }
             assert!(isolated_test_proof().is_err());
             return;
@@ -1194,6 +1242,9 @@ mod isolation_tests {
             "swapped-backup-listener",
             "rewrite-restore",
             "auth-key-replay",
+            "missing-proof-backup",
+            "mismatched-proof-backup",
+            "clobbered-low-proof-is-restored",
         ] {
             let status = supervised_test_subprocess_command()
                 .args([
