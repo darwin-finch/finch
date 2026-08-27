@@ -478,7 +478,16 @@ fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
             name,
             ..
         } => Some(ModelConfig::Remote {
-            provider: credential_provider.as_str().to_string(),
+            provider: match credential_provider {
+                crate::config::CredentialProvider::Anthropic => "claude",
+                crate::config::CredentialProvider::OpenaiPlatform => "openai",
+                crate::config::CredentialProvider::Xai => "grok",
+                crate::config::CredentialProvider::GeminiAiStudio => "gemini",
+                crate::config::CredentialProvider::Mistral => "mistral",
+                crate::config::CredentialProvider::Groq => "groq",
+                _ => credential_provider.as_str(),
+            }
+            .to_string(),
             name: name
                 .clone()
                 .unwrap_or_else(|| credential_provider.as_str().to_string()),
@@ -553,7 +562,7 @@ fn provider_entry_from_remote_model(
             models_path,
             reasoning_effort,
             ..
-        }) if api_key.is_empty() => ProviderEntry::Credentialed {
+        }) => ProviderEntry::Credentialed {
             provider: *provider,
             credential: credential.clone(),
             model,

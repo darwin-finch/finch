@@ -365,6 +365,29 @@ pub fn required_audience(
     AudienceBinding::custom(&actual)
 }
 
+/// Reject absolute authenticated path overrides that leave the bound origin.
+pub fn validate_authenticated_endpoints(
+    provider: CredentialProvider,
+    base_url: Option<&str>,
+    overrides: &[Option<&str>],
+) -> Result<()> {
+    let expected = descriptor(provider);
+    let base_origin = normalize_origin(base_url.unwrap_or(expected.standard_origin))?;
+    for endpoint in overrides.iter().flatten() {
+        if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+            let origin = normalize_origin(endpoint)?;
+            if origin != base_origin {
+                bail!(
+                    "authenticated endpoint origin mismatch: '{}' does not match bound origin '{}'",
+                    origin,
+                    base_origin
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate all credential metadata and return a stable name index.
 pub fn credential_index(
     credentials: &[ProviderCredential],
@@ -465,7 +488,10 @@ pub fn validate_binding(
     match &credential.lifecycle {
         CredentialLifecycle::Revoked => bail!("credential '{}' is revoked; choose or configure another named credential", name),
         CredentialLifecycle::LegacyAmbiguous => bail!("credential '{}' is an ambiguous legacy record; run `finch setup` and explicitly classify its provider, kind, issuer, and audience", name),
-        CredentialLifecycle::Active { expires_at: Some(expires_at), refreshable: false } if *expires_at <= now => {
+        CredentialLifecycle::Active { expires_at: Some(expires_at), refreshable } if *expires_at <= now => {
+            if *refreshable {
+                bail!("credential '{}' is expired; this resolver cannot refresh during validation, so refresh it explicitly before retrying", name)
+            }
             bail!("credential '{}' is expired and cannot be refreshed", name)
         }
         CredentialLifecycle::Active { .. } => {}
@@ -476,13 +502,13 @@ pub fn validate_binding(
 /// Names of profiles that depend on a credential, for revoke/delete UX.
 pub fn credential_dependencies<'a>(
     credential_name: &str,
-    profiles: impl IntoIterator<Item = (&'a str, Option<&'a CredentialBinding>)>,
+    profiles: impl IntoIterator<Item = (String, Option<&'a CredentialBinding>)>,
 ) -> Vec<String> {
     profiles
         .into_iter()
         .filter_map(|(profile, binding)| {
             (binding.is_some_and(|binding| binding.credential_ref == credential_name))
-                .then(|| profile.to_string())
+                .then_some(profile)
         })
         .collect()
 }
@@ -722,9 +748,9 @@ mod tests {
             credential_dependencies(
                 "work",
                 [
-                    ("primary", Some(&shared)),
-                    ("tools", Some(&shared)),
-                    ("local", None)
+                    ("primary".into(), Some(&shared)),
+                    ("tools".into(), Some(&shared)),
+                    ("local".into(), None)
                 ]
             ),
             vec!["primary", "tools"]

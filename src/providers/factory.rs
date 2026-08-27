@@ -317,16 +317,12 @@ fn resolve_named_graph(
         let credential = credentials
             .get(binding.credential_ref.as_str())
             .expect("Config::validate checked every named credential reference");
-        let handle = resolver.resolve(credential).with_context(|| {
-            format!(
-                "Failed to resolve named credential '{}'",
-                binding.credential_ref
-            )
+        let handle = resolver.resolve(credential).map_err(|_| {
+            anyhow::anyhow!("Failed to resolve named credential '{}'; inspect the credential store without printing secret material", binding.credential_ref)
         })?;
         if handle.credential_name != binding.credential_ref {
             bail!(
-                "credential resolver returned handle '{}' for requested credential '{}'",
-                handle.credential_name,
+                "credential resolver returned a handle for the wrong requested credential '{}'",
                 binding.credential_ref
             );
         }
@@ -523,6 +519,20 @@ pub fn create_provider_graph_from_config_with_resolver(
     graph_from_boxed_profiles(create_named_profiles_from_config_with_resolver(
         config, resolver,
     )?)
+}
+
+/// Revalidate the complete graph and return one configured profile.
+pub fn create_provider_profile_from_config(
+    config: &Config,
+    profile_name: &str,
+) -> Result<Arc<dyn LlmProvider>> {
+    let graph = create_provider_graph_from_config(config)?;
+    graph
+        .profiles()
+        .iter()
+        .find(|profile| profile.profile_name() == profile_name)
+        .map(|profile| Arc::clone(profile.provider()))
+        .with_context(|| format!("Provider profile '{profile_name}' was not found"))
 }
 
 /// Create the ordered cloud provider pool from unified configuration, falling back to legacy

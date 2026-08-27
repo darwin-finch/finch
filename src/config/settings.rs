@@ -558,6 +558,13 @@ impl Config {
         // fallback, catalogue, or transport object is constructed.
         let credentials = super::credential::credential_index(&self.credentials)
             .context("Invalid named credential records")?;
+        let mut profile_names = std::collections::BTreeSet::new();
+        for provider in &self.providers {
+            let normalized = provider.profile_name().trim().to_lowercase();
+            if !profile_names.insert(normalized) {
+                anyhow::bail!("duplicate provider profile name '{}'; profile selectors must be unique across accounts", provider.profile_name());
+            }
+        }
         for provider in &self.providers {
             let Some(binding) = provider.credential_binding() else {
                 continue;
@@ -569,6 +576,26 @@ impl Config {
                     binding.credential_ref
                 )
             })?;
+            if let ProviderEntry::Credentialed {
+                provider: credential_provider,
+                base_url,
+                chat_path,
+                models_path,
+                ..
+            } = provider
+            {
+                super::credential::validate_authenticated_endpoints(
+                    *credential_provider,
+                    base_url.as_deref(),
+                    &[chat_path.as_deref(), models_path.as_deref()],
+                )
+                .with_context(|| {
+                    format!(
+                        "provider profile '{}' has unsafe endpoint override",
+                        provider.profile_name()
+                    )
+                })?;
+            }
             super::credential::validate_binding(
                 provider
                     .credential_provider()
@@ -865,6 +892,28 @@ impl Config {
     pub fn with_credentials(mut self, credentials: Vec<ProviderCredential>) -> Self {
         self.credentials = credentials;
         self
+    }
+
+    /// Profiles that reference a named credential, for dependency-aware UX.
+    pub fn credential_dependents(&self, credential_name: &str) -> Vec<String> {
+        super::credential::credential_dependencies(
+            credential_name,
+            self.providers
+                .iter()
+                .map(|profile| (profile.profile_name(), profile.credential_binding())),
+        )
+    }
+
+    /// Revoke a named credential and return every invalidated dependent profile.
+    pub fn revoke_credential(&mut self, credential_name: &str) -> anyhow::Result<Vec<String>> {
+        let dependents = self.credential_dependents(credential_name);
+        let credential = self
+            .credentials
+            .iter_mut()
+            .find(|credential| credential.name == credential_name)
+            .ok_or_else(|| anyhow::anyhow!("credential '{}' was not found", credential_name))?;
+        credential.lifecycle = super::CredentialLifecycle::Revoked;
+        Ok(dependents)
     }
 
     /// Get the active teacher (first cloud provider in priority list).

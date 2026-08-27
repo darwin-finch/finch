@@ -26,7 +26,7 @@ pub enum CatalogAuth {
     Bearer,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ModelCatalogProfile {
     pub provider: String,
     /// Stable, non-secret configured profile/account label.
@@ -35,6 +35,20 @@ pub struct ModelCatalogProfile {
     pub endpoints: ProviderEndpoints,
     pub auth: CatalogAuth,
     pub request_timeout: Duration,
+}
+
+impl std::fmt::Debug for ModelCatalogProfile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModelCatalogProfile")
+            .field("provider", &self.provider)
+            .field("profile_id", &self.profile_id)
+            .field("api_key", &"[REDACTED]")
+            .field("endpoints", &self.endpoints)
+            .field("auth", &self.auth)
+            .field("request_timeout", &self.request_timeout)
+            .finish()
+    }
 }
 
 impl ModelCatalogProfile {
@@ -245,7 +259,9 @@ pub async fn refresh_from_config(
     let metadata = credentials
         .get(credential.credential_ref.as_str())
         .expect("Config::validate checked the named credential reference");
-    let resolved = resolver.resolve(metadata)?;
+    let resolved = resolver.resolve(metadata).map_err(|_| {
+        anyhow::anyhow!("Failed to resolve named credential '{}'; inspect the credential store without printing secret material", credential.credential_ref)
+    })?;
     if resolved.credential_name != credential.credential_ref {
         bail!("credential resolver returned a handle for the wrong named credential");
     }

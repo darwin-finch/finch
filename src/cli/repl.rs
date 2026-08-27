@@ -4111,7 +4111,10 @@ impl Repl {
             }
         } else {
             // Cloud provider — create a new teacher session.
-            let llm_provider = match crate::providers::create_provider_from_entry(&new_entry) {
+            let llm_provider = match crate::providers::create_provider_profile_from_config(
+                &self._config,
+                &new_entry.profile_name(),
+            ) {
                 Ok(p) => p,
                 Err(e) => {
                     self.output_error(format!("Failed to create provider: {}", e));
@@ -4126,7 +4129,7 @@ impl Repl {
             };
 
             *self.teacher_session.write().await =
-                TeacherSession::with_config(llm_provider, teacher_config);
+                TeacherSession::with_shared_provider(llm_provider, teacher_config);
 
             // Keep available_teachers index in sync
             if let Some(new_teacher_idx) = self
