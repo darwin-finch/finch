@@ -16,6 +16,9 @@ const MAX_CATALOG_BODY_BYTES: usize = 1_048_576;
 const MAX_MODEL_COUNT: usize = 4_096;
 const MAX_MODEL_ID_BYTES: usize = 512;
 
+/// Date on which Finch's bundled, deliberately incomplete model fallback was reviewed.
+pub const STATIC_FALLBACK_AS_OF: &str = "2026-08-26";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogAuth {
     AnthropicApiKey,
@@ -89,7 +92,10 @@ pub fn default_cache_dir() -> Result<PathBuf> {
 pub fn static_fallback(provider: &str) -> Vec<String> {
     let models: &[&str] = match provider {
         "claude" => &["claude-sonnet-5"],
-        "openai" => &["gpt-5.6-sol", "gpt-4o"],
+        // Keep this deliberately short. Authenticated discovery is authoritative;
+        // this offline snapshot only offers the three general-purpose API tiers
+        // documented when STATIC_FALLBACK_AS_OF was reviewed.
+        "openai" => &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
         "grok" => &["grok-4.6"],
         "gemini" => &["gemini-2.5-flash"],
         "mistral" => &["mistral-large-2512"],
@@ -630,7 +636,11 @@ mod tests {
         let (catalog, error) = refresh_with_fallback(&profile, empty_cache.path()).await;
         assert!(error.is_some());
         assert_eq!(catalog.source, CatalogSource::StaticFallback);
-        assert!(!catalog.models.is_empty());
+        assert_eq!(
+            catalog.models,
+            vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+        );
+        assert_eq!(STATIC_FALLBACK_AS_OF, "2026-08-26");
     }
 
     #[test]

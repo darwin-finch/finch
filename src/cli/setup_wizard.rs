@@ -72,12 +72,7 @@ const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
         "",
         "get key at console.anthropic.com",
     ),
-    (
-        "openai",
-        "GPT-4 (OpenAI)",
-        "",
-        "get key at platform.openai.com",
-    ),
+    ("openai", "OpenAI API", "", "get key at platform.openai.com"),
     (
         "gemini",
         "Gemini (Google)",
@@ -668,10 +663,18 @@ struct WizardState {
     sections: HashMap<WizardSection, SectionState>,
     completed: HashSet<WizardSection>,
     confirming_cancel: bool,
+    catalog_cache_dir: Option<std::path::PathBuf>,
 }
 
 impl WizardState {
     fn new(existing_config: Option<&crate::config::Config>) -> Self {
+        Self::new_with_catalog_cache_dir(existing_config, model_catalog::default_cache_dir().ok())
+    }
+
+    fn new_with_catalog_cache_dir(
+        existing_config: Option<&crate::config::Config>,
+        catalog_cache_dir: Option<std::path::PathBuf>,
+    ) -> Self {
         use crate::config::persona::Persona;
         use crate::config::ColorTheme;
 
@@ -900,6 +903,7 @@ impl WizardState {
             sections,
             completed: HashSet::new(),
             confirming_cancel: false,
+            catalog_cache_dir,
         }
     }
 
@@ -2255,6 +2259,7 @@ fn handle_themes_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
 
 /// Handle input for Models section (unified Backend + Teachers)
 fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
+    let catalog_cache_dir = state.catalog_cache_dir.clone();
     if let Some(SectionState::Models {
         primary_model,
         tool_models,
@@ -2598,10 +2603,13 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         ));
                         return Ok(false);
                     };
-                    let cache_dir = match model_catalog::default_cache_dir() {
-                        Ok(path) => path,
-                        Err(error) => {
-                            *catalog_error = Some(error.to_string());
+                    let cache_dir = match catalog_cache_dir.clone() {
+                        Some(path) => path,
+                        None => {
+                            *catalog_error = Some(
+                                "Cannot locate home directory for model catalogue cache"
+                                    .to_string(),
+                            );
                             return Ok(false);
                         }
                     };
@@ -2734,14 +2742,14 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 *catalog_error = None;
                                 *catalog_generation = catalog_generation.wrapping_add(1);
                                 *catalog_refresh = None;
-                                if let (Some(profile), Ok(cache_dir)) = (
+                                if let (Some(profile), Some(cache_dir)) = (
                                     model_catalog_profile(
                                         CLOUD_PROVIDERS[selected].0,
                                         CLOUD_PROVIDERS[selected].0,
                                         "",
                                         None,
                                     ),
-                                    model_catalog::default_cache_dir(),
+                                    catalog_cache_dir.clone(),
                                 ) {
                                     if let Ok(Some(cached)) =
                                         model_catalog::read_cache(&profile, &cache_dir)
@@ -3053,9 +3061,9 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         *catalog_error = None;
                         *catalog_generation = catalog_generation.wrapping_add(1);
                         *catalog_refresh = None;
-                        if let (Some(profile), Ok(cache_dir)) = (
+                        if let (Some(profile), Some(cache_dir)) = (
                             model_catalog_profile(provider, name, api_key, persisted.as_ref()),
-                            model_catalog::default_cache_dir(),
+                            catalog_cache_dir.clone(),
                         ) {
                             if let Ok(Some(cached)) =
                                 model_catalog::read_cache(&profile, &cache_dir)
@@ -4854,6 +4862,34 @@ fn format_catalog_refresh_time(refreshed_at: &DateTime<Utc>, now: DateTime<Utc>)
     format!("{} ({age})", refreshed_at.format("%Y-%m-%d %H:%M UTC"))
 }
 
+fn format_catalog_label(
+    catalog_source: &CatalogSource,
+    catalog_refreshing: bool,
+    catalog_refreshed_at: Option<&DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> String {
+    if catalog_refreshing {
+        return "Refreshing authenticated model catalogue…".to_string();
+    }
+
+    let source = match catalog_source {
+        CatalogSource::Discovered => "provider discovery".to_string(),
+        CatalogSource::Cache => "local cache".to_string(),
+        CatalogSource::StaticFallback => format!(
+            "bundled fallback snapshot (as of {}; incomplete)",
+            model_catalog::STATIC_FALLBACK_AS_OF
+        ),
+    };
+    let refreshed = if *catalog_source == CatalogSource::StaticFallback {
+        String::new()
+    } else {
+        catalog_refreshed_at
+            .map(|refreshed| format!(" · {}", format_catalog_refresh_time(refreshed, now)))
+            .unwrap_or_default()
+    };
+    format!("Models: {source}{refreshed} · Ctrl+R refresh · model ID remains editable")
+}
+
 /// Render single-screen cloud provider configuration dialog
 fn render_configure_remote_overlay(
     f: &mut Frame,
@@ -4941,24 +4977,12 @@ fn render_configure_remote_overlay(
         Style::default().fg(Color::DarkGray),
     )));
 
-    let catalog_label = if catalog_refreshing {
-        "Refreshing authenticated model catalogue…".to_string()
-    } else {
-        format!(
-            "Models: {}{} · Ctrl+R refresh · model ID remains editable",
-            match catalog_source {
-                CatalogSource::Discovered => "provider discovery",
-                CatalogSource::Cache => "local cache",
-                CatalogSource::StaticFallback => "static fallback",
-            },
-            catalog_refreshed_at
-                .map(|refreshed| format!(
-                    " · {}",
-                    format_catalog_refresh_time(refreshed, Utc::now())
-                ))
-                .unwrap_or_default()
-        )
-    };
+    let catalog_label = format_catalog_label(
+        catalog_source,
+        catalog_refreshing,
+        catalog_refreshed_at,
+        Utc::now(),
+    );
     lines.push(Line::from(Span::styled(
         catalog_label,
         Style::default().fg(Color::Cyan),
@@ -6926,7 +6950,6 @@ for line in sys.stdin:
         KeyEvent::new(code, modifiers)
     }
 
-    #[cfg(target_os = "macos")]
     fn test_buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
         (0..buffer.area.height)
             .map(|y| {
@@ -6942,7 +6965,15 @@ for line in sys.stdin:
     }
 
     fn state_with_step(step: AddProviderStep) -> WizardState {
-        let mut state = WizardState::new(None);
+        let hermetic_config = crate::config::Config::with_providers(vec![ProviderEntry::Claude {
+            api_key: String::new(),
+            model: None,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("claude".to_string()),
+        }]);
+        let mut state = WizardState::new_with_catalog_cache_dir(Some(&hermetic_config), None);
         if let Some(SectionState::Models {
             adding_provider,
             catalog_models,
@@ -6994,6 +7025,15 @@ for line in sys.stdin:
         profile: &ModelCatalogProfile,
         catalog: ModelCatalog,
     ) {
+        install_completed_catalog_refresh_result(state, profile, catalog, None);
+    }
+
+    fn install_completed_catalog_refresh_result(
+        state: &mut WizardState,
+        profile: &ModelCatalogProfile,
+        catalog: ModelCatalog,
+        error: Option<String>,
+    ) {
         if let Some(SectionState::Models {
             catalog_refresh,
             catalog_generation,
@@ -7004,9 +7044,20 @@ for line in sys.stdin:
             *catalog_refresh = Some(CatalogRefresh {
                 generation: *catalog_generation,
                 selection_identity: model_catalog::profile_cache_identity(profile),
-                result: Arc::new(Mutex::new(Some((catalog, None)))),
+                result: Arc::new(Mutex::new(Some((catalog, error)))),
             });
         }
+    }
+
+    fn render_wizard_text(state: &WizardState) -> String {
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(180, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_tabbed_wizard(frame, state))
+            .unwrap();
+        test_buffer_text(terminal.backend().buffer())
     }
 
     fn discovered_catalog(profile: &ModelCatalogProfile, models: &[&str]) -> ModelCatalog {
@@ -7359,6 +7410,318 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn chooser_keeps_openai_api_and_chatgpt_subscription_visibly_distinct() {
+        use ratatui::backend::TestBackend;
+
+        let openai = CLOUD_PROVIDERS
+            .iter()
+            .find(|(id, ..)| *id == "openai")
+            .unwrap();
+        let subscription = CLOUD_PROVIDERS
+            .iter()
+            .find(|(id, ..)| *id == "chatgpt_subscription")
+            .unwrap();
+        assert_eq!(openai.1, "OpenAI API");
+        assert_eq!(subscription.1, "ChatGPT subscription (Codex)");
+        assert_ne!(subscription.1, "OpenAI API");
+
+        let step = AddProviderStep::SelectAddType { selected: 0 };
+        let backend = TestBackend::new(160, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_add_provider_overlay(
+                    frame,
+                    area,
+                    &step,
+                    &CatalogSource::StaticFallback,
+                    false,
+                    None,
+                    None,
+                );
+            })
+            .unwrap();
+        let rendered = test_buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("OpenAI API"), "{rendered}");
+        assert!(
+            rendered.contains("ChatGPT subscription (Codex)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("device sign-in"), "{rendered}");
+        assert!(rendered.contains("platform.openai.com"), "{rendered}");
+        assert!(!rendered.contains("GPT-4 (OpenAI)"), "{rendered}");
+    }
+
+    #[test]
+    fn static_fallback_ui_is_dated_incomplete_and_never_presented_as_fresh() {
+        use ratatui::backend::TestBackend;
+
+        let misleading_runtime_time = Utc::now();
+        let label = format_catalog_label(
+            &CatalogSource::StaticFallback,
+            false,
+            Some(&misleading_runtime_time),
+            misleading_runtime_time,
+        );
+
+        assert!(label.contains("bundled fallback snapshot"), "{label}");
+        assert!(
+            label.contains(model_catalog::STATIC_FALLBACK_AS_OF),
+            "{label}"
+        );
+        assert!(label.contains("incomplete"), "{label}");
+        assert!(label.contains("model ID remains editable"), "{label}");
+        assert!(!label.contains("provider discovery"), "{label}");
+        assert!(!label.contains("local cache"), "{label}");
+        assert!(!label.contains("UTC"), "{label}");
+        assert!(!label.contains("ago"), "{label}");
+        assert!(!label.contains("current"), "{label}");
+        assert!(!label.contains("live"), "{label}");
+
+        let openai_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, ..)| *id == "openai")
+            .unwrap();
+        let step = AddProviderStep::ConfigureRemote {
+            provider_idx: openai_idx,
+            name: "openai-work".to_string(),
+            model: "gateway-preview-model".to_string(),
+            api_key: "openai-key".to_string(),
+            focused_field: 2,
+            editing_idx: None,
+        };
+        let backend = TestBackend::new(180, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_add_provider_overlay(
+                    frame,
+                    area,
+                    &step,
+                    &CatalogSource::StaticFallback,
+                    false,
+                    Some(&misleading_runtime_time),
+                    None,
+                );
+            })
+            .unwrap();
+        let rendered = test_buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("bundled fallback snapshot"), "{rendered}");
+        assert!(
+            rendered.contains(model_catalog::STATIC_FALLBACK_AS_OF),
+            "{rendered}"
+        );
+        assert!(rendered.contains("incomplete"), "{rendered}");
+        assert!(!rendered.contains("provider discovery"), "{rendered}");
+        assert!(!rendered.contains("local cache"), "{rendered}");
+        assert!(!rendered.contains("UTC"), "{rendered}");
+    }
+
+    #[test]
+    fn manual_openai_id_survives_save_reopen_and_fallback_installation() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let cache_dir = directory.path().join("model-catalog-cache");
+        let openai_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, ..)| *id == "openai")
+            .unwrap();
+        let manual_model = "gateway-preview-model";
+        let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+            provider_idx: openai_idx,
+            name: "openai-work".to_string(),
+            model: String::new(),
+            api_key: "openai-key".to_string(),
+            focused_field: 2,
+            editing_idx: None,
+        });
+        state.catalog_cache_dir = Some(cache_dir.clone());
+        for character in manual_model.chars() {
+            handle_models_input(&mut state, key(KeyCode::Char(character))).unwrap();
+        }
+        handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
+
+        let first_save = build_setup_result(&state).unwrap();
+        let config = config_from_setup_result(&first_save);
+        config.save_to(&config_path).unwrap();
+        let loaded = crate::config::load_config_from_path(&config_path).unwrap();
+        assert!(matches!(
+            loaded.providers.first(),
+            Some(ProviderEntry::Openai { model: Some(model), .. }) if model == manual_model
+        ));
+
+        let mut reopened =
+            WizardState::new_with_catalog_cache_dir(Some(&loaded), Some(cache_dir.clone()));
+        handle_models_input(&mut reopened, key(KeyCode::Enter)).unwrap();
+        assert!(matches!(
+            get_step(&reopened),
+            Some(AddProviderStep::ConfigureRemote { model, .. }) if model == manual_model
+        ));
+        assert_eq!(
+            catalog_model_provenance(&reopened),
+            ModelSelectionProvenance::Persisted
+        );
+
+        let persisted = loaded.providers.first().unwrap();
+        let profile =
+            model_catalog_profile("openai", "openai-work", "openai-key", Some(persisted)).unwrap();
+        let mut fallback =
+            model_catalog::fallback_catalog(&profile.provider, &profile.endpoints.models_url);
+        fallback.profile_id = profile.profile_id.clone();
+        install_completed_catalog_refresh_result(
+            &mut reopened,
+            &profile,
+            fallback,
+            Some("fake authenticated catalogue failure".to_string()),
+        );
+        advance_catalog_refresh_if_done(&mut reopened);
+        assert!(matches!(
+            get_step(&reopened),
+            Some(AddProviderStep::ConfigureRemote { model, .. }) if model == manual_model
+        ));
+        assert!(matches!(
+            reopened.sections.get(&WizardSection::Models),
+            Some(SectionState::Models {
+                catalog_source: CatalogSource::StaticFallback,
+                catalog_error: Some(error),
+                ..
+            }) if error == "fake authenticated catalogue failure"
+        ));
+
+        handle_models_input(&mut reopened, key(KeyCode::Enter)).unwrap();
+        let second_save = build_setup_result(&reopened).unwrap();
+        config_from_setup_result(&second_save)
+            .save_to(&config_path)
+            .unwrap();
+        let reloaded = crate::config::load_config_from_path(&config_path).unwrap();
+        assert!(matches!(
+            reloaded.providers.first(),
+            Some(ProviderEntry::Openai { model: Some(model), .. }) if model == manual_model
+        ));
+        assert!(
+            !cache_dir.exists(),
+            "the hermetic cache should remain empty unless the test writes it"
+        );
+    }
+
+    #[test]
+    fn failed_refresh_with_stale_cache_renders_age_warning_and_preserves_manual_model() {
+        let openai_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, ..)| *id == "openai")
+            .unwrap();
+        let manual_model = "gateway-preview-model";
+        let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+            provider_idx: openai_idx,
+            name: "openai-work".to_string(),
+            model: manual_model.to_string(),
+            api_key: "openai-key".to_string(),
+            focused_field: 2,
+            editing_idx: None,
+        });
+        state.current_section = WizardSection::Models;
+        let profile = model_catalog_profile("openai", "openai-work", "openai-key", None).unwrap();
+        let refreshed_at = Utc::now() - chrono::Duration::hours(2);
+        install_completed_catalog_refresh_result(
+            &mut state,
+            &profile,
+            ModelCatalog {
+                provider: profile.provider.clone(),
+                profile_id: profile.profile_id.clone(),
+                models_url: profile.endpoints.models_url.clone(),
+                models: vec!["cached-account-model".to_string()],
+                source: CatalogSource::Cache,
+                refreshed_at,
+            },
+            Some("fake provider unavailable".to_string()),
+        );
+        advance_catalog_refresh_if_done(&mut state);
+
+        assert!(matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote { model, .. }) if model == manual_model
+        ));
+        assert!(matches!(
+            state.sections.get(&WizardSection::Models),
+            Some(SectionState::Models {
+                catalog_source: CatalogSource::Cache,
+                catalog_error: Some(error),
+                ..
+            }) if error == "fake provider unavailable"
+        ));
+        let rendered = render_wizard_text(&state);
+        assert!(rendered.contains("local cache"), "{rendered}");
+        assert!(
+            rendered.contains(&refreshed_at.format("%Y-%m-%d %H:%M UTC").to_string()),
+            "{rendered}"
+        );
+        assert!(rendered.contains("2h ago"), "{rendered}");
+        assert!(
+            rendered.contains("Refresh warning: fake provider unavailable"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(manual_model), "{rendered}");
+    }
+
+    #[test]
+    fn failed_refresh_with_static_fallback_renders_snapshot_warning_and_preserves_manual_model() {
+        let openai_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, ..)| *id == "openai")
+            .unwrap();
+        let manual_model = "restricted-account-model";
+        let mut state = state_with_step(AddProviderStep::ConfigureRemote {
+            provider_idx: openai_idx,
+            name: "openai-work".to_string(),
+            model: manual_model.to_string(),
+            api_key: "openai-key".to_string(),
+            focused_field: 2,
+            editing_idx: None,
+        });
+        state.current_section = WizardSection::Models;
+        let profile = model_catalog_profile("openai", "openai-work", "openai-key", None).unwrap();
+        let mut fallback =
+            model_catalog::fallback_catalog(&profile.provider, &profile.endpoints.models_url);
+        fallback.profile_id = profile.profile_id.clone();
+        install_completed_catalog_refresh_result(
+            &mut state,
+            &profile,
+            fallback,
+            Some("fake provider unavailable".to_string()),
+        );
+        advance_catalog_refresh_if_done(&mut state);
+
+        assert!(matches!(
+            get_step(&state),
+            Some(AddProviderStep::ConfigureRemote { model, .. }) if model == manual_model
+        ));
+        assert!(matches!(
+            state.sections.get(&WizardSection::Models),
+            Some(SectionState::Models {
+                catalog_source: CatalogSource::StaticFallback,
+                catalog_error: Some(error),
+                ..
+            }) if error == "fake provider unavailable"
+        ));
+        let rendered = render_wizard_text(&state);
+        assert!(rendered.contains("bundled fallback snapshot"), "{rendered}");
+        assert!(
+            rendered.contains(model_catalog::STATIC_FALLBACK_AS_OF),
+            "{rendered}"
+        );
+        assert!(rendered.contains("incomplete"), "{rendered}");
+        assert!(
+            rendered.contains("Refresh warning: fake provider unavailable"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(manual_model), "{rendered}");
+        assert!(!rendered.contains("provider discovery"), "{rendered}");
+        assert!(!rendered.contains("local cache"), "{rendered}");
+    }
+
+    #[test]
     fn persisted_fallback_id_is_not_replaced_by_refresh() {
         let persisted = ProviderEntry::Openai {
             api_key: "openai-key".to_string(),
@@ -7369,9 +7732,8 @@ for line in sys.stdin:
             name: Some("openai-work".to_string()),
             reasoning_effort: None,
         };
-        let mut state = WizardState::new(Some(&crate::config::Config::with_providers(vec![
-            persisted.clone(),
-        ])));
+        let config = crate::config::Config::with_providers(vec![persisted.clone()]);
+        let mut state = WizardState::new_with_catalog_cache_dir(Some(&config), None);
         handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
         assert_eq!(
             catalog_model_provenance(&state),
