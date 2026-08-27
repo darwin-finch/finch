@@ -16,7 +16,7 @@ use crate::claude::types::{ContentBlock, Message};
 /// - Optional truncation of old messages
 /// - Smart retention strategies (e.g., keep system prompts, drop old tool results)
 pub struct TeacherSession {
-    provider: Box<dyn LlmProvider>,
+    provider: std::sync::Arc<dyn LlmProvider>,
     state: ConversationState,
     config: TeacherContextConfig,
 }
@@ -65,7 +65,7 @@ impl TeacherSession {
     /// Create a new teacher session with default config
     pub fn new(provider: Box<dyn LlmProvider>) -> Self {
         Self {
-            provider,
+            provider: std::sync::Arc::from(provider),
             state: ConversationState::default(),
             config: TeacherContextConfig::default(),
         }
@@ -73,6 +73,18 @@ impl TeacherSession {
 
     /// Create a new teacher session with custom config
     pub fn with_config(provider: Box<dyn LlmProvider>, config: TeacherContextConfig) -> Self {
+        Self {
+            provider: std::sync::Arc::from(provider),
+            state: ConversationState::default(),
+            config,
+        }
+    }
+
+    /// Create a session from an already validated shared provider.
+    pub fn with_shared_provider(
+        provider: std::sync::Arc<dyn LlmProvider>,
+        config: TeacherContextConfig,
+    ) -> Self {
         Self {
             provider,
             state: ConversationState::default(),

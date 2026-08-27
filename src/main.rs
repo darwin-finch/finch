@@ -13,7 +13,7 @@ use finch::cli::{ConversationHistory, Repl};
 use finch::config::{load_config, Config};
 use finch::metrics::MetricsLogger;
 use finch::models::ThresholdRouter;
-use finch::providers::create_provider;
+use finch::providers::create_provider_from_config;
 use finch::router::Router;
 use tracing_subscriber::prelude::*;
 
@@ -328,7 +328,7 @@ fn build_teachers_from_env() -> Vec<finch::config::TeacherEntry> {
 /// This function creates a provider based on the teacher configuration
 /// and wraps it in a ClaudeClient for backwards compatibility.
 fn create_claude_client_with_provider(config: &Config) -> Result<ClaudeClient> {
-    let provider = create_provider(&config.teachers)?;
+    let provider = create_provider_from_config(config)?;
     Ok(ClaudeClient::with_provider(provider))
 }
 
@@ -1725,8 +1725,7 @@ async fn run_daemon(bind_address: String) -> Result<()> {
     // Build the multi-provider pool from [[providers]] config (cloud providers only).
     // Falls back gracefully to the legacy ClaudeClient path when empty.
     let providers: Vec<Box<dyn finch::providers::LlmProvider>> = {
-        use finch::providers::create_providers_from_entries;
-        create_providers_from_entries(&config.providers).unwrap_or_default()
+        finch::providers::create_providers_from_config(&config)?
     };
 
     // Create and start agent server (with LocalGenerator support)
@@ -2237,12 +2236,14 @@ async fn run_query_teacher_only(
 
     let claude_client = create_claude_client_with_provider(config)?;
     let model = config
-        .active_teacher()
-        .and_then(|t| t.model.clone())
+        .cloud_providers()
+        .first()
+        .and_then(|provider| provider.model().map(str::to_string))
         .unwrap_or_else(|| finch::config::constants::DEFAULT_CLAUDE_MODEL.to_string());
     let provider = config
-        .active_teacher()
-        .map(|teacher| teacher.provider.clone())
+        .cloud_providers()
+        .first()
+        .map(|provider| provider.provider_type().to_string())
         .unwrap_or_else(|| "teacher".to_string());
     let wire_metrics = default_wire_metrics_logger();
     let mut wire_metric =
@@ -2546,7 +2547,7 @@ async fn run_node_info() -> Result<()> {
     use finch::node::NodeInfo;
 
     let config = load_config().unwrap_or_else(|_| Config::new(vec![]));
-    let has_teacher = config.active_teacher().is_some();
+    let has_teacher = !config.cloud_providers().is_empty();
     let info = NodeInfo::load(has_teacher)?;
 
     println!("╔══════════════════════════════════════╗");
@@ -2839,7 +2840,7 @@ async fn run_worker(bind_address: String, info_only: bool) -> Result<()> {
     use finch::node::NodeInfo;
 
     let config = load_config().unwrap_or_else(|_| Config::new(vec![]));
-    let has_teacher = config.active_teacher().is_some();
+    let has_teacher = !config.cloud_providers().is_empty();
     let info = NodeInfo::load(has_teacher)?;
 
     // Always show node identity when starting as worker
@@ -2954,7 +2955,7 @@ async fn run_agent(
         }
     };
 
-    if config.active_teacher().is_none() {
+    if config.cloud_providers().is_empty() {
         anyhow::bail!(
             "No teacher API configured.\n\
              Agent mode requires a teacher API (Claude, GPT-4, etc.).\n\

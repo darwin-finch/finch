@@ -9,7 +9,7 @@ use super::codex_app_server::CodexAppServerProvider;
 use super::gemini::GeminiProvider;
 use super::openai::OpenAIProvider;
 use super::LlmProvider;
-use crate::config::{ProviderEntry, TeacherEntry};
+use crate::config::{Config, ProviderEntry, TeacherEntry};
 
 // ---------------------------------------------------------------------------
 // New API: ProviderEntry-based (unified)
@@ -230,6 +230,27 @@ pub fn create_provider_from_entries(entries: &[ProviderEntry]) -> Result<Box<dyn
     }
 }
 
+/// Create the ordered cloud provider pool from unified configuration, falling back to legacy
+/// teacher entries only when no cloud `[[providers]]` entries exist.
+pub fn create_providers_from_config(config: &Config) -> Result<Vec<Box<dyn LlmProvider>>> {
+    if config.providers.iter().any(|entry| !entry.is_local()) {
+        return create_providers_from_entries(&config.providers);
+    }
+    create_providers(&config.teachers)
+}
+
+/// Create the active provider or fallback chain from unified or legacy configuration.
+pub fn create_provider_from_config(config: &Config) -> Result<Box<dyn LlmProvider>> {
+    let providers = create_providers_from_config(config)?;
+    if providers.len() == 1 {
+        return Ok(providers
+            .into_iter()
+            .next()
+            .expect("len == 1 checked above"));
+    }
+    Ok(Box::new(super::FallbackChain::new(providers)))
+}
+
 // ---------------------------------------------------------------------------
 // Legacy API: TeacherEntry-based (kept for backward compat)
 // ---------------------------------------------------------------------------
@@ -390,6 +411,26 @@ mod tests {
             base_url: None,
             name: None,
         }
+    }
+
+    fn install_schema_app_server(directory: &tempfile::TempDir, restricted: bool) {
+        let fake = directory.path().join("schema_app_server.py");
+        let script = if restricted {
+            r#"import json, pathlib, sys
+out = pathlib.Path(sys.argv[-1]) / 'v2'
+out.mkdir(parents=True)
+(out / 'ThreadStartParams.json').write_text('{}')
+schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandboxPolicy'}}, 'definitions': {'ReadOnlySandboxPolicy': {'properties': {'type': {'enum': ['readOnly']}, 'networkAccess': {'type': 'boolean'}, 'access': {'$ref': '#/definitions/ReadOnlyAccess'}}}, 'ReadOnlyAccess': {'properties': {'type': {'enum': ['restricted']}, 'readableRoots': {'type': 'array', 'items': {'type': 'string'}}, 'includePlatformDefaults': {'type': 'boolean'}}}}}
+(out / 'TurnStartParams.json').write_text(json.dumps(schema))
+"#
+        } else {
+            "import sys\n# No restricted schema output.\nsys.exit(0)\n"
+        };
+        std::fs::write(&fake, script).unwrap();
+        crate::providers::codex_app_server::install_test_provider_app_server(
+            std::path::PathBuf::from("python3"),
+            vec![fake.to_string_lossy().into_owned()],
+        );
     }
 
     fn pentry(variant: ProviderEntry) -> ProviderEntry {
@@ -613,16 +654,7 @@ mod tests {
     #[test]
     fn test_unusable_chatgpt_schema_preserves_later_configured_grok_fallback() {
         let directory = tempfile::tempdir().unwrap();
-        let fake = directory.path().join("fake_app_server.py");
-        std::fs::write(
-            &fake,
-            "import sys\n# Exit successfully without producing the required restricted schemas.\nsys.exit(0)\n",
-        )
-        .unwrap();
-        crate::providers::codex_app_server::install_test_provider_app_server(
-            std::path::PathBuf::from("python3"),
-            vec![fake.to_string_lossy().into_owned()],
-        );
+        install_schema_app_server(&directory, false);
         let entries = vec![
             ProviderEntry::ChatgptSubscription {
                 credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
@@ -639,9 +671,38 @@ mod tests {
                 name: Some("fallback".into()),
             },
         ];
-        let providers = create_providers_from_entries(&entries).unwrap();
-        assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0].name(), "grok");
-        assert_eq!(providers[0].default_model(), "grok-code-fast-1");
+        let path = directory.path().join("config.toml");
+        Config::with_providers(entries).save_to(&path).unwrap();
+        let config = crate::config::load_config_from_path(&path).unwrap();
+        let provider = create_provider_from_config(&config).unwrap();
+        assert_eq!(provider.name(), "grok");
+        assert_eq!(provider.default_model(), "grok-code-fast-1");
+    }
+
+    #[test]
+    fn test_saved_chatgpt_only_config_constructs_shared_startup_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        install_schema_app_server(&directory, true);
+        let path = directory.path().join("config.toml");
+        Config::with_providers(vec![ProviderEntry::ChatgptSubscription {
+            credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF.into(),
+            model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.into()),
+            name: Some("subscription".into()),
+        }])
+        .save_to(&path)
+        .unwrap();
+
+        let config = crate::config::load_config_from_path(&path).unwrap();
+        assert!(config.teachers.is_empty());
+        let provider = create_provider_from_config(&config).unwrap();
+        assert_eq!(provider.name(), "chatgpt_subscription");
+    }
+
+    #[test]
+    fn test_shared_startup_provider_preserves_legacy_teacher_config() {
+        let mut config = Config::new(vec![entry("claude", "legacy-key")]);
+        config.providers.clear();
+        let provider = create_provider_from_config(&config).unwrap();
+        assert_eq!(provider.name(), "claude");
     }
 }

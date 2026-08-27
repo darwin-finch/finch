@@ -31,6 +31,11 @@ impl ClaudeClient {
         }
     }
 
+    /// Share the already validated provider with other compatibility facades.
+    pub(crate) fn shared_provider(&self) -> std::sync::Arc<dyn LlmProvider> {
+        std::sync::Arc::clone(&self.provider)
+    }
+
     /// Get the provider name
     pub fn provider_name(&self) -> &str {
         self.provider.name()
