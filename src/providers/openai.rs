@@ -14,8 +14,8 @@ use tokio::sync::mpsc;
 
 use super::endpoints::ProviderEndpoints;
 use super::types::{
-    CapabilitySupport, ModelCapabilities, ProviderRequest, ProviderResponse, StreamChunk,
-    WireProtocol,
+    CapabilitySupport, ModelCapabilities, ModelFeature, ProviderRequest, ProviderResponse,
+    StreamChunk, WireProtocol,
 };
 use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::claude::retry::{with_retry, NonRetriableError};
@@ -25,9 +25,10 @@ use crate::config::ReasoningEffort;
 const REQUEST_TIMEOUT_SECS: u64 = 60;
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
-const MAX_SSE_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SSE_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +123,88 @@ async fn read_api_error(
     friendly_api_error(status, &String::from_utf8_lossy(&body))
 }
 
+async fn read_bounded_response_body(response: reqwest::Response) -> Result<Vec<u8>> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(next) = stream.next().await {
+        let bytes = next.context("Failed to read OpenAI response body")?;
+        if body.len().saturating_add(bytes.len()) > MAX_RESPONSE_BYTES {
+            anyhow::bail!("OpenAI response exceeded the 32 MiB payload limit");
+        }
+        body.extend_from_slice(&bytes);
+    }
+    Ok(body)
+}
+
+fn validate_canonical_response_shape(value: &serde_json::Value) -> Result<()> {
+    let root = value
+        .as_object()
+        .context("OpenAI response was not a JSON object")?;
+    reject_unknown_keys(
+        root,
+        &[
+            "id",
+            "object",
+            "created",
+            "model",
+            "choices",
+            "usage",
+            "service_tier",
+            "system_fingerprint",
+        ],
+        "response",
+    )?;
+    let choices = root
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .context("OpenAI response omitted a valid choices array")?;
+    for choice in choices {
+        let choice = choice
+            .as_object()
+            .context("OpenAI response choice was not an object")?;
+        reject_unknown_keys(
+            choice,
+            &["index", "message", "finish_reason", "logprobs"],
+            "response choice",
+        )?;
+        let message = choice
+            .get("message")
+            .and_then(serde_json::Value::as_object)
+            .context("OpenAI response choice omitted a valid message")?;
+        reject_unknown_keys(
+            message,
+            &["role", "content", "tool_calls", "refusal", "annotations"],
+            "response message",
+        )?;
+        if message.get("refusal").is_some_and(|value| !value.is_null()) {
+            anyhow::bail!("OpenAI response contained an unsupported refusal item");
+        }
+        if message
+            .get("annotations")
+            .is_some_and(|value| value.as_array().is_none_or(|items| !items.is_empty()))
+        {
+            anyhow::bail!("OpenAI response contained unsupported annotations");
+        }
+        if let Some(tool_calls) = message.get("tool_calls") {
+            let tool_calls = tool_calls
+                .as_array()
+                .context("OpenAI response tool_calls was not an array")?;
+            for tool_call in tool_calls {
+                let tool_call = tool_call
+                    .as_object()
+                    .context("OpenAI response tool call was not an object")?;
+                reject_unknown_keys(tool_call, &["id", "type", "function"], "tool call")?;
+                let function = tool_call
+                    .get("function")
+                    .and_then(serde_json::Value::as_object)
+                    .context("OpenAI response tool call omitted a function object")?;
+                reject_unknown_keys(function, &["name", "arguments"], "tool function")?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct CanonicalStreamState {
     response_id: Option<String>,
@@ -132,12 +215,91 @@ struct CanonicalStreamState {
     tool_calls: Vec<(String, String, String)>,
 }
 
+fn reject_unknown_keys(
+    object: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+    context: &str,
+) -> Result<()> {
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        anyhow::bail!(
+            "OpenAI stream contained unknown {} field '{}'",
+            context,
+            key
+        );
+    }
+    Ok(())
+}
+
+fn validate_canonical_chunk_shape(value: &serde_json::Value) -> Result<()> {
+    let root = value
+        .as_object()
+        .context("OpenAI stream event was not a JSON object")?;
+    reject_unknown_keys(
+        root,
+        &[
+            "id",
+            "object",
+            "created",
+            "model",
+            "system_fingerprint",
+            "service_tier",
+            "choices",
+            "usage",
+        ],
+        "event",
+    )?;
+    let choices = root
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .context("OpenAI stream event omitted a valid choices array")?;
+    for choice in choices {
+        let choice = choice
+            .as_object()
+            .context("OpenAI stream choice was not an object")?;
+        reject_unknown_keys(
+            choice,
+            &["index", "delta", "finish_reason", "logprobs"],
+            "choice",
+        )?;
+        let delta = choice
+            .get("delta")
+            .and_then(serde_json::Value::as_object)
+            .context("OpenAI stream choice omitted a valid delta object")?;
+        reject_unknown_keys(delta, &["role", "content", "tool_calls"], "delta")?;
+        if let Some(tool_calls) = delta.get("tool_calls") {
+            let tool_calls = tool_calls
+                .as_array()
+                .context("OpenAI stream tool_calls was not an array")?;
+            for tool_call in tool_calls {
+                let tool_call = tool_call
+                    .as_object()
+                    .context("OpenAI stream tool-call item was not an object")?;
+                reject_unknown_keys(
+                    tool_call,
+                    &["index", "id", "type", "function"],
+                    "tool-call item",
+                )?;
+                if let Some(function) = tool_call.get("function") {
+                    let function = function
+                        .as_object()
+                        .context("OpenAI stream function delta was not an object")?;
+                    reject_unknown_keys(function, &["name", "arguments"], "function delta")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result<Vec<StreamChunk>> {
     if state.done {
         anyhow::bail!("OpenAI stream sent data after its terminal marker");
     }
-    let chunk: OpenAIStreamChunk =
+    let value: serde_json::Value =
         serde_json::from_str(data).context("OpenAI stream contained malformed JSON")?;
+    validate_canonical_chunk_shape(&value)?;
+    let chunk: OpenAIStreamChunk = serde_json::from_value(value)
+        .context("OpenAI stream event did not match the documented schema")?;
     if chunk.object.as_deref() != Some("chat.completion.chunk") {
         anyhow::bail!("OpenAI stream contained an unknown event object");
     }
@@ -153,6 +315,9 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
             anyhow::bail!("OpenAI stream changed actual model mid-stream");
         }
     } else {
+        if chunk.model.trim().is_empty() {
+            anyhow::bail!("OpenAI stream omitted the actual model");
+        }
         state.model = Some(chunk.model.clone());
     }
 
@@ -172,6 +337,18 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
         anyhow::bail!("OpenAI stream returned an unexpected choice set");
     }
     let choice = &chunk.choices[0];
+    if let Some(role) = &choice.delta.role {
+        if role != "assistant" {
+            anyhow::bail!("OpenAI stream returned unknown delta role '{}'", role);
+        }
+    }
+    if choice.delta.role.is_none()
+        && choice.delta.content.is_none()
+        && choice.delta.tool_calls.is_none()
+        && choice.finish_reason.is_none()
+    {
+        anyhow::bail!("OpenAI stream returned an empty non-terminal delta");
+    }
     if state.terminal_reason.is_some()
         && (choice.delta.content.is_some() || choice.delta.tool_calls.is_some())
     {
@@ -239,10 +416,7 @@ fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result
     Ok(output)
 }
 
-async fn finish_canonical_stream(
-    state: &mut CanonicalStreamState,
-    tx: &mpsc::Sender<Result<StreamChunk>>,
-) -> Result<()> {
+fn mark_canonical_done(state: &mut CanonicalStreamState) -> Result<()> {
     if state.done {
         anyhow::bail!("OpenAI stream sent duplicate terminal marker");
     }
@@ -250,6 +424,13 @@ async fn finish_canonical_stream(
         anyhow::bail!("OpenAI stream ended before terminal status");
     }
     state.done = true;
+    Ok(())
+}
+
+async fn publish_canonical_completion(
+    state: &CanonicalStreamState,
+    tx: &mpsc::Sender<Result<StreamChunk>>,
+) -> Result<()> {
     if !state.accumulated_text.is_empty() {
         tx.send(Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text {
             text: state.accumulated_text.clone(),
@@ -257,12 +438,19 @@ async fn finish_canonical_stream(
         .await
         .map_err(|_| anyhow::anyhow!("OpenAI stream receiver was dropped"))?;
     }
-    for block in finalize_tool_calls(&state.tool_calls)? {
+    for block in finalize_tool_calls(&state.tool_calls, true)? {
         tx.send(Ok(StreamChunk::ContentBlockComplete(block)))
             .await
             .map_err(|_| anyhow::anyhow!("OpenAI stream receiver was dropped"))?;
     }
     Ok(())
+}
+
+fn sse_line_prefix_exceeds_limit(buffer: &[u8]) -> bool {
+    match buffer.iter().position(|byte| *byte == b'\n') {
+        Some(position) => position.saturating_add(1) > MAX_SSE_LINE_BYTES,
+        None => buffer.len() > MAX_SSE_LINE_BYTES,
+    }
 }
 
 fn spawn_canonical_stream_parser(
@@ -281,12 +469,27 @@ fn spawn_canonical_stream_parser(
                 next = stream.next() => next,
             };
             let Some(next) = next else {
+                if buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                    let message = if state.done {
+                        "OpenAI stream sent data after its terminal marker"
+                    } else {
+                        "OpenAI stream reached EOF with an incomplete SSE event"
+                    };
+                    let _ = tx.send(Err(anyhow::anyhow!(message))).await;
+                    return;
+                }
                 if !state.done {
                     let _ = tx
                         .send(Err(anyhow::anyhow!(
                             "OpenAI stream reached EOF before [DONE]"
                         )))
                         .await;
+                    return;
+                }
+                if let Err(error) = publish_canonical_completion(&state, &tx).await {
+                    if !tx.is_closed() {
+                        let _ = tx.send(Err(error)).await;
+                    }
                 }
                 return;
             };
@@ -301,13 +504,13 @@ fn spawn_canonical_stream_parser(
             if total > MAX_SSE_TOTAL_BYTES {
                 let _ = tx
                     .send(Err(anyhow::anyhow!(
-                        "OpenAI stream exceeded the 32 MiB total limit"
+                        "OpenAI stream exceeded the 4 MiB total limit"
                     )))
                     .await;
                 return;
             }
             buffer.extend_from_slice(&bytes);
-            if buffer.len() > MAX_SSE_LINE_BYTES && !buffer.contains(&b'\n') {
+            if sse_line_prefix_exceeds_limit(&buffer) {
                 let _ = tx
                     .send(Err(anyhow::anyhow!(
                         "OpenAI SSE line exceeded the 1 MiB limit"
@@ -334,7 +537,26 @@ fn spawn_canonical_stream_parser(
                         return;
                     }
                 };
-                if line.is_empty() || line.starts_with(':') {
+                if line.is_empty() {
+                    if sse_line_prefix_exceeds_limit(&buffer) {
+                        let _ = tx
+                            .send(Err(anyhow::anyhow!(
+                                "OpenAI SSE line exceeded the 1 MiB limit"
+                            )))
+                            .await;
+                        return;
+                    }
+                    continue;
+                }
+                if state.done {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "OpenAI stream sent data after its terminal marker"
+                        )))
+                        .await;
+                    return;
+                }
+                if line.starts_with(':') {
                     continue;
                 }
                 let Some(data) = line.strip_prefix("data:") else {
@@ -347,19 +569,21 @@ fn spawn_canonical_stream_parser(
                 };
                 let data = data.strip_prefix(' ').unwrap_or(data);
                 if data == "[DONE]" {
-                    if let Err(error) = finish_canonical_stream(&mut state, &tx).await {
+                    if let Err(error) = mark_canonical_done(&mut state) {
                         if !tx.is_closed() {
                             let _ = tx.send(Err(error)).await;
                         }
+                        return;
                     }
-                    if buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                    if sse_line_prefix_exceeds_limit(&buffer) {
                         let _ = tx
                             .send(Err(anyhow::anyhow!(
-                                "OpenAI stream sent data after its terminal marker"
+                                "OpenAI SSE line exceeded the 1 MiB limit"
                             )))
                             .await;
+                        return;
                     }
-                    return;
+                    continue;
                 }
                 match canonical_stream_data(&mut state, data) {
                     Ok(chunks) => {
@@ -373,6 +597,14 @@ fn spawn_canonical_stream_parser(
                         let _ = tx.send(Err(error)).await;
                         return;
                     }
+                }
+                if sse_line_prefix_exceeds_limit(&buffer) {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "OpenAI SSE line exceeded the 1 MiB limit"
+                        )))
+                        .await;
+                    return;
                 }
             }
         }
@@ -413,19 +645,27 @@ fn accumulate_tool_call_delta(
 ///
 /// Each entry is `(id, name, json_arguments_string)`.
 /// Invalid JSON in the arguments is replaced with an empty object.
-fn finalize_tool_calls(acc: &[(String, String, String)]) -> Result<Vec<ContentBlock>> {
+fn finalize_tool_calls(
+    acc: &[(String, String, String)],
+    strict: bool,
+) -> Result<Vec<ContentBlock>> {
     acc.iter()
         .filter(|(id, name, _)| !id.is_empty() || !name.is_empty())
         .map(|(id, name, args_str)| {
-            if id.is_empty() || name.is_empty() {
+            if strict && (id.is_empty() || name.is_empty()) {
                 anyhow::bail!("OpenAI stream ended with an incomplete function call");
             }
-            if args_str.len() > MAX_TOOL_ARGUMENT_BYTES {
+            if strict && args_str.len() > MAX_TOOL_ARGUMENT_BYTES {
                 anyhow::bail!("OpenAI function arguments exceeded the 1 MiB limit");
             }
-            let input = serde_json::from_str::<serde_json::Value>(args_str)
-                .context("OpenAI returned malformed JSON function arguments")?;
-            if !input.is_object() {
+            let input = if strict {
+                serde_json::from_str::<serde_json::Value>(args_str)
+                    .context("OpenAI returned malformed JSON function arguments")?
+            } else {
+                serde_json::from_str::<serde_json::Value>(args_str)
+                    .unwrap_or_else(|_| serde_json::json!({}))
+            };
+            if strict && !input.is_object() {
                 anyhow::bail!("OpenAI function arguments were not a JSON object");
             }
             Ok(ContentBlock::ToolUse {
@@ -950,10 +1190,20 @@ impl OpenAIProvider {
             anyhow::bail!("{}", msg);
         }
 
-        let openai_response: OpenAIResponse = response
-            .json()
-            .await
-            .context("Failed to parse OpenAI API response")?;
+        let openai_response: OpenAIResponse = match rule {
+            TransportRule::CanonicalGpt56ChatCompletions => {
+                let body = read_bounded_response_body(response).await?;
+                let value: serde_json::Value =
+                    serde_json::from_slice(&body).context("Failed to parse OpenAI API response")?;
+                validate_canonical_response_shape(&value)?;
+                serde_json::from_value(value)
+                    .context("OpenAI response did not match the documented schema")?
+            }
+            TransportRule::CompatibleChatCompletions => response
+                .json()
+                .await
+                .context("Failed to parse OpenAI API response")?,
+        };
 
         tracing::debug!(
             provider = %self.provider_name,
@@ -1067,7 +1317,7 @@ impl OpenAIProvider {
                                     }
 
                                     // Convert accumulated tool call deltas to ToolUse blocks
-                                    let blocks = match finalize_tool_calls(&tool_call_acc) {
+                                    let blocks = match finalize_tool_calls(&tool_call_acc, false) {
                                         Ok(blocks) => blocks,
                                         Err(error) => {
                                             let _ = tx.send(Err(error)).await;
@@ -1197,7 +1447,7 @@ impl ProviderBackend for OpenAIProvider {
 
         let (source, streaming, tools, reasoning, max_tokens, max_output_tokens) =
             match (self.provider_name.as_str(), model) {
-                ("openai", "gpt-5.6-sol") => (
+                ("openai", "gpt-5.6-sol" | "gpt-5.6") => (
                     "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
                     CapabilitySupport::Supported,
                     CapabilitySupport::Supported,
@@ -1272,7 +1522,7 @@ impl ProviderBackend for OpenAIProvider {
                 // all optional capabilities remain unknown until attested.
                 _ => return ModelCapabilities::unknown(self.name(), model),
             };
-        ModelCapabilities::static_metadata(
+        let mut capabilities = ModelCapabilities::static_metadata(
             self.name(),
             model,
             "2026-08-26",
@@ -1289,7 +1539,15 @@ impl ProviderBackend for OpenAIProvider {
             WireProtocol::OpenAiChatCompletions,
             "2026-08-26",
             "Finch OpenAI-compatible chat-completions adapter",
-        )
+        );
+        if self.provider_name == "openai" && matches!(model, "gpt-5.6-sol" | "gpt-5.6") {
+            capabilities.image_input = ModelFeature::static_metadata(
+                CapabilitySupport::Supported,
+                "2026-08-27",
+                "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+            );
+        }
+        capabilities
     }
 
     fn requested_reasoning_effort(&self, _request: &ProviderRequest) -> Option<ReasoningEffort> {
@@ -1505,6 +1763,22 @@ struct OpenAIFunctionDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn canonical_test_provider(base_url: String) -> OpenAIProvider {
         let mut provider = OpenAIProvider::new_compatible(
@@ -1519,6 +1793,63 @@ mod tests {
         .with_reasoning_effort(ReasoningEffort::High);
         provider.canonical_openai_endpoint = true;
         provider
+    }
+
+    async fn stalling_http_server(
+        send_sse_headers: bool,
+    ) -> (String, tokio::sync::oneshot::Receiver<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 16 * 1024];
+            let _ = socket.read(&mut request).await;
+            if send_sse_headers {
+                socket.write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                ).await.unwrap();
+                socket.flush().await.unwrap();
+            }
+            let mut byte = [0u8; 1];
+            loop {
+                match socket.read(&mut byte).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = closed_tx.send(());
+        });
+        (format!("http://{}", address), closed_rx)
+    }
+
+    async fn canonical_stream_outcome(body: String) -> (bool, Vec<String>) {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = canonical_test_provider(server.url());
+        let mut rx = provider
+            .send_message_stream_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("gpt-5.6-sol"),
+            )
+            .await
+            .unwrap();
+        let mut complete = false;
+        let mut errors = Vec::new();
+        while let Some(item) = rx.recv().await {
+            match item {
+                Ok(StreamChunk::ContentBlockComplete(_)) => complete = true,
+                Err(error) => errors.push(error.to_string()),
+                _ => {}
+            }
+        }
+        (complete, errors)
     }
 
     #[tokio::test]
@@ -1614,6 +1945,10 @@ mod tests {
             TransportRule::CanonicalGpt56ChatCompletions
         );
         assert_eq!(
+            canonical.transport_rule("gpt-5.6"),
+            TransportRule::CanonicalGpt56ChatCompletions
+        );
+        assert_eq!(
             canonical.transport_rule("gpt-4o"),
             TransportRule::CompatibleChatCompletions
         );
@@ -1634,6 +1969,25 @@ mod tests {
             canonical.capabilities("gpt-5.6-sol").wire_protocol.protocol,
             Some(WireProtocol::OpenAiChatCompletions)
         );
+        assert!(canonical
+            .capabilities("gpt-5.6-sol")
+            .image_input
+            .is_supported());
+        assert!(canonical.capabilities("gpt-5.6").image_input.is_supported());
+        let alias = canonical
+            .clone()
+            .with_model("gpt-5.6")
+            .with_reasoning_effort(ReasoningEffort::High);
+        let validated = crate::providers::validate_provider_request(
+            &alias,
+            &ProviderRequest::new(vec![crate::claude::Message::with_content(
+                "user",
+                vec![ContentBlock::image("image/png", "iVBORw0KGgo=")],
+            )]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(validated.capabilities().model, "gpt-5.6");
     }
 
     #[tokio::test]
@@ -1712,6 +2066,132 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn canonical_stream_releases_transport_when_receiver_is_dropped() {
+        let (url, closed) = stalling_http_server(true).await;
+        let provider = canonical_test_provider(url);
+        let rx = provider
+            .send_message_stream_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("gpt-5.6-sol"),
+            )
+            .await
+            .unwrap();
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("transport was not released after receiver drop")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn canonical_request_timeout_is_bounded_and_releases_transport() {
+        let (url, closed) = stalling_http_server(false).await;
+        let mut provider = canonical_test_provider(url);
+        provider.client = Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let error = provider
+            .send_message_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("gpt-5.6-sol"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Failed to send request"));
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("timed-out transport was not released")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn canonical_stream_rejects_duplicate_or_late_done_without_completion_block() {
+        for trailing in [
+            "data: [DONE]\n\n",
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let body = format!(
+                "data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"provisional\"}},\"finish_reason\":null}}]}}\n\ndata: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n{}",
+                trailing
+            );
+            server
+                .mock("POST", "/v1/chat/completions")
+                .with_status(200)
+                .with_header("content-type", "text/event-stream")
+                .with_body(body)
+                .create_async()
+                .await;
+            let provider = canonical_test_provider(server.url());
+            let mut rx = provider
+                .send_message_stream_once(
+                    &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                        .with_model("gpt-5.6-sol"),
+                )
+                .await
+                .unwrap();
+            let mut complete = false;
+            let mut terminal_error = false;
+            while let Some(item) = rx.recv().await {
+                match item {
+                    Ok(StreamChunk::ContentBlockComplete(_)) => complete = true,
+                    Err(error) => {
+                        terminal_error = error.to_string().contains("after its terminal marker")
+                    }
+                    _ => {}
+                }
+            }
+            assert!(terminal_error);
+            assert!(!complete, "completion published before terminal uniqueness was proven");
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_stream_enforces_sse_field_line_and_total_bounds_at_http_boundary() {
+        let (complete, errors) = canonical_stream_outcome("event: mystery\n\n".to_string()).await;
+        assert!(!complete);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unknown SSE field")));
+
+        let unknown_delta = "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"unknown_item\":{}},\"finish_reason\":null}]}\n\n";
+        let (complete, errors) = canonical_stream_outcome(unknown_delta.to_string()).await;
+        assert!(!complete);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unknown delta field")));
+
+        let mut oversized_line = concat!(
+            "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+            ": short\n"
+        )
+        .as_bytes()
+        .to_vec();
+        oversized_line.extend(std::iter::repeat_n(b'a', MAX_SSE_LINE_BYTES));
+        oversized_line.push(b'\n');
+        let (complete, errors) =
+            canonical_stream_outcome(String::from_utf8(oversized_line).unwrap()).await;
+        assert!(!complete);
+        assert!(errors.iter().any(|error| error.contains("line exceeded")));
+
+        let comment = format!(":{}\n", "a".repeat(900_000));
+        let oversized_total = comment.repeat(5);
+        let (complete, errors) = canonical_stream_outcome(oversized_total).await;
+        assert!(!complete);
+        assert!(errors.iter().any(|error| error.contains("total limit")));
+
+        assert!(!sse_line_prefix_exceeds_limit(&vec![
+            b'a';
+            MAX_SSE_LINE_BYTES
+        ]));
+        assert!(sse_line_prefix_exceeds_limit(&vec![
+            b'a';
+            MAX_SSE_LINE_BYTES + 1
+        ]));
+    }
+
     #[test]
     fn canonical_stream_rejects_unknown_malformed_duplicate_and_mismatched_events() {
         let mut state = CanonicalStreamState::default();
@@ -1726,6 +2206,43 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("unknown event"));
+        let mut state = CanonicalStreamState::default();
+        assert!(canonical_stream_data(
+            &mut state,
+            r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{"mystery":"payload"},"finish_reason":null}]}"#
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("unknown delta field"));
+        let mut state = CanonicalStreamState::default();
+        assert!(canonical_stream_data(
+            &mut state,
+            r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{"role":"tool"},"finish_reason":null}]}"#
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("unknown delta role"));
+        let mut state = CanonicalStreamState::default();
+        assert!(canonical_stream_data(
+            &mut state,
+            r#"{"id":"x","object":"chat.completion.chunk","model":"","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("omitted the actual model"));
+        let mut state = CanonicalStreamState::default();
+        canonical_stream_data(
+            &mut state,
+            r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol-a","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+        assert!(canonical_stream_data(
+            &mut state,
+            r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol-b","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}"#
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("changed actual model"));
         let mut state = CanonicalStreamState::default();
         canonical_stream_data(&mut state, r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#).unwrap();
         assert!(canonical_stream_data(&mut state, r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#).unwrap_err().to_string().contains("duplicate terminal"));
@@ -1771,6 +2288,128 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unknown function call ID"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn canonical_non_success_body_and_sensitive_request_fields_are_redacted_from_logs() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream_secret = "UPSTREAM_REFLECTED_SECRET";
+        server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(400)
+            .with_body(format!(
+                "{{\"error\":{{\"message\":\"{}{}\"}}}}",
+                upstream_secret,
+                "x".repeat(MAX_ERROR_BODY_BYTES + 1024)
+            ))
+            .create_async()
+            .await;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || CapturedLogs(Arc::clone(&writer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let provider = canonical_test_provider(server.url());
+        let prompt_secret = "PROMPT_PRIVATE_VALUE";
+        let request = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            "user",
+            vec![
+                ContentBlock::text(prompt_secret),
+                ContentBlock::image("image/png", "iVBORw0KGgo="),
+            ],
+        )])
+        .with_model("gpt-5.6-sol");
+        let error = provider.send_message_once(&request).await.unwrap_err();
+        let error = error.to_string();
+        assert!(error.contains("response body redacted"));
+        assert!(!error.contains(upstream_secret));
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        for secret in [
+            "test-secret",
+            upstream_secret,
+            prompt_secret,
+            "iVBORw0KGgo=",
+        ] {
+            assert!(
+                !logs.contains(secret),
+                "logs exposed sensitive request material"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_nonstream_rejects_malformed_status_model_and_unknown_items() {
+        let cases = [
+            ("not-json", "Failed to parse OpenAI API response"),
+            (
+                r#"{"id":"x","object":"chat.completion","model":"","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                "omitted the actual model",
+            ),
+            (
+                r#"{"id":"x","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"mystery"}]}"#,
+                "unknown terminal status",
+            ),
+            (
+                r#"{"id":"x","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":"ok","mystery_item":{}},"finish_reason":"stop"}]}"#,
+                "unknown response message field",
+            ),
+            (
+                r#"{"id":"x","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_x","type":"function","function":{"name":"read","arguments":"not-json"}}]},"finish_reason":"tool_calls"}]}"#,
+                "malformed JSON function arguments",
+            ),
+        ];
+        for (body, expected) in cases {
+            let mut server = mockito::Server::new_async().await;
+            server
+                .mock("POST", "/v1/chat/completions")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create_async()
+                .await;
+            let provider = canonical_test_provider(server.url());
+            let error = provider
+                .send_message_once(
+                    &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                        .with_model("gpt-5.6-sol"),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compatible_nonstream_keeps_historical_malformed_tool_argument_fallback() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_body(r#"{"id":"x","model":"compatible-model","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_x","type":"function","function":{"name":"read","arguments":"not-json"}}]},"finish_reason":"tool_calls"}]}"#)
+            .create_async()
+            .await;
+        let provider = OpenAIProvider::new_compatible(
+            "key".into(),
+            server.url(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "compatible-model".into(),
+            "compatible".into(),
+        )
+        .unwrap();
+        let response = provider
+            .send_message_once(&ProviderRequest::new(vec![crate::claude::Message::user(
+                "hello",
+            )]))
+            .await
+            .unwrap();
+        assert_eq!(response.tool_uses()[0].input, serde_json::json!({}));
     }
 
     #[tokio::test]
@@ -2291,7 +2930,7 @@ mod tests {
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
         )];
-        let blocks = finalize_tool_calls(&acc).unwrap();
+        let blocks = finalize_tool_calls(&acc, true).unwrap();
         assert_eq!(blocks.len(), 1);
         if let crate::claude::types::ContentBlock::ToolUse { id, name, input } = &blocks[0] {
             assert_eq!(id, "call_1");
@@ -2309,7 +2948,7 @@ mod tests {
             "glob".to_string(),
             "NOT_VALID_JSON".to_string(),
         )];
-        let error = finalize_tool_calls(&acc).unwrap_err();
+        let error = finalize_tool_calls(&acc, true).unwrap_err();
         assert!(error
             .to_string()
             .contains("malformed JSON function arguments"));
@@ -2318,7 +2957,7 @@ mod tests {
     #[test]
     fn test_finalize_tool_calls_empty_acc() {
         let acc: Vec<(String, String, String)> = Vec::new();
-        let blocks = finalize_tool_calls(&acc).unwrap();
+        let blocks = finalize_tool_calls(&acc, true).unwrap();
         assert!(blocks.is_empty());
     }
 
@@ -2360,7 +2999,7 @@ mod tests {
         accumulate_tool_call_delta(&mut acc, &delta2);
 
         // Finalize
-        let blocks = finalize_tool_calls(&acc).unwrap();
+        let blocks = finalize_tool_calls(&acc, true).unwrap();
         assert_eq!(blocks.len(), 1);
         if let crate::claude::types::ContentBlock::ToolUse { id, name, input } = &blocks[0] {
             assert_eq!(id, "call_xyz");
