@@ -360,8 +360,7 @@ impl TypedRuntime {
                 ProducerFiberState::Failed { .. } | ProducerFiberState::Cancelled => {}
             }
         }
-        self.producer_fibers
-            .retain(|id, _| reachable.contains(id));
+        self.producer_fibers.retain(|id, _| reachable.contains(id));
     }
 
     /// Reconcile this private runtime snapshot's CPU-task leases with every
@@ -878,16 +877,10 @@ impl TypedRuntime {
                         handler,
                     );
                 }
-                match handler
-                    .request_effect(&effect)
-                    .and_then(|values| {
-                        super::interpreter::validate_host_result(
-                            &call.output,
-                            &values,
-                            &call.origin,
-                        )
+                match handler.request_effect(&effect).and_then(|values| {
+                    super::interpreter::validate_host_result(&call.output, &values, &call.origin)
                         .map(|()| values)
-                    }) {
+                }) {
                     Ok(values) => {
                         acknowledge_last(&mut effect_journal, values.clone());
                         values
@@ -1421,10 +1414,8 @@ impl TypedRuntime {
                             )
                         }
                     };
-                    let poll = TypedValue::Record(vec![
-                        ("task".into(), task),
-                        ("value".into(), value),
-                    ]);
+                    let poll =
+                        TypedValue::Record(vec![("task".into(), task), ("value".into(), value)]);
                     let trampoline = VmTrampoline::new(
                         &module,
                         &InterpreterConfig {
@@ -2052,11 +2043,7 @@ fn fiber_end_type(result_type: Type) -> Type {
     Type::Variant(vec![("end".into(), Some(result_type))])
 }
 
-fn fiber_yielded(
-    yield_type: Type,
-    result_type: Type,
-    value: TypedValue,
-) -> TypedValue {
+fn fiber_yielded(yield_type: Type, result_type: Type, value: TypedValue) -> TypedValue {
     TypedValue::Result {
         ok_type: yield_type,
         error_type: fiber_end_type(result_type),
@@ -2065,11 +2052,7 @@ fn fiber_yielded(
     }
 }
 
-fn fiber_returned(
-    yield_type: Type,
-    result_type: Type,
-    value: TypedValue,
-) -> TypedValue {
+fn fiber_returned(yield_type: Type, result_type: Type, value: TypedValue) -> TypedValue {
     let error_type = fiber_end_type(result_type);
     TypedValue::Result {
         ok_type: yield_type,
@@ -2282,8 +2265,7 @@ fn validate_fiber_handle(
                 validate_fiber_handle(value, registry)?;
             }
         }
-        TypedValue::Option { value, .. }
-        | TypedValue::Variant { value, .. } => {
+        TypedValue::Option { value, .. } | TypedValue::Variant { value, .. } => {
             if let Some(value) = value {
                 validate_fiber_handle(value, registry)?;
             }
@@ -2890,9 +2872,11 @@ mod tests {
             second.effect_journal[1].state,
             EffectJournalState::AwaitingApproval
         ));
-        assert!(runtime.grants().0.iter().all(|requirement| {
-            requirement.capability != CapabilityKind::FileRead
-        }));
+        assert!(runtime
+            .grants()
+            .0
+            .iter()
+            .all(|requirement| { requirement.capability != CapabilityKind::FileRead }));
     }
 
     #[test]
@@ -3295,15 +3279,13 @@ mod tests {
             "{:?}",
             deferred.diagnostics
         );
-        assert!(matches!(deferred.values.as_slice(), [TypedValue::Fiber { .. }]));
+        assert!(matches!(
+            deferred.values.as_slice(),
+            [TypedValue::Fiber { .. }]
+        ));
         assert_eq!(runtime.checkpoint().unwrap().producer_fibers.len(), 2);
 
-        let dropped = runtime.execute(
-            ProgramLanguage::Forth,
-            "drop-outer.forth",
-            "drop",
-            5_000,
-        );
+        let dropped = runtime.execute(ProgramLanguage::Forth, "drop-outer.forth", "drop", 5_000);
         assert_eq!(
             dropped.status,
             TypedExecutionStatus::Completed,
@@ -3324,7 +3306,10 @@ mod tests {
             5_000,
         );
         assert_eq!(deferred.status, TypedExecutionStatus::Completed);
-        assert!(matches!(deferred.values.as_slice(), [TypedValue::Fiber { .. }]));
+        assert!(matches!(
+            deferred.values.as_slice(),
+            [TypedValue::Fiber { .. }]
+        ));
 
         let checkpoint = runtime.checkpoint().expect("producer is VM-checkpointable");
         let mut restored = TypedRuntime::from_checkpoint(checkpoint)
@@ -3449,7 +3434,10 @@ mod tests {
         let mut host = RuntimeCapabilities::default();
         let resumed = runtime.resume_with_handler(suspension, Vec::new(), &mut host);
         assert_eq!(resumed.status, TypedExecutionStatus::Completed);
-        assert!(matches!(resumed.values.as_slice(), [TypedValue::Fiber { .. }]));
+        assert!(matches!(
+            resumed.values.as_slice(),
+            [TypedValue::Fiber { .. }]
+        ));
         assert_eq!(runtime.producer_fibers.len(), 1);
 
         let next = runtime.execute(
@@ -3839,7 +3827,10 @@ mod tests {
         assert_eq!(definition.status, TypedExecutionStatus::Completed);
 
         let checkpoint = runtime.checkpoint().expect("quotation state checkpoints");
-        assert!(checkpoint.functions.keys().any(|name| name.starts_with("quote$")));
+        assert!(checkpoint
+            .functions
+            .keys()
+            .any(|name| name.starts_with("quote$")));
         let mut restored = TypedRuntime::from_checkpoint(checkpoint)
             .expect("generated quotation bodies restore with their public definition");
         let result = restored.execute(
