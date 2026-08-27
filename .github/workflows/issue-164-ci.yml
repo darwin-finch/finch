@@ -1,0 +1,42 @@
+name: Issue 164 hermetic fallback regression
+
+on:
+  push:
+    branches: [codex/issue-164-hermetic-fallback]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  hermetic-fallback:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install capnproto
+        run: sudo apt-get update && sudo apt-get install -y capnproto
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: issue-164-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: issue-164-${{ runner.os }}-
+      - name: Check focused whitespace
+        run: git diff --check
+      - name: Check library and test targets
+        run: cargo check --lib --tests
+      - name: Run exact hermetic fallback regression
+        run: >-
+          cargo test --lib
+          cli::repl::disabled_training_tests::fallback_repl_completion_does_not_mutate_legacy_conversation_or_training_logs
+          -- --exact --nocapture
+      - name: Run relevant tests in normal-parallel mode
+        run: >-
+          timeout 900 cargo test --lib
+          cli::repl::disabled_training_tests
+          -- --test-threads=8
