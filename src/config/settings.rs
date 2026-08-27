@@ -1004,6 +1004,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_legacy_coreml_provider_reloads_with_compatible_default_policy() {
+        use crate::config::ExecutionTarget;
+
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         std::fs::write(
