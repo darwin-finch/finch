@@ -69,8 +69,9 @@ finch --exec path/to/file      execute a typed Finch script
 ```
 
 Run `finch --help` and `finch <command> --help` for the full generated CLI reference. In the REPL,
-`/help` shows the slash commands present in that build. `/provider` is the canonical provider
-selector; `/model` and `/teacher` remain compatibility aliases.
+`/help` shows the slash commands present in that build. `/model`, `/provider`, and `/teacher`
+currently reach the same profile selector; generated help emphasizes `/model` while retaining the
+other spellings for compatibility.
 
 ### Tools and approval
 

@@ -25,7 +25,9 @@ Explicit feedback is retained privately in `~/.finch/feedback.jsonl` without
 triggering training. Existing legacy training queues and adapters are left
 untouched.
 
-**Supported `type` values:** `claude`, `openai`, `grok`, `gemini`, `mistral`, `groq`, `local`
+**Configured `type` values:** `claude`, `openai`, `grok`, `gemini`, `mistral`, `groq`, `ollama`,
+`remote_daemon`, and `local`. The legacy `chatgpt_subscription` value still deserializes only to
+produce migration guidance and is rejected before provider construction.
 
 **Backwards-compatible:** Old `[[teachers]]` format still loads correctly; auto-rewritten to `[[providers]]` on next save.
 

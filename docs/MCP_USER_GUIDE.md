@@ -454,7 +454,7 @@ npm install -g @modelcontextprotocol/server-brave-search
    source ~/.zshrc
    ```
 
-5. **Check Shammah logs**:
+5. **Check Finch logs**:
    ```bash
    # Look for MCP-related errors
    finch 2>&1 | grep -i mcp
@@ -471,7 +471,7 @@ npm install -g @modelcontextprotocol/server-brave-search
    > /mcp refresh
    ```
 
-2. **Restart Shammah**:
+2. **Restart Finch**:
    ```bash
    # Exit
    > /quit
@@ -502,7 +502,7 @@ npm install -g @modelcontextprotocol/server-brave-search
    - Verify AI is passing correct JSON structure
 
 3. **Server crashed**:
-   - Restart Shammah to reconnect
+   - Restart Finch to reconnect
    - Check if server command still works: `which npx`
    - Look for stderr output in terminal
 
@@ -633,7 +633,7 @@ finch 2>&1 | grep -i "mcp\|jsonrpc"
 - **MCP Specification**: https://modelcontextprotocol.io/specification/2026-07-28/
 - **Official Server List**: https://github.com/modelcontextprotocol/servers
 - **JSON-RPC 2.0 Spec**: https://www.jsonrpc.org/specification
-- **Shammah Documentation**: `docs/` folder in repository
+- **Finch documentation map**: [`README.md`](README.md)
 
 ## Getting Help
 

@@ -30,6 +30,7 @@ CURRENT_DOCS = (
 # These are precise remnants of superseded public copy, rather than broad words
 # that can legitimately appear in a limitation or migration note.
 STALE_CLAIMS = {
+    r"\bShammah\b(?!\s+Chancellor)": "obsolete product name",
     r"<100ms startup": "unverified startup metric",
     r"near-zero marginal cost": "unverified cost claim",
     r"Grok is the fastest free option": "unverified provider recommendation",
@@ -40,6 +41,13 @@ STALE_CLAIMS = {
         "stale installer path"
     ),
     r"gpt-5\.6": "unverified model claim",
+    r"model\s*=\s*\"(?:gpt|claude|grok|gemini|mistral|qwen|llama|phi|deepseek)[^\"]*\"": (
+        "fixed provider model string"
+    ),
+    r"finch daemon --bind 127\.0\.0\.1:11435": "background port assigned to foreground daemon",
+    r"finch daemon-start(?: --bind)? 127\.0\.0\.1:8000": (
+        "foreground port assigned to background daemon"
+    ),
 }
 
 LINK_RE = re.compile(r"(?<!!)\[[^\]]*\]\(([^)]+)\)")

@@ -223,7 +223,8 @@ artifacts exist; release and installer reliability are tracked in Issues #119 an
 **Platform notes:**
 - Intel macOS: **not supported** (`ort` has no prebuilt binaries; GitHub deprecated Intel Mac runners Jun 2025)
 - Linux: must be `ubuntu-24.04`+ (requires glibc 2.38+)
-- macOS-only deps in `Cargo.toml` must appear **before** the `[target.'cfg(target_os = "macos")'.dependencies]` header
+- macOS-only dependencies belong **after** the `[target.'cfg(target_os = "macos")'.dependencies]`
+  header so they remain target-scoped
 
 ## Current Project Status
 
