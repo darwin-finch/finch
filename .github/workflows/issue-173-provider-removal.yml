@@ -54,17 +54,23 @@ jobs:
           key: issue-173-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
 
       - name: Check scoped formatting
-        run: >-
-          rustfmt --edition 2021 --check
-          src/agent/mod.rs
-          src/cli/setup_wizard.rs
-          src/config/provider.rs
-          src/config/settings.rs
-          src/main.rs
-          src/providers/factory.rs
-          src/providers/mod.rs
-          src/providers/types.rs
-          tests/no_external_provider_binary_test.rs
+        run: |
+          rustfmt --edition 2021 --check \
+            src/agent/mod.rs \
+            src/cli/setup_wizard.rs \
+            src/config/provider.rs \
+            src/config/settings.rs \
+            src/main.rs \
+            src/providers/factory.rs \
+            src/providers/mod.rs \
+            src/providers/types.rs \
+            tests/no_external_provider_binary_test.rs
+          # This file is byte-identical to the issue base. It has unrelated
+          # pre-existing rustfmt drift, so tolerate rustfmt failure only while
+          # its exact base blob remains unchanged.
+          rustfmt --edition 2021 --check src/cli/repl_event/event_loop.rs || \
+            test "$(git hash-object src/cli/repl_event/event_loop.rs)" = \
+              "07ae3a6ebb97c1b1730d60e444cd91d99ebbfe77"
 
       - name: Check all targets
         run: cargo check --all-targets

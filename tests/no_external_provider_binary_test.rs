@@ -1,32 +1,63 @@
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Command, Output, Stdio};
+use std::os::unix::process::CommandExt;
+use std::process::{Command, ExitStatus, Stdio};
 
 struct BoundedOutput {
-    output: Output,
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
     timed_out: bool,
 }
 
 fn run_bounded(mut command: Command) -> BoundedOutput {
+    run_bounded_with_timeout(&mut command, std::time::Duration::from_secs(5))
+}
+
+fn run_bounded_with_timeout(command: &mut Command, timeout: std::time::Duration) -> BoundedOutput {
+    let output_directory = tempfile::tempdir().unwrap();
+    let stdout_path = output_directory.path().join("stdout");
+    let stderr_path = output_directory.path().join("stderr");
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::from(std::fs::File::create(&stdout_path).unwrap()))
+        .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
+        .process_group(0);
     let mut child = command.spawn().unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let timed_out = loop {
-        if child.try_wait().unwrap().is_some() {
-            break false;
+    let process_group = nix::unistd::Pid::from_raw(-(child.id() as i32));
+    let deadline = std::time::Instant::now() + timeout;
+    let (mut status, timed_out) = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break (Some(status), false);
         }
         if std::time::Instant::now() >= deadline {
+            let _ = nix::sys::signal::kill(process_group, nix::sys::signal::Signal::SIGKILL);
             let _ = child.kill();
-            break true;
+            break (None, true);
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    let output = child.wait_with_output().unwrap();
-    BoundedOutput { output, timed_out }
+
+    // Kill any descendants still sharing the group even if the direct child
+    // exited first, then reap the direct child without an unbounded wait.
+    let _ = nix::sys::signal::kill(process_group, nix::sys::signal::Signal::SIGKILL);
+    let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while status.is_none() && std::time::Instant::now() < reap_deadline {
+        status = child.try_wait().unwrap();
+        if status.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    let status = status.expect("bounded child did not exit after its process group was killed");
+    let stdout = std::fs::read(stdout_path).unwrap();
+    let stderr = std::fs::read(stderr_path).unwrap();
+    BoundedOutput {
+        status,
+        stdout,
+        stderr,
+        timed_out,
+    }
 }
 
 fn assert_codex_was_not_executed(marker: &std::path::Path, boundary: &str) {
@@ -44,6 +75,18 @@ fn assert_no_connection(listener: &std::net::TcpListener, boundary: &str) {
         ),
         "unexpected external connection during {boundary}"
     );
+}
+
+#[test]
+fn test_bounded_runner_kills_descendant_retaining_output() {
+    let started = std::time::Instant::now();
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "(sleep 60) & printf ready; wait"]);
+    let result = run_bounded_with_timeout(&mut command, std::time::Duration::from_millis(200));
+
+    assert!(result.timed_out);
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    assert_eq!(result.stdout, b"ready");
 }
 
 #[test]
@@ -115,8 +158,8 @@ prefer_local = true
     request.args(["--cloud-only", "query", "do not execute providers"]);
     let request = run_bounded(request);
     assert!(!request.timed_out, "query boundary did not terminate");
-    assert!(!request.output.status.success());
-    let stderr = String::from_utf8_lossy(&request.output.stderr);
+    assert!(!request.status.success());
+    let stderr = String::from_utf8_lossy(&request.stderr);
     assert!(
         stderr.contains("Legacy chatgpt_subscription profiles are unsupported"),
         "{stderr}"
@@ -133,7 +176,7 @@ prefer_local = true
     auth.args(["auth", "status", "chatgpt"]);
     let auth = run_bounded(auth);
     assert!(!auth.timed_out, "removed auth command did not terminate");
-    assert!(!auth.output.status.success());
+    assert!(!auth.status.success());
     assert_codex_was_not_executed(&marker, "removed auth command");
     assert_no_connection(&provider_listener, "removed auth command");
     assert_no_connection(&daemon_listener, "removed auth command");
