@@ -57,6 +57,27 @@ fn try_load_from_finch_config() -> Result<Option<Config>> {
 }
 
 pub(crate) fn load_config_from_path(config_path: &std::path::Path) -> Result<Config> {
+    load_config_from_path_with_factory(config_path, Config::with_providers)
+}
+
+#[cfg(test)]
+pub(crate) fn load_config_from_path_with_paths(
+    config_path: &std::path::Path,
+    metrics_dir: std::path::PathBuf,
+    constitution_path: Option<std::path::PathBuf>,
+) -> Result<Config> {
+    load_config_from_path_with_factory(config_path, move |providers| {
+        Config::with_providers_and_paths(providers, metrics_dir, constitution_path)
+    })
+}
+
+fn load_config_from_path_with_factory<F>(
+    config_path: &std::path::Path,
+    config_factory: F,
+) -> Result<Config>
+where
+    F: FnOnce(Vec<ProviderEntry>) -> Config,
+{
     use super::backend::BackendConfig;
     use super::colors::ColorScheme;
     use super::settings::{ClientConfig, FeaturesConfig, ServerConfig, TeacherEntry};
@@ -134,7 +155,7 @@ pub(crate) fn load_config_from_path(config_path: &std::path::Path) -> Result<Con
         bail!("Config has no providers configured. Please run 'finch setup' to configure.");
     }
 
-    let mut config = Config::with_providers(providers);
+    let mut config = config_factory(providers);
 
     // Apply scalar overrides
     if let Some(features) = toml_config.features {
@@ -183,5 +204,44 @@ pub(crate) fn load_config_from_path(config_path: &std::path::Path) -> Result<Con
 
 #[cfg(test)]
 mod tests {
-    // Config loading tests rely on filesystem state; see integration tests.
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn test_explicit_config_path_loader_bypasses_default_resolver() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let metrics_dir = directory.path().join("metrics");
+        let resolver_calls = Cell::new(0);
+        let source = Config::with_providers_and_paths(
+            vec![ProviderEntry::Claude {
+                api_key: String::new(),
+                model: None,
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: Some("claude".to_string()),
+            }],
+            metrics_dir.clone(),
+            None,
+        );
+        source.save_to(&config_path).unwrap();
+
+        let loaded = load_config_from_path_with_factory(&config_path, |providers| {
+            Config::with_providers_and_paths_using_resolver(
+                providers,
+                metrics_dir.clone(),
+                None,
+                || {
+                    resolver_calls.set(resolver_calls.get() + 1);
+                    panic!("explicit config loader must bypass ambient default resolution");
+                },
+            )
+        })
+        .unwrap();
+
+        assert_eq!(resolver_calls.get(), 0);
+        assert_eq!(loaded.metrics_dir, metrics_dir);
+        assert_eq!(loaded.constitution_path, None);
+    }
 }

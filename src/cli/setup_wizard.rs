@@ -7551,6 +7551,9 @@ for line in sys.stdin:
         let directory = tempfile::tempdir().unwrap();
         let config_path = directory.path().join("config.toml");
         let cache_dir = directory.path().join("model-catalog-cache");
+        let metrics_dir = directory.path().join("metrics");
+        let constitution_path = directory.path().join("constitution.md");
+        std::fs::write(&constitution_path, "test-only constitution").unwrap();
         let openai_idx = CLOUD_PROVIDERS
             .iter()
             .position(|(id, ..)| *id == "openai")
@@ -7573,11 +7576,18 @@ for line in sys.stdin:
         let first_save = build_setup_result(&state).unwrap();
         let config = config_from_setup_result_with_paths(
             &first_save,
-            directory.path().join("metrics"),
-            None,
+            metrics_dir.clone(),
+            Some(constitution_path.clone()),
         );
         config.save_to(&config_path).unwrap();
-        let loaded = crate::config::load_config_from_path(&config_path).unwrap();
+        let loaded = crate::config::load_config_from_path_with_paths(
+            &config_path,
+            metrics_dir.clone(),
+            Some(constitution_path.clone()),
+        )
+        .unwrap();
+        assert_eq!(loaded.metrics_dir, metrics_dir);
+        assert_eq!(loaded.constitution_path, Some(constitution_path.clone()));
         assert!(matches!(
             loaded.providers.first(),
             Some(ProviderEntry::Openai { model: Some(model), .. }) if model == manual_model
@@ -7628,10 +7638,21 @@ for line in sys.stdin:
 
         handle_models_input(&mut reopened, key(KeyCode::Enter)).unwrap();
         let second_save = build_setup_result(&reopened).unwrap();
-        config_from_setup_result_with_paths(&second_save, directory.path().join("metrics"), None)
-            .save_to(&config_path)
-            .unwrap();
-        let reloaded = crate::config::load_config_from_path(&config_path).unwrap();
+        config_from_setup_result_with_paths(
+            &second_save,
+            metrics_dir.clone(),
+            Some(constitution_path.clone()),
+        )
+        .save_to(&config_path)
+        .unwrap();
+        let reloaded = crate::config::load_config_from_path_with_paths(
+            &config_path,
+            metrics_dir.clone(),
+            Some(constitution_path.clone()),
+        )
+        .unwrap();
+        assert_eq!(reloaded.metrics_dir, metrics_dir);
+        assert_eq!(reloaded.constitution_path, Some(constitution_path));
         assert!(matches!(
             reloaded.providers.first(),
             Some(ProviderEntry::Openai { model: Some(model), .. }) if model == manual_model

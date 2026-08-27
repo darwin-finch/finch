@@ -513,6 +513,21 @@ impl ProviderEntry {
     }
 }
 
+pub(crate) struct ConfigPaths {
+    metrics_dir: PathBuf,
+    constitution_path: Option<PathBuf>,
+}
+
+fn resolve_default_config_paths() -> ConfigPaths {
+    let home = dirs::home_dir().expect("Could not determine home directory");
+    let constitution_path = home.join(".finch/constitution.md");
+    let constitution_path = constitution_path.exists().then_some(constitution_path);
+    ConfigPaths {
+        metrics_dir: home.join(".finch/metrics"),
+        constitution_path,
+    }
+}
+
 impl Config {
     /// Validate configuration and return helpful errors
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -670,10 +685,7 @@ impl Config {
     /// Automatically derives the legacy `teachers` and `backend` fields so
     /// existing code continues to work without changes.
     pub fn with_providers(providers: Vec<ProviderEntry>) -> Self {
-        let home = dirs::home_dir().expect("Could not determine home directory");
-        let constitution_path = home.join(".finch/constitution.md");
-        let constitution_path = constitution_path.exists().then_some(constitution_path);
-        Self::with_providers_and_paths(providers, home.join(".finch/metrics"), constitution_path)
+        Self::with_providers_from_paths_or_else(providers, None, resolve_default_config_paths)
     }
 
     /// Construct from providers with every filesystem path supplied explicitly.
@@ -685,6 +697,42 @@ impl Config {
         metrics_dir: PathBuf,
         constitution_path: Option<PathBuf>,
     ) -> Self {
+        Self::with_providers_and_paths_using_resolver(
+            providers,
+            metrics_dir,
+            constitution_path,
+            resolve_default_config_paths,
+        )
+    }
+
+    pub(crate) fn with_providers_and_paths_using_resolver<F>(
+        providers: Vec<ProviderEntry>,
+        metrics_dir: PathBuf,
+        constitution_path: Option<PathBuf>,
+        resolve_default_paths: F,
+    ) -> Self
+    where
+        F: FnOnce() -> ConfigPaths,
+    {
+        Self::with_providers_from_paths_or_else(
+            providers,
+            Some(ConfigPaths {
+                metrics_dir,
+                constitution_path,
+            }),
+            resolve_default_paths,
+        )
+    }
+
+    fn with_providers_from_paths_or_else<F>(
+        providers: Vec<ProviderEntry>,
+        paths: Option<ConfigPaths>,
+        resolve_default_paths: F,
+    ) -> Self
+    where
+        F: FnOnce() -> ConfigPaths,
+    {
+        let paths = paths.unwrap_or_else(resolve_default_paths);
         let teachers: Vec<TeacherEntry> = providers
             .iter()
             .filter_map(ProviderEntry::to_teacher_entry)
@@ -696,7 +744,13 @@ impl Config {
                 enabled: false,
                 ..BackendConfig::default()
             });
-        Self::new_with_all_and_paths(teachers, backend, providers, metrics_dir, constitution_path)
+        Self::new_with_all_and_paths(
+            teachers,
+            backend,
+            providers,
+            paths.metrics_dir,
+            paths.constitution_path,
+        )
     }
 
     #[allow(deprecated)]
@@ -705,22 +759,14 @@ impl Config {
         backend: BackendConfig,
         providers: Vec<ProviderEntry>,
     ) -> Self {
-        let home = dirs::home_dir().expect("Could not determine home directory");
-
-        // Look for constitution in ~/.finch/constitution.md
-        let constitution_path = home.join(".finch/constitution.md");
-        let constitution_path = if constitution_path.exists() {
-            Some(constitution_path)
-        } else {
-            None
-        };
+        let paths = resolve_default_config_paths();
 
         Self::new_with_all_and_paths(
             teachers,
             backend,
             providers,
-            home.join(".finch/metrics"),
-            constitution_path,
+            paths.metrics_dir,
+            paths.constitution_path,
         )
     }
 
@@ -1014,19 +1060,27 @@ mod tests {
     }
 
     #[test]
-    fn test_with_providers_and_paths_does_not_probe_or_replace_explicit_paths() {
+    fn test_explicit_config_paths_bypass_default_resolver() {
+        use std::cell::Cell;
+
         let directory = tempfile::tempdir().unwrap();
         let metrics_dir = directory.path().join("metrics-not-created");
         let constitution_path = directory.path().join("constitution-not-created.md");
+        let resolver_calls = Cell::new(0);
         assert!(!metrics_dir.exists());
         assert!(!constitution_path.exists());
 
-        let config = Config::with_providers_and_paths(
+        let config = Config::with_providers_and_paths_using_resolver(
             vec![],
             metrics_dir.clone(),
             Some(constitution_path.clone()),
+            || {
+                resolver_calls.set(resolver_calls.get() + 1);
+                panic!("explicit config paths must bypass ambient default resolution");
+            },
         );
 
+        assert_eq!(resolver_calls.get(), 0);
         assert_eq!(config.metrics_dir, metrics_dir);
         assert_eq!(config.constitution_path, Some(constitution_path));
     }

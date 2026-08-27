@@ -47,7 +47,7 @@ jobs:
           key: issue-104-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Check scoped formatting
-        run: rustfmt --edition 2021 --check src/cli/setup_wizard.rs src/config/settings.rs src/providers/model_catalog.rs
+        run: rustfmt --edition 2021 --check src/cli/setup_wizard.rs src/config/loader.rs src/config/settings.rs src/providers/model_catalog.rs
 
       - name: Check library, binaries, and tests
         run: cargo check --lib --bins --tests
@@ -58,5 +58,5 @@ jobs:
       - name: Run setup wizard regressions
         run: cargo test --lib setup_wizard -- --nocapture
 
-      - name: Run explicit config path regression
-        run: cargo test --lib test_with_providers_and_paths_does_not_probe_or_replace_explicit_paths -- --nocapture
+      - name: Run explicit config path regressions
+        run: cargo test --lib explicit_config_path -- --nocapture
