@@ -1373,14 +1373,30 @@ fn prepare_canonical_commit(stdout: &mut impl Write) -> Result<()> {
     // Previously committed rows are already in native history. Remove their
     // visible projection before the linefeed spool so a later commit cannot
     // append that projection to history a second time.
+    let mut staged = Vec::new();
     execute!(
-        stdout,
+        staged,
         BeginSynchronizedUpdate,
         cursor::MoveTo(0, 0),
         Clear(ClearType::All),
         cursor::MoveTo(0, 0)
     )?;
+    stdout.write_all(&staged)?;
+    stdout.flush()?;
     Ok(())
+}
+
+fn prepare_canonical_commit_guarded(stdout: &mut impl Write) -> Result<()> {
+    match prepare_canonical_commit(stdout) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // BeginSynchronizedUpdate is the first command in preparation. A
+            // later partial-write failure must never leave terminal updates
+            // suppressed indefinitely.
+            let _ = execute!(stdout, EndSynchronizedUpdate);
+            Err(error)
+        }
+    }
 }
 
 // ─── Live area management ─────────────────────────────────────────────────────
@@ -2095,7 +2111,7 @@ impl TuiRenderer {
 
         if !to_commit.is_empty() {
             let mut stdout = io::stdout();
-            prepare_canonical_commit(&mut stdout)?;
+            prepare_canonical_commit_guarded(&mut stdout)?;
             self.active_rows = 0;
             self.cursor_row_from_top = 0;
             let commit_result = commit_complete_messages(
@@ -4211,6 +4227,39 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn canonical_prepare_flush_error_closes_synchronized_update() {
+        struct FirstFlushFails {
+            bytes: Vec<u8>,
+            flushes: usize,
+        }
+
+        impl Write for FirstFlushFails {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushes += 1;
+                if self.flushes == 1 {
+                    return Err(io::Error::other("ambiguous prepare flush failure"));
+                }
+                Ok(())
+            }
+        }
+
+        let mut output = FirstFlushFails {
+            bytes: Vec::new(),
+            flushes: 0,
+        };
+        assert!(prepare_canonical_commit_guarded(&mut output).is_err());
+
+        let raw = String::from_utf8(output.bytes).unwrap();
+        assert_eq!(raw.matches("\x1b[?2026h").count(), 1);
+        assert_eq!(raw.matches("\x1b[?2026l").count(), 1);
     }
 
     #[test]
