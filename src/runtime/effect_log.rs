@@ -3,6 +3,7 @@
 use crate::runtime::VmEffectEnvelope;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -17,6 +18,11 @@ pub const MAX_EFFECT_AUDIT_INTENT_BYTES: usize = 256 * 1024;
 pub const MAX_EFFECT_AUDIT_OUTCOME_BYTES: usize = 64 * 1024;
 /// Maximum number of non-terminal effects owned by one named-Brain run.
 pub const MAX_ACTIVE_EFFECT_AUDITS_PER_RUN: usize = 64;
+/// Brain-wide unresolved admission bound across concurrent runs.
+pub const MAX_ACTIVE_EFFECT_AUDITS_PER_BRAIN: usize = 256;
+/// Brain-wide bound for canonical pre-redaction effect payloads represented
+/// by unresolved reservations.
+pub const MAX_ACTIVE_EFFECT_AUDIT_BYTES_PER_BRAIN: usize = 16 * 1024 * 1024;
 
 /// Complete immutable identity of one named-Brain host effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -42,7 +48,44 @@ pub struct EffectAuditAuthority {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EffectAuditIntent {
     pub identity: EffectAuditIdentity,
-    pub effect: crate::vm::VmSideEffect,
+    pub capability: crate::vm::CapabilityKind,
+    pub selector: crate::vm::ResourceSelector,
+    pub output: Vec<crate::vm::Type>,
+    pub effect_kind: String,
+    pub payload_bytes: usize,
+    pub canonical_sha256: String,
+}
+
+impl EffectAuditIntent {
+    pub fn from_effect(
+        identity: EffectAuditIdentity,
+        effect: &crate::vm::VmSideEffect,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            identity.effect_sequence == effect.sequence,
+            "effect audit identity sequence does not match its effect"
+        );
+        let canonical = serde_json::to_vec(effect)?;
+        anyhow::ensure!(
+            canonical.len() <= MAX_EFFECT_AUDIT_INTENT_BYTES,
+            "effect audit intent exceeds the bounded payload limit"
+        );
+        let effect_kind = match &effect.event {
+            crate::vm::HostSideEffect::Emit { .. } => "emit",
+            crate::vm::HostSideEffect::Ui { .. } => "ui",
+            crate::vm::HostSideEffect::Request { .. } => "request",
+        }
+        .to_string();
+        Ok(Self {
+            identity,
+            capability: effect.requirement.capability.clone(),
+            selector: effect.requirement.selector.clone(),
+            output: effect.output.clone(),
+            effect_kind,
+            payload_bytes: canonical.len(),
+            canonical_sha256: hex::encode(Sha256::digest(canonical)),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,6 +102,12 @@ pub enum EffectAuditTerminalOutcome {
     },
     AbandonedNotApplied,
     UncertainProcessLoss,
+    /// Bounded durable replay fence replacing an older terminal payload.
+    /// The digest covers the complete canonical typed terminal outcome.
+    Compacted {
+        outcome_kind: String,
+        canonical_sha256: String,
+    },
     /// Read-only projection of a schema-v14 `EffectRecorded` event. New
     /// writers never emit this variant.
     LegacyV14Snapshot {
@@ -164,13 +213,43 @@ impl EffectAuditReducer {
             .count()
     }
 
+    pub fn active_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| !entry.state.is_terminal())
+            .count()
+    }
+
+    pub fn active_bytes(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| !entry.state.is_terminal())
+            .map(|entry| entry.intent.payload_bytes)
+            .sum()
+    }
+
     /// Forget a terminal projection after its complete transition history has
     /// been durably removed from the canonical Brain journal. Unresolved
     /// write-ahead state is never eligible for retention compaction.
-    pub(crate) fn remove_terminal(&mut self, identity: &EffectAuditIdentity) -> Result<()> {
-        let entry = self.entries.get(identity).context("effect audit does not exist")?;
-        anyhow::ensure!(entry.state.is_terminal(), "unresolved effect audit cannot be compacted");
-        self.entries.remove(identity);
+    pub(crate) fn compact_terminal(&mut self, identity: &EffectAuditIdentity) -> Result<()> {
+        let entry = self
+            .entries
+            .get_mut(identity)
+            .context("effect audit does not exist")?;
+        let EffectAuditState::Terminal { outcome } = &entry.state else {
+            bail!("unresolved effect audit cannot be compacted");
+        };
+        if matches!(outcome, EffectAuditTerminalOutcome::Compacted { .. }) {
+            return Ok(());
+        }
+        let canonical_sha256 = terminal_outcome_sha256(outcome)?;
+        let outcome_kind = terminal_outcome_kind(outcome).to_string();
+        entry.state = EffectAuditState::Terminal {
+            outcome: EffectAuditTerminalOutcome::Compacted {
+                outcome_kind,
+                canonical_sha256,
+            },
+        };
         Ok(())
     }
 
@@ -182,8 +261,17 @@ impl EffectAuditReducer {
             EffectAuditTransition::Reserve { intent, authority } => {
                 anyhow::ensure!(intent.identity == identity, "effect audit identity changed");
                 anyhow::ensure!(
-                    serde_json::to_vec(&intent)?.len() <= MAX_EFFECT_AUDIT_INTENT_BYTES,
+                    intent.payload_bytes <= MAX_EFFECT_AUDIT_INTENT_BYTES,
                     "effect audit intent exceeds the bounded payload limit"
+                );
+                anyhow::ensure!(
+                    intent.payload_bytes > 0
+                        && intent.canonical_sha256.len() == 64
+                        && intent
+                            .canonical_sha256
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit()),
+                    "effect audit intent digest metadata is invalid"
                 );
                 if let Some(existing) = self.entries.get(&identity) {
                     anyhow::ensure!(
@@ -196,6 +284,15 @@ impl EffectAuditReducer {
                     self.active_for_run(identity.run_id) < MAX_ACTIVE_EFFECT_AUDITS_PER_RUN,
                     "effect audit active-intent quota exceeded for run {}",
                     identity.run_id
+                );
+                anyhow::ensure!(
+                    self.active_count() < MAX_ACTIVE_EFFECT_AUDITS_PER_BRAIN,
+                    "effect audit Brain-wide active-intent quota exceeded"
+                );
+                anyhow::ensure!(
+                    self.active_bytes().saturating_add(intent.payload_bytes)
+                        <= MAX_ACTIVE_EFFECT_AUDIT_BYTES_PER_BRAIN,
+                    "effect audit Brain-wide active-byte quota exceeded"
                 );
                 self.entries.insert(
                     identity,
@@ -254,6 +351,7 @@ impl EffectAuditReducer {
                                 outcome,
                                 EffectAuditTerminalOutcome::NotApplied { .. }
                                     | EffectAuditTerminalOutcome::AbandonedNotApplied
+                                    | EffectAuditTerminalOutcome::Compacted { .. }
                                     | EffectAuditTerminalOutcome::LegacyV14Snapshot { .. }
                             ),
                             "a host outcome cannot be recorded before durable begin"
@@ -266,15 +364,46 @@ impl EffectAuditReducer {
                         Ok(true)
                     }
                     EffectAuditState::Terminal { outcome: existing } => {
-                        anyhow::ensure!(
-                            existing == &outcome,
-                            "conflicting terminal effect audit outcome"
-                        );
+                        let matches = match existing {
+                            EffectAuditTerminalOutcome::Compacted {
+                                canonical_sha256, ..
+                            } => canonical_sha256 == &terminal_outcome_sha256(&outcome)?,
+                            _ => existing == &outcome,
+                        };
+                        anyhow::ensure!(matches, "conflicting terminal effect audit outcome");
                         Ok(false)
                     }
                 }
             }
         }
+    }
+}
+
+fn terminal_outcome_sha256(outcome: &EffectAuditTerminalOutcome) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(outcome)?)))
+}
+
+pub(crate) fn compacted_terminal_outcome(
+    outcome: &EffectAuditTerminalOutcome,
+) -> Result<EffectAuditTerminalOutcome> {
+    if let EffectAuditTerminalOutcome::Compacted { .. } = outcome {
+        return Ok(outcome.clone());
+    }
+    Ok(EffectAuditTerminalOutcome::Compacted {
+        outcome_kind: terminal_outcome_kind(outcome).to_string(),
+        canonical_sha256: terminal_outcome_sha256(outcome)?,
+    })
+}
+
+fn terminal_outcome_kind(outcome: &EffectAuditTerminalOutcome) -> &'static str {
+    match outcome {
+        EffectAuditTerminalOutcome::Acknowledged { .. } => "acknowledged",
+        EffectAuditTerminalOutcome::NotApplied { .. } => "not_applied",
+        EffectAuditTerminalOutcome::FailedPartial { .. } => "failed_partial",
+        EffectAuditTerminalOutcome::AbandonedNotApplied => "abandoned_not_applied",
+        EffectAuditTerminalOutcome::UncertainProcessLoss => "uncertain_process_loss",
+        EffectAuditTerminalOutcome::Compacted { .. } => "compacted",
+        EffectAuditTerminalOutcome::LegacyV14Snapshot { .. } => "legacy_v14_snapshot",
     }
 }
 
@@ -524,10 +653,11 @@ mod tests {
             effect_sequence: 2,
         };
         (
-            EffectAuditIntent {
+            EffectAuditIntent::from_effect(
                 identity,
-                effect: effect(identity.execution_id, identity.effect_sequence, "audit").effect,
-            },
+                &effect(identity.execution_id, identity.effect_sequence, "audit").effect,
+            )
+            .unwrap(),
             EffectAuditAuthority {
                 authority_id: Uuid::new_v4(),
                 runner_lease_id: Uuid::new_v4(),
@@ -550,7 +680,7 @@ mod tests {
         assert!(!reducer.apply(reserve).unwrap());
 
         let mut changed = intent.clone();
-        changed.effect.origin = SourceOrigin::generated("forged");
+        changed.canonical_sha256 = "forged".into();
         assert!(reducer
             .apply(EffectAuditTransition::Reserve {
                 intent: changed,
@@ -635,21 +765,83 @@ mod tests {
             let mut intent = template.clone();
             intent.identity.execution_id = Uuid::new_v4();
             intent.identity.effect_sequence = sequence as u64;
-            intent.effect.sequence = sequence as u64;
-            reducer.apply(EffectAuditTransition::Reserve {
-                intent,
-                authority: authority.clone(),
-            }).unwrap();
+            intent.canonical_sha256 = format!("{sequence:064x}");
+            reducer
+                .apply(EffectAuditTransition::Reserve {
+                    intent,
+                    authority: authority.clone(),
+                })
+                .unwrap();
         }
         let mut overflow = template;
         overflow.identity.execution_id = Uuid::new_v4();
         overflow.identity.effect_sequence = 100;
-        overflow.effect.sequence = 100;
-        let error = reducer.apply(EffectAuditTransition::Reserve {
-            intent: overflow,
-            authority,
-        }).unwrap_err();
+        overflow.canonical_sha256 = format!("{:064x}", 100);
+        let error = reducer
+            .apply(EffectAuditTransition::Reserve {
+                intent: overflow,
+                authority,
+            })
+            .unwrap_err();
         assert!(error.to_string().contains("quota exceeded"));
+    }
+
+    #[test]
+    fn audit_reducer_enforces_brain_wide_count_and_byte_admission() {
+        let (template, authority) = audit_fixture();
+        let mut count_limited = EffectAuditReducer::default();
+        for index in 0..MAX_ACTIVE_EFFECT_AUDITS_PER_BRAIN {
+            let mut intent = template.clone();
+            intent.identity.run_id = Uuid::new_v4();
+            intent.identity.execution_id = Uuid::new_v4();
+            intent.canonical_sha256 = format!("{index:064x}");
+            intent.payload_bytes = 1;
+            count_limited
+                .apply(EffectAuditTransition::Reserve {
+                    intent,
+                    authority: authority.clone(),
+                })
+                .unwrap();
+        }
+        let mut count_overflow = template.clone();
+        count_overflow.identity.run_id = Uuid::new_v4();
+        count_overflow.identity.execution_id = Uuid::new_v4();
+        assert!(count_limited
+            .apply(EffectAuditTransition::Reserve {
+                intent: count_overflow,
+                authority: authority.clone(),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("Brain-wide active-intent"));
+
+        let mut byte_limited = EffectAuditReducer::default();
+        let admitted = MAX_ACTIVE_EFFECT_AUDIT_BYTES_PER_BRAIN / MAX_EFFECT_AUDIT_INTENT_BYTES;
+        for index in 0..admitted {
+            let mut intent = template.clone();
+            intent.identity.run_id = Uuid::new_v4();
+            intent.identity.execution_id = Uuid::new_v4();
+            intent.canonical_sha256 = format!("{index:064x}");
+            intent.payload_bytes = MAX_EFFECT_AUDIT_INTENT_BYTES;
+            byte_limited
+                .apply(EffectAuditTransition::Reserve {
+                    intent,
+                    authority: authority.clone(),
+                })
+                .unwrap();
+        }
+        let mut byte_overflow = template;
+        byte_overflow.identity.run_id = Uuid::new_v4();
+        byte_overflow.identity.execution_id = Uuid::new_v4();
+        byte_overflow.payload_bytes = 1;
+        assert!(byte_limited
+            .apply(EffectAuditTransition::Reserve {
+                intent: byte_overflow,
+                authority,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("Brain-wide active-byte"));
     }
 
     #[test]

@@ -1011,9 +1011,9 @@ impl BrainState {
                 };
                 self.effect_audits.apply(
                     crate::runtime::effect_log::EffectAuditTransition::Reserve {
-                        intent: crate::runtime::effect_log::EffectAuditIntent {
-                            identity, effect: effect.clone(),
-                        },
+                        intent: crate::runtime::effect_log::EffectAuditIntent::from_effect(
+                            identity, effect,
+                        ).expect("legacy effect audit payload must be bounded"),
                         authority: authority.clone(),
                     },
                 ).expect("legacy effect reservation must project");
@@ -1579,6 +1579,24 @@ impl BrainStore {
         &self,
         grant: &EffectAuditAuthorityGrant,
     ) -> Result<usize> {
+        self.terminalize_effect_audit_authority(grant, true)
+    }
+
+    /// A normally returned runner can prove that accepted-but-unbegun
+    /// reservations were never dispatched. Begun effects retain their
+    /// detached permit so one late authoritative completion may still land.
+    pub(crate) fn abandon_unbegun_effect_audits(
+        &self,
+        grant: &EffectAuditAuthorityGrant,
+    ) -> Result<usize> {
+        self.terminalize_effect_audit_authority(grant, false)
+    }
+
+    fn terminalize_effect_audit_authority(
+        &self,
+        grant: &EffectAuditAuthorityGrant,
+        process_lost: bool,
+    ) -> Result<usize> {
         let name = Self::validate_name(&grant.brain)?;
         self.ensure_loaded(name)?;
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
@@ -1591,25 +1609,21 @@ impl BrainStore {
                         entry.intent.identity,
                         crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied,
                     )),
-                    crate::runtime::effect_log::EffectAuditState::AwaitingHostResult => Some((
-                        entry.intent.identity,
-                        crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss,
-                    )),
+                    crate::runtime::effect_log::EffectAuditState::AwaitingHostResult
+                        if process_lost => Some((entry.intent.identity,
+                            crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss)),
+                    crate::runtime::effect_log::EffectAuditState::AwaitingHostResult => None,
                     crate::runtime::effect_log::EffectAuditState::Terminal { .. } => None,
                 })
                 .flatten()
         }).collect::<Vec<_>>();
-        for (identity, outcome) in &unresolved {
-            self.append_effect_audit_transition_locked(
-                name,
-                state,
-                crate::runtime::effect_log::EffectAuditTransition::Finish {
+        let transitions = unresolved.iter().map(|(identity, outcome)|
+            crate::runtime::effect_log::EffectAuditTransition::Finish {
                     identity: *identity,
                     authority_id: grant.authority.authority_id,
                     outcome: outcome.clone(),
-                },
-            )?;
-        }
+                }).collect::<Vec<_>>();
+        self.append_effect_audit_transition_batch_locked(name, state, transitions)?;
         Ok(unresolved.len())
     }
 
@@ -1631,7 +1645,9 @@ impl BrainStore {
         };
         self.append_effect_audit_transition_locked(
             name, state, crate::runtime::effect_log::EffectAuditTransition::Reserve {
-                intent: crate::runtime::effect_log::EffectAuditIntent { identity, effect },
+                intent: crate::runtime::effect_log::EffectAuditIntent::from_effect(
+                    identity, &effect,
+                )?,
                 authority: grant.authority.clone(),
             },
         )?;
@@ -1743,6 +1759,46 @@ impl BrainStore {
         Ok(true)
     }
 
+    fn append_effect_audit_transition_batch_locked(
+        &self,
+        name: &str,
+        state: &mut BrainState,
+        transitions: Vec<crate::runtime::effect_log::EffectAuditTransition>,
+    ) -> Result<usize> {
+        let mut projected = state.effect_audits.clone();
+        let mut events = Vec::new();
+        let mut next_seq = state.events.last().map(|event| event.seq + 1).unwrap_or(1);
+        for transition in transitions {
+            if !projected.apply(transition.clone())? {
+                continue;
+            }
+            events.push(BrainEvent {
+                schema_version: BRAIN_EVENT_SCHEMA_VERSION,
+                brain_id: state.brain_id,
+                seq: next_seq,
+                environment_generation: self.environment.generation,
+                sender: "daemon/effect-audit-reconcile".into(),
+                created_ms: unix_millis(),
+                run_id: Some(RunId(transition.identity().run_id)),
+                mutation: None,
+                kind: BrainEventKind::EffectAuditTransition { transition },
+            });
+            next_seq += 1;
+        }
+        if events.is_empty() {
+            return Ok(0);
+        }
+        self.append_event_batch(name, &events)?;
+        for event in &events {
+            state.apply(event.clone());
+            let _ = state.tx.send(event.clone());
+        }
+        self.compact_terminal_effect_audits_locked(
+            name, state, MAX_RETAINED_TERMINAL_EFFECT_AUDITS,
+        )?;
+        Ok(events.len())
+    }
+
     fn compact_terminal_effect_audits_locked(
         &self, name: &str, state: &mut BrainState, retained_limit: usize,
     ) -> Result<()> {
@@ -1754,8 +1810,12 @@ impl BrainStore {
             } = &event.kind else {
                 return None;
             };
-            state.effect_audits.get(identity)
-                .is_some_and(|entry| entry.state.is_terminal())
+            state.effect_audits.get(identity).is_some_and(|entry| matches!(
+                entry.state,
+                crate::runtime::effect_log::EffectAuditState::Terminal { ref outcome }
+                    if !matches!(outcome,
+                        crate::runtime::effect_log::EffectAuditTerminalOutcome::Compacted { .. })
+            ))
                 .then_some((event.seq, *identity))
         }).collect::<Vec<_>>();
         terminal_order.sort_by_key(|(seq, identity)| (*seq, *identity));
@@ -1766,16 +1826,37 @@ impl BrainStore {
         }
         let removed = terminal_order.into_iter().take(remove_count)
             .map(|(_, identity)| identity).collect::<HashSet<_>>();
-        let retained_events = state.events.iter().filter(|event| {
+        let mut retained_events = Vec::with_capacity(state.events.len());
+        for event in &state.events {
             let BrainEventKind::EffectAuditTransition { transition } = &event.kind else {
-                return true;
+                retained_events.push(event.clone());
+                continue;
             };
-            !removed.contains(&transition.identity())
-        }).cloned().collect::<Vec<_>>();
+            if !removed.contains(&transition.identity()) {
+                retained_events.push(event.clone());
+                continue;
+            }
+            match transition {
+                crate::runtime::effect_log::EffectAuditTransition::Reserve { .. } =>
+                    retained_events.push(event.clone()),
+                crate::runtime::effect_log::EffectAuditTransition::Begin { .. } => {}
+                crate::runtime::effect_log::EffectAuditTransition::Finish { outcome, .. } => {
+                    let mut compacted = event.clone();
+                    let BrainEventKind::EffectAuditTransition {
+                        transition: crate::runtime::effect_log::EffectAuditTransition::Finish {
+                            outcome: compacted_outcome, ..
+                        },
+                    } = &mut compacted.kind else { unreachable!() };
+                    *compacted_outcome =
+                        crate::runtime::effect_log::compacted_terminal_outcome(outcome)?;
+                    retained_events.push(compacted);
+                }
+            }
+        }
 
         self.rewrite_events(name, &retained_events)?;
         for identity in &removed {
-            state.effect_audits.remove_terminal(identity)?;
+            state.effect_audits.compact_terminal(identity)?;
         }
         state.events = retained_events;
         Ok(())
@@ -4650,9 +4731,9 @@ impl BrainStore {
                     };
                     validated_effect_audits.apply(
                         crate::runtime::effect_log::EffectAuditTransition::Reserve {
-                            intent: crate::runtime::effect_log::EffectAuditIntent {
-                                identity, effect: effect.clone(),
-                            }, authority: authority.clone(),
+                            intent: crate::runtime::effect_log::EffectAuditIntent::from_effect(
+                                identity, effect,
+                            )?, authority: authority.clone(),
                         },
                     )?;
                     validated_effect_audits.apply(
@@ -4724,30 +4805,21 @@ impl BrainStore {
         // Reconcile unresolved write-ahead state before a successor can run.
         let unresolved_effects = state.effect_audits.entries().values()
             .filter(|entry| !entry.state.is_terminal()).cloned().collect::<Vec<_>>();
-        for entry in unresolved_effects {
+        let restart_transitions = unresolved_effects.into_iter().filter_map(|entry| {
             let outcome = match entry.state {
                 crate::runtime::effect_log::EffectAuditState::IntentAccepted =>
                     crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied,
                 crate::runtime::effect_log::EffectAuditState::AwaitingHostResult =>
                     crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss,
-                crate::runtime::effect_log::EffectAuditState::Terminal { .. } => continue,
+                crate::runtime::effect_log::EffectAuditState::Terminal { .. } => return None,
             };
-            let transition = crate::runtime::effect_log::EffectAuditTransition::Finish {
+            Some(crate::runtime::effect_log::EffectAuditTransition::Finish {
                 identity: entry.intent.identity,
                 authority_id: entry.authority.authority_id,
                 outcome,
-            };
-            let event = BrainEvent {
-                schema_version: BRAIN_EVENT_SCHEMA_VERSION, brain_id: state.brain_id,
-                seq: state.events.last().map(|event| event.seq + 1).unwrap_or(1),
-                environment_generation: self.environment.generation,
-                sender: "daemon/restart-effect-audit".into(), created_ms: unix_millis(),
-                run_id: Some(RunId(entry.intent.identity.run_id)), mutation: None,
-                kind: BrainEventKind::EffectAuditTransition { transition },
-            };
-            self.append_event(name, &event)?;
-            state.apply(event);
-        }
+            })
+        }).collect::<Vec<_>>();
+        self.append_effect_audit_transition_batch_locked(name, &mut state, restart_transitions)?;
         self.compact_terminal_effect_audits_locked(
             name, &mut state, MAX_RETAINED_TERMINAL_EFFECT_AUDITS,
         )?;
@@ -9826,6 +9898,41 @@ mod tests {
     }
 
     #[test]
+    fn effect_audit_observers_never_receive_secret_host_arguments() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrainStore::with_root("box.local", Some(temp.path().into()));
+        let (_run, _lease, grant) = audit_run_fixture(&store);
+        for (sequence, capability, secret) in [
+            (0, crate::vm::CapabilityKind::FileWrite, "FILE_SECRET_163"),
+            (1, crate::vm::CapabilityKind::NetworkConnect, "NETWORK_SECRET_163"),
+            (2, crate::vm::CapabilityKind::ProcessRun, "PROCESS_SECRET_163"),
+        ] {
+            let effect = crate::vm::VmSideEffect {
+                protocol_version: 1,
+                sequence,
+                requirement: crate::vm::CapabilityRequirement {
+                    capability,
+                    selector: crate::vm::ResourceSelector::None,
+                },
+                output: Vec::new(),
+                event: crate::vm::HostSideEffect::Request {
+                    arguments: vec![crate::vm::TypedValue::String(secret.into())],
+                },
+                origin: crate::vm::SourceOrigin::generated(secret),
+            };
+            store.reserve_effect_audit(&grant, uuid::Uuid::new_v4(), effect).unwrap();
+        }
+        let snapshot_json = serde_json::to_string(&store.snapshot("shared").unwrap()).unwrap();
+        let journal = std::fs::read_to_string(temp.path().join("shared/events.jsonl")).unwrap();
+        for secret in ["FILE_SECRET_163", "NETWORK_SECRET_163", "PROCESS_SECRET_163"] {
+            assert!(!snapshot_json.contains(secret), "snapshot leaked {secret}");
+            assert!(!journal.contains(secret), "canonical observer journal leaked {secret}");
+        }
+        assert!(snapshot_json.contains("canonical_sha256"));
+        assert!(snapshot_json.contains("payload_bytes"));
+    }
+
+    #[test]
     fn effect_audit_reconnect_reuses_request_authority_and_exact_reservation() {
         let store = BrainStore::with_root("box.local", None);
         let (run, lease, first) = audit_run_fixture(&store);
@@ -9879,9 +9986,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = BrainStore::with_root("box.local", Some(temp.path().into()));
         let (_run, _lease, grant) = audit_run_fixture(&store);
+        let mut completed = Vec::new();
         for sequence in 0..3 {
+            let execution_id = uuid::Uuid::new_v4();
+            let effect = audit_effect(sequence, "terminal");
             let identity = store.reserve_effect_audit(
-                &grant, uuid::Uuid::new_v4(), audit_effect(sequence, "terminal"),
+                &grant, execution_id, effect.clone(),
             ).unwrap();
             let permit = store.begin_effect_audit(&grant, identity).unwrap();
             store.finish_effect_audit(
@@ -9890,6 +10000,7 @@ mod tests {
                     response: crate::runtime::VmResumeResponse::Result { values: Vec::new() },
                 },
             ).unwrap();
+            completed.push((identity, effect));
         }
         let unresolved = store.reserve_effect_audit(
             &grant, uuid::Uuid::new_v4(), audit_effect(3, "unresolved"),
@@ -9900,15 +10011,48 @@ mod tests {
             store.compact_terminal_effect_audits_locked("shared", state, 1).unwrap();
         }
         let snapshot = store.snapshot("shared").unwrap();
-        assert_eq!(snapshot.effect_audits.iter().filter(|entry| entry.state.is_terminal()).count(), 1);
+        assert_eq!(snapshot.effect_audits.iter().filter(|entry| matches!(entry.state,
+            crate::runtime::effect_log::EffectAuditState::Terminal {
+                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Compacted { .. }
+            })).count(), 2);
+        assert_eq!(snapshot.effect_audits.len(), 4,
+            "compaction retains bounded replay fences instead of forgetting identities");
         assert!(snapshot.effect_audits.iter().any(|entry|
             entry.intent.identity == unresolved && !entry.state.is_terminal()));
         drop(store);
 
         let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let snapshot = restarted.snapshot("shared").unwrap();
-        assert_eq!(snapshot.effect_audits.iter().filter(|entry| entry.state.is_terminal()).count(), 2,
-            "restart reconciles the unresolved reservation without restoring compacted history");
+        assert_eq!(snapshot.effect_audits.len(), 4);
+        let (identity, effect) = &completed[0];
+        let authority = snapshot.effect_audits.iter()
+            .find(|entry| entry.intent.identity == *identity).unwrap().authority.clone();
+        let exact = crate::runtime::effect_log::EffectAuditTransition::Reserve {
+            intent: crate::runtime::effect_log::EffectAuditIntent::from_effect(*identity, effect).unwrap(),
+            authority: authority.clone(),
+        };
+        let mut changed_effect = effect.clone();
+        changed_effect.event = crate::vm::HostSideEffect::Emit { text: "changed secret".into() };
+        let conflicting = crate::runtime::effect_log::EffectAuditTransition::Reserve {
+            intent: crate::runtime::effect_log::EffectAuditIntent::from_effect(
+                *identity, &changed_effect,
+            ).unwrap(),
+            authority,
+        };
+        let mut brains = restarted.brains.write().unwrap();
+        let state = brains.get_mut("shared").unwrap();
+        assert!(!restarted.append_effect_audit_transition_locked(
+            "shared", state, exact,
+        ).unwrap(), "an exact compacted retry remains a no-op after restart");
+        assert!(restarted.append_effect_audit_transition_locked(
+            "shared", state, conflicting,
+        ).unwrap_err().to_string().contains("conflicting"));
+        assert!(restarted.append_effect_audit_transition_locked(
+            "shared", state,
+            crate::runtime::effect_log::EffectAuditTransition::Begin {
+                identity: *identity, authority_id: grant.authority.authority_id,
+            },
+        ).unwrap_err().to_string().contains("terminal"));
     }
 
     #[test]

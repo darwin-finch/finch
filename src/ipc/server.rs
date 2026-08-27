@@ -2021,13 +2021,13 @@ async fn forward_runner_request(
                 Err(error) => (Err(error.to_string().into()), true),
             };
             audit_active.store(false, std::sync::atomic::Ordering::Release);
-            if disconnected {
-                if let Err(error) = server
-                    .brain_store()
-                    .reconcile_effect_audit_authority(&reconciliation_grant)
-                {
-                    result = Err(error.to_string().into());
-                }
+            let reconciliation = if disconnected {
+                server.brain_store().reconcile_effect_audit_authority(&reconciliation_grant)
+            } else {
+                server.brain_store().abandon_unbegun_effect_audits(&reconciliation_grant)
+            };
+            if let Err(error) = reconciliation {
+                result = Err(error.to_string().into());
             }
             let _ = request.response_tx.send(result);
             disconnected
@@ -2097,13 +2097,13 @@ async fn forward_runner_request(
                 }
             };
             audit_active.store(false, std::sync::atomic::Ordering::Release);
-            if disconnected {
-                if let Err(error) = server
-                    .brain_store()
-                    .reconcile_effect_audit_authority(&reconciliation_grant)
-                {
-                    result = Err(error.to_string().into());
-                }
+            let reconciliation = if disconnected {
+                server.brain_store().reconcile_effect_audit_authority(&reconciliation_grant)
+            } else {
+                server.brain_store().abandon_unbegun_effect_audits(&reconciliation_grant)
+            };
+            if let Err(error) = reconciliation {
+                result = Err(error.to_string().into());
             }
             let _ = request.response_tx.send(result);
             disconnected
@@ -2497,6 +2497,7 @@ mod tests {
 
     struct EffectEofRunner {
         begin: bool,
+        count: usize,
     }
 
     impl super::finch_ipc_capnp::brain_runner::Server for EffectEofRunner {
@@ -2514,14 +2515,16 @@ mod tests {
                 Err(error) => return capnp::capability::Promise::err(error),
             };
             let begin = self.begin;
+            let count = self.count;
             capnp::capability::Promise::from_future(async move {
-                let mut reserve = control.reserve_effect_request();
-                reserve.get().set_execution_id(&uuid::Uuid::new_v4().to_string());
-                crate::ipc::checkpoint_codec::encode_vm_side_effect(
-                    reserve.get().init_effect(),
-                    &crate::vm::VmSideEffect {
+                for sequence in 0..count {
+                    let mut reserve = control.reserve_effect_request();
+                    reserve.get().set_execution_id(&uuid::Uuid::new_v4().to_string());
+                    crate::ipc::checkpoint_codec::encode_vm_side_effect(
+                        reserve.get().init_effect(),
+                        &crate::vm::VmSideEffect {
                         protocol_version: 1,
-                        sequence: 0,
+                        sequence: sequence as u64,
                         requirement: crate::vm::CapabilityRequirement {
                             capability: crate::vm::CapabilityKind::SessionEmit,
                             selector: crate::vm::ResourceSelector::None,
@@ -2529,13 +2532,14 @@ mod tests {
                         output: Vec::new(),
                         event: crate::vm::HostSideEffect::Emit { text: "eof".into() },
                         origin: crate::vm::SourceOrigin::generated("raw-eof-effect-audit"),
-                    },
-                ).map_err(|error| capnp::Error::failed(error.to_string()))?;
-                let reservation = reserve.send().promise.await?
-                    .get()?.get_reservation()?;
-                if begin {
-                    let _permit = reservation.begin_request().send().promise.await?
-                        .get()?.get_permit()?;
+                        },
+                    ).map_err(|error| capnp::Error::failed(error.to_string()))?;
+                    let reservation = reserve.send().promise.await?
+                        .get()?.get_reservation()?;
+                    if begin {
+                        let _permit = reservation.begin_request().send().promise.await?
+                            .get()?.get_permit()?;
+                    }
                 }
                 Err(capnp::Error::disconnected("synthetic raw frontend EOF".into()))
             })
@@ -2566,7 +2570,85 @@ mod tests {
         }
     }
 
-    async fn raw_effect_eof_state(begin: bool) -> crate::runtime::effect_log::EffectAuditState {
+    struct EffectNormalRunner {
+        begin: bool,
+        permit_tx: Option<tokio::sync::oneshot::Sender<Option<
+            super::finch_ipc_capnp::brain_host_effect_permit::Client,
+        >>>,
+    }
+
+    impl super::finch_ipc_capnp::brain_runner::Server for EffectNormalRunner {
+        fn run_program(
+            &mut self,
+            params: super::finch_ipc_capnp::brain_runner::RunProgramParams,
+            mut results: super::finch_ipc_capnp::brain_runner::RunProgramResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            let control = match params.get().and_then(|params| params.get_request())
+                .and_then(|request| request.get_control()) {
+                Ok(control) => control,
+                Err(error) => return capnp::capability::Promise::err(error),
+            };
+            let begin = self.begin;
+            let permit_tx = self.permit_tx.take().expect("normal runner called twice");
+            capnp::capability::Promise::from_future(async move {
+                let mut reserve = control.reserve_effect_request();
+                reserve.get().set_execution_id(&uuid::Uuid::new_v4().to_string());
+                crate::ipc::checkpoint_codec::encode_vm_side_effect(
+                    reserve.get().init_effect(),
+                    &crate::vm::VmSideEffect {
+                        protocol_version: 1,
+                        sequence: 0,
+                        requirement: crate::vm::CapabilityRequirement {
+                            capability: crate::vm::CapabilityKind::SessionEmit,
+                            selector: crate::vm::ResourceSelector::None,
+                        },
+                        output: Vec::new(),
+                        event: crate::vm::HostSideEffect::Emit { text: "normal".into() },
+                        origin: crate::vm::SourceOrigin::generated("raw-normal-effect-audit"),
+                    },
+                ).map_err(|error| capnp::Error::failed(error.to_string()))?;
+                let reservation = reserve.send().promise.await?.get()?.get_reservation()?;
+                let permit = if begin {
+                    Some(reservation.begin_request().send().promise.await?
+                        .get()?.get_permit()?)
+                } else {
+                    None
+                };
+                let _ = permit_tx.send(permit);
+                results.get().init_result().set_error("synthetic normal application return");
+                Ok(())
+            })
+        }
+
+        fn run_turn(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::RunTurnParams,
+            _results: super::finch_ipc_capnp::brain_runner::RunTurnResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
+        }
+
+        fn cancel_run(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::CancelRunParams,
+            _results: super::finch_ipc_capnp::brain_runner::CancelRunResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
+        }
+
+        fn project_memory(
+            &mut self,
+            _params: super::finch_ipc_capnp::brain_runner::ProjectMemoryParams,
+            _results: super::finch_ipc_capnp::brain_runner::ProjectMemoryResults,
+        ) -> capnp::capability::Promise<(), capnp::Error> {
+            capnp::capability::Promise::err(capnp::Error::unimplemented("program only".into()))
+        }
+    }
+
+    async fn raw_effect_eof_states(
+        begin: bool,
+        count: usize,
+    ) -> Vec<crate::runtime::effect_log::EffectAuditState> {
         let temp = tempfile::tempdir().unwrap();
         let store = crate::brain::store::BrainStore::with_root(
             "box.local", Some(temp.path().join("brains")),
@@ -2605,23 +2687,115 @@ mod tests {
             response_tx,
         };
         let runner: super::finch_ipc_capnp::brain_runner::Client =
-            capnp_rpc::new_client(EffectEofRunner { begin });
+            capnp_rpc::new_client(EffectEofRunner { begin, count });
         assert!(super::forward_test_runner_request(
             runner, server, crate::server::RunnerRequest::Program(request),
         ).await);
         assert!(response_rx.await.unwrap().is_err());
-        store.snapshot("shared").unwrap().effect_audits[0].state.clone()
+        store.snapshot("shared").unwrap().effect_audits.into_iter()
+            .map(|entry| entry.state).collect()
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn effect_audit_raw_frontend_eof_reconciles_before_and_after_application_boundary() {
-        assert!(matches!(raw_effect_eof_state(false).await,
+        assert!(matches!(raw_effect_eof_states(false, 1).await.remove(0),
             crate::runtime::effect_log::EffectAuditState::Terminal {
                 outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
             }));
-        assert!(matches!(raw_effect_eof_state(true).await,
+        assert!(matches!(raw_effect_eof_states(true, 1).await.remove(0),
             crate::runtime::effect_log::EffectAuditState::Terminal {
                 outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss
+            }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn effect_audit_max_quota_raw_eof_terminalizes_once_within_teardown_bound() {
+        let states = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            raw_effect_eof_states(
+                false,
+                crate::runtime::effect_log::MAX_ACTIVE_EFFECT_AUDITS_PER_RUN,
+            ),
+        ).await.expect("max-quota runner EOF exceeded the two-second teardown bound");
+        assert_eq!(states.len(), crate::runtime::effect_log::MAX_ACTIVE_EFFECT_AUDITS_PER_RUN);
+        assert!(states.into_iter().all(|state| matches!(state,
+            crate::runtime::effect_log::EffectAuditState::Terminal {
+                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
+            })));
+    }
+
+    async fn raw_normal_effect_state(
+        begin: bool,
+    ) -> (
+        tempfile::TempDir,
+        crate::brain::store::BrainStore,
+        crate::runtime::effect_log::EffectAuditState,
+        Option<super::finch_ipc_capnp::brain_host_effect_permit::Client>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::brain::store::BrainStore::with_root(
+            "box.local", Some(temp.path().join("brains")),
+        );
+        let attachment = store.attach(
+            "shared", "alice", crate::brain::store::AttachmentRole::Driver, None,
+        ).unwrap();
+        let prompt = store.push(
+            "shared", "alice",
+            crate::brain::store::BrainEventKind::Prompt { text: "normal effect".into() },
+        ).unwrap();
+        let run = store.start_run(
+            "shared", "alice", crate::brain::store::BrainRunKind::Interactive,
+            prompt.seq, attachment.attachment_id,
+            crate::brain::store::BrainRunStatus::Running,
+        ).unwrap();
+        store.acquire_runner_lease("shared", "runner", 1, None, 300_000).unwrap();
+        let server = std::sync::Arc::new(
+            crate::server::AgentServer::for_brain_protocol_test(
+                store.clone(),
+                crate::brain::credential::BrainCredentialAuthority::ephemeral([46; 32]),
+                "test-password".into(), temp.path(),
+            ).unwrap(),
+        );
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let request = crate::server::RunnerProgramRequest {
+            brain: "shared".into(), run_id: run.run_id, request_seq: prompt.seq,
+            language: crate::brain::store::ProgramLanguage::Forth,
+            source: "noop".into(),
+            interaction: crate::server::RunnerProgramInteraction::Interactive,
+            grant_ceiling: None, control_tx: None, effect_audit: None, response_tx,
+        };
+        let (permit_tx, permit_rx) = tokio::sync::oneshot::channel();
+        let runner: super::finch_ipc_capnp::brain_runner::Client =
+            capnp_rpc::new_client(EffectNormalRunner {
+                begin, permit_tx: Some(permit_tx),
+            });
+        assert!(!super::forward_test_runner_request(
+            runner, server, crate::server::RunnerRequest::Program(request),
+        ).await, "normal application return must not be classified as transport EOF");
+        assert!(response_rx.await.unwrap().is_err());
+        let permit = permit_rx.await.unwrap();
+        let state = store.snapshot("shared").unwrap().effect_audits[0].state.clone();
+        (temp, store, state, permit)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn effect_audit_normal_return_abandons_only_unbegun_and_allows_late_finish() {
+        let (_temp, _store, state, permit) = raw_normal_effect_state(false).await;
+        assert!(permit.is_none());
+        assert!(matches!(state, crate::runtime::effect_log::EffectAuditState::Terminal {
+            outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
+        }));
+
+        let (_temp, store, state, permit) = raw_normal_effect_state(true).await;
+        assert!(matches!(state,
+            crate::runtime::effect_log::EffectAuditState::AwaitingHostResult));
+        let permit = permit.expect("begun normal-return effect retained its detached permit");
+        let mut finish = permit.finish_request();
+        finish.get().init_outcome().init_acknowledged(0);
+        finish.send().promise.await.unwrap();
+        assert!(matches!(store.snapshot("shared").unwrap().effect_audits[0].state,
+            crate::runtime::effect_log::EffectAuditState::Terminal {
+                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Acknowledged { .. }
             }));
     }
 
