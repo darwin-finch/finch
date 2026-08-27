@@ -914,7 +914,7 @@ fn task_kind_from_wire(value: wire::TaskKind) -> TaskKind {
     }
 }
 
-fn encode_value_list(
+pub(super) fn encode_value_list(
     mut builder: capnp::struct_list::Builder<'_, wire::typed_value::Owned>,
     values: &[TypedValue],
     depth: usize,
@@ -925,7 +925,7 @@ fn encode_value_list(
     Ok(())
 }
 
-fn decode_value_list(
+pub(super) fn decode_value_list(
     reader: capnp::struct_list::Reader<'_, wire::typed_value::Owned>,
     depth: usize,
 ) -> Result<Vec<TypedValue>> {

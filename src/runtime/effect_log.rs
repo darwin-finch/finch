@@ -618,6 +618,31 @@ mod tests {
     }
 
     #[test]
+    fn audit_reducer_bounds_active_intents_before_any_permit() {
+        let (template, authority) = audit_fixture();
+        let mut reducer = EffectAuditReducer::default();
+        for sequence in 0..MAX_ACTIVE_EFFECT_AUDITS_PER_RUN {
+            let mut intent = template.clone();
+            intent.identity.execution_id = Uuid::new_v4();
+            intent.identity.effect_sequence = sequence as u64;
+            intent.effect.sequence = sequence as u64;
+            reducer.apply(EffectAuditTransition::Reserve {
+                intent,
+                authority: authority.clone(),
+            }).unwrap();
+        }
+        let mut overflow = template;
+        overflow.identity.execution_id = Uuid::new_v4();
+        overflow.identity.effect_sequence = 100;
+        overflow.effect.sequence = 100;
+        let error = reducer.apply(EffectAuditTransition::Reserve {
+            intent: overflow,
+            authority,
+        }).unwrap_err();
+        assert!(error.to_string().contains("quota exceeded"));
+    }
+
+    #[test]
     fn reopens_and_replays_only_each_consumers_unacknowledged_suffix() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("effects.jsonl");

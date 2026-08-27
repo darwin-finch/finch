@@ -85,6 +85,39 @@ struct BrainTurnControlImpl {
     request_seq: u64,
     expected_audience: crate::brain::store::BrainApprovalAudience,
     expected_connection_id: Option<crate::brain::store::ConnectionId>,
+    effect_audit: Option<BrainEffectAuditRpcAuthority>,
+}
+
+#[derive(Clone)]
+struct BrainEffectAuditRpcAuthority {
+    store: crate::brain::store::BrainStore,
+    grant: crate::brain::store::EffectAuditAuthorityGrant,
+    runners: crate::server::BrainRunnerBroker,
+    brain: String,
+    lease_id: crate::brain::store::RunnerLeaseId,
+    connection_id: Option<uuid::Uuid>,
+}
+
+impl BrainEffectAuditRpcAuthority {
+    fn validate_new_work(&self) -> anyhow::Result<()> {
+        if let Some(connection_id) = self.connection_id {
+            self.runners.require_connection_lease(
+                connection_id, &self.brain, self.lease_id,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+struct BrainEffectReservationImpl {
+    authority: BrainEffectAuditRpcAuthority,
+    identity: crate::runtime::effect_log::EffectAuditIdentity,
+    begun: bool,
+}
+
+struct BrainHostEffectPermitImpl {
+    authority: BrainEffectAuditRpcAuthority,
+    permit: std::sync::Arc<crate::runtime::effect_log::HostEffectPermit>,
 }
 
 fn require_approval_connection(
@@ -107,6 +140,7 @@ pub(crate) fn test_turn_control_client(
         request_seq,
         expected_audience,
         expected_connection_id,
+        effect_audit: None,
     })
 }
 
@@ -168,6 +202,7 @@ struct BrainProgramControlImpl {
     run_id: crate::brain::store::RunId,
     request_seq: u64,
     maximum_grant_ceiling: Option<crate::vm::EffectSet>,
+    effect_audit: Option<BrainEffectAuditRpcAuthority>,
 }
 
 /// Reverse lifecycle capability scoped to one exact runner registration.
@@ -208,7 +243,7 @@ impl finch_ipc_capnp::brain_runner_control::Server for BrainRunnerControlImpl {
         }
         let params = match params.get() {
             Ok(params) => params,
-            Err(error) => return Promise::err(error),
+            Err(error) => return Promise::err(error.into()),
         };
         let parse_uuid = |value: capnp::text::Reader<'_>| {
             value
@@ -405,6 +440,158 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
             Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
         }
     }
+
+    fn reserve_effect(
+        &mut self,
+        params: finch_ipc_capnp::brain_program_control::ReserveEffectParams,
+        mut results: finch_ipc_capnp::brain_program_control::ReserveEffectResults,
+    ) -> Promise<(), capnp::Error> {
+        let Some(authority) = &self.effect_audit else {
+            return Promise::err(capnp::Error::failed(
+                "effect audit authority is unavailable".into(),
+            ));
+        };
+        if let Err(error) = authority.validate_new_work() {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        let params = match params.get() {
+            Ok(params) => params,
+            Err(error) => return Promise::err(error),
+        };
+        let execution_id = match params.get_execution_id()
+            .map_err(anyhow::Error::from)
+            .and_then(|value| value.to_str().map_err(anyhow::Error::from))
+            .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::from))
+        {
+            Ok(value) => value,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let effect = match params.get_effect()
+            .map_err(anyhow::Error::from)
+            .and_then(crate::ipc::checkpoint_codec::decode_vm_side_effect)
+        {
+            Ok(effect) => effect,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        match authority.store.reserve_effect_audit(&authority.grant, execution_id, effect) {
+            Ok(identity) => {
+                let reservation: finch_ipc_capnp::brain_effect_reservation::Client =
+                    capnp_rpc::new_client(BrainEffectReservationImpl {
+                        authority: authority.clone(), identity, begun: false,
+                    });
+                results.get().set_reservation(reservation);
+                Promise::ok(())
+            }
+            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+        }
+    }
+}
+
+impl finch_ipc_capnp::brain_effect_reservation::Server for BrainEffectReservationImpl {
+    fn begin(
+        &mut self,
+        _params: finch_ipc_capnp::brain_effect_reservation::BeginParams,
+        mut results: finch_ipc_capnp::brain_effect_reservation::BeginResults,
+    ) -> Promise<(), capnp::Error> {
+        if let Err(error) = self.authority.validate_new_work() {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        match self.authority.store.begin_effect_audit(
+            &self.authority.grant, self.identity,
+        ) {
+            Ok(permit) => {
+                self.begun = true;
+                let permit: finch_ipc_capnp::brain_host_effect_permit::Client =
+                    capnp_rpc::new_client(BrainHostEffectPermitImpl {
+                        authority: self.authority.clone(),
+                        permit: std::sync::Arc::new(permit),
+                    });
+                results.get().set_permit(permit);
+                Promise::ok(())
+            }
+            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+        }
+    }
+
+    fn not_applied(
+        &mut self,
+        params: finch_ipc_capnp::brain_effect_reservation::NotAppliedParams,
+        _results: finch_ipc_capnp::brain_effect_reservation::NotAppliedResults,
+    ) -> Promise<(), capnp::Error> {
+        if self.begun {
+            return Promise::err(capnp::Error::failed(
+                "begun effect outcome requires its host permit".into(),
+            ));
+        }
+        if let Err(error) = self.authority.validate_new_work() {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        let reason = match params
+            .get()
+            .and_then(|params| params.get_reason())
+            .and_then(|value| value.to_str().map_err(capnp::Error::from))
+        {
+            Ok(reason) => reason.to_string(),
+            Err(error) => return Promise::err(error),
+        };
+        match self.authority.store.finish_effect_audit(
+            &self.authority.grant, None, self.identity,
+            crate::runtime::effect_log::EffectAuditTerminalOutcome::NotApplied { reason },
+        ) {
+            Ok(()) => Promise::ok(()),
+            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+        }
+    }
+}
+
+impl finch_ipc_capnp::brain_host_effect_permit::Server for BrainHostEffectPermitImpl {
+    fn finish(
+        &mut self,
+        params: finch_ipc_capnp::brain_host_effect_permit::FinishParams,
+        _results: finch_ipc_capnp::brain_host_effect_permit::FinishResults,
+    ) -> Promise<(), capnp::Error> {
+        let outcome = match params.get().and_then(|params| params.get_outcome()) {
+            Ok(outcome) => outcome,
+            Err(error) => return Promise::err(error),
+        };
+        use finch_ipc_capnp::brain_host_effect_outcome::Which;
+        let outcome = match outcome.which() {
+            Ok(Which::Acknowledged(values)) => match values
+                .map_err(anyhow::Error::from)
+                .and_then(|values| crate::ipc::checkpoint_codec::decode_value_list(values, 0))
+            {
+                Ok(values) => crate::runtime::effect_log::EffectAuditTerminalOutcome::Acknowledged {
+                    response: crate::runtime::VmResumeResponse::Result { values },
+                },
+                Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+            },
+            Ok(Which::NotApplied(reason)) => {
+                let reason = match reason
+                    .and_then(|value| value.to_str().map_err(capnp::Error::from))
+                {
+                    Ok(reason) => reason.to_string(),
+                    Err(error) => return Promise::err(error),
+                };
+                crate::runtime::effect_log::EffectAuditTerminalOutcome::NotApplied { reason }
+            }
+            Ok(Which::FailedPartial(detail)) => {
+                let detail = match detail
+                    .and_then(|value| value.to_str().map_err(capnp::Error::from))
+                {
+                    Ok(detail) => detail.to_string(),
+                    Err(error) => return Promise::err(error),
+                };
+                crate::runtime::effect_log::EffectAuditTerminalOutcome::FailedPartial { detail }
+            }
+            Err(error) => return Promise::err(error.into()),
+        };
+        match self.authority.store.finish_effect_audit(
+            &self.authority.grant, Some(&self.permit), self.permit.identity(), outcome,
+        ) {
+            Ok(()) => Promise::ok(()),
+            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+        }
+    }
 }
 
 impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
@@ -497,6 +684,51 @@ impl finch_ipc_capnp::brain_turn_control::Server for BrainTurnControlImpl {
                 .map_err(|error| capnp::Error::failed(error.to_string()))?;
             Ok(())
         })
+    }
+
+    fn reserve_effect(
+        &mut self,
+        params: finch_ipc_capnp::brain_turn_control::ReserveEffectParams,
+        mut results: finch_ipc_capnp::brain_turn_control::ReserveEffectResults,
+    ) -> Promise<(), capnp::Error> {
+        let Some(authority) = &self.effect_audit else {
+            return Promise::err(capnp::Error::failed(
+                "effect audit authority is unavailable".into(),
+            ));
+        };
+        if let Err(error) = authority.validate_new_work() {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
+        let params = match params.get() {
+            Ok(params) => params,
+            Err(error) => return Promise::err(error),
+        };
+        let execution_id = match params.get_execution_id()
+            .map_err(anyhow::Error::from)
+            .and_then(|value| value.to_str().map_err(anyhow::Error::from))
+            .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::from))
+        {
+            Ok(value) => value,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        let effect = match params.get_effect()
+            .map_err(anyhow::Error::from)
+            .and_then(crate::ipc::checkpoint_codec::decode_vm_side_effect)
+        {
+            Ok(effect) => effect,
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        };
+        match authority.store.reserve_effect_audit(&authority.grant, execution_id, effect) {
+            Ok(identity) => {
+                let reservation: finch_ipc_capnp::brain_effect_reservation::Client =
+                    capnp_rpc::new_client(BrainEffectReservationImpl {
+                        authority: authority.clone(), identity, begun: false,
+                    });
+                results.get().set_reservation(reservation);
+                Promise::ok(())
+            }
+            Err(error) => Promise::err(capnp::Error::failed(error.to_string())),
+        }
     }
 }
 
@@ -1559,6 +1791,7 @@ impl finch_daemon::Server for FinchDaemonImpl {
         let queued_lifecycle = crate::server::BrainLifecycleService::from_server(&server);
         let queued_brain = brain.clone();
         let registered_brain = brain.clone();
+        let registered_connection_id = self.connection_id;
         tokio::task::spawn_local(async move {
             while let Some(request) = rx.recv().await {
                 let runner = runner.clone();
@@ -1566,7 +1799,10 @@ impl finch_daemon::Server for FinchDaemonImpl {
                 let broker = broker.clone();
                 let brain = registered_brain.clone();
                 tokio::task::spawn_local(async move {
-                    if forward_runner_request(runner, server, request).await {
+                    if forward_runner_request(
+                        runner, server, request, lease_id,
+                        Some(crate::brain::store::ConnectionId(registered_connection_id)),
+                    ).await {
                         broker.unregister(&brain, registration_id);
                     }
                 });
@@ -1694,9 +1930,20 @@ async fn forward_runner_request(
     runner: finch_ipc_capnp::brain_runner::Client,
     server: Arc<AgentServer>,
     request: crate::server::RunnerRequest,
+    lease_id: crate::brain::store::RunnerLeaseId,
+    connection_id: Option<crate::brain::store::ConnectionId>,
 ) -> bool {
     match request {
         crate::server::RunnerRequest::Program(request) => {
+            let audit_grant = match server.brain_store().issue_effect_audit_authority(
+                &request.brain, request.run_id, lease_id, connection_id,
+            ) {
+                Ok(grant) => grant,
+                Err(error) => {
+                    let _ = request.response_tx.send(Err(error.to_string().into()));
+                    return false;
+                }
+            };
             let mut call = runner.run_program_request();
             {
                 let mut payload = call.get().init_request();
@@ -1729,6 +1976,14 @@ async fn forward_runner_request(
                         run_id: request.run_id,
                         request_seq: request.request_seq,
                         maximum_grant_ceiling: request.grant_ceiling.clone(),
+                        effect_audit: Some(BrainEffectAuditRpcAuthority {
+                            store: server.brain_store().clone(),
+                            grant: audit_grant,
+                            runners: server.brain_runners().clone(),
+                            brain: request.brain.clone(),
+                            lease_id,
+                            connection_id: connection_id.map(|id| id.0),
+                        }),
                     });
                 payload.set_control(control);
             }
@@ -1743,6 +1998,15 @@ async fn forward_runner_request(
             disconnected
         }
         crate::server::RunnerRequest::Turn(request) => {
+            let audit_grant = match server.brain_store().issue_effect_audit_authority(
+                &request.brain, request.run_id, lease_id, connection_id,
+            ) {
+                Ok(grant) => grant,
+                Err(error) => {
+                    let _ = request.response_tx.send(Err(error.to_string().into()));
+                    return false;
+                }
+            };
             let (result, disconnected) = {
                 let mut call = runner.run_turn_request();
                 let encoded = {
@@ -1765,11 +2029,19 @@ async fn forward_runner_request(
                         );
                         let control: finch_ipc_capnp::brain_turn_control::Client =
                             capnp_rpc::new_client(BrainTurnControlImpl {
-                                server,
+                                server: Arc::clone(&server),
                                 brain: request.brain.clone(),
                                 request_seq: request.request_seq,
                                 expected_audience: request.approval_audience.clone(),
                                 expected_connection_id: request.approval_connection_id,
+                                effect_audit: Some(BrainEffectAuditRpcAuthority {
+                                    store: server.brain_store().clone(),
+                                    grant: audit_grant,
+                                    runners: server.brain_runners().clone(),
+                                    brain: request.brain.clone(),
+                                    lease_id,
+                                    connection_id: connection_id.map(|id| id.0),
+                                }),
                             });
                         payload.set_control(control);
                     }
@@ -1855,7 +2127,16 @@ pub(crate) async fn forward_test_runner_request(
     server: Arc<AgentServer>,
     request: crate::server::RunnerRequest,
 ) -> bool {
-    forward_runner_request(runner, server, request).await
+    let brain = match &request {
+        crate::server::RunnerRequest::Program(request) => &request.brain,
+        crate::server::RunnerRequest::Turn(request) => &request.brain,
+        crate::server::RunnerRequest::ProjectMemory(request) => &request.brain,
+        crate::server::RunnerRequest::Cancel(request) => &request.brain,
+    };
+    let lease_id = server.brain_store().snapshot(brain).ok()
+        .and_then(|snapshot| snapshot.runner_lease.map(|lease| lease.lease_id))
+        .unwrap_or(crate::brain::store::RunnerLeaseId(uuid::Uuid::nil()));
+    forward_runner_request(runner, server, request, lease_id, None).await
 }
 
 fn decode_runner_program_result(
@@ -2044,6 +2325,114 @@ mod tests {
         require_approval_connection, BrainRpcService, BrainRunnerControlImpl,
     };
     use crate::ipc::brain_codec::encode_approval_audience;
+
+    #[test]
+    fn capnp_effect_audit_requires_durable_begin_before_terminal_outcome() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all().build().unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let store = crate::brain::store::BrainStore::with_root(
+                "box.local", Some(temp.path().join("brains")),
+            );
+            let attachment = store.attach(
+                "shared", "alice", crate::brain::store::AttachmentRole::Driver, None,
+            ).unwrap();
+            let prompt = store.push(
+                "shared", "alice",
+                crate::brain::store::BrainEventKind::Prompt { text: "effect".into() },
+            ).unwrap();
+            let run = store.start_run(
+                "shared", "alice", crate::brain::store::BrainRunKind::Interactive,
+                prompt.seq, attachment.attachment_id,
+                crate::brain::store::BrainRunStatus::Running,
+            ).unwrap();
+            let lease = store.acquire_runner_lease(
+                "shared", "runner", 1, None, 300_000,
+            ).unwrap();
+            let grant = store.issue_effect_audit_authority(
+                "shared", run.run_id, lease.lease_id, None,
+            ).unwrap();
+            let server = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    store.clone(),
+                    crate::brain::credential::BrainCredentialAuthority::ephemeral([44; 32]),
+                    "test-password".into(), temp.path(),
+                ).unwrap(),
+            );
+            let authority = super::BrainEffectAuditRpcAuthority {
+                store: store.clone(), grant,
+                runners: server.brain_runners().clone(),
+                brain: "shared".into(), lease_id: lease.lease_id, connection_id: None,
+            };
+            let control: super::finch_ipc_capnp::brain_program_control::Client =
+                capnp_rpc::new_client(super::BrainProgramControlImpl {
+                    lifecycle: crate::server::BrainLifecycleService::from_server(&server),
+                    brain: "shared".into(), run_id: run.run_id,
+                    request_seq: prompt.seq, maximum_grant_ceiling: None,
+                    effect_audit: Some(authority),
+                });
+            let execution_id = uuid::Uuid::new_v4();
+            let mut reserve = control.reserve_effect_request();
+            reserve.get().set_execution_id(&execution_id.to_string());
+            let effect = crate::vm::VmSideEffect {
+                protocol_version: 1, sequence: 0,
+                requirement: crate::vm::CapabilityRequirement {
+                    capability: crate::vm::CapabilityKind::SessionEmit,
+                    selector: crate::vm::ResourceSelector::None,
+                },
+                output: Vec::new(),
+                event: crate::vm::HostSideEffect::Emit { text: "hello".into() },
+                origin: crate::vm::SourceOrigin::generated("capnp-effect-audit-test"),
+            };
+            crate::ipc::checkpoint_codec::encode_vm_side_effect(
+                reserve.get().init_effect(), &effect,
+            ).unwrap();
+            let reservation = reserve.send().promise.await.unwrap()
+                .get().unwrap().get_reservation().unwrap();
+            let permit = reservation.begin_request().send().promise.await.unwrap()
+                .get().unwrap().get_permit().unwrap();
+            assert!(matches!(
+                store.snapshot("shared").unwrap().effect_audits[0].state,
+                crate::runtime::effect_log::EffectAuditState::AwaitingHostResult
+            ));
+            let mut invalid_terminal = reservation.not_applied_request();
+            invalid_terminal.get().set_reason("too late");
+            assert!(invalid_terminal.send().promise.await.unwrap_err().to_string()
+                .contains("host permit"));
+
+            store.release_runner_lease("shared", lease.lease_id).unwrap();
+            store.acquire_runner_lease("shared", "successor", 1, None, 300_000).unwrap();
+            let mut stale_reserve = control.reserve_effect_request();
+            stale_reserve.get().set_execution_id(&uuid::Uuid::new_v4().to_string());
+            crate::ipc::checkpoint_codec::encode_vm_side_effect(
+                stale_reserve.get().init_effect(), &crate::vm::VmSideEffect {
+                    sequence: 1,
+                    ..effect.clone()
+                },
+            ).unwrap();
+            assert!(stale_reserve.send().promise.await.unwrap_err().to_string()
+                .contains("successor"));
+            store.transition_run(
+                "shared", "daemon", run.run_id,
+                crate::brain::store::BrainRunStatus::Cancelled,
+                Some("turn cancelled before host completion".into()),
+            ).unwrap();
+            let mut finish = permit.finish_request();
+            finish.get().init_outcome().init_acknowledged(0);
+            finish.send().promise.await.unwrap();
+
+            let snapshot = store.snapshot("shared").unwrap();
+            assert!(matches!(snapshot.effect_audits[0].state,
+                crate::runtime::effect_log::EffectAuditState::Terminal {
+                    outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Acknowledged { .. }
+                }));
+            assert!(!snapshot.events.iter().any(|event| matches!(
+                event.kind, crate::brain::store::BrainEventKind::ToolResult { .. }
+            )));
+        }));
+    }
 
     struct SocketApprovalRunner {
         failed_tx: Option<tokio::sync::oneshot::Sender<String>>,

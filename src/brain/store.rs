@@ -1621,6 +1621,12 @@ impl BrainStore {
         }
         let mut brains = self.brains.write().expect("shared brain lock poisoned");
         let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        if permit.is_none() {
+            anyhow::ensure!(state.effect_audits.get(&identity).is_some_and(|entry|
+                    matches!(entry.state,
+                        crate::runtime::effect_log::EffectAuditState::IntentAccepted)),
+                "begun effect outcome requires its durable host permit");
+        }
         self.append_effect_audit_transition_locked(
             name, state, crate::runtime::effect_log::EffectAuditTransition::Finish {
                 identity, authority_id: grant.authority.authority_id, outcome,
@@ -4470,6 +4476,12 @@ impl BrainStore {
         let initialization = self.load_or_create_initialization(name, brain_id)?;
         let mut events = self.read_events(name)?;
         backfill_legacy_speculative_run_correlation(&mut events);
+        let canonical_run_requests = events.iter().filter_map(|event| {
+            let BrainEventKind::RunStarted { run } = &event.kind else {
+                return None;
+            };
+            Some((run.run_id.0, run.request_seq))
+        }).collect::<HashMap<_, _>>();
         let mut reviewed_schedules = HashMap::new();
         let mut validated_effect_audits =
             crate::runtime::effect_log::EffectAuditReducer::default();
@@ -4496,6 +4508,12 @@ impl BrainStore {
                     anyhow::ensure!(identity.brain_id == brain_id.0
                             && event.run_id.map(|run_id| run_id.0) == Some(identity.run_id),
                         "Brain '{name}' event #{} has mismatched effect-audit identity", event.seq);
+                    anyhow::ensure!(
+                        canonical_run_requests.get(&identity.run_id)
+                            == Some(&identity.request_seq),
+                        "Brain '{name}' event #{} has a non-canonical effect-audit run/request identity",
+                        event.seq,
+                    );
                     validated_effect_audits.apply(transition.clone()).with_context(|| format!(
                         "Brain '{name}' event #{} contains an invalid effect-audit transition",
                         event.seq

@@ -646,6 +646,7 @@ impl BrainRunnerBroker {
                     interaction,
                     grant_ceiling,
                     control_tx: None,
+                    effect_audit: None,
                     response_tx,
                 }))
                 .map_err(|_| {
@@ -703,6 +704,7 @@ impl BrainRunnerBroker {
                     approval_audience,
                     approval_connection_id,
                     approval_tx: None,
+                    effect_audit: None,
                     response_tx,
                 }))
                 .map_err(|_| {

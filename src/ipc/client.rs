@@ -766,6 +766,142 @@ struct BrainRunnerImpl {
     event_tx: tokio::sync::mpsc::UnboundedSender<crate::cli::repl_event::ReplEvent>,
 }
 
+fn effect_audit_reservation_proxy(
+    reservation: finch_ipc_capnp::brain_effect_reservation::Client,
+) -> crate::server::RunnerEffectAuditReservation {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tokio::task::spawn_local(async move {
+        let Some(request) = rx.recv().await else {
+            return;
+        };
+        match request {
+            crate::server::RunnerEffectAuditReservationRequest::Begin { response_tx } => {
+                let result = async {
+                    let response = reservation.begin_request().send().promise.await?;
+                    let permit = response.get()?.get_permit()?;
+                    Ok(host_effect_permit_proxy(permit))
+                }
+                .await
+                .map_err(|error: capnp::Error| error.to_string());
+                let _ = response_tx.send(result);
+            }
+            crate::server::RunnerEffectAuditReservationRequest::NotApplied {
+                reason,
+                response_tx,
+            } => {
+                let result = async {
+                    let mut call = reservation.not_applied_request();
+                    call.get().set_reason(&reason);
+                    call.send().promise.await?;
+                    Ok(())
+                }
+                .await
+                .map_err(|error: capnp::Error| error.to_string());
+                let _ = response_tx.send(result);
+            }
+        }
+    });
+    crate::server::RunnerEffectAuditReservation::new(tx)
+}
+
+fn host_effect_permit_proxy(
+    permit: finch_ipc_capnp::brain_host_effect_permit::Client,
+) -> crate::server::RunnerHostEffectPermit {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tokio::task::spawn_local(async move {
+        let Some(request) = rx.recv().await else {
+            return;
+        };
+        let result = async {
+            let mut call = permit.finish_request();
+            let mut outcome = call.get().init_outcome();
+            match request.outcome {
+                crate::server::RunnerHostEffectOutcome::Acknowledged { values } => {
+                    crate::ipc::checkpoint_codec::encode_value_list(
+                        outcome.init_acknowledged(values.len() as u32),
+                        &values,
+                        0,
+                    )?;
+                }
+                crate::server::RunnerHostEffectOutcome::NotApplied { reason } => {
+                    outcome.set_not_applied(&reason);
+                }
+                crate::server::RunnerHostEffectOutcome::FailedPartial { detail } => {
+                    outcome.set_failed_partial(&detail);
+                }
+            }
+            call.send().promise.await?;
+            Ok(())
+        }
+        .await
+        .map_err(|error: capnp::Error| error.to_string());
+        let _ = request.response_tx.send(result);
+    });
+    crate::server::RunnerHostEffectPermit::new(tx)
+}
+
+fn program_effect_audit_proxy(
+    control: finch_ipc_capnp::brain_program_control::Client,
+) -> crate::server::RunnerEffectAuditControl {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tokio::task::spawn_local(async move {
+        while let Some(request) = rx.recv().await {
+            let crate::server::RunnerEffectAuditControlRequest::Reserve {
+                execution_id,
+                effect,
+                response_tx,
+            } = request;
+            let result = async {
+                let mut call = control.reserve_effect_request();
+                call.get().set_execution_id(&execution_id.to_string());
+                crate::ipc::checkpoint_codec::encode_vm_side_effect(
+                    call.get().init_effect(),
+                    &effect,
+                )?;
+                let response = call.send().promise.await?;
+                Ok(effect_audit_reservation_proxy(
+                    response.get()?.get_reservation()?,
+                ))
+            }
+            .await
+            .map_err(|error: capnp::Error| error.to_string());
+            let _ = response_tx.send(result);
+        }
+    });
+    crate::server::RunnerEffectAuditControl::new(tx)
+}
+
+fn turn_effect_audit_proxy(
+    control: finch_ipc_capnp::brain_turn_control::Client,
+) -> crate::server::RunnerEffectAuditControl {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tokio::task::spawn_local(async move {
+        while let Some(request) = rx.recv().await {
+            let crate::server::RunnerEffectAuditControlRequest::Reserve {
+                execution_id,
+                effect,
+                response_tx,
+            } = request;
+            let result = async {
+                let mut call = control.reserve_effect_request();
+                call.get().set_execution_id(&execution_id.to_string());
+                crate::ipc::checkpoint_codec::encode_vm_side_effect(
+                    call.get().init_effect(),
+                    &effect,
+                )?;
+                let response = call.send().promise.await?;
+                Ok(effect_audit_reservation_proxy(
+                    response.get()?.get_reservation()?,
+                ))
+            }
+            .await
+            .map_err(|error: capnp::Error| error.to_string());
+            let _ = response_tx.send(result);
+        }
+    });
+    crate::server::RunnerEffectAuditControl::new(tx)
+}
+
 struct BrainTurnCommitAckImpl {
     tx: tokio::sync::mpsc::UnboundedSender<crate::server::RunnerTurnCommitNotice>,
 }
@@ -847,6 +983,7 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(control) => control,
             Err(error) => return Promise::err(error),
         };
+        let effect_audit = program_effect_audit_proxy(control.clone());
         let (control_tx, mut control_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::server::RunnerProgramControlRequest>();
         tokio::task::spawn_local(async move {
@@ -989,6 +1126,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                             None
                         },
                         control_tx: Some(control_tx),
+                        effect_audit: Some(effect_audit),
                         response_tx,
                     },
                 ),
@@ -1076,6 +1214,7 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(control) => control,
             Err(error) => return Promise::err(error),
         };
+        let effect_audit = turn_effect_audit_proxy(control.clone());
         let (approval_tx, mut approval_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::server::RunnerApprovalRequest>();
         tokio::task::spawn_local(async move {
@@ -1105,6 +1244,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                     approval_audience,
                     approval_connection_id: None,
                     approval_tx: Some(approval_tx),
+                    effect_audit: Some(effect_audit),
                     response_tx,
                 },
             ))
