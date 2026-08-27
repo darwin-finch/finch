@@ -902,8 +902,7 @@ impl ProgramRuntime {
         if root == Path::new("/") && !whole_machine {
             bail!("binding '/' requires bind_whole_machine_root");
         }
-        if whole_machine
-            && (kind != crate::vm::ResourceRoot::HostMachine || root != Path::new("/"))
+        if whole_machine && (kind != crate::vm::ResourceRoot::HostMachine || root != Path::new("/"))
         {
             bail!("whole-machine binding must be host-machine root '/'");
         }
@@ -929,13 +928,8 @@ impl ProgramRuntime {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("resource-root generation overflow"))?;
         let now = unix_time_ms();
-        let binding = resource_root_binding_record(
-            kind.clone(),
-            &root,
-            generation,
-            whole_machine,
-            now,
-        )?;
+        let binding =
+            resource_root_binding_record(kind.clone(), &root, generation, whole_machine, now)?;
         if let Some(replaced) = roots.bindings.remove(&kind) {
             let sequence = roots.audit.len() as u64 + 1;
             roots.audit.push(ResourceRootAuditEntry {
@@ -949,7 +943,9 @@ impl ProgramRuntime {
                 actor: actor.into(),
             });
         }
-        roots.bindings.insert(kind.clone(), Arc::new(binding.clone()));
+        roots
+            .bindings
+            .insert(kind.clone(), Arc::new(binding.clone()));
         let sequence = roots.audit.len() as u64 + 1;
         roots.audit.push(ResourceRootAuditEntry {
             sequence,
@@ -1306,10 +1302,8 @@ impl ProgramRuntime {
         }
         state.policy.validate().map_err(anyhow::Error::msg)?;
         validate_restored_process_authority(&state.ledger)?;
-        let restored_roots = validate_resource_root_authority(
-            &state.resource_roots,
-            &state.resource_root_audit,
-        )?;
+        let restored_roots =
+            validate_resource_root_authority(&state.resource_roots, &state.resource_root_audit)?;
         let now = unix_time_ms();
         if state.ledger.grants.grants.iter().any(|grant| {
             grant.is_active(now)
@@ -1333,8 +1327,7 @@ impl ProgramRuntime {
         *self
             .resource_roots
             .write()
-            .map_err(|_| anyhow::anyhow!("resource-root binding lock poisoned"))? =
-            restored_roots;
+            .map_err(|_| anyhow::anyhow!("resource-root binding lock poisoned"))? = restored_roots;
         self.refresh_active_grants()
     }
 
@@ -4161,10 +4154,7 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         ));
                     };
                     let roots = self.resource_roots.read().map_err(|_| {
-                        host_binding_error(
-                            &effect.origin,
-                            "resource-root binding lock poisoned",
-                        )
+                        host_binding_error(&effect.origin, "resource-root binding lock poisoned")
                     })?;
                     if let Err(error) = sink(authority_state_from_parts(
                         context.session_id,
@@ -4220,13 +4210,12 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
         effect: &VmSideEffect,
     ) -> std::result::Result<Vec<TypedValue>, VmDiagnostic> {
         let values = match &effect.event {
-            crate::vm::interpreter::HostSideEffect::Request { arguments } => {
-                self.request_with_authority_lease(
+            crate::vm::interpreter::HostSideEffect::Request { arguments } => self
+                .request_with_authority_lease(
                     &effect.requirement,
                     arguments.clone(),
                     &effect.origin,
-                )?
-            }
+                )?,
             _ => {
                 return Err(VmDiagnostic::error(
                     "E-HOST-002",
@@ -5090,13 +5079,8 @@ impl crate::vm::interpreter::CapabilityHandler for TypedHostHandler {
                         )),
                     })
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                let executable = validate_process_request(
-                    binding,
-                    requirement,
-                    command,
-                    &arguments,
-                    origin,
-                )?;
+                let executable =
+                    validate_process_request(binding, requirement, command, &arguments, origin)?;
                 let child = match spawn_open_process(executable) {
                     Ok(child) => child,
                     Err(error) => {
@@ -5543,9 +5527,7 @@ fn validate_core_host_request(
     let path = |value: &TypedValue| matches!(value, TypedValue::Path { .. });
     let bytes = |value: &TypedValue| matches!(value, TypedValue::Bytes(_));
     let stream = |value: &TypedValue| matches!(value, TypedValue::Stream { .. });
-    let resource = |value: &TypedValue, kind: &str| {
-        matches!(value, TypedValue::Resource { kind: actual, .. } if actual == kind)
-    };
+    let resource = |value: &TypedValue, kind: &str| matches!(value, TypedValue::Resource { kind: actual, .. } if actual == kind);
     let task = |value: &TypedValue| matches!(value, TypedValue::Task { .. });
     let valid_arguments = match binding {
         CoreHostBinding::SessionEmit => matches!(arguments, [value] if string(value)),
@@ -5591,9 +5573,11 @@ fn validate_core_host_request(
         CoreHostBinding::ProcessRun => matches!(arguments,
             [command, TypedValue::List { values, .. }]
                 if string(command) && values.iter().all(string)),
-        CoreHostBinding::McpCall => matches!(arguments,
+        CoreHostBinding::McpCall => {
+            matches!(arguments,
             [server, tool, TypedValue::Json(_)] if string(server) && string(tool))
-            || arguments.len() == 1 && word.is_some_and(|name| name.starts_with("mcp.")),
+                || arguments.len() == 1 && word.is_some_and(|name| name.starts_with("mcp."))
+        }
         CoreHostBinding::ProposalOpen => {
             matches!(arguments, [first, second, third]
                 if string(first) && string(second) && string(third))
@@ -5616,9 +5600,9 @@ fn validate_core_host_request(
         }
         CoreHostBinding::AgentSpawn => matches!(arguments, [value] if string(value)),
         CoreHostBinding::AgentSpawnWith => matches!(arguments, [TypedValue::Record(_)]),
-        CoreHostBinding::AgentAwait
-        | CoreHostBinding::AgentPoll
-        | CoreHostBinding::AgentCancel => matches!(arguments, [value] if task(value)),
+        CoreHostBinding::AgentAwait | CoreHostBinding::AgentPoll | CoreHostBinding::AgentCancel => {
+            matches!(arguments, [value] if task(value))
+        }
         CoreHostBinding::AutomationClick => matches!(arguments, [x, y, button, count]
             if float(x) && float(y) && string(button) && integer(count)),
         CoreHostBinding::AutomationType => {
@@ -5715,7 +5699,10 @@ fn validate_core_host_request(
             unreachable!("validated above")
         };
         let ResourceSelector::Process { executables } = &requirement.selector else {
-            return Err(host_binding_error(origin, "process selector is not concrete"));
+            return Err(host_binding_error(
+                origin,
+                "process selector is not concrete",
+            ));
         };
         let [encoded] = executables.as_slice() else {
             return Err(host_binding_error(origin, "process selector is not exact"));
@@ -6080,9 +6067,8 @@ type ProcessBeforeExecHook = (String, Box<dyn FnOnce() + Send>);
 type AuthorizationBeforeUseHook = (uuid::Uuid, CapabilityKind, Box<dyn FnOnce() + Send>);
 
 #[cfg(test)]
-static AUTHORIZATION_BEFORE_USE_HOOK: std::sync::OnceLock<
-    Mutex<Vec<AuthorizationBeforeUseHook>>,
-> = std::sync::OnceLock::new();
+static AUTHORIZATION_BEFORE_USE_HOOK: std::sync::OnceLock<Mutex<Vec<AuthorizationBeforeUseHook>>> =
+    std::sync::OnceLock::new();
 
 #[cfg(test)]
 fn run_authorization_before_use_hook(execution_id: uuid::Uuid, capability: CapabilityKind) {
@@ -6162,16 +6148,14 @@ fn spawn_open_process(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     unsafe {
-        command.pre_exec(
-            move || {
-                nix::unistd::fchdir(cwd_fd)
-                    .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
-                match nix::unistd::fexecve(fd, &argv, &environment) {
-                    Ok(never) => match never {},
-                    Err(error) => Err(std::io::Error::from_raw_os_error(error as i32)),
-                }
-            },
-        );
+        command.pre_exec(move || {
+            nix::unistd::fchdir(cwd_fd)
+                .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
+            match nix::unistd::fexecve(fd, &argv, &environment) {
+                Ok(never) => match never {},
+                Err(error) => Err(std::io::Error::from_raw_os_error(error as i32)),
+            }
+        });
     }
     command.spawn().map_err(|error| error.to_string())
 }
@@ -6219,7 +6203,8 @@ fn validate_process_effect(effect: &VmSideEffect) -> std::result::Result<(), VmD
             "process-run requires a typed host request",
         ));
     };
-    let [TypedValue::String(command), TypedValue::List { values, .. }] = arguments.as_slice() else {
+    let [TypedValue::String(command), TypedValue::List { values, .. }] = arguments.as_slice()
+    else {
         return Err(host_binding_error(
             &effect.origin,
             "process-run requires an executable and string arguments",
@@ -6348,13 +6333,7 @@ fn list_directory_tree(
         let mut directory = nix::dir::Dir::from(root).map_err(|error| error.to_string())?;
         let mut raw_entries = Vec::new();
         let mut scanned = 0usize;
-        walk_directory_for_listing(
-            &mut directory,
-            "",
-            &mut raw_entries,
-            &mut scanned,
-            100_000,
-        )?;
+        walk_directory_for_listing(&mut directory, "", &mut raw_entries, &mut scanned, 100_000)?;
         raw_entries.sort_by(|left, right| left.0.cmp(&right.0));
         let truncated = raw_entries.len() > maximum_entries;
         raw_entries.truncate(maximum_entries);
@@ -6374,57 +6353,58 @@ fn list_directory_tree(
     }
     #[cfg(any())]
     {
-    const MAX_SCANNED_DIRECTORY_ENTRIES: usize = 100_000;
-    let metadata = std::fs::symlink_metadata(root).map_err(|error| error.to_string())?;
-    if metadata.file_type().is_symlink() {
-        return Err("tree-list rejects a symlink root".into());
-    }
-    if !metadata.is_dir() {
-        return Err("tree-list requires a directory path".into());
-    }
-
-    let mut pending = BinaryHeap::new();
-    let mut scanned = 0;
-    enqueue_directory_entries(
-        root,
-        root,
-        &mut pending,
-        &mut scanned,
-        MAX_SCANNED_DIRECTORY_ENTRIES,
-    )?;
-    let mut entries = Vec::with_capacity(maximum_entries.min(pending.len()));
-
-    while entries.len() < maximum_entries {
-        let Some(Reverse((relative, path))) = pending.pop() else {
-            break;
-        };
-        let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        const MAX_SCANNED_DIRECTORY_ENTRIES: usize = 100_000;
+        let metadata = std::fs::symlink_metadata(root).map_err(|error| error.to_string())?;
         if metadata.file_type().is_symlink() {
-            return Err(format!("tree-list rejects symlink '{relative}'"));
+            return Err("tree-list rejects a symlink root".into());
         }
-        let (kind, size) = if metadata.is_dir() {
-            enqueue_directory_entries(
-                root,
-                &path,
-                &mut pending,
-                &mut scanned,
-                MAX_SCANNED_DIRECTORY_ENTRIES,
-            )?;
-            ("directory", 0)
-        } else if metadata.is_file() {
-            let size = i64::try_from(metadata.len())
-                .map_err(|_| format!("tree-list file '{relative}' is too large to represent"))?;
-            ("file", size)
-        } else {
-            return Err(format!("tree-list rejects unsupported entry '{relative}'"));
-        };
-        entries.push(TypedValue::Record(vec![
-            ("path".into(), TypedValue::String(relative)),
-            ("kind".into(), TypedValue::String(kind.into())),
-            ("size".into(), TypedValue::Int(size)),
-        ]));
-    }
-    Ok((entries, !pending.is_empty()))
+        if !metadata.is_dir() {
+            return Err("tree-list requires a directory path".into());
+        }
+
+        let mut pending = BinaryHeap::new();
+        let mut scanned = 0;
+        enqueue_directory_entries(
+            root,
+            root,
+            &mut pending,
+            &mut scanned,
+            MAX_SCANNED_DIRECTORY_ENTRIES,
+        )?;
+        let mut entries = Vec::with_capacity(maximum_entries.min(pending.len()));
+
+        while entries.len() < maximum_entries {
+            let Some(Reverse((relative, path))) = pending.pop() else {
+                break;
+            };
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!("tree-list rejects symlink '{relative}'"));
+            }
+            let (kind, size) = if metadata.is_dir() {
+                enqueue_directory_entries(
+                    root,
+                    &path,
+                    &mut pending,
+                    &mut scanned,
+                    MAX_SCANNED_DIRECTORY_ENTRIES,
+                )?;
+                ("directory", 0)
+            } else if metadata.is_file() {
+                let size = i64::try_from(metadata.len()).map_err(|_| {
+                    format!("tree-list file '{relative}' is too large to represent")
+                })?;
+                ("file", size)
+            } else {
+                return Err(format!("tree-list rejects unsupported entry '{relative}'"));
+            };
+            entries.push(TypedValue::Record(vec![
+                ("path".into(), TypedValue::String(relative)),
+                ("kind".into(), TypedValue::String(kind.into())),
+                ("size".into(), TypedValue::Int(size)),
+            ]));
+        }
+        Ok((entries, !pending.is_empty()))
     }
 }
 
@@ -6439,8 +6419,8 @@ fn walk_directory_for_listing(
     use nix::dir::Dir;
     use nix::fcntl::{AtFlags, OFlag};
     use nix::sys::stat::{fstat, fstatat, Mode, SFlag};
-    use std::os::fd::FromRawFd;
     use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
 
     let mut names = directory
         .iter()
@@ -6490,13 +6470,7 @@ fn walk_directory_for_listing(
             )
             .map_err(|error| error.to_string())?;
             entries.push((relative.clone(), "directory".into(), 0));
-            walk_directory_for_listing(
-                &mut child,
-                &relative,
-                entries,
-                scanned,
-                maximum_entries,
-            )?;
+            walk_directory_for_listing(&mut child, &relative, entries, scanned, maximum_entries)?;
         } else if kind.contains(SFlag::S_IFREG) {
             let fd = nix::fcntl::openat(
                 Some(directory.as_raw_fd()),
@@ -6508,7 +6482,9 @@ fn walk_directory_for_listing(
             let file = unsafe { std::fs::File::from_raw_fd(fd) };
             let opened = fstat(file.as_raw_fd()).map_err(|error| error.to_string())?;
             if !SFlag::from_bits_truncate(opened.st_mode).contains(SFlag::S_IFREG) {
-                return Err(format!("tree-list entry changed while opening '{relative}'"));
+                return Err(format!(
+                    "tree-list entry changed while opening '{relative}'"
+                ));
             }
             let size = i64::try_from(opened.st_size)
                 .map_err(|_| format!("tree-list file '{relative}' is too large to represent"))?;
@@ -6566,25 +6542,25 @@ fn merkle_directory(root: std::fs::File) -> std::result::Result<String, String> 
     }
     #[cfg(any())]
     {
-    const MAX_TREE_MERKLE_ENTRIES: usize = 100_000;
-    let metadata = std::fs::symlink_metadata(root).map_err(|error| error.to_string())?;
-    if metadata.file_type().is_symlink() {
-        return Err("tree-merkle rejects a symlink root".into());
-    }
-    if !metadata.is_dir() {
-        return Err("tree-merkle requires a directory path".into());
-    }
+        const MAX_TREE_MERKLE_ENTRIES: usize = 100_000;
+        let metadata = std::fs::symlink_metadata(root).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err("tree-merkle rejects a symlink root".into());
+        }
+        if !metadata.is_dir() {
+            return Err("tree-merkle requires a directory path".into());
+        }
 
-    let mut hasher = Sha256::new();
-    let mut entries = 0;
-    merkle_walk(
-        root,
-        root,
-        &mut hasher,
-        &mut entries,
-        MAX_TREE_MERKLE_ENTRIES,
-    )?;
-    Ok(format!("{:x}", hasher.finalize()))
+        let mut hasher = Sha256::new();
+        let mut entries = 0;
+        merkle_walk(
+            root,
+            root,
+            &mut hasher,
+            &mut entries,
+            MAX_TREE_MERKLE_ENTRIES,
+        )?;
+        Ok(format!("{:x}", hasher.finalize()))
     }
 }
 
@@ -6666,7 +6642,9 @@ fn merkle_walk_descriptor(
             hasher.update(b"\0");
             hasher.update(sha256_file_handle(&file)?);
         } else {
-            return Err(format!("tree-merkle rejects unsupported entry '{relative}'"));
+            return Err(format!(
+                "tree-merkle rejects unsupported entry '{relative}'"
+            ));
         }
     }
     Ok(())
@@ -6764,8 +6742,7 @@ fn read_workbook_rows(
     let range = workbook.worksheet_range(&sheet).map_err(|error| {
         format!(
             "cannot read workbook sheet '{}' from '{}': {error}",
-            sheet,
-            label
+            sheet, label
         )
     })?;
     let mut cell_count = 0usize;
@@ -7295,7 +7272,10 @@ fn resource_root_binding_record(
     let metadata = std::fs::symlink_metadata(&canonical)
         .with_context(|| format!("inspect resource root '{}'", canonical.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!("resource root is not a stable directory: {}", canonical.display());
+        bail!(
+            "resource root is not a stable directory: {}",
+            canonical.display()
+        );
     }
     #[cfg(unix)]
     let (device, inode) = {
@@ -7319,10 +7299,7 @@ fn validate_resource_root_authority(
     bindings: &[ResourceRootBindingRecord],
     audit: &[ResourceRootAuditEntry],
 ) -> Result<ResourceRootState> {
-    let mut replayed = BTreeMap::<
-        crate::vm::ResourceRoot,
-        (u64, PathBuf, bool, u64),
-    >::new();
+    let mut replayed = BTreeMap::<crate::vm::ResourceRoot, (u64, PathBuf, bool, u64)>::new();
     let mut next_generation = 1_u64;
     let mut previous_time = 0_u64;
     for (index, entry) in audit.iter().enumerate() {
@@ -7335,8 +7312,7 @@ fn validate_resource_root_authority(
         }
         previous_time = entry.at_unix_ms;
         if entry.whole_machine
-            && (entry.root != crate::vm::ResourceRoot::HostMachine
-                || entry.path != Path::new("/"))
+            && (entry.root != crate::vm::ResourceRoot::HostMachine || entry.path != Path::new("/"))
         {
             bail!("resource-root audit contains an invalid whole-machine binding");
         }
@@ -7396,8 +7372,7 @@ fn validate_resource_root_authority(
                 binding.path.display()
             );
         }
-        let Some((generation, path, whole_machine, bound_at)) = replayed.get(&binding.root)
-        else {
+        let Some((generation, path, whole_machine, bound_at)) = replayed.get(&binding.root) else {
             bail!("active resource root has no replayed audit authority");
         };
         if *generation != binding.generation
@@ -7515,9 +7490,7 @@ fn open_resource_beneath_mode(
         {
             return Err("resource object is not a regular file".into());
         }
-        SecureOpenMode::ReadDirectory
-            if !opened_kind.contains(nix::sys::stat::SFlag::S_IFDIR) =>
-        {
+        SecureOpenMode::ReadDirectory if !opened_kind.contains(nix::sys::stat::SFlag::S_IFDIR) => {
             return Err("resource object is not a directory".into());
         }
         _ => {}
@@ -10794,15 +10767,20 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .await
             .unwrap();
         assert_eq!(pending.status, ExecutionStatus::AuthorizationRequired);
-        let ResourceSelector::Process { executables } =
-            &pending.required_capabilities[0].selector
+        let ResourceSelector::Process { executables } = &pending.required_capabilities[0].selector
         else {
             panic!("process requirement must be concrete")
         };
         let identity = ProcessExecutableIdentity::decode(&executables[0]).unwrap();
         assert_eq!(identity.arguments, vec!["same-inode"]);
-        assert_eq!(identity.environment_sha256, format!("{:x}", Sha256::digest(b"")));
-        assert_eq!(identity.cwd_path, std::env::current_dir().unwrap().to_string_lossy());
+        assert_eq!(
+            identity.environment_sha256,
+            format!("{:x}", Sha256::digest(b""))
+        );
+        assert_eq!(
+            identity.cwd_path,
+            std::env::current_dir().unwrap().to_string_lossy()
+        );
 
         let expected_path = executable.to_string_lossy().into_owned();
         let original_inode = std::fs::metadata(&executable).unwrap().ino();
@@ -10814,8 +10792,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             expected_path,
             Box::new(move || {
                 std::fs::copy("/usr/bin/false", &mutated).unwrap();
-                std::fs::set_permissions(&mutated, std::fs::Permissions::from_mode(0o700))
-                    .unwrap();
+                std::fs::set_permissions(&mutated, std::fs::Permissions::from_mode(0o700)).unwrap();
                 assert_eq!(std::fs::metadata(&mutated).unwrap().ino(), original_inode);
             }),
         ));
@@ -10828,7 +10805,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .await
             .unwrap();
         assert_eq!(completed.status, ExecutionStatus::Completed);
-        assert_eq!(completed.values, vec![ProgramValue::String("same-inode".into())]);
+        assert_eq!(
+            completed.values,
+            vec![ProgramValue::String("same-inode".into())]
+        );
     }
 
     #[cfg(any(
@@ -10868,7 +10848,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             )
             .unwrap();
         std::fs::copy("/usr/bin/false", &executable).unwrap();
-        assert_eq!(std::fs::metadata(&executable).unwrap().ino(), original_inode);
+        assert_eq!(
+            std::fs::metadata(&executable).unwrap().ino(),
+            original_inode
+        );
         let error = runtime
             .restore_capability_ledger(ledger)
             .expect_err("restart must revalidate executable bytes");
@@ -11653,9 +11636,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         let pending = runtime
             .submit(submission(
                 ProgramLanguage::Forth,
-                &format!(
-                    "s\"127.0.0.1\" {port} network-connect s\"ping\" bytes network-send"
-                ),
+                &format!("s\"127.0.0.1\" {port} network-connect s\"ping\" bytes network-send"),
                 ExecutionEffect::ExternalWrite,
             ))
             .await
@@ -12873,13 +12854,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
                     std::fs::rename(replacement, replacement_target).unwrap();
                 }),
             ));
-        let mut file = open_resource_beneath_mode(
-            &binding,
-            &selector,
-            "dir/value",
-            SecureOpenMode::ReadFile,
-        )
-        .unwrap();
+        let mut file =
+            open_resource_beneath_mode(&binding, &selector, "dir/value", SecureOpenMode::ReadFile)
+                .unwrap();
         let mut value = String::new();
         file.read_to_string(&mut value).unwrap();
         assert_eq!(value, "authorized");
@@ -12903,13 +12880,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             1,
         )
         .unwrap();
-        let mut file = open_resource_beneath_mode(
-            &root,
-            &selector,
-            "etc/hosts",
-            SecureOpenMode::ReadFile,
-        )
-        .unwrap();
+        let mut file =
+            open_resource_beneath_mode(&root, &selector, "etc/hosts", SecureOpenMode::ReadFile)
+                .unwrap();
         let mut text = String::new();
         file.read_to_string(&mut text).unwrap();
         assert_eq!(text, "local");
@@ -13142,7 +13115,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .await
             .unwrap();
         assert_eq!(outcome.status, ExecutionStatus::Failed);
-        assert_eq!(std::fs::read(root.path().join("note.txt")).unwrap(), b"before");
+        assert_eq!(
+            std::fs::read(root.path().join("note.txt")).unwrap(),
+            b"before"
+        );
         let ledger = runtime.capability_ledger().unwrap();
         assert!(ledger.authorization_audit.is_empty());
         assert!(ledger
@@ -13189,7 +13165,13 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         let mut restored = ProgramRuntime::new();
         restored.restore_authority_state(state).unwrap();
         let restored = restored.capability_ledger().unwrap();
-        assert!(restored.grants.grants.last().unwrap().consumed_at_unix_ms.is_none());
+        assert!(restored
+            .grants
+            .grants
+            .last()
+            .unwrap()
+            .consumed_at_unix_ms
+            .is_none());
         assert!(restored.authorization_audit.is_empty());
     }
 
@@ -13243,7 +13225,13 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
             .any(|diagnostic| diagnostic.contains("persist unused host authorization rollback")));
         let ledger = runtime.capability_ledger().unwrap();
         assert_eq!(ledger.authorization_audit.len(), 1);
-        assert!(ledger.grants.grants.last().unwrap().consumed_at_unix_ms.is_some());
+        assert!(ledger
+            .grants
+            .grants
+            .last()
+            .unwrap()
+            .consumed_at_unix_ms
+            .is_some());
         assert_eq!(
             durable.lock().unwrap().as_ref().unwrap().ledger,
             ledger,
@@ -13349,8 +13337,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         assert!(final_state
             .resource_root_audit
             .iter()
-            .any(|entry| entry.whole_machine
-                && entry.action == ResourceRootAuditAction::Bound));
+            .any(|entry| entry.whole_machine && entry.action == ResourceRootAuditAction::Bound));
         assert!(!final_state
             .resource_roots
             .iter()

@@ -21,7 +21,9 @@ impl CapabilityPolicy {
         if self.policy_hash.trim().is_empty() {
             return Err("capability policy requires a non-empty hash".into());
         }
-        if self.denied_capabilities.contains(&CapabilityKind::SessionEmit)
+        if self
+            .denied_capabilities
+            .contains(&CapabilityKind::SessionEmit)
             || self.denied_capabilities.contains(&CapabilityKind::VmRead)
         {
             return Err("intrinsic VM capabilities cannot be denied by host policy".into());
@@ -151,21 +153,19 @@ impl GrantSet {
         &'a self,
         context: &'a AuthorizationContext,
     ) -> impl Iterator<Item = &'a CapabilityGrant> + 'a {
-        self.grants
-            .iter()
-            .filter(move |grant| {
-                grant.is_active(context.now_unix_ms)
-                    && grant.policy_hash == context.policy_hash
-                    && match &grant.scope {
-                        GrantScope::Once { .. } => false,
-                        GrantScope::Task { task_id } => context.task_id == Some(*task_id),
-                        GrantScope::Session { session_id } => *session_id == context.session_id,
-                        GrantScope::Project { project_id } => {
-                            context.project_id.as_ref() == Some(project_id)
-                        }
-                        GrantScope::Global => true,
+        self.grants.iter().filter(move |grant| {
+            grant.is_active(context.now_unix_ms)
+                && grant.policy_hash == context.policy_hash
+                && match &grant.scope {
+                    GrantScope::Once { .. } => false,
+                    GrantScope::Task { task_id } => context.task_id == Some(*task_id),
+                    GrantScope::Session { session_id } => *session_id == context.session_id,
+                    GrantScope::Project { project_id } => {
+                        context.project_id.as_ref() == Some(project_id)
                     }
-            })
+                    GrantScope::Global => true,
+                }
+        })
     }
 
     pub fn authorize(
@@ -250,16 +250,12 @@ impl CapabilityLedger {
         request: &CapabilityRequest,
         context: &AuthorizationContext,
     ) -> Option<AuthorizationDecision> {
-        let entry = self.authorization_audit
-            .iter()
-            .rev()
-            .find(|entry| {
-                entry.request_id == request.id
-                    && entry.execution_id == request.execution_id
-                    && entry.effect_sequence == request.effect_sequence
-                    && entry.requirement == request.requirement
-            })
-            ?;
+        let entry = self.authorization_audit.iter().rev().find(|entry| {
+            entry.request_id == request.id
+                && entry.execution_id == request.execution_id
+                && entry.effect_sequence == request.effect_sequence
+                && entry.requirement == request.requirement
+        })?;
         let decision = entry.decision.clone();
         if let AuthorizationDecision::Allowed { grant_id } = decision {
             let still_live = self.grants.grants.iter().any(|grant| {

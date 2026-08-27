@@ -683,7 +683,11 @@ impl<'a> VmTrampoline<'a> {
                     ));
                     Ok(None)
                 }
-                Instruction::MakeVariant { variants: _, tag, payload_type } => {
+                Instruction::MakeVariant {
+                    variants: _,
+                    tag,
+                    payload_type,
+                } => {
                     let value = if payload_type.is_some() {
                         let Some(value) = continuation.stack.pop() else {
                             return VmStep::Failed(self.underflow(&located.origin, &continuation));
@@ -692,10 +696,16 @@ impl<'a> VmTrampoline<'a> {
                     } else {
                         None
                     };
-                    continuation.stack.push(TypedValue::Variant { name: tag, value });
+                    continuation
+                        .stack
+                        .push(TypedValue::Variant { name: tag, value });
                     Ok(None)
                 }
-                Instruction::VariantGet { variants: _, tag, payload_type } => {
+                Instruction::VariantGet {
+                    variants: _,
+                    tag,
+                    payload_type,
+                } => {
                     let Some(TypedValue::Variant { name, value }) = continuation.stack.pop() else {
                         return VmStep::Failed(self.with_trace(
                             VmDiagnostic::error(
@@ -713,7 +723,9 @@ impl<'a> VmTrampoline<'a> {
                     } else {
                         None
                     };
-                    continuation.stack.push(TypedValue::Option { inner_type, value });
+                    continuation
+                        .stack
+                        .push(TypedValue::Option { inner_type, value });
                     Ok(None)
                 }
                 Instruction::RecordGet { field, value_type } => {
@@ -1189,11 +1201,7 @@ impl<'a> VmTrampoline<'a> {
                     let found = value.value_type();
                     if !value_type.accepts(&found) {
                         return VmStep::Failed(self.with_trace(
-                            VmDiagnostic::type_mismatch(
-                                value_type,
-                                found,
-                                Some(located.origin),
-                            ),
+                            VmDiagnostic::type_mismatch(value_type, found, Some(located.origin)),
                             &continuation,
                         ));
                     }
@@ -1300,12 +1308,7 @@ impl<'a> VmTrampoline<'a> {
                     let Some(result) = continuation.stack.pop() else {
                         return VmStep::Failed(self.underflow(&located.origin, &continuation));
                     };
-                    let TypedValue::Result {
-                        is_ok,
-                        value,
-                        ..
-                    } = result
-                    else {
+                    let TypedValue::Result { is_ok, value, .. } = result else {
                         return VmStep::Failed(self.with_trace(
                             VmDiagnostic::error(
                                 "E-RUNTIME-036",
@@ -1943,7 +1946,10 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
                     Some(origin),
                 ));
             };
-            let found = value.as_object().and_then(|object| object.get(&key)).cloned();
+            let found = value
+                .as_object()
+                .and_then(|object| object.get(&key))
+                .cloned();
             stack.push(TypedValue::Option {
                 inner_type: Type::Json,
                 value: found.map(|value| Box::new(TypedValue::Json(value))),
@@ -1981,13 +1987,7 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
             };
             let values = value
                 .as_object()
-                .map(|object| {
-                    object
-                        .keys()
-                        .cloned()
-                        .map(TypedValue::String)
-                        .collect()
-                })
+                .map(|object| object.keys().cloned().map(TypedValue::String).collect())
                 .unwrap_or_default();
             stack.push(TypedValue::List {
                 element_type: Type::String,
@@ -2011,7 +2011,10 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
                     entries: object
                         .iter()
                         .map(|(key, value)| {
-                            (TypedValue::String(key.clone()), TypedValue::Json(value.clone()))
+                            (
+                                TypedValue::String(key.clone()),
+                                TypedValue::Json(value.clone()),
+                            )
                         })
                         .collect(),
                 })
@@ -2034,20 +2037,13 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
             let (inner_type, value) = match name {
                 "json-as-string" => (
                     Type::String,
-                    value.as_str().map(|value| TypedValue::String(value.to_string())),
+                    value
+                        .as_str()
+                        .map(|value| TypedValue::String(value.to_string())),
                 ),
-                "json-as-int" => (
-                    Type::Int,
-                    value.as_i64().map(TypedValue::Int),
-                ),
-                "json-as-float" => (
-                    Type::Float,
-                    value.as_f64().map(TypedValue::Float),
-                ),
-                "json-as-bool" => (
-                    Type::Bool,
-                    value.as_bool().map(TypedValue::Bool),
-                ),
+                "json-as-int" => (Type::Int, value.as_i64().map(TypedValue::Int)),
+                "json-as-float" => (Type::Float, value.as_f64().map(TypedValue::Float)),
+                "json-as-bool" => (Type::Bool, value.as_bool().map(TypedValue::Bool)),
                 _ => unreachable!(),
             };
             stack.push(TypedValue::Option {
@@ -2376,7 +2372,8 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
                     Some(origin),
                 ));
             };
-            if let Some((_, existing)) = entries.iter_mut().find(|(candidate, _)| *candidate == key) {
+            if let Some((_, existing)) = entries.iter_mut().find(|(candidate, _)| *candidate == key)
+            {
                 *existing = value;
             } else {
                 entries.push((key, value));
@@ -2420,10 +2417,8 @@ fn execute_core(name: &str, stack: &mut Vec<TypedValue>) -> Result<(), VmDiagnos
                     Some(origin),
                 ));
             };
-            let element_type = Type::Record(vec![
-                ("key".into(), key_type),
-                ("value".into(), value_type),
-            ]);
+            let element_type =
+                Type::Record(vec![("key".into(), key_type), ("value".into(), value_type)]);
             stack.push(TypedValue::List {
                 element_type,
                 values: entries
@@ -2525,10 +2520,7 @@ mod tests {
             ))
         }
 
-        fn authorize_awaited_effect(
-            &mut self,
-            effect: &VmSideEffect,
-        ) -> Result<(), VmDiagnostic> {
+        fn authorize_awaited_effect(&mut self, effect: &VmSideEffect) -> Result<(), VmDiagnostic> {
             self.authorizations += 1;
             Err(VmDiagnostic::error(
                 "E-AUTHORIZE-TEST",
@@ -2650,9 +2642,7 @@ mod tests {
     #[test]
     fn every_pure_core_word_has_an_interpreter_implementation() {
         for (name, spec) in crate::vm::vocabulary::core_word_registry() {
-            if spec.implementation
-                != crate::vm::vocabulary::CoreWordImplementation::Interpreter
-            {
+            if spec.implementation != crate::vm::vocabulary::CoreWordImplementation::Interpreter {
                 continue;
             }
             let mut stack = Vec::new();
@@ -2865,8 +2855,7 @@ mod tests {
         let VmStep::Yielded {
             value: TypedValue::Unit,
             continuation,
-        } =
-            trampoline.run(trampoline.start(Vec::new()).unwrap())
+        } = trampoline.run(trampoline.start(Vec::new()).unwrap())
         else {
             panic!("Lisp yield must return control to the event loop");
         };
