@@ -47,7 +47,11 @@ brain_test_isolation_is_active() {
   [[ "${FINCH_BRAIN_TEST_PROOF_FD:-}" == 9 ]] || return 1
   [[ "${FINCH_BRAIN_TEST_PROOF_BACKUP_FD:-}" == 108 ]] || return 1
   [[ -n "${FINCH_TEST_SUPERVISOR_BIN:-}" ]] || return 1
-  proof="$("$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof 2>/dev/null)" || return 1
+  if [[ "${FINCH_TEST_PROOF_DIAGNOSTICS:-}" == 1 ]]; then
+    proof="$("$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof)" || return 1
+  else
+    proof="$("$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof 2>/dev/null)" || return 1
+  fi
   token="$(printf '%s\n' "$proof" | sed -n '1p')"
   home="$(printf '%s\n' "$proof" | sed -n '2p')"
   root="$(printf '%s\n' "$proof" | sed -n '3p')"

@@ -370,8 +370,10 @@ test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 launchers=(demo_boot.sh smoke_vm_wire_provider.sh stress_test.sh test_persistence.sh test_server.sh test_tool_passthrough.sh test_tui_debug.sh)
 phase=launcher-probe-closure
 for launcher in "${launchers[@]}"; do
+  phase="launcher-probe-closure:$launcher"
   launcher_probe="$scratch/probe-$launcher"
-  FINCH_TEST_LAUNCHER_PROBE_FILE="$launcher_probe" FINCH_TEST_LAUNCHER_PROBE_ONLY=1 \
+  FINCH_TEST_PROOF_DIAGNOSTICS=1 FINCH_TEST_LAUNCHER_PROBE_FILE="$launcher_probe" \
+    FINCH_TEST_LAUNCHER_PROBE_ONLY=1 \
     run_isolated "$repo_root/scripts/$launcher"
   [[ "$(cat "$launcher_probe")" == "$temp_parent"/finch-brain-test-home.* ]]
 done

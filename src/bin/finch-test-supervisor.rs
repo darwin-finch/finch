@@ -682,7 +682,15 @@ fn main() {
     {
         let status = match finch::brain::authenticated_isolated_test_proof_text() {
             Ok(contents) => io::stdout().write_all(&contents).map(|_| 0).unwrap_or(1),
-            Err(_) => 1,
+            Err(error) => {
+                // The synthetic harness enables this only while diagnosing its
+                // own inherited-descriptor contract. Display the outer
+                // predicate, never proof contents, credentials, or paths.
+                if std::env::var("FINCH_TEST_PROOF_DIAGNOSTICS").as_deref() == Ok("1") {
+                    eprintln!("Brain test proof verification failed: {error}");
+                }
+                1
+            }
         };
         std::process::exit(status);
     }
