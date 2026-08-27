@@ -7,6 +7,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Tool trait - all tools must implement this
 #[async_trait]
@@ -35,7 +36,7 @@ pub trait Tool: Send + Sync {
 
 /// Registry of available tools
 pub struct ToolRegistry {
-    tools: HashMap<String, Box<dyn Tool>>,
+    tools: HashMap<String, Arc<dyn Tool>>,
     /// Compatibility spellings accepted at dispatch time but deliberately
     /// omitted from provider manifests. A provider should learn one canonical
     /// operation name, not receive duplicate semantic tools.
@@ -54,7 +55,7 @@ impl ToolRegistry {
     /// Register a tool
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         let name = tool.name().to_string();
-        self.tools.insert(name, tool);
+        self.tools.insert(name, Arc::from(tool));
     }
 
     /// Accept a legacy spelling for a canonical registered tool. Aliases are
@@ -69,9 +70,13 @@ impl ToolRegistry {
 
     /// Get tool by name
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools
-            .get(self.canonical_name(name))
-            .map(|b| b.as_ref())
+        self.tools.get(self.canonical_name(name)).map(Arc::as_ref)
+    }
+
+    /// Clone one immutable tool adapter so execution does not retain the
+    /// registry's shared coordination lock across an async host operation.
+    pub fn get_shared(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.get(self.canonical_name(name)).cloned()
     }
 
     /// Check if tool exists

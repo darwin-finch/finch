@@ -71,6 +71,68 @@ mod tests {
         committed: Arc<std::sync::atomic::AtomicBool>,
     }
 
+    struct RecordingWriteTool {
+        started: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct BlockingWriteTool {
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl Tool for BlockingWriteTool {
+        fn name(&self) -> &str {
+            "write"
+        }
+
+        fn description(&self) -> &str {
+            "unrelated no-timeout holder"
+        }
+
+        fn input_schema(&self) -> crate::tools::types::ToolInputSchema {
+            crate::tools::types::ToolInputSchema::simple(vec![])
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: &crate::tools::types::ToolContext<'_>,
+        ) -> anyhow::Result<String> {
+            if let Some(started) = self.started.lock().unwrap().take() {
+                let _ = started.send(());
+            }
+            let release = self.release.lock().unwrap().take().unwrap();
+            let _ = release.await;
+            Ok("holder released".into())
+        }
+    }
+
+    #[async_trait]
+    impl Tool for RecordingWriteTool {
+        fn name(&self) -> &str {
+            "write"
+        }
+
+        fn description(&self) -> &str {
+            "approval cancellation regression tool"
+        }
+
+        fn input_schema(&self) -> crate::tools::types::ToolInputSchema {
+            crate::tools::types::ToolInputSchema::simple(vec![])
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: &crate::tools::types::ToolContext<'_>,
+        ) -> anyhow::Result<String> {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("unexpected execution".into())
+        }
+    }
+
     #[async_trait]
     impl Tool for BlockingReadTool {
         fn name(&self) -> &str {
@@ -158,21 +220,36 @@ mod tests {
             let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (holder_started_tx, holder_started_rx) = tokio::sync::oneshot::channel();
+            let (holder_release_tx, holder_release_rx) = tokio::sync::oneshot::channel();
             let mut registry = crate::tools::registry::ToolRegistry::new();
             registry.register(Box::new(BlockingReadTool {
                 started: std::sync::Mutex::new(Some(started_tx)),
                 dropped: Arc::clone(&dropped),
                 committed: Arc::clone(&committed),
             }));
+            registry.register(Box::new(BlockingWriteTool {
+                started: std::sync::Mutex::new(Some(holder_started_tx)),
+                release: std::sync::Mutex::new(Some(holder_release_rx)),
+            }));
             let permissions = crate::tools::permissions::PermissionManager::new()
                 .with_default_rule(crate::tools::permissions::PermissionRule::Allow);
             let patterns = tempfile::tempdir().unwrap();
-            let executor = crate::tools::executor::ToolExecutor::new(
+            let mut executor = crate::tools::executor::ToolExecutor::new(
                 registry,
                 permissions,
                 patterns.path().join("patterns.json"),
             )
             .unwrap();
+            let holder_use = crate::tools::types::ToolUse {
+                id: "unrelated-holder".into(),
+                name: "write".into(),
+                input: serde_json::json!({"path": "held", "content": "held"}),
+            };
+            executor.approve_exact_session(generate_tool_signature(
+                &holder_use,
+                std::path::Path::new("."),
+            ));
             let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
             let output = Arc::new(crate::cli::output_manager::OutputManager::default());
             let coordinator = ToolExecutionCoordinator::new(
@@ -188,6 +265,23 @@ mod tests {
                 Arc::new(RwLock::new(None)),
             );
             let query_states = Arc::new(super::super::query_state::QueryStateManager::new());
+            let holder_query_id = query_states.create_query(Vec::new()).await;
+            let holder_metadata = query_states.get_metadata(holder_query_id).await.unwrap();
+            let holder_unit = output.start_work_unit("unrelated holder");
+            let holder_row = holder_unit.add_row("blocking write");
+            coordinator.spawn_tool_execution(
+                holder_query_id,
+                holder_use,
+                holder_unit,
+                holder_row,
+                holder_metadata.cancellation_token,
+                query_states
+                    .begin_cancellation_sensitive_work(holder_query_id)
+                    .await
+                    .unwrap(),
+            );
+            holder_started_rx.await.unwrap();
+
             let query_id = query_states.create_query(Vec::new()).await;
             let metadata = query_states.get_metadata(query_id).await.unwrap();
             let query_work = query_states
@@ -245,6 +339,7 @@ mod tests {
                     effect_journal: Vec::new(),
                 }))
                 .is_err());
+            assert!(!holder_release_tx.is_closed());
 
             let mut replacement_call = runner.run_turn_request();
             write_turn_request(
@@ -270,7 +365,106 @@ mod tests {
                 .unwrap();
             replacement_rpc.await.unwrap().unwrap();
             assert!(!replacement.cancel.is_cancelled());
+
+            holder_release_tx.send(()).unwrap();
+            query_states.cancel_query(holder_query_id).await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                query_states.wait_for_cancellation_safe(holder_query_id),
+            )
+            .await
+            .expect("unrelated holder must cleanly retire");
         }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_wins_blocked_post_approval_lock_without_mutation_or_execution() {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut registry = crate::tools::registry::ToolRegistry::new();
+        registry.register(Box::new(RecordingWriteTool {
+            started: Arc::clone(&started),
+        }));
+        let patterns = tempfile::tempdir().unwrap();
+        let patterns_path = patterns.path().join("patterns.json");
+        let mutation_path = patterns.path().join("must-not-exist");
+        let executor = Arc::new(tokio::sync::Mutex::new(
+            crate::tools::executor::ToolExecutor::new(
+                registry,
+                crate::tools::permissions::PermissionManager::new(),
+                patterns_path.clone(),
+            )
+            .unwrap(),
+        ));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let output = Arc::new(crate::cli::output_manager::OutputManager::default());
+        let coordinator = ToolExecutionCoordinator::new(
+            event_tx,
+            Arc::clone(&executor),
+            Arc::clone(&output),
+            Arc::new(RwLock::new(
+                crate::cli::conversation::ConversationHistory::new(),
+            )),
+            Arc::new(RwLock::new(crate::local::LocalGenerator::new())),
+            Arc::new(crate::models::tokenizer::TextTokenizer::stub().unwrap()),
+            Arc::new(RwLock::new(crate::cli::ReplMode::Normal)),
+            Arc::new(RwLock::new(None)),
+        );
+        let query_states = super::super::query_state::QueryStateManager::new();
+        let query_id = query_states.create_query(Vec::new()).await;
+        let metadata = query_states.get_metadata(query_id).await.unwrap();
+        let tool_use = crate::tools::types::ToolUse {
+            id: "approval-race".into(),
+            name: "write".into(),
+            input: serde_json::json!({
+                "path": mutation_path.to_string_lossy(),
+                "content": "late"
+            }),
+        };
+        let signature = generate_tool_signature(&tool_use, std::path::Path::new("."));
+        let work_unit = output.start_work_unit("approval cancellation");
+        let row = work_unit.add_row("blocked write");
+        coordinator.spawn_tool_execution(
+            query_id,
+            tool_use,
+            work_unit,
+            row,
+            metadata.cancellation_token,
+            query_states
+                .begin_cancellation_sensitive_work(query_id)
+                .await
+                .unwrap(),
+        );
+        let approval_tx = match event_rx.recv().await.unwrap() {
+            ReplEvent::ToolApprovalNeeded { response_tx, .. } => response_tx,
+            _ => panic!("expected approval request"),
+        };
+        let mut holder = executor.lock().await;
+        approval_tx
+            .send(ConfirmationResult::ApproveExactPersistent(
+                signature.clone(),
+            ))
+            .unwrap();
+        query_states.cancel_query(query_id).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            query_states.wait_for_cancellation_safe(query_id),
+        )
+        .await
+        .expect("cancelled approval lock waiter must release its exact work fence");
+
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!patterns_path.exists());
+        assert!(!mutation_path.exists());
+        assert!(matches!(
+            holder.is_approved(&signature),
+            crate::tools::executor::ApprovalSource::NotApproved
+        ));
+        drop(holder);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), event_rx.recv(),)
+                .await
+                .is_err()
+        );
     }
 }
 
@@ -429,7 +623,17 @@ impl ToolExecutionCoordinator {
             let signature = generate_tool_signature(&tool_use, std::path::Path::new("."));
 
             // Check if tool needs approval
-            let approval_source = tool_executor.lock().await.is_approved(&signature);
+            let approval_source = {
+                let mut executor = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    executor = tool_executor.lock() => executor,
+                };
+                if cancel.is_cancelled() {
+                    return;
+                }
+                executor.is_approved(&signature)
+            };
 
             let is_auto_approved =
                 crate::tools::permissions::legacy_tool_effect(&tool_use.name, &tool_use.input)
@@ -472,33 +676,53 @@ impl ToolExecutionCoordinator {
                                 // Approved for this execution only, continue
                             }
                             ConfirmationResult::ApproveExactSession(sig) => {
-                                // Save session approval
-                                tool_executor.lock().await.approve_exact_session(sig);
+                                let mut executor = tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => return,
+                                    executor = tool_executor.lock() => executor,
+                                };
+                                if cancel.is_cancelled() {
+                                    return;
+                                }
+                                executor.approve_exact_session(sig);
                             }
                             ConfirmationResult::ApprovePatternSession(pattern) => {
-                                // Save session pattern approval
-                                tool_executor.lock().await.approve_pattern_session(pattern);
+                                let mut executor = tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => return,
+                                    executor = tool_executor.lock() => executor,
+                                };
+                                if cancel.is_cancelled() {
+                                    return;
+                                }
+                                executor.approve_pattern_session(pattern);
                             }
                             ConfirmationResult::ApproveExactPersistent(sig) => {
-                                // Save persistent approval and write to disk immediately
-                                {
-                                    let mut executor = tool_executor.lock().await;
-                                    executor.approve_exact_persistent(sig);
-                                    if let Err(e) = executor.save_patterns() {
-                                        tracing::warn!("Failed to save persistent approval: {}", e);
-                                        // Continue anyway - approval is in memory
-                                    }
+                                let mut executor = tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => return,
+                                    executor = tool_executor.lock() => executor,
+                                };
+                                if cancel.is_cancelled() {
+                                    return;
+                                }
+                                executor.approve_exact_persistent(sig);
+                                if let Err(e) = executor.save_patterns() {
+                                    tracing::warn!("Failed to save persistent approval: {}", e);
                                 }
                             }
                             ConfirmationResult::ApprovePatternPersistent(pattern) => {
-                                // Save persistent pattern approval and write to disk immediately
-                                {
-                                    let mut executor = tool_executor.lock().await;
-                                    executor.approve_pattern_persistent(pattern);
-                                    if let Err(e) = executor.save_patterns() {
-                                        tracing::warn!("Failed to save persistent pattern: {}", e);
-                                        // Continue anyway - pattern is in memory
-                                    }
+                                let mut executor = tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => return,
+                                    executor = tool_executor.lock() => executor,
+                                };
+                                if cancel.is_cancelled() {
+                                    return;
+                                }
+                                executor.approve_pattern_persistent(pattern);
+                                if let Err(e) = executor.save_patterns() {
+                                    tracing::warn!("Failed to save persistent pattern: {}", e);
                                 }
                             }
                             ConfirmationResult::ApproveWithInput(new_input) => {
@@ -533,26 +757,45 @@ impl ToolExecutionCoordinator {
             }
 
             // Tool approved (or doesn't need approval), execute it
-            let conversation_snapshot = conversation.read().await.clone();
-
-            // Wire the poset into the executor so tool calls auto-record trace nodes.
-            tool_executor.lock().await.poset = poset.clone();
-
-            // Editor-backed proposal tools explicitly suspend on a human review;
-            // that wait is not a process timeout. Those adapters enforce their
-            // own timeout only after they have an accepted script to execute.
-            let timeout_duration = tool_executor.lock().await.execution_timeout(&tool_use.name);
-            let executor = tool_executor.lock().await;
-            let execute = executor.execute_tool::<fn() -> anyhow::Result<()>>(
+            let conversation_snapshot = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                conversation = conversation.read() => conversation.clone(),
+            };
+            if cancel.is_cancelled() {
+                return;
+            }
+            let prepared = {
+                let executor = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    executor = tool_executor.lock() => executor,
+                };
+                if cancel.is_cancelled() {
+                    return;
+                }
+                match executor.prepare_event_loop_execution(&tool_use, poset) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        let _ = event_tx.send(ReplEvent::ToolResult {
+                            query_id,
+                            tool_id: tool_use.id.clone(),
+                            result: Err(error),
+                        });
+                        return;
+                    }
+                }
+            };
+            let timeout_duration = prepared.timeout();
+            let execute = prepared.execute(
                 &tool_use,
                 Some(&conversation_snapshot),
-                None, // save_fn (not needed in event loop)
-                None, // router (for training)
-                Some(Arc::clone(&local_generator)),
-                Some(Arc::clone(&tokenizer)),
-                Some(Arc::clone(&repl_mode)),
-                Some(Arc::clone(&plan_content)),
-                Some(Arc::clone(&live_output)),
+                Arc::clone(&local_generator),
+                Arc::clone(&tokenizer),
+                Arc::clone(&repl_mode),
+                Arc::clone(&plan_content),
+                Arc::clone(&live_output),
+                &cancel,
             );
             let execution = async {
                 match timeout_duration {

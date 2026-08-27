@@ -232,6 +232,141 @@ pub struct ToolExecutor {
     pub poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
 }
 
+enum PreparedToolTarget {
+    BuiltIn(Arc<dyn crate::tools::registry::Tool>),
+    Mcp(Arc<crate::tools::mcp::McpClient>),
+    Rejected(String),
+}
+
+/// Immutable execution snapshot used by the event loop after releasing the
+/// global ToolExecutor coordination lock.
+pub(crate) struct PreparedToolExecution {
+    target: PreparedToolTarget,
+    timeout: Option<std::time::Duration>,
+    poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
+}
+
+impl PreparedToolExecution {
+    pub(crate) fn timeout(&self) -> Option<std::time::Duration> {
+        self.timeout
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute(
+        &self,
+        tool_use: &ToolUse,
+        conversation: Option<&ConversationHistory>,
+        local_generator: Arc<tokio::sync::RwLock<crate::local::LocalGenerator>>,
+        tokenizer: Arc<crate::models::tokenizer::TextTokenizer>,
+        repl_mode: Arc<tokio::sync::RwLock<crate::cli::ReplMode>>,
+        plan_content: Arc<tokio::sync::RwLock<Option<String>>>,
+        live_output: crate::tools::types::LiveOutput,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<ToolResult> {
+        let mode = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => anyhow::bail!("tool execution cancelled"),
+            mode = repl_mode.read() => mode,
+        };
+        if cancel.is_cancelled() {
+            anyhow::bail!("tool execution cancelled");
+        }
+        if matches!(&*mode, crate::cli::ReplMode::Planning { .. })
+            && !matches!(
+                tool_use.name.as_str(),
+                "read"
+                    | "glob"
+                    | "grep"
+                    | "web_fetch"
+                    | "enter_plan_mode"
+                    | "EnterPlanMode"
+                    | "present_plan"
+                    | "PresentPlan"
+                    | "ask_user_question"
+                    | "AskUserQuestion"
+            )
+        {
+            return Ok(ToolResult::error(
+                tool_use.id.clone(),
+                format!(
+                    "Tool '{}' is not allowed in planning mode.\n\
+                     Available tools: read, glob, grep, web_fetch, present_plan, ask_user_question\n\
+                     Use present_plan to show your plan for approval.",
+                    tool_use.name
+                ),
+            ));
+        }
+        drop(mode);
+
+        let output = match &self.target {
+            PreparedToolTarget::Rejected(reason) => {
+                return Ok(ToolResult::error(tool_use.id.clone(), reason.clone()));
+            }
+            PreparedToolTarget::Mcp(client) => {
+                match client
+                    .execute_tool(&tool_use.name, tool_use.input.clone())
+                    .await
+                {
+                    Ok(output) => output,
+                    Err(error) => {
+                        return Ok(ToolResult::error(
+                            tool_use.id.clone(),
+                            format!("MCP execution error: {error}"),
+                        ));
+                    }
+                }
+            }
+            PreparedToolTarget::BuiltIn(tool) => {
+                let context = crate::tools::types::ToolContext {
+                    conversation,
+                    save_models: None,
+                    batch_trainer: None,
+                    local_generator: Some(local_generator),
+                    tokenizer: Some(tokenizer),
+                    repl_mode: Some(repl_mode),
+                    plan_content: Some(plan_content),
+                    live_output: Some(live_output),
+                    poset: None,
+                };
+                match tool.execute(tool_use.input.clone(), &context).await {
+                    Ok(output) => output,
+                    Err(error) => {
+                        return Ok(ToolResult::error(
+                            tool_use.id.clone(),
+                            format!("Execution error: {error}"),
+                        ));
+                    }
+                }
+            }
+        };
+
+        if cancel.is_cancelled() {
+            anyhow::bail!("tool execution cancelled");
+        }
+        if !matches!(tool_use.name.as_str(), "push" | "pop_stack") {
+            if let Some(poset) = &self.poset {
+                let mut poset = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => anyhow::bail!("tool execution cancelled"),
+                    poset = poset.lock() => poset,
+                };
+                if cancel.is_cancelled() {
+                    anyhow::bail!("tool execution cancelled");
+                }
+                let new_id = poset.add_node(
+                    tool_label(&tool_use.name, &tool_use.input),
+                    tool_kind(&tool_use.name),
+                    crate::poset::NodeAuthor::Ai,
+                );
+                if new_id > 0 {
+                    poset.edges.push((new_id - 1, new_id));
+                }
+            }
+        }
+        Ok(ToolResult::success(tool_use.id.clone(), output))
+    }
+}
+
 impl ToolExecutor {
     /// Create new tool executor with persistent patterns path
     pub fn new(
@@ -302,6 +437,39 @@ impl ToolExecutor {
             .as_ref()
             .and_then(|client| client.timeout_for_tool(tool_name))
             .or_else(|| Some(std::time::Duration::from_secs(30)))
+    }
+
+    /// Snapshot one event-loop execution without retaining this executor's
+    /// global coordination lock across an async tool or editor lifetime.
+    pub(crate) fn prepare_event_loop_execution(
+        &self,
+        tool_use: &ToolUse,
+        poset: Option<Arc<tokio::sync::Mutex<crate::poset::Poset>>>,
+    ) -> Result<PreparedToolExecution> {
+        let permission = self
+            .permissions
+            .check_tool_use(&tool_use.name, &tool_use.input);
+        let target = if let PermissionCheck::Deny(reason) = permission {
+            PreparedToolTarget::Rejected(reason)
+        } else if tool_use.name.starts_with("mcp_") {
+            match &self.mcp_client {
+                Some(client) => PreparedToolTarget::Mcp(Arc::clone(client)),
+                None => PreparedToolTarget::Rejected(
+                    "MCP tools not available (no MCP servers configured)".into(),
+                ),
+            }
+        } else {
+            PreparedToolTarget::BuiltIn(
+                self.registry
+                    .get_shared(&tool_use.name)
+                    .with_context(|| format!("Tool '{}' not found", tool_use.name))?,
+            )
+        };
+        Ok(PreparedToolExecution {
+            target,
+            timeout: self.execution_timeout(&tool_use.name),
+            poset,
+        })
     }
 
     /// Get list of all available tools (built-in + MCP)
@@ -830,7 +998,9 @@ mod tests {
         assert!(executor.execution_timeout("edit").is_none());
         assert!(executor.execution_timeout("write").is_none());
         assert_eq!(
-            executor.execution_timeout("mock").map(|duration| duration.as_secs()),
+            executor
+                .execution_timeout("mock")
+                .map(|duration| duration.as_secs()),
             Some(30)
         );
     }

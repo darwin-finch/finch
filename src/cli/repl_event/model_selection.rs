@@ -188,6 +188,38 @@ pub(crate) struct GeneratorPins {
 }
 
 impl GeneratorPins {
+    pub(crate) async fn for_turn_until_cancelled(
+        &self,
+        query_id: Uuid,
+        new_query: bool,
+        active: Arc<dyn Generator>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Option<Arc<dyn Generator>> {
+        if !new_query {
+            let generators = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return None,
+                generators = self.generators.read() => generators,
+            };
+            if cancel.is_cancelled() {
+                return None;
+            }
+            if let Some(generator) = generators.get(&query_id).cloned() {
+                return Some(generator);
+            }
+        }
+        let mut generators = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return None,
+            generators = self.generators.write() => generators,
+        };
+        if cancel.is_cancelled() {
+            return None;
+        }
+        generators.insert(query_id, Arc::clone(&active));
+        Some(active)
+    }
+
     pub(crate) async fn for_turn(
         &self,
         query_id: Uuid,

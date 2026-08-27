@@ -37,6 +37,28 @@ async fn run_query_until_cancelled(
         _ = processing => {}
     }
 }
+
+async fn reset_graph_until_cancelled(
+    graph: &tokio::sync::Mutex<crate::graph::ExecutionGraph>,
+    query_id: Uuid,
+    query: &str,
+    session_label: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> bool {
+    let mut graph = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return false,
+        graph = graph.lock() => graph,
+    };
+    if cancel.is_cancelled() {
+        return false;
+    }
+    graph.reset(query_id, session_label);
+    graph.add_node(crate::graph::NodeKind::UserInput {
+        text: query.to_string(),
+    });
+    true
+}
 use super::tool_execution::ToolExecutionCoordinator;
 
 /// LLM worker loop — owns AI generation concerns, runs as its own Tokio task.
@@ -178,35 +200,46 @@ impl LlmLoop {
     /// `query = ""` for tool-continuation turns (graph is not reset).
     /// `no_tools = true` suppresses tool definitions for conversational turns.
     async fn spawn_query(&self, query_id: Uuid, query: String, no_tools: bool) {
-        let Some(query_work) = self
+        let Some(query_cancel) = self
             .query_states
-            .begin_cancellation_sensitive_work(query_id)
+            .get_metadata(query_id)
             .await
+            .map(|metadata| metadata.cancellation_token)
         else {
             return;
         };
         // Reset the execution graph on fresh queries (not tool continuations).
-        if !query.is_empty() {
-            let mut g = self.current_graph.lock().await;
-            g.reset(query_id, &self.session_label);
-            g.add_node(crate::graph::NodeKind::UserInput {
-                text: query.clone(),
-            });
+        if !query.is_empty()
+            && !reset_graph_until_cancelled(
+                self.current_graph.as_ref(),
+                query_id,
+                &query,
+                &self.session_label,
+                &query_cancel,
+            )
+            .await
+        {
+            return;
         }
 
         let event_tx = self.event_tx.clone();
-        let active_generator = self.cloud_gen.read().await.clone();
-        let claude_gen = self
-            .pinned_generators
-            .for_turn(query_id, !query.is_empty(), active_generator)
-            .await;
+        let active_generator = tokio::select! {
+            biased;
+            _ = query_cancel.cancelled() => return,
+            generator = self.cloud_gen.read() => generator.clone(),
+        };
         let qwen_gen = Arc::clone(&self.qwen_gen);
         let router = Arc::clone(&self.router);
         let generator_state = Arc::clone(&self.generator_state);
         let tool_defs: Arc<Vec<ToolDefinition>> = if no_tools {
             Arc::new(vec![])
         } else {
-            Arc::new(self.tool_definitions.read().await.clone())
+            let definitions = tokio::select! {
+                biased;
+                _ = query_cancel.cancelled() => return,
+                definitions = self.tool_definitions.read() => definitions.clone(),
+            };
+            Arc::new(definitions)
         };
         let conversation = Arc::clone(&self.conversation);
         let query_states = Arc::clone(&self.query_states);
@@ -227,17 +260,28 @@ impl LlmLoop {
         let enable_summarization = self.enable_summarization;
         let auto_compact_enabled = self.auto_compact_enabled;
         let wire_metrics_logger = self.wire_metrics_logger.clone();
-        let persona_system_prompt = self.active_persona.read().await.to_system_message();
-        // Always use the capable cloud model for summarisation, regardless of routing.
-        let summary_gen = Arc::clone(&claude_gen);
+        let persona_system_prompt = tokio::select! {
+            biased;
+            _ = query_cancel.cancelled() => return,
+            persona = self.active_persona.read() => persona.to_system_message(),
+        };
         let tool_call_history = Arc::clone(&self.tool_call_history);
         let pinned_generators = Arc::clone(&self.pinned_generators);
         let terminal_query_states = Arc::clone(&query_states);
-        let query_cancel = query_states
-            .get_metadata(query_id)
+        let Some(query_work) = query_states
+            .begin_cancellation_sensitive_work(query_id)
             .await
-            .map(|metadata| metadata.cancellation_token)
-            .unwrap_or_default();
+        else {
+            return;
+        };
+        let Some(claude_gen) = pinned_generators
+            .for_turn_until_cancelled(query_id, !query.is_empty(), active_generator, &query_cancel)
+            .await
+        else {
+            return;
+        };
+        // Always use the capable cloud model for summarisation, regardless of routing.
+        let summary_gen = Arc::clone(&claude_gen);
 
         tokio::spawn(async move {
             let _query_work = query_work;
@@ -316,5 +360,43 @@ mod tests {
             .expect("cancelled provider generation must terminate")
             .unwrap();
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_setup_lock_cancellation_resolves_before_lock_release() {
+        let graph =
+            std::sync::Arc::new(tokio::sync::Mutex::new(crate::graph::ExecutionGraph::new()));
+        let held = graph.lock().await;
+        let query_states = super::QueryStateManager::new();
+        let query_id = query_states.create_query(Vec::new()).await;
+        let cancel = query_states
+            .get_metadata(query_id)
+            .await
+            .unwrap()
+            .cancellation_token;
+        let setup = {
+            let graph = std::sync::Arc::clone(&graph);
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                super::reset_graph_until_cancelled(
+                    graph.as_ref(),
+                    query_id,
+                    "blocked setup",
+                    "test",
+                    &cancel,
+                )
+                .await
+            })
+        };
+
+        query_states.cancel_query(query_id).await;
+        query_states.wait_for_cancellation_safe(query_id).await;
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(1), setup)
+                .await
+                .expect("setup lock wait must observe exact cancellation")
+                .unwrap()
+        );
+        drop(held);
     }
 }
