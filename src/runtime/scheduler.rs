@@ -128,6 +128,8 @@ pub struct ProviderResolver {
     active: Arc<RwLock<Arc<dyn Generator>>>,
     profiles: Arc<Vec<crate::config::ProviderEntry>>,
     daemon_client: Option<Arc<crate::client::DaemonClient>>,
+    config: Option<Arc<crate::config::Config>>,
+    credential_resolver: Option<Arc<dyn crate::config::CredentialResolver>>,
 }
 
 impl ProviderResolver {
@@ -136,6 +138,8 @@ impl ProviderResolver {
             active: Arc::new(RwLock::new(active)),
             profiles: Arc::new(Vec::new()),
             daemon_client: None,
+            config: None,
+            credential_resolver: None,
         }
     }
 
@@ -148,6 +152,37 @@ impl ProviderResolver {
             active: Arc::new(RwLock::new(active)),
             profiles: Arc::new(profiles),
             daemon_client,
+            config: None,
+            credential_resolver: None,
+        }
+    }
+
+    pub fn with_config(
+        active: Arc<dyn Generator>,
+        config: crate::config::Config,
+        daemon_client: Option<Arc<crate::client::DaemonClient>>,
+    ) -> Self {
+        Self {
+            active: Arc::new(RwLock::new(active)),
+            profiles: Arc::new(config.providers.clone()),
+            daemon_client,
+            config: Some(Arc::new(config)),
+            credential_resolver: Some(Arc::new(crate::config::EnvironmentCredentialResolver)),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_config_and_credential_resolver(
+        active: Arc<dyn Generator>,
+        config: crate::config::Config,
+        resolver: Arc<dyn crate::config::CredentialResolver>,
+    ) -> Self {
+        Self {
+            active: Arc::new(RwLock::new(active)),
+            profiles: Arc::new(config.providers.clone()),
+            daemon_client: None,
+            config: Some(Arc::new(config)),
+            credential_resolver: Some(resolver),
         }
     }
 
@@ -178,16 +213,39 @@ impl ProviderResolver {
                 requested == entry.profile_name() || entry.model() == Some(requested)
             })
         };
-        let Some(entry) = self
-            .profiles
-            .iter()
-            .find(|entry| matches_provider(entry) && matches_model(entry))
-        else {
-            let requested = model.or(provider).unwrap_or("unknown");
-            if requested == active.name() {
-                return Ok(active);
+        let mut exact = self.profiles.iter().filter(|entry| {
+            provider.is_some_and(|requested| requested == entry.profile_name())
+                || model.is_some_and(|requested| requested == entry.profile_name())
+        });
+        let exact_entry = exact.next();
+        if exact.next().is_some() {
+            bail!("NoEligibleModel: provider and model selectors name conflicting exact profiles");
+        }
+        let entry = if let Some(entry) = exact_entry {
+            if !matches_provider(entry) || !matches_model(entry) {
+                let requested = model.or(provider).unwrap_or("unknown");
+                bail!("NoEligibleModel: no configured profile matches '{requested}'");
             }
-            bail!("NoEligibleModel: no configured profile matches '{requested}'");
+            entry
+        } else {
+            let mut matches = self.profiles.iter().filter(|entry| {
+                provider.is_none_or(|requested| requested == entry.provider_type())
+                    && model.is_none_or(|requested| entry.model() == Some(requested))
+            });
+            let Some(entry) = matches.next() else {
+                let requested = model.or(provider).unwrap_or("unknown");
+                if requested == active.name() {
+                    return Ok(active);
+                }
+                bail!("NoEligibleModel: no configured profile matches '{requested}'");
+            };
+            if matches.next().is_some() {
+                let requested = model.or(provider).unwrap_or("unknown");
+                bail!(
+                    "NoEligibleModel: configured profile selection '{requested}' is ambiguous; select an exact profile name so Finch cannot choose an implicit credential account"
+                );
+            }
+            entry
         };
         if entry.profile_name() == active.name() {
             return Ok(active);
@@ -203,8 +261,20 @@ impl ProviderResolver {
                 ),
             ));
         }
-        let provider = crate::providers::create_provider_from_entry(entry)?;
-        let client = crate::claude::ClaudeClient::with_provider(provider);
+        let provider: Arc<dyn crate::providers::LlmProvider> = if let Some(config) = &self.config {
+            let resolver = self
+                .credential_resolver
+                .as_deref()
+                .expect("complete config always carries its credential resolver");
+            crate::providers::create_provider_profile_from_config_with_resolver(
+                config,
+                &entry.profile_name(),
+                resolver,
+            )?
+        } else {
+            Arc::from(crate::providers::create_provider_from_entry(entry)?)
+        };
+        let client = crate::claude::ClaudeClient::with_shared_provider(provider);
         let inner: Arc<dyn Generator> = Arc::new(crate::generators::claude::ClaudeGenerator::new(
             Arc::new(client),
         ));
@@ -989,10 +1059,87 @@ fn truncate(mut value: String, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle,
+        CredentialProvider, CredentialResolver, ProviderCredential, ProviderEntry,
+        ResolvedCredential, ResolvedSecret,
+    };
     use crate::generators::{GeneratorCapabilities, GeneratorResponse, ResponseMetadata};
     use crate::tools::types::ToolDefinition;
     use crate::vm::{CapabilityKind, CapabilityRequirement, ResourceSelector};
     use async_trait::async_trait;
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
+    struct AccountResolver;
+
+    #[derive(Default)]
+    struct TrackingAccountResolver {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl CredentialResolver for AccountResolver {
+        fn resolve(&self, credential: &ProviderCredential) -> Result<ResolvedCredential> {
+            let secret = match credential.name.as_str() {
+                "account-a" => "account-a-key",
+                "account-b" => "account-b-key",
+                other => anyhow::bail!("unexpected credential {other}"),
+            };
+            Ok(ResolvedCredential {
+                credential_name: credential.name.clone(),
+                secret: ResolvedSecret::new(secret)?,
+            })
+        }
+    }
+
+    impl CredentialResolver for TrackingAccountResolver {
+        fn resolve(&self, credential: &ProviderCredential) -> Result<ResolvedCredential> {
+            self.calls.lock().unwrap().push(credential.name.clone());
+            AccountResolver.resolve(credential)
+        }
+    }
+
+    fn named_account_profile(
+        name: &str,
+        credential_ref: &str,
+        account: &str,
+        endpoint: &str,
+    ) -> ProviderEntry {
+        ProviderEntry::Credentialed {
+            provider: CredentialProvider::OpenaiPlatform,
+            credential: CredentialBinding {
+                credential_ref: credential_ref.into(),
+                audience: Some(AudienceBinding::custom(endpoint).unwrap()),
+                tenant: None,
+                project: None,
+                account: Some(account.into()),
+                required_scopes: BTreeSet::new(),
+            },
+            model: Some("gpt-4o".into()),
+            base_url: Some(endpoint.into()),
+            chat_path: None,
+            models_path: None,
+            name: Some(name.into()),
+            reasoning_effort: None,
+        }
+    }
+
+    fn named_account_credential(name: &str, account: &str, endpoint: &str) -> ProviderCredential {
+        ProviderCredential {
+            name: name.into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::OpenaiPlatform,
+            issuer: "openai-platform".into(),
+            audience: AudienceBinding::custom(endpoint).unwrap(),
+            tenant: None,
+            project: None,
+            account: Some(account.into()),
+            scopes: BTreeSet::new(),
+            secret_ref: format!("test:{name}"),
+            lifecycle: CredentialLifecycle::default(),
+            revocation: Default::default(),
+        }
+    }
 
     fn grant_agent_capabilities(runtime: &ProgramRuntime) {
         for capability in [
@@ -1096,6 +1243,179 @@ mod tests {
         fn name(&self) -> &str {
             "blocking"
         }
+    }
+
+    #[tokio::test]
+    async fn child_model_selection_keeps_named_accounts_isolated() {
+        let mut server_a = mockito::Server::new_async().await;
+        let mut server_b = mockito::Server::new_async().await;
+        let account_a = server_a
+            .mock("POST", "/v1/chat/completions")
+            .match_header("authorization", "Bearer account-a-key")
+            .expect(0)
+            .create_async()
+            .await;
+        let account_b = server_b
+            .mock("POST", "/v1/chat/completions")
+            .match_header("authorization", "Bearer account-b-key")
+            .with_status(200)
+            .with_body(r#"{"id":"chat-1","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"account-b"},"finish_reason":"stop"}]}"#)
+            .create_async()
+            .await;
+        let config = crate::config::Config::with_providers(vec![
+            named_account_profile("profile-a", "account-a", "a", &server_a.url()),
+            named_account_profile("profile-b", "account-b", "b", &server_b.url()),
+        ])
+        .with_credentials(vec![
+            named_account_credential("account-a", "a", &server_a.url()),
+            named_account_credential("account-b", "b", &server_b.url()),
+        ]);
+        let resolver = ProviderResolver::with_config_and_credential_resolver(
+            Arc::new(EchoGenerator),
+            config,
+            Arc::new(AccountResolver),
+        );
+
+        let selected = resolver.resolve(Some("profile-b"), None).await.unwrap();
+        let response = selected
+            .generate(vec![Message::user("use the selected account")], None)
+            .await
+            .unwrap();
+
+        assert_eq!(response.text, "account-b");
+        account_a.assert_async().await;
+        account_b.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn child_model_selection_rejects_invalid_complete_graph_before_resolution_or_http() {
+        struct PanicResolver;
+        impl CredentialResolver for PanicResolver {
+            fn resolve(&self, _: &ProviderCredential) -> Result<ResolvedCredential> {
+                panic!("invalid child graph reached credential resolution")
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let valid = named_account_profile("profile-a", "account-a", "a", &endpoint);
+        let invalid = named_account_profile("profile-b", "missing", "b", &endpoint);
+        let config = crate::config::Config::with_providers(vec![valid, invalid])
+            .with_credentials(vec![named_account_credential("account-a", "a", &endpoint)]);
+        let resolver = ProviderResolver::with_config_and_credential_resolver(
+            Arc::new(EchoGenerator),
+            config,
+            Arc::new(PanicResolver),
+        );
+
+        let error = resolver
+            .resolve(Some("profile-a"), None)
+            .await
+            .err()
+            .expect("invalid sibling binding must reject child model selection");
+        assert!(format!("{error:#}").contains("missing credential 'missing'"));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[tokio::test]
+    async fn child_model_selection_rejects_ambiguous_account_without_resolution_or_http() {
+        struct PanicResolver;
+        impl CredentialResolver for PanicResolver {
+            fn resolve(&self, _: &ProviderCredential) -> Result<ResolvedCredential> {
+                panic!("ambiguous child selection reached credential resolution")
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let config = crate::config::Config::with_providers(vec![
+            named_account_profile("profile-a", "account-a", "a", &endpoint),
+            named_account_profile("profile-b", "account-b", "b", &endpoint),
+        ])
+        .with_credentials(vec![
+            named_account_credential("account-a", "a", &endpoint),
+            named_account_credential("account-b", "b", &endpoint),
+        ]);
+        let resolver = ProviderResolver::with_config_and_credential_resolver(
+            Arc::new(EchoGenerator),
+            config,
+            Arc::new(PanicResolver),
+        );
+
+        let error = resolver
+            .resolve(None, Some("gpt-4o"))
+            .await
+            .err()
+            .expect("model-only selection must not choose an implicit account");
+        assert!(error.to_string().contains("ambiguous"));
+        assert!(error.to_string().contains("exact profile name"));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[tokio::test]
+    async fn child_exact_profile_name_precedes_provider_and_model_alias_collisions() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+
+        let provider_collision = crate::config::Config::with_providers(vec![
+            named_account_profile("openai_platform", "account-a", "a", &endpoint),
+            named_account_profile("other-account-profile", "account-b", "b", &endpoint),
+        ])
+        .with_credentials(vec![
+            named_account_credential("account-a", "a", &endpoint),
+            named_account_credential("account-b", "b", &endpoint),
+        ]);
+        let provider_store = Arc::new(TrackingAccountResolver::default());
+        let provider_resolver = ProviderResolver::with_config_and_credential_resolver(
+            Arc::new(EchoGenerator),
+            provider_collision,
+            provider_store.clone(),
+        );
+        let selected = provider_resolver
+            .resolve(Some("openai_platform"), None)
+            .await
+            .unwrap();
+        assert_eq!(selected.name(), "openai_platform");
+        assert_eq!(
+            provider_store.calls.lock().unwrap().as_slice(),
+            ["account-a"]
+        );
+
+        let mut exact_model_profile = named_account_profile("gpt-4o", "account-b", "b", &endpoint);
+        if let ProviderEntry::Credentialed { model, .. } = &mut exact_model_profile {
+            *model = Some("gpt-4o-mini".into());
+        }
+        let model_collision = crate::config::Config::with_providers(vec![
+            exact_model_profile,
+            named_account_profile("model-alias-profile", "account-a", "a", &endpoint),
+        ])
+        .with_credentials(vec![
+            named_account_credential("account-a", "a", &endpoint),
+            named_account_credential("account-b", "b", &endpoint),
+        ]);
+        let model_store = Arc::new(TrackingAccountResolver::default());
+        let model_resolver = ProviderResolver::with_config_and_credential_resolver(
+            Arc::new(EchoGenerator),
+            model_collision,
+            model_store.clone(),
+        );
+        let selected = model_resolver.resolve(None, Some("gpt-4o")).await.unwrap();
+        assert_eq!(selected.name(), "gpt-4o");
+        assert_eq!(model_store.calls.lock().unwrap().as_slice(), ["account-b"]);
+
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[tokio::test]

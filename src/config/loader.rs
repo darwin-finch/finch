@@ -99,6 +99,8 @@ where
         // New unified format
         #[serde(default)]
         providers: Vec<ProviderEntry>,
+        #[serde(default)]
+        credentials: Vec<super::ProviderCredential>,
         // Legacy fields — kept for reading old configs
         #[serde(default)]
         backend: Option<BackendConfig>,
@@ -159,6 +161,7 @@ where
     }
 
     let mut config = config_factory(providers);
+    config.replace_loaded_credentials(toml_config.credentials);
 
     if let Some(coreml) = toml_config.coreml.or(legacy_coreml) {
         config.backend.coreml = coreml;

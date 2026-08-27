@@ -1,6 +1,7 @@
 // Unified provider entry — covers both cloud and local inference backends.
 
 use crate::config::backend::ExecutionTarget;
+use crate::config::credential::{CredentialBinding, CredentialProvider};
 use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -74,9 +75,27 @@ fn default_model_size() -> ModelSize {
 /// inference_provider = "onnx"
 /// execution_target = "coreml"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ProviderEntry {
+    /// A cloud model profile bound to a first-class named credential.
+    #[serde(rename = "credentialed")]
+    Credentialed {
+        provider: CredentialProvider,
+        credential: CredentialBinding,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        models_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<ReasoningEffort>,
+    },
     #[serde(rename = "chatgpt_subscription")]
     /// Legacy Codex app-server profile retained only so old configuration can
     /// be diagnosed without silently treating a subscription as a Platform key.
@@ -209,6 +228,20 @@ pub enum ProviderEntry {
     },
 }
 
+impl std::fmt::Debug for ProviderEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("ProviderEntry");
+        debug.field("type", &self.provider_type());
+        debug.field("profile_name", &self.profile_name());
+        if let Some(binding) = self.credential_binding() {
+            debug.field("credential_ref", &binding.credential_ref);
+        } else if self.api_key().is_some() {
+            debug.field("legacy_inline_api_key", &"[REDACTED]");
+        }
+        debug.finish_non_exhaustive()
+    }
+}
+
 impl ProviderEntry {
     /// Stable, user-facing selector for this configured provider profile.
     ///
@@ -216,7 +249,8 @@ impl ProviderEntry {
     /// falling back to the configured model, then to a provider-specific label.
     pub fn profile_name(&self) -> String {
         let explicit_name = match self {
-            Self::LegacyChatgptSubscription { name, .. }
+            Self::Credentialed { name, .. }
+            | Self::LegacyChatgptSubscription { name, .. }
             | Self::Claude { name, .. }
             | Self::Openai { name, .. }
             | Self::Grok { name, .. }
@@ -237,6 +271,7 @@ impl ProviderEntry {
         }
 
         match self {
+            Self::Credentialed { provider, .. } => provider.as_str().to_string(),
             Self::LegacyChatgptSubscription { .. } => "chatgpt-subscription-legacy".to_string(),
             Self::Local {
                 model_family,
@@ -258,6 +293,9 @@ impl ProviderEntry {
     /// Human-readable name for UI display.
     pub fn display_name(&self) -> &str {
         match self {
+            Self::Credentialed { name, provider, .. } => {
+                name.as_deref().unwrap_or_else(|| provider.as_str())
+            }
             Self::LegacyChatgptSubscription { name, .. } => name
                 .as_deref()
                 .unwrap_or("Unsupported legacy ChatGPT subscription"),
@@ -276,6 +314,7 @@ impl ProviderEntry {
     /// Short provider-type tag (e.g. "claude", "grok", "local").
     pub fn provider_type(&self) -> &'static str {
         match self {
+            Self::Credentialed { provider, .. } => provider.as_str(),
             Self::LegacyChatgptSubscription { .. } => "chatgpt_subscription",
             Self::Claude { .. } => "claude",
             Self::Openai { .. } => "openai",
@@ -303,7 +342,8 @@ impl ProviderEntry {
             Self::Gemini { api_key, .. } => Some(api_key.as_str()),
             Self::Mistral { api_key, .. } => Some(api_key.as_str()),
             Self::Groq { api_key, .. } => Some(api_key.as_str()),
-            Self::LegacyChatgptSubscription { .. }
+            Self::Credentialed { .. }
+            | Self::LegacyChatgptSubscription { .. }
             | Self::Ollama { .. }
             | Self::RemoteDaemon { .. }
             | Self::Local { .. } => None,
@@ -313,6 +353,7 @@ impl ProviderEntry {
     /// Optional model override (cloud providers only).
     pub fn model(&self) -> Option<&str> {
         match self {
+            Self::Credentialed { model, .. } => model.as_deref(),
             Self::LegacyChatgptSubscription { model, .. } => model.as_deref(),
             Self::Claude { model, .. } => model.as_deref(),
             Self::Openai { model, .. } => model.as_deref(),
@@ -322,6 +363,30 @@ impl ProviderEntry {
             Self::Groq { model, .. } => model.as_deref(),
             Self::Ollama { model, .. } => Some(model.as_str()),
             Self::RemoteDaemon { .. } | Self::Local { .. } => None,
+        }
+    }
+
+    /// Named provider credential binding, if this is a credentialed profile.
+    pub fn credential_binding(&self) -> Option<&CredentialBinding> {
+        match self {
+            Self::Credentialed { credential, .. } => Some(credential),
+            _ => None,
+        }
+    }
+
+    /// Named credential provider namespace, if applicable.
+    pub fn credential_provider(&self) -> Option<CredentialProvider> {
+        match self {
+            Self::Credentialed { provider, .. } => Some(*provider),
+            _ => None,
+        }
+    }
+
+    /// Configured base endpoint for credential audience validation.
+    pub fn credential_base_url(&self) -> Option<&str> {
+        match self {
+            Self::Credentialed { base_url, .. } => base_url.as_deref(),
+            _ => None,
         }
     }
 }
@@ -343,6 +408,22 @@ mod tests {
         let toml = toml::to_string(&entry).unwrap();
         let decoded: ProviderEntry = toml::from_str(&toml).unwrap();
         assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn test_legacy_inline_api_key_debug_is_redacted() {
+        let secret = "sk-ant-super-secret-marker";
+        let entry = ProviderEntry::Claude {
+            api_key: secret.into(),
+            model: None,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("legacy".into()),
+        };
+        let debug = format!("{entry:?}");
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED]"));
     }
 
     #[test]

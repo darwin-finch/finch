@@ -165,6 +165,21 @@ fn model_catalog_profile(
     let (base_url, chat_path, models_path, auth) = match (provider, persisted) {
         (
             "claude",
+            Some(ProviderEntry::Credentialed {
+                provider: crate::config::CredentialProvider::Anthropic,
+                base_url,
+                chat_path,
+                models_path,
+                ..
+            }),
+        ) => (
+            base_url.as_deref().unwrap_or("https://api.anthropic.com"),
+            chat_path.as_deref().unwrap_or("/v1/messages"),
+            models_path.as_deref().unwrap_or("/v1/models"),
+            CatalogAuth::AnthropicApiKey,
+        ),
+        (
+            "claude",
             Some(ProviderEntry::Claude {
                 base_url,
                 chat_path,
@@ -197,12 +212,36 @@ fn model_catalog_profile(
             models_path.as_deref().unwrap_or("/v1/models"),
             CatalogAuth::Bearer,
         ),
-        ("openai", _) => (
+        ("openai", persisted)
+            if !matches!(persisted, Some(ProviderEntry::Credentialed { .. })) => (
             "https://api.openai.com",
             "/v1/chat/completions",
             "/v1/models",
             CatalogAuth::Bearer,
         ),
+        (
+            "openai" | "grok" | "mistral" | "groq",
+            Some(ProviderEntry::Credentialed {
+                base_url,
+                chat_path,
+                models_path,
+                ..
+            }),
+        ) => {
+            let (default_base, default_chat, default_models) = match provider {
+                "openai" => ("https://api.openai.com", "/v1/chat/completions", "/v1/models"),
+                "grok" => ("https://api.x.ai", "/v1/chat/completions", "/v1/models"),
+                "mistral" => ("https://api.mistral.ai", "/v1/chat/completions", "/v1/models"),
+                "groq" => ("https://api.groq.com/openai", "/v1/chat/completions", "/v1/models"),
+                _ => unreachable!("match pattern limits provider"),
+            };
+            (
+                base_url.as_deref().unwrap_or(default_base),
+                chat_path.as_deref().unwrap_or(default_chat),
+                models_path.as_deref().unwrap_or(default_models),
+                CatalogAuth::Bearer,
+            )
+        }
         (
             "grok",
             Some(ProviderEntry::Grok {
@@ -458,7 +497,11 @@ impl ModelConfig {
     fn is_configured(&self) -> bool {
         match self {
             Self::Local { .. } => true, // Local models are always "configured"
-            Self::Remote { api_key, .. } => !api_key.is_empty(),
+            Self::Remote {
+                api_key, persisted, ..
+            } => {
+                !api_key.is_empty() || matches!(persisted, Some(ProviderEntry::Credentialed { .. }))
+            }
         }
     }
 }
@@ -468,6 +511,30 @@ impl ModelConfig {
 /// `teachers` projection.
 fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
     match provider {
+        ProviderEntry::Credentialed {
+            provider: credential_provider,
+            model,
+            name,
+            ..
+        } => Some(ModelConfig::Remote {
+            provider: match credential_provider {
+                crate::config::CredentialProvider::Anthropic => "claude",
+                crate::config::CredentialProvider::OpenaiPlatform => "openai",
+                crate::config::CredentialProvider::Xai => "grok",
+                crate::config::CredentialProvider::GeminiAiStudio => "gemini",
+                crate::config::CredentialProvider::Mistral => "mistral",
+                crate::config::CredentialProvider::Groq => "groq",
+                _ => credential_provider.as_str(),
+            }
+            .to_string(),
+            name: name
+                .clone()
+                .unwrap_or_else(|| credential_provider.as_str().to_string()),
+            api_key: String::new(),
+            model: model.clone().unwrap_or_default(),
+            enabled: true,
+            persisted: Some(provider.clone()),
+        }),
         ProviderEntry::LegacyChatgptSubscription { .. } => None,
         ProviderEntry::Local {
             inference_provider,
@@ -526,6 +593,24 @@ fn provider_entry_from_remote_model(
     let model = (!model.is_empty()).then(|| model.to_string());
     let name = Some(name.to_string());
     match persisted {
+        Some(ProviderEntry::Credentialed {
+            provider,
+            credential,
+            base_url,
+            chat_path,
+            models_path,
+            reasoning_effort,
+            ..
+        }) => ProviderEntry::Credentialed {
+            provider: *provider,
+            credential: credential.clone(),
+            model,
+            base_url: base_url.clone(),
+            chat_path: chat_path.clone(),
+            models_path: models_path.clone(),
+            name,
+            reasoning_effort: *reasoning_effort,
+        },
         Some(ProviderEntry::Claude {
             base_url,
             chat_path,
@@ -613,6 +698,45 @@ fn provider_entry_from_remote_model(
     }
 }
 
+fn named_catalog_refresh_config(
+    primary_model: &ModelConfig,
+    tool_models: &[ModelConfig],
+    editing_idx: usize,
+    selected_entry: &ProviderEntry,
+    credentials: Vec<crate::config::ProviderCredential>,
+) -> crate::config::Config {
+    let providers = std::iter::once(primary_model)
+        .chain(tool_models.iter())
+        .enumerate()
+        .filter_map(|(index, configured)| {
+            if index == editing_idx {
+                return Some(selected_entry.clone());
+            }
+            match configured {
+                ModelConfig::Remote {
+                    provider,
+                    name,
+                    api_key,
+                    model,
+                    enabled,
+                    persisted,
+                } if index == 0 || *enabled => Some(provider_entry_from_remote_model(
+                    provider,
+                    name,
+                    api_key,
+                    model,
+                    persisted.as_ref(),
+                )),
+                ModelConfig::Local { persisted, enabled, .. } if index == 0 || *enabled => {
+                    persisted.clone()
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    crate::config::Config::with_providers(providers).with_credentials(credentials)
+}
+
 #[derive(Debug, Clone)]
 struct PersonaInfo {
     slug: String, // Key used to load the persona (e.g. "expert-coder")
@@ -630,6 +754,9 @@ struct WizardState {
     catalog_cache_dir: Option<std::path::PathBuf>,
     /// Typed CoreML policy provenance from the loaded configuration.
     coreml: CoreMlConfig,
+    /// Named credential metadata is preserved unchanged by the compact model
+    /// editor; it contains no secret material.
+    credentials: Vec<crate::config::ProviderCredential>,
 }
 
 impl WizardState {
@@ -873,6 +1000,9 @@ impl WizardState {
             coreml: existing_config
                 .map(|config| config.backend.coreml)
                 .unwrap_or_default(),
+            credentials: existing_config
+                .map(|config| config.credentials().to_vec())
+                .unwrap_or_default(),
         }
     }
 
@@ -928,6 +1058,9 @@ pub struct SetupResult {
 
     // Unified providers list (new format)
     pub providers: Vec<ProviderEntry>,
+
+    /// Secret-free named credential records preserved by setup.
+    pub credentials: Vec<crate::config::ProviderCredential>,
 
     // Backward compatibility fields (mapped from primary_model)
     pub claude_api_key: String,
@@ -1144,7 +1277,10 @@ fn config_from_setup_result(result: &SetupResult) -> crate::config::Config {
     use crate::config::Config;
 
     let providers = result.providers.clone();
-    apply_setup_result_to_config(result, Config::with_providers(providers))
+    apply_setup_result_to_config(
+        result,
+        Config::with_providers(providers).with_credentials(result.credentials.clone()),
+    )
 }
 
 #[cfg(test)]
@@ -1158,7 +1294,8 @@ fn config_from_setup_result_with_paths(
     let providers = result.providers.clone();
     apply_setup_result_to_config(
         result,
-        Config::with_providers_and_paths(providers, metrics_dir, constitution_path),
+        Config::with_providers_and_paths(providers, metrics_dir, constitution_path)
+            .with_credentials(result.credentials.clone()),
     )
 }
 
@@ -1551,6 +1688,7 @@ fn handle_themes_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
 /// Handle input for Models section (unified Backend + Teachers)
 fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
     let catalog_cache_dir = state.catalog_cache_dir.clone();
+    let credentials = state.credentials.clone();
     if let Some(SectionState::Models {
         primary_model,
         tool_models,
@@ -1865,6 +2003,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         provider_idx,
                         name,
                         api_key,
+                        model,
                         editing_idx,
                         ..
                     }) = adding_provider.as_ref()
@@ -1894,6 +2033,24 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         ));
                         return Ok(false);
                     };
+                    let selected_entry = provider_entry_from_remote_model(
+                        provider_id,
+                        name,
+                        api_key,
+                        model,
+                        persisted,
+                    );
+                    let named_config = matches!(selected_entry, ProviderEntry::Credentialed { .. })
+                        .then(|| {
+                            named_catalog_refresh_config(
+                                primary_model,
+                                tool_models,
+                                editing_idx.unwrap_or(0),
+                                &selected_entry,
+                                credentials.clone(),
+                            )
+                        });
+                    let named_profile = selected_entry.profile_name();
                     let cache_dir = match catalog_cache_dir.clone() {
                         Some(path) => path,
                         None => {
@@ -1915,9 +2072,32 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             .build()
                             .map_err(anyhow::Error::from)
                             .map(|runtime| {
-                                runtime.block_on(model_catalog::refresh_with_fallback(
-                                    &profile, &cache_dir,
-                                ))
+                                if let Some(config) = named_config {
+                                    runtime.block_on(async {
+                                        match model_catalog::refresh_from_config(
+                                            &config,
+                                            &named_profile,
+                                            &crate::config::EnvironmentCredentialResolver,
+                                            &cache_dir,
+                                        )
+                                        .await
+                                        {
+                                            Ok(catalog) => (catalog, None),
+                                            Err(error) => {
+                                                let mut fallback = model_catalog::fallback_catalog(
+                                                    &profile.provider,
+                                                    &profile.endpoints.models_url,
+                                                );
+                                                fallback.profile_id = profile.profile_id.clone();
+                                                (fallback, Some(error.to_string()))
+                                            }
+                                        }
+                                    })
+                                } else {
+                                    runtime.block_on(model_catalog::refresh_with_fallback(
+                                        &profile, &cache_dir,
+                                    ))
+                                }
                             });
                         *result_for_thread.lock().unwrap() = Some(match refreshed {
                             Ok(result) => result,
@@ -3281,6 +3461,7 @@ fn build_setup_result(state: &WizardState) -> Result<SetupResult> {
         primary_model,
         tool_models,
         providers,
+        credentials: state.credentials.clone(),
         claude_api_key,
         hf_token: hf_token_val,
         backend_enabled,
@@ -6269,6 +6450,88 @@ mod tests {
     }
 
     #[test]
+    fn named_catalog_profile_preserves_bound_custom_endpoints_without_inline_secret() {
+        let persisted = ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::OpenaiPlatform,
+            credential: crate::config::CredentialBinding {
+                credential_ref: "work".into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: std::collections::BTreeSet::new(),
+            },
+            model: Some("manual-model".into()),
+            base_url: Some("https://compatible.example/v1".into()),
+            chat_path: Some("/v1/chat/completions".into()),
+            models_path: Some("/v1/models".into()),
+            name: Some("work-profile".into()),
+            reasoning_effort: None,
+        };
+        let profile =
+            model_catalog_profile("openai", "work-profile", "", Some(&persisted)).unwrap();
+        assert!(profile.api_key.is_empty());
+        assert_eq!(
+            profile.endpoints.models_url,
+            "https://compatible.example/v1/models"
+        );
+    }
+
+    #[test]
+    fn named_catalog_refresh_config_uses_edited_name_and_validates_siblings() {
+        use crate::config::{
+            AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle,
+            CredentialProvider, EndpointFamily, ProviderCredential,
+        };
+        let credential = ProviderCredential {
+            name: "work".into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::OpenaiPlatform,
+            issuer: "openai-platform".into(),
+            audience: AudienceBinding::standard(EndpointFamily::OpenaiPlatform),
+            tenant: None,
+            project: None,
+            account: None,
+            scopes: std::collections::BTreeSet::new(),
+            secret_ref: "env:OPENAI_WORK_API_KEY".into(),
+            lifecycle: CredentialLifecycle::default(),
+            revocation: Default::default(),
+        };
+        let named = |name: &str, credential_ref: &str| ProviderEntry::Credentialed {
+            provider: CredentialProvider::OpenaiPlatform,
+            credential: CredentialBinding {
+                credential_ref: credential_ref.into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: std::collections::BTreeSet::new(),
+            },
+            model: Some("gpt-4o".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some(name.into()),
+            reasoning_effort: None,
+        };
+        let primary = model_config_from_provider(&named("old-name", "work")).unwrap();
+        let sibling = model_config_from_provider(&named("broken", "missing")).unwrap();
+        let selected = named("renamed", "work");
+        let config = named_catalog_refresh_config(
+            &primary,
+            &[sibling],
+            0,
+            &selected,
+            vec![credential.clone()],
+        );
+        assert!(config.validate().unwrap_err().to_string().contains("missing"));
+
+        let valid = named_catalog_refresh_config(&primary, &[], 0, &selected, vec![credential]);
+        valid.validate().unwrap();
+        assert_eq!(valid.providers[0].profile_name(), "renamed");
+    }
+
+    #[test]
     fn builtin_discovery_profiles_use_provider_specific_urls_and_auth() {
         let claude = model_catalog_profile("claude", "claude-work", "key", None).unwrap();
         assert_eq!(claude.auth, CatalogAuth::AnthropicApiKey);
@@ -8117,5 +8380,55 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("Legacy chatgpt_subscription profiles are unsupported"));
         assert!(message.contains("finch setup") || message.contains("configure OpenAI Platform"));
+    }
+
+    #[test]
+    fn named_credential_setup_reopen_and_save_preserves_reference_without_secret() {
+        use crate::config::{
+            AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle,
+            CredentialProvider, EndpointFamily, ProviderCredential,
+        };
+        let credential = ProviderCredential {
+            name: "openai-work".into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::OpenaiPlatform,
+            issuer: "openai-platform".into(),
+            audience: AudienceBinding::standard(EndpointFamily::OpenaiPlatform),
+            tenant: None,
+            project: None,
+            account: Some("work".into()),
+            scopes: std::collections::BTreeSet::new(),
+            secret_ref: "env:OPENAI_WORK_API_KEY".into(),
+            lifecycle: CredentialLifecycle::default(),
+            revocation: Default::default(),
+        };
+        let profile = ProviderEntry::Credentialed {
+            provider: CredentialProvider::OpenaiPlatform,
+            credential: CredentialBinding {
+                credential_ref: "openai-work".into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: Some("work".into()),
+                required_scopes: std::collections::BTreeSet::new(),
+            },
+            model: Some("gpt-5.6-sol".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("work-reasoning".into()),
+            reasoning_effort: Some(crate::config::ReasoningEffort::High),
+        };
+        let existing = crate::config::Config::with_providers(vec![profile.clone()])
+            .with_credentials(vec![credential.clone()]);
+
+        let result = build_setup_result(&WizardState::new(Some(&existing))).unwrap();
+        assert_eq!(result.providers, vec![profile]);
+        assert_eq!(result.credentials, vec![credential]);
+        let saved = config_from_setup_result(&result);
+        saved.validate().unwrap();
+        let serialized = toml::to_string(&saved.credentials()[0]).unwrap();
+        assert!(serialized.contains("env:OPENAI_WORK_API_KEY"));
+        assert!(!serialized.contains("sk-"));
     }
 }

@@ -34,8 +34,8 @@ use crate::local::LocalGenerator;
 use crate::memory::NeuralEmbeddingEngine;
 use crate::models::bootstrap::GeneratorState;
 use crate::models::tokenizer::TextTokenizer;
-use crate::router::Router;
 use crate::review::store::DiffStore;
+use crate::router::Router;
 use crate::tools::executor::ToolExecutor;
 use crate::tools::types::ToolDefinition;
 
@@ -113,17 +113,16 @@ pub(crate) fn resolve_provider_profile(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BrainAttachmentRoute {
-    LocalIpc { brain: String },
+    LocalIpc {
+        brain: String,
+    },
     RemoteInvitation {
         target: crate::brain::remote::RemoteBrainTarget,
         invitation: String,
     },
 }
 
-fn brain_attachment_route(
-    value: &str,
-    invitation: Option<String>,
-) -> Result<BrainAttachmentRoute> {
+fn brain_attachment_route(value: &str, invitation: Option<String>) -> Result<BrainAttachmentRoute> {
     if value.contains('@') {
         let invitation = invitation.context(
             "remote Brain attachments require `/brain join NAME@MACHINE[:PORT] INVITE`; use `/brain attach NAME` for a Brain on this daemon",
@@ -213,6 +212,8 @@ pub struct EventLoop {
     /// through this field.
     program_runtime: Arc<crate::runtime::ProgramRuntime>,
     agent_scheduler: Arc<crate::runtime::scheduler::AgentScheduler>,
+    /// Revalidating provider resolver shared with child-agent model selection.
+    provider_resolver: crate::runtime::scheduler::ProviderResolver,
 
     /// Tool results collected per query (query_id -> Vec<(tool_id, result)>)
     tool_results: ToolResultsMap,
@@ -444,7 +445,11 @@ fn participant_subject_from(user: &str, machine: &str) -> String {
     let value = format!(
         "{}@{}",
         if user.is_empty() { "user" } else { user },
-        if machine.is_empty() { "machine" } else { machine }
+        if machine.is_empty() {
+            "machine"
+        } else {
+            machine
+        }
     );
     value
         .chars()
@@ -490,9 +495,7 @@ fn finch_addressed_prompt(input: &str) -> Option<&str> {
     (!prompt.is_empty()).then_some(prompt)
 }
 
-fn approval_audience_summary(
-    audience: &crate::brain::store::BrainApprovalAudience,
-) -> String {
+fn approval_audience_summary(audience: &crate::brain::store::BrainApprovalAudience) -> String {
     format!(
         "Brain: {} ({})\nApproval audience: {} ({:?}, attachment {})\nEnvironment generation: {}",
         audience.brain,
@@ -608,18 +611,14 @@ struct PendingNamedBrainTurn {
     /// boundary and all execute-once effects have been collected.
     cancellation_requested: bool,
     approval_audience: crate::brain::store::BrainApprovalAudience,
-    approval_tx: Option<
-        tokio::sync::mpsc::UnboundedSender<crate::server::RunnerApprovalRequest>,
-    >,
+    approval_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::server::RunnerApprovalRequest>>,
     restart: Option<crate::tools::implementations::restart::DeferredFrontendRestart>,
 }
 
 async fn resume_named_brain_program_boundaries(
     runtime: &crate::runtime::ProgramRuntime,
     event_tx: mpsc::UnboundedSender<ReplEvent>,
-    control_tx: Option<
-        mpsc::UnboundedSender<crate::server::RunnerProgramControlRequest>,
-    >,
+    control_tx: Option<mpsc::UnboundedSender<crate::server::RunnerProgramControlRequest>>,
     language: crate::brain::store::ProgramLanguage,
     interaction: crate::server::RunnerProgramInteraction,
     fixed_grant_ceiling: Option<crate::vm::EffectSet>,
@@ -641,8 +640,7 @@ async fn resume_named_brain_program_boundaries(
             }
         };
         let Some(crate::runtime::PendingTypedExecutionInfo {
-            reason:
-                crate::runtime::PendingTypedReason::AwaitingHostEffect { requirement },
+            reason: crate::runtime::PendingTypedReason::AwaitingHostEffect { requirement },
             resume_effect_sequence: Some(sequence),
             ..
         }) = runtime.pending_typed_execution(outcome.execution_id)?
@@ -668,8 +666,7 @@ async fn resume_named_brain_program_boundaries(
                     anyhow::bail!("named Brain schedule effect stream closed")
                 }
             };
-            if envelope.execution_id == outcome.execution_id
-                && envelope.effect.sequence == sequence
+            if envelope.execution_id == outcome.execution_id && envelope.effect.sequence == sequence
             {
                 break envelope;
             }
@@ -723,7 +720,9 @@ async fn execute_named_brain_schedule_effect(
             let next_due_ms = u64::try_from(*timestamp)
                 .ok()
                 .and_then(|timestamp| timestamp.checked_mul(1_000))
-                .ok_or_else(|| anyhow::anyhow!("schedule timestamp is outside the supported range"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("schedule timestamp is outside the supported range")
+                })?;
             let grant_ceiling = match fixed_grant_ceiling {
                 Some(grant_ceiling) => grant_ceiling.clone(),
                 None => runtime.effective_grants_for(None)?,
@@ -736,8 +735,7 @@ async fn execute_named_brain_schedule_effect(
                     grant_ceiling,
                     next_due_ms,
                     interval_ms: None,
-                    delivery_policy:
-                        crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce,
+                    delivery_policy: crate::brain::store::BrainScheduleDeliveryPolicy::Coalesce,
                     response_tx,
                 })
                 .map_err(|_| anyhow::anyhow!("named Brain schedule control disconnected"))?;
@@ -755,10 +753,12 @@ async fn execute_named_brain_schedule_effect(
             let schedule_id = schedule_id_argument(arguments)?;
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
             control_tx
-                .send(crate::server::RunnerProgramControlRequest::InspectSchedule {
-                    schedule_id,
-                    response_tx,
-                })
+                .send(
+                    crate::server::RunnerProgramControlRequest::InspectSchedule {
+                        schedule_id,
+                        response_tx,
+                    },
+                )
                 .map_err(|_| anyhow::anyhow!("named Brain schedule control disconnected"))?;
             let schedule = response_rx
                 .await
@@ -809,7 +809,9 @@ fn schedule_id_argument(
         anyhow::bail!("schedule operation requires one schedule resource");
     };
     anyhow::ensure!(kind == "schedule", "resource is not a schedule");
-    Ok(crate::brain::store::ScheduleId(uuid::Uuid::parse_str(handle)?))
+    Ok(crate::brain::store::ScheduleId(uuid::Uuid::parse_str(
+        handle,
+    )?))
 }
 
 #[derive(Clone)]
@@ -922,13 +924,8 @@ fn project_remote_brain_run_event(
         | BrainEventKind::Result { .. } => (None, BrainRunStatus::Running),
         _ => return false,
     };
-    let projection = ensure_remote_brain_run_projection(
-        output_manager,
-        projections,
-        run_id,
-        kind,
-        status,
-    );
+    let projection =
+        ensure_remote_brain_run_projection(output_manager, projections, run_id, kind, status);
 
     match &event.kind {
         BrainEventKind::RunStarted { .. } => {}
@@ -965,15 +962,18 @@ fn project_remote_brain_run_event(
             if projection.locally_rendered_tool_ids.contains(tool_id) {
                 return true;
             }
-            projection.tool_rows.entry(tool_id.clone()).or_insert_with(|| {
-                let input = input.to_string();
-                let input = if input.chars().count() > 80 {
-                    format!("{}…", input.chars().take(79).collect::<String>())
-                } else {
-                    input
-                };
-                projection.unit.add_row(format!("{name} {input}"))
-            });
+            projection
+                .tool_rows
+                .entry(tool_id.clone())
+                .or_insert_with(|| {
+                    let input = input.to_string();
+                    let input = if input.chars().count() > 80 {
+                        format!("{}…", input.chars().take(79).collect::<String>())
+                    } else {
+                        input
+                    };
+                    projection.unit.add_row(format!("{name} {input}"))
+                });
         }
         BrainEventKind::ToolResult {
             tool_id,
@@ -1151,10 +1151,7 @@ fn failed_local_brain_projection(
 fn register_named_brain_turn_projection(
     projections: &mut std::collections::VecDeque<LocalBrainProjection>,
     run_id: crate::brain::store::RunId,
-    result: &std::result::Result<
-        crate::server::RunnerTurnResult,
-        crate::server::RunnerTurnError,
-    >,
+    result: &std::result::Result<crate::server::RunnerTurnResult, crate::server::RunnerTurnError>,
     transient_output_unit: Option<Arc<crate::cli::messages::WorkUnit>>,
 ) {
     match result {
@@ -1211,12 +1208,8 @@ fn named_brain_wire_source(
         .filter(|source| !source.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("named Brain turn produced no wire source"))?;
     let language = match crate::programs::ProgramLanguage::infer_wire_source(&source)? {
-        crate::programs::ProgramLanguage::Forth => {
-            crate::brain::store::ProgramLanguage::Forth
-        }
-        crate::programs::ProgramLanguage::Lisp => {
-            crate::brain::store::ProgramLanguage::Lisp
-        }
+        crate::programs::ProgramLanguage::Forth => crate::brain::store::ProgramLanguage::Forth,
+        crate::programs::ProgramLanguage::Lisp => crate::brain::store::ProgramLanguage::Lisp,
     };
     Ok((source, language))
 }
@@ -1242,9 +1235,7 @@ fn assemble_named_brain_turn(
             .find(|snapshot| snapshot.revision == runtime_revision)
             .and_then(|snapshot| snapshot.checkpoint)
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "named Brain revision {runtime_revision} is not checkpointable"
-                )
+                anyhow::anyhow!("named Brain revision {runtime_revision} is not checkpointable")
             })?;
         Ok(crate::server::RunnerTurnResult {
             source,
@@ -1262,12 +1253,7 @@ fn assemble_named_brain_turn(
         turn_events,
         effect_journal,
     });
-    register_named_brain_turn_projection(
-        projections,
-        run_id,
-        &result,
-        transient_output_unit,
-    );
+    register_named_brain_turn_projection(projections, run_id, &result, transient_output_unit);
     result
 }
 
@@ -1364,9 +1350,8 @@ fn project_remote_brain_live_run_event(
     if projected && projection_match == LocalProjectionMatch::SuppressAndComplete {
         if let Some(local) = local_projections.pop_front() {
             if let Some(output_unit) = local.transient_output_unit {
-                output_manager.remove_message(crate::cli::messages::Message::id(
-                    output_unit.as_ref(),
-                ));
+                output_manager
+                    .remove_message(crate::cli::messages::Message::id(output_unit.as_ref()));
             }
         }
     }
@@ -1399,9 +1384,7 @@ fn runner_effect_records_from_tool_result(
         .unwrap_or_default()
 }
 
-fn deferred_proposal_from_tool_result(
-    result: &anyhow::Result<String>,
-) -> Option<DeferredProposal> {
+fn deferred_proposal_from_tool_result(result: &anyhow::Result<String>) -> Option<DeferredProposal> {
     let content = result.as_ref().ok()?;
     let outcome: crate::runtime::outcome::ExecutionOutcome = serde_json::from_str(content).ok()?;
     if outcome.status != crate::runtime::outcome::ExecutionStatus::Suspended {
@@ -1414,11 +1397,8 @@ fn deferred_proposal_from_tool_result(
     let crate::vm::HostSideEffect::Request { arguments } = &effect.event else {
         return None;
     };
-    let [
-        crate::vm::TypedValue::String(language),
-        crate::vm::TypedValue::String(intent),
-        crate::vm::TypedValue::String(source),
-    ] = arguments.as_slice()
+    let [crate::vm::TypedValue::String(language), crate::vm::TypedValue::String(intent), crate::vm::TypedValue::String(source)] =
+        arguments.as_slice()
     else {
         return None;
     };
@@ -1513,8 +1493,9 @@ mod deferred_proposal_tests {
             )
             .await
             .unwrap();
-        let proposal = deferred_proposal_from_tool_result(&Ok(serde_json::to_string(&outcome).unwrap()))
-            .expect("suspended proposal effect");
+        let proposal =
+            deferred_proposal_from_tool_result(&Ok(serde_json::to_string(&outcome).unwrap()))
+                .expect("suspended proposal effect");
         assert_eq!(proposal.handle.execution_id, outcome.execution_id);
         assert_eq!(proposal.handle.sequence, 0);
         assert_eq!(proposal.language, "python");
@@ -1549,10 +1530,9 @@ mod deferred_proposal_tests {
             )
             .await
             .unwrap();
-        let approval = deferred_vm_approval_from_tool_result(&Ok(
-            serde_json::to_string(&outcome).unwrap(),
-        ))
-        .expect("authorization-required tool outcome");
+        let approval =
+            deferred_vm_approval_from_tool_result(&Ok(serde_json::to_string(&outcome).unwrap()))
+                .expect("authorization-required tool outcome");
 
         assert_eq!(approval.prompt.request.execution_id, outcome.execution_id);
         assert_eq!(approval.prompt.request.effect_sequence, Some(0));
@@ -1591,8 +1571,9 @@ mod deferred_proposal_tests {
             )
             .await
             .unwrap();
-        let proposal = deferred_proposal_from_tool_result(&Ok(serde_json::to_string(&outcome).unwrap()))
-            .expect("suspended proposal effect");
+        let proposal =
+            deferred_proposal_from_tool_result(&Ok(serde_json::to_string(&outcome).unwrap()))
+                .expect("suspended proposal effect");
 
         let completed = resume_deferred_proposal(
             runtime.as_ref(),
@@ -1793,6 +1774,7 @@ impl EventLoop {
             tool_coordinator,
             program_runtime,
             agent_scheduler,
+            provider_resolver,
             tool_results: Arc::new(RwLock::new(std::collections::HashMap::new())),
             active_query_id: Arc::new(RwLock::new(None)),
             pending_queries: std::collections::VecDeque::new(),
@@ -1899,9 +1881,7 @@ impl EventLoop {
         self.home_runner_lease_active = home_runner_state
             .as_ref()
             .is_some_and(|state| state.registration.is_ok());
-        self.runner_reconnect_target = home_runner_state
-            .as_ref()
-            .map(|state| state.target.clone());
+        self.runner_reconnect_target = home_runner_state.as_ref().map(|state| state.target.clone());
         self.runner_brain = home_runner_state.as_ref().and_then(|state| {
             state
                 .registration
@@ -2685,12 +2665,10 @@ Rules:\n\
                     Command::PersonaSelect(name) => {
                         match crate::config::Persona::load_by_name(&name) {
                             Ok(persona) => {
-                                let old_name =
-                                    self.active_persona.read().await.name().to_string();
+                                let old_name = self.active_persona.read().await.name().to_string();
                                 *self.active_persona.write().await = persona;
-                                self.output_manager.write_info(format!(
-                                    "Switched persona: {old_name} → {name}"
-                                ));
+                                self.output_manager
+                                    .write_info(format!("Switched persona: {old_name} → {name}"));
                                 match crate::config::load_config() {
                                     Ok(mut config) => {
                                         config.active_persona = name.clone();
@@ -2705,9 +2683,9 @@ Rules:\n\
                                     )),
                                 }
                             }
-                            Err(error) => self.output_manager.write_info(format!(
-                                "Failed to load persona '{name}': {error}"
-                            )),
+                            Err(error) => self
+                                .output_manager
+                                .write_info(format!("Failed to load persona '{name}': {error}")),
                         }
                         self.render_tui().await?;
                     }
@@ -2715,7 +2693,8 @@ Rules:\n\
                         let persona = self.active_persona.read().await;
                         self.output_manager.write_info(format!(
                             "Current persona: {}\n\n{}",
-                            persona.name(), persona.behavior.system_prompt
+                            persona.name(),
+                            persona.behavior.system_prompt
                         ));
                         drop(persona);
                         self.render_tui().await?;
@@ -3090,13 +3069,15 @@ Rules:\n\
                     }
                     Command::BrainSay(text) => {
                         if let Err(error) = self.handle_brain_say(text).await {
-                            self.output_manager.write_info(format!("brain say: {error}"));
+                            self.output_manager
+                                .write_info(format!("brain say: {error}"));
                             self.render_tui().await?;
                         }
                     }
                     Command::BrainWho => {
                         if let Err(error) = self.handle_brain_who().await {
-                            self.output_manager.write_info(format!("brain who: {error}"));
+                            self.output_manager
+                                .write_info(format!("brain who: {error}"));
                             self.render_tui().await?;
                         }
                     }
@@ -3227,10 +3208,7 @@ Rules:\n\
                     .await;
             }
             return self
-                .execute_interactive_typed_program(
-                    crate::programs::ProgramLanguage::Lisp,
-                    input,
-                )
+                .execute_interactive_typed_program(crate::programs::ProgramLanguage::Lisp, input)
                 .await;
         }
 
@@ -3526,9 +3504,6 @@ Rules:\n\
 
     /// Handle `/model <name>` — switch the active named provider profile.
     async fn handle_provider_switch(&mut self, name: String) -> Result<()> {
-        use crate::generators::claude::ClaudeGenerator;
-        use crate::providers::create_provider_from_entry;
-
         let target_index = match resolve_provider_profile(&self.available_providers, &name) {
             Ok(index) => index,
             Err(error) => {
@@ -3632,18 +3607,16 @@ Rules:\n\
                 }
             }
         } else {
-            match create_provider_from_entry(&entry) {
+            match self
+                .provider_resolver
+                .resolve(Some(&entry.profile_name()), entry.model())
+                .await
+            {
                 Err(e) => {
                     self.output_manager
                         .write_info(format!("⚠️  Failed to create model '{}': {}", name, e));
                 }
-                Ok(provider) => {
-                    let client = crate::claude::ClaudeClient::with_provider(provider);
-                    let inner: Arc<dyn Generator> =
-                        Arc::new(ClaudeGenerator::new(Arc::new(client)));
-                    let new_gen: Arc<dyn Generator> = Arc::new(
-                        crate::generators::ProfiledGenerator::new(entry.profile_name(), inner),
-                    );
+                Ok(new_gen) => {
                     self.model_selection.activate(target_index, new_gen).await;
                     self.output_manager.write_info(format!(
                         "✓ Switched to {} · {} (conversation preserved)",
@@ -3891,11 +3864,13 @@ Rules:\n\
                             &pending.turn_events,
                             transient_output_unit,
                         ));
-                    let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
-                        message: error.clone(),
-                        turn_events: pending.turn_events,
-                        effect_journal: pending.effect_journal,
-                    }));
+                    let _ = pending
+                        .response_tx
+                        .send(Err(crate::server::RunnerTurnError {
+                            message: error.clone(),
+                            turn_events: pending.turn_events,
+                            effect_journal: pending.effect_journal,
+                        }));
                 }
 
                 // Render TUI to ensure viewport is redrawn after error message
@@ -3948,12 +3923,7 @@ Rules:\n\
                         .pending_named_brain_turns
                         .get(&query_id)
                         .map(|turn| turn.approval_audience.clone());
-                    self.spawn_deferred_proposal(
-                        query_id,
-                        tool_id,
-                        proposal,
-                        approval_audience,
-                    );
+                    self.spawn_deferred_proposal(query_id, tool_id, proposal, approval_audience);
                 } else if let Some(approval) = deferred_vm_approval_from_tool_result(&result) {
                     self.output_manager.write_status(format!(
                         "VM capability request {} is awaiting approval",
@@ -3970,13 +3940,14 @@ Rules:\n\
                 tool_uses,
             } => {
                 if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
-                    turn.turn_events.extend(tool_uses.into_iter().map(|tool_use| {
-                        crate::server::RunnerTurnEvent::Call {
-                            tool_id: tool_use.id,
-                            name: tool_use.name,
-                            input: tool_use.input,
-                        }
-                    }));
+                    turn.turn_events
+                        .extend(tool_uses.into_iter().map(|tool_use| {
+                            crate::server::RunnerTurnEvent::Call {
+                                tool_id: tool_use.id,
+                                name: tool_use.name,
+                                input: tool_use.input,
+                            }
+                        }));
                 }
             }
 
@@ -4054,11 +4025,13 @@ Rules:\n\
             } => {
                 match result {
                     Ok(outcome)
-                        if outcome.status == crate::runtime::outcome::ExecutionStatus::Completed => {}
+                        if outcome.status
+                            == crate::runtime::outcome::ExecutionStatus::Completed => {}
                     Ok(outcome) => {
-                        let detail = outcome.diagnostics.first().cloned().unwrap_or_else(|| {
-                            format!("VM program ended as {:?}", outcome.status)
-                        });
+                        let detail =
+                            outcome.diagnostics.first().cloned().unwrap_or_else(|| {
+                                format!("VM program ended as {:?}", outcome.status)
+                            });
                         output_unit.append_response(&format!("VM error: {detail}"));
                     }
                     Err(error) => output_unit.append_response(&format!("VM error: {error}")),
@@ -4208,14 +4181,13 @@ Rules:\n\
                     // Fire the per-query cancellation token so handle_present_plan
                     // (and any other token-aware loops) can detect the cancel immediately.
                     self.query_states.cancel_query(qid).await;
-                    let named_turn = if let Some(pending) =
-                        self.pending_named_brain_turns.get_mut(&qid)
-                    {
-                        pending.cancellation_requested = true;
-                        true
-                    } else {
-                        false
-                    };
+                    let named_turn =
+                        if let Some(pending) = self.pending_named_brain_turns.get_mut(&qid) {
+                            pending.cancellation_requested = true;
+                            true
+                        } else {
+                            false
+                        };
 
                     if !named_turn {
                         *self.active_query_id.write().await = None;
@@ -4295,9 +4267,7 @@ Rules:\n\
                 let is_current = self.selected_brain_matches(&target);
                 if is_current {
                     let acknowledged_seq = match &message {
-                        crate::brain::store::BrainWireMessage::Snapshot { brain } => {
-                            brain.revision
-                        }
+                        crate::brain::store::BrainWireMessage::Snapshot { brain } => brain.revision,
                         crate::brain::store::BrainWireMessage::Event { event } => event.seq,
                     };
                     self.render_remote_brain_message(message).await?;
@@ -4375,7 +4345,11 @@ Rules:\n\
                         format!(
                             "◆ {} · {} · event watch reconnecting",
                             self.session_label,
-                            if self.home_runner_lease_active { "runner" } else { "runner offline" },
+                            if self.home_runner_lease_active {
+                                "runner"
+                            } else {
+                                "runner offline"
+                            },
                         ),
                     );
                     self.render_tui().await?;
@@ -4391,7 +4365,11 @@ Rules:\n\
                         self.output_manager.write_info(format!(
                             "{}: home event watch reconnected; runner callback {}",
                             self.session_label,
-                            if self.home_runner_lease_active { "registered" } else { "still retrying" },
+                            if self.home_runner_lease_active {
+                                "registered"
+                            } else {
+                                "still retrying"
+                            },
                         ));
                         self.render_tui().await?;
                     }
@@ -4477,11 +4455,7 @@ Rules:\n\
                 }
                 let registration = match (lease_id, self.ipc_client.as_ref()) {
                     (Some(lease_id), Some(ipc)) => match ipc
-                        .register_brain_runner(
-                            &brain,
-                            lease_id,
-                            self.event_tx.clone(),
-                        )
+                        .register_brain_runner(&brain, lease_id, self.event_tx.clone())
                         .await
                     {
                         Ok(bootstrap) => {
@@ -4629,12 +4603,10 @@ Rules:\n\
             .insert(run_id, cancel.clone());
         tokio::task::spawn_local(async move {
             agent_scheduler
-                .set_active_brain_parent(Some(
-                    crate::runtime::scheduler::AgentBrainContext {
-                        run_id,
-                        request_seq,
-                    },
-                ))
+                .set_active_brain_parent(Some(crate::runtime::scheduler::AgentBrainContext {
+                    run_id,
+                    request_seq,
+                }))
                 .await;
             let brain_language = request.language;
             let language = match brain_language {
@@ -4753,25 +4725,29 @@ Rules:\n\
         if self.runner_brain.as_deref() != Some(request.brain.as_str())
             || !self.home_runner_lease_active
         {
-            let _ = request.response_tx.send(Err(crate::server::RunnerTurnError {
-                message: format!(
-                    "frontend does not hold the runner lease for named Brain '{}'",
-                    request.brain
-                ),
-                turn_events: Vec::new(),
-                effect_journal: Vec::new(),
-            }));
+            let _ = request
+                .response_tx
+                .send(Err(crate::server::RunnerTurnError {
+                    message: format!(
+                        "frontend does not hold the runner lease for named Brain '{}'",
+                        request.brain
+                    ),
+                    turn_events: Vec::new(),
+                    effect_journal: Vec::new(),
+                }));
             return Ok(());
         }
         if self.active_query_id.read().await.is_some() {
-            let _ = request.response_tx.send(Err(crate::server::RunnerTurnError {
-                message: format!(
-                    "named Brain '{}' runner is already executing a turn",
-                    request.brain
-                ),
-                turn_events: Vec::new(),
-                effect_journal: Vec::new(),
-            }));
+            let _ = request
+                .response_tx
+                .send(Err(crate::server::RunnerTurnError {
+                    message: format!(
+                        "named Brain '{}' runner is already executing a turn",
+                        request.brain
+                    ),
+                    turn_events: Vec::new(),
+                    effect_journal: Vec::new(),
+                }));
             return Ok(());
         }
 
@@ -4821,12 +4797,10 @@ Rules:\n\
             },
         );
         self.agent_scheduler
-            .set_active_brain_parent(Some(
-                crate::runtime::scheduler::AgentBrainContext {
-                    run_id: request.run_id,
-                    request_seq: request.request_seq,
-                },
-            ))
+            .set_active_brain_parent(Some(crate::runtime::scheduler::AgentBrainContext {
+                run_id: request.run_id,
+                request_seq: request.request_seq,
+            }))
             .await;
         self.update_compaction_status().await;
         if self
@@ -4841,11 +4815,13 @@ Rules:\n\
             *self.active_query_id.write().await = None;
             self.agent_scheduler.set_active_brain_parent(None).await;
             if let Some(pending) = self.pending_named_brain_turns.remove(&query_id) {
-                let _ = pending.response_tx.send(Err(crate::server::RunnerTurnError {
-                    message: "frontend LLM worker is unavailable".to_string(),
-                    turn_events: pending.turn_events,
-                    effect_journal: pending.effect_journal,
-                }));
+                let _ = pending
+                    .response_tx
+                    .send(Err(crate::server::RunnerTurnError {
+                        message: "frontend LLM worker is unavailable".to_string(),
+                        turn_events: pending.turn_events,
+                        effect_journal: pending.effect_journal,
+                    }));
             }
         }
         Ok(())
@@ -4866,9 +4842,10 @@ Rules:\n\
             let _ = request.response_tx.send(Ok(true));
             return;
         }
-        let query_id = self.pending_named_brain_turns.iter().find_map(|(query_id, turn)| {
-            (turn.run_id == request.run_id).then_some(*query_id)
-        });
+        let query_id = self
+            .pending_named_brain_turns
+            .iter()
+            .find_map(|(query_id, turn)| (turn.run_id == request.run_id).then_some(*query_id));
         let Some(query_id) = query_id else {
             let _ = request.response_tx.send(Ok(false));
             return;
@@ -4957,9 +4934,8 @@ Rules:\n\
             return;
         }
         let commit_ack = restart.map(|restart| {
-            let (commit_tx, mut commit_rx) = tokio::sync::mpsc::unbounded_channel::<
-                crate::server::RunnerTurnCommitNotice,
-            >();
+            let (commit_tx, mut commit_rx) =
+                tokio::sync::mpsc::unbounded_channel::<crate::server::RunnerTurnCommitNotice>();
             let event_tx = self.event_tx.clone();
             tokio::spawn(async move {
                 let Some(notice) = commit_rx.recv().await else {
@@ -5012,15 +4988,14 @@ Rules:\n\
         restart: crate::tools::implementations::restart::DeferredFrontendRestart,
     ) -> Result<()> {
         anyhow::ensure!(
-            self.runner_brain.as_deref() == Some(brain.as_str())
-                && self.home_runner_lease_active,
+            self.runner_brain.as_deref() == Some(brain.as_str()) && self.home_runner_lease_active,
             "cannot restart after Brain run {}: this frontend no longer owns '{}'",
             run_id.0,
             brain
         );
-        let lease_id = self.home_runner_lease_id.context(
-            "cannot restart the frontend without its exact runner lease identity",
-        )?;
+        let lease_id = self
+            .home_runner_lease_id
+            .context("cannot restart the frontend without its exact runner lease identity")?;
         let ipc = self
             .ipc_client
             .as_ref()
@@ -5088,11 +5063,7 @@ Rules:\n\
                 error
             );
             let error = self
-                .fail_handoff_and_restore_runner(
-                    &ipc,
-                    Some((brain, environment)),
-                    error,
-                )
+                .fail_handoff_and_restore_runner(&ipc, Some((brain, environment)), error)
                 .await;
             crate::set_tui_active(true);
             self.tui_renderer
@@ -5137,13 +5108,15 @@ Rules:\n\
                         )
                     })
                     .unwrap_or_else(|| proposal.intent.clone());
-                let decision = crate::tools::implementations::propose::propose_artifact_with_decision(
-                    &proposal.language,
-                    &intent,
-                    &proposal.source,
-                )
-                .await?;
-                let outcome = resume_deferred_proposal(runtime.as_ref(), &proposal, decision).await?;
+                let decision =
+                    crate::tools::implementations::propose::propose_artifact_with_decision(
+                        &proposal.language,
+                        &intent,
+                        &proposal.source,
+                    )
+                    .await?;
+                let outcome =
+                    resume_deferred_proposal(runtime.as_ref(), &proposal, decision).await?;
                 Ok::<_, anyhow::Error>(serde_json::to_string(&outcome)?)
             }
             .await;
@@ -5180,11 +5153,7 @@ Rules:\n\
                     .await
                     .map_err(|_| anyhow::anyhow!("VM approval dialog was cancelled"))?;
                 let outcome = runtime
-                    .resolve_typed_approval(
-                        &approval.prompt,
-                        choice,
-                        "interactive-tool-user",
-                    )
+                    .resolve_typed_approval(&approval.prompt, choice, "interactive-tool-user")
                     .await?;
                 Ok::<_, anyhow::Error>(serde_json::to_string(&outcome)?)
             }
@@ -5437,9 +5406,10 @@ Rules:\n\
         };
         let (target, mut client, invited) = match route {
             BrainAttachmentRoute::LocalIpc { brain } => {
-                let ipc = self.ipc_client.clone().context(
-                    "local Brain attachment requires the connected daemon IPC socket",
-                )?;
+                let ipc = self
+                    .ipc_client
+                    .clone()
+                    .context("local Brain attachment requires the connected daemon IPC socket")?;
                 let mut target = self
                     .home_brain
                     .as_ref()
@@ -5559,11 +5529,7 @@ Rules:\n\
         Ok(())
     }
 
-    async fn handle_brain_invite(
-        &mut self,
-        role: String,
-        ttl_minutes: Option<u64>,
-    ) -> Result<()> {
+    async fn handle_brain_invite(&mut self, role: String, ttl_minutes: Option<u64>) -> Result<()> {
         if self.active_remote_brain.is_some() {
             anyhow::bail!(
                 "issue invitations from the Brain owner's home console, not through a guest attachment"
@@ -5583,10 +5549,8 @@ Rules:\n\
             .daemon_base_url
             .as_deref()
             .context("this console is not connected to its local daemon")?;
-        let target = crate::brain::remote::RemoteBrainTarget::local(
-            &home.target.brain,
-            daemon_base_url,
-        )?;
+        let target =
+            crate::brain::remote::RemoteBrainTarget::local(&home.target.brain, daemon_base_url)?;
         let config = crate::config::load_config().context("load Brain collaboration settings")?;
         anyhow::ensure!(
             config.server.advertise,
@@ -5640,11 +5604,9 @@ Rules:\n\
         self.todo_journal_target.set(self.home_brain.clone());
         if let Some(home) = self.home_brain.as_ref() {
             let snapshot = home.snapshot().await?;
-            self.render_remote_brain_message(
-                crate::brain::store::BrainWireMessage::Snapshot {
-                    brain: snapshot.clone(),
-                },
-            )
+            self.render_remote_brain_message(crate::brain::store::BrainWireMessage::Snapshot {
+                brain: snapshot.clone(),
+            })
             .await?;
             if let Some(home) = self.home_brain.as_mut() {
                 home.acknowledge(snapshot.revision).await?;
@@ -5731,10 +5693,7 @@ Rules:\n\
             .is_some_and(|client| client.target.display_name() == target)
     }
 
-    async fn push_remote_brain(
-        &mut self,
-        kind: crate::brain::store::BrainEventKind,
-    ) -> Result<()> {
+    async fn push_remote_brain(&mut self, kind: crate::brain::store::BrainEventKind) -> Result<()> {
         let Some(client) = self.selected_brain().cloned() else {
             return Ok(());
         };
@@ -5882,9 +5841,9 @@ Rules:\n\
                             .unwrap_or(serde_json::Value::Null),
                     }),
                     "vm_capability" => {
-                        let Ok(prompt) = serde_json::from_value::<crate::vm::ApprovalPrompt>(
-                            detail.clone(),
-                        ) else {
+                        let Ok(prompt) =
+                            serde_json::from_value::<crate::vm::ApprovalPrompt>(detail.clone())
+                        else {
                             self.output_manager.write_error(format!(
                                 "approval {approval_id} has an invalid VM capability prompt"
                             ));
@@ -5945,9 +5904,11 @@ Rules:\n\
                 summary.push_str(&approval_audience_summary(&pending.audience));
                 crate::cli::tui::Dialog::tool_approval(&tool_use.name, &summary)
             }
-            RemoteBrainApprovalKind::Vm { prompt, .. } => {
-                vm_approval_dialog(prompt, Some(&pending.audience), self.program_runtime.as_ref())
-            }
+            RemoteBrainApprovalKind::Vm { prompt, .. } => vm_approval_dialog(
+                prompt,
+                Some(&pending.audience),
+                self.program_runtime.as_ref(),
+            ),
         };
         self.active_remote_brain_approval = Some(pending);
         tui.active_dialog = Some(dialog);
@@ -6479,9 +6440,8 @@ Rules:\n\
                         .get("language")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("inferred");
-                    if let Some(source) = tool_input
-                        .get("source")
-                        .and_then(serde_json::Value::as_str)
+                    if let Some(source) =
+                        tool_input.get("source").and_then(serde_json::Value::as_str)
                     {
                         let mut source_body = vec![format!("VM source ({language}):")];
                         source_body.extend(source.lines().map(str::to_owned));
@@ -6708,8 +6668,7 @@ Rules:\n\
             crate::poset::NodeAuthor::User,
         );
 
-        self.tui_renderer.lock().await.poset_panel_mode =
-            crate::cli::tui::PosetPanelMode::Graph;
+        self.tui_renderer.lock().await.poset_panel_mode = crate::cli::tui::PosetPanelMode::Graph;
         self.render_tui().await
     }
 
@@ -6956,11 +6915,10 @@ Rules:\n\
         } else {
             removed.label
         };
-        self.output_manager
-            .write_info(format!(
-                "📚 removed W{} → \"{preview}\"   nodes:{depth}",
-                removed.id
-            ));
+        self.output_manager.write_info(format!(
+            "📚 removed W{} → \"{preview}\"   nodes:{depth}",
+            removed.id
+        ));
         self.render_tui().await
     }
 
@@ -7148,9 +7106,7 @@ Rules:\n\
             .pending_named_brain_turns
             .get(&query_id)
             .and_then(|turn| turn.approval_tx.clone());
-        if let (Some(approval_tx), Some(audience)) =
-            (approval_tx, approval_audience.as_ref())
-        {
+        if let (Some(approval_tx), Some(audience)) = (approval_tx, approval_audience.as_ref()) {
             let event = crate::server::RunnerTurnEvent::ApprovalRequested {
                 approval_id: tool_use.id.clone(),
                 approval_kind: "tool".to_string(),
@@ -7174,9 +7130,7 @@ Rules:\n\
                     .await
                     .ok()
                     .and_then(|result| result.ok())
-                    .and_then(|decision| {
-                        confirmation_from_audit_value(&decision, &tool_use).ok()
-                    })
+                    .and_then(|decision| confirmation_from_audit_value(&decision, &tool_use).ok())
                     .unwrap_or(super::events::ConfirmationResult::Deny);
                 let _ = response_tx.send(confirmation);
             });
@@ -7263,8 +7217,9 @@ Rules:\n\
                 approval_kind: "vm_capability".to_string(),
                 subject: format!("{:?}", prompt.exact.capability),
                 audience,
-                detail: serde_json::to_value(&prompt)
-                    .unwrap_or_else(|_| serde_json::json!({"reason": prompt.request.reason.clone()})),
+                detail: serde_json::to_value(&prompt).unwrap_or_else(
+                    |_| serde_json::json!({"reason": prompt.request.reason.clone()}),
+                ),
             };
             let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
             if approval_tx
@@ -7296,9 +7251,9 @@ Rules:\n\
                         approval_kind: "vm_capability".to_string(),
                         subject: format!("{:?}", prompt.exact.capability),
                         audience: turn.approval_audience.clone(),
-                        detail: serde_json::to_value(&prompt).unwrap_or_else(|_| {
-                            serde_json::json!({"reason": prompt.request.reason.clone()})
-                        }),
+                        detail: serde_json::to_value(&prompt).unwrap_or_else(
+                            |_| serde_json::json!({"reason": prompt.request.reason.clone()}),
+                        ),
                     });
             }
         }
@@ -7691,7 +7646,9 @@ fn project_brain_context(
         );
     }
     for index in count..8 {
-        status_bar.remove_line(&crate::cli::status_bar::StatusLineType::BrainContextLine(index));
+        status_bar.remove_line(&crate::cli::status_bar::StatusLineType::BrainContextLine(
+            index,
+        ));
     }
 }
 
@@ -8113,9 +8070,7 @@ pub(crate) fn dialog_result_to_confirmation(
     }
 }
 
-fn confirmation_audit_value(
-    confirmation: &super::events::ConfirmationResult,
-) -> serde_json::Value {
+fn confirmation_audit_value(confirmation: &super::events::ConfirmationResult) -> serde_json::Value {
     use super::events::ConfirmationResult;
 
     match confirmation {
@@ -8407,9 +8362,8 @@ mod tests {
 
     #[test]
     fn approval_audit_value_preserves_the_decision_scope() {
-        let decision = super::confirmation_audit_value(
-            &super::super::events::ConfirmationResult::ApproveOnce,
-        );
+        let decision =
+            super::confirmation_audit_value(&super::super::events::ConfirmationResult::ApproveOnce);
         assert_eq!(decision, serde_json::json!({"choice": "approve_once"}));
     }
 
@@ -8485,7 +8439,13 @@ mod tests {
     fn snapshot_replay_keeps_conversation_and_hides_presence_churn() {
         use crate::brain::store::{AttachmentId, AttachmentRole, BrainEventKind, ConnectionId};
 
-        let prompt = brain_event(1, "alice", BrainEventKind::Prompt { text: "hello".into() });
+        let prompt = brain_event(
+            1,
+            "alice",
+            BrainEventKind::Prompt {
+                text: "hello".into(),
+            },
+        );
         let attached = brain_event(
             2,
             "daemon",
@@ -8756,9 +8716,8 @@ mod tests {
             RunId,
         };
 
-        let output = crate::cli::output_manager::OutputManager::new(
-            crate::config::ColorScheme::default(),
-        );
+        let output =
+            crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
         output.disable_stdout();
         let run_id = RunId(uuid::Uuid::new_v4());
         let run = BrainRun {
@@ -8843,14 +8802,9 @@ mod tests {
         .unit
         .clone();
         let tool_row = local_unit.add_row("read_cache {\"key\":\"alpha\"}");
-        local_unit.complete_row_with_body(
-            tool_row,
-            "cache hit",
-            vec!["value=7".to_string()],
-        );
-        let approval_row = local_unit.add_row(
-            "approval (tool) for legacy audience unspecified: write_cache",
-        );
+        local_unit.complete_row_with_body(tool_row, "cache hit", vec!["value=7".to_string()]);
+        let approval_row =
+            local_unit.add_row("approval (tool) for legacy audience unspecified: write_cache");
         local_unit.complete_row(approval_row, "approve_once by daemon");
         local_unit.set_program_source("lisp");
         local_unit.set_response("(say \"cache checked\")");
@@ -8916,9 +8870,8 @@ mod tests {
             AttachmentId, BrainEventKind, BrainRun, BrainRunKind, BrainRunStatus, RunId,
         };
 
-        let output = crate::cli::output_manager::OutputManager::new(
-            crate::config::ColorScheme::default(),
-        );
+        let output =
+            crate::cli::output_manager::OutputManager::new(crate::config::ColorScheme::default());
         output.disable_stdout();
         let run_id = RunId(uuid::Uuid::new_v4());
         let run = BrainRun {
@@ -9086,8 +9039,15 @@ mod tests {
             "approval (tool)",
             "named Brain turn produced no wire source",
         ] {
-            assert!(rendered.contains(expected), "missing {expected:?}:\n{rendered}");
-            assert_eq!(rendered.matches(expected).count(), 1, "duplicated {expected:?}");
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}:\n{rendered}"
+            );
+            assert_eq!(
+                rendered.matches(expected).count(),
+                1,
+                "duplicated {expected:?}"
+            );
         }
         assert_eq!(rendered.matches("result").count(), 1);
     }
@@ -9113,10 +9073,7 @@ mod tests {
             },
         );
         program.run_id = Some(projection.run_id);
-        assert_eq!(
-            projection.observe(&program),
-            LocalProjectionMatch::Suppress
-        );
+        assert_eq!(projection.observe(&program), LocalProjectionMatch::Suppress);
         assert_eq!(projection.program_seq, Some(12));
 
         let mut result = brain_event(
@@ -10117,7 +10074,6 @@ mod tests {
             result
         );
     }
-
 }
 
 /// Open `content` in `$VISUAL` or `$EDITOR` (falling back to `vi`), let the user

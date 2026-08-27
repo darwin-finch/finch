@@ -192,6 +192,7 @@ mod disabled_training_tests {
         features.streaming_enabled = false;
         #[allow(deprecated)]
         let config = Config {
+            credentials: Vec::new(),
             metrics_dir: temp.path().join("metrics"),
             streaming_enabled: false,
             tui_enabled: false,
@@ -669,9 +670,7 @@ impl Repl {
                             .sync_program_files(root, crate::programs::ProgramScope::Project)
                             .await
                         {
-                            tracing::warn!(
-                                "Failed to index project program vocabulary: {error}"
-                            );
+                            tracing::warn!("Failed to index project program vocabulary: {error}");
                         }
                     }
                     let root = system.program_source_root();
@@ -2098,10 +2097,16 @@ impl Repl {
             .available_providers
             .get(initial_provider_index)
             .filter(|entry| !entry.is_local())
-            .and_then(|entry| crate::providers::create_provider_from_entry(entry).ok())
+            .and_then(|entry| {
+                crate::providers::create_provider_profile_from_config(
+                    &self._config,
+                    &entry.profile_name(),
+                )
+                .ok()
+            })
             .map(|provider| {
                 let inner: Arc<dyn crate::generators::Generator> = Arc::new(ClaudeGenerator::new(
-                    Arc::new(crate::claude::ClaudeClient::with_provider(provider)),
+                    Arc::new(crate::claude::ClaudeClient::with_shared_provider(provider)),
                 ));
                 Arc::new(ProfiledGenerator::new(
                     self.available_providers[initial_provider_index].profile_name(),
@@ -2139,9 +2144,9 @@ impl Repl {
 
         // Child agents share the currently selected generator through this
         // resolver, and share the same persistent VM runtime as the root.
-        let provider_resolver = crate::runtime::scheduler::ProviderResolver::with_profiles(
+        let provider_resolver = crate::runtime::scheduler::ProviderResolver::with_config(
             Arc::clone(&claude_gen),
-            self.available_providers.clone(),
+            self._config.clone(),
             self.daemon_client.clone(),
         );
         let agent_scheduler = crate::runtime::scheduler::AgentScheduler::new(
@@ -4112,7 +4117,10 @@ impl Repl {
             }
         } else {
             // Cloud provider — create a new teacher session.
-            let llm_provider = match crate::providers::create_provider_from_entry(&new_entry) {
+            let llm_provider = match crate::providers::create_provider_profile_from_config(
+                &self._config,
+                &new_entry.profile_name(),
+            ) {
                 Ok(p) => p,
                 Err(e) => {
                     self.output_error(format!("Failed to create provider: {}", e));
@@ -4127,7 +4135,7 @@ impl Repl {
             };
 
             *self.teacher_session.write().await =
-                TeacherSession::with_config(llm_provider, teacher_config);
+                TeacherSession::with_shared_provider(llm_provider, teacher_config);
 
             // Keep available_teachers index in sync
             if let Some(new_teacher_idx) = self
