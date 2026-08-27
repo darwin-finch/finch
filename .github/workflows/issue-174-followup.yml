@@ -1,0 +1,24 @@
+name: Issue 174 Complete Graph Follow-up
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - src/providers/factory.rs
+      - src/providers/model_catalog.rs
+      - src/runtime/scheduler.rs
+      - .github/workflows/issue-174-followup.yml
+
+jobs:
+  complete-graph-preflight:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y capnproto
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --lib --no-run
+      - run: cargo test --lib providers::factory::tests -- --nocapture
+      - run: cargo test --lib providers::model_catalog::tests -- --nocapture
+      - run: cargo test --lib runtime::scheduler::tests::complete_graph_preflight_ -- --nocapture
+      - run: cargo test --lib runtime::scheduler::tests::child_model_selection_ -- --nocapture
