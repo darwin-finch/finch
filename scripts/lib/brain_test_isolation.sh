@@ -40,7 +40,7 @@ brain_isolation_resolve_store() {
 
 brain_test_isolation_is_active() {
   local proof token home root home_identity root_identity brain_addr daemon_addr
-  local password_digest socket supervisor_pid supervisor_executable supervisor_identity
+  local password_digest socket socket_root socket_root_identity supervisor_pid supervisor_executable supervisor_identity
   local links proof_uid proof_mode proof_type actual_password_digest ancestor actual_supervisor_executable
   local library_root expected_supervisor
   [[ "${FINCH_BRAIN_TEST_ISOLATED:-}" == 1 ]] || return 1
@@ -55,10 +55,12 @@ brain_test_isolation_is_active() {
   daemon_addr="$(printf '%s\n' "$proof" | sed -n '7p')"
   password_digest="$(printf '%s\n' "$proof" | sed -n '8p')"
   socket="$(printf '%s\n' "$proof" | sed -n '9p')"
-  supervisor_pid="$(printf '%s\n' "$proof" | sed -n '10p')"
-  supervisor_executable="$(printf '%s\n' "$proof" | sed -n '11p')"
-  supervisor_identity="$(printf '%s\n' "$proof" | sed -n '12p')"
-  [[ "$(printf '%s\n' "$proof" | sed -n '13p')" == '' ]] || return 1
+  socket_root="$(printf '%s\n' "$proof" | sed -n '10p')"
+  socket_root_identity="$(printf '%s\n' "$proof" | sed -n '11p')"
+  supervisor_pid="$(printf '%s\n' "$proof" | sed -n '12p')"
+  supervisor_executable="$(printf '%s\n' "$proof" | sed -n '13p')"
+  supervisor_identity="$(printf '%s\n' "$proof" | sed -n '14p')"
+  [[ "$(printf '%s\n' "$proof" | sed -n '15p')" == '' ]] || return 1
   [[ "$token" == "${FINCH_BRAIN_TEST_TOKEN:-}" ]] || return 1
   [[ "$home" == "${HOME:-}" && "$home" == "${FINCH_BRAIN_TEST_HOME:-}" ]] || return 1
   [[ "$root" == "$home/.finch/brains" && "$root" == "${FINCH_BRAIN_TEST_ROOT:-}" ]] || return 1
@@ -69,11 +71,14 @@ brain_test_isolation_is_active() {
   actual_password_digest="$(printf '%s' "${FINCH_TEST_BRAIN_PASSWORD:-}" | shasum -a 256 | awk '{print $1}')" || return 1
   [[ "$password_digest" == "$actual_password_digest" ]] || return 1
   [[ "$socket" == "${FINCH_TEST_IPC_SOCKET:-}" ]] || return 1
+  [[ "$socket_root" == "${FINCH_TEST_SOCKET_ROOT:-}" && "$socket" == "$socket_root/daemon.sock" ]] || return 1
+  [[ "$socket_root_identity" == "$(brain_isolation_file_identity "$socket_root")" ]] || return 1
   [[ "${FINCH_TEST_BRAIN_LISTENER_FD:-}" == 10 && "${FINCH_TEST_DAEMON_LISTENER_FD:-}" == 11 ]] || return 1
+  [[ "${FINCH_TEST_BRAIN_LISTENER_BACKUP_FD:-}" == 110 && "${FINCH_TEST_DAEMON_LISTENER_BACKUP_FD:-}" == 111 ]] || return 1
   perl -MSocket=SOL_SOCKET,SO_TYPE,SOCK_STREAM,sockaddr_in,inet_ntoa -e '
     sub verify_listener {
       my ($fd, $expected) = @_;
-      open(my $socket, "<&=$fd") or return 0;
+      open(my $socket, "<&$fd") or return 0;
       my $type = getsockopt($socket, SOL_SOCKET, SO_TYPE);
       return 0 unless defined($type) && unpack("i", $type) == SOCK_STREAM;
       my $name = getsockname($socket);
@@ -81,13 +86,15 @@ brain_test_isolation_is_active() {
       my ($port, $address) = sockaddr_in($name);
       return inet_ntoa($address) . ":" . $port eq $expected;
     }
-    exit(verify_listener(10, $ARGV[0]) && verify_listener(11, $ARGV[1]) ? 0 : 1);
+    exit(verify_listener(10, $ARGV[0]) && verify_listener(11, $ARGV[1])
+      && verify_listener(110, $ARGV[0]) && verify_listener(111, $ARGV[1]) ? 0 : 1);
   ' "$brain_addr" "$daemon_addr" || return 1
   perl -MFcntl=F_GETFL,O_ACCMODE,O_RDONLY -e '
     my $flags = fcntl(STDIN, F_GETFL, 0); exit 1 unless defined $flags;
     exit(($flags & O_ACCMODE) == O_RDONLY ? 0 : 1)
   ' <&9 || return 1
   [[ "$supervisor_pid" == "${FINCH_TEST_SUPERVISOR_PID:-}" ]] || return 1
+  [[ "$supervisor_executable" == "${FINCH_TEST_SUPERVISOR_BIN:-}" ]] || return 1
   ancestor="$$"
   while [[ "$ancestor" -gt 1 && "$ancestor" != "$supervisor_pid" ]]; do
     ancestor="$(ps -o ppid= -p "$ancestor" 2>/dev/null | tr -d ' ')" || return 1
@@ -104,10 +111,12 @@ brain_test_isolation_is_active() {
     *) return 1 ;;
   esac
   library_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd -P)" || return 1
-  expected_supervisor="$library_root/target/debug/finch-test-supervisor"
+  case "$supervisor_executable" in
+    "$library_root/target/debug/finch-test-supervisor"|"$library_root/target/release/finch-test-supervisor")
+      expected_supervisor="$supervisor_executable" ;;
+    *) return 1 ;;
+  esac
   [[ -x "$expected_supervisor" ]] || return 1
-  expected_supervisor="$(cd "$(dirname "$expected_supervisor")" && pwd -P)/$(basename "$expected_supervisor")" || return 1
-  [[ "$supervisor_executable" == "$expected_supervisor" ]] || return 1
   [[ "$actual_supervisor_executable" == "$supervisor_executable" ]] || return 1
   [[ "$(brain_isolation_file_identity "$supervisor_executable")" == "$supervisor_identity" ]] || return 1
   if [[ "$(uname -s)" == Darwin ]]; then
@@ -125,6 +134,18 @@ brain_test_isolation_is_active() {
   [[ "$proof_type" == 'Regular File' || "$proof_type" == 'regular file' ]] || return 1
   [[ "$(cd "$home" 2>/dev/null && pwd -P)" == "$home" ]] || return 1
   [[ "$(brain_isolation_resolve_store "$home" 2>/dev/null)" == "$root" ]] || return 1
+}
+
+brain_test_isolation_require_finch_profile() {
+  local finch_bin="$1" finch_path supervisor_path finch_profile supervisor_profile
+  finch_path="$(cd "$(dirname "$finch_bin")" 2>/dev/null && pwd -P)/$(basename "$finch_bin")" || return 1
+  supervisor_path="${FINCH_TEST_SUPERVISOR_BIN:-}";
+  [[ -n "$supervisor_path" ]] || return 1
+  supervisor_path="$(cd "$(dirname "$supervisor_path")" 2>/dev/null && pwd -P)/$(basename "$supervisor_path")" || return 1
+  finch_profile="$(basename "$(dirname "$finch_path")")"
+  supervisor_profile="$(basename "$(dirname "$supervisor_path")")"
+  [[ "$finch_profile" == debug || "$finch_profile" == release ]] || return 1
+  [[ "$finch_profile" == "$supervisor_profile" ]] || return 1
 }
 
 brain_test_isolation_reexec_launcher() {

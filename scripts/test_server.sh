@@ -3,6 +3,15 @@
 
 script_path="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
 source "$(dirname "$script_path")/lib/brain_test_isolation.sh"
+finch_bin="${FINCH_BIN:-target/release/finch}"
+if [[ "${FINCH_BRAIN_TEST_ISOLATED:-}" != 1 ]]; then
+    case "$finch_bin" in
+        target/debug/finch|*/target/debug/finch)
+            export FINCH_TEST_SUPERVISOR_BIN="$(dirname "$script_path")/../target/debug/finch-test-supervisor" ;;
+        target/release/finch|*/target/release/finch)
+            export FINCH_TEST_SUPERVISOR_BIN="$(dirname "$script_path")/../target/release/finch-test-supervisor" ;;
+    esac
+fi
 brain_test_isolation_reexec_launcher "$script_path" "$@"
 
 set -euo pipefail
@@ -11,7 +20,10 @@ echo "Testing Shammah HTTP daemon mode..."
 echo
 
 # Check if binary exists
-finch_bin="${FINCH_BIN:-target/release/finch}"
+brain_test_isolation_require_finch_profile "$finch_bin" || {
+    echo 'Finch binary and test supervisor must use the same debug/release profile' >&2
+    exit 64
+}
 if [ ! -x "$finch_bin" ]; then
     echo "Error: Binary not found. Run 'cargo build --release' first."
     exit 1
@@ -32,7 +44,7 @@ trap cleanup EXIT INT TERM HUP
 # Port zero delegates endpoint allocation to the kernel. The daemon publishes
 # the actual loopback address only inside this isolated HOME.
 echo "Starting daemon on an ephemeral loopback port..."
-FINCH_TEST_BOUND_ADDR_FILE="$address_file" "$finch_bin" daemon --bind 127.0.0.1:0 &
+FINCH_TEST_BOUND_ADDR_FILE="$address_file" "$finch_bin" daemon --bind "$FINCH_TEST_DAEMON_ADDR" &
 DAEMON_PID=$!
 daemon_pid="$DAEMON_PID"
 

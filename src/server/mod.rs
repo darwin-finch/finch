@@ -1186,7 +1186,7 @@ mod tests {
             assert!(std::fs::read_dir(&forged_home).unwrap().next().is_none());
             return;
         }
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let status = crate::brain::supervised_test_subprocess_command()
             .args([
                 "--exact",
                 "server::tests::production_constructor_rejects_unverified_environment_before_store_mutation",
@@ -1265,6 +1265,8 @@ mod tests {
             home_identity: (metadata.dev(), metadata.ino()),
             root_identity: (0, 0),
             ipc_socket: home.join("safe.sock"),
+            socket_root: home.clone(),
+            socket_root_identity: (metadata.dev(), metadata.ino()),
             home,
             root,
             brain_addr: String::new(),

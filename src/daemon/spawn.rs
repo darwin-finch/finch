@@ -230,8 +230,13 @@ mod tests {
 
     #[test]
     fn test_isolation_gate_denies_before_probe_reuse_or_spawn() {
-        let error = ensure_daemon_access_allowed().unwrap_err().to_string();
-        assert!(error.contains("discovery, reuse, and auto-spawn are disabled"));
+        let error = ensure_daemon_access_allowed().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("discovery, reuse, and auto-spawn are disabled"),
+            "unexpected isolation-gate error: {error:#}"
+        );
     }
 
     #[test]

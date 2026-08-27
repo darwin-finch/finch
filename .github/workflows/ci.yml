@@ -65,7 +65,9 @@ jobs:
       run: cargo fmt --all -- --check
 
     - name: Build Brain test supervisor
-      run: cargo build --bin finch-test-supervisor
+      run: |
+        cargo build --bin finch-test-supervisor
+        cargo build --release --bin finch-test-supervisor
 
     - name: Verify Brain test isolation harness
       run: ./scripts/test_brain_isolation.sh
