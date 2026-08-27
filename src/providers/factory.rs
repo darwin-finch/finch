@@ -1033,7 +1033,7 @@ mod tests {
         let cases = [
             (
                 CredentialProvider::ChatgptSubscription,
-                CredentialKind::SubscriptionSession,
+                CredentialKind::Bearer,
                 "openai-chatgpt",
                 EndpointFamily::ChatgptSubscription,
                 false,
