@@ -530,17 +530,20 @@ mock_bind_log="$scratch/mock-bind.log"
 mkdir -p "$mock_debug_dir" "$mock_release_dir"
 cp "$supervisor" "$mock_finch"
 cp "$mock_finch" "$mock_release_dir/finch"
-FINCH_TEST_HTTP_FIXTURE=1 FINCH_BIN="$mock_finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" \
-  run_isolated "$repo_root/scripts/test_server.sh" >/dev/null
-FINCH_TEST_HTTP_FIXTURE=1 FINCH_BIN="$mock_finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" ANTHROPIC_API_KEY=synthetic \
-  run_isolated "$repo_root/scripts/test_tool_passthrough.sh" >/dev/null
+FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
+  FINCH_TEST_HTTP_FIXTURE=1 FINCH_BIN="$mock_finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" \
+  "$supervisor" "$repo_root/scripts/test_server.sh" >/dev/null
+FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
+  FINCH_TEST_HTTP_FIXTURE=1 FINCH_BIN="$mock_finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" \
+  ANTHROPIC_API_KEY=synthetic "$supervisor" "$repo_root/scripts/test_tool_passthrough.sh" >/dev/null
 test "$(wc -l <"$mock_bind_log" | tr -d ' ')" -eq 2
 awk -F '|' '$1 != $2 || $1 ~ /:0$/ { exit 1 }' "$mock_bind_log"
 
 phase=debug-release-profile-mismatch-rejected
 profile_status=0
-FINCH_TEST_HTTP_FIXTURE=1 FINCH_BIN="$mock_release_dir/finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" \
-  run_isolated "$repo_root/scripts/test_server.sh" >/dev/null 2>&1 || profile_status=$?
+FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
+  FINCH_TEST_HTTP_FIXTURE=1 FINCH_BIN="$mock_release_dir/finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" \
+  "$supervisor" "$repo_root/scripts/test_server.sh" >/dev/null 2>&1 || profile_status=$?
 test "$profile_status" -eq 64
 
 # CI builds the release supervisor before this harness, making this a real
