@@ -10877,7 +10877,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("tool");
         std::fs::copy("/usr/bin/true", &executable).unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o001)).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o401)).unwrap();
         let executable = std::fs::canonicalize(executable).unwrap();
         assert_eq!(
             std::fs::metadata(&executable).unwrap().uid(),
