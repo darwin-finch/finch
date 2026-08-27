@@ -63,7 +63,7 @@ for workflow in "${authoritative_workflows[@]}"; do
 
   cargo_jobs_without_pin=$(awk -v expected="dtolnay/rust-toolchain@$expected_toolchain" '
     function finish_job() {
-      if (job != "" && invokes_cargo && !has_pin) {
+      if (job != "" && invokes_cargo && (!has_pin || pin_line > first_use_line)) {
         print job
       }
     }
@@ -73,12 +73,21 @@ for workflow in "${authoritative_workflows[@]}"; do
       sub(/:$/, "", job)
       invokes_cargo = 0
       has_pin = 0
+      first_use_line = 0
+      pin_line = 0
       next
     }
-    job != "" && $0 ~ /(^|[[:space:]])cargo([[:space:]]|$)/ {
+    job != "" && ($0 ~ /(^|[[:space:]])cargo([[:space:]]|$)/ \
+      || $0 ~ /tests\/toolchain_contract\.sh/) {
+      if (!invokes_cargo) {
+        first_use_line = NR
+      }
       invokes_cargo = 1
     }
     job != "" && index($0, "uses: " expected) != 0 {
+      if (!has_pin) {
+        pin_line = NR
+      }
       has_pin = 1
     }
     END {
@@ -86,7 +95,7 @@ for workflow in "${authoritative_workflows[@]}"; do
     }
   ' "$workflow")
   if [[ -n "$cargo_jobs_without_pin" ]]; then
-    echo "$workflow has Cargo jobs without an explicit Rust $expected_toolchain install:" >&2
+    echo "$workflow has Cargo jobs without a preceding Rust $expected_toolchain install:" >&2
     echo "$cargo_jobs_without_pin" >&2
     exit 1
   fi
