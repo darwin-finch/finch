@@ -629,7 +629,7 @@ mod tests {
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
         config.revoke_credential("work").unwrap();
         release.send(()).unwrap();
-        assert!(refresh.join().unwrap().unwrap_err().to_string().contains("revoked"));
+        assert!(format!("{:#}", refresh.join().unwrap().unwrap_err()).contains("revoked"));
         assert!(matches!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
@@ -647,7 +647,7 @@ mod tests {
         entered.recv_timeout(Duration::from_secs(5)).unwrap();
         std::thread::sleep(Duration::from_millis(550));
         release.send(()).unwrap();
-        assert!(refresh.join().unwrap().unwrap_err().to_string().contains("expired"));
+        assert!(format!("{:#}", refresh.join().unwrap().unwrap_err()).contains("expired"));
         assert!(matches!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
