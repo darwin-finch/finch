@@ -8322,7 +8322,7 @@ mod tests {
         assert_eq!(result.credentials, vec![credential]);
         let saved = config_from_setup_result(&result);
         saved.validate().unwrap();
-        let serialized = toml::to_string(&saved.credentials).unwrap();
+        let serialized = toml::to_string(&saved).unwrap();
         assert!(serialized.contains("env:OPENAI_WORK_API_KEY"));
         assert!(!serialized.contains("sk-"));
     }
