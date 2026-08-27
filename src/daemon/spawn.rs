@@ -29,7 +29,8 @@ pub async fn ensure_daemon_running(bind_address: Option<&str>) -> Result<()> {
 
 fn ensure_daemon_access_allowed() -> Result<()> {
     let supervisor_marker = std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref() == Ok("1")
-        || std::env::var_os("FINCH_BRAIN_TEST_PROOF_FD").is_some();
+        || std::env::var_os("FINCH_BRAIN_TEST_PROOF_FD").is_some()
+        || std::env::var_os("FINCH_BRAIN_TEST_PROOF_BACKUP_FD").is_some();
     let no_auto_spawn = std::env::var("FINCH_BRAIN_TEST_NO_AUTO_SPAWN").as_deref() == Ok("1");
     if !supervisor_marker && !no_auto_spawn {
         return Ok(());

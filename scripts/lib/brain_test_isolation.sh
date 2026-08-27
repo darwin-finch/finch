@@ -45,6 +45,7 @@ brain_test_isolation_is_active() {
   local library_root expected_supervisor
   [[ "${FINCH_BRAIN_TEST_ISOLATED:-}" == 1 ]] || return 1
   [[ "${FINCH_BRAIN_TEST_PROOF_FD:-}" == 9 ]] || return 1
+  [[ "${FINCH_BRAIN_TEST_PROOF_BACKUP_FD:-}" == 108 ]] || return 1
   [[ -n "${FINCH_TEST_SUPERVISOR_BIN:-}" ]] || return 1
   proof="$("$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof 2>/dev/null)" || return 1
   token="$(printf '%s\n' "$proof" | sed -n '1p')"
@@ -98,7 +99,7 @@ brain_test_isolation_is_active() {
   perl -MFcntl=F_GETFL,O_ACCMODE,O_RDONLY -e '
     my $flags = fcntl(STDIN, F_GETFL, 0); exit 1 unless defined $flags;
     exit(($flags & O_ACCMODE) == O_RDONLY ? 0 : 1)
-  ' <&9 || return 1
+  ' <&108 || return 1
   [[ "$supervisor_pid" == "${FINCH_TEST_SUPERVISOR_PID:-}" ]] || return 1
   [[ "$supervisor_executable" == "${FINCH_TEST_SUPERVISOR_BIN:-}" ]] || return 1
   ancestor="$$"
@@ -126,15 +127,15 @@ brain_test_isolation_is_active() {
   [[ "$actual_supervisor_executable" == "$supervisor_executable" ]] || return 1
   [[ "$(brain_isolation_file_identity "$supervisor_executable")" == "$supervisor_identity" ]] || return 1
   if [[ "$(uname -s)" == Darwin ]]; then
-    links="$(stat -f '%l' /dev/fd/9)" || return 1
-    proof_uid="$(stat -f '%u' /dev/fd/9)" || return 1
-    proof_mode="$(stat -f '%Lp' /dev/fd/9)" || return 1
-    proof_type="$(stat -f '%HT' /dev/fd/9)" || return 1
+    links="$(stat -f '%l' /dev/fd/108)" || return 1
+    proof_uid="$(stat -f '%u' /dev/fd/108)" || return 1
+    proof_mode="$(stat -f '%Lp' /dev/fd/108)" || return 1
+    proof_type="$(stat -f '%HT' /dev/fd/108)" || return 1
   else
-    links="$(stat -c '%h' /dev/fd/9)" || return 1
-    proof_uid="$(stat -c '%u' /dev/fd/9)" || return 1
-    proof_mode="$(stat -c '%a' /dev/fd/9)" || return 1
-    proof_type="$(stat -c '%F' /dev/fd/9)" || return 1
+    links="$(stat -c '%h' /dev/fd/108)" || return 1
+    proof_uid="$(stat -c '%u' /dev/fd/108)" || return 1
+    proof_mode="$(stat -c '%a' /dev/fd/108)" || return 1
+    proof_type="$(stat -c '%F' /dev/fd/108)" || return 1
   fi
   [[ "$links" == 0 && "$proof_uid" == "$(id -u)" && "$proof_mode" == 400 ]] || return 1
   [[ "$proof_type" == 'Regular File' || "$proof_type" == 'regular file' ]] || return 1

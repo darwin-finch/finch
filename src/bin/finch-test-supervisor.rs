@@ -252,11 +252,16 @@ fn configure_supervised_child(
             if libc::setpgid(0, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
-            if proof_fd != 9 && libc::dup2(proof_fd, 9) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::fcntl(9, libc::F_SETFD, 0) == -1 {
-                return Err(io::Error::last_os_error());
+            // FD108 is the sealed proof authority. FD9 is the production
+            // target restored from it because script interpreters may use a
+            // low descriptor while reading a launcher.
+            for target in [9, 108] {
+                if proof_fd != target && libc::dup2(proof_fd, target) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::fcntl(target, libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
             }
             if auth_fd != 109 && libc::dup2(auth_fd, 109) == -1 {
                 return Err(io::Error::last_os_error());
@@ -587,6 +592,7 @@ fn run() -> anyhow::Result<i32> {
         .env("FINCH_BRAIN_TEST_ISOLATED", "1")
         .env("FINCH_BRAIN_TEST_TOKEN", &token)
         .env("FINCH_BRAIN_TEST_PROOF_FD", "9")
+        .env("FINCH_BRAIN_TEST_PROOF_BACKUP_FD", "108")
         .env("FINCH_BRAIN_TEST_AUTH_FD", "109")
         .env("FINCH_BRAIN_TEST_NO_AUTO_SPAWN", "1")
         .env("FINCH_TEST_BRAIN_ADDR", &brain_address)
