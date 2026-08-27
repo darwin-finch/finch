@@ -8984,7 +8984,7 @@ for line in sys.stdin:
         let original = ProviderEntry::ChatgptSubscription {
             credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
                 .to_string(),
-            app_server_executable: Some(PathBuf::from("/opt/codex/bin/codex")),
+            app_server_executable: Some(std::path::PathBuf::from("/opt/codex/bin/codex")),
             model: Some("gpt-5.6-sol".into()),
             name: Some("subscription-primary".into()),
         };
@@ -9008,7 +9008,7 @@ for line in sys.stdin:
                 model: Some(model),
                 name: Some(name),
             } if credential_ref == crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
-                && executable == PathBuf::from("/opt/codex/bin/codex")
+                && executable == std::path::PathBuf::from("/opt/codex/bin/codex")
                 && model == "gpt-5.6-sol"
                 && name == "renamed"
         ));
