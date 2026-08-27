@@ -1069,8 +1069,14 @@ mod tests {
     use crate::vm::{CapabilityKind, CapabilityRequirement, ResourceSelector};
     use async_trait::async_trait;
     use std::collections::BTreeSet;
+    use std::sync::Mutex;
 
     struct AccountResolver;
+
+    #[derive(Default)]
+    struct TrackingAccountResolver {
+        calls: Mutex<Vec<String>>,
+    }
 
     impl CredentialResolver for AccountResolver {
         fn resolve(&self, credential: &ProviderCredential) -> Result<ResolvedCredential> {
@@ -1083,6 +1089,13 @@ mod tests {
                 credential_name: credential.name.clone(),
                 secret: ResolvedSecret::new(secret)?,
             })
+        }
+    }
+
+    impl CredentialResolver for TrackingAccountResolver {
+        fn resolve(&self, credential: &ProviderCredential) -> Result<ResolvedCredential> {
+            self.calls.lock().unwrap().push(credential.name.clone());
+            AccountResolver.resolve(credential)
         }
     }
 
@@ -1352,25 +1365,32 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let credential = named_account_credential("account-a", "a", &endpoint);
 
         let provider_collision = crate::config::Config::with_providers(vec![
             named_account_profile("openai_platform", "account-a", "a", &endpoint),
-            named_account_profile("other-account-profile", "account-a", "a", &endpoint),
+            named_account_profile("other-account-profile", "account-b", "b", &endpoint),
         ])
-        .with_credentials(vec![credential.clone()]);
+        .with_credentials(vec![
+            named_account_credential("account-a", "a", &endpoint),
+            named_account_credential("account-b", "b", &endpoint),
+        ]);
+        let provider_store = Arc::new(TrackingAccountResolver::default());
         let provider_resolver = ProviderResolver::with_config_and_credential_resolver(
             Arc::new(EchoGenerator),
             provider_collision,
-            Arc::new(AccountResolver),
+            provider_store.clone(),
         );
         let selected = provider_resolver
             .resolve(Some("openai_platform"), None)
             .await
             .unwrap();
         assert_eq!(selected.name(), "openai_platform");
+        assert_eq!(
+            provider_store.calls.lock().unwrap().as_slice(),
+            ["account-a"]
+        );
 
-        let mut exact_model_profile = named_account_profile("gpt-4o", "account-a", "a", &endpoint);
+        let mut exact_model_profile = named_account_profile("gpt-4o", "account-b", "b", &endpoint);
         if let ProviderEntry::Credentialed { model, .. } = &mut exact_model_profile {
             *model = Some("gpt-4o-mini".into());
         }
@@ -1378,14 +1398,19 @@ mod tests {
             exact_model_profile,
             named_account_profile("model-alias-profile", "account-a", "a", &endpoint),
         ])
-        .with_credentials(vec![credential]);
+        .with_credentials(vec![
+            named_account_credential("account-a", "a", &endpoint),
+            named_account_credential("account-b", "b", &endpoint),
+        ]);
+        let model_store = Arc::new(TrackingAccountResolver::default());
         let model_resolver = ProviderResolver::with_config_and_credential_resolver(
             Arc::new(EchoGenerator),
             model_collision,
-            Arc::new(AccountResolver),
+            model_store.clone(),
         );
         let selected = model_resolver.resolve(None, Some("gpt-4o")).await.unwrap();
         assert_eq!(selected.name(), "gpt-4o");
+        assert_eq!(model_store.calls.lock().unwrap().as_slice(), ["account-b"]);
 
         assert!(matches!(
             listener.accept(),

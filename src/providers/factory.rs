@@ -405,18 +405,27 @@ fn resolve_named_graph(
         let credential = credentials
             .get(binding.credential_ref.as_str())
             .expect("Config::validate checked every named credential reference");
-        let handle = resolver.resolve(credential).map_err(|_| {
-            anyhow::anyhow!("Failed to resolve named credential '{}'; inspect the credential store without printing secret material", binding.credential_ref)
-        })?;
-        if handle.credential_name != binding.credential_ref {
-            bail!(
-                "credential resolver returned a handle for the wrong requested credential '{}'",
-                binding.credential_ref
-            );
-        }
+        let handle = resolve_named_credential(binding, credential, resolver)?;
         resolved.insert(binding.credential_ref.clone(), handle);
     }
     Ok(resolved)
+}
+
+fn resolve_named_credential(
+    binding: &crate::config::CredentialBinding,
+    credential: &crate::config::ProviderCredential,
+    resolver: &dyn CredentialResolver,
+) -> Result<ResolvedCredential> {
+    let handle = resolver.resolve(credential).map_err(|_| {
+        anyhow::anyhow!("Failed to resolve named credential '{}'; inspect the credential store without printing secret material", binding.credential_ref)
+    })?;
+    if handle.credential_name != binding.credential_ref {
+        bail!(
+            "credential resolver returned a handle for the wrong requested credential '{}'",
+            binding.credential_ref
+        );
+    }
+    Ok(handle)
 }
 
 fn preflight_named_transport(entry: &ProviderEntry) -> Result<()> {
@@ -672,13 +681,52 @@ pub fn create_provider_profile_from_config_with_resolver(
     profile_name: &str,
     resolver: &dyn CredentialResolver,
 ) -> Result<Arc<dyn LlmProvider>> {
-    let graph = create_provider_graph_from_config_with_resolver(config, resolver)?;
-    graph
-        .profiles()
+    if !config.providers.iter().any(|entry| !entry.is_local()) {
+        let graph = create_provider_graph_from_config_with_resolver(config, resolver)?;
+        return graph
+            .profiles()
+            .iter()
+            .find(|profile| profile.profile_name() == profile_name)
+            .map(|profile| Arc::clone(profile.provider()))
+            .with_context(|| format!("Provider profile '{profile_name}' was not found"));
+    }
+
+    // Revalidate every profile and transport before resolving even the one
+    // selected secret. Selection does not authorize reading other accounts.
+    config.validate()?;
+    if let Some((index, _)) = config
+        .providers
         .iter()
-        .find(|profile| profile.profile_name() == profile_name)
-        .map(|profile| Arc::clone(profile.provider()))
-        .with_context(|| format!("Provider profile '{profile_name}' was not found"))
+        .enumerate()
+        .find(|(_, entry)| matches!(entry, ProviderEntry::LegacyChatgptSubscription { .. }))
+    {
+        bail!(
+            "Provider #{} is invalid: {}",
+            index + 1,
+            LEGACY_CHATGPT_MIGRATION_ERROR
+        );
+    }
+    for (index, entry) in config.providers.iter().enumerate() {
+        preflight_named_transport(entry)
+            .with_context(|| format!("Provider #{} is invalid", index + 1))?;
+    }
+    let entry = config
+        .providers
+        .iter()
+        .find(|entry| !entry.is_local() && entry.profile_name() == profile_name)
+        .with_context(|| format!("Provider profile '{profile_name}' was not found"))?;
+    let provider = if let Some(binding) = entry.credential_binding() {
+        let credentials = crate::config::credential::credential_index(config.credentials())?;
+        let credential = credentials
+            .get(binding.credential_ref.as_str())
+            .expect("Config::validate checked the selected named credential reference");
+        let handle = resolve_named_credential(binding, credential, resolver)?;
+        let inner = create_provider_from_resolved_entry(entry, &handle)?;
+        Arc::new(CredentialBoundProvider::new(inner, credential)) as Arc<dyn LlmProvider>
+    } else {
+        Arc::from(create_provider_from_entry(entry)?)
+    };
+    Ok(provider)
 }
 
 /// Create the ordered cloud provider pool from unified configuration, falling back to legacy
