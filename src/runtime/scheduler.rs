@@ -433,6 +433,8 @@ pub struct AgentScheduler {
     context_store: Arc<AgentContextStore>,
     brain_control: RwLock<Option<mpsc::UnboundedSender<AgentBrainControlRequest>>>,
     active_brain_parent: RwLock<Option<AgentBrainContext>>,
+    #[cfg(test)]
+    wait_after_initial_check: tokio::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 impl AgentScheduler {
@@ -455,6 +457,8 @@ impl AgentScheduler {
             context_store,
             brain_control: RwLock::new(None),
             active_brain_parent: RwLock::new(None),
+            #[cfg(test)]
+            wait_after_initial_check: tokio::sync::Mutex::new(None),
         });
         runtime.attach_agent_scheduler(&scheduler);
         scheduler
@@ -644,7 +648,26 @@ impl AgentScheduler {
                 }
                 Arc::clone(&record.notify)
             };
-            notify.notified().await;
+            #[cfg(test)]
+            if let Some((checked, resume)) = self.wait_after_initial_check.lock().await.clone() {
+                checked.notify_one();
+                resume.notified().await;
+            }
+            // Register before rechecking the result so a fast child cannot
+            // finish between the state check and the notification await.
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let tasks = self.tasks.read().await;
+                let record = tasks
+                    .get(&task_id)
+                    .ok_or_else(|| anyhow::anyhow!("unknown agent task: {task_id}"))?;
+                if let Some(result) = &record.snapshot.result {
+                    return Ok(result.clone());
+                }
+            }
+            notified.await;
         }
     }
 
@@ -1609,6 +1632,75 @@ mod tests {
                 "child tool '{bypass}' bypasses the typed VM"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn wait_rechecks_completion_after_registering_notification() {
+        let runtime = Arc::new(ProgramRuntime::new());
+        let scheduler = AgentScheduler::new(
+            ProviderResolver::new(Arc::new(EchoGenerator)),
+            Arc::clone(&runtime),
+        );
+        let task_id = Uuid::new_v4();
+        let identity = AgentIdentity {
+            agent_id: Uuid::new_v4(),
+            task_id,
+            parent_agent_id: None,
+            root_agent_id: Uuid::new_v4(),
+            depth: 0,
+            provider_model: "echo".into(),
+            vm_revision: runtime.revision(),
+            manifest_generation: runtime.manifest_generation(),
+            starting_context_hash: "wait-race-test".into(),
+            grant_ceiling: EffectSet::pure(),
+            brain_run_id: None,
+        };
+        scheduler.tasks.write().await.insert(
+            task_id,
+            TaskRecord {
+                snapshot: AgentTaskSnapshot {
+                    identity: identity.clone(),
+                    task: "complete inside the wait registration window".into(),
+                    role: AgentRole::Explore,
+                    status: AgentTaskStatus::Running,
+                    result: None,
+                },
+                cancellation: CancellationToken::new(),
+                notify: Arc::new(Notify::new()),
+            },
+        );
+        let checked = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *scheduler.wait_after_initial_check.lock().await =
+            Some((Arc::clone(&checked), Arc::clone(&resume)));
+
+        let waiter = tokio::spawn({
+            let scheduler = Arc::clone(&scheduler);
+            async move { scheduler.wait(task_id).await }
+        });
+        checked.notified().await;
+        scheduler
+            .store_result(AgentTaskResult {
+                identity,
+                status: AgentTaskStatus::Completed,
+                final_message: "completed before notification registration".into(),
+                diagnostics: Vec::new(),
+                turns: 1,
+                elapsed_ms: 1,
+            })
+            .await;
+        resume.notify_one();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("wait lost a completion notification")
+            .expect("wait task panicked")
+            .expect("wait rejected a known task");
+        assert_eq!(result.status, AgentTaskStatus::Completed);
+        assert_eq!(
+            result.final_message,
+            "completed before notification registration"
+        );
     }
 
     #[tokio::test]
