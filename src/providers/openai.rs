@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::Engine;
 use futures::stream::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -18,10 +19,25 @@ use super::types::{
 };
 use super::{LlmProvider, ProviderBackend, ReasoningCapability, ValidatedProviderRequest};
 use crate::claude::retry::{with_retry, NonRetriableError};
-use crate::claude::types::ContentBlock;
+use crate::claude::types::{ContentBlock, ImageSource};
 use crate::config::ReasoningEffort;
 
 const REQUEST_TIMEOUT_SECS: u64 = 60;
+const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+const MAX_SSE_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportRule {
+    /// Current official OpenAI Chat Completions contract for GPT-5.6.
+    CanonicalGpt56ChatCompletions,
+    /// Historical OpenAI-compatible shape used by xAI, Groq, Mistral, Ollama,
+    /// remote Finch, custom endpoints, and pre-GPT-5.6 OpenAI models.
+    CompatibleChatCompletions,
+}
 
 /// Parse an API error body and return a human-friendly message with hints.
 ///
@@ -51,6 +67,317 @@ fn friendly_api_error(status: reqwest::StatusCode, body: &str) -> String {
     };
 
     format!("API error {}{}: {}", status, hint, msg)
+}
+
+fn validate_image_source(source: &ImageSource) -> Result<OpenAIImageUrl> {
+    if source.source_type != "base64" {
+        anyhow::bail!("OpenAI images must use a base64 source");
+    }
+    let expected_magic: &[u8] = match source.media_type.as_str() {
+        "image/png" => b"\x89PNG\r\n\x1a\n",
+        "image/jpeg" => b"\xff\xd8\xff",
+        other => anyhow::bail!(
+            "OpenAI image media type '{}' is unsupported; expected image/png or image/jpeg",
+            other
+        ),
+    };
+    let estimated_decoded = source.data.len().saturating_mul(3) / 4;
+    if estimated_decoded > MAX_IMAGE_BYTES {
+        anyhow::bail!("OpenAI image exceeded the 10 MiB decoded-size limit");
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&source.data)
+        .context("OpenAI image contained invalid base64")?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        anyhow::bail!("OpenAI image exceeded the 10 MiB decoded-size limit");
+    }
+    if !bytes.starts_with(expected_magic) {
+        anyhow::bail!("OpenAI image bytes did not match the declared media type");
+    }
+    Ok(OpenAIImageUrl {
+        url: format!("data:{};base64,{}", source.media_type, source.data),
+    })
+}
+
+async fn read_api_error(
+    response: reqwest::Response,
+    status: reqwest::StatusCode,
+    rule: TransportRule,
+) -> String {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(next) = stream.next().await {
+        let Ok(bytes) = next else { break };
+        let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
+        if remaining == 0 {
+            break;
+        }
+        body.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+    }
+    if rule == TransportRule::CanonicalGpt56ChatCompletions {
+        // Upstream error bodies can reflect prompts or tool arguments. They are
+        // deliberately consumed with a bound but never surfaced or logged.
+        return friendly_api_error(status, "response body redacted");
+    }
+    friendly_api_error(status, &String::from_utf8_lossy(&body))
+}
+
+#[derive(Default)]
+struct CanonicalStreamState {
+    response_id: Option<String>,
+    model: Option<String>,
+    terminal_reason: Option<String>,
+    done: bool,
+    accumulated_text: String,
+    tool_calls: Vec<(String, String, String)>,
+}
+
+fn canonical_stream_data(state: &mut CanonicalStreamState, data: &str) -> Result<Vec<StreamChunk>> {
+    if state.done {
+        anyhow::bail!("OpenAI stream sent data after its terminal marker");
+    }
+    let chunk: OpenAIStreamChunk =
+        serde_json::from_str(data).context("OpenAI stream contained malformed JSON")?;
+    if chunk.object.as_deref() != Some("chat.completion.chunk") {
+        anyhow::bail!("OpenAI stream contained an unknown event object");
+    }
+    if let Some(id) = &state.response_id {
+        if id != &chunk.id {
+            anyhow::bail!("OpenAI stream changed response ID mid-stream");
+        }
+    } else {
+        state.response_id = Some(chunk.id.clone());
+    }
+    if let Some(model) = &state.model {
+        if model != &chunk.model {
+            anyhow::bail!("OpenAI stream changed actual model mid-stream");
+        }
+    } else {
+        state.model = Some(chunk.model.clone());
+    }
+
+    let mut output = Vec::new();
+    if let Some(usage) = chunk.usage {
+        output.push(StreamChunk::Usage {
+            input_tokens: usage.prompt_tokens,
+        });
+    }
+    if chunk.choices.is_empty() {
+        if output.is_empty() {
+            anyhow::bail!("OpenAI stream chunk had neither a choice nor usage");
+        }
+        return Ok(output);
+    }
+    if chunk.choices.len() != 1 || chunk.choices[0].index != 0 {
+        anyhow::bail!("OpenAI stream returned an unexpected choice set");
+    }
+    let choice = &chunk.choices[0];
+    if state.terminal_reason.is_some()
+        && (choice.delta.content.is_some() || choice.delta.tool_calls.is_some())
+    {
+        anyhow::bail!("OpenAI stream sent content after terminal status");
+    }
+    if let Some(content) = &choice.delta.content {
+        state.accumulated_text.push_str(content);
+        output.push(StreamChunk::TextDelta(content.clone()));
+    }
+    if let Some(tool_deltas) = &choice.delta.tool_calls {
+        for delta in tool_deltas {
+            let index = delta
+                .index
+                .context("OpenAI function-call delta omitted its index")?;
+            if index > state.tool_calls.len() {
+                anyhow::bail!("OpenAI function-call indices were not contiguous");
+            }
+            if index == state.tool_calls.len() {
+                state
+                    .tool_calls
+                    .push((String::new(), String::new(), String::new()));
+            }
+            let call = &mut state.tool_calls[index];
+            if let Some(kind) = &delta.tool_type {
+                if kind != "function" {
+                    anyhow::bail!("OpenAI stream contained an unknown tool-call type");
+                }
+            }
+            if let Some(id) = &delta.id {
+                if !call.0.is_empty() && call.0 != *id {
+                    anyhow::bail!("OpenAI stream changed a function-call ID");
+                }
+                call.0 = id.clone();
+            }
+            if let Some(function) = &delta.function {
+                if let Some(name) = &function.name {
+                    if !call.1.is_empty() && call.1 != *name {
+                        anyhow::bail!("OpenAI stream changed a function-call name");
+                    }
+                    call.1 = name.clone();
+                }
+                if let Some(arguments) = &function.arguments {
+                    if call.2.len().saturating_add(arguments.len()) > MAX_TOOL_ARGUMENT_BYTES {
+                        anyhow::bail!("OpenAI function arguments exceeded the 1 MiB limit");
+                    }
+                    call.2.push_str(arguments);
+                }
+            }
+        }
+    }
+    if let Some(reason) = &choice.finish_reason {
+        if state.terminal_reason.replace(reason.clone()).is_some() {
+            anyhow::bail!("OpenAI stream sent duplicate terminal status");
+        }
+        if !matches!(
+            reason.as_str(),
+            "stop" | "length" | "tool_calls" | "content_filter"
+        ) {
+            anyhow::bail!(
+                "OpenAI stream returned unknown terminal status '{}'",
+                reason
+            );
+        }
+    }
+    Ok(output)
+}
+
+async fn finish_canonical_stream(
+    state: &mut CanonicalStreamState,
+    tx: &mpsc::Sender<Result<StreamChunk>>,
+) -> Result<()> {
+    if state.done {
+        anyhow::bail!("OpenAI stream sent duplicate terminal marker");
+    }
+    if state.terminal_reason.is_none() {
+        anyhow::bail!("OpenAI stream ended before terminal status");
+    }
+    state.done = true;
+    if !state.accumulated_text.is_empty() {
+        tx.send(Ok(StreamChunk::ContentBlockComplete(ContentBlock::Text {
+            text: state.accumulated_text.clone(),
+        })))
+        .await
+        .map_err(|_| anyhow::anyhow!("OpenAI stream receiver was dropped"))?;
+    }
+    for block in finalize_tool_calls(&state.tool_calls)? {
+        tx.send(Ok(StreamChunk::ContentBlockComplete(block)))
+            .await
+            .map_err(|_| anyhow::anyhow!("OpenAI stream receiver was dropped"))?;
+    }
+    Ok(())
+}
+
+fn spawn_canonical_stream_parser(
+    response: reqwest::Response,
+) -> mpsc::Receiver<Result<StreamChunk>> {
+    let (tx, rx) = mpsc::channel(100);
+    tokio::spawn(async move {
+        let mut stream = response.bytes_stream();
+        let mut buffer = Vec::new();
+        let mut total = 0usize;
+        let mut state = CanonicalStreamState::default();
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                next = stream.next() => next,
+            };
+            let Some(next) = next else {
+                if !state.done {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "OpenAI stream reached EOF before [DONE]"
+                        )))
+                        .await;
+                }
+                return;
+            };
+            let bytes = match next {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let _ = tx.send(Err(error.into())).await;
+                    return;
+                }
+            };
+            total = total.saturating_add(bytes.len());
+            if total > MAX_SSE_TOTAL_BYTES {
+                let _ = tx
+                    .send(Err(anyhow::anyhow!(
+                        "OpenAI stream exceeded the 32 MiB total limit"
+                    )))
+                    .await;
+                return;
+            }
+            buffer.extend_from_slice(&bytes);
+            if buffer.len() > MAX_SSE_LINE_BYTES && !buffer.contains(&b'\n') {
+                let _ = tx
+                    .send(Err(anyhow::anyhow!(
+                        "OpenAI SSE line exceeded the 1 MiB limit"
+                    )))
+                    .await;
+                return;
+            }
+            while let Some(pos) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line = buffer.drain(..=pos).collect::<Vec<_>>();
+                if line.len() > MAX_SSE_LINE_BYTES {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "OpenAI SSE line exceeded the 1 MiB limit"
+                        )))
+                        .await;
+                    return;
+                }
+                let line = match std::str::from_utf8(&line) {
+                    Ok(line) => line.trim_end_matches(&['\r', '\n'][..]),
+                    Err(_) => {
+                        let _ = tx
+                            .send(Err(anyhow::anyhow!("OpenAI SSE was not valid UTF-8")))
+                            .await;
+                        return;
+                    }
+                };
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
+                let Some(data) = line.strip_prefix("data:") else {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "OpenAI stream contained an unknown SSE field"
+                        )))
+                        .await;
+                    return;
+                };
+                let data = data.strip_prefix(' ').unwrap_or(data);
+                if data == "[DONE]" {
+                    if let Err(error) = finish_canonical_stream(&mut state, &tx).await {
+                        if !tx.is_closed() {
+                            let _ = tx.send(Err(error)).await;
+                        }
+                    }
+                    if buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                        let _ = tx
+                            .send(Err(anyhow::anyhow!(
+                                "OpenAI stream sent data after its terminal marker"
+                            )))
+                            .await;
+                    }
+                    return;
+                }
+                match canonical_stream_data(&mut state, data) {
+                    Ok(chunks) => {
+                        for chunk in chunks {
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    rx
 }
 
 // ─── Streaming tool-call helpers ─────────────────────────────────────────────
@@ -86,17 +413,26 @@ fn accumulate_tool_call_delta(
 ///
 /// Each entry is `(id, name, json_arguments_string)`.
 /// Invalid JSON in the arguments is replaced with an empty object.
-fn finalize_tool_calls(acc: &[(String, String, String)]) -> Vec<ContentBlock> {
+fn finalize_tool_calls(acc: &[(String, String, String)]) -> Result<Vec<ContentBlock>> {
     acc.iter()
         .filter(|(id, name, _)| !id.is_empty() || !name.is_empty())
         .map(|(id, name, args_str)| {
+            if id.is_empty() || name.is_empty() {
+                anyhow::bail!("OpenAI stream ended with an incomplete function call");
+            }
+            if args_str.len() > MAX_TOOL_ARGUMENT_BYTES {
+                anyhow::bail!("OpenAI function arguments exceeded the 1 MiB limit");
+            }
             let input = serde_json::from_str::<serde_json::Value>(args_str)
-                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-            ContentBlock::ToolUse {
+                .context("OpenAI returned malformed JSON function arguments")?;
+            if !input.is_object() {
+                anyhow::bail!("OpenAI function arguments were not a JSON object");
+            }
+            Ok(ContentBlock::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
                 input,
-            }
+            })
         })
         .collect()
 }
@@ -114,6 +450,7 @@ pub struct OpenAIProvider {
     default_model: String,
     provider_name: String,
     reasoning_effort: Option<ReasoningEffort>,
+    canonical_openai_endpoint: bool,
 }
 
 impl OpenAIProvider {
@@ -241,33 +578,52 @@ impl OpenAIProvider {
             .build()
             .context("Failed to create HTTP client")?;
 
+        let endpoints = ProviderEndpoints::new(&base_url, chat_path, models_path);
+        let canonical_openai_endpoint = provider_name == "openai"
+            && endpoints.chat_url == "https://api.openai.com/v1/chat/completions"
+            && endpoints.models_url == "https://api.openai.com/v1/models";
+
         Ok(Self {
             client,
             api_key,
-            endpoints: ProviderEndpoints::new(&base_url, chat_path, models_path),
+            endpoints,
             default_model,
             provider_name,
             reasoning_effort: None,
+            canonical_openai_endpoint,
         })
     }
 
-    /// Convert ProviderRequest to OpenAI API format
-    fn to_openai_request(&self, request: &ProviderRequest) -> OpenAIRequest {
+    fn transport_rule(&self, model: &str) -> TransportRule {
+        if self.canonical_openai_endpoint && matches!(model, "gpt-5.6-sol" | "gpt-5.6") {
+            return TransportRule::CanonicalGpt56ChatCompletions;
+        }
+        TransportRule::CompatibleChatCompletions
+    }
+
+    /// Convert a Finch request according to the explicitly selected wire rule.
+    fn to_openai_request(&self, request: &ProviderRequest) -> Result<OpenAIRequest> {
         let model = if request.model.is_empty() {
             self.default_model.clone()
         } else {
             request.model.clone()
         };
+        let rule = self.transport_rule(&model);
 
         let mut messages: Vec<OpenAIMessage> = Vec::new();
 
-        // Prepend system prompt as a {"role":"system"} message (OpenAI convention)
         if let Some(system) = &request.system {
             messages.push(OpenAIMessage::Regular {
-                role: "system".to_string(),
-                content: system.clone(),
+                role: match rule {
+                    TransportRule::CanonicalGpt56ChatCompletions => "developer",
+                    TransportRule::CompatibleChatCompletions => "system",
+                }
+                .to_string(),
+                content: OpenAIMessageContent::Text(system.clone()),
             });
         }
+
+        let mut outstanding_tool_ids = std::collections::HashSet::new();
 
         for msg in &request.messages {
             match msg.role.as_str() {
@@ -301,6 +657,18 @@ impl OpenAIProvider {
                             _ => None,
                         })
                         .collect();
+                    if rule == TransportRule::CanonicalGpt56ChatCompletions {
+                        for call in &tool_calls {
+                            if call.id.is_empty() || call.function.name.is_empty() {
+                                anyhow::bail!(
+                                    "OpenAI function calls require non-empty IDs and names"
+                                );
+                            }
+                            if !outstanding_tool_ids.insert(call.id.clone()) {
+                                anyhow::bail!("Duplicate OpenAI function call ID '{}'", call.id);
+                            }
+                        }
+                    }
 
                     // Grok (and strict OpenAI) require at least one of content or tool_calls.
                     // If both are absent, use a single space so the message is not empty.
@@ -320,14 +688,17 @@ impl OpenAIProvider {
                     });
                 }
                 _ => {
-                    // user / system messages: separate text from tool results
-                    let mut text_parts: Vec<&str> = Vec::new();
+                    // user/developer messages: keep ordered multimodal content for canonical
+                    // OpenAI. Compatible providers retain Finch's historical text shape.
+                    let mut content_parts: Vec<OpenAIContentPart> = Vec::new();
+                    let mut compatible_text_parts: Vec<&str> = Vec::new();
                     let mut tool_results: Vec<(String, String)> = Vec::new();
 
                     for block in &msg.content {
                         match block {
                             ContentBlock::Text { text } => {
-                                text_parts.push(text.as_str());
+                                compatible_text_parts.push(text.as_str());
+                                content_parts.push(OpenAIContentPart::Text { text: text.clone() });
                             }
                             ContentBlock::ToolResult {
                                 tool_use_id,
@@ -336,25 +707,50 @@ impl OpenAIProvider {
                             } => {
                                 tool_results.push((tool_use_id.clone(), content.clone()));
                             }
-                            ContentBlock::Image { .. } => {
-                                text_parts.push("[image]");
-                            }
+                            ContentBlock::Image { source } => match rule {
+                                TransportRule::CanonicalGpt56ChatCompletions => {
+                                    content_parts.push(OpenAIContentPart::ImageUrl {
+                                        image_url: validate_image_source(source)?,
+                                    });
+                                }
+                                TransportRule::CompatibleChatCompletions => {
+                                    compatible_text_parts.push("[image]");
+                                }
+                            },
                             ContentBlock::ToolUse { .. } => {}
                         }
                     }
 
-                    if !text_parts.is_empty() {
-                        let content = text_parts.join("\n");
-                        if !content.trim().is_empty() {
-                            messages.push(OpenAIMessage::Regular {
-                                role: msg.role.clone(),
-                                content,
-                            });
+                    let content = match rule {
+                        TransportRule::CanonicalGpt56ChatCompletions => {
+                            if content_parts.is_empty() {
+                                None
+                            } else {
+                                Some(OpenAIMessageContent::Parts(content_parts))
+                            }
                         }
+                        TransportRule::CompatibleChatCompletions => {
+                            let text = compatible_text_parts.join("\n");
+                            (!text.trim().is_empty()).then_some(OpenAIMessageContent::Text(text))
+                        }
+                    };
+                    if let Some(content) = content {
+                        messages.push(OpenAIMessage::Regular {
+                            role: msg.role.clone(),
+                            content,
+                        });
                     }
 
                     // One tool message per result (OpenAI requires separate messages)
                     for (tool_call_id, content) in tool_results {
+                        if rule == TransportRule::CanonicalGpt56ChatCompletions
+                            && !outstanding_tool_ids.remove(&tool_call_id)
+                        {
+                            anyhow::bail!(
+                                "OpenAI tool result references unknown function call ID '{}'",
+                                tool_call_id
+                            );
+                        }
                         messages.push(OpenAIMessage::Tool {
                             role: "tool".to_string(),
                             content: if content.trim().is_empty() {
@@ -367,6 +763,10 @@ impl OpenAIProvider {
                     }
                 }
             }
+        }
+        if rule == TransportRule::CanonicalGpt56ChatCompletions && !outstanding_tool_ids.is_empty()
+        {
+            anyhow::bail!("OpenAI request contained function calls without matching results");
         }
 
         // Convert tools to OpenAI format if present
@@ -399,19 +799,48 @@ impl OpenAIProvider {
                 .collect()
         });
 
-        OpenAIRequest {
+        let openai_request = OpenAIRequest {
             model,
             messages,
-            max_tokens: Some(request.max_tokens),
+            max_tokens: (rule == TransportRule::CompatibleChatCompletions)
+                .then_some(request.max_tokens),
+            max_completion_tokens: (rule == TransportRule::CanonicalGpt56ChatCompletions)
+                .then_some(request.max_tokens),
             temperature: request.temperature,
             reasoning_effort: self.reasoning_effort.map(ReasoningEffort::as_str),
             tools,
             stream: request.stream,
+            stream_options: (request.stream
+                && rule == TransportRule::CanonicalGpt56ChatCompletions)
+                .then_some(OpenAIStreamOptions {
+                    include_usage: true,
+                }),
+        };
+        let encoded =
+            serde_json::to_vec(&openai_request).context("Failed to serialize OpenAI request")?;
+        if encoded.len() > MAX_REQUEST_BYTES {
+            anyhow::bail!("OpenAI request exceeded the 32 MiB payload limit");
         }
+        Ok(openai_request)
     }
 
     /// Convert OpenAI response to ProviderResponse
-    fn parse_response(&self, response: OpenAIResponse) -> Result<ProviderResponse> {
+    fn parse_response(
+        &self,
+        response: OpenAIResponse,
+        rule: TransportRule,
+    ) -> Result<ProviderResponse> {
+        if rule == TransportRule::CanonicalGpt56ChatCompletions {
+            if response.object.as_deref() != Some("chat.completion") {
+                anyhow::bail!("OpenAI returned an unknown response object");
+            }
+            if response.model.trim().is_empty() {
+                anyhow::bail!("OpenAI response omitted the actual model");
+            }
+            if response.choices.len() != 1 || response.choices[0].index != 0 {
+                anyhow::bail!("OpenAI returned an unexpected choice set");
+            }
+        }
         let choice = response
             .choices
             .into_iter()
@@ -429,16 +858,49 @@ impl OpenAIProvider {
 
         // Convert tool calls to ContentBlock::ToolUse
         if let Some(tool_calls) = choice.message.tool_calls {
+            let mut call_ids = std::collections::HashSet::new();
             for tool_call in tool_calls {
                 if tool_call.tool_type == "function" {
-                    let input = serde_json::from_str(&tool_call.function.arguments)
-                        .unwrap_or(serde_json::json!({}));
+                    let input = match rule {
+                        TransportRule::CanonicalGpt56ChatCompletions => {
+                            if tool_call.id.is_empty()
+                                || tool_call.function.name.is_empty()
+                                || !call_ids.insert(tool_call.id.clone())
+                            {
+                                anyhow::bail!(
+                                    "OpenAI returned an invalid or duplicate function call ID/name"
+                                );
+                            }
+                            let input = serde_json::from_str(&tool_call.function.arguments)
+                                .context("OpenAI returned malformed JSON function arguments")?;
+                            if !input.is_object() {
+                                anyhow::bail!("OpenAI function arguments were not a JSON object");
+                            }
+                            input
+                        }
+                        TransportRule::CompatibleChatCompletions => {
+                            serde_json::from_str(&tool_call.function.arguments)
+                                .unwrap_or_else(|_| serde_json::json!({}))
+                        }
+                    };
                     content.push(ContentBlock::ToolUse {
                         id: tool_call.id,
                         name: tool_call.function.name,
                         input,
                     });
+                } else if rule == TransportRule::CanonicalGpt56ChatCompletions {
+                    anyhow::bail!("OpenAI returned an unknown tool-call type");
                 }
+            }
+        }
+
+        if rule == TransportRule::CanonicalGpt56ChatCompletions {
+            let reason = choice
+                .finish_reason
+                .as_deref()
+                .context("OpenAI response omitted terminal status")?;
+            if !matches!(reason, "stop" | "length" | "tool_calls" | "content_filter") {
+                anyhow::bail!("OpenAI returned unknown terminal status '{}'", reason);
             }
         }
 
@@ -454,7 +916,8 @@ impl OpenAIProvider {
 
     /// Send a single message request (no retry)
     async fn send_message_once(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        let openai_request = self.to_openai_request(request);
+        let openai_request = self.to_openai_request(request)?;
+        let rule = self.transport_rule(&openai_request.model);
         let url = &self.endpoints.chat_url;
 
         tracing::debug!(
@@ -479,8 +942,7 @@ impl OpenAIProvider {
         let status = response.status();
 
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
-            let msg = friendly_api_error(status, &error_body);
+            let msg = read_api_error(response, status, rule).await;
             if status.is_client_error() {
                 return Err(anyhow::Error::new(NonRetriableError(msg)));
             }
@@ -500,7 +962,7 @@ impl OpenAIProvider {
             "received OpenAI-compatible response"
         );
 
-        self.parse_response(openai_response)
+        self.parse_response(openai_response, rule)
     }
 
     /// Send a message with streaming response (no retry)
@@ -510,8 +972,14 @@ impl OpenAIProvider {
     ) -> Result<mpsc::Receiver<Result<StreamChunk>>> {
         let (tx, rx) = mpsc::channel(100);
 
-        let mut openai_request = self.to_openai_request(request);
+        let mut openai_request = self.to_openai_request(request)?;
         openai_request.stream = true;
+        let rule = self.transport_rule(&openai_request.model);
+        if rule == TransportRule::CanonicalGpt56ChatCompletions {
+            openai_request.stream_options = Some(OpenAIStreamOptions {
+                include_usage: true,
+            });
+        }
 
         let url = &self.endpoints.chat_url;
 
@@ -529,15 +997,26 @@ impl OpenAIProvider {
 
         let status = response.status();
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
-            let msg = friendly_api_error(status, &error_body);
+            let msg = read_api_error(response, status, rule).await;
             if status.is_client_error() {
                 return Err(anyhow::Error::new(NonRetriableError(msg)));
             }
             anyhow::bail!("{}", msg);
         }
 
-        // Spawn task to parse SSE stream
+        if rule == TransportRule::CanonicalGpt56ChatCompletions {
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            if !content_type.starts_with("text/event-stream") {
+                anyhow::bail!("OpenAI streaming response was not text/event-stream");
+            }
+            return Ok(spawn_canonical_stream_parser(response));
+        }
+
+        // Compatible providers retain the permissive historical parser.
         tokio::spawn(async move {
             tracing::debug!("[STREAM] OpenAI streaming task started");
             let mut stream = response.bytes_stream();
@@ -587,7 +1066,15 @@ impl OpenAIProvider {
                                     }
 
                                     // Convert accumulated tool call deltas to ToolUse blocks
-                                    for block in finalize_tool_calls(&tool_call_acc) {
+                                    let blocks = match finalize_tool_calls(&tool_call_acc) {
+                                        Ok(blocks) => blocks,
+                                        Err(error) => {
+                                            let _ = tx.send(Err(error)).await;
+                                            done = true;
+                                            break;
+                                        }
+                                    };
+                                    for block in blocks {
                                         if let ContentBlock::ToolUse {
                                             ref name, ref id, ..
                                         } = block
@@ -818,6 +1305,8 @@ struct OpenAIRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
@@ -825,6 +1314,13 @@ struct OpenAIRequest {
     tools: Option<Vec<OpenAITool>>,
     #[serde(skip_serializing_if = "is_false")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<OpenAIStreamOptions>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenAIStreamOptions {
+    include_usage: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -852,8 +1348,30 @@ enum OpenAIMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<OpenAIRequestToolCall>>,
     },
-    /// Plain user / system message
-    Regular { role: String, content: String },
+    /// Plain user / system/developer message
+    Regular {
+        role: String,
+        content: OpenAIMessageContent,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+enum OpenAIMessageContent {
+    Text(String),
+    Parts(Vec<OpenAIContentPart>),
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenAIContentPart {
+    Text { text: String },
+    ImageUrl { image_url: OpenAIImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenAIImageUrl {
+    url: String,
 }
 
 /// Tool call entry inside an assistant message (request format)
@@ -888,8 +1406,12 @@ struct OpenAIFunction {
 #[derive(Debug, Clone, Deserialize)]
 struct OpenAIResponse {
     id: String,
+    #[serde(default)]
+    object: Option<String>,
     model: String,
     choices: Vec<OpenAIChoice>,
+    #[serde(default)]
+    usage: Option<OpenAIUsage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -929,7 +1451,22 @@ struct OpenAIToolFunction {
 #[allow(dead_code)]
 struct OpenAIStreamChunk {
     id: String,
+    #[serde(default)]
+    object: Option<String>,
+    #[serde(default)]
+    model: String,
     choices: Vec<OpenAIStreamChoice>,
+    #[serde(default)]
+    usage: Option<OpenAIUsage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAIUsage {
+    prompt_tokens: u32,
+    #[allow(dead_code)]
+    completion_tokens: u32,
+    #[allow(dead_code)]
+    total_tokens: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -967,6 +1504,273 @@ struct OpenAIFunctionDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn canonical_test_provider(base_url: String) -> OpenAIProvider {
+        let mut provider = OpenAIProvider::new_compatible(
+            "test-secret".to_string(),
+            base_url,
+            "/v1/chat/completions",
+            "/v1/models",
+            "gpt-5.6-sol".to_string(),
+            "openai".to_string(),
+        )
+        .unwrap()
+        .with_reasoning_effort(ReasoningEffort::High);
+        provider.canonical_openai_endpoint = true;
+        provider
+    }
+
+    #[tokio::test]
+    async fn canonical_gpt_5_6_posts_exact_current_chat_completions_json() {
+        use crate::claude::types::{ContentBlock, Message};
+        use crate::tools::types::{ToolDefinition, ToolInputSchema};
+
+        let mut server = mockito::Server::new_async().await;
+        let expected = serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "messages": [
+                {"role":"developer","content":"guard"},
+                {"role":"user","content":[
+                    {"type":"text","text":"inspect"},
+                    {"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}},
+                    {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,/9j/"}}
+                ]},
+                {"role":"assistant","tool_calls":[
+                    {"id":"call_a","type":"function","function":{"name":"read","arguments":"{\"path\":\"a\"}"}},
+                    {"id":"call_b","type":"function","function":{"name":"read","arguments":"{\"path\":\"b\"}"}}
+                ]},
+                {"role":"tool","content":"A","tool_call_id":"call_a"},
+                {"role":"tool","content":"B","tool_call_id":"call_b"}
+            ],
+            "max_completion_tokens": 321,
+            "reasoning_effort": "high",
+            "tools": [{"type":"function","function":{
+                "name":"read","description":"read file","parameters":{
+                    "type":"object","properties":{"path":{"type":"string","description":"path"}},"required":["path"]
+                }
+            }}]
+        });
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_header("authorization", "Bearer test-secret")
+            .match_body(mockito::Matcher::Json(expected))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"chat-1","object":"chat.completion","model":"gpt-5.6-sol-2026-08-01","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":1,"total_tokens":10}}"#)
+            .create_async()
+            .await;
+        let provider = canonical_test_provider(server.url());
+        let request = ProviderRequest::new(vec![
+            Message::with_content(
+                "user",
+                vec![
+                    ContentBlock::text("inspect"),
+                    ContentBlock::image("image/png", "iVBORw0KGgo="),
+                    ContentBlock::image("image/jpeg", "/9j/"),
+                ],
+            ),
+            Message::with_content(
+                "assistant",
+                vec![
+                    ContentBlock::ToolUse {
+                        id: "call_a".into(),
+                        name: "read".into(),
+                        input: serde_json::json!({"path":"a"}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call_b".into(),
+                        name: "read".into(),
+                        input: serde_json::json!({"path":"b"}),
+                    },
+                ],
+            ),
+            Message::with_content(
+                "user",
+                vec![
+                    ContentBlock::tool_result("call_a".into(), "A".into(), None),
+                    ContentBlock::tool_result("call_b".into(), "B".into(), None),
+                ],
+            ),
+        ])
+        .with_model("gpt-5.6-sol")
+        .with_system("guard")
+        .with_max_tokens(321)
+        .with_tools(vec![ToolDefinition {
+            name: "read".into(),
+            description: "read file".into(),
+            input_schema: ToolInputSchema::simple(vec![("path", "path")]),
+        }]);
+        let response = provider.send_message_once(&request).await.unwrap();
+        assert_eq!(response.model, "gpt-5.6-sol-2026-08-01");
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn canonical_and_compatible_rules_are_explicit_and_separate() {
+        let canonical = OpenAIProvider::new_openai("key".into()).unwrap();
+        assert_eq!(
+            canonical.transport_rule("gpt-5.6-sol"),
+            TransportRule::CanonicalGpt56ChatCompletions
+        );
+        assert_eq!(
+            canonical.transport_rule("gpt-4o"),
+            TransportRule::CompatibleChatCompletions
+        );
+        let custom = OpenAIProvider::new_compatible(
+            "key".into(),
+            "https://gateway.example".into(),
+            "/v1/chat/completions",
+            "/v1/models",
+            "gpt-5.6-sol".into(),
+            "openai".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            custom.transport_rule("gpt-5.6-sol"),
+            TransportRule::CompatibleChatCompletions
+        );
+        assert_eq!(
+            canonical.capabilities("gpt-5.6-sol").wire_protocol.protocol,
+            Some(WireProtocol::OpenAiChatCompletions)
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_stream_preserves_fragmented_parallel_calls_usage_and_terminal() {
+        let mut server = mockito::Server::new_async().await;
+        let body = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol-actual\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"pa\"}},{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"pa\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol-actual\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"a\\\"}\"}},{\"index\":1,\"function\":{\"arguments\":\"th\\\":\\\"b\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol-actual\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol-actual\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "model":"gpt-5.6-sol", "stream":true,
+                "stream_options":{"include_usage":true}, "max_completion_tokens":4096
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream; charset=utf-8")
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = canonical_test_provider(server.url());
+        let mut rx = provider
+            .send_message_stream_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("use tools")])
+                    .with_model("gpt-5.6-sol"),
+            )
+            .await
+            .unwrap();
+        let mut calls = Vec::new();
+        let mut usage = None;
+        while let Some(item) = rx.recv().await {
+            match item.unwrap() {
+                StreamChunk::ContentBlockComplete(ContentBlock::ToolUse { id, name, input }) => {
+                    calls.push((id, name, input))
+                }
+                StreamChunk::Usage { input_tokens } => usage = Some(input_tokens),
+                _ => {}
+            }
+        }
+        assert_eq!(usage, Some(12));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "call_a");
+        assert_eq!(calls[0].2, serde_json::json!({"path":"a"}));
+        assert_eq!(calls[1].0, "call_b");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn canonical_stream_rejects_premature_eof_at_http_boundary() {
+        let mut server = mockito::Server::new_async().await;
+        server.mock("POST", "/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.6-sol\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n")
+            .create_async().await;
+        let provider = canonical_test_provider(server.url());
+        let mut rx = provider
+            .send_message_stream_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("gpt-5.6-sol"),
+            )
+            .await
+            .unwrap();
+        let mut error = None;
+        while let Some(item) = rx.recv().await {
+            if let Err(err) = item {
+                error = Some(err.to_string());
+            }
+        }
+        assert_eq!(
+            error.as_deref(),
+            Some("OpenAI stream reached EOF before [DONE]")
+        );
+    }
+
+    #[test]
+    fn canonical_stream_rejects_unknown_malformed_duplicate_and_mismatched_events() {
+        let mut state = CanonicalStreamState::default();
+        assert!(canonical_stream_data(&mut state, "not-json")
+            .unwrap_err()
+            .to_string()
+            .contains("malformed JSON"));
+        assert!(canonical_stream_data(
+            &mut state,
+            r#"{"id":"x","object":"response.output_text.delta","model":"gpt-5.6-sol","choices":[]}"#
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("unknown event"));
+        let mut state = CanonicalStreamState::default();
+        canonical_stream_data(&mut state, r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#).unwrap();
+        assert!(canonical_stream_data(&mut state, r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#).unwrap_err().to_string().contains("duplicate terminal"));
+        let mut state = CanonicalStreamState::default();
+        canonical_stream_data(&mut state, r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":null}]}"#).unwrap();
+        assert!(canonical_stream_data(&mut state, r#"{"id":"x","object":"chat.completion.chunk","model":"gpt-5.6-sol","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_b","function":{"arguments":""}}]},"finish_reason":null}]}"#).unwrap_err().to_string().contains("changed a function-call ID"));
+    }
+
+    #[test]
+    fn canonical_images_and_tool_results_fail_closed_before_http() {
+        let provider = canonical_test_provider("http://127.0.0.1:1".into());
+        let bad_base64 = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            "user",
+            vec![ContentBlock::image("image/png", "not base64")],
+        )])
+        .with_model("gpt-5.6-sol");
+        assert!(provider
+            .to_openai_request(&bad_base64)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid base64"));
+        let bad_mime = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            "user",
+            vec![ContentBlock::image("image/webp", "AAAA")],
+        )])
+        .with_model("gpt-5.6-sol");
+        assert!(provider
+            .to_openai_request(&bad_mime)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported"));
+        let mismatch = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            "user",
+            vec![ContentBlock::tool_result(
+                "missing".into(),
+                "x".into(),
+                None,
+            )],
+        )])
+        .with_model("gpt-5.6-sol");
+        assert!(provider
+            .to_openai_request(&mismatch)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown function call ID"));
+    }
 
     #[tokio::test]
     async fn compatible_provider_posts_to_exact_chat_path_with_bearer_auth() {
@@ -1037,13 +1841,15 @@ mod tests {
         use crate::providers::types::ProviderRequest;
         let req =
             ProviderRequest::new(vec![Message::user("hello")]).with_system("You are helpful.");
-        let openai_req = provider.to_openai_request(&req);
+        let openai_req = provider.to_openai_request(&req).unwrap();
         // System message should be first
         assert!(
             matches!(&openai_req.messages[0], OpenAIMessage::Regular { role, .. } if role == "system")
         );
         if let OpenAIMessage::Regular { content, .. } = &openai_req.messages[0] {
-            assert_eq!(content, "You are helpful.");
+            assert!(
+                matches!(content, OpenAIMessageContent::Text(text) if text == "You are helpful.")
+            );
         }
     }
 
@@ -1053,7 +1859,7 @@ mod tests {
         use crate::claude::types::Message;
         use crate::providers::types::ProviderRequest;
         let req = ProviderRequest::new(vec![Message::user("hello")]);
-        let openai_req = provider.to_openai_request(&req);
+        let openai_req = provider.to_openai_request(&req).unwrap();
         // No system message — first message is user
         assert!(
             matches!(&openai_req.messages[0], OpenAIMessage::Regular { role, .. } if role == "user")
@@ -1076,7 +1882,7 @@ mod tests {
                 }],
             ),
         ]);
-        let openai_req = provider.to_openai_request(&req);
+        let openai_req = provider.to_openai_request(&req).unwrap();
         // Assistant message should have tool_calls
         let assistant_msg = openai_req
             .messages
@@ -1115,7 +1921,7 @@ mod tests {
                 }],
             ),
         ]);
-        let openai_req = provider.to_openai_request(&req);
+        let openai_req = provider.to_openai_request(&req).unwrap();
         // There should be a "tool" role message
         let tool_msg = openai_req
             .messages
@@ -1146,7 +1952,7 @@ mod tests {
                 is_error: None,
             }],
         )]);
-        let openai_req = provider.to_openai_request(&req);
+        let openai_req = provider.to_openai_request(&req).unwrap();
         if let Some(OpenAIMessage::Tool { content, .. }) = openai_req
             .messages
             .iter()
@@ -1170,7 +1976,7 @@ mod tests {
                 text: "   ".to_string(),
             }],
         )]);
-        let openai_req = provider.to_openai_request(&req);
+        let openai_req = provider.to_openai_request(&req).unwrap();
         assert!(openai_req.messages.is_empty());
     }
 
@@ -1180,7 +1986,7 @@ mod tests {
         use crate::providers::types::ProviderRequest;
         // Request with empty model — should fall back to provider default
         let req = ProviderRequest::new(vec![]);
-        let openai_req = provider.to_openai_request(&req);
+        let openai_req = provider.to_openai_request(&req).unwrap();
         assert!(!openai_req.model.is_empty());
     }
 
@@ -1191,7 +1997,7 @@ mod tests {
             .with_model("gpt-5.6-sol")
             .with_reasoning_effort(ReasoningEffort::High);
         let request = ProviderRequest::new(vec![crate::claude::Message::user("reason carefully")]);
-        let openai_request = provider.to_openai_request(&request);
+        let openai_request = provider.to_openai_request(&request).unwrap();
 
         assert_eq!(openai_request.model, "gpt-5.6-sol");
         assert_eq!(openai_request.reasoning_effort, Some("high"));
@@ -1484,7 +2290,7 @@ mod tests {
             "bash".to_string(),
             r#"{"command":"ls"}"#.to_string(),
         )];
-        let blocks = finalize_tool_calls(&acc);
+        let blocks = finalize_tool_calls(&acc).unwrap();
         assert_eq!(blocks.len(), 1);
         if let crate::claude::types::ContentBlock::ToolUse { id, name, input } = &blocks[0] {
             assert_eq!(id, "call_1");
@@ -1496,25 +2302,22 @@ mod tests {
     }
 
     #[test]
-    fn test_finalize_tool_calls_invalid_json_falls_back_to_empty_object() {
+    fn test_finalize_tool_calls_invalid_json_is_rejected() {
         let acc = vec![(
             "call_x".to_string(),
             "glob".to_string(),
             "NOT_VALID_JSON".to_string(),
         )];
-        let blocks = finalize_tool_calls(&acc);
-        assert_eq!(blocks.len(), 1);
-        if let crate::claude::types::ContentBlock::ToolUse { input, .. } = &blocks[0] {
-            assert!(input.is_object(), "Invalid JSON should yield empty object");
-        } else {
-            panic!("Expected ToolUse block");
-        }
+        let error = finalize_tool_calls(&acc).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("malformed JSON function arguments"));
     }
 
     #[test]
     fn test_finalize_tool_calls_empty_acc() {
         let acc: Vec<(String, String, String)> = Vec::new();
-        let blocks = finalize_tool_calls(&acc);
+        let blocks = finalize_tool_calls(&acc).unwrap();
         assert!(blocks.is_empty());
     }
 
@@ -1556,7 +2359,7 @@ mod tests {
         accumulate_tool_call_delta(&mut acc, &delta2);
 
         // Finalize
-        let blocks = finalize_tool_calls(&acc);
+        let blocks = finalize_tool_calls(&acc).unwrap();
         assert_eq!(blocks.len(), 1);
         if let crate::claude::types::ContentBlock::ToolUse { id, name, input } = &blocks[0] {
             assert_eq!(id, "call_xyz");
