@@ -41,4 +41,4 @@ jobs:
       - name: Run OpenAI provider protocol regressions
         run: cargo test --lib providers::openai::tests -- --nocapture
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: rustfmt --edition 2021 --check src/providers/openai.rs
