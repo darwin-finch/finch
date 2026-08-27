@@ -10,6 +10,7 @@ on:
     paths:
       - Cargo.toml
       - vendor/russh-0.60.3/**
+      - vendor/internal-russh-forked-ssh-key-0.6.18/**
       - src/ssh/**
       - tests/ssh_client_test.rs
       - .github/workflows/issue-186-russh-security.yml
@@ -44,6 +45,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Install Cap'n Proto (Linux)
         if: runner.os == 'Linux'
@@ -85,13 +87,20 @@ jobs:
             vendor/russh-0.60.3/src/keys/format/mod.rs \
             vendor/russh-0.60.3/src/keys/format/pkcs5.rs \
             vendor/russh-0.60.3/src/keys/format/pkcs8.rs
+          rustfmt --edition 2021 --config skip_children=true --check \
+            vendor/internal-russh-forked-ssh-key-0.6.18/src/error.rs \
+            vendor/internal-russh-forked-ssh-key-0.6.18/src/mpint.rs \
+            vendor/internal-russh-forked-ssh-key-0.6.18/src/ppk.rs \
+            vendor/internal-russh-forked-ssh-key-0.6.18/src/private/rsa.rs \
+            vendor/internal-russh-forked-ssh-key-0.6.18/src/public/rsa.rs \
+            vendor/internal-russh-forked-ssh-key-0.6.18/src/signature.rs
 
       - name: Assert isolated migration diff
         if: runner.os == 'Linux'
         shell: bash
         run: |
           git diff --name-only ca184e08a3e99992f86f3a3d14a260a7f3986760 HEAD > changed-files.txt
-          unexpected="$(grep -Ev '^(.github/workflows/issue-186-russh-security.yml|.github/workflows/release.yml|Cargo.toml|src/ssh/client.rs|src/ssh/mod.rs|tests/ssh_client_test.rs|vendor/russh-0.60.3/)' changed-files.txt || true)"
+          unexpected="$(grep -Ev '^(.github/workflows/issue-186-russh-security.yml|.github/workflows/release.yml|Cargo.toml|src/ssh/client.rs|src/ssh/mod.rs|tests/ssh_client_test.rs|vendor/(russh-0.60.3|internal-russh-forked-ssh-key-0.6.18)/)' changed-files.txt || true)"
           if [ -n "$unexpected" ]; then
             echo "Unexpected files in the issue #186 migration:"
             printf '%s\n' "$unexpected"
@@ -103,25 +112,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          crate="$(mktemp)"
           reconstructed="$(mktemp -d)"
-          license="$(mktemp)"
-          curl --fail --location --silent --show-error \
-            https://crates.io/api/v1/crates/russh/0.60.3/download \
-            --output "$crate"
-          echo '324b92f459d3e42da294e14e8eb150d2215fcfb7c966838bc1127cd68bc05a0d  '"$crate" | sha256sum --check
-          tar -xzf "$crate" --strip-components=1 -C "$reconstructed"
-          (cd "$reconstructed" && patch --strip=3 < "$GITHUB_WORKSPACE/vendor/russh-0.60.3/FINCH-RSA-REMOVAL.patch")
-          curl --fail --location --silent --show-error \
-            https://raw.githubusercontent.com/Eugeny/russh/fab67f8ec3e1dbe45fb1caf1362cdd04848ce9d0/LICENSE.txt \
-            --output "$license"
-          echo 'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30  '"$license" | sha256sum --check
-          cmp "$license" vendor/russh-0.60.3/LICENSE.txt
+          test "$(git rev-parse 80e65c91:vendor/russh-0.60.3)" = b8b9ee58f65ae0d36aba701ea87c2b13970892fd
+          git archive 80e65c91 vendor/russh-0.60.3 \
+            | tar -x --strip-components=2 -C "$reconstructed"
+          (cd "$reconstructed" && patch --remove-empty-files --strip=3 < "$GITHUB_WORKSPACE/vendor/russh-0.60.3/FINCH-RSA-REMOVAL.patch")
+          echo 'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30  vendor/russh-0.60.3/LICENSE.txt' | sha256sum --check
           diff -ru \
             --exclude FINCH-VENDOR.md \
             --exclude FINCH-RSA-REMOVAL.patch \
             --exclude LICENSE.txt \
             "$reconstructed" vendor/russh-0.60.3
+
+          ssh_key_reconstructed="$(mktemp -d)"
+          test "$(git rev-parse c82eea26:vendor/internal-russh-forked-ssh-key-0.6.18)" = 3e2e5760e59a47316fc45852fdbabfb1030a5113
+          git archive c82eea26 vendor/internal-russh-forked-ssh-key-0.6.18 \
+            | tar -x --strip-components=2 -C "$ssh_key_reconstructed"
+          (cd "$ssh_key_reconstructed" && patch --remove-empty-files --strip=3 < "$GITHUB_WORKSPACE/vendor/internal-russh-forked-ssh-key-0.6.18/FINCH-RSA-REMOVAL.patch")
+          echo 'a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5  vendor/internal-russh-forked-ssh-key-0.6.18/LICENSE-APACHE' | sha256sum --check
+          echo '33f702959c0ea91c08b21b65cf1f08b6c122ec9e6db0b5db784a7b367d942330  vendor/internal-russh-forked-ssh-key-0.6.18/LICENSE-MIT' | sha256sum --check
+          diff -ru \
+            --exclude FINCH-VENDOR.md \
+            --exclude FINCH-RSA-REMOVAL.patch \
+            "$ssh_key_reconstructed" vendor/internal-russh-forked-ssh-key-0.6.18
 
       - name: Reject reintroduced Russh RSA implementation
         if: runner.os == 'Linux'
@@ -129,7 +142,9 @@ jobs:
         run: |
           set -euo pipefail
           if grep -Eiq '(^|[[:space:]])rsa[[:space:]]*=|dep:rsa|ssh-key/rsa|dependencies\.rsa|dependencies\.pkcs1' \
-            vendor/russh-0.60.3/Cargo.toml vendor/russh-0.60.3/Cargo.toml.orig; then
+            vendor/russh-0.60.3/Cargo.toml vendor/russh-0.60.3/Cargo.toml.upstream \
+            vendor/internal-russh-forked-ssh-key-0.6.18/Cargo.toml \
+            vendor/internal-russh-forked-ssh-key-0.6.18/Cargo.toml.upstream; then
             echo 'Vendored Russh reintroduced an RSA feature or dependency'
             exit 1
           fi
@@ -138,6 +153,11 @@ jobs:
             vendor/russh-0.60.3/src/keys/key.rs \
             vendor/russh-0.60.3/src/keys/format; then
             echo 'Vendored Russh reintroduced an RSA-gated implementation path'
+            exit 1
+          fi
+          if grep -R -nE 'feature = "(rsa|rsa-sha1|hazmat-allow-insecure-rsa-keys)"' \
+            vendor/internal-russh-forked-ssh-key-0.6.18/src; then
+            echo 'Vendored ssh-key reintroduced an RSA-gated implementation path'
             exit 1
           fi
 
@@ -165,6 +185,12 @@ jobs:
       - name: Assert reviewed SSH dependency graph
         shell: bash
         run: |
+          cargo generate-lockfile
+          if grep -Eq '^name = "(rsa|russh-keys)"$' Cargo.lock; then
+            echo 'Forbidden RSA/obsolete SSH package remains in the generated lockfile'
+            grep -n -E '^name = "(rsa|russh-keys)"$' Cargo.lock
+            exit 1
+          fi
           cargo tree --edges normal --prefix none --format '{p}' | sort -u > ssh-tree-default.txt
           cargo tree --edges normal --no-default-features --prefix none --format '{p}' | sort -u > ssh-tree-no-default.txt
           cargo tree --edges normal --all-features --prefix none --format '{p}' | sort -u > ssh-tree-all.txt
@@ -187,6 +213,8 @@ jobs:
     steps:
       - name: Checkout exact branch tip
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked

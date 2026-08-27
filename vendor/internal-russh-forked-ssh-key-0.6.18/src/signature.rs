@@ -1,3 +1,4 @@
+// Modified by Finch: RSA signing/verification removed; see FINCH-RSA-REMOVAL.patch.
 //! Signatures (e.g. CA signatures over SSH certificates)
 
 use crate::{private, public, Algorithm, EcdsaCurve, Error, Mpint, PrivateKey, PublicKey, Result};
@@ -28,17 +29,11 @@ use crate::{
 #[cfg(any(feature = "dsa", feature = "p256", feature = "p384", feature = "p521"))]
 use core::iter;
 
-#[cfg(feature = "rsa")]
-use crate::{private::RsaKeypair, public::RsaPublicKey, HashAlg};
-
-#[cfg(any(feature = "rsa-sha1", feature = "dsa"))]
+#[cfg(feature = "dsa")]
 use sha1::Sha1;
 
-#[cfg(any(feature = "ed25519", feature = "rsa", feature = "p256"))]
+#[cfg(any(feature = "ed25519", feature = "p256"))]
 use sha2::Sha256;
-
-#[cfg(any(feature = "rsa"))]
-use sha2::Sha512;
 
 const DSA_SIGNATURE_SIZE: usize = 40;
 const ED25519_SIGNATURE_SIZE: usize = 64;
@@ -290,8 +285,6 @@ impl Signer<Signature> for private::KeypairData {
             Self::Ecdsa(keypair) => keypair.try_sign(message),
             #[cfg(feature = "ed25519")]
             Self::Ed25519(keypair) => keypair.try_sign(message),
-            #[cfg(feature = "rsa")]
-            Self::Rsa(keypair) => keypair.try_sign(message),
             _ => Err(self.algorithm()?.unsupported_error().into()),
         }
     }
@@ -317,8 +310,6 @@ impl Verifier<Signature> for public::KeyData {
             Self::SkEd25519(pk) => pk.verify(message, signature),
             #[cfg(feature = "p256")]
             Self::SkEcdsaSha2NistP256(pk) => pk.verify(message, signature),
-            #[cfg(feature = "rsa")]
-            Self::Rsa(pk) => pk.verify(message, signature),
             #[allow(unreachable_patterns)]
             _ => Err(self.algorithm().unsupported_error().into()),
         }
@@ -662,80 +653,6 @@ impl Verifier<Signature> for EcdsaPublicKey {
                 #[cfg(not(all(feature = "p256", feature = "p384", feature = "p521")))]
                 _ => Err(signature.algorithm().unsupported_error().into()),
             },
-            _ => Err(signature.algorithm().unsupported_error().into()),
-        }
-    }
-}
-
-/// Maps between versions of signature crate
-fn remap_sig_result<T>(r: signature::Result<T>) -> signature::Result<T> {
-    r.map_err(|_| signature::Error::new())
-}
-
-#[cfg(feature = "rsa")]
-impl Signer<Signature> for (&RsaKeypair, Option<HashAlg>) {
-    fn try_sign(&self, message: &[u8]) -> signature::Result<Signature> {
-        use rsa::signature::SignatureEncoding;
-        let data = match self.1 {
-            Some(HashAlg::Sha512) => remap_sig_result(
-                rsa::pkcs1v15::SigningKey::<Sha512>::try_from(self.0)?.try_sign(message),
-            ),
-            Some(HashAlg::Sha256) => remap_sig_result(
-                rsa::pkcs1v15::SigningKey::<Sha256>::try_from(self.0)?.try_sign(message),
-            ),
-            #[cfg(feature = "rsa-sha1")]
-            None => remap_sig_result(
-                rsa::pkcs1v15::SigningKey::<Sha1>::try_from(self.0)?.try_sign(message),
-            ),
-            #[cfg(not(feature = "rsa-sha1"))]
-            None => return Err(Algorithm::Rsa { hash: None }.unsupported_error().into()),
-        }
-        .map_err(|_| signature::Error::new())?;
-
-        Ok(Signature {
-            algorithm: Algorithm::Rsa { hash: self.1 },
-            data: data.to_vec(),
-        })
-    }
-}
-
-#[cfg(feature = "rsa")]
-impl Signer<Signature> for RsaKeypair {
-    fn try_sign(&self, message: &[u8]) -> signature::Result<Signature> {
-        (self, Some(HashAlg::Sha512)).try_sign(message)
-    }
-}
-
-#[cfg(feature = "rsa")]
-impl Verifier<Signature> for RsaPublicKey {
-    fn verify(&self, message: &[u8], signature: &Signature) -> signature::Result<()> {
-        use signature::Verifier;
-        match signature.algorithm {
-            Algorithm::Rsa { hash } => {
-                let signature =
-                    remap_sig_result(rsa::pkcs1v15::Signature::try_from(signature.data.as_ref()))?;
-
-                match hash {
-                    #[cfg(not(feature = "rsa-sha1"))]
-                    None => Err(Algorithm::Rsa { hash: None }.unsupported_error().into()),
-                    #[cfg(feature = "rsa-sha1")]
-                    None => remap_sig_result(
-                        rsa::pkcs1v15::VerifyingKey::<sha1::Sha1>::try_from(self)?
-                            .verify(message, &signature),
-                    )
-                    .map_err(|_| signature::Error::new()),
-                    Some(HashAlg::Sha256) => remap_sig_result(
-                        rsa::pkcs1v15::VerifyingKey::<rsa::sha2::Sha256>::try_from(self)?
-                            .verify(message, &signature),
-                    )
-                    .map_err(|_| signature::Error::new()),
-                    Some(HashAlg::Sha512) => remap_sig_result(
-                        rsa::pkcs1v15::VerifyingKey::<rsa::sha2::Sha512>::try_from(self)?
-                            .verify(message, &signature),
-                    )
-                    .map_err(|_| signature::Error::new()),
-                }
-            }
             _ => Err(signature.algorithm().unsupported_error().into()),
         }
     }

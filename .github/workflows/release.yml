@@ -64,8 +64,11 @@ jobs:
       - name: Create tarball
         run: |
           cp vendor/russh-0.60.3/LICENSE.txt target/${{ matrix.target }}/release/RUSSH-LICENSE.txt
+          cp vendor/internal-russh-forked-ssh-key-0.6.18/LICENSE-APACHE target/${{ matrix.target }}/release/SSH-KEY-LICENSE-APACHE.txt
+          cp vendor/internal-russh-forked-ssh-key-0.6.18/LICENSE-MIT target/${{ matrix.target }}/release/SSH-KEY-LICENSE-MIT.txt
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.asset_name }}.tar.gz finch RUSSH-LICENSE.txt
+          tar czf ../../../${{ matrix.asset_name }}.tar.gz \
+            finch RUSSH-LICENSE.txt SSH-KEY-LICENSE-APACHE.txt SSH-KEY-LICENSE-MIT.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

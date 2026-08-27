@@ -1,3 +1,4 @@
+// Modified by Finch: RSA implementation error conversion removed; see FINCH-RSA-REMOVAL.patch.
 //! Error types
 
 use crate::Algorithm;
@@ -212,13 +213,6 @@ impl From<alloc::string::FromUtf8Error> for Error {
 impl From<sec1::Error> for Error {
     fn from(err: sec1::Error) -> Error {
         Error::Ecdsa(err)
-    }
-}
-
-#[cfg(feature = "rsa")]
-impl From<rsa::errors::Error> for Error {
-    fn from(_: rsa::errors::Error) -> Error {
-        Error::Crypto
     }
 }
 

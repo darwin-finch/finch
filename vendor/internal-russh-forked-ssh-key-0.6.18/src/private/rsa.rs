@@ -1,3 +1,4 @@
+// Modified by Finch: RSA crypto implementation removed; wire representation remains.
 //! Rivest–Shamir–Adleman (RSA) private keys.
 
 use crate::{public::RsaPublicKey, Error, Mpint, Result};
@@ -5,13 +6,6 @@ use core::fmt;
 use encoding::{CheckedSum, Decode, Encode, Reader, Writer};
 use subtle::{Choice, ConstantTimeEq};
 use zeroize::Zeroize;
-
-#[cfg(feature = "rsa")]
-use {
-    rand_core::CryptoRng,
-    rsa::sha2::digest::const_oid::AssociatedOid,
-    rsa::{pkcs1v15, traits::PrivateKeyParts},
-};
 
 /// RSA private key.
 #[derive(Clone)]
@@ -97,22 +91,6 @@ pub struct RsaKeypair {
     pub private: RsaPrivateKey,
 }
 
-impl RsaKeypair {
-    /// Minimum allowed RSA key size.
-    #[cfg(all(feature = "rsa", not(feature = "hazmat-allow-insecure-rsa-keys")))]
-    pub(crate) const MIN_KEY_SIZE: usize = 2048;
-
-    /// Generate a random RSA keypair of the given size.
-    #[cfg(feature = "rsa")]
-    pub fn random(rng: &mut impl CryptoRng, bit_size: usize) -> Result<Self> {
-        #[cfg(not(feature = "hazmat-allow-insecure-rsa-keys"))]
-        if bit_size < Self::MIN_KEY_SIZE {
-            return Err(Error::Crypto);
-        }
-        rsa::RsaPrivateKey::new(rng, bit_size)?.try_into()
-    }
-}
-
 impl ConstantTimeEq for RsaKeypair {
     fn ct_eq(&self, other: &Self) -> Choice {
         Choice::from((self.public == other.public) as u8) & self.private.ct_eq(&other.private)
@@ -173,92 +151,5 @@ impl fmt::Debug for RsaKeypair {
         f.debug_struct("RsaKeypair")
             .field("public", &self.public)
             .finish_non_exhaustive()
-    }
-}
-
-#[cfg(feature = "rsa")]
-impl TryFrom<RsaKeypair> for rsa::RsaPrivateKey {
-    type Error = Error;
-
-    fn try_from(key: RsaKeypair) -> Result<rsa::RsaPrivateKey> {
-        rsa::RsaPrivateKey::try_from(&key)
-    }
-}
-
-#[cfg(feature = "rsa")]
-impl TryFrom<&RsaKeypair> for rsa::RsaPrivateKey {
-    type Error = Error;
-
-    fn try_from(key: &RsaKeypair) -> Result<rsa::RsaPrivateKey> {
-        use rsa::BoxedUint;
-
-        let ret: rsa::RsaPrivateKey = rsa::RsaPrivateKey::from_components(
-            BoxedUint::try_from(&key.public.n)?,
-            BoxedUint::try_from(&key.public.e)?,
-            BoxedUint::try_from(&key.private.d)?,
-            vec![
-                BoxedUint::try_from(&key.private.p)?,
-                BoxedUint::try_from(&key.private.q)?,
-            ],
-        )?;
-
-        #[cfg(not(feature = "hazmat-allow-insecure-rsa-keys"))]
-        {
-            use rsa::traits::PublicKeyParts;
-
-            if ret.size().saturating_mul(8) < RsaKeypair::MIN_KEY_SIZE {
-                return Err(Error::Crypto);
-            }
-        }
-
-        Ok(ret)
-    }
-}
-
-#[cfg(feature = "rsa")]
-impl TryFrom<rsa::RsaPrivateKey> for RsaKeypair {
-    type Error = Error;
-
-    fn try_from(key: rsa::RsaPrivateKey) -> Result<RsaKeypair> {
-        RsaKeypair::try_from(&key)
-    }
-}
-
-#[cfg(feature = "rsa")]
-impl TryFrom<&rsa::RsaPrivateKey> for RsaKeypair {
-    type Error = Error;
-
-    fn try_from(key: &rsa::RsaPrivateKey) -> Result<RsaKeypair> {
-        // Multi-prime keys are not supported
-        if key.primes().len() > 2 {
-            return Err(Error::Crypto);
-        }
-
-        let public = RsaPublicKey::try_from(key.to_public_key())?;
-
-        let p = &key.primes()[0];
-        let q = &key.primes()[1];
-        let iqmp = key.crt_coefficient().ok_or(Error::Crypto)?;
-
-        let private = RsaPrivateKey {
-            d: key.d().try_into()?,
-            iqmp: iqmp.try_into()?,
-            p: p.try_into()?,
-            q: q.try_into()?,
-        };
-
-        Ok(RsaKeypair { public, private })
-    }
-}
-
-#[cfg(feature = "rsa")]
-impl<D> TryFrom<&RsaKeypair> for pkcs1v15::SigningKey<D>
-where
-    D: signature::digest::Digest + AssociatedOid,
-{
-    type Error = Error;
-
-    fn try_from(keypair: &RsaKeypair) -> Result<pkcs1v15::SigningKey<D>> {
-        Ok(pkcs1v15::SigningKey::new(keypair.try_into()?))
     }
 }

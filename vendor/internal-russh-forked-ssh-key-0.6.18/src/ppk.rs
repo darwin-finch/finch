@@ -1,3 +1,4 @@
+// Modified by Finch: RSA private PPK decoding removed; see FINCH-RSA-REMOVAL.patch.
 // Format documentation:
 // https://tartarus.org/~simon/putty-snapshots/htmldoc/AppendixC.html
 
@@ -462,22 +463,6 @@ fn decode_private_key_as(
             use crate::private::{DsaKeypair, DsaPrivateKey};
             Ok(KeypairData::Dsa(DsaKeypair {
                 private: DsaPrivateKey::decode(reader)?,
-                public: pk.clone(),
-            }))
-        }
-
-        #[cfg(feature = "rsa")]
-        (Algorithm::Rsa { .. }, KeyData::Rsa(pk)) => {
-            use crate::private::{RsaKeypair, RsaPrivateKey};
-            use crate::Mpint;
-
-            let d = Mpint::decode(reader)?;
-            let p = Mpint::decode(reader)?;
-            let q = Mpint::decode(reader)?;
-            let iqmp = Mpint::decode(reader)?;
-            let private = RsaPrivateKey { d, iqmp, p, q };
-            Ok(KeypairData::Rsa(RsaKeypair {
-                private,
                 public: pk.clone(),
             }))
         }

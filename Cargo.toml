@@ -158,6 +158,11 @@ nix = { version = "0.29", features = ["dir", "fs", "process", "signal", "user"] 
 capnp = "0.20"
 capnp-rpc = "0.20"
 
+[target.'cfg(windows)'.dependencies]
+# IPC code is cross-platform and imports these crates unconditionally.
+capnp = "0.20"
+capnp-rpc = "0.20"
+
 [build-dependencies]
 capnpc = "0.20"
 

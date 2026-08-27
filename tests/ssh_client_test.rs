@@ -163,8 +163,8 @@ impl server::Handler for FixtureHandler {
                     .current_dir(cwd)
                     .output()
                     .await?;
-                session.data(channel, output.stdout.into())?;
-                session.extended_data(channel, 1, output.stderr.into())?;
+                session.data(channel, output.stdout)?;
+                session.extended_data(channel, 1, output.stderr)?;
                 output.status.code().unwrap_or(255) as u32
             }
             #[cfg(not(unix))]

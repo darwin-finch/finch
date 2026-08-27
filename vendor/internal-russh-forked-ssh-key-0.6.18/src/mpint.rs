@@ -1,15 +1,16 @@
+// Modified by Finch: RSA-only feature gates removed; see FINCH-RSA-REMOVAL.patch.
 //! Multiple precision integer
 
 use crate::{Error, Result};
 use alloc::{boxed::Box, vec::Vec};
 use core::fmt;
-#[cfg(any(feature = "dsa", feature = "rsa"))]
+#[cfg(feature = "dsa")]
 use crypto_bigint::BoxedUint;
 use encoding::{CheckedSum, Decode, Encode, Reader, Writer};
 use subtle::{Choice, ConstantTimeEq};
 use zeroize::Zeroize;
 
-#[cfg(any(feature = "dsa", feature = "rsa"))]
+#[cfg(feature = "dsa")]
 use zeroize::Zeroizing;
 
 /// Multiple precision integer, a.k.a. "mpint".
@@ -197,7 +198,7 @@ impl fmt::UpperHex for Mpint {
     }
 }
 
-#[cfg(any(feature = "dsa", feature = "rsa"))]
+#[cfg(feature = "dsa")]
 impl TryFrom<bigint::BigUint> for Mpint {
     type Error = Error;
 
@@ -206,7 +207,7 @@ impl TryFrom<bigint::BigUint> for Mpint {
     }
 }
 
-#[cfg(any(feature = "dsa", feature = "rsa"))]
+#[cfg(feature = "dsa")]
 impl TryFrom<&bigint::BigUint> for Mpint {
     type Error = Error;
 
@@ -216,7 +217,7 @@ impl TryFrom<&bigint::BigUint> for Mpint {
     }
 }
 
-#[cfg(any(feature = "dsa", feature = "rsa"))]
+#[cfg(feature = "dsa")]
 impl TryFrom<Mpint> for bigint::BigUint {
     type Error = Error;
 
@@ -225,7 +226,7 @@ impl TryFrom<Mpint> for bigint::BigUint {
     }
 }
 
-#[cfg(any(feature = "dsa", feature = "rsa"))]
+#[cfg(feature = "dsa")]
 impl TryFrom<&Mpint> for bigint::BigUint {
     type Error = Error;
 
@@ -237,7 +238,7 @@ impl TryFrom<&Mpint> for bigint::BigUint {
     }
 }
 
-#[cfg(any(feature = "dsa", feature = "rsa"))]
+#[cfg(feature = "dsa")]
 impl TryFrom<Mpint> for BoxedUint {
     type Error = Error;
 
@@ -246,7 +247,7 @@ impl TryFrom<Mpint> for BoxedUint {
     }
 }
 
-#[cfg(any(feature = "dsa", feature = "rsa"))]
+#[cfg(feature = "dsa")]
 impl TryFrom<&Mpint> for BoxedUint {
     type Error = Error;
 
@@ -257,7 +258,7 @@ impl TryFrom<&Mpint> for BoxedUint {
     }
 }
 
-#[cfg(any(feature = "dsa", feature = "rsa"))]
+#[cfg(feature = "dsa")]
 impl TryFrom<BoxedUint> for Mpint {
     type Error = Error;
 
@@ -266,7 +267,7 @@ impl TryFrom<BoxedUint> for Mpint {
     }
 }
 
-#[cfg(any(feature = "dsa", feature = "rsa"))]
+#[cfg(feature = "dsa")]
 impl TryFrom<&BoxedUint> for Mpint {
     type Error = Error;
 

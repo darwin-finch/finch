@@ -373,8 +373,8 @@ features = [
     "p521",
     "encryption",
     "ppk",
-    "hazmat-allow-insecure-rsa-keys",
 ]
+path = "../internal-russh-forked-ssh-key-0.6.18"
 package = "internal-russh-forked-ssh-key"
 
 [dependencies.subtle]

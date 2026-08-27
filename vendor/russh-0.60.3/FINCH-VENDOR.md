@@ -17,6 +17,10 @@ metadata and are not part of the upstream crate payload. The dedicated security
 workflow reconstructs this tree from the checksummed crate and the recorded
 Finch patch before comparing it with the checked-in source.
 
+The published `Cargo.toml.orig` is retained byte-for-byte as
+`Cargo.toml.upstream`; the repository hygiene policy reserves `.orig` for
+transient files. The patch manifest records this packaging-only rename.
+
 The only source delta is `FINCH-RSA-REMOVAL.patch`; CI applies it to the
 checksummed crate and byte-compares the reconstructed source.
 It removes the optional `rsa` and `pkcs1` dependencies, the `rsa` feature, and

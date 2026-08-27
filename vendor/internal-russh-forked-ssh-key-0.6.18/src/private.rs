@@ -1,3 +1,4 @@
+// Modified by Finch: RSA key generation removed; see FINCH-RSA-REMOVAL.patch.
 //! SSH private key support.
 //!
 //! Support for decoding SSH private keys (i.e. digital signature keys)
@@ -165,10 +166,6 @@ use std::{io::Write, os::unix::fs::OpenOptionsExt};
 
 /// Error message for infallible conversions (used by `expect`)
 const CONVERSION_ERROR_MSG: &str = "SSH private key conversion error";
-
-/// Default key size to use for RSA keys in bits.
-#[cfg(all(feature = "rand_core", feature = "rsa"))]
-const DEFAULT_RSA_KEY_SIZE: usize = 4096;
 
 /// Maximum supported block size.
 ///
@@ -518,10 +515,6 @@ impl PrivateKey {
             Algorithm::Ecdsa { curve } => KeypairData::from(EcdsaKeypair::random(rng, curve)?),
             #[cfg(feature = "ed25519")]
             Algorithm::Ed25519 => KeypairData::from(Ed25519Keypair::random(rng)),
-            #[cfg(feature = "rsa")]
-            Algorithm::Rsa { .. } => {
-                KeypairData::from(RsaKeypair::random(rng, DEFAULT_RSA_KEY_SIZE)?)
-            }
             _ => return Err(Error::AlgorithmUnknown),
         };
         let public_key = public::KeyData::try_from(&key_data)?;
