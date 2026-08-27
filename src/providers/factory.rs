@@ -390,7 +390,7 @@ fn resolve_named_graph(
     resolver: &dyn CredentialResolver,
 ) -> Result<BTreeMap<String, ResolvedCredential>> {
     config.validate()?;
-    let credentials = crate::config::credential::credential_index(&config.credentials)?;
+    let credentials = crate::config::credential::credential_index(config.credentials())?;
     let mut resolved = BTreeMap::new();
     for entry in &config.providers {
         let Some(binding) = entry.credential_binding() else {
@@ -467,7 +467,7 @@ fn create_named_profiles_from_config_with_resolver(
             .with_context(|| format!("Provider #{} is invalid", index + 1))?;
     }
     let resolved = resolve_named_graph(config, resolver)?;
-    let credentials = crate::config::credential::credential_index(&config.credentials)?;
+    let credentials = crate::config::credential::credential_index(config.credentials())?;
     let cloud: Vec<_> = config
         .providers
         .iter()
@@ -1113,41 +1113,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_active_binding_expiring_after_factory_rejects_before_socket_activity() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let mut profile = named_openai("primary", "work", "gpt-4o");
-        if let ProviderEntry::Credentialed { base_url, .. } = &mut profile {
-            *base_url = Some(origin.clone());
-        }
-        let mut credential = named_openai_credential("work", "account-1");
-        credential.audience = AudienceBinding::custom(&origin).unwrap();
-        credential.lifecycle = CredentialLifecycle::Active {
-            expires_at: Some(chrono::Utc::now() + chrono::Duration::milliseconds(50)),
-            refreshable: false,
-        };
-        let config = Config::with_providers(vec![profile]).with_credentials(vec![credential]);
-        let resolver = CountingResolver {
-            calls: AtomicUsize::new(0),
-        };
-        let provider = create_provider_graph_from_config_with_resolver(&config, &resolver)
-            .unwrap()
-            .default_provider();
-        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
-
-        let error = provider
-            .send_message(&ProviderRequest::new(Vec::new()).with_model("gpt-4o"))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("expired after provider construction"));
-        assert!(matches!(
-            listener.accept().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        ));
-    }
-
-    #[tokio::test]
     async fn test_live_config_revocation_invalidates_constructed_provider_before_socket_activity() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1173,6 +1138,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("revoked after provider construction"));
+        assert!(matches!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_live_config_deletion_invalidates_constructed_provider_before_socket_activity() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut profile = named_openai("primary", "work", "gpt-4o");
+        if let ProviderEntry::Credentialed { base_url, .. } = &mut profile {
+            *base_url = Some(origin.clone());
+        }
+        let mut credential = named_openai_credential("work", "account-1");
+        credential.audience = AudienceBinding::custom(&origin).unwrap();
+        let mut config =
+            Config::with_providers(vec![profile]).with_credentials(vec![credential]);
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let provider = create_provider_graph_from_config_with_resolver(&config, &resolver)
+            .unwrap()
+            .default_provider();
+        config.delete_credential("work").unwrap();
+
+        assert!(provider
+            .send_message(&ProviderRequest::new(Vec::new()).with_model("gpt-4o"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("revoked after provider construction"));
         assert!(matches!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock

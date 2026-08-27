@@ -164,7 +164,7 @@ pub struct Config {
 
     /// Secret-free named provider credential records. Secret material is
     /// resolved through an injected credential store only after graph validation.
-    pub credentials: Vec<ProviderCredential>,
+    credentials: Vec<ProviderCredential>,
 
     /// Teacher LLM provider configuration (array of teachers in priority order)
     pub teachers: Vec<TeacherEntry>,
@@ -894,6 +894,16 @@ impl Config {
         self
     }
 
+    /// Secret-free named credential records. Mutations must use the lifecycle
+    /// methods below so live providers receive invalidation signals.
+    pub fn credentials(&self) -> &[ProviderCredential] {
+        &self.credentials
+    }
+
+    pub(crate) fn replace_loaded_credentials(&mut self, credentials: Vec<ProviderCredential>) {
+        self.credentials = credentials;
+    }
+
     /// Profiles that reference a named credential, for dependency-aware UX.
     pub fn credential_dependents(&self, credential_name: &str) -> Vec<String> {
         super::credential::credential_dependencies(
@@ -914,6 +924,20 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("credential '{}' was not found", credential_name))?;
         credential.revocation.revoke();
         credential.lifecycle = super::CredentialLifecycle::Revoked;
+        Ok(dependents)
+    }
+
+    /// Delete a credential after invalidating every already-constructed
+    /// provider that shares its authoritative lifecycle signal.
+    pub fn delete_credential(&mut self, credential_name: &str) -> anyhow::Result<Vec<String>> {
+        let dependents = self.credential_dependents(credential_name);
+        let index = self
+            .credentials
+            .iter()
+            .position(|credential| credential.name == credential_name)
+            .ok_or_else(|| anyhow::anyhow!("credential '{}' was not found", credential_name))?;
+        self.credentials[index].revocation.revoke();
+        self.credentials.remove(index);
         Ok(dependents)
     }
 

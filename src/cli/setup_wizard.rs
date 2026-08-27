@@ -1001,7 +1001,7 @@ impl WizardState {
                 .map(|config| config.backend.coreml)
                 .unwrap_or_default(),
             credentials: existing_config
-                .map(|config| config.credentials.clone())
+                .map(|config| config.credentials().to_vec())
                 .unwrap_or_default(),
         }
     }
@@ -8427,7 +8427,7 @@ mod tests {
         assert_eq!(result.credentials, vec![credential]);
         let saved = config_from_setup_result(&result);
         saved.validate().unwrap();
-        let serialized = toml::to_string(&saved.credentials[0]).unwrap();
+        let serialized = toml::to_string(&saved.credentials()[0]).unwrap();
         assert!(serialized.contains("env:OPENAI_WORK_API_KEY"));
         assert!(!serialized.contains("sk-"));
     }

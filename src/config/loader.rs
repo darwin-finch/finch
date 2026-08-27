@@ -161,7 +161,7 @@ where
     }
 
     let mut config = config_factory(providers);
-    config.credentials = toml_config.credentials;
+    config.replace_loaded_credentials(toml_config.credentials);
 
     if let Some(coreml) = toml_config.coreml.or(legacy_coreml) {
         config.backend.coreml = coreml;

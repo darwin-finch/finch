@@ -295,7 +295,7 @@ pub async fn refresh_from_config(
             "provider profile '{profile_name}' does not have a supported named-credential catalogue transport"
         ),
     };
-    let credentials = crate::config::credential::credential_index(&config.credentials)?;
+    let credentials = crate::config::credential::credential_index(config.credentials())?;
     let metadata = credentials
         .get(credential.credential_ref.as_str())
         .expect("Config::validate checked the named credential reference");
@@ -305,6 +305,10 @@ pub async fn refresh_from_config(
     if resolved.credential_name != credential.credential_ref {
         bail!("credential resolver returned a handle for the wrong named credential");
     }
+    // Resolution may block on a local store. Revalidate the complete graph at
+    // the last local boundary before constructing HTTP state so revocation or
+    // expiry during resolution still produces zero network activity.
+    config.validate()?;
     let profile = ModelCatalogProfile::new(
         provider_name,
         profile_name,
@@ -452,8 +456,14 @@ mod tests {
     use mockito::Matcher;
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Mutex};
 
     struct CountingResolver(AtomicUsize);
+
+    struct BlockingResolver {
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
 
     impl CredentialResolver for CountingResolver {
         fn resolve(&self, credential: &ProviderCredential) -> Result<ResolvedCredential> {
@@ -463,6 +473,87 @@ mod tests {
                 secret: ResolvedSecret::new("not-sent")?,
             })
         }
+    }
+
+    impl CredentialResolver for BlockingResolver {
+        fn resolve(&self, credential: &ProviderCredential) -> Result<ResolvedCredential> {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            Ok(ResolvedCredential {
+                credential_name: credential.name.clone(),
+                secret: ResolvedSecret::new("must-not-be-sent")?,
+            })
+        }
+    }
+
+    fn live_catalog_config(
+        origin: &str,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Config {
+        let profile = ProviderEntry::Credentialed {
+            provider: CredentialProvider::OpenaiPlatform,
+            credential: CredentialBinding {
+                credential_ref: "work".into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: BTreeSet::new(),
+            },
+            model: Some("gpt-4o".into()),
+            base_url: Some(origin.into()),
+            chat_path: None,
+            models_path: None,
+            name: Some("primary".into()),
+            reasoning_effort: None,
+        };
+        let credential = ProviderCredential {
+            name: "work".into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::OpenaiPlatform,
+            issuer: "openai-platform".into(),
+            audience: AudienceBinding::custom(origin).unwrap(),
+            tenant: None,
+            project: None,
+            account: None,
+            scopes: BTreeSet::new(),
+            secret_ref: "test:work".into(),
+            lifecycle: CredentialLifecycle::Active {
+                expires_at,
+                refreshable: false,
+            },
+            revocation: Default::default(),
+        };
+        Config::with_providers(vec![profile]).with_credentials(vec![credential])
+    }
+
+    fn start_blocked_catalog_refresh(
+        config: Config,
+    ) -> (
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+        std::thread::JoinHandle<Result<ModelCatalog>>,
+    ) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let cache = tempfile::tempdir().unwrap();
+            let resolver = BlockingResolver {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            };
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(refresh_from_config(
+                    &config,
+                    "primary",
+                    &resolver,
+                    cache.path(),
+                ))
+        });
+        (entered_rx, release_tx, handle)
     }
 
     fn profile(server_url: &str, provider: &str, auth: CatalogAuth) -> ModelCatalogProfile {
@@ -522,6 +613,41 @@ mod tests {
             .unwrap_err();
         assert!(format!("{error:#}").contains("authenticated endpoint origin mismatch"));
         assert_eq!(resolver.0.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn catalog_revocation_while_resolving_rejects_before_socket_activity() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut config = live_catalog_config(&origin, None);
+        let (entered, release, refresh) = start_blocked_catalog_refresh(config.clone());
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        config.revoke_credential("work").unwrap();
+        release.send(()).unwrap();
+        assert!(refresh.join().unwrap().unwrap_err().to_string().contains("revoked"));
+        assert!(matches!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn catalog_expiry_while_resolving_rejects_before_socket_activity() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let expires_at = chrono::Utc::now() + chrono::Duration::milliseconds(500);
+        let config = live_catalog_config(&origin, Some(expires_at));
+        let (entered, release, refresh) = start_blocked_catalog_refresh(config);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::thread::sleep(Duration::from_millis(550));
+        release.send(()).unwrap();
+        assert!(refresh.join().unwrap().unwrap_err().to_string().contains("expired"));
         assert!(matches!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
