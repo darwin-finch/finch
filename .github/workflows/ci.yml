@@ -109,7 +109,7 @@ jobs:
       run: cargo test --all-targets --no-run
 
     - name: Test all targets
-      run: timeout --signal=TERM --kill-after=30s 15m cargo test --all-targets -- --nocapture --test-threads=1
+      run: timeout --signal=TERM --kill-after=30s 15m cargo test --all-targets -- --nocapture
 
   build:
     name: Build Release
