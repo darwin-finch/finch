@@ -1629,13 +1629,16 @@ async fn cancel_login_and_wait(
     login_id: &str,
     deadline: Instant,
 ) -> Result<DeviceLoginOutcome> {
-    client
+    let cancel_result = client
         .request_allowing(
             "account/login/cancel",
             json!({"loginId": login_id}),
             &["account/updated", "account/login/completed"],
         )
         .await?;
+    if cancel_result.get("success").and_then(Value::as_bool) != Some(true) {
+        bail!("Codex app-server returned an invalid login cancellation response");
+    }
     let mut completed_successfully = false;
     let mut account_updated = false;
     loop {
@@ -1672,7 +1675,11 @@ async fn cancel_login_and_wait(
                     continue;
                 }
                 client.require_no_post_terminal_message().await?;
-                return Ok(DeviceLoginOutcome::Cancelled);
+                return Ok(if account_updated {
+                    DeviceLoginOutcome::CompletedAfterCancel
+                } else {
+                    DeviceLoginOutcome::Cancelled
+                });
             }
             Some(method) => bail!("Unexpected notification {method} while cancelling login"),
             None => bail!("Invalid login cancellation lifecycle message"),
@@ -1796,6 +1803,10 @@ pub struct CodexAppServerProvider {
 
 impl CodexAppServerProvider {
     pub fn new(credential_ref: String, default_model: String) -> Result<Self> {
+        #[cfg(test)]
+        if credential_ref == "finch-test://unaudited-schema" {
+            bail!("Codex app-server restricted schema is unavailable");
+        }
         if credential_ref != MANAGED_CODEX_CREDENTIAL_REF {
             bail!("Unsupported ChatGPT credential reference");
         }
@@ -2619,7 +2630,11 @@ for line in sys.stdin:
         result = {'type': 'chatgptDeviceCode', 'loginId': 'login-1', 'verificationUrl': 'https://example.invalid/device', 'userCode': 'ABCD'}
     elif method == 'account/login/cancel':
         assert m['params']['loginId'] == 'login-1'
-        result = {}
+        if thread_event == 'cancel_response_missing': result = {}
+        elif thread_event == 'cancel_response_null': result = {'success': None}
+        elif thread_event == 'cancel_response_string': result = {'success': 'true'}
+        elif thread_event == 'cancel_response_false': result = {'success': False}
+        else: result = {'success': True}
     elif method == 'account/logout':
         signed_out = True
         result = {}
@@ -2660,7 +2675,7 @@ for line in sys.stdin:
         print(json.dumps({'method': 'thread/started', 'params': {'thread': {'id': started_id}}}), flush=True)
         if thread_event == 'duplicate':
             print(json.dumps({'method': 'thread/started', 'params': {'thread': {'id': started_id}}}), flush=True)
-    if method == 'account/login/start' and thread_event not in ['pending_login', 'cancel_duplicate', 'cancel_success_race']:
+    if method == 'account/login/start' and thread_event not in ['pending_login', 'cancel_duplicate', 'cancel_success_race', 'cancel_updated_then_false', 'cancel_updated_then_true', 'cancel_response_missing', 'cancel_response_null', 'cancel_response_string', 'cancel_response_false']:
         completed = {'method': 'account/login/completed', 'params': {'loginId': 'wrong-login' if thread_event == 'login_mismatch' else 'login-1', 'success': thread_event not in ['login_denied', 'login_expired'], 'error': 'access_denied' if thread_event == 'login_denied' else ('expired_token' if thread_event == 'login_expired' else None)}}
         updated = {'method': 'account/updated', 'params': {'authMode': 'chatgpt', 'planType': 'plus'}}
         if thread_event == 'login_updated_first': print(json.dumps(updated), flush=True)
@@ -2668,9 +2683,12 @@ for line in sys.stdin:
         if thread_event not in ['login_denied', 'login_expired', 'login_updated_first']: print(json.dumps(updated), flush=True)
         if thread_event in ['login_duplicate', 'login_late']: print(json.dumps(completed), flush=True)
     if method == 'account/login/cancel':
-        success = thread_event == 'cancel_success_race'
+        if thread_event in ['cancel_response_missing', 'cancel_response_null', 'cancel_response_string', 'cancel_response_false']: continue
+        if thread_event in ['cancel_updated_then_false', 'cancel_updated_then_true']:
+            print(json.dumps({'method':'account/updated','params':{'authMode':'chatgpt','planType':'plus'}}), flush=True)
+        success = thread_event in ['cancel_success_race', 'cancel_updated_then_true']
         print(json.dumps({'method':'account/login/completed','params':{'loginId':'login-1','success':success,'error':None if success else 'cancelled'}}), flush=True)
-        if success: print(json.dumps({'method':'account/updated','params':{'authMode':'chatgpt','planType':'plus'}}), flush=True)
+        if thread_event == 'cancel_success_race': print(json.dumps({'method':'account/updated','params':{'authMode':'chatgpt','planType':'plus'}}), flush=True)
         if thread_event == 'cancel_duplicate': print(json.dumps({'method':'account/login/completed','params':{'loginId':'login-1','success':False,'error':'cancelled'}}), flush=True)
     if method == 'account/logout':
         print(json.dumps({'method': 'account/updated', 'params': {'authMode': None, 'planType': None}}), flush=True)
@@ -3444,6 +3462,47 @@ for line in sys.stdin:
             .await
             .unwrap();
         assert_eq!(outcome, DeviceLoginOutcome::CompletedAfterCancel);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_surfaces_authenticated_account_in_both_notification_orders() {
+        for mode in [
+            "cancel_success_race",
+            "cancel_updated_then_true",
+            "cancel_updated_then_false",
+        ] {
+            let (_directory, command) = mock_app_server_with_thread_event("chatgpt", mode);
+            let auth = CodexAppServerAuth::with_command(command);
+            let login = auth.begin_device_login().await.unwrap();
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            cancel_tx.send(true).unwrap();
+            let outcome = auth
+                .finish_device_login_or_cancel(login, cancel_rx)
+                .await
+                .unwrap();
+            assert_eq!(outcome, DeviceLoginOutcome::CompletedAfterCancel, "{mode}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancel_response_requires_exact_boolean_success() {
+        for mode in [
+            "cancel_response_missing",
+            "cancel_response_null",
+            "cancel_response_string",
+            "cancel_response_false",
+        ] {
+            let (_directory, command) = mock_app_server_with_thread_event("chatgpt", mode);
+            let auth = CodexAppServerAuth::with_command(command);
+            let login = auth.begin_device_login().await.unwrap();
+            let error = auth.cancel_device_login(login).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid login cancellation response"),
+                "{mode} produced {error:#}"
+            );
+        }
     }
 
     #[tokio::test]

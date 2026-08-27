@@ -934,11 +934,7 @@ async fn main() -> Result<()> {
                 use finch::cli::show_setup_wizard;
                 match show_setup_wizard() {
                     Ok(result) => {
-                        if finch::cli::setup_wizard::validate_and_apply_for(
-                            finch::cli::setup_wizard::SetupInvocation::FirstRun,
-                            &result,
-                        )
-                        .await?
+                        if finch::cli::setup_wizard::validate_first_run_and_apply(&result).await?
                             == finch::cli::setup_wizard::SetupApplyOutcome::Cancelled
                         {
                             return Err(anyhow::anyhow!("Setup cancelled"));
@@ -2531,11 +2527,7 @@ async fn run_setup() -> Result<()> {
 
     // Run the wizard
     let result = show_setup_wizard()?;
-    if finch::cli::setup_wizard::validate_and_apply_for(
-        finch::cli::setup_wizard::SetupInvocation::Command,
-        &result,
-    )
-    .await?
+    if finch::cli::setup_wizard::validate_command_and_apply(&result).await?
         == finch::cli::setup_wizard::SetupApplyOutcome::Cancelled
     {
         println!("Setup cancelled; configuration was not changed.");

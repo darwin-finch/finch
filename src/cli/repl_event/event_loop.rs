@@ -2586,11 +2586,8 @@ impl EventLoop {
                                 .await;
                         match wizard_result {
                             Ok(Ok(Some(result))) => {
-                                match crate::cli::setup_wizard::validate_and_apply_for(
-                                    crate::cli::setup_wizard::SetupInvocation::Repl,
-                                    &result,
-                                )
-                                .await
+                                match crate::cli::setup_wizard::validate_repl_and_apply(&result)
+                                    .await
                                 {
                                     Ok(crate::cli::setup_wizard::SetupApplyOutcome::Saved) => {
                                         self.output_manager.write_info(

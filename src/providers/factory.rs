@@ -614,8 +614,7 @@ mod tests {
     fn test_unusable_chatgpt_schema_preserves_later_configured_grok_fallback() {
         let entries = vec![
             ProviderEntry::ChatgptSubscription {
-                credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
-                    .into(),
+                credential_ref: "finch-test://unaudited-schema".into(),
                 model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.into()),
                 name: Some("subscription".into()),
             },
@@ -628,13 +627,7 @@ mod tests {
                 name: Some("fallback".into()),
             },
         ];
-        let providers = create_providers_from_entries_with(&entries, |entry| {
-            if matches!(entry, ProviderEntry::ChatgptSubscription { .. }) {
-                bail!("restricted schema unavailable")
-            }
-            create_provider_from_entry(entry)
-        })
-        .unwrap();
+        let providers = create_providers_from_entries(&entries).unwrap();
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].name(), "grok");
         assert_eq!(providers[0].default_model(), "grok-code-fast-1");

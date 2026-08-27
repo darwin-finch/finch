@@ -1560,6 +1560,94 @@ fn state_after_device_login(
     }
 }
 
+fn should_logout_after_post_cancel_choice(choice: ChatGptSetupAction) -> bool {
+    choice != ChatGptSetupAction::Keep
+}
+
+#[async_trait::async_trait(?Send)]
+trait ChatGptSetupCeremony {
+    async fn status(&mut self) -> Result<crate::providers::codex_app_server::ChatGptAccountStatus>;
+    async fn choose(
+        &mut self,
+        title: &str,
+        message: &str,
+        choices: &[(char, ChatGptSetupAction, &str)],
+    ) -> Result<ChatGptSetupAction>;
+    async fn login(&mut self) -> Result<crate::providers::codex_app_server::DeviceLoginOutcome>;
+    async fn validate_sol(&mut self) -> Result<()>;
+    fn save(&mut self, result: &SetupResult) -> Result<()>;
+    fn save_fallback(&mut self, result: &SetupResult) -> Result<()>;
+    async fn logout(&mut self) -> Result<()>;
+    fn restore(&mut self) -> Result<()>;
+}
+
+struct LiveChatGptSetupCeremony {
+    auth: crate::providers::CodexAppServerAuth,
+    ui: SetupAuthUi,
+}
+
+#[async_trait::async_trait(?Send)]
+impl ChatGptSetupCeremony for LiveChatGptSetupCeremony {
+    async fn status(&mut self) -> Result<crate::providers::codex_app_server::ChatGptAccountStatus> {
+        self.auth.status(false).await
+    }
+
+    async fn choose(
+        &mut self,
+        title: &str,
+        message: &str,
+        choices: &[(char, ChatGptSetupAction, &str)],
+    ) -> Result<ChatGptSetupAction> {
+        self.ui.choose(title, message, choices).await
+    }
+
+    async fn login(&mut self) -> Result<crate::providers::codex_app_server::DeviceLoginOutcome> {
+        let login = self.auth.begin_device_login().await?;
+        self.ui.wait_for_device_login(&self.auth, login).await
+    }
+
+    async fn validate_sol(&mut self) -> Result<()> {
+        self.auth.validate_sol_access().await.map(|_| ())
+    }
+
+    fn save(&mut self, result: &SetupResult) -> Result<()> {
+        apply_and_save(result)
+    }
+
+    fn save_fallback(&mut self, result: &SetupResult) -> Result<()> {
+        save_without_chatgpt(result)
+    }
+
+    async fn logout(&mut self) -> Result<()> {
+        self.auth.logout().await
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        self.ui.restore()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CHATGPT_CEREMONY: std::cell::RefCell<Option<Box<dyn ChatGptSetupCeremony>>> =
+        std::cell::RefCell::new(None);
+}
+
+async fn run_chatgpt_setup_ceremony(
+    result: &SetupResult,
+    ceremony: &mut dyn ChatGptSetupCeremony,
+) -> Result<SetupApplyOutcome> {
+    let status = ceremony.status().await?;
+    let had_existing_account = status.signed_in;
+    let state = if status.signed_in {
+        ChatGptSetupState::SignedIn
+    } else {
+        ChatGptSetupState::SignedOut
+    };
+
+    continue_chatgpt_setup_ceremony(result, ceremony, had_existing_account, state).await
+}
+
 /// Validate ChatGPT authentication and Sol availability before atomically committing setup.
 ///
 /// This is the single post-wizard state machine used by all three setup entry points. Finch
@@ -1569,8 +1657,6 @@ pub async fn validate_and_apply_for(
     result: &SetupResult,
 ) -> Result<SetupApplyOutcome> {
     use crate::config::ProviderEntry;
-    use crate::providers::CodexAppServerAuth;
-
     tracing::debug!(?invocation, "Starting shared setup commit ceremony");
 
     let selected = result
@@ -1582,18 +1668,26 @@ pub async fn validate_and_apply_for(
         return Ok(SetupApplyOutcome::Saved);
     }
 
-    let auth = CodexAppServerAuth::new()?;
-    let mut ui = SetupAuthUi::enter()?;
-    let status = auth.status(false).await?;
-    let had_existing_account = status.signed_in;
-    let mut state = if status.signed_in {
-        ChatGptSetupState::SignedIn
-    } else {
-        ChatGptSetupState::SignedOut
-    };
+    #[cfg(test)]
+    if let Some(mut ceremony) = TEST_CHATGPT_CEREMONY.with(|slot| slot.borrow_mut().take()) {
+        return run_chatgpt_setup_ceremony(result, ceremony.as_mut()).await;
+    }
 
+    let mut ceremony = LiveChatGptSetupCeremony {
+        auth: crate::providers::CodexAppServerAuth::new()?,
+        ui: SetupAuthUi::enter()?,
+    };
+    run_chatgpt_setup_ceremony(result, &mut ceremony).await
+}
+
+async fn continue_chatgpt_setup_ceremony(
+    result: &SetupResult,
+    ceremony: &mut dyn ChatGptSetupCeremony,
+    had_existing_account: bool,
+    mut state: ChatGptSetupState,
+) -> Result<SetupApplyOutcome> {
     if state == ChatGptSetupState::SignedIn {
-        let choice = ui.choose(
+        let choice = ceremony.choose(
             "ChatGPT subscription",
             "An account is already signed in. Replacement keeps it active until the new login succeeds.",
             &[
@@ -1605,7 +1699,7 @@ pub async fn validate_and_apply_for(
         ).await?;
         state = state.transition(choice)?;
     } else {
-        let choice = ui
+        let choice = ceremony
             .choose(
                 "ChatGPT subscription",
                 "No account is signed in.",
@@ -1624,11 +1718,10 @@ pub async fn validate_and_apply_for(
     }
 
     while state == ChatGptSetupState::LoginPending {
-        let login = auth.begin_device_login().await?;
-        match ui.wait_for_device_login(&auth, login).await {
+        match ceremony.login().await {
             Ok(outcome) => state = state_after_device_login(state, outcome)?,
             Err(error) => {
-                let recovery = ui
+                let recovery = ceremony
                     .choose(
                         "ChatGPT sign-in did not complete",
                         &format!("{error}"),
@@ -1649,11 +1742,11 @@ pub async fn validate_and_apply_for(
 
     match state {
         ChatGptSetupState::Ready => {
-            let validation = auth.validate_sol_access().await;
-            let saved = validation.and_then(|_| apply_and_save(result));
+            let validation = ceremony.validate_sol().await;
+            let saved = validation.and_then(|_| ceremony.save(result));
             if let Err(error) = saved {
                 let choices = validation_recovery_choices(configured_fallback_exists(result));
-                let decision = ui
+                let decision = ceremony
                     .choose(
                         "ChatGPT setup could not be saved",
                         &format!("{error}\n\nThe managed sign-in remains opaque to Finch."),
@@ -1661,26 +1754,26 @@ pub async fn validate_and_apply_for(
                     )
                     .await?;
                 if decision == ChatGptSetupAction::Fallback {
-                    save_without_chatgpt(result)?;
-                    ui.restore()?;
+                    ceremony.save_fallback(result)?;
+                    ceremony.restore()?;
                     return Ok(SetupApplyOutcome::Saved);
                 }
                 if decision == ChatGptSetupAction::Logout {
-                    auth.logout().await?;
+                    ceremony.logout().await?;
                 }
-                ui.restore()?;
+                ceremony.restore()?;
                 return Err(error);
             }
-            ui.restore()?;
+            ceremony.restore()?;
             Ok(SetupApplyOutcome::Saved)
         }
         ChatGptSetupState::Fallback => {
-            save_without_chatgpt(result)?;
-            ui.restore()?;
+            ceremony.save_fallback(result)?;
+            ceremony.restore()?;
             Ok(SetupApplyOutcome::Saved)
         }
         ChatGptSetupState::AuthenticatedAfterCancel => {
-            let decision = ui
+            let decision = ceremony
                 .choose(
                     "Sign-in completed while cancelling",
                     "Codex authenticated the managed account before cancellation completed. Explicitly choose whether to retain it.",
@@ -1690,15 +1783,18 @@ pub async fn validate_and_apply_for(
                     ],
                 )
                 .await?;
-            if decision == ChatGptSetupAction::Logout {
-                auth.logout().await?;
+            // Escape is reported by `choose` as Cancel. Once Codex has authenticated the new
+            // account, only an explicit Keep may retain it; every other path fails closed by
+            // logging out the managed profile.
+            if should_logout_after_post_cancel_choice(decision) {
+                ceremony.logout().await?;
             }
-            ui.restore()?;
+            ceremony.restore()?;
             Ok(SetupApplyOutcome::Cancelled)
         }
         ChatGptSetupState::Cancelled => {
             if had_existing_account {
-                let decision = ui
+                let decision = ceremony
                     .choose(
                         "Cancel ChatGPT setup",
                         "Keep the existing managed ChatGPT sign-in?",
@@ -1709,10 +1805,10 @@ pub async fn validate_and_apply_for(
                     )
                     .await?;
                 if decision == ChatGptSetupAction::Logout {
-                    auth.logout().await?;
+                    ceremony.logout().await?;
                 }
             }
-            ui.restore()?;
+            ceremony.restore()?;
             Ok(SetupApplyOutcome::Cancelled)
         }
         _ => Err(anyhow::anyhow!(
@@ -1727,6 +1823,21 @@ pub async fn validate_and_apply_for(
 /// diagnostics can prove that first-run, command, and REPL setup use the same boundary.
 pub async fn validate_and_apply(result: &SetupResult) -> Result<SetupApplyOutcome> {
     validate_and_apply_for(SetupInvocation::Command, result).await
+}
+
+/// Run the shared ceremony for automatic first-run setup.
+pub async fn validate_first_run_and_apply(result: &SetupResult) -> Result<SetupApplyOutcome> {
+    validate_and_apply_for(SetupInvocation::FirstRun, result).await
+}
+
+/// Run the shared ceremony for the explicit `finch setup` command.
+pub async fn validate_command_and_apply(result: &SetupResult) -> Result<SetupApplyOutcome> {
+    validate_and_apply_for(SetupInvocation::Command, result).await
+}
+
+/// Run the shared ceremony for the in-session `/setup` command.
+pub async fn validate_repl_and_apply(result: &SetupResult) -> Result<SetupApplyOutcome> {
+    validate_and_apply_for(SetupInvocation::Repl, result).await
 }
 
 /// Convert wizard output into the complete configuration written to disk.
@@ -5727,6 +5838,112 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    #[derive(Default)]
+    struct CeremonyObservations {
+        saves: usize,
+        fallback_saves: usize,
+        logouts: usize,
+        restores: usize,
+    }
+
+    struct MockChatGptCeremony {
+        signed_in: bool,
+        choices: std::collections::VecDeque<ChatGptSetupAction>,
+        login_outcomes:
+            std::collections::VecDeque<crate::providers::codex_app_server::DeviceLoginOutcome>,
+        validation_error: bool,
+        observed: Arc<Mutex<CeremonyObservations>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl ChatGptSetupCeremony for MockChatGptCeremony {
+        async fn status(
+            &mut self,
+        ) -> Result<crate::providers::codex_app_server::ChatGptAccountStatus> {
+            Ok(crate::providers::codex_app_server::ChatGptAccountStatus {
+                signed_in: self.signed_in,
+                plan_type: self.signed_in.then(|| "plus".into()),
+            })
+        }
+
+        async fn choose(
+            &mut self,
+            _title: &str,
+            _message: &str,
+            offered: &[(char, ChatGptSetupAction, &str)],
+        ) -> Result<ChatGptSetupAction> {
+            let choice = self.choices.pop_front().context("missing mock choice")?;
+            anyhow::ensure!(
+                choice == ChatGptSetupAction::Cancel
+                    || offered.iter().any(|(_, candidate, _)| *candidate == choice),
+                "mock selected an action that was not offered"
+            );
+            Ok(choice)
+        }
+
+        async fn login(
+            &mut self,
+        ) -> Result<crate::providers::codex_app_server::DeviceLoginOutcome> {
+            self.login_outcomes
+                .pop_front()
+                .context("missing mock login outcome")
+        }
+
+        async fn validate_sol(&mut self) -> Result<()> {
+            if self.validation_error {
+                anyhow::bail!("restricted schema unavailable")
+            }
+            Ok(())
+        }
+
+        fn save(&mut self, _result: &SetupResult) -> Result<()> {
+            self.observed.lock().unwrap().saves += 1;
+            Ok(())
+        }
+
+        fn save_fallback(&mut self, result: &SetupResult) -> Result<()> {
+            anyhow::ensure!(configured_fallback_exists(result), "missing fallback");
+            self.observed.lock().unwrap().fallback_saves += 1;
+            Ok(())
+        }
+
+        async fn logout(&mut self) -> Result<()> {
+            self.observed.lock().unwrap().logouts += 1;
+            Ok(())
+        }
+
+        fn restore(&mut self) -> Result<()> {
+            self.observed.lock().unwrap().restores += 1;
+            Ok(())
+        }
+    }
+
+    fn chatgpt_ceremony_result(with_fallback: bool) -> SetupResult {
+        let mut result = build_setup_result(&WizardState::new(None)).unwrap();
+        result.providers = vec![ProviderEntry::ChatgptSubscription {
+            credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF.into(),
+            model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.into()),
+            name: Some("subscription".into()),
+        }];
+        if with_fallback {
+            result.providers.push(ProviderEntry::Grok {
+                api_key: "xai-test".into(),
+                model: Some("grok-code-fast-1".into()),
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: Some("fallback".into()),
+            });
+        }
+        result
+    }
+
+    fn install_mock_ceremony(mock: MockChatGptCeremony) {
+        TEST_CHATGPT_CEREMONY.with(|slot| {
+            assert!(slot.borrow_mut().replace(Box::new(mock)).is_none());
+        });
+    }
+
     #[test]
     fn models_tab_describes_model_setup() {
         assert_eq!(WizardSection::Models.name(), "Model Setup");
@@ -8284,5 +8501,102 @@ mod tests {
         assert!(state
             .transition(ChatGptSetupAction::LoginSucceeded)
             .is_err());
+        assert!(!should_logout_after_post_cancel_choice(
+            ChatGptSetupAction::Keep
+        ));
+        assert!(should_logout_after_post_cancel_choice(
+            ChatGptSetupAction::Logout
+        ));
+        assert!(should_logout_after_post_cancel_choice(
+            ChatGptSetupAction::Cancel
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_public_ceremony_validation_failure_saves_configured_fallback() {
+        let observed = Arc::new(Mutex::new(CeremonyObservations::default()));
+        install_mock_ceremony(MockChatGptCeremony {
+            signed_in: true,
+            choices: [ChatGptSetupAction::Reuse, ChatGptSetupAction::Fallback]
+                .into_iter()
+                .collect(),
+            login_outcomes: Default::default(),
+            validation_error: true,
+            observed: Arc::clone(&observed),
+        });
+
+        let outcome =
+            validate_and_apply_for(SetupInvocation::Command, &chatgpt_ceremony_result(true))
+                .await
+                .unwrap();
+
+        assert_eq!(outcome, SetupApplyOutcome::Saved);
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.saves, 0);
+        assert_eq!(observed.fallback_saves, 1);
+        assert_eq!(observed.logouts, 0);
+        assert_eq!(observed.restores, 1);
+    }
+
+    #[tokio::test]
+    async fn test_public_ceremony_post_cancel_requires_retain_or_logs_out() {
+        for (decision, expected_logouts) in [
+            (ChatGptSetupAction::Keep, 0),
+            (ChatGptSetupAction::Logout, 1),
+            (ChatGptSetupAction::Cancel, 1),
+        ] {
+            let observed = Arc::new(Mutex::new(CeremonyObservations::default()));
+            install_mock_ceremony(MockChatGptCeremony {
+                signed_in: false,
+                choices: [ChatGptSetupAction::Login, decision].into_iter().collect(),
+                login_outcomes: [
+                    crate::providers::codex_app_server::DeviceLoginOutcome::CompletedAfterCancel,
+                ]
+                .into_iter()
+                .collect(),
+                validation_error: false,
+                observed: Arc::clone(&observed),
+            });
+
+            let outcome =
+                validate_and_apply_for(SetupInvocation::Command, &chatgpt_ceremony_result(false))
+                    .await
+                    .unwrap();
+
+            assert_eq!(outcome, SetupApplyOutcome::Cancelled);
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.logouts, expected_logouts, "{decision:?}");
+            assert_eq!(observed.restores, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_first_run_command_and_repl_adapters_share_public_ceremony() {
+        for invocation in [
+            SetupInvocation::FirstRun,
+            SetupInvocation::Command,
+            SetupInvocation::Repl,
+        ] {
+            let observed = Arc::new(Mutex::new(CeremonyObservations::default()));
+            install_mock_ceremony(MockChatGptCeremony {
+                signed_in: true,
+                choices: [ChatGptSetupAction::Reuse].into_iter().collect(),
+                login_outcomes: Default::default(),
+                validation_error: false,
+                observed: Arc::clone(&observed),
+            });
+            let result = chatgpt_ceremony_result(false);
+            let outcome = match invocation {
+                SetupInvocation::FirstRun => validate_first_run_and_apply(&result).await,
+                SetupInvocation::Command => validate_command_and_apply(&result).await,
+                SetupInvocation::Repl => validate_repl_and_apply(&result).await,
+            }
+            .unwrap();
+
+            assert_eq!(outcome, SetupApplyOutcome::Saved);
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.saves, 1, "{invocation:?}");
+            assert_eq!(observed.restores, 1, "{invocation:?}");
+        }
     }
 }
