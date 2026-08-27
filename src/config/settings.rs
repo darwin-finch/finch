@@ -549,6 +549,20 @@ fn resolve_default_config_paths() -> ConfigPaths {
     }
 }
 
+fn credential_metadata_eq(left: &ProviderCredential, right: &ProviderCredential) -> bool {
+    left.name == right.name
+        && left.kind == right.kind
+        && left.provider == right.provider
+        && left.issuer == right.issuer
+        && left.audience == right.audience
+        && left.tenant == right.tenant
+        && left.project == right.project
+        && left.account == right.account
+        && left.scopes == right.scopes
+        && left.secret_ref == right.secret_ref
+        && left.lifecycle == right.lifecycle
+}
+
 impl Config {
     /// Validate configuration and return helpful errors
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -889,8 +903,8 @@ impl Config {
     }
 
     /// Attach secret-free named credential metadata to this configuration.
-    pub fn with_credentials(mut self, credentials: Vec<ProviderCredential>) -> Self {
-        self.credentials = credentials;
+    pub fn with_credentials(mut self, mut credentials: Vec<ProviderCredential>) -> Self {
+        self.replace_credentials_preserving_authority(&mut credentials);
         self
     }
 
@@ -900,8 +914,23 @@ impl Config {
         &self.credentials
     }
 
-    pub(crate) fn replace_loaded_credentials(&mut self, credentials: Vec<ProviderCredential>) {
-        self.credentials = credentials;
+    pub(crate) fn replace_loaded_credentials(&mut self, mut credentials: Vec<ProviderCredential>) {
+        self.replace_credentials_preserving_authority(&mut credentials);
+    }
+
+    fn replace_credentials_preserving_authority(
+        &mut self,
+        credentials: &mut Vec<ProviderCredential>,
+    ) {
+        for old in &self.credentials {
+            match credentials.iter_mut().find(|new| new.name == old.name) {
+                Some(new) if credential_metadata_eq(old, new) => {
+                    new.revocation = old.revocation.clone();
+                }
+                Some(_) | None => old.revocation.revoke(),
+            }
+        }
+        self.credentials = std::mem::take(credentials);
     }
 
     /// Profiles that reference a named credential, for dependency-aware UX.

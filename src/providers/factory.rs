@@ -1177,6 +1177,38 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn test_public_credential_replacement_invalidates_live_provider_before_socket_activity() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let mut profile = named_openai("primary", "work", "gpt-4o");
+        if let ProviderEntry::Credentialed { base_url, .. } = &mut profile {
+            *base_url = Some(origin.clone());
+        }
+        let mut credential = named_openai_credential("work", "account-1");
+        credential.audience = AudienceBinding::custom(&origin).unwrap();
+        let config = Config::with_providers(vec![profile]).with_credentials(vec![credential]);
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let provider = create_provider_graph_from_config_with_resolver(&config, &resolver)
+            .unwrap()
+            .default_provider();
+        let _replacement = config.with_credentials(Vec::new());
+
+        assert!(provider
+            .send_message(&ProviderRequest::new(Vec::new()).with_model("gpt-4o"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("revoked after provider construction"));
+        assert!(matches!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        ));
+    }
+
     #[test]
     fn test_missing_named_account_never_falls_back_to_another_credential() {
         let config = Config::with_providers(vec![named_openai("primary", "missing", "gpt-4o")])
