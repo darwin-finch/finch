@@ -127,6 +127,9 @@ fn hash_manifest_directory(
     digest: &mut Sha256,
     nodes: &mut usize,
     bytes: &mut u64,
+    name_bytes: &mut usize,
+    depth: usize,
+    control_root: Option<&Path>,
 ) -> anyhow::Result<()> {
     use nix::fcntl::{openat, readlinkat, AtFlags, OFlag};
     use nix::sys::stat::{fstat, fstatat, Mode, SFlag};
@@ -135,6 +138,13 @@ fn hash_manifest_directory(
 
     const MAX_MANIFEST_NODES: usize = 100_000;
     const MAX_MANIFEST_BYTES: u64 = 1 << 30;
+    const MAX_MANIFEST_NAME_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_MANIFEST_DEPTH: usize = 128;
+
+    anyhow::ensure!(
+        depth <= MAX_MANIFEST_DEPTH,
+        "real Brain store manifest exceeds its depth bound"
+    );
 
     let mut names = directory
         .iter()
@@ -144,20 +154,27 @@ fn hash_manifest_directory(
             if bytes == b"." || bytes == b".." {
                 return Ok(None);
             }
+            *nodes += 1;
+            anyhow::ensure!(
+                *nodes <= MAX_MANIFEST_NODES,
+                "real Brain store manifest exceeds its node bound"
+            );
+            *name_bytes = name_bytes
+                .checked_add(bytes.len())
+                .context("real Brain store manifest name count overflowed")?;
+            anyhow::ensure!(
+                *name_bytes <= MAX_MANIFEST_NAME_BYTES,
+                "real Brain store manifest exceeds its filename bound"
+            );
             Ok(Some(std::ffi::OsString::from_vec(bytes.to_vec())))
         })
-        .collect::<Result<Vec<_>, nix::Error>>()?
+        .collect::<anyhow::Result<Vec<_>>>()?
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
     names.sort();
 
     for name in names {
-        *nodes += 1;
-        anyhow::ensure!(
-            *nodes <= MAX_MANIFEST_NODES,
-            "real Brain store manifest exceeds its node bound"
-        );
         let child_relative = relative.join(&name);
         let observed = fstatat(
             Some(directory.as_raw_fd()),
@@ -166,11 +183,11 @@ fn hash_manifest_directory(
         )?;
         hash_manifest_stat(digest, &child_relative, &observed);
         if std::env::var_os("FINCH_TEST_MANIFEST_RACE_NAME").as_deref() == Some(name.as_os_str()) {
-            let ready = std::env::var_os("FINCH_TEST_MANIFEST_RACE_READY")
-                .context("manifest race probe requires a ready path")?;
-            let continuation = std::env::var_os("FINCH_TEST_MANIFEST_RACE_CONTINUE")
-                .context("manifest race probe requires a continuation path")?;
-            fs::write(ready, b"ready\n")?;
+            let control_root =
+                control_root.context("manifest race probe requires a private root")?;
+            let ready = control_root.join(".manifest-race-ready");
+            let continuation = control_root.join(".manifest-race-continue");
+            fs::write(&ready, b"ready\n")?;
             let deadline = Instant::now() + Duration::from_secs(2);
             while !Path::new(&continuation).exists() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(5));
@@ -232,7 +249,16 @@ fn hash_manifest_directory(
                 opened.st_dev == observed.st_dev && opened.st_ino == observed.st_ino,
                 "real Brain store directory changed while opening"
             );
-            hash_manifest_directory(&mut child, &child_relative, digest, nodes, bytes)?;
+            hash_manifest_directory(
+                &mut child,
+                &child_relative,
+                digest,
+                nodes,
+                bytes,
+                name_bytes,
+                depth + 1,
+                control_root,
+            )?;
         } else if kind.contains(SFlag::S_IFSOCK) {
             digest.update(b"socket");
         } else if kind.contains(SFlag::S_IFIFO) {
@@ -248,7 +274,7 @@ fn hash_manifest_directory(
     Ok(())
 }
 
-fn manifest_digest(store: &Path) -> anyhow::Result<String> {
+fn manifest_digest(store: &Path, control_root: Option<&Path>) -> anyhow::Result<String> {
     use nix::fcntl::{open, OFlag};
     use nix::sys::stat::{fstat, Mode, SFlag};
 
@@ -273,12 +299,16 @@ fn manifest_digest(store: &Path) -> anyhow::Result<String> {
     let mut directory = nix::dir::Dir::from(root)?;
     let mut nodes = 0;
     let mut bytes = 0;
+    let mut name_bytes = 0;
     hash_manifest_directory(
         &mut directory,
         Path::new("."),
         &mut digest,
         &mut nodes,
         &mut bytes,
+        &mut name_bytes,
+        0,
+        control_root,
     )?;
     Ok(hex::encode(digest.finalize()))
 }
@@ -486,10 +516,15 @@ fn bounded_ps_output() -> anyhow::Result<Vec<u8>> {
     let deadline = Instant::now() + Duration::from_secs(1);
     let mut output = Vec::new();
     let mut buffer = [0_u8; 8192];
+    let mut status = None;
     loop {
+        let mut eof = false;
         loop {
             match stdout.read(&mut buffer) {
-                Ok(0) => break,
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
                 Ok(count) => {
                     anyhow::ensure!(
                         output.len() + count <= 1024 * 1024,
@@ -502,7 +537,10 @@ fn bounded_ps_output() -> anyhow::Result<Vec<u8>> {
                 Err(error) => return Err(error.into()),
             }
         }
-        if let Some(status) = child.try_wait()? {
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if let Some(status) = status.filter(|_| eof) {
             anyhow::ensure!(
                 status.success(),
                 "could not inspect supervised process group"
@@ -695,7 +733,6 @@ fn run() -> anyhow::Result<i32> {
         !temp_parent.starts_with(&real_store) && !real_store.starts_with(&temp_parent),
         "temporary parent overlaps the real Brain store"
     );
-    let before = manifest_digest(&real_store)?;
     let isolated = tempfile::Builder::new()
         .prefix("finch-brain-test-home.")
         .tempdir_in(&temp_parent)?;
@@ -720,6 +757,7 @@ fn run() -> anyhow::Result<i32> {
         fs::create_dir_all(&directory)?;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
     }
+    let before = manifest_digest(&real_store, Some(isolated.path()))?;
     let socket_parent = if Path::new("/private/tmp").is_dir() {
         Path::new("/private/tmp")
     } else {
@@ -849,7 +887,7 @@ fn run() -> anyhow::Result<i32> {
     };
     // Once the group is proven quiescent, always take the parent-held after
     // snapshot before propagating an observation error or removing HOME.
-    let after = manifest_digest(&real_store)?;
+    let after = manifest_digest(&real_store, Some(isolated.path()))?;
     anyhow::ensure!(
         before == after,
         "real Brain store manifest changed (sha256={before} -> sha256={after})"

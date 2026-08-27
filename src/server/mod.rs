@@ -193,7 +193,18 @@ fn supervised_state_root(
     #[cfg(target_os = "linux")]
     let path = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
     #[cfg(target_os = "macos")]
-    let path = std::path::PathBuf::from(format!("/dev/fd/{}", directory.as_raw_fd()));
+    let path = {
+        // Darwin's fdescfs exposes the directory descriptor itself but does
+        // not permit `/dev/fd/N/child` traversal. These authenticated fixture
+        // tests run as exact, supervisor-owned subprocesses, so pin their
+        // process-wide working directory to the opened inode and use only
+        // descriptor-relative `.` descendants for the fixture lifetime.
+        anyhow::ensure!(
+            unsafe { nix::libc::fchdir(directory.as_raw_fd()) } == 0,
+            "could not pin the Brain fixture process to its state descriptor"
+        );
+        std::path::PathBuf::from(".")
+    };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     anyhow::bail!("descriptor-relative Brain fixture state is unsupported on this platform");
     Ok(SupervisedStateRoot { directory, path })

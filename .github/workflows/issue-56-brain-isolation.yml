@@ -110,10 +110,9 @@ jobs:
 
     - name: Reject fixture traversal before external mutation
       timeout-minutes: 15
-      run: >-
-        ./scripts/test_brains.sh cargo test --lib
-        supervised_http_fixture_rejects
-        -- --nocapture
+      run: |
+        ./scripts/test_brains.sh cargo test --lib supervised_http_fixture_rejects -- --nocapture
+        ./scripts/test_brains.sh cargo test --lib server::tests::supervised_http_fixture_pins_state_root_across_ancestor_swap -- --exact --nocapture
 
     - name: Exercise real Brain and server paths behind the guard
       timeout-minutes: 25

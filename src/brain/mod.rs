@@ -286,27 +286,57 @@ fn restore_supervisor_listener(
 }
 
 fn process_descends_from(ancestor: u32) -> anyhow::Result<bool> {
+    #[cfg(target_os = "linux")]
+    fn parent(pid: u32) -> anyhow::Result<u32> {
+        use std::io::Read as _;
+
+        let mut file = std::fs::File::open(format!("/proc/{pid}/stat"))?;
+        let mut bytes = Vec::new();
+        file.by_ref().take(4097).read_to_end(&mut bytes)?;
+        anyhow::ensure!(bytes.len() <= 4096, "process ancestry record is too large");
+        let record = std::str::from_utf8(&bytes)?;
+        let suffix = record
+            .rsplit_once(") ")
+            .context("process ancestry record is malformed")?
+            .1;
+        Ok(suffix
+            .split_whitespace()
+            .nth(1)
+            .context("process ancestry record has no parent")?
+            .parse()?)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn parent(pid: u32) -> anyhow::Result<u32> {
+        let mut information: nix::libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let expected = std::mem::size_of_val(&information) as nix::libc::c_int;
+        let length = unsafe {
+            nix::libc::proc_pidinfo(
+                pid as nix::libc::c_int,
+                nix::libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut information as *mut nix::libc::proc_bsdinfo).cast(),
+                expected,
+            )
+        };
+        anyhow::ensure!(length == expected, "could not verify supervisor ancestry");
+        Ok(information.pbi_ppid)
+    }
+
     let mut pid = std::process::id();
-    let parent = |pid: u32| -> anyhow::Result<u32> {
-        let output = std::process::Command::new("/bin/ps")
-            .args(["-o", "ppid=", "-p", &pid.to_string()])
-            .output()?;
-        anyhow::ensure!(
-            output.status.success(),
-            "could not verify supervisor ancestry"
-        );
-        Ok(String::from_utf8(output.stdout)?.trim().parse()?)
-    };
     // The proof issuer must be an actual ancestor. Accepting the current
     // process would let a test manufacture a self-signed environment and FD.
     pid = parent(pid)?;
-    while pid > 1 {
+    for _ in 0..256 {
+        if pid <= 1 {
+            return Ok(false);
+        }
         if pid == ancestor {
             return Ok(true);
         }
         pid = parent(pid)?;
     }
-    Ok(false)
+    anyhow::bail!("process ancestry exceeds its depth bound")
 }
 
 #[cfg(unix)]
