@@ -7929,6 +7929,7 @@ mod tests {
             TypedRuntime::intrinsic_grants(),
             None,
             DeferredHostEffects::None,
+            None,
         )
     }
 
