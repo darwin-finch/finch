@@ -255,16 +255,6 @@ pub async fn refresh_from_config(
     else {
         bail!("provider profile '{profile_name}' does not use a named credential");
     };
-    let credentials = crate::config::credential::credential_index(&config.credentials)?;
-    let metadata = credentials
-        .get(credential.credential_ref.as_str())
-        .expect("Config::validate checked the named credential reference");
-    let resolved = resolver.resolve(metadata).map_err(|_| {
-        anyhow::anyhow!("Failed to resolve named credential '{}'; inspect the credential store without printing secret material", credential.credential_ref)
-    })?;
-    if resolved.credential_name != credential.credential_ref {
-        bail!("credential resolver returned a handle for the wrong named credential");
-    }
     let (default_base, default_chat, default_models, auth, provider_name) = match provider {
         CredentialProvider::Anthropic => (
             "https://api.anthropic.com",
@@ -305,6 +295,16 @@ pub async fn refresh_from_config(
             "provider profile '{profile_name}' does not have a supported named-credential catalogue transport"
         ),
     };
+    let credentials = crate::config::credential::credential_index(&config.credentials)?;
+    let metadata = credentials
+        .get(credential.credential_ref.as_str())
+        .expect("Config::validate checked the named credential reference");
+    let resolved = resolver.resolve(metadata).map_err(|_| {
+        anyhow::anyhow!("Failed to resolve named credential '{}'; inspect the credential store without printing secret material", credential.credential_ref)
+    })?;
+    if resolved.credential_name != credential.credential_ref {
+        bail!("credential resolver returned a handle for the wrong named credential");
+    }
     let profile = ModelCatalogProfile::new(
         provider_name,
         profile_name,

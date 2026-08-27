@@ -2097,10 +2097,16 @@ impl Repl {
             .available_providers
             .get(initial_provider_index)
             .filter(|entry| !entry.is_local())
-            .and_then(|entry| crate::providers::create_provider_from_entry(entry).ok())
+            .and_then(|entry| {
+                crate::providers::create_provider_profile_from_config(
+                    &self._config,
+                    &entry.profile_name(),
+                )
+                .ok()
+            })
             .map(|provider| {
                 let inner: Arc<dyn crate::generators::Generator> = Arc::new(ClaudeGenerator::new(
-                    Arc::new(crate::claude::ClaudeClient::with_provider(provider)),
+                    Arc::new(crate::claude::ClaudeClient::with_shared_provider(provider)),
                 ));
                 Arc::new(ProfiledGenerator::new(
                     self.available_providers[initial_provider_index].profile_name(),

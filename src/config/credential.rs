@@ -337,7 +337,9 @@ pub fn normalize_origin(endpoint: &str) -> Result<String> {
         .host_str()
         .context("endpoint must contain a host")?
         .to_ascii_lowercase();
-    let host = if host.contains(':') {
+    let host = if host.starts_with('[') && host.ends_with(']') {
+        host
+    } else if host.contains(':') {
         format!("[{host}]")
     } else {
         host
@@ -674,6 +676,25 @@ mod tests {
 
     #[test]
     fn test_authenticated_endpoint_parser_rejects_ambiguous_authorities() {
+        assert_eq!(
+            normalize_origin("http://[::1]:8080/v1").unwrap(),
+            "http://[::1]:8080"
+        );
+        assert_eq!(
+            AudienceBinding::custom("http://[::1]:8080/v1")
+                .unwrap()
+                .endpoint
+                .as_deref(),
+            Some("http://[::1]:8080")
+        );
+        assert_eq!(
+            required_audience(
+                CredentialProvider::OpenaiPlatform,
+                Some("http://[::1]:8080/v1")
+            )
+            .unwrap(),
+            AudienceBinding::custom("http://[::1]:8080").unwrap()
+        );
         assert!(validate_authenticated_endpoints(
             CredentialProvider::OpenaiPlatform,
             None,

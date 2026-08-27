@@ -3,19 +3,96 @@
 // Creates LLM providers based on teacher/provider configuration
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use super::claude::ClaudeProvider;
 use super::gemini::GeminiProvider;
 use super::openai::OpenAIProvider;
-use super::LlmProvider;
+use super::{LlmProvider, ProviderBackend, ProviderRequest, ProviderResponse, StreamChunk, ValidatedProviderRequest};
 use crate::config::{
     Config, CredentialProvider, CredentialResolver, EnvironmentCredentialResolver, ProviderEntry,
     ResolvedCredential, TeacherEntry,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use tokio::sync::mpsc::Receiver;
 
 const LEGACY_CHATGPT_MIGRATION_ERROR: &str = "Legacy chatgpt_subscription profiles are unsupported because Finch no longer launches Codex app-server. Run `finch setup` and configure OpenAI Platform with an API key or another supported provider; subscription credentials are not API keys";
+
+struct CredentialBoundProvider {
+    inner: Box<dyn LlmProvider>,
+    credential_name: String,
+    expires_at: Option<DateTime<Utc>>,
+}
+
+impl CredentialBoundProvider {
+    fn new(
+        inner: Box<dyn LlmProvider>,
+        credential: &crate::config::ProviderCredential,
+    ) -> Self {
+        let expires_at = match &credential.lifecycle {
+            crate::config::CredentialLifecycle::Active { expires_at, .. } => *expires_at,
+            crate::config::CredentialLifecycle::Revoked
+            | crate::config::CredentialLifecycle::LegacyAmbiguous => None,
+        };
+        Self {
+            inner,
+            credential_name: credential.name.clone(),
+            expires_at,
+        }
+    }
+
+    fn validate_lifecycle(&self) -> Result<()> {
+        if self.expires_at.is_some_and(|expires_at| expires_at <= Utc::now()) {
+            bail!(
+                "credential '{}' expired after provider construction; reconnect or reselect the profile after updating it",
+                self.credential_name
+            );
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ProviderBackend for CredentialBoundProvider {
+    async fn send_message_validated(
+        &self,
+        request: ValidatedProviderRequest,
+    ) -> Result<ProviderResponse> {
+        let request = request.into_request_for(self)?;
+        self.validate_lifecycle()?;
+        self.inner.send_message(&request).await
+    }
+
+    async fn send_message_stream_validated(
+        &self,
+        request: ValidatedProviderRequest,
+    ) -> Result<Receiver<Result<StreamChunk>>> {
+        let request = request.into_request_for(self)?;
+        self.validate_lifecycle()?;
+        self.inner.send_message_stream(&request).await
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn default_model(&self) -> &str {
+        self.inner.default_model()
+    }
+
+    fn capabilities(&self, model: &str) -> super::ModelCapabilities {
+        self.inner.capabilities(model)
+    }
+
+    fn requested_reasoning_effort(
+        &self,
+        request: &ProviderRequest,
+    ) -> Option<crate::config::ReasoningEffort> {
+        self.inner.requested_reasoning_effort(request)
+    }
+}
 
 /// A successfully constructed cloud provider paired with its configured selector.
 #[derive(Clone)]
@@ -331,13 +408,40 @@ fn resolve_named_graph(
     Ok(resolved)
 }
 
+fn preflight_named_transport(entry: &ProviderEntry) -> Result<()> {
+    let ProviderEntry::Credentialed {
+        provider,
+        base_url,
+        chat_path,
+        models_path,
+        ..
+    } = entry
+    else {
+        return Ok(());
+    };
+    match provider {
+        CredentialProvider::ChatgptSubscription => bail!(
+            "ChatGPT subscription credentials are distinct from OpenAI Platform credentials, but no documented Finch-native subscription transport is currently available"
+        ),
+        CredentialProvider::GoogleVertex => bail!(
+            "Google Vertex named credentials are modeled but its cloud-identity transport is not implemented"
+        ),
+        CredentialProvider::GeminiAiStudio
+            if base_url.is_some() || chat_path.is_some() || models_path.is_some() =>
+        {
+            bail!("Gemini AI Studio custom endpoints are not supported by this transport")
+        }
+        _ => Ok(()),
+    }
+}
+
 fn create_named_profiles_from_config_with_resolver(
     config: &Config,
     resolver: &dyn CredentialResolver,
 ) -> Result<Vec<(String, Box<dyn LlmProvider>)>> {
-    // Complete graph validation and local secret resolution happen before the
-    // first provider constructor is called.
-    let resolved = resolve_named_graph(config, resolver)?;
+    // Complete graph and transport validation happen before secret resolution
+    // or the first provider constructor.
+    config.validate()?;
     if let Some((index, _)) = config
         .providers
         .iter()
@@ -350,6 +454,12 @@ fn create_named_profiles_from_config_with_resolver(
             LEGACY_CHATGPT_MIGRATION_ERROR
         );
     }
+    for (index, entry) in config.providers.iter().enumerate() {
+        preflight_named_transport(entry)
+            .with_context(|| format!("Provider #{} is invalid", index + 1))?;
+    }
+    let resolved = resolve_named_graph(config, resolver)?;
+    let credentials = crate::config::credential::credential_index(&config.credentials)?;
     let cloud: Vec<_> = config
         .providers
         .iter()
@@ -362,11 +472,16 @@ fn create_named_profiles_from_config_with_resolver(
     cloud
         .into_iter()
         .map(|(index, entry)| {
-            let provider = if let Some(handle) = entry
-                .credential_binding()
-                .and_then(|binding| resolved.get(&binding.credential_ref))
-            {
-                create_provider_from_resolved_entry(entry, handle)
+            let provider = if let Some(binding) = entry.credential_binding() {
+                let handle = resolved
+                    .get(&binding.credential_ref)
+                    .expect("resolved graph contains every validated named credential");
+                let inner = create_provider_from_resolved_entry(entry, handle)?;
+                let metadata = credentials
+                    .get(binding.credential_ref.as_str())
+                    .expect("validated credential index contains every profile reference");
+                Ok(Box::new(CredentialBoundProvider::new(inner, metadata))
+                    as Box<dyn LlmProvider>)
             } else {
                 create_provider_from_entry(entry)
             }
@@ -445,6 +560,7 @@ pub fn create_provider_from_entries(entries: &[ProviderEntry]) -> Result<Box<dyn
 
 fn graph_from_boxed_profiles(
     profiles: Vec<(String, Box<dyn LlmProvider>)>,
+    allow_implicit_fallback: bool,
 ) -> Result<ProviderGraph> {
     if profiles.is_empty() {
         bail!("No usable cloud provider entries configured");
@@ -456,7 +572,7 @@ fn graph_from_boxed_profiles(
             provider: Arc::from(provider),
         })
         .collect();
-    let default_provider = if profiles.len() == 1 {
+    let default_provider = if profiles.len() == 1 || !allow_implicit_fallback {
         Arc::clone(profiles[0].provider())
     } else {
         Arc::new(super::FallbackChain::from_shared(
@@ -504,7 +620,11 @@ pub fn create_provider_graph_from_config(config: &Config) -> Result<ProviderGrap
             })
             .collect::<Result<Vec<_>>>()?
     };
-    graph_from_boxed_profiles(profiles)
+    let allow_implicit_fallback = !config
+        .providers
+        .iter()
+        .any(|entry| matches!(entry, ProviderEntry::Credentialed { .. }));
+    graph_from_boxed_profiles(profiles, allow_implicit_fallback)
 }
 
 /// Construct a provider graph using an injected local credential resolver.
@@ -516,9 +636,10 @@ pub fn create_provider_graph_from_config_with_resolver(
     if !config.providers.iter().any(|entry| !entry.is_local()) {
         return create_provider_graph_from_config(config);
     }
-    graph_from_boxed_profiles(create_named_profiles_from_config_with_resolver(
-        config, resolver,
-    )?)
+    graph_from_boxed_profiles(
+        create_named_profiles_from_config_with_resolver(config, resolver)?,
+        false,
+    )
 }
 
 /// Revalidate the complete graph and return one configured profile.
@@ -552,12 +673,15 @@ pub fn create_providers_from_config(config: &Config) -> Result<Vec<Box<dyn LlmPr
 
 /// Create the active provider or fallback chain from unified or legacy configuration.
 pub fn create_provider_from_config(config: &Config) -> Result<Box<dyn LlmProvider>> {
-    let providers = create_providers_from_config(config)?;
-    if providers.len() == 1 {
+    let mut providers = create_providers_from_config(config)?;
+    if providers.len() == 1
+        || config
+            .providers
+            .iter()
+            .any(|entry| matches!(entry, ProviderEntry::Credentialed { .. }))
+    {
         return Ok(providers
-            .into_iter()
-            .next()
-            .expect("len == 1 checked above"));
+            .remove(0));
     }
     Ok(Box::new(super::FallbackChain::new(providers)))
 }
@@ -900,6 +1024,113 @@ mod tests {
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
         assert_eq!(graph.profiles()[0].profile_name(), "fast");
         assert_eq!(graph.profiles()[1].profile_name(), "reasoning");
+        let default = graph.default_provider();
+        assert!(Arc::ptr_eq(&default, graph.profiles()[0].provider()));
+    }
+
+    #[test]
+    fn test_unsupported_named_transports_reject_before_secret_resolution() {
+        let cases = [
+            (
+                CredentialProvider::ChatgptSubscription,
+                CredentialKind::SubscriptionSession,
+                "openai-chatgpt",
+                EndpointFamily::ChatgptSubscription,
+                false,
+            ),
+            (
+                CredentialProvider::GoogleVertex,
+                CredentialKind::CloudIdentity,
+                "google-cloud",
+                EndpointFamily::GoogleVertex,
+                false,
+            ),
+            (
+                CredentialProvider::GeminiAiStudio,
+                CredentialKind::ApiKey,
+                "google-ai-studio",
+                EndpointFamily::GeminiAiStudio,
+                true,
+            ),
+        ];
+        for (provider, kind, issuer, family, custom_gemini) in cases {
+            let mut profile = ProviderEntry::Credentialed {
+                provider,
+                credential: CredentialBinding {
+                    credential_ref: "work".into(),
+                    audience: None,
+                    tenant: None,
+                    project: None,
+                    account: None,
+                    required_scopes: BTreeSet::new(),
+                },
+                model: None,
+                base_url: None,
+                chat_path: None,
+                models_path: None,
+                name: Some("primary".into()),
+                reasoning_effort: None,
+            };
+            if custom_gemini {
+                if let ProviderEntry::Credentialed { base_url, .. } = &mut profile {
+                    *base_url = Some("https://custom.example".into());
+                }
+            }
+            let credential = ProviderCredential {
+                name: "work".into(),
+                kind,
+                provider,
+                issuer: issuer.into(),
+                audience: if custom_gemini {
+                    AudienceBinding::custom("https://custom.example").unwrap()
+                } else {
+                    AudienceBinding::standard(family)
+                },
+                tenant: None,
+                project: None,
+                account: None,
+                scopes: BTreeSet::new(),
+                secret_ref: "test:work".into(),
+                lifecycle: CredentialLifecycle::default(),
+            };
+            let config = Config::with_providers(vec![profile]).with_credentials(vec![credential]);
+            let resolver = CountingResolver {
+                calls: AtomicUsize::new(0),
+            };
+            assert!(create_provider_graph_from_config_with_resolver(&config, &resolver).is_err());
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_expired_live_binding_rejects_before_socket_activity() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let inner = OpenAIProvider::new_compatible(
+            "must-not-be-sent".into(),
+            format!("http://{}", listener.local_addr().unwrap()),
+            "/v1/chat/completions",
+            "/v1/models",
+            "gpt-4o".into(),
+            "openai".into(),
+        )
+        .unwrap();
+        let mut metadata = named_openai_credential("work", "account-1");
+        metadata.lifecycle = CredentialLifecycle::Active {
+            expires_at: Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
+            refreshable: false,
+        };
+        let provider = CredentialBoundProvider::new(Box::new(inner), &metadata);
+
+        let error = provider
+            .send_message(&ProviderRequest::new(Vec::new()).with_model("gpt-4o"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("expired after provider construction"));
+        assert!(matches!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[test]

@@ -165,6 +165,21 @@ fn model_catalog_profile(
     let (base_url, chat_path, models_path, auth) = match (provider, persisted) {
         (
             "claude",
+            Some(ProviderEntry::Credentialed {
+                provider: crate::config::CredentialProvider::Anthropic,
+                base_url,
+                chat_path,
+                models_path,
+                ..
+            }),
+        ) => (
+            base_url.as_deref().unwrap_or("https://api.anthropic.com"),
+            chat_path.as_deref().unwrap_or("/v1/messages"),
+            models_path.as_deref().unwrap_or("/v1/models"),
+            CatalogAuth::AnthropicApiKey,
+        ),
+        (
+            "claude",
             Some(ProviderEntry::Claude {
                 base_url,
                 chat_path,
@@ -197,12 +212,36 @@ fn model_catalog_profile(
             models_path.as_deref().unwrap_or("/v1/models"),
             CatalogAuth::Bearer,
         ),
-        ("openai", _) => (
+        ("openai", persisted)
+            if !matches!(persisted, Some(ProviderEntry::Credentialed { .. })) => (
             "https://api.openai.com",
             "/v1/chat/completions",
             "/v1/models",
             CatalogAuth::Bearer,
         ),
+        (
+            "openai" | "grok" | "mistral" | "groq",
+            Some(ProviderEntry::Credentialed {
+                base_url,
+                chat_path,
+                models_path,
+                ..
+            }),
+        ) => {
+            let (default_base, default_chat, default_models) = match provider {
+                "openai" => ("https://api.openai.com", "/v1/chat/completions", "/v1/models"),
+                "grok" => ("https://api.x.ai", "/v1/chat/completions", "/v1/models"),
+                "mistral" => ("https://api.mistral.ai", "/v1/chat/completions", "/v1/models"),
+                "groq" => ("https://api.groq.com/openai", "/v1/chat/completions", "/v1/models"),
+                _ => unreachable!("match pattern limits provider"),
+            };
+            (
+                base_url.as_deref().unwrap_or(default_base),
+                chat_path.as_deref().unwrap_or(default_chat),
+                models_path.as_deref().unwrap_or(default_models),
+                CatalogAuth::Bearer,
+            )
+        }
         (
             "grok",
             Some(ProviderEntry::Grok {
@@ -1610,6 +1649,7 @@ fn handle_themes_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
 /// Handle input for Models section (unified Backend + Teachers)
 fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
     let catalog_cache_dir = state.catalog_cache_dir.clone();
+    let credentials = state.credentials.clone();
     if let Some(SectionState::Models {
         primary_model,
         tool_models,
@@ -1953,6 +1993,14 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                         ));
                         return Ok(false);
                     };
+                    let named_config = persisted
+                        .filter(|entry| matches!(entry, ProviderEntry::Credentialed { .. }))
+                        .cloned()
+                        .map(|entry| {
+                            crate::config::Config::with_providers(vec![entry])
+                                .with_credentials(credentials.clone())
+                        });
+                    let named_profile = name.clone();
                     let cache_dir = match catalog_cache_dir.clone() {
                         Some(path) => path,
                         None => {
@@ -1974,9 +2022,32 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                             .build()
                             .map_err(anyhow::Error::from)
                             .map(|runtime| {
-                                runtime.block_on(model_catalog::refresh_with_fallback(
-                                    &profile, &cache_dir,
-                                ))
+                                if let Some(config) = named_config {
+                                    runtime.block_on(async {
+                                        match model_catalog::refresh_from_config(
+                                            &config,
+                                            &named_profile,
+                                            &crate::config::EnvironmentCredentialResolver,
+                                            &cache_dir,
+                                        )
+                                        .await
+                                        {
+                                            Ok(catalog) => (catalog, None),
+                                            Err(error) => {
+                                                let mut fallback = model_catalog::fallback_catalog(
+                                                    &profile.provider,
+                                                    &profile.endpoints.models_url,
+                                                );
+                                                fallback.profile_id = profile.profile_id.clone();
+                                                (fallback, Some(error.to_string()))
+                                            }
+                                        }
+                                    })
+                                } else {
+                                    runtime.block_on(model_catalog::refresh_with_fallback(
+                                        &profile, &cache_dir,
+                                    ))
+                                }
                             });
                         *result_for_thread.lock().unwrap() = Some(match refreshed {
                             Ok(result) => result,
@@ -6325,6 +6396,34 @@ mod tests {
         assert_eq!(
             profile.endpoints.models_url,
             "https://models.example/exact/catalog?account=work"
+        );
+    }
+
+    #[test]
+    fn named_catalog_profile_preserves_bound_custom_endpoints_without_inline_secret() {
+        let persisted = ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::OpenaiPlatform,
+            credential: crate::config::CredentialBinding {
+                credential_ref: "work".into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: std::collections::BTreeSet::new(),
+            },
+            model: Some("manual-model".into()),
+            base_url: Some("https://compatible.example/v1".into()),
+            chat_path: Some("/v1/chat/completions".into()),
+            models_path: Some("/v1/models".into()),
+            name: Some("work-profile".into()),
+            reasoning_effort: None,
+        };
+        let profile =
+            model_catalog_profile("openai", "work-profile", "", Some(&persisted)).unwrap();
+        assert!(profile.api_key.is_empty());
+        assert_eq!(
+            profile.endpoints.models_url,
+            "https://compatible.example/v1/models"
         );
     }
 
