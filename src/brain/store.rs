@@ -5422,9 +5422,13 @@ impl BrainStore {
         self.ensure_loaded(name)?;
         let brain_id = self.brains.read().expect("shared brain lock poisoned")
             .get(name).context("Brain was removed concurrently")?.brain_id;
-        self.with_effect_audit_storage_mut(name, brain_id, |storage| {
-            storage.replay.seed_mature_history_for_test(brain_id.0, records, epochs)
-        })?;
+        let max_seq = self.with_effect_audit_storage_mut(name, brain_id, |storage| {
+            storage.replay.seed_mature_history_for_test(brain_id.0, records, epochs)?;
+            Ok(storage.replay.max_seq())
+        })?.unwrap_or(0);
+        let mut brains = self.brains.write().expect("shared brain lock poisoned");
+        let state = brains.get_mut(name).context("Brain was removed concurrently")?;
+        state.revision = state.revision.max(max_seq);
         Ok(())
     }
 

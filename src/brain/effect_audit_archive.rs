@@ -116,6 +116,7 @@ pub(crate) struct EffectAuditReplayArchive {
     manifest_path: PathBuf,
     index_path: PathBuf,
     manifest: ReplayManifest,
+    sealed_epoch_file_bytes: u64,
     #[cfg(test)]
     lookup_epoch_queries: std::cell::Cell<usize>,
 }
@@ -378,11 +379,26 @@ impl EffectAuditReplayArchive {
         initialize_index(&index_path)?;
         reconcile_active_index(&index_path, &active_path, manifest.active_epoch)?;
         validate_index_counts(&index_path, &manifest)?;
+        let sealed_epoch_file_bytes = manifest
+            .epochs
+            .iter()
+            .filter(|epoch| epoch.sealed)
+            .try_fold(0u64, |total, epoch| {
+                let path = directory.join(&epoch.file);
+                Ok::<_, anyhow::Error>(
+                    total.saturating_add(
+                        std::fs::metadata(&path)
+                            .with_context(|| format!("stat {}", path.display()))?
+                            .len(),
+                    ),
+                )
+            })?;
         let archive = Self {
             directory,
             manifest_path,
             index_path,
             manifest,
+            sealed_epoch_file_bytes,
             #[cfg(test)]
             lookup_epoch_queries: std::cell::Cell::new(0),
         };
@@ -598,6 +614,10 @@ impl EffectAuditReplayArchive {
             return Ok(());
         }
         let generation = self.manifest.active_epoch + 1;
+        let sealed_path = self.directory.join(&self.manifest.epochs[active].file);
+        let sealed_bytes = std::fs::metadata(&sealed_path)
+            .with_context(|| format!("stat {}", sealed_path.display()))?
+            .len();
         let path = self.directory.join(epoch_file_name(generation));
         reject_symlink(&path)?;
         initialize_epoch(&path)?;
@@ -606,6 +626,7 @@ impl EffectAuditReplayArchive {
             "orphan effect-audit replay epoch is not empty"
         );
         self.manifest.epochs[active].sealed = true;
+        self.sealed_epoch_file_bytes = self.sealed_epoch_file_bytes.saturating_add(sealed_bytes);
         self.manifest.active_epoch = generation;
         self.manifest.epochs.push(ReplayEpoch {
             generation,
@@ -619,17 +640,18 @@ impl EffectAuditReplayArchive {
     }
 
     fn archive_file_bytes(&self) -> Result<u64> {
-        let mut total = std::fs::metadata(&self.manifest_path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        for epoch in &self.manifest.epochs {
-            let path = self.directory.join(&epoch.file);
-            total = total.saturating_add(
-                std::fs::metadata(&path)
-                    .with_context(|| format!("stat {}", path.display()))?
-                    .len(),
-            );
-        }
+        let mut total = self.sealed_epoch_file_bytes.saturating_add(
+            std::fs::metadata(&self.manifest_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+        );
+        let active = self.manifest.active_epoch as usize;
+        let active_path = self.directory.join(&self.manifest.epochs[active].file);
+        total = total.saturating_add(
+            std::fs::metadata(&active_path)
+                .with_context(|| format!("stat {}", active_path.display()))?
+                .len(),
+        );
         total = total.saturating_add(
             std::fs::metadata(&self.index_path)
                 .with_context(|| format!("stat {}", self.index_path.display()))?
@@ -718,6 +740,15 @@ impl EffectAuditReplayArchive {
             next += take;
         }
         self.manifest.active_epoch = epochs as u64 - 1;
+        self.sealed_epoch_file_bytes = self
+            .manifest
+            .epochs
+            .iter()
+            .filter(|epoch| epoch.sealed)
+            .try_fold(0u64, |total, epoch| {
+                let path = self.directory.join(&epoch.file);
+                Ok::<_, anyhow::Error>(total.saturating_add(std::fs::metadata(&path)?.len()))
+            })?;
         validate_index_counts(&self.index_path, &self.manifest)?;
         self.persist_manifest()
     }
@@ -1015,6 +1046,7 @@ mod tests {
             manifest_path: archive.manifest_path.clone(),
             index_path: archive.index_path.clone(),
             manifest: missing,
+            sealed_epoch_file_bytes: archive.sealed_epoch_file_bytes,
             lookup_epoch_queries: std::cell::Cell::new(0),
         };
         missing_archive.persist_manifest().unwrap();
