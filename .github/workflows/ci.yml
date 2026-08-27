@@ -74,6 +74,14 @@ jobs:
     - name: Build binary (all features)
       run: cargo build --bin finch --all-features --verbose
 
+    - name: Run runtime authority regressions (Ubuntu)
+      if: runner.os == 'Linux'
+      run: cargo test --lib runtime::tests -- --nocapture
+
+    - name: Test all targets (Ubuntu)
+      if: runner.os == 'Linux'
+      run: cargo test --all-targets
+
     - name: Build binary (with candle)
       run: cargo build --bin finch --features candle --verbose
       if: matrix.os == 'macos-latest'

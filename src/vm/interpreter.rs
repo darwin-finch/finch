@@ -143,7 +143,7 @@ pub trait CapabilityHandler {
                 Some(effect.origin.clone()),
             ));
         };
-        self.request(&effect.requirement, arguments.clone(), &effect.origin)
+        self.request_with_authority_lease(&effect.requirement, arguments.clone(), &effect.origin)
     }
 
     /// Let the host refine a concrete awaited effect to a stable host identity
@@ -222,6 +222,27 @@ impl<T: CapabilityHandler + ?Sized> CapabilityHandler for &mut T {
         origin: &SourceOrigin,
     ) -> Result<Vec<TypedValue>, VmDiagnostic> {
         (**self).request(requirement, arguments, origin)
+    }
+
+    fn request_with_authority_lease(
+        &mut self,
+        requirement: &CapabilityRequirement,
+        arguments: Vec<TypedValue>,
+        origin: &SourceOrigin,
+    ) -> Result<Vec<TypedValue>, VmDiagnostic> {
+        (**self).request_with_authority_lease(requirement, arguments, origin)
+    }
+
+    fn request_effect(&mut self, effect: &VmSideEffect) -> Result<Vec<TypedValue>, VmDiagnostic> {
+        (**self).request_effect(effect)
+    }
+
+    fn prepare_awaited_effect(&mut self, effect: &mut VmSideEffect) -> Result<(), VmDiagnostic> {
+        (**self).prepare_awaited_effect(effect)
+    }
+
+    fn authorize_awaited_effect(&mut self, effect: &VmSideEffect) -> Result<(), VmDiagnostic> {
+        (**self).authorize_awaited_effect(effect)
     }
 
     fn output(&self) -> String {
@@ -2456,6 +2477,121 @@ mod tests {
     use crate::vm::types::Type;
     use crate::vm::{core_vocabulary, Verifier};
     use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct RejectingBorrowedHandler {
+        requests: usize,
+        leases: usize,
+        prepares: usize,
+        authorizations: usize,
+    }
+
+    impl CapabilityHandler for RejectingBorrowedHandler {
+        fn request(
+            &mut self,
+            _requirement: &CapabilityRequirement,
+            _arguments: Vec<TypedValue>,
+            _origin: &SourceOrigin,
+        ) -> Result<Vec<TypedValue>, VmDiagnostic> {
+            self.requests += 1;
+            Ok(vec![TypedValue::Unit])
+        }
+
+        fn request_with_authority_lease(
+            &mut self,
+            _requirement: &CapabilityRequirement,
+            _arguments: Vec<TypedValue>,
+            origin: &SourceOrigin,
+        ) -> Result<Vec<TypedValue>, VmDiagnostic> {
+            self.leases += 1;
+            Err(VmDiagnostic::error(
+                "E-LEASE-TEST",
+                DiagnosticPhase::Authorization,
+                "hostile lease rejected",
+                Some(origin.clone()),
+            ))
+        }
+
+        fn prepare_awaited_effect(
+            &mut self,
+            effect: &mut VmSideEffect,
+        ) -> Result<(), VmDiagnostic> {
+            self.prepares += 1;
+            Err(VmDiagnostic::error(
+                "E-PREPARE-TEST",
+                DiagnosticPhase::Authorization,
+                "hostile preparation rejected",
+                Some(effect.origin.clone()),
+            ))
+        }
+
+        fn authorize_awaited_effect(
+            &mut self,
+            effect: &VmSideEffect,
+        ) -> Result<(), VmDiagnostic> {
+            self.authorizations += 1;
+            Err(VmDiagnostic::error(
+                "E-AUTHORIZE-TEST",
+                DiagnosticPhase::Authorization,
+                "hostile authorization rejected",
+                Some(effect.origin.clone()),
+            ))
+        }
+    }
+
+    #[test]
+    fn borrowed_capability_handler_preserves_prepare_authorize_and_lease_rejections() {
+        let requirement = CapabilityRequirement {
+            capability: CapabilityKind::SessionEmit,
+            selector: ResourceSelector::None,
+        };
+        let mut effect = VmSideEffect {
+            protocol_version: side_effect_protocol_version(),
+            sequence: 0,
+            requirement,
+            event: HostSideEffect::Request {
+                arguments: vec![TypedValue::String("hostile".into())],
+            },
+            output: vec![Type::Unit],
+            origin: SourceOrigin::generated("say"),
+        };
+        let mut handler = RejectingBorrowedHandler::default();
+        let mut borrowed = &mut handler;
+
+        assert_eq!(
+            CapabilityHandler::prepare_awaited_effect(&mut borrowed, &mut effect)
+                .unwrap_err()
+                .code,
+            "E-PREPARE-TEST"
+        );
+        assert_eq!(
+            CapabilityHandler::authorize_awaited_effect(&mut borrowed, &effect)
+                .unwrap_err()
+                .code,
+            "E-AUTHORIZE-TEST"
+        );
+        assert_eq!(
+            CapabilityHandler::request_with_authority_lease(
+                &mut borrowed,
+                &effect.requirement,
+                vec![TypedValue::String("hostile".into())],
+                &effect.origin,
+            )
+            .unwrap_err()
+            .code,
+            "E-LEASE-TEST"
+        );
+        assert_eq!(
+            CapabilityHandler::request_effect(&mut borrowed, &effect)
+                .unwrap_err()
+                .code,
+            "E-LEASE-TEST"
+        );
+        assert_eq!(handler.prepares, 1);
+        assert_eq!(handler.authorizations, 1);
+        assert_eq!(handler.leases, 2);
+        assert_eq!(handler.requests, 0, "no rejection may fall through to use");
+    }
 
     fn arithmetic_module(instructions: Vec<Instruction>) -> VerifiedModule {
         let function = Function {
