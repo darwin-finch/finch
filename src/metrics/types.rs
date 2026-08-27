@@ -146,6 +146,33 @@ impl ResponseComparison {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+
+    const LEGACY_RESPONSE_SOURCE_KEYS: [&str; 2] = ["local_response", "claude_response"];
+
+    fn assert_json_tree_excludes_response_sources(value: &Value, forbidden_sources: &[&str]) {
+        match value {
+            Value::Object(object) => {
+                for (key, nested) in object {
+                    assert!(
+                        !LEGACY_RESPONSE_SOURCE_KEYS.contains(&key.as_str()),
+                        "serialized metrics exposed legacy source-bearing key {key:?}"
+                    );
+                    assert_json_tree_excludes_response_sources(nested, forbidden_sources);
+                }
+            }
+            Value::Array(array) => {
+                for nested in array {
+                    assert_json_tree_excludes_response_sources(nested, forbidden_sources);
+                }
+            }
+            Value::String(text) => assert!(
+                !forbidden_sources.contains(&text.as_str()),
+                "serialized metrics exposed response source text"
+            ),
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
 
     fn make_comparison(local: Option<&str>, claude: &str, quality: f64) -> ResponseComparison {
         ResponseComparison {
@@ -225,23 +252,35 @@ mod tests {
 
     #[test]
     fn test_request_metric_serialization_is_source_free() {
-        let comparison = make_comparison(None, "42", 1.0);
+        const LOCAL_SOURCE: &str = "PRIVATE_LOCAL_RESPONSE_42";
+        const PROVIDER_SOURCE: &str = "PRIVATE_PROVIDER_RESPONSE_42";
+
+        let comparison = make_comparison(Some(LOCAL_SOURCE), PROVIDER_SOURCE, 1.0);
         let metric = RequestMetric::new(
-            "hash_roundtrip".to_string(),
+            "hash_roundtrip_42".to_string(),
             "local".to_string(),
             None,
             None,
             None,
-            100,
+            42,
             comparison,
             None,
             None,
         );
-        let json = serde_json::to_string(&metric).unwrap();
-        assert!(!json.contains("42"));
-        assert!(!json.contains("claude_response"));
-        assert!(!json.contains("local_response"));
-        let decoded: RequestMetric = serde_json::from_str(&json).unwrap();
+        let value = serde_json::to_value(&metric).unwrap();
+        assert_json_tree_excludes_response_sources(&value, &[LOCAL_SOURCE, PROVIDER_SOURCE]);
+        assert_eq!(value["query_hash"], "hash_roundtrip_42");
+        assert_eq!(value["response_time_ms"], 42);
+        assert_eq!(
+            value["comparison"],
+            serde_json::json!({
+                "quality_score": 1.0,
+                "similarity_score": null,
+                "divergence": null,
+            })
+        );
+
+        let decoded: RequestMetric = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.query_hash, metric.query_hash);
         assert_eq!(decoded.response_time_ms, metric.response_time_ms);
         assert_eq!(decoded.comparison.quality_score, 1.0);
@@ -258,10 +297,21 @@ mod tests {
             similarity_score: Some(0.9),
             divergence: Some(0.1),
         };
-        let json = serde_json::to_string(&c).unwrap();
-        assert!(!json.contains("LOCAL_SENSITIVE_SENTINEL"));
-        assert!(!json.contains("PROVIDER_SENSITIVE_SENTINEL"));
-        let decoded: ResponseComparison = serde_json::from_str(&json).unwrap();
+        let value = serde_json::to_value(&c).unwrap();
+        assert_json_tree_excludes_response_sources(
+            &value,
+            &["LOCAL_SENSITIVE_SENTINEL", "PROVIDER_SENSITIVE_SENTINEL"],
+        );
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "quality_score": 0.75,
+                "similarity_score": 0.9,
+                "divergence": 0.1,
+            })
+        );
+
+        let decoded: ResponseComparison = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.quality_score, 0.75);
         assert_eq!(decoded.similarity_score, Some(0.9));
         assert!(decoded.local_response.is_none());
@@ -298,14 +348,12 @@ mod tests {
         assert_eq!(decoded.comparison.similarity_score, Some(0.9));
         assert_eq!(decoded.routing_decision, "local_attempted");
 
-        let rewritten = serde_json::to_string(&decoded).unwrap();
-        assert!(!rewritten.contains("legacy local source"));
-        assert!(!rewritten.contains("legacy provider source"));
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&rewritten).unwrap()["comparison"]
-                ["quality_score"],
-            0.75
+        let rewritten = serde_json::to_value(&decoded).unwrap();
+        assert_json_tree_excludes_response_sources(
+            &rewritten,
+            &["legacy local source", "legacy provider source"],
         );
+        assert_eq!(rewritten["comparison"]["quality_score"], 0.75);
     }
 
     #[test]
