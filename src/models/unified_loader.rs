@@ -417,6 +417,23 @@ impl UnifiedModelLoader {
             ExecutionTarget::Cpu => Some(vec![ExecutionProvider::CPU]),
             ExecutionTarget::Auto => None, // Let ONNX loader decide
         };
+        let coreml_profile_output = if config.coreml.profile_compute_plan {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .context("System clock is before the Unix epoch")?
+                .as_nanos();
+            Some(
+                dirs::home_dir()
+                    .context("Failed to determine home directory")?
+                    .join(".finch/diagnostics")
+                    .join(format!(
+                        "coreml-compute-plan-{}-{timestamp}.ndjson",
+                        std::process::id()
+                    )),
+            )
+        } else {
+            None
+        };
 
         Ok(OnnxLoadConfig {
             model_name,
@@ -425,6 +442,7 @@ impl UnifiedModelLoader {
             cache_dir,
             execution_providers,
             coreml: config.coreml,
+            coreml_profile_output,
         })
     }
 

@@ -69,6 +69,9 @@ pub struct OnnxLoadConfig {
 
     /// Requested CoreML policy and opt-in diagnostics.
     pub coreml: CoreMlConfig,
+
+    /// Private output selected for this opt-in compute-plan capture.
+    pub coreml_profile_output: Option<PathBuf>,
 }
 
 impl OnnxLoadConfig {
@@ -86,6 +89,7 @@ impl OnnxLoadConfig {
             cache_dir,
             execution_providers: None,
             coreml: CoreMlConfig::default(),
+            coreml_profile_output: None,
         }
     }
 
@@ -101,6 +105,7 @@ impl OnnxLoadConfig {
             cache_dir,
             execution_providers: None,
             coreml: CoreMlConfig::default(),
+            coreml_profile_output: None,
         }
     }
 

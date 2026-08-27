@@ -110,9 +110,12 @@ validator = "~/.claude-proxy/models/constitutional.mlmodel"
 [coreml]
 compute_units = "all"
 
-# Opt-in placement diagnostics. CoreML writes the hardware selected for each
-# operator and estimated execution time to Finch's local logs when this is true.
-# Operator/model details may be present in those logs.
+# Opt-in placement diagnostics. Finch asks CoreML for its compute plan and
+# attempts to capture only this Finch process's matching Apple unified-log
+# records in a private ~/.finch/diagnostics/coreml-compute-plan-*.ndjson file.
+# Operator/model details may be present in that file. Finch reports whether any
+# operation placement records were actually received; an empty capture or an
+# error-only diagnostic record is not placement evidence.
 profile_compute_plan = false
 
 # Whether CoreML may take nodes inside Loop, Scan, and If subgraphs.

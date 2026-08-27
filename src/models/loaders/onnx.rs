@@ -8,13 +8,21 @@ type TokenCallback = Box<dyn FnMut(u32, &str) + Send>;
 type ForwardOutput = (Vec<f32>, Vec<(DynValue, DynValue)>);
 use ort::{
     ep,
-    logging::LogLevel,
     memory::MemoryInfo,
     session::{builder::GraphOptimizationLevel, Session, SessionOutputs},
     value::{DynValue, Value},
 };
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+#[cfg(target_os = "macos")]
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    process::{Child, Command, Stdio},
+    thread::JoinHandle,
+    time::Duration,
+};
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 
@@ -64,6 +72,334 @@ fn coreml_execution_provider(config: CoreMlConfig) -> ort::ep::ExecutionProvider
         .build()
 }
 
+#[cfg(target_os = "macos")]
+const COREML_PROFILE_PREDICATE: &str = r#"composedMessage BEGINSWITH "Operation:" OR composedMessage BEGINSWITH "profile function :" OR composedMessage BEGINSWITH "Error loading compute plan:" OR composedMessage BEGINSWITH "Error loading program from compute plan.""#;
+
+#[cfg(target_os = "macos")]
+const COREML_PROFILE_PREFIXES: [&str; 4] = [
+    "Operation:",
+    "profile function :",
+    "Error loading compute plan:",
+    "Error loading program from compute plan.",
+];
+
+#[cfg(target_os = "macos")]
+const COREML_PROFILE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+struct CoreMlProfileCaptureReport {
+    output_path: PathBuf,
+    diagnostic_record_count: usize,
+    placement_record_count: usize,
+    truncated: bool,
+}
+
+#[cfg(target_os = "macos")]
+struct CoreMlProfileReadReport {
+    diagnostic_record_count: usize,
+    placement_record_count: usize,
+    truncated: bool,
+}
+
+#[cfg(target_os = "macos")]
+struct CoreMlProfileCapture {
+    child: Child,
+    output_path: PathBuf,
+    reader: Option<JoinHandle<Result<CoreMlProfileReadReport>>>,
+    finished: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl CoreMlProfileCapture {
+    fn start(output_path: PathBuf) -> Result<Self> {
+        let command = coreml_profile_log_command(std::process::id());
+        Self::start_with_command(output_path, command)
+    }
+
+    fn start_with_command(output_path: PathBuf, mut command: Command) -> Result<Self> {
+        let output = open_private_profile_output(&output_path)?;
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command
+            .spawn()
+            .context("Failed to start process-scoped CoreML compute-plan capture")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("CoreML compute-plan capture did not provide stdout")?;
+        let reader = std::thread::spawn(move || drain_profile_stream(stdout, output));
+
+        std::thread::sleep(Duration::from_millis(200));
+        if let Some(status) = child
+            .try_wait()
+            .context("Failed to inspect CoreML compute-plan capture")?
+        {
+            let _ = reader.join();
+            bail!(
+                "CoreML compute-plan capture exited before session creation ({status}); no placement evidence was captured"
+            );
+        }
+
+        Ok(Self {
+            child,
+            output_path,
+            reader: Some(reader),
+            finished: false,
+        })
+    }
+
+    fn finish(mut self) -> Result<CoreMlProfileCaptureReport> {
+        let already_exited = self
+            .child
+            .try_wait()
+            .context("Failed to inspect CoreML compute-plan capture")?;
+        if already_exited.is_none() {
+            // Give unified logging a bounded opportunity to flush records that
+            // were emitted immediately before session creation returned.
+            std::thread::sleep(Duration::from_millis(500));
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(self.child.id() as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            )
+            .context("Failed to stop CoreML compute-plan capture")?;
+            for _ in 0..20 {
+                if self
+                    .child
+                    .try_wait()
+                    .context("Failed to inspect CoreML compute-plan capture during shutdown")?
+                    .is_some()
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if self
+                .child
+                .try_wait()
+                .context("Failed to inspect CoreML compute-plan capture after shutdown")?
+                .is_none()
+            {
+                self.child
+                    .kill()
+                    .context("Failed to force-stop CoreML compute-plan capture")?;
+            }
+        }
+        let status = self
+            .child
+            .wait()
+            .context("Failed to reap CoreML compute-plan capture")?;
+
+        let exited_unexpectedly = already_exited.is_some() && !status.success();
+        let read_report = self
+            .reader
+            .take()
+            .context("CoreML compute-plan capture reader was missing")?
+            .join()
+            .map_err(|_| anyhow::anyhow!("CoreML compute-plan capture reader panicked"))??;
+        self.finished = true;
+
+        if exited_unexpectedly {
+            bail!(
+                "CoreML compute-plan capture exited unexpectedly ({status}); no placement evidence is available"
+            );
+        }
+
+        Ok(CoreMlProfileCaptureReport {
+            output_path: self.output_path.clone(),
+            diagnostic_record_count: read_report.diagnostic_record_count,
+            placement_record_count: read_report.placement_record_count,
+            truncated: read_report.truncated,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn coreml_profile_log_command(pid: u32) -> Command {
+    let pid = pid.to_string();
+    let mut command = Command::new("/usr/bin/log");
+    command.args([
+        "stream",
+        "--process",
+        pid.as_str(),
+        "--style",
+        "ndjson",
+        "--level",
+        "info",
+        "--type",
+        "log",
+        "--timeout",
+        "30m",
+        "--predicate",
+        COREML_PROFILE_PREDICATE,
+    ]);
+    command
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for CoreMlProfileCapture {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(self.child.id() as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        let mut exited = false;
+        for _ in 0..4 {
+            if self.child.try_wait().ok().flatten().is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if !exited {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn drain_profile_stream(
+    stdout: std::process::ChildStdout,
+    mut output: File,
+) -> Result<CoreMlProfileReadReport> {
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    let mut bytes_written = 0usize;
+    let mut diagnostic_record_count = 0usize;
+    let mut placement_record_count = 0usize;
+    let mut truncated = false;
+
+    loop {
+        line.clear();
+        if reader
+            .read_line(&mut line)
+            .context("Failed to read CoreML compute-plan capture stream")?
+            == 0
+        {
+            break;
+        }
+        if COREML_PROFILE_PREFIXES
+            .iter()
+            .any(|prefix| line.contains(prefix))
+        {
+            diagnostic_record_count += 1;
+        }
+        if line.contains("Operation:") {
+            placement_record_count += 1;
+        }
+
+        if bytes_written.saturating_add(line.len()) <= COREML_PROFILE_MAX_BYTES {
+            output
+                .write_all(line.as_bytes())
+                .context("Failed to write CoreML compute-plan capture")?;
+            bytes_written += line.len();
+        } else {
+            truncated = true;
+        }
+    }
+    output
+        .flush()
+        .context("Failed to flush CoreML compute-plan capture")?;
+
+    Ok(CoreMlProfileReadReport {
+        diagnostic_record_count,
+        placement_record_count,
+        truncated,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn open_private_profile_output(path: &Path) -> Result<File> {
+    let parent = path
+        .parent()
+        .context("CoreML compute-plan output has no parent directory")?;
+    let parent_existed = parent.exists();
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "Failed to create CoreML diagnostic directory {}",
+            parent.display()
+        )
+    })?;
+    let parent_metadata = fs::symlink_metadata(parent).with_context(|| {
+        format!(
+            "Failed to inspect CoreML diagnostic directory {}",
+            parent.display()
+        )
+    })?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        bail!(
+            "CoreML diagnostic directory {} must be a real directory",
+            parent.display()
+        );
+    }
+    if !parent_existed {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!(
+                "Failed to protect CoreML diagnostic directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "Failed to open private CoreML compute-plan output {}",
+                path.display()
+            )
+        })?;
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "Failed to inspect CoreML compute-plan output {}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        bail!(
+            "CoreML compute-plan output {} must be a regular, unlinked file",
+            path.display()
+        );
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| {
+            format!(
+                "Failed to protect CoreML compute-plan output {}",
+                path.display()
+            )
+        })?;
+    file.set_len(0).with_context(|| {
+        format!(
+            "Failed to truncate CoreML compute-plan output {}",
+            path.display()
+        )
+    })?;
+    Ok(file)
+}
+
+#[cfg(target_os = "macos")]
+fn coreml_provider_requested(config: &OnnxLoadConfig) -> bool {
+    config
+        .execution_providers
+        .as_ref()
+        .map_or(true, |providers| {
+            providers.contains(&ConfigExecutionProvider::CoreML)
+        })
+}
+
 impl OnnxLoader {
     /// Create new ONNX loader with cache directory
     pub fn new(cache_dir: PathBuf) -> Self {
@@ -75,14 +411,7 @@ impl OnnxLoader {
         info!("Creating ONNX session from: {:?}", model_path);
 
         // Build execution provider list
-        let session_log_level = if config.coreml.profile_compute_plan {
-            LogLevel::Verbose
-        } else {
-            LogLevel::Warning
-        };
         let mut builder = Session::builder()
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .with_log_level(session_log_level)
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -97,10 +426,49 @@ impl OnnxLoader {
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
 
-        // Create session
-        let session = builder
-            .commit_from_file(model_path)
-            .context("Failed to create ONNX session")?;
+        #[cfg(target_os = "macos")]
+        let capture = if config.coreml.profile_compute_plan && coreml_provider_requested(config) {
+            let output_path = config.coreml_profile_output.clone().context(
+                "CoreML compute-plan profiling requires a private diagnostic output path",
+            )?;
+            let capture = CoreMlProfileCapture::start(output_path.clone())?;
+            info!(
+                output = %output_path.display(),
+                "CoreML compute-plan capture started; placement remains unobserved until matching records arrive"
+            );
+            Some(capture)
+        } else {
+            None
+        };
+
+        // CoreML emits compute-plan details through Apple unified logging
+        // during session creation, so the scoped capture must span this call.
+        let session_result = builder.commit_from_file(model_path);
+
+        #[cfg(target_os = "macos")]
+        let capture_result = capture.map(CoreMlProfileCapture::finish).transpose();
+
+        let session = session_result.context("Failed to create ONNX session")?;
+
+        #[cfg(target_os = "macos")]
+        if let Some(report) = capture_result? {
+            if report.placement_record_count == 0 {
+                warn!(
+                    output = %report.output_path.display(),
+                    diagnostic_records = report.diagnostic_record_count,
+                    truncated = report.truncated,
+                    "CoreML compute-plan capture received no operation placement records; placement remains unobserved"
+                );
+            } else {
+                info!(
+                    output = %report.output_path.display(),
+                    placement_records = report.placement_record_count,
+                    diagnostic_records = report.diagnostic_record_count,
+                    truncated = report.truncated,
+                    "CoreML compute-plan capture received operation placement records"
+                );
+            }
+        }
 
         info!("ONNX session created successfully");
 
@@ -855,5 +1223,90 @@ mod tests {
             assert_eq!(options.profile_compute_plan, enabled);
             assert_eq!(options.enable_subgraphs, !enabled);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_coreml_profile_record_reaches_only_private_isolated_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("diagnostics/compute-plan.ndjson");
+        let unrelated_output = directory.path().join("general-finch.log");
+        let ort_log_before = std::env::var_os("ORT_LOG");
+        let rust_log_before = std::env::var_os("RUST_LOG");
+
+        let mut source = Command::new("/bin/sh");
+        source.args([
+            "-c",
+            "printf '%s\\n' '{\"composedMessage\":\"Operation: test_add, Device Usage: test_device, Estimated Cost: 0.5\"}'; exec sleep 5",
+        ]);
+        let capture = CoreMlProfileCapture::start_with_command(output.clone(), source).unwrap();
+        let report = capture.finish().unwrap();
+
+        assert_eq!(report.diagnostic_record_count, 1);
+        assert_eq!(report.placement_record_count, 1);
+        assert!(!report.truncated);
+        assert_eq!(report.output_path, output);
+        let captured = fs::read_to_string(&output).unwrap();
+        assert!(captured.contains("Operation: test_add"));
+        assert!(!unrelated_output.exists());
+        assert_eq!(std::env::var_os("ORT_LOG"), ort_log_before);
+        assert_eq!(std::env::var_os("RUST_LOG"), rust_log_before);
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_coreml_profile_predicate_is_pid_scoped_and_prefix_limited() {
+        let command = coreml_profile_log_command(4242);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|args| args == ["--process", "4242"]));
+        assert!(COREML_PROFILE_PREDICATE.contains("composedMessage BEGINSWITH"));
+        for prefix in COREML_PROFILE_PREFIXES {
+            assert!(COREML_PROFILE_PREDICATE.contains(prefix));
+        }
+        assert!(!COREML_PROFILE_PREDICATE.contains("CONTAINS"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_coreml_profile_output_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.ndjson");
+        let output = directory.path().join("compute-plan.ndjson");
+        fs::write(&target, "keep").unwrap();
+        symlink(&target, &output).unwrap();
+
+        let error = open_private_profile_output(&output).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("private CoreML compute-plan output"));
+        assert_eq!(fs::read_to_string(target).unwrap(), "keep");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires the macOS unified logging service"]
+    fn test_coreml_profile_capture_production_log_stream_smoke() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("compute-plan.ndjson");
+        let capture = CoreMlProfileCapture::start(output.clone()).unwrap();
+        let report = capture.finish().unwrap();
+
+        assert_eq!(report.output_path, output);
+        assert_eq!(report.diagnostic_record_count, 0);
+        assert_eq!(report.placement_record_count, 0);
+        assert!(!report.truncated);
+        assert_eq!(
+            fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

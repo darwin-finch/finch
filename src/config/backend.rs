@@ -161,7 +161,8 @@ impl CoreMlComputeUnits {
 pub struct CoreMlConfig {
     /// Requested CoreML compute units.
     pub compute_units: CoreMlComputeUnits,
-    /// Ask CoreML to log its compute plan for placement diagnostics.
+    /// Ask CoreML to emit a compute plan and Finch to attempt a private,
+    /// process-scoped capture while the session is created.
     pub profile_compute_plan: bool,
     /// Allow CoreML to take nodes inside Loop, Scan, and If subgraphs.
     pub enable_subgraphs: bool,
