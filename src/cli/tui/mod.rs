@@ -1331,7 +1331,10 @@ fn commit_complete_messages(
     accordion: &mut AccordionState,
     colors: &ColorScheme,
     printed_ids: &mut HashSet<MessageId>,
+    terminal_height: usize,
 ) -> Result<()> {
+    let mut accepted = Vec::new();
+    let mut staged = Vec::new();
     for message in messages {
         if printed_ids.contains(&message.id()) {
             continue;
@@ -1342,17 +1345,27 @@ fn commit_complete_messages(
             .map(|line| line.text)
             .collect::<Vec<_>>()
             .join("\n");
-        let mut staged = Vec::new();
         for line in complete.split('\n') {
             execute!(staged, Print(line.trim_end_matches('\r')), Print("\r\n"))?;
         }
         execute!(staged, Print("\r\n"))?;
-        stdout.write_all(&staged)?;
-        // Once write_all accepts the staged record, retrying it would create a
-        // duplicate if a later flush reports an ambiguous error.
-        printed_ids.insert(message.id());
-        stdout.flush()?;
+        accepted.push(message.id());
     }
+    if accepted.is_empty() {
+        return Ok(());
+    }
+    // A viewport of linefeeds moves every newly inserted canonical row above
+    // row zero. The preceding visible rows scroll first, followed by exactly
+    // the canonical batch; the blank spool remains on-screen for repaint and
+    // does not pollute native history.
+    for _ in 0..terminal_height {
+        execute!(staged, Print("\r\n"))?;
+    }
+    stdout.write_all(&staged)?;
+    // Once write_all accepts the staged transaction, retrying it would create
+    // duplicates if a later flush reports an ambiguous error.
+    printed_ids.extend(accepted);
+    stdout.flush()?;
     Ok(())
 }
 
@@ -2067,11 +2080,11 @@ impl TuiRenderer {
                 &mut self.accordion,
                 &self.colors,
                 &mut self.printed_ids,
+                usize::from(crossterm::terminal::size().unwrap_or((80, 24)).1),
             )?;
-            // Drawing the live region below the inserted canonical rows is
-            // what naturally scrolls those rows into terminal history. Do not
-            // clear/reproject the visible screen in this commit transaction.
-            self.draw_live_area()?;
+            self.pending_viewport_size = Some(crossterm::terminal::size().unwrap_or((80, 24)));
+            self.viewport_invalidated = true;
+            self.redraw_full_viewport()?;
             self.live_area_dirty = false;
         } else {
             // Only redraw when something actually changed: a message is streaming
@@ -4011,6 +4024,7 @@ mod tests {
             &mut state,
             &colors,
             &mut printed,
+            6,
         )
         .is_err());
         assert_eq!(printed.len(), 1, "accepted bytes must not be retried");
@@ -4021,6 +4035,7 @@ mod tests {
             &mut state,
             &colors,
             &mut printed,
+            6,
         )
         .expect("already accepted message skips ambiguous flush retry");
         assert_eq!(failure.0.len(), accepted_len);
@@ -4043,10 +4058,11 @@ mod tests {
         let mut resize_printed = HashSet::new();
         commit_complete_messages(
             &mut bytes,
-            &[message],
+            &[message.clone()],
             &mut state,
             &colors,
             &mut resize_printed,
+            8,
         )
         .unwrap();
         let raw = String::from_utf8(bytes).unwrap();
@@ -4078,6 +4094,7 @@ mod tests {
             &mut state,
             &colors,
             &mut canonical_printed,
+            6,
         )
         .unwrap();
         let mut terminal = TerminalHistory {
@@ -4091,11 +4108,9 @@ mod tests {
         {
             terminal.write_line(line);
         }
-        // Production draw_live_area writes the complete two-row live region
-        // below the old live origin, forcing every inserted canonical row out
-        // of the visible screen and into terminal history.
-        terminal.write_line("live separator");
-        terminal.write_line("live draft");
+        // The production commit transaction includes one viewport of blank
+        // linefeeds, so the complete canonical batch reaches history before
+        // the subsequent Clear(All) viewport reconstruction.
         assert!(terminal
             .history
             .iter()
