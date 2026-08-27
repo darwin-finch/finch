@@ -2683,6 +2683,170 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn read_pid_and_group(path: &Path) -> (i32, i32) {
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut fields = text
+            .split_whitespace()
+            .map(|value| value.parse::<i32>().unwrap());
+        (fields.next().unwrap(), fields.next().unwrap())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_spawn_remains_in_authenticated_supervisor_process_group() {
+        crate::brain::isolated_test_proof()
+            .expect("process-group regression requires supervisor authority");
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("version-pgid");
+        let script = directory.path().join("version.py");
+        std::fs::write(
+            &script,
+            "import os,sys\nopen(sys.argv[1], 'w').write(f'{os.getpid()} {os.getpgid(0)}')\nprint('codex-cli 1.0')\n",
+        ).unwrap();
+        let python = resolve_trusted_program("python3").unwrap();
+        let output = run_version_bounded(
+            &python,
+            &[
+                script.to_string_lossy().into_owned(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            StdDuration::from_secs(5),
+            None,
+        )
+        .unwrap();
+        assert!(output.contains("codex-cli 1.0"));
+        let (_pid, pgid) = read_pid_and_group(&marker);
+        assert_eq!(pgid, nix::unistd::getpgrp().as_raw());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn app_server_spawn_remains_in_authenticated_supervisor_process_group() {
+        crate::brain::isolated_test_proof()
+            .expect("process-group regression requires supervisor authority");
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("app-server-pgid");
+        let script = directory.path().join("app_server_pgid.py");
+        std::fs::write(
+            &script,
+            r#"import json, os, sys
+open(sys.argv[1], 'w').write(f'{os.getpid()} {os.getpgid(0)}')
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get('method') == 'initialized':
+        continue
+    print(json.dumps({'id': message.get('id'), 'result': {}}), flush=True)
+"#,
+        )
+        .unwrap();
+        let command = AppServerCommand::test(
+            PathBuf::from("python3"),
+            vec![
+                script.to_string_lossy().into_owned(),
+                marker.to_string_lossy().into_owned(),
+            ],
+        );
+        let mut client = RpcClient::spawn(&command).await.unwrap();
+        let (_pid, pgid) = read_pid_and_group(&marker);
+        assert_eq!(pgid, nix::unistd::getpgrp().as_raw());
+        client.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_claimed_isolation_authority_fails_before_version_spawn() {
+        const CHILD: &str = "FINCH_CODEX_MALFORMED_PROOF_SPAWN_CHILD";
+        const MARKER: &str = "FINCH_CODEX_MALFORMED_PROOF_SPAWN_MARKER";
+        if std::env::var_os(CHILD).is_some() {
+            let marker = PathBuf::from(std::env::var_os(MARKER).unwrap());
+            let script = marker.with_extension("py");
+            std::fs::write(
+                &script,
+                "import pathlib,sys\npathlib.Path(sys.argv[1]).write_text('spawned')\nprint('codex-cli 1.0')\n",
+            ).unwrap();
+            let python = resolve_trusted_program("python3").unwrap();
+            let error = run_version_bounded(
+                &python,
+                &[
+                    script.to_string_lossy().into_owned(),
+                    marker.to_string_lossy().into_owned(),
+                ],
+                StdDuration::from_secs(2),
+                None,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("wrapper proof"));
+            assert!(
+                !marker.exists(),
+                "malformed authority reached Command::spawn"
+            );
+            return;
+        }
+        crate::brain::isolated_test_proof()
+            .expect("spawn rejection regression requires supervisor authority");
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("spawn-marker");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "providers::codex_app_server::tests::malformed_claimed_isolation_authority_fails_before_version_spawn", "--nocapture"])
+            .env(CHILD, "1")
+            .env(MARKER, &marker)
+            .env("FINCH_BRAIN_TEST_ISOLATED", "1")
+            .env_remove("FINCH_BRAIN_TEST_PROOF_FD")
+            .env_remove("FINCH_BRAIN_TEST_PROOF_BACKUP_FD")
+            .env_remove("FINCH_TEST_SUPERVISOR_PID")
+            .status().unwrap();
+        assert!(status.success());
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_timeout_descendant_stays_supervisor_owned_for_teardown() {
+        let proof = crate::brain::isolated_test_proof()
+            .expect("descendant teardown regression requires supervisor authority");
+        let directory = proof
+            .home
+            .join(format!("version-timeout-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&directory).unwrap();
+        let marker = directory.join("descendant");
+        let script = directory.join("timeout.py");
+        std::fs::write(
+            &script,
+            r#"import os, sys, time
+child = os.fork()
+if child == 0:
+    open(sys.argv[1], 'w').write(f'{os.getpid()} {os.getpgid(0)}')
+    while True: time.sleep(1)
+while True: time.sleep(1)
+"#,
+        )
+        .unwrap();
+        let python = resolve_trusted_program("python3").unwrap();
+        let error = run_version_bounded(
+            &python,
+            &[
+                script.to_string_lossy().into_owned(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            StdDuration::from_millis(250),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        for _ in 0..50 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(StdDuration::from_millis(10));
+        }
+        let (_pid, pgid) = read_pid_and_group(&marker);
+        assert_eq!(pgid, nix::unistd::getpgrp().as_raw());
+        // The child deliberately remains alive here. The production test
+        // supervisor owns this process group and must reap it before removing
+        // the sealed HOME; the isolated harness verifies that boundary.
+    }
+
     fn mock_app_server(account_type: &str) -> (tempfile::TempDir, AppServerCommand) {
         mock_app_server_with_thread_event(account_type, "after")
     }

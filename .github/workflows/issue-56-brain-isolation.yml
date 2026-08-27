@@ -81,6 +81,34 @@ jobs:
         server::tests::production_constructor_rejects_rewritten_proof_and_accepts_exact_restore
         -- --nocapture
 
+    - name: Reject fixture traversal before external mutation
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test --lib
+        supervised_http_fixture_rejects
+        -- --nocapture
+
+    - name: Exercise real Codex spawn process-group boundaries
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test --lib
+        authenticated_supervisor_process_group
+        -- --nocapture
+
+    - name: Reject malformed Codex authority before spawn
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test --lib
+        malformed_claimed_isolation_authority_fails_before_version_spawn
+        -- --nocapture
+
+    - name: Reap timed-out Codex descendants before HOME cleanup
+      timeout-minutes: 15
+      run: >-
+        ./scripts/test_brains.sh cargo test --lib
+        version_timeout_descendant_stays_supervisor_owned_for_teardown
+        -- --nocapture
+
     - name: Exercise the complete synthetic isolation harness
       timeout-minutes: 15
       run: ./scripts/test_brain_isolation.sh

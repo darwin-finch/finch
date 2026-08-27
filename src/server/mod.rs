@@ -124,6 +124,65 @@ pub struct AgentServer {
     brain_password: Arc<RwLock<String>>,
 }
 
+#[cfg(test)]
+fn supervised_state_root(
+    home: &std::path::Path,
+    requested: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    use anyhow::Context as _;
+    use std::path::Component;
+
+    let relative = requested
+        .strip_prefix(home)
+        .context("Brain HTTP fixture state must remain under the sealed HOME")?;
+    anyhow::ensure!(
+        !relative.as_os_str().is_empty()
+            && relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_))),
+        "Brain HTTP fixture state must be a normal descendant of the sealed HOME"
+    );
+
+    let canonical_home =
+        std::fs::canonicalize(home).context("Could not resolve the sealed Brain test HOME")?;
+    let mut cursor = canonical_home.clone();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            unreachable!()
+        };
+        cursor.push(name);
+        let metadata = std::fs::symlink_metadata(&cursor).with_context(|| {
+            format!(
+                "Brain HTTP fixture state component is unavailable: {}",
+                cursor.display()
+            )
+        })?;
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "Brain HTTP fixture state cannot traverse symlinks"
+        );
+    }
+    let canonical_state = std::fs::canonicalize(&cursor)
+        .context("Could not resolve the Brain HTTP fixture state root")?;
+    anyhow::ensure!(
+        canonical_state.starts_with(&canonical_home) && canonical_state != canonical_home,
+        "Brain HTTP fixture state must remain under the sealed HOME"
+    );
+    anyhow::ensure!(
+        canonical_state.is_dir(),
+        "Brain HTTP fixture state root must be a directory"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        anyhow::ensure!(
+            std::fs::metadata(&canonical_state)?.uid() == nix::unistd::geteuid().as_raw(),
+            "Brain HTTP fixture state root must be owned by the isolated test user"
+        );
+    }
+    Ok(canonical_state)
+}
+
 impl AgentServer {
     #[cfg(test)]
     pub(crate) fn for_brain_http_test(
@@ -166,12 +225,9 @@ impl AgentServer {
         use anyhow::Context as _;
         let proof = crate::brain::isolated_test_proof()
             .context("Brain HTTP fixture requires supervisor authority")?;
-        anyhow::ensure!(
-            state_root.starts_with(&proof.home),
-            "Brain HTTP fixture state must remain under the sealed HOME"
-        );
+        let state_root = supervised_state_root(&proof.home, state_root)?;
         let password = proof.brain_password()?;
-        let mut server = Self::for_brain_http_test(machine, state_root, brain_credentials)?;
+        let mut server = Self::for_brain_http_test(machine, &state_root, brain_credentials)?;
         server.brain_password = Arc::new(RwLock::new(password));
         Ok(server)
     }
@@ -1170,6 +1226,60 @@ mod tests {
             )
             .unwrap();
         assert!(expected_root.join(name).join("events.jsonl").is_file());
+    }
+
+    #[test]
+    fn supervised_http_fixture_rejects_parent_traversal_without_external_mutation() {
+        let proof = crate::brain::isolated_test_proof()
+            .expect("HTTP containment regression requires supervisor authority");
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+        let requested = proof
+            .home
+            .join("fixture")
+            .join("..")
+            .join("..")
+            .join("outside");
+        let result = AgentServer::for_supervised_brain_http_test(
+            "containment.local",
+            &requested,
+            crate::brain::credential::BrainCredentialAuthority::ephemeral([71; 32]),
+        );
+        let error = match result {
+            Ok(_) => panic!("parent traversal unexpectedly constructed a server"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("normal descendant"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervised_http_fixture_rejects_symlinked_ancestor_without_external_mutation() {
+        let proof = crate::brain::isolated_test_proof()
+            .expect("HTTP containment regression requires supervisor authority");
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        std::fs::write(&sentinel, b"unchanged").unwrap();
+        let link = proof
+            .home
+            .join(format!("fixture-link-{}", uuid::Uuid::new_v4().simple()));
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let result = AgentServer::for_supervised_brain_http_test(
+            "containment.local",
+            &link,
+            crate::brain::credential::BrainCredentialAuthority::ephemeral([72; 32]),
+        );
+        let error = match result {
+            Ok(_) => panic!("symlink traversal unexpectedly constructed a server"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("cannot traverse symlinks"));
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+        std::fs::remove_file(link).unwrap();
     }
 
     #[test]
