@@ -457,9 +457,6 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
                 "effect audit authority is unavailable".into(),
             ));
         };
-        if let Err(error) = authority.validate_new_work() {
-            return Promise::err(capnp::Error::failed(error.to_string()));
-        }
         let params = match params.get() {
             Ok(params) => params,
             Err(error) => return Promise::err(error),
@@ -479,6 +476,23 @@ impl finch_ipc_capnp::brain_program_control::Server for BrainProgramControlImpl 
             Ok(effect) => effect,
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
+        match authority.store.retry_effect_audit_reservation(
+            &authority.grant, execution_id, &effect,
+        ) {
+            Ok(Some(identity)) => {
+                let reservation: finch_ipc_capnp::brain_effect_reservation::Client =
+                    capnp_rpc::new_client(BrainEffectReservationImpl {
+                        authority: authority.clone(), identity, begun: false,
+                    });
+                results.get().set_reservation(reservation);
+                return Promise::ok(());
+            }
+            Ok(None) => {}
+            Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
+        }
+        if let Err(error) = authority.validate_new_work() {
+            return Promise::err(capnp::Error::failed(error.to_string()));
+        }
         match authority.store.reserve_effect_audit(&authority.grant, execution_id, effect) {
             Ok(identity) => {
                 let reservation: finch_ipc_capnp::brain_effect_reservation::Client =
@@ -2401,6 +2415,7 @@ mod tests {
             let grant = store.issue_effect_audit_authority(
                 "shared", run.run_id, lease.lease_id, None,
             ).unwrap();
+            let original_grant = grant.clone();
             let server = std::sync::Arc::new(
                 crate::server::AgentServer::for_brain_protocol_test(
                     store.clone(),
@@ -2494,6 +2509,57 @@ mod tests {
             assert!(!snapshot.events.iter().any(|event| matches!(
                 event.kind, crate::brain::store::BrainEventKind::ToolResult { .. }
             )));
+
+            // Reconstruct the raw server capability after a daemon/store
+            // reload. The original callback and lease are stale and the run
+            // is terminal, but a caller that lost the original reserve ACK
+            // must still learn that its exact identity is durably fenced.
+            let restarted = crate::brain::store::BrainStore::with_root(
+                "box.local", Some(temp.path().join("brains")),
+            );
+            let restarted_server = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    restarted.clone(),
+                    crate::brain::credential::BrainCredentialAuthority::ephemeral([45; 32]),
+                    "test-password".into(), temp.path(),
+                ).unwrap(),
+            );
+            let replay_control: super::finch_ipc_capnp::brain_program_control::Client =
+                capnp_rpc::new_client(super::BrainProgramControlImpl {
+                    lifecycle: crate::server::BrainLifecycleService::from_server(
+                        &restarted_server,
+                    ),
+                    brain: "shared".into(), run_id: run.run_id,
+                    request_seq: prompt.seq, maximum_grant_ceiling: None,
+                    effect_audit: Some(super::BrainEffectAuditRpcAuthority {
+                        store: restarted.clone(), grant: original_grant,
+                        runners: restarted_server.brain_runners().clone(),
+                        brain: "shared".into(), lease_id: lease.lease_id,
+                        connection_id: None,
+                        active: std::sync::Arc::new(
+                            std::sync::atomic::AtomicBool::new(false),
+                        ),
+                    }),
+                });
+            let mut replay = replay_control.reserve_effect_request();
+            replay.get().set_execution_id(&execution_id.to_string());
+            crate::ipc::checkpoint_codec::encode_vm_side_effect(
+                replay.get().init_effect(), &effect,
+            ).unwrap();
+            replay.send().promise.await.unwrap().get().unwrap()
+                .get_reservation().unwrap();
+
+            let mut conflicting = replay_control.reserve_effect_request();
+            conflicting.get().set_execution_id(&execution_id.to_string());
+            crate::ipc::checkpoint_codec::encode_vm_side_effect(
+                conflicting.get().init_effect(), &crate::vm::VmSideEffect {
+                    event: crate::vm::HostSideEffect::Emit { text: "changed".into() },
+                    ..effect
+                },
+            ).unwrap();
+            let error = conflicting.send().promise.await.err()
+                .expect("conflicting raw reserve replay must fail closed after reload");
+            assert!(error.to_string().contains("conflicting"));
         }));
     }
 
@@ -2650,6 +2716,7 @@ mod tests {
     async fn raw_effect_eof_states(
         begin: bool,
         count: usize,
+        mature_history: bool,
     ) -> Vec<crate::runtime::effect_log::EffectAuditState> {
         let temp = tempfile::tempdir().unwrap();
         let store = crate::brain::store::BrainStore::with_root(
@@ -2668,6 +2735,9 @@ mod tests {
             crate::brain::store::BrainRunStatus::Running,
         ).unwrap();
         store.acquire_runner_lease("shared", "runner", 1, None, 300_000).unwrap();
+        if mature_history {
+            store.seed_mature_effect_audit_history_for_test("shared", 1_024, 3).unwrap();
+        }
         let server = std::sync::Arc::new(
             crate::server::AgentServer::for_brain_protocol_test(
                 store.clone(),
@@ -2700,11 +2770,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn effect_audit_raw_frontend_eof_reconciles_before_and_after_application_boundary() {
-        assert!(matches!(raw_effect_eof_states(false, 1).await.remove(0),
+        assert!(matches!(raw_effect_eof_states(false, 1, false).await.remove(0),
             crate::runtime::effect_log::EffectAuditState::Terminal {
                 outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::AbandonedNotApplied
             }));
-        assert!(matches!(raw_effect_eof_states(true, 1).await.remove(0),
+        assert!(matches!(raw_effect_eof_states(true, 1, false).await.remove(0),
             crate::runtime::effect_log::EffectAuditState::Terminal {
                 outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::UncertainProcessLoss
             }));
@@ -2717,6 +2787,7 @@ mod tests {
             raw_effect_eof_states(
                 false,
                 crate::runtime::effect_log::MAX_ACTIVE_EFFECT_AUDITS_PER_RUN,
+                true,
             ),
         ).await.expect("max-quota runner EOF exceeded the two-second teardown bound");
         assert_eq!(states.len(), crate::runtime::effect_log::MAX_ACTIVE_EFFECT_AUDITS_PER_RUN);

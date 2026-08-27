@@ -778,6 +778,9 @@ struct BrainState {
     runtime_checkpoint: Option<RuntimeCheckpointState>,
     runtime_commit_count: u64,
     effect_audits: crate::runtime::effect_log::EffectAuditReducer,
+    recent_effect_audits: std::collections::VecDeque<
+        crate::runtime::effect_log::EffectAuditEntry,
+    >,
     revision: u64,
     tx: broadcast::Sender<BrainEvent>,
 }
@@ -806,6 +809,7 @@ impl BrainState {
             runtime_checkpoint: None,
             runtime_commit_count: 0,
             effect_audits: crate::runtime::effect_log::EffectAuditReducer::default(),
+            recent_effect_audits: std::collections::VecDeque::new(),
             revision: 0,
             tx,
         };
@@ -1546,6 +1550,7 @@ impl BrainStore {
             pending_schedule_dues: sorted_schedule_dues(&state.pending_schedule_dues),
             effect_audits: state.effect_audits.entries().values()
                 .map(crate::runtime::effect_log::EffectAuditEntry::observer_projection)
+                .chain(state.recent_effect_audits.iter().cloned())
                 .collect(),
         })
     }
@@ -1649,6 +1654,47 @@ impl BrainStore {
                 }).collect::<Vec<_>>();
         self.append_effect_audit_transition_batch_locked(name, state, transitions)?;
         Ok(unresolved.len())
+    }
+
+    /// Resolve an exact durable reserve retry before applying current callback,
+    /// lease, or run-terminal checks. A changed intent or authority fails
+    /// closed; absence returns `None` and grants no authority for new work.
+    pub(crate) fn retry_effect_audit_reservation(
+        &self, grant: &EffectAuditAuthorityGrant, execution_id: uuid::Uuid,
+        effect: &crate::vm::VmSideEffect,
+    ) -> Result<Option<crate::runtime::effect_log::EffectAuditIdentity>> {
+        let name = Self::validate_name(&grant.brain)?;
+        self.ensure_loaded(name)?;
+        let brains = self.brains.read().expect("shared brain lock poisoned");
+        let state = brains.get(name).context("Brain was removed concurrently")?;
+        let run = state.runs.get(&grant.run_id).context("Brain run does not exist")?;
+        let identity = crate::runtime::effect_log::EffectAuditIdentity {
+            brain_id: state.brain_id.0, run_id: grant.run_id.0,
+            request_seq: run.request_seq, execution_id,
+            effect_sequence: effect.sequence,
+        };
+        let transition = crate::runtime::effect_log::EffectAuditTransition::Reserve {
+            intent: crate::runtime::effect_log::EffectAuditIntent::from_effect(
+                identity, effect,
+            )?,
+            authority: grant.authority.clone(),
+        };
+        if state.effect_audits.get(&identity).is_some() {
+            anyhow::ensure!(!state.effect_audits.validate(&transition)?,
+                "existing effect audit reservation unexpectedly changed state");
+            return Ok(Some(identity));
+        }
+        if let Some(Some(fence)) = self.with_effect_audit_storage_mut(
+            name, state.brain_id,
+            |storage| storage.replay.lookup(&identity),
+        )? {
+            let mut archived = crate::runtime::effect_log::EffectAuditReducer::default();
+            archived.apply(fence)?;
+            anyhow::ensure!(!archived.validate(&transition)?,
+                "archived effect audit reservation unexpectedly changed state");
+            return Ok(Some(identity));
+        }
+        Ok(None)
     }
 
     /// Durably accept an effect intent without permitting physical application.
@@ -1816,8 +1862,8 @@ impl BrainStore {
             let BrainEventKind::EffectAuditTransition { transition } = &event.kind else {
                 unreachable!("effect-audit append constructed a non-audit event");
             };
-            self.archive_terminal_effect_audit_locked(
-                name, state, event.seq, transition.identity(),
+            self.archive_terminal_effect_audits_batch_locked(
+                name, state, &[(event.seq, transition.identity())],
             )?;
         } else {
             self.compact_terminal_effect_audits_locked(
@@ -1872,6 +1918,7 @@ impl BrainStore {
         } else {
             self.append_event_batch(name, &events)?;
         }
+        let mut terminal = Vec::new();
         for event in &events {
             state.apply(event.clone());
             if self.root.is_some() {
@@ -1879,11 +1926,17 @@ impl BrainStore {
                 let BrainEventKind::EffectAuditTransition { transition } = &event.kind else {
                     unreachable!("effect-audit batch constructed a non-audit event");
                 };
-                self.archive_terminal_effect_audit_locked(
-                    name, state, event.seq, transition.identity(),
-                )?;
+                if state.effect_audits.get(&transition.identity())
+                    .is_some_and(|entry| entry.state.is_terminal()) {
+                    terminal.push((event.seq, transition.identity()));
+                }
             }
             let _ = state.tx.send(observer_effect_audit_event(event));
+        }
+        if self.root.is_some() {
+            self.archive_terminal_effect_audits_batch_locked(
+                name, state, &terminal,
+            )?;
         }
         if self.root.is_none() {
             self.compact_terminal_effect_audits_locked(
@@ -1893,26 +1946,39 @@ impl BrainStore {
         Ok(events.len())
     }
 
-    fn archive_terminal_effect_audit_locked(
+    fn archive_terminal_effect_audits_batch_locked(
         &self,
         name: &str,
         state: &mut BrainState,
-        seq: u64,
-        identity: crate::runtime::effect_log::EffectAuditIdentity,
+        terminal: &[(u64, crate::runtime::effect_log::EffectAuditIdentity)],
     ) -> Result<()> {
-        let Some(entry) = state.effect_audits.get(&identity) else { return Ok(()); };
-        if !entry.state.is_terminal() {
+        let mut fences = Vec::new();
+        let mut observers = Vec::new();
+        for (seq, identity) in terminal {
+            let Some(entry) = state.effect_audits.get(identity) else { continue; };
+            if !entry.state.is_terminal() {
+                continue;
+            }
+            observers.push((*identity, entry.observer_projection()));
+            fences.push((*seq, crate::runtime::effect_log::replay_fence_transition(entry)?));
+        }
+        if fences.is_empty() {
             return Ok(());
         }
-        let entry = state.effect_audits.get(&identity)
-            .context("terminal effect audit disappeared before archive")?;
-        let fence = crate::runtime::effect_log::replay_fence_transition(entry)?;
+        let identities = observers.iter().map(|(identity, _)| *identity).collect::<Vec<_>>();
         self.with_effect_audit_storage_mut(name, state.brain_id, |storage| {
             let active_bytes = storage.active.file_bytes()?;
-            storage.replay.append_fence(seq, &fence, active_bytes)?;
-            storage.active.remove_identity(&identity)
+            storage.replay.append_fences(&fences, active_bytes)?;
+            storage.active.remove_identities(&identities)
         })?;
-        state.effect_audits.forget_archived(&identity)
+        for (identity, observer) in observers {
+            state.effect_audits.forget_archived(&identity)?;
+            state.recent_effect_audits.push_back(observer);
+        }
+        while state.recent_effect_audits.len() > MAX_RETAINED_TERMINAL_EFFECT_AUDITS {
+            state.recent_effect_audits.pop_front();
+        }
+        Ok(())
     }
 
     fn compact_terminal_effect_audits_locked(
@@ -4938,17 +5004,32 @@ impl BrainStore {
                 name, brain_id, |storage| Ok(storage.replay.max_seq()),
             )?.unwrap_or(0);
             state.revision = state.revision.max(replay_max);
-            let terminal = state.effect_audits.entries().values().filter_map(|entry| {
+            let terminal_identities = state.effect_audits.entries().values().filter_map(|entry| {
                 entry.state.is_terminal().then_some(entry.intent.identity)
             }).collect::<Vec<_>>();
-            for identity in terminal {
+            let mut terminal = Vec::new();
+            for identity in terminal_identities {
                 let terminal_seq = self.with_effect_audit_storage_mut(
                     name, brain_id,
                     |storage| storage.active.last_seq_for(&identity),
                 )?.flatten().unwrap_or(state.revision);
-                self.archive_terminal_effect_audit_locked(
-                    name, &mut state, terminal_seq, identity,
-                )?;
+                terminal.push((terminal_seq, identity));
+            }
+            self.archive_terminal_effect_audits_batch_locked(
+                name, &mut state, &terminal,
+            )?;
+            let recent = self.with_effect_audit_storage_mut(
+                name, brain_id,
+                |storage| storage.replay.latest(MAX_RETAINED_TERMINAL_EFFECT_AUDITS),
+            )?.unwrap_or_default();
+            state.recent_effect_audits.clear();
+            for fence in recent {
+                let mut observer = crate::runtime::effect_log::EffectAuditReducer::default();
+                observer.apply(fence)?;
+                state.recent_effect_audits.extend(
+                    observer.entries().values()
+                        .map(crate::runtime::effect_log::EffectAuditEntry::observer_projection),
+                );
             }
         }
         for attachment in state.attachments.values_mut() {
@@ -5328,6 +5409,23 @@ impl BrainStore {
         }
         operation(stores.get_mut(name)
             .context("effect-audit storage disappeared during operation")?).map(Some)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_mature_effect_audit_history_for_test(
+        &self,
+        name: &str,
+        records: usize,
+        epochs: usize,
+    ) -> Result<()> {
+        let name = Self::validate_name(name)?;
+        self.ensure_loaded(name)?;
+        let brain_id = self.brains.read().expect("shared brain lock poisoned")
+            .get(name).context("Brain was removed concurrently")?.brain_id;
+        self.with_effect_audit_storage_mut(name, brain_id, |storage| {
+            storage.replay.seed_mature_history_for_test(brain_id.0, records, epochs)
+        })?;
+        Ok(())
     }
 
     fn disconnect_intent_path(&self, name: &str, run_id: RunId) -> Option<PathBuf> {
@@ -10064,8 +10162,12 @@ mod tests {
             },
         ).unwrap();
         let snapshot = store.snapshot("shared").unwrap();
-        assert!(snapshot.effect_audits.is_empty(),
-            "terminal replay authority stays out of ordinary snapshots");
+        assert!(matches!(snapshot.effect_audits[0].state,
+            crate::runtime::effect_log::EffectAuditState::Terminal {
+                outcome: crate::runtime::effect_log::EffectAuditTerminalOutcome::Redacted {
+                    ref outcome_kind
+                }
+            } if outcome_kind == "acknowledged"));
         let fence = store.with_effect_audit_storage_mut(
             "shared", snapshot.brain_id,
             |storage| storage.replay.lookup(&identity),
@@ -10206,8 +10308,8 @@ mod tests {
             &grant, uuid::Uuid::new_v4(), audit_effect(3, "unresolved"),
         ).unwrap();
         let snapshot = store.snapshot("shared").unwrap();
-        assert_eq!(snapshot.effect_audits.len(), 1,
-            "ordinary snapshots retain only bounded unresolved observer state");
+        assert_eq!(snapshot.effect_audits.len(), 4,
+            "ordinary snapshots retain a bounded redacted terminal tail plus unresolved state");
         assert!(snapshot.effect_audits.iter().any(|entry|
             entry.intent.identity == unresolved && !entry.state.is_terminal()));
         let journal = std::fs::read(temp.path().join("shared/events.jsonl")).unwrap();
@@ -10217,8 +10319,8 @@ mod tests {
 
         let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let snapshot = restarted.snapshot("shared").unwrap();
-        assert!(snapshot.effect_audits.is_empty(),
-            "restart reconciliation archives unresolved state before publication");
+        assert_eq!(snapshot.effect_audits.len(), 4,
+            "restart reconstructs the bounded redacted terminal observer tail");
         let (identity, effect) = &completed[0];
         assert_eq!(restarted.reserve_effect_audit(
             &grant, identity.execution_id, effect.clone(),
@@ -10274,7 +10376,7 @@ mod tests {
         drop(store);
         let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let snapshot = restarted.snapshot("shared").unwrap();
-        assert!(snapshot.effect_audits.is_empty());
+        assert_eq!(snapshot.effect_audits.len(), 2);
         let unbegun_fence = restarted.with_effect_audit_storage_mut(
             "shared", snapshot.brain_id,
             |storage| storage.replay.lookup(&unbegun),
@@ -10314,7 +10416,7 @@ mod tests {
         ).unwrap();
         let restarted = BrainStore::with_root("box.local", Some(temp.path().into()));
         let snapshot = restarted.snapshot("legacy-audit").unwrap();
-        assert!(snapshot.effect_audits.is_empty());
+        assert_eq!(snapshot.effect_audits.len(), 1);
     }
 
     #[test]
