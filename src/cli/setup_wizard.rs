@@ -7161,6 +7161,11 @@ mod tests {
     fn test_cloud_primary_keeps_local_qwen_as_tool_model_on_reopen() {
         use crate::config::{Config, ProviderEntry};
 
+        #[cfg(target_os = "macos")]
+        let execution_target = ExecutionTarget::CoreML;
+        #[cfg(not(target_os = "macos"))]
+        let execution_target = ExecutionTarget::Cpu;
+
         let original = Config::with_providers(vec![
             ProviderEntry::Grok {
                 api_key: "xai-test-key".to_string(),
@@ -7172,7 +7177,7 @@ mod tests {
             },
             ProviderEntry::Local {
                 inference_provider: InferenceProvider::Onnx,
-                execution_target: ExecutionTarget::CoreML,
+                execution_target,
                 model_family: ModelFamily::Qwen2,
                 model_size: ModelSize::Small,
                 model_repo: Some("onnx-community/Qwen2.5-Coder-3B-Instruct".to_string()),
@@ -7192,9 +7197,9 @@ mod tests {
             [ModelConfig::Local {
                 family: ModelFamily::Qwen2,
                 size: ModelSize::Small,
-                execution: ExecutionTarget::CoreML,
+                execution,
                 ..
-            }]
+            }] if *execution == execution_target
         ));
 
         let saved = build_setup_result(&state).unwrap();
@@ -7205,12 +7210,13 @@ mod tests {
             ProviderEntry::Local {
                 model_family: ModelFamily::Qwen2,
                 model_size: ModelSize::Small,
-                execution_target: ExecutionTarget::CoreML,
+                execution_target: saved_execution_target,
                 model_repo: Some(ref repo),
                 model_path: Some(ref path),
                 name: Some(ref name),
                 ..
-            } if repo == "onnx-community/Qwen2.5-Coder-3B-Instruct"
+            } if saved_execution_target == execution_target
+                && repo == "onnx-community/Qwen2.5-Coder-3B-Instruct"
                 && path == &std::path::PathBuf::from("/models/qwen-coder")
                 && name == "local-qwen"
         ));
