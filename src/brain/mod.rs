@@ -5,6 +5,7 @@
 //! "Brain session" or hidden context-injection path here.
 
 pub mod credential;
+pub(crate) mod effect_audit_archive;
 pub mod names;
 pub mod remote;
 pub mod store;

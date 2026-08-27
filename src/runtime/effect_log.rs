@@ -102,6 +102,8 @@ impl EffectAuditIntent {
 
     pub(crate) fn observer_projection(&self) -> Self {
         let mut projected = self.clone();
+        projected.selector = crate::vm::ResourceSelector::None;
+        projected.output.clear();
         projected.canonical_sha256.clear();
         projected
     }
@@ -445,8 +447,6 @@ impl EffectAuditReducer {
                         "conflicting effect audit reservation for {identity:?}");
                     return Ok(false);
                 }
-                anyhow::ensure!(self.total_count < MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN,
-                    "effect audit replay index exhausted; archive this Brain before admitting more host effects");
                 anyhow::ensure!(
                     self.active_for_run(identity.run_id) < MAX_ACTIVE_EFFECT_AUDITS_PER_RUN,
                     "effect audit active-intent quota exceeded for run {}",
@@ -593,8 +593,6 @@ impl EffectAuditReducer {
                         "effect audit replay fence conflicts with existing state");
                     return Ok(false);
                 }
-                anyhow::ensure!(self.total_count < MAX_EFFECT_AUDIT_REPLAY_FENCES_PER_BRAIN,
-                    "effect audit replay index exhausted; archive this Brain before admitting more host effects");
                 self.entries.insert(identity, EffectAuditEntry {
                     intent: EffectAuditIntent {
                         identity,
@@ -624,6 +622,27 @@ impl EffectAuditReducer {
                 Ok(true)
             }
         }
+    }
+
+    /// Drop an in-memory compact fence after the indexed archive has durably
+    /// accepted it. Exact replay remains enforced by the archive lookup.
+    pub(crate) fn forget_archived(
+        &mut self,
+        identity: &EffectAuditIdentity,
+    ) -> Result<()> {
+        let entry = self.entries.get(identity).context("effect audit does not exist")?;
+        anyhow::ensure!(matches!(entry.state, EffectAuditState::Terminal { .. }),
+            "unresolved effect audit cannot leave the active reducer");
+        let compacted = matches!(entry.state, EffectAuditState::Terminal {
+            outcome: EffectAuditTerminalOutcome::Compacted { .. }
+        });
+        self.entries.remove(identity);
+        self.detailed_terminal_order.retain(|candidate| candidate != identity);
+        self.total_count = self.total_count.saturating_sub(1);
+        if compacted {
+            self.replay_fence_count = self.replay_fence_count.saturating_sub(1);
+        }
+        Ok(())
     }
 }
 
