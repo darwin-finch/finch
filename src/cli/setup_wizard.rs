@@ -4193,6 +4193,7 @@ fn render_section_content(f: &mut Frame, area: Rect, state: &WizardState, permis
         }) => render_models_section(
             f,
             area,
+            state.coreml,
             primary_model,
             tool_models,
             *selected_idx,
@@ -4410,10 +4411,20 @@ fn render_themes_section(f: &mut Frame, area: Rect, selected_theme: usize) {
 }
 
 /// Render Models section (unified Backend + Teachers)
+fn execution_target_display(execution: ExecutionTarget, coreml: CoreMlConfig) -> String {
+    #[cfg(target_os = "macos")]
+    if execution == ExecutionTarget::CoreML {
+        return format!("CoreML ({})", coreml.compute_units.name());
+    }
+
+    execution.name().to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_models_section(
     f: &mut Frame,
     area: Rect,
+    coreml: CoreMlConfig,
     primary_model: &ModelConfig,
     tool_models: &[ModelConfig],
     selected_idx: usize,
@@ -4500,7 +4511,7 @@ fn render_models_section(
                 prefix,
                 family.name(),
                 model_size_display(size),
-                execution.name(),
+                execution_target_display(*execution, coreml),
                 suffix
             )
         }
@@ -4656,6 +4667,7 @@ fn render_models_section(
         render_add_provider_overlay(
             f,
             area,
+            coreml,
             step,
             catalog_source,
             catalog_refreshing,
@@ -4669,6 +4681,7 @@ fn render_models_section(
 fn render_add_provider_overlay(
     f: &mut Frame,
     area: Rect,
+    coreml: CoreMlConfig,
     step: &AddProviderStep,
     catalog_source: &CatalogSource,
     catalog_refreshing: bool,
@@ -4811,6 +4824,7 @@ fn render_add_provider_overlay(
             render_configure_local_overlay(
                 f,
                 inner,
+                coreml,
                 *inference_provider,
                 *family,
                 *size,
@@ -5050,6 +5064,7 @@ fn render_configure_remote_overlay(
 fn render_configure_local_overlay(
     f: &mut Frame,
     area: Rect,
+    coreml: CoreMlConfig,
     inference_provider: InferenceProvider,
     family: ModelFamily,
     size: ModelSize,
@@ -5098,14 +5113,14 @@ fn render_configure_local_overlay(
         family_name = format!("{} (only)", family.name());
     }
     let size_name = model_size_display(&size);
-    let device_name = execution.name();
+    let device_name = execution_target_display(execution, coreml);
 
     let mut lines = vec![
         Line::from(""),
         make_row("Backend", backend_name, focused_field == 0),
         make_row("Family", &family_name, focused_field == 1),
         make_row("Size", size_name, focused_field == 2),
-        make_row("Device", device_name, focused_field == 3),
+        make_row("Device", &device_name, focused_field == 3),
         Line::from(""),
         Line::from(Span::styled(
             "─".repeat(area.width as usize),
@@ -7470,6 +7485,7 @@ for line in sys.stdin:
                 render_add_provider_overlay(
                     frame,
                     area,
+                    CoreMlConfig::default(),
                     &step,
                     &CatalogSource::StaticFallback,
                     false,
@@ -7535,6 +7551,7 @@ for line in sys.stdin:
                 render_add_provider_overlay(
                     frame,
                     area,
+                    CoreMlConfig::default(),
                     &step,
                     &CatalogSource::StaticFallback,
                     false,
@@ -8766,6 +8783,41 @@ for line in sys.stdin:
         assert!(description.contains("automatic compute-unit selection"));
         assert!(!description.to_ascii_lowercase().contains("fastest"));
         assert!(!description.contains("ANE only"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_reopened_coreml_policy_renders_requested_units_for_every_policy() {
+        use crate::config::{Config, CoreMlComputeUnits};
+
+        for (compute_units, expected) in [
+            (CoreMlComputeUnits::All, "CoreML (Auto: ANE/GPU/CPU)"),
+            (CoreMlComputeUnits::CpuAndNeuralEngine, "CoreML (CPU + ANE)"),
+            (CoreMlComputeUnits::CpuAndGpu, "CoreML (CPU + GPU)"),
+            (CoreMlComputeUnits::CpuOnly, "CoreML (CPU only)"),
+        ] {
+            let coreml = CoreMlConfig {
+                compute_units,
+                ..CoreMlConfig::default()
+            };
+            let mut reopened = Config::with_providers(vec![ProviderEntry::Local {
+                inference_provider: InferenceProvider::Onnx,
+                execution_target: ExecutionTarget::CoreML,
+                model_family: ModelFamily::Qwen2,
+                model_size: ModelSize::Medium,
+                model_repo: None,
+                model_path: None,
+                enabled: true,
+                name: Some("reopened-coreml".to_string()),
+            }]);
+            reopened.backend.coreml = coreml;
+            let state = WizardState::new_with_catalog_cache_dir(Some(&reopened), None);
+            assert_eq!(state.coreml, coreml);
+            assert_eq!(
+                execution_target_display(ExecutionTarget::CoreML, state.coreml),
+                expected
+            );
+        }
     }
 
     #[test]

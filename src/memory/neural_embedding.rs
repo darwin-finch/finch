@@ -29,6 +29,32 @@ const MAX_SEQ_LEN: usize = 256;
 /// Output embedding dimension for all-MiniLM-L6-v2.
 const EMBEDDING_DIM: usize = 384;
 
+/// Reproducible facts needed before considering a CoreML policy for embeddings.
+/// This records the current boundary without claiming performance or placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EmbeddingProviderEvaluationFixture {
+    model_repository: &'static str,
+    current_provider: &'static str,
+    batch_size: usize,
+    sequence_length_min: usize,
+    sequence_length_max: usize,
+    embedding_dimension: usize,
+    coreml_latency_observed: Option<u64>,
+    coreml_placement_observed: Option<bool>,
+}
+
+const EMBEDDING_PROVIDER_EVALUATION: EmbeddingProviderEvaluationFixture =
+    EmbeddingProviderEvaluationFixture {
+        model_repository: "Xenova/all-MiniLM-L6-v2-ONNX",
+        current_provider: "CPU (no execution provider registered)",
+        batch_size: 1,
+        sequence_length_min: 1,
+        sequence_length_max: MAX_SEQ_LEN,
+        embedding_dimension: EMBEDDING_DIM,
+        coreml_latency_observed: None,
+        coreml_placement_observed: None,
+    };
+
 /// ONNX sentence transformer embedding engine.
 ///
 /// Produces 384-dimensional L2-normalized embeddings via mean pooling over the
@@ -78,8 +104,9 @@ impl NeuralEmbeddingEngine {
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
 
-        // Create ONNX Runtime session (CPU only for embeddings — fast enough)
-        std::env::set_var("ORT_LOGGING_LEVEL", "3"); // Fatal only
+        // Create an ONNX Runtime session without registering an execution
+        // provider. The evaluation fixture above records this CPU default;
+        // CoreML remains unselected until separately measured.
         let session = Session::builder()
             .map_err(|e| anyhow!("Failed to create ONNX session builder: {e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -362,6 +389,24 @@ mod tests {
     #[test]
     fn test_max_seq_len_constant() {
         assert_eq!(MAX_SEQ_LEN, 256);
+    }
+
+    #[test]
+    fn test_embedding_provider_evaluation_records_unmeasured_coreml_candidate() {
+        let fixture = EMBEDDING_PROVIDER_EVALUATION;
+        assert_eq!(
+            fixture.current_provider,
+            "CPU (no execution provider registered)"
+        );
+        assert_eq!(fixture.batch_size, 1);
+        assert_eq!(
+            (fixture.sequence_length_min, fixture.sequence_length_max),
+            (1, 256)
+        );
+        assert_eq!(fixture.embedding_dimension, 384);
+        assert_eq!(fixture.coreml_latency_observed, None);
+        assert_eq!(fixture.coreml_placement_observed, None);
+        assert_eq!(fixture.model_repository, "Xenova/all-MiniLM-L6-v2-ONNX");
     }
 
     /// Verify that find_in_cache does not panic and returns None when absent.
