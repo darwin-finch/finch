@@ -1348,6 +1348,45 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn test_reconnect_revalidates_revocation_before_resolution_or_socket_activity() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let profile = named_openai_at("primary", "work", "account-1", &origin);
+        let credential = named_openai_credential_at("work", "account-1", &origin);
+        let mut config = Config::with_providers(vec![profile]).with_credentials(vec![credential]);
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let connected =
+            create_provider_profile_from_config_with_resolver(&config, "primary", &resolver)
+                .unwrap();
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+
+        config.revoke_credential("work").unwrap();
+        let reconnect_error =
+            create_provider_profile_from_config_with_resolver(&config, "primary", &resolver)
+                .err()
+                .expect("reconnect must revalidate lifecycle");
+        assert!(format!("{reconnect_error:#}").contains("revoked"));
+        assert_eq!(
+            resolver.calls.load(Ordering::SeqCst),
+            1,
+            "reconnect resolved a revoked credential"
+        );
+        assert!(connected
+            .send_message(&ProviderRequest::new(Vec::new()).with_model("gpt-4o"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("revoked after provider construction"));
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
     #[test]
     fn test_missing_named_account_never_falls_back_to_another_credential() {
         let config = Config::with_providers(vec![named_openai("primary", "missing", "gpt-4o")])
