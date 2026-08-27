@@ -1369,6 +1369,19 @@ fn commit_complete_messages(
     Ok(())
 }
 
+fn prepare_canonical_commit(stdout: &mut impl Write) -> Result<()> {
+    // Previously committed rows are already in native history. Remove their
+    // visible projection before the linefeed spool so a later commit cannot
+    // append that projection to history a second time.
+    execute!(
+        stdout,
+        cursor::MoveTo(0, 0),
+        Clear(ClearType::All),
+        cursor::MoveTo(0, 0)
+    )?;
+    Ok(())
+}
+
 // ─── Live area management ─────────────────────────────────────────────────────
 
 impl TuiRenderer {
@@ -2072,8 +2085,10 @@ impl TuiRenderer {
         }
 
         if !to_commit.is_empty() {
-            self.erase_live_area()?;
             let mut stdout = io::stdout();
+            prepare_canonical_commit(&mut stdout)?;
+            self.active_rows = 0;
+            self.cursor_row_from_top = 0;
             commit_complete_messages(
                 &mut stdout,
                 &to_commit,
@@ -4049,12 +4064,7 @@ mod tests {
         assert_eq!(state.render_message(&message, &colors), before);
 
         let mut bytes = Vec::new();
-        begin_full_viewport_paint(
-            &mut bytes,
-            viewport_redraw_plan(8, 2, 1),
-            &["resize projection".into()],
-        )
-        .unwrap();
+        prepare_canonical_commit(&mut bytes).unwrap();
         let mut resize_printed = HashSet::new();
         commit_complete_messages(
             &mut bytes,
@@ -4100,7 +4110,7 @@ mod tests {
         let mut terminal = TerminalHistory {
             screen: vec![String::new(); 6],
             history: Vec::new(),
-            cursor: 4,
+            cursor: 0,
         };
         for line in String::from_utf8(canonical)
             .unwrap()
@@ -4118,6 +4128,50 @@ mod tests {
         let history_before_clear = terminal.history.clone();
         terminal.screen.fill(String::new());
         assert_eq!(terminal.history, history_before_clear);
+
+        // A later commit begins with prepare_canonical_commit's visible-screen
+        // clear. The old projected row therefore cannot be spooled into native
+        // history for a second time.
+        terminal.screen[0] = "secret canonical body [projected]".into();
+        terminal.screen.fill(String::new());
+        terminal.cursor = 0;
+        let second = Arc::new(WorkUnit::new("response"));
+        second.set_response("second canonical body");
+        second.set_complete();
+        let second_message: MessageRef = second;
+        let mut second_bytes = Vec::new();
+        let mut second_printed = HashSet::new();
+        commit_complete_messages(
+            &mut second_bytes,
+            &[second_message],
+            &mut state,
+            &colors,
+            &mut second_printed,
+            6,
+        )
+        .unwrap();
+        for line in String::from_utf8(second_bytes)
+            .unwrap()
+            .split_terminator("\r\n")
+        {
+            terminal.write_line(line);
+        }
+        assert_eq!(
+            terminal
+                .history
+                .iter()
+                .filter(|line| line.contains("secret canonical body"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            terminal
+                .history
+                .iter()
+                .filter(|line| line.contains("second canonical body"))
+                .count(),
+            1
+        );
     }
 
     #[test]
