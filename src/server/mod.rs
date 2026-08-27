@@ -1375,12 +1375,28 @@ mod tests {
         )
         .unwrap();
         server.supervised_state_root = Some(pinned.directory);
+        let brain = format!("pinned-brain-{}", uuid::Uuid::new_v4().simple());
+        server
+            .brain_store()
+            .push(
+                &brain,
+                "containment-test",
+                crate::brain::store::BrainEventKind::Prompt {
+                    text: "descriptor-pinned write".into(),
+                },
+            )
+            .unwrap();
 
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
         assert!(moved.join("metrics").is_dir());
         assert!(moved.join("feedback.jsonl").is_file());
-        assert!(moved.join("brains").is_dir());
+        assert!(moved
+            .join("brains")
+            .join(&brain)
+            .join("events.jsonl")
+            .is_file());
+        assert!(!outside.path().join("brains").join(brain).exists());
 
         let second = proof
             .home
