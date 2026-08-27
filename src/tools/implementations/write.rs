@@ -96,14 +96,35 @@ impl Tool for WriteTool {
 
         // Interactive: propose the script in $EDITOR before writing.
         if std::io::stdin().is_terminal() {
+            let (original, was_missing) = match fs::read_to_string(file_path) {
+                Ok(value) => (value, false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), true),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to read existing file: {}", file_path))
+                }
+            };
             let line_count = content.lines().count();
             let description = format!("Write {} ({} lines)", file_path, line_count);
             let code = build_write_code(file_path, content);
             let approved = propose_in_editor(&description, &code).await?;
-            return match approved {
-                None => Ok("Write aborted by user.".to_string()),
-                Some(script) => run_script_async(&script).await,
+            let Some(script) = approved else {
+                return Ok("Write aborted by user.".to_string());
             };
+            let script_stdout = run_script_async(&script).await?;
+            let updated = fs::read_to_string(file_path)
+                .with_context(|| format!("Failed to read written file: {}", file_path))?;
+            let diff = if was_missing {
+                crate::cli::diff::FileDiff::from_created(file_path, &updated)
+            } else {
+                crate::cli::diff::FileDiff::from_texts(file_path, &original, &updated)
+            }
+            .to_unified();
+            return Ok(if script_stdout.trim().is_empty() {
+                diff
+            } else {
+                format!("{}\n{}", script_stdout.trim_end(), diff)
+            });
         }
 
         // Non-interactive (tests, daemon): write directly.
@@ -124,13 +145,7 @@ impl Tool for WriteTool {
                 .with_context(|| format!("Failed to write file: {}", file_path))?;
             run_post_save_hook(file_path);
 
-            let line_count = content.lines().count();
-            Ok(format!(
-                "Created {} ({} line{})\n",
-                file_path,
-                line_count,
-                if line_count == 1 { "" } else { "s" }
-            ))
+            Ok(crate::cli::diff::FileDiff::from_created(file_path, content).to_unified())
         } else {
             // Existing file: read original, write new, show stats
             let original = fs::read_to_string(file_path)
@@ -140,18 +155,7 @@ impl Tool for WriteTool {
                 .with_context(|| format!("Failed to write file: {}", file_path))?;
             run_post_save_hook(file_path);
 
-            let old_lines = original.lines().count();
-            let new_lines = content.lines().count();
-            let delta: i64 = new_lines as i64 - old_lines as i64;
-            let delta_str = match delta.cmp(&0) {
-                std::cmp::Ordering::Greater => format!("+{} lines", delta),
-                std::cmp::Ordering::Less => format!("{} lines", delta),
-                std::cmp::Ordering::Equal => "unchanged line count".to_string(),
-            };
-            Ok(format!(
-                "Updated {} ({} → {} lines, {})\n",
-                file_path, old_lines, new_lines, delta_str
-            ))
+            Ok(crate::cli::diff::FileDiff::from_texts(file_path, &original, content).to_unified())
         }
     }
 }
@@ -185,7 +189,10 @@ mod tests {
             poset: None,
         };
         let result = tool.execute(input, &context).await.unwrap();
-        assert!(result.contains("Created"), "got: {}", result);
-        assert!(result.contains("3 lines"), "got: {}", result);
+        let diff = crate::cli::diff::FileDiff::parse(&result).unwrap();
+        assert_eq!(diff.display_path(), path);
+        assert_eq!(diff.old_path, "/dev/null");
+        assert!(diff.is_created());
+        assert_eq!((diff.added(), diff.removed()), (3, 0));
     }
 }

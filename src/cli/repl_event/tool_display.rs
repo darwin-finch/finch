@@ -16,8 +16,8 @@
 //! Also contains `format_elapsed` and `format_token_count` used in the status
 //! bar and in tests.
 
-use serde_json::Value;
 use crossterm::style::{Attribute, Color, SetAttribute, SetForegroundColor};
+use serde_json::Value;
 
 const CYAN: SetForegroundColor = SetForegroundColor(Color::Cyan);
 const GRAY: SetForegroundColor = SetForegroundColor(Color::DarkGrey);
@@ -28,15 +28,16 @@ const MAX_PARAM_LEN: usize = 60;
 
 /// Format a tool label like "Bash(git push)" or "Read(src/file.rs)"
 pub fn format_tool_label(name: &str, input: &Value) -> String {
-    let key_param = extract_key_param(name, input);
+    let safe_name = crate::cli::diff::sanitize_terminal(name);
+    let key_param = crate::cli::diff::sanitize_terminal(&extract_key_param(name, input));
     if key_param.is_empty() {
-        format!("{}{}{}{}", CYAN, BOLD, name, RESET)
+        format!("{}{}{}{}", CYAN, BOLD, safe_name, RESET)
     } else {
         format!(
             "{}{}{}{}{}({}){}",
             CYAN,
             BOLD,
-            name,
+            safe_name,
             RESET,
             GRAY,
             truncate(&key_param, MAX_PARAM_LEN),
@@ -144,10 +145,10 @@ pub fn shorten_path(path: &str) -> String {
 
 /// Truncate a string to max_len chars, adding "…" if needed
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}…", &s[..max_len])
+        format!("{}…", s.chars().take(max_len).collect::<String>())
     }
 }
 
@@ -176,7 +177,35 @@ pub(crate) fn tool_result_to_display(tool_name: &str, content: &str) -> (String,
         return (String::new(), Vec::new());
     }
 
-    match tool_name.to_lowercase().as_str() {
+    let lower = tool_name.to_lowercase();
+    let structured_files = (matches!(lower.as_str(), "edit" | "write")
+        && trimmed.lines().any(|line| {
+            line.starts_with("--- ")
+                || line.starts_with("diff --git ")
+                || line.starts_with("Binary files ")
+        }))
+    .then(|| crate::cli::diff::FileDiff::parse_all(trimmed));
+    if let Some(files) = structured_files.filter(|files| !files.is_empty()) {
+        let summary = crate::cli::diff::summarize_files(&files);
+        // Keep the complete bounded unified representation. WorkUnit owns
+        // final rendering and must be able to re-render retained rows.
+        let first_header = trimmed.lines().position(|line| {
+            line.starts_with("--- ")
+                || line.starts_with("diff --git ")
+                || line.starts_with("Binary files ")
+        });
+        let mut body: Vec<String> = first_header
+            .into_iter()
+            .flat_map(|end| trimmed.lines().take(end).take(20))
+            .map(crate::cli::diff::sanitize_terminal)
+            .collect();
+        for file in files {
+            body.extend(file.to_unified().lines().map(str::to_owned));
+        }
+        return (summary, body);
+    }
+
+    match lower.as_str() {
         "edit" => {
             let mut lines_iter = trimmed.lines();
             let summary = lines_iter.next().unwrap_or("").trim().to_string();
@@ -257,6 +286,53 @@ pub(crate) fn tool_result_to_display(tool_name: &str, content: &str) -> (String,
 
         _ => (compact_tool_summary(content), Vec::new()),
     }
+}
+
+/// Build the approval preview for a mutating file tool using the same bounded,
+/// sanitized renderer as completed transcript rows.
+pub(crate) fn tool_approval_diff_preview(
+    tool_use: &crate::tools::types::ToolUse,
+    colors: &crate::config::ColorScheme,
+    mode: crate::cli::diff::DiffColorMode,
+) -> Option<String> {
+    let path = tool_use.input.get("file_path")?.as_str()?;
+    let diff = match tool_use.name.to_lowercase().as_str() {
+        "write" => {
+            let after = tool_use.input.get("content")?.as_str()?;
+            let (before, was_missing) = match std::fs::read_to_string(path) {
+                Ok(value) => (value, false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), true),
+                Err(_) => return None,
+            };
+            if was_missing {
+                crate::cli::diff::FileDiff::from_created(path, after)
+            } else {
+                crate::cli::diff::FileDiff::from_texts(path, &before, after)
+            }
+        }
+        "edit" => {
+            let old_string = tool_use.input.get("old_string")?.as_str()?;
+            let new_string = tool_use.input.get("new_string")?.as_str()?;
+            let replace_all = tool_use
+                .input
+                .get("replace_all")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let before = std::fs::read_to_string(path).ok()?;
+            let matches = before.matches(old_string).count();
+            if matches == 0 || (matches > 1 && !replace_all) {
+                return None;
+            }
+            let after = if replace_all {
+                before.replace(old_string, new_string)
+            } else {
+                before.replacen(old_string, new_string, 1)
+            };
+            crate::cli::diff::FileDiff::from_texts(path, &before, &after)
+        }
+        _ => return None,
+    };
+    Some(diff.render(colors, mode))
 }
 
 /// Strip ANSI escape codes from a string, returning plain text.
@@ -831,6 +907,100 @@ mod tests {
         let (summary, body) = tool_result_to_display("write", content);
         assert!(summary.contains("Updated"), "got: {}", summary);
         assert!(body.is_empty());
+    }
+
+    #[test]
+    fn test_tool_result_edit_structured_diff_reaches_direct_display_untruncated() {
+        let diff =
+            crate::cli::diff::FileDiff::from_texts("src/é.rs", "old\n", "new\nmore\n").to_unified();
+        let (summary, body) = tool_result_to_display("edit", &diff);
+        assert_eq!(summary, "src/é.rs  +2 -1");
+        assert!(body.iter().any(|line| line == "+more"));
+        assert!(!body.iter().any(|line| line.contains("ctrl+o")));
+    }
+
+    #[test]
+    fn test_tool_result_write_structured_diff_keeps_body_and_sanitizes_preamble() {
+        let diff = crate::cli::diff::FileDiff::from_created("out.txt", "hello\n").to_unified();
+        let content = format!("\x1b]8;;bad\x07Created\n{diff}");
+        let (summary, body) = tool_result_to_display("write", &content);
+        assert_eq!(summary, "out.txt  +1 -0");
+        assert_eq!(body.first().map(String::as_str), Some("Created"));
+        assert_eq!(
+            body.iter()
+                .find(|line| line.starts_with("--- "))
+                .map(String::as_str),
+            Some("--- /dev/null")
+        );
+        assert!(body.iter().any(|line| line == "+hello"));
+    }
+
+    #[test]
+    fn test_tool_result_preserves_stdout_before_standard_git_diff() {
+        let content = "approved script stdout\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n";
+        let (summary, body) = tool_result_to_display("edit", content);
+        assert_eq!(summary, "x  +1 -1");
+        assert_eq!(
+            body.first().map(String::as_str),
+            Some("approved script stdout")
+        );
+        assert!(body.iter().any(|line| line == "+new"));
+    }
+
+    #[test]
+    fn test_format_tool_label_non_ascii_truncation_does_not_panic() {
+        let label = format_tool_label("bash", &serde_json::json!({"command": "é".repeat(80)}));
+        assert!(label.contains('…'));
+    }
+
+    #[test]
+    fn test_format_tool_label_sanitizes_hostile_path_controls() {
+        let label = format_tool_label(
+            "write\x1b]8;;tool\x07",
+            &serde_json::json!({"file_path": "src/\x1b[31mé.rs"}),
+        );
+        assert!(!label.contains("\x1b]"));
+        assert!(!label.contains("\x1b[31m"));
+        assert!(label.contains('é'));
+    }
+
+    #[test]
+    fn test_write_approval_preview_preserves_existing_read_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let tool = crate::tools::types::ToolUse::new(
+            "write".into(),
+            serde_json::json!({
+                "file_path": directory.path(),
+                "content": "replacement"
+            }),
+        );
+        assert!(tool_approval_diff_preview(
+            &tool,
+            &crate::config::ColorScheme::default(),
+            crate::cli::diff::DiffColorMode::NoColor,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_write_approval_preview_marks_missing_file_as_created() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new.txt");
+        let tool = crate::tools::types::ToolUse::new(
+            "write".into(),
+            serde_json::json!({
+                "file_path": path,
+                "content": "created\n"
+            }),
+        );
+        let rendered = tool_approval_diff_preview(
+            &tool,
+            &crate::config::ColorScheme::default(),
+            crate::cli::diff::DiffColorMode::NoColor,
+        )
+        .unwrap();
+        assert!(rendered.contains("created"), "{rendered}");
+        assert!(!rendered.contains("renamed"), "{rendered}");
     }
 
     #[test]
