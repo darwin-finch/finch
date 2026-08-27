@@ -33,8 +33,10 @@ the boundary adequately. Add one row to `.github/repository-hygiene-allowlist.ts
 Keep the fixture minimal and deterministic, document its regeneration or acquisition next to the
 fixture, and have the bytes, provenance document, and allowlist row reviewed. The provenance document
 must repeat the exact path, digest, size, platform, license, and generation rationale; the guard
-verifies all six values in addition to the file metadata. Its allowlist is deliberately capped at 20
-entries so exceptional data cannot quietly become a general artifact store.
+verifies all six values in addition to the file metadata. It must also contain a specific `Origin:`
+line and either an `Acquisition:` or `Regeneration:` line explaining where the bytes came from and
+how to obtain them again. Its allowlist is deliberately capped at 20 entries so exceptional data
+cannot quietly become a general artifact store.
 
 ## Removed root artifacts
 

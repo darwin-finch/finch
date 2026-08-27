@@ -68,7 +68,6 @@ GENERATED_SUFFIXES = (
     ".swp",
 )
 CACHE_COMPONENTS = {
-    "target",
     "__pycache__",
     ".mypy_cache",
     ".pytest_cache",
@@ -194,6 +193,19 @@ def load_allowlist(
                 f"{path}:{line_number}: provenance document {provenance} is missing exact "
                 f"fixture metadata: {', '.join(missing)}"
             )
+        if not re.search(r"^Origin:\s*\S.{7,}$", provenance_text, flags=re.MULTILINE):
+            errors.append(
+                f"{path}:{line_number}: provenance document {provenance} needs a specific Origin"
+            )
+        if not re.search(
+            r"^(?:Acquisition|Regeneration):\s*\S.{7,}$",
+            provenance_text,
+            flags=re.MULTILINE,
+        ):
+            errors.append(
+                f"{path}:{line_number}: provenance document {provenance} needs a specific "
+                "Acquisition or Regeneration method"
+            )
 
     if len(entries) > MAX_ALLOWLIST_ENTRIES:
         errors.append(
@@ -204,6 +216,8 @@ def load_allowlist(
 
 def generated_name_reason(path: PurePosixPath) -> str | None:
     name = path.name.lower()
+    if path.parts and path.parts[0].lower() == "target":
+        return "generated root build/cache path"
     if any(part.lower() in CACHE_COMPONENTS for part in path.parts):
         return "generated cache path"
     if name in GENERATED_NAMES or CORE_NAME.fullmatch(name):
