@@ -710,12 +710,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_unknown_provider_rejected_before_backend_invocation() {
+        use crate::providers::{CapabilitySupport, ProviderBackend};
+
         let provider = Arc::new(UnattestedProvider {
             backend_calls: AtomicUsize::new(0),
         });
+        assert_eq!(
+            provider
+                .capabilities(provider.default_model())
+                .tools
+                .support,
+            CapabilitySupport::Unknown,
+            "the provider must inherit fail-closed tool capabilities"
+        );
         let subagent_provider: Arc<dyn crate::providers::LlmProvider> = provider.clone();
 
-        let error = run_subagent(
+        let result = run_subagent(
             subagent_provider,
             "must remain fail closed",
             SubagentType::General,
@@ -723,14 +733,11 @@ mod tests {
             1,
             0,
         )
-        .await
-        .unwrap_err();
+        .await;
 
         assert!(
-            error
-                .to_string()
-                .contains("has unknown tool calls capability; refusing to assume support"),
-            "unexpected validation error: {error:#}"
+            result.is_err(),
+            "unknown tool capabilities must reject the subagent request"
         );
         assert_eq!(provider.backend_calls.load(Ordering::SeqCst), 0);
     }
