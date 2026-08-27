@@ -7533,7 +7533,7 @@ for line in sys.stdin:
             provider_idx: openai_idx,
             name: "openai-work".to_string(),
             model: String::new(),
-            api_key: "openai-key".to_string(),
+            api_key: "sk-openai-test-key".to_string(),
             focused_field: 2,
             editing_idx: None,
         });
@@ -7565,8 +7565,13 @@ for line in sys.stdin:
         );
 
         let persisted = loaded.providers.first().unwrap();
-        let profile =
-            model_catalog_profile("openai", "openai-work", "openai-key", Some(persisted)).unwrap();
+        let profile = model_catalog_profile(
+            "openai",
+            "openai-work",
+            "sk-openai-test-key",
+            Some(persisted),
+        )
+        .unwrap();
         let mut fallback =
             model_catalog::fallback_catalog(&profile.provider, &profile.endpoints.models_url);
         fallback.profile_id = profile.profile_id.clone();
