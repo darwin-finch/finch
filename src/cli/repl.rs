@@ -68,7 +68,10 @@ enum ConfirmationChoice {
 mod disabled_training_tests {
     use super::*;
     use crate::claude::ContentBlock;
-    use crate::providers::{LlmProvider, ProviderRequest, ProviderResponse, StreamChunk};
+    use crate::providers::{
+        CapabilitySupport, ModelCapabilities, ProviderBackend, ProviderResponse,
+        ReasoningCapability, StreamChunk, ValidatedProviderRequest,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct HermeticFallbackProvider {
@@ -79,8 +82,12 @@ mod disabled_training_tests {
     }
 
     #[async_trait::async_trait]
-    impl LlmProvider for HermeticFallbackProvider {
-        async fn send_message(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
+    impl ProviderBackend for HermeticFallbackProvider {
+        async fn send_message_validated(
+            &self,
+            request: ValidatedProviderRequest,
+        ) -> Result<ProviderResponse> {
+            let request = request.into_request_for(self)?;
             self.buffered_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::ensure!(
                 request
@@ -102,10 +109,11 @@ mod disabled_training_tests {
             })
         }
 
-        async fn send_message_stream(
+        async fn send_message_stream_validated(
             &self,
-            _request: &ProviderRequest,
+            request: ValidatedProviderRequest,
         ) -> Result<tokio::sync::mpsc::Receiver<Result<StreamChunk>>> {
+            let _ = request.into_request_for(self)?;
             self.streaming_calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("hermetic fallback regression must not use streaming")
         }
@@ -116,6 +124,22 @@ mod disabled_training_tests {
 
         fn default_model(&self) -> &str {
             "hermetic-fallback-model"
+        }
+
+        fn capabilities(&self, model: &str) -> ModelCapabilities {
+            ModelCapabilities::static_metadata(
+                self.name(),
+                model,
+                "2026-08-26",
+                "hermetic fallback fixture",
+                CapabilitySupport::Supported,
+                CapabilitySupport::Supported,
+                CapabilitySupport::Unsupported,
+                ReasoningCapability::unsupported("2026-08-26", "hermetic fallback fixture"),
+                Some(4_096),
+                Some(128_000),
+                None,
+            )
         }
     }
 
