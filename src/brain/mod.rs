@@ -992,8 +992,10 @@ mod isolation_tests {
         }
         Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
             let mut fields = line.split_whitespace();
-            let pid = fields.next().and_then(|value| value.parse().ok());
-            let pgid = fields.next().and_then(|value| value.parse().ok());
+            let pid: Option<nix::libc::pid_t> =
+                fields.next().and_then(|value| value.parse().ok());
+            let pgid: Option<nix::libc::pid_t> =
+                fields.next().and_then(|value| value.parse().ok());
             matches!((pid, pgid), (Some(pid), Some(pgid)) if pgid == group && pid != group)
         }))
     }
