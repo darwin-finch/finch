@@ -12,10 +12,7 @@ use ratatui::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
-};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Step in the "Add Provider" flow (overlay inside Models section)
@@ -54,12 +51,6 @@ enum AddProviderStep {
 
 /// Cloud provider options shown in the add-provider overlay
 const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
-    (
-        "chatgpt_subscription",
-        "ChatGPT subscription (Codex)",
-        "gpt-5.6-sol",
-        "device sign-in and Sol validation happen before setup is saved",
-    ),
     (
         "grok",
         "Grok (xAI)",
@@ -162,9 +153,6 @@ fn detect_xai_api_key() -> Option<String> {
 
 /// Known model names for cloud providers (used for cycling in ConfigureRemote dialog)
 fn known_models_for(provider: &str) -> Vec<String> {
-    if provider == "chatgpt_subscription" {
-        return vec![crate::providers::codex_app_server::GPT_5_6_SOL.to_string()];
-    }
     model_catalog::static_fallback(provider)
 }
 
@@ -480,16 +468,7 @@ impl ModelConfig {
 /// `teachers` projection.
 fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
     match provider {
-        ProviderEntry::ChatgptSubscription { model, name, .. } => Some(ModelConfig::Remote {
-            provider: "chatgpt_subscription".to_string(),
-            name: name
-                .clone()
-                .unwrap_or_else(|| "ChatGPT subscription".to_string()),
-            api_key: String::new(),
-            model: model.clone().unwrap_or_else(|| "gpt-5.6-sol".to_string()),
-            enabled: true,
-            persisted: Some(provider.clone()),
-        }),
+        ProviderEntry::LegacyChatgptSubscription { .. } => None,
         ProviderEntry::Local {
             inference_provider,
             execution_target,
@@ -547,13 +526,6 @@ fn provider_entry_from_remote_model(
     let model = (!model.is_empty()).then(|| model.to_string());
     let name = Some(name.to_string());
     match persisted {
-        Some(ProviderEntry::ChatgptSubscription { credential_ref, .. }) => {
-            ProviderEntry::ChatgptSubscription {
-                credential_ref: credential_ref.clone(),
-                model,
-                name,
-            }
-        }
         Some(ProviderEntry::Claude {
             base_url,
             chat_path,
@@ -631,14 +603,6 @@ fn provider_entry_from_remote_model(
             address: model.unwrap_or_default(),
             name,
         },
-        _ if provider.eq_ignore_ascii_case("chatgpt_subscription") => {
-            ProviderEntry::ChatgptSubscription {
-                credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
-                    .to_string(),
-                model,
-                name,
-            }
-        }
         _ => ProviderEntry::from_teacher_entry(&TeacherEntry {
             provider: provider.to_string(),
             api_key: api_key.to_string(),
@@ -1126,730 +1090,26 @@ pub enum SetupInvocation {
     Repl,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChatGptSetupState {
-    SignedOut,
-    SignedIn,
-    LoginPending,
-    Ready,
-    Fallback,
-    Cancelled,
-    AuthenticatedAfterCancel,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChatGptSetupAction {
-    Reuse,
-    Replace,
-    Login,
-    LoginSucceeded,
-    Fallback,
-    Cancel,
-    Keep,
-    Logout,
-}
-
-impl ChatGptSetupState {
-    fn transition(self, action: ChatGptSetupAction) -> Result<Self> {
-        use ChatGptSetupAction as Action;
-        use ChatGptSetupState as State;
-        match (self, action) {
-            (State::SignedIn, Action::Reuse) => Ok(State::Ready),
-            (State::SignedIn, Action::Replace) | (State::SignedOut, Action::Login) => {
-                Ok(State::LoginPending)
-            }
-            (State::LoginPending, Action::LoginSucceeded) => Ok(State::Ready),
-            (State::SignedIn | State::SignedOut | State::LoginPending, Action::Fallback) => {
-                Ok(State::Fallback)
-            }
-            (State::SignedIn | State::SignedOut | State::LoginPending, Action::Cancel) => {
-                Ok(State::Cancelled)
-            }
-            _ => Err(anyhow::anyhow!("Invalid ChatGPT setup state transition")),
-        }
-    }
-}
-
-struct SetupAuthUi {
-    terminal: ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
-    events: tokio::sync::mpsc::Receiver<Event>,
-    stop_events: Arc<AtomicBool>,
-    event_thread: Option<std::thread::JoinHandle<()>>,
-    restored: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeviceUiAction {
-    Cancel,
-    Copy,
-    Open,
-    Redraw,
-    Ignore,
-}
-
-fn device_ui_action(event: &Event) -> DeviceUiAction {
-    match event {
-        Event::Resize(_, _) => DeviceUiAction::Redraw,
-        Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => match key.code {
-            KeyCode::Esc => DeviceUiAction::Cancel,
-            KeyCode::Char('c' | 'C') => DeviceUiAction::Copy,
-            KeyCode::Char('o' | 'O') => DeviceUiAction::Open,
-            _ => DeviceUiAction::Ignore,
-        },
-        _ => DeviceUiAction::Ignore,
-    }
-}
-
-struct DeviceCountdown {
-    deadline: tokio::time::Instant,
-    ticks: tokio::time::Interval,
-}
-
-impl DeviceCountdown {
-    fn new(timeout: Duration) -> Self {
-        let mut ticks = tokio::time::interval(Duration::from_secs(1));
-        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        Self {
-            deadline: tokio::time::Instant::now() + timeout,
-            ticks,
-        }
-    }
-
-    fn remaining(&self) -> Duration {
-        self.deadline
-            .saturating_duration_since(tokio::time::Instant::now())
-    }
-
-    async fn tick(&mut self) {
-        self.ticks.tick().await;
-    }
-}
-
-fn device_login_body(
-    verification_url: &str,
-    user_code: &str,
-    notice: &str,
-    remaining: Duration,
-) -> Vec<Line<'static>> {
-    vec![
-        Line::from(format!("Open: {verification_url}")),
-        Line::from(format!("Code: {user_code}")),
-        Line::from(""),
-        Line::from(format!(
-            "{notice} · {:02}:{:02} remaining",
-            remaining.as_secs() / 60,
-            remaining.as_secs() % 60
-        )),
-        Line::from("Codex owns polling and honors authorization slow-down responses."),
-    ]
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1])[1]
-}
-
-impl SetupAuthUi {
-    fn enter() -> Result<Self> {
-        crossterm::terminal::enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        if let Err(error) = crossterm::execute!(
-            stdout,
-            crossterm::terminal::EnterAlternateScreen,
-            crossterm::event::EnableMouseCapture
-        ) {
-            let _ = crossterm::terminal::disable_raw_mode();
-            return Err(error.into());
-        }
-        let backend = ratatui::backend::CrosstermBackend::new(stdout);
-        let mut terminal = match ratatui::Terminal::new(backend) {
-            Ok(terminal) => terminal,
-            Err(error) => {
-                let _ = crossterm::execute!(
-                    io::stdout(),
-                    crossterm::terminal::LeaveAlternateScreen,
-                    crossterm::event::DisableMouseCapture
-                );
-                let _ = crossterm::terminal::disable_raw_mode();
-                return Err(error).context("Failed to open setup terminal");
-            }
-        };
-        let (event_tx, events) = tokio::sync::mpsc::channel(32);
-        let stop_events = Arc::new(AtomicBool::new(false));
-        let stop = Arc::clone(&stop_events);
-        let event_thread = match std::thread::Builder::new()
-            .name("finch-setup-events".into())
-            .spawn(move || {
-                while !stop.load(Ordering::Acquire) {
-                    match event::poll(Duration::from_millis(50)) {
-                        Ok(true) => {
-                            let Ok(event) = event::read() else {
-                                break;
-                            };
-                            if event_tx.blocking_send(event).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(false) => {}
-                        Err(_) => break,
-                    }
-                }
-            }) {
-            Ok(thread) => thread,
-            Err(error) => {
-                let _ = cleanup_terminal(&mut terminal);
-                return Err(error).context("Could not start setup input reader");
-            }
-        };
-        Ok(Self {
-            terminal,
-            events,
-            stop_events,
-            event_thread: Some(event_thread),
-            restored: false,
-        })
-    }
-
-    fn restore(&mut self) -> Result<()> {
-        if self.restored {
-            return Ok(());
-        }
-        self.restored = true;
-        self.stop_events.store(true, Ordering::Release);
-        if let Some(thread) = self.event_thread.take() {
-            let _ = thread.join();
-        }
-        cleanup_terminal(&mut self.terminal)
-    }
-
-    fn draw(&mut self, title: &str, body: &[Line<'static>], footer: &str) -> Result<()> {
-        self.terminal.draw(|frame| {
-            let area = frame.area();
-            let panel = centered_rect(76, 70, area);
-            frame.render_widget(ratatui::widgets::Clear, panel);
-            let block = Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan));
-            let inner = block.inner(panel);
-            frame.render_widget(block, panel);
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(3), Constraint::Length(2)])
-                .split(inner);
-            frame.render_widget(
-                Paragraph::new(body.to_vec()).wrap(Wrap { trim: false }),
-                chunks[0],
-            );
-            frame.render_widget(
-                Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
-                chunks[1],
-            );
-        })?;
-        Ok(())
-    }
-
-    async fn choose(
-        &mut self,
-        title: &str,
-        message: &str,
-        choices: &[(char, ChatGptSetupAction, &str)],
-    ) -> Result<ChatGptSetupAction> {
-        loop {
-            let options = choices
-                .iter()
-                .map(|(key, _, label)| format!("[{key}] {label}"))
-                .collect::<Vec<_>>()
-                .join("    ");
-            self.draw(
-                title,
-                &[
-                    Line::from(message.to_string()),
-                    Line::from(""),
-                    Line::from(options),
-                ],
-                "Esc cancels · the provider selector will be restored on exit",
-            )?;
-            let event = self.next_event().await?;
-            match event {
-                Event::Resize(_, _) => continue,
-                Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
-                    if matches!(key.code, KeyCode::Esc) {
-                        return Ok(ChatGptSetupAction::Cancel);
-                    }
-                    if let KeyCode::Char(value) = key.code {
-                        if let Some((_, action, _)) = choices
-                            .iter()
-                            .find(|(candidate, _, _)| candidate.eq_ignore_ascii_case(&value))
-                        {
-                            return Ok(*action);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    async fn wait_for_device_login(
-        &mut self,
-        auth: &crate::providers::CodexAppServerAuth,
-        login: crate::providers::codex_app_server::ChatGptDeviceLogin,
-    ) -> Result<crate::providers::codex_app_server::DeviceLoginOutcome> {
-        let details = login.details.clone();
-        let mut countdown = DeviceCountdown::new(Duration::from_secs(10 * 60));
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let wait = auth.finish_device_login_or_cancel(login, cancel_rx);
-        tokio::pin!(wait);
-        let mut notice = "Pending authorization".to_string();
-        let mut cancel_requested = false;
-        loop {
-            let remaining = countdown.remaining();
-            let body = device_login_body(
-                &details.verification_url,
-                &details.user_code,
-                &notice,
-                remaining,
-            );
-            self.draw(
-                "ChatGPT device sign-in",
-                &body,
-                "[C] copy code  [O] open browser  [Esc] cancel",
-            )?;
-            tokio::select! {
-                biased;
-                event = self.next_event(), if !cancel_requested => match device_ui_action(&event?) {
-                            DeviceUiAction::Cancel => {
-                                cancel_requested = true;
-                                let _ = cancel_tx.send(true);
-                                notice = "Cancelling with Codex…".into();
-                            }
-                            DeviceUiAction::Copy => {
-                                notice = match copy_device_code(&details.user_code) {
-                                    Ok(()) => "Code copied to clipboard".into(),
-                                    Err(_) => "Clipboard unavailable; use the displayed code".into(),
-                                };
-                            }
-                            DeviceUiAction::Open => {
-                                notice = match open_verification_url(&details.verification_url) {
-                                    Ok(()) => "Browser opened".into(),
-                                    Err(_) => "Could not open a browser; use the displayed URL".into(),
-                                };
-                            }
-                            DeviceUiAction::Redraw | DeviceUiAction::Ignore => {}
-                },
-                result = &mut wait => return result,
-                _ = countdown.tick() => {}
-            }
-        }
-    }
-
-    async fn next_event(&mut self) -> Result<Event> {
-        self.events
-            .recv()
-            .await
-            .context("Setup terminal input reader stopped")
-    }
-}
-
-impl Drop for SetupAuthUi {
-    fn drop(&mut self) {
-        let _ = self.restore();
-    }
-}
-
-fn copy_device_code(code: &str) -> Result<()> {
-    let mut clipboard = arboard::Clipboard::new().context("Clipboard is unavailable")?;
-    clipboard
-        .set_text(code.to_string())
-        .context("Could not copy the device code")
-}
-
-fn open_verification_url(url: &str) -> Result<()> {
-    if !url.starts_with("https://") {
-        anyhow::bail!("Refusing to open a non-HTTPS verification URL");
-    }
-    #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("/usr/bin/open");
-    #[cfg(target_os = "linux")]
-    let mut command = std::process::Command::new("/usr/bin/xdg-open");
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    anyhow::bail!("Opening a browser is unsupported on this platform");
-    command
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("Could not open the verification URL")?;
-    Ok(())
-}
-
-fn configured_provider_is_usable(provider: &ProviderEntry) -> bool {
-    match provider {
-        ProviderEntry::ChatgptSubscription { .. } => true,
-        ProviderEntry::Claude { api_key, .. }
-        | ProviderEntry::Openai { api_key, .. }
-        | ProviderEntry::Grok { api_key, .. }
-        | ProviderEntry::Gemini { api_key, .. }
-        | ProviderEntry::Mistral { api_key, .. }
-        | ProviderEntry::Groq { api_key, .. } => !api_key.trim().is_empty(),
-        ProviderEntry::Ollama {
-            model, base_url, ..
-        } => !model.trim().is_empty() && !base_url.trim().is_empty(),
-        ProviderEntry::RemoteDaemon { address, .. } => !address.trim().is_empty(),
-        ProviderEntry::Local { enabled, .. } => *enabled,
-    }
-}
-
-fn configured_fallback_exists(result: &SetupResult) -> bool {
-    result.providers.iter().any(|provider| {
-        !matches!(provider, ProviderEntry::ChatgptSubscription { .. })
-            && configured_provider_is_usable(provider)
-    })
-}
-
-fn validation_recovery_choices(
-    has_configured_fallback: bool,
-) -> Vec<(char, ChatGptSetupAction, &'static str)> {
-    let mut choices = vec![
-        ('k', ChatGptSetupAction::Keep, "retain sign-in"),
-        ('o', ChatGptSetupAction::Logout, "log out"),
-    ];
-    if has_configured_fallback {
-        choices.insert(
-            0,
-            (
-                'f',
-                ChatGptSetupAction::Fallback,
-                "save configured fallback; retain sign-in",
-            ),
-        );
-    }
-    choices
-}
-
-fn save_without_chatgpt(result: &SetupResult) -> Result<()> {
-    let mut config = config_from_setup_result(result);
-    config
-        .providers
-        .retain(|provider| !matches!(provider, ProviderEntry::ChatgptSubscription { .. }));
-    if !config.providers.iter().any(configured_provider_is_usable) {
-        anyhow::bail!("Setup cannot remove ChatGPT because no other usable provider is configured");
-    }
-    config.save()?;
-    if let Some(prompt) = result.custom_system_prompt.as_deref() {
-        crate::config::Persona::save_system_prompt_override(&result.default_persona, prompt)?;
-    }
-    Ok(())
-}
-
-fn state_after_device_login(
-    state: ChatGptSetupState,
-    outcome: crate::providers::codex_app_server::DeviceLoginOutcome,
-) -> Result<ChatGptSetupState> {
-    use crate::providers::codex_app_server::DeviceLoginOutcome;
-
-    match outcome {
-        DeviceLoginOutcome::Completed => state.transition(ChatGptSetupAction::LoginSucceeded),
-        DeviceLoginOutcome::Cancelled => state.transition(ChatGptSetupAction::Cancel),
-        DeviceLoginOutcome::CompletedAfterCancel => Ok(ChatGptSetupState::AuthenticatedAfterCancel),
-    }
-}
-
-fn should_logout_after_post_cancel_choice(choice: ChatGptSetupAction) -> bool {
-    choice != ChatGptSetupAction::Keep
-}
-
-async fn choose_account_acknowledgement(
-    ceremony: &mut dyn ChatGptSetupCeremony,
-    title: &str,
-    message: &str,
-    choices: &[(char, ChatGptSetupAction, &str)],
-    retaining: &[ChatGptSetupAction],
-) -> Result<ChatGptSetupAction> {
-    match ceremony.choose(title, message, choices).await {
-        Ok(choice) if retaining.contains(&choice) => Ok(choice),
-        Ok(choice) => {
-            ceremony.logout().await?;
-            Ok(choice)
-        }
-        Err(choice_error) => {
-            let logout_error = ceremony.logout().await.err();
-            let restore_error = ceremony.restore().err();
-            let mut error = choice_error;
-            if let Some(logout_error) = logout_error {
-                error = error.context(format!(
-                    "acknowledgement failed and managed-account logout also failed: {logout_error}"
-                ));
-            }
-            if let Some(restore_error) = restore_error {
-                error = error.context(format!(
-                    "acknowledgement failed and terminal restoration also failed: {restore_error}"
-                ));
-            }
-            Err(error)
-        }
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-trait ChatGptSetupCeremony {
-    async fn status(&mut self) -> Result<crate::providers::codex_app_server::ChatGptAccountStatus>;
-    async fn choose(
-        &mut self,
-        title: &str,
-        message: &str,
-        choices: &[(char, ChatGptSetupAction, &str)],
-    ) -> Result<ChatGptSetupAction>;
-    async fn login(&mut self) -> Result<crate::providers::codex_app_server::DeviceLoginOutcome>;
-    async fn validate_sol(&mut self) -> Result<()>;
-    fn save(&mut self, result: &SetupResult) -> Result<()>;
-    fn save_fallback(&mut self, result: &SetupResult) -> Result<()>;
-    async fn logout(&mut self) -> Result<()>;
-    fn restore(&mut self) -> Result<()>;
-}
-
-struct LiveChatGptSetupCeremony {
-    auth: crate::providers::CodexAppServerAuth,
-    ui: SetupAuthUi,
-}
-
-#[async_trait::async_trait(?Send)]
-impl ChatGptSetupCeremony for LiveChatGptSetupCeremony {
-    async fn status(&mut self) -> Result<crate::providers::codex_app_server::ChatGptAccountStatus> {
-        self.auth.status(false).await
-    }
-
-    async fn choose(
-        &mut self,
-        title: &str,
-        message: &str,
-        choices: &[(char, ChatGptSetupAction, &str)],
-    ) -> Result<ChatGptSetupAction> {
-        self.ui.choose(title, message, choices).await
-    }
-
-    async fn login(&mut self) -> Result<crate::providers::codex_app_server::DeviceLoginOutcome> {
-        let login = self.auth.begin_device_login().await?;
-        self.ui.wait_for_device_login(&self.auth, login).await
-    }
-
-    async fn validate_sol(&mut self) -> Result<()> {
-        self.auth.validate_sol_access().await.map(|_| ())
-    }
-
-    fn save(&mut self, result: &SetupResult) -> Result<()> {
-        apply_and_save(result)
-    }
-
-    fn save_fallback(&mut self, result: &SetupResult) -> Result<()> {
-        save_without_chatgpt(result)
-    }
-
-    async fn logout(&mut self) -> Result<()> {
-        self.auth.logout().await
-    }
-
-    fn restore(&mut self) -> Result<()> {
-        self.ui.restore()
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_CHATGPT_CEREMONY: std::cell::RefCell<Option<Box<dyn ChatGptSetupCeremony>>> =
-        std::cell::RefCell::new(None);
-}
-
-async fn run_chatgpt_setup_ceremony(
-    result: &SetupResult,
-    ceremony: &mut dyn ChatGptSetupCeremony,
-) -> Result<SetupApplyOutcome> {
-    let status = ceremony.status().await?;
-    let had_existing_account = status.signed_in;
-    let state = if status.signed_in {
-        ChatGptSetupState::SignedIn
-    } else {
-        ChatGptSetupState::SignedOut
-    };
-
-    continue_chatgpt_setup_ceremony(result, ceremony, had_existing_account, state).await
-}
-
-/// Validate ChatGPT authentication and Sol availability before atomically committing setup.
+/// Validate and save setup through the shared first-run/command/REPL boundary.
 ///
-/// This is the single post-wizard state machine used by all three setup entry points. Finch
-/// displays the device code but never reads the app-server-owned credential file.
+/// Unsupported legacy ChatGPT subscription profiles are rejected before any
+/// provider, network, or process boundary is reached.
 pub async fn validate_and_apply_for(
     invocation: SetupInvocation,
     result: &SetupResult,
 ) -> Result<SetupApplyOutcome> {
-    use crate::config::ProviderEntry;
     tracing::debug!(?invocation, "Starting shared setup commit ceremony");
-
-    let selected = result
+    if result
         .providers
         .iter()
-        .any(|provider| matches!(provider, ProviderEntry::ChatgptSubscription { .. }));
-    if !selected {
-        apply_and_save(result)?;
-        return Ok(SetupApplyOutcome::Saved);
+        .any(|provider| matches!(provider, ProviderEntry::LegacyChatgptSubscription { .. }))
+    {
+        anyhow::bail!(
+            "Legacy chatgpt_subscription profiles are unsupported because Finch no longer launches Codex app-server. Remove that profile and configure OpenAI Platform with an API key or another supported provider"
+        );
     }
-
-    #[cfg(test)]
-    if let Some(mut ceremony) = TEST_CHATGPT_CEREMONY.with(|slot| slot.borrow_mut().take()) {
-        return run_chatgpt_setup_ceremony(result, ceremony.as_mut()).await;
-    }
-
-    let mut ceremony = LiveChatGptSetupCeremony {
-        auth: crate::providers::CodexAppServerAuth::new()?,
-        ui: SetupAuthUi::enter()?,
-    };
-    run_chatgpt_setup_ceremony(result, &mut ceremony).await
-}
-
-async fn continue_chatgpt_setup_ceremony(
-    result: &SetupResult,
-    ceremony: &mut dyn ChatGptSetupCeremony,
-    had_existing_account: bool,
-    mut state: ChatGptSetupState,
-) -> Result<SetupApplyOutcome> {
-    if state == ChatGptSetupState::SignedIn {
-        let choice = ceremony.choose(
-            "ChatGPT subscription",
-            "An account is already signed in. Replacement keeps it active until the new login succeeds.",
-            &[
-                ('r', ChatGptSetupAction::Reuse, "reuse account"),
-                ('l', ChatGptSetupAction::Replace, "sign in to replace"),
-                ('f', ChatGptSetupAction::Fallback, "remove ChatGPT from this setup"),
-                ('c', ChatGptSetupAction::Cancel, "cancel setup"),
-            ],
-        ).await?;
-        state = state.transition(choice)?;
-    } else {
-        let choice = ceremony
-            .choose(
-                "ChatGPT subscription",
-                "No account is signed in.",
-                &[
-                    ('l', ChatGptSetupAction::Login, "sign in"),
-                    (
-                        'f',
-                        ChatGptSetupAction::Fallback,
-                        "remove ChatGPT from this setup",
-                    ),
-                    ('c', ChatGptSetupAction::Cancel, "cancel setup"),
-                ],
-            )
-            .await?;
-        state = state.transition(choice)?;
-    }
-
-    while state == ChatGptSetupState::LoginPending {
-        match ceremony.login().await {
-            Ok(outcome) => state = state_after_device_login(state, outcome)?,
-            Err(error) => {
-                let recovery = ceremony
-                    .choose(
-                        "ChatGPT sign-in did not complete",
-                        &format!("{error}"),
-                        &[
-                            ('r', ChatGptSetupAction::Login, "retry"),
-                            ('f', ChatGptSetupAction::Fallback, "remove ChatGPT"),
-                            ('c', ChatGptSetupAction::Cancel, "cancel setup"),
-                        ],
-                    )
-                    .await?;
-                state = match recovery {
-                    ChatGptSetupAction::Login => ChatGptSetupState::LoginPending,
-                    action => state.transition(action)?,
-                };
-            }
-        }
-    }
-
-    match state {
-        ChatGptSetupState::Ready => {
-            let validation = ceremony.validate_sol().await;
-            let saved = validation.and_then(|_| ceremony.save(result));
-            if let Err(error) = saved {
-                let choices = validation_recovery_choices(configured_fallback_exists(result));
-                let decision = choose_account_acknowledgement(
-                    ceremony,
-                    "ChatGPT setup could not be saved",
-                    &format!("{error}\n\nThe managed sign-in remains opaque to Finch."),
-                    &choices,
-                    &[ChatGptSetupAction::Keep, ChatGptSetupAction::Fallback],
-                )
-                .await?;
-                if decision == ChatGptSetupAction::Fallback {
-                    ceremony.save_fallback(result)?;
-                    ceremony.restore()?;
-                    return Ok(SetupApplyOutcome::Saved);
-                }
-                ceremony.restore()?;
-                return Err(error);
-            }
-            ceremony.restore()?;
-            Ok(SetupApplyOutcome::Saved)
-        }
-        ChatGptSetupState::Fallback => {
-            ceremony.save_fallback(result)?;
-            ceremony.restore()?;
-            Ok(SetupApplyOutcome::Saved)
-        }
-        ChatGptSetupState::AuthenticatedAfterCancel => {
-            choose_account_acknowledgement(
-                ceremony,
-                "Sign-in completed while cancelling",
-                "Codex authenticated the managed account before cancellation completed. Explicitly choose whether to retain it.",
-                &[
-                    ('k', ChatGptSetupAction::Keep, "retain sign-in"),
-                    ('o', ChatGptSetupAction::Logout, "log out"),
-                ],
-                &[ChatGptSetupAction::Keep],
-            )
-            .await?;
-            // Escape is reported by `choose` as Cancel. Only explicit Keep is retained.
-            ceremony.restore()?;
-            Ok(SetupApplyOutcome::Cancelled)
-        }
-        ChatGptSetupState::Cancelled => {
-            if had_existing_account {
-                choose_account_acknowledgement(
-                    ceremony,
-                    "Cancel ChatGPT setup",
-                    "Keep the existing managed ChatGPT sign-in?",
-                    &[
-                        ('k', ChatGptSetupAction::Keep, "keep sign-in"),
-                        ('o', ChatGptSetupAction::Logout, "log out"),
-                    ],
-                    &[ChatGptSetupAction::Keep],
-                )
-                .await?;
-            }
-            ceremony.restore()?;
-            Ok(SetupApplyOutcome::Cancelled)
-        }
-        _ => Err(anyhow::anyhow!(
-            "ChatGPT setup did not reach a terminal state"
-        )),
-    }
+    apply_and_save(result)?;
+    Ok(SetupApplyOutcome::Saved)
 }
 
 /// Apply setup through the shared ceremony without a specific UI entry-point label.
@@ -2704,11 +1964,9 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 *catalog_model_provenance = ModelSelectionProvenance::Manual;
                             }
                             3 => {
-                                if CLOUD_PROVIDERS[*provider_idx].0 != "chatgpt_subscription" {
-                                    api_key.push(c);
-                                    *catalog_generation = catalog_generation.wrapping_add(1);
-                                    *catalog_refresh = None;
-                                }
+                                api_key.push(c);
+                                *catalog_generation = catalog_generation.wrapping_add(1);
+                                *catalog_refresh = None;
                             }
                             _ => {}
                         }
@@ -2739,11 +1997,9 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                 };
                             }
                             3 => {
-                                if CLOUD_PROVIDERS[*provider_idx].0 != "chatgpt_subscription" {
-                                    api_key.pop();
-                                    *catalog_generation = catalog_generation.wrapping_add(1);
-                                    *catalog_refresh = None;
-                                }
+                                api_key.pop();
+                                *catalog_generation = catalog_generation.wrapping_add(1);
+                                *catalog_refresh = None;
                             }
                             _ => {}
                         }
@@ -4989,10 +4245,7 @@ fn render_configure_remote_overlay(
 
     let provider_value = format!("{} ({})", provider_name, provider_id);
     let model_display = if model.is_empty() { "(default)" } else { model };
-    let managed_auth = provider_id == "chatgpt_subscription";
-    let key_display = if managed_auth {
-        "managed by Codex app-server".to_string()
-    } else if api_key.is_empty() {
+    let key_display = if api_key.is_empty() {
         String::new()
     } else {
         let visible: String = api_key.chars().take(12).collect();
@@ -5004,12 +4257,7 @@ fn render_configure_remote_overlay(
         make_row("Provider", &provider_value, focused_field == 0, false),
         make_row("Name", name, focused_field == 1, true),
         make_row("Model", model_display, focused_field == 2, true),
-        make_row(
-            if managed_auth { "Auth" } else { "API Key" },
-            &key_display,
-            focused_field == 3,
-            !managed_auth,
-        ),
+        make_row("API Key", &key_display, focused_field == 3, true),
         Line::from(""),
         Line::from(Span::styled(
             "─".repeat(area.width as usize),
@@ -5932,246 +5180,6 @@ fn render_review_section(f: &mut Frame, area: Rect, state: &WizardState) {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    #[derive(Default)]
-    struct CeremonyObservations {
-        saves: usize,
-        fallback_saves: usize,
-        logouts: usize,
-        restores: usize,
-    }
-
-    struct MockChatGptCeremony {
-        signed_in: bool,
-        choices: std::collections::VecDeque<ChatGptSetupAction>,
-        login_outcomes:
-            std::collections::VecDeque<crate::providers::codex_app_server::DeviceLoginOutcome>,
-        validation_error: bool,
-        choice_error_after: Option<usize>,
-        choices_seen: usize,
-        observed: Arc<Mutex<CeremonyObservations>>,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl ChatGptSetupCeremony for MockChatGptCeremony {
-        async fn status(
-            &mut self,
-        ) -> Result<crate::providers::codex_app_server::ChatGptAccountStatus> {
-            Ok(crate::providers::codex_app_server::ChatGptAccountStatus {
-                signed_in: self.signed_in,
-                plan_type: self.signed_in.then(|| "plus".into()),
-            })
-        }
-
-        async fn choose(
-            &mut self,
-            _title: &str,
-            _message: &str,
-            offered: &[(char, ChatGptSetupAction, &str)],
-        ) -> Result<ChatGptSetupAction> {
-            let choice_index = self.choices_seen;
-            self.choices_seen += 1;
-            if self.choice_error_after == Some(choice_index) {
-                anyhow::bail!("setup acknowledgement input failed")
-            }
-            let choice = self.choices.pop_front().context("missing mock choice")?;
-            anyhow::ensure!(
-                choice == ChatGptSetupAction::Cancel
-                    || offered.iter().any(|(_, candidate, _)| *candidate == choice),
-                "mock selected an action that was not offered"
-            );
-            Ok(choice)
-        }
-
-        async fn login(
-            &mut self,
-        ) -> Result<crate::providers::codex_app_server::DeviceLoginOutcome> {
-            self.login_outcomes
-                .pop_front()
-                .context("missing mock login outcome")
-        }
-
-        async fn validate_sol(&mut self) -> Result<()> {
-            if self.validation_error {
-                anyhow::bail!("restricted schema unavailable")
-            }
-            Ok(())
-        }
-
-        fn save(&mut self, _result: &SetupResult) -> Result<()> {
-            self.observed.lock().unwrap().saves += 1;
-            Ok(())
-        }
-
-        fn save_fallback(&mut self, result: &SetupResult) -> Result<()> {
-            anyhow::ensure!(configured_fallback_exists(result), "missing fallback");
-            self.observed.lock().unwrap().fallback_saves += 1;
-            Ok(())
-        }
-
-        async fn logout(&mut self) -> Result<()> {
-            self.observed.lock().unwrap().logouts += 1;
-            Ok(())
-        }
-
-        fn restore(&mut self) -> Result<()> {
-            self.observed.lock().unwrap().restores += 1;
-            Ok(())
-        }
-    }
-
-    fn chatgpt_ceremony_result(with_fallback: bool) -> SetupResult {
-        let mut result = build_setup_result(&WizardState::new(None)).unwrap();
-        result.providers = vec![ProviderEntry::ChatgptSubscription {
-            credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF.into(),
-            model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.into()),
-            name: Some("subscription".into()),
-        }];
-        if with_fallback {
-            result.providers.push(ProviderEntry::Grok {
-                api_key: "xai-test".into(),
-                model: Some("grok-code-fast-1".into()),
-                base_url: None,
-                chat_path: None,
-                models_path: None,
-                name: Some("fallback".into()),
-            });
-        }
-        result
-    }
-
-    fn install_test_ceremony(ceremony: impl ChatGptSetupCeremony + 'static) {
-        TEST_CHATGPT_CEREMONY.with(|slot| {
-            assert!(slot.borrow_mut().replace(Box::new(ceremony)).is_none());
-        });
-    }
-
-    struct BoundaryChatGptCeremony {
-        auth: crate::providers::CodexAppServerAuth,
-        choices: std::collections::VecDeque<ChatGptSetupAction>,
-        config_path: std::path::PathBuf,
-        restores: Arc<Mutex<usize>>,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl ChatGptSetupCeremony for BoundaryChatGptCeremony {
-        async fn status(
-            &mut self,
-        ) -> Result<crate::providers::codex_app_server::ChatGptAccountStatus> {
-            self.auth.status(false).await
-        }
-
-        async fn choose(
-            &mut self,
-            _title: &str,
-            _message: &str,
-            offered: &[(char, ChatGptSetupAction, &str)],
-        ) -> Result<ChatGptSetupAction> {
-            let choice = self
-                .choices
-                .pop_front()
-                .context("missing boundary choice")?;
-            anyhow::ensure!(
-                choice == ChatGptSetupAction::Cancel
-                    || offered.iter().any(|(_, candidate, _)| *candidate == choice),
-                "boundary selected an action that was not offered"
-            );
-            Ok(choice)
-        }
-
-        async fn login(
-            &mut self,
-        ) -> Result<crate::providers::codex_app_server::DeviceLoginOutcome> {
-            anyhow::bail!("boundary test did not configure device login")
-        }
-
-        async fn validate_sol(&mut self) -> Result<()> {
-            self.auth.validate_sol_access().await.map(|_| ())
-        }
-
-        fn save(&mut self, result: &SetupResult) -> Result<()> {
-            config_from_setup_result(result).save_to(&self.config_path)
-        }
-
-        fn save_fallback(&mut self, result: &SetupResult) -> Result<()> {
-            let mut config = config_from_setup_result(result);
-            config
-                .providers
-                .retain(|provider| !matches!(provider, ProviderEntry::ChatgptSubscription { .. }));
-            anyhow::ensure!(
-                config.providers.iter().any(configured_provider_is_usable),
-                "missing fallback"
-            );
-            config.save_to(&self.config_path)
-        }
-
-        async fn logout(&mut self) -> Result<()> {
-            self.auth.logout().await
-        }
-
-        fn restore(&mut self) -> Result<()> {
-            *self.restores.lock().unwrap() += 1;
-            Ok(())
-        }
-    }
-
-    fn boundary_ceremony(
-        directory: &tempfile::TempDir,
-        choices: impl IntoIterator<Item = ChatGptSetupAction>,
-        sol_visible: bool,
-    ) -> (BoundaryChatGptCeremony, Arc<Mutex<usize>>) {
-        let script = directory.path().join("fake_setup_app_server.py");
-        std::fs::write(
-            &script,
-            r#"import json, os, pathlib, sys
-sol_visible = sys.argv[1] == 'sol'
-home = pathlib.Path(os.environ['CODEX_HOME'])
-logout_marker = home / 'logged_out'
-initialized = False
-for line in sys.stdin:
-    message = json.loads(line)
-    method = message.get('method')
-    if method == 'initialized':
-        initialized = True
-        continue
-    ident = message.get('id')
-    if method == 'initialize': result = {'capabilities': {}}
-    elif method == 'config/read':
-        assert initialized
-        result = {'config': {'mcp_servers': {}, 'plugins': {}, 'environments': {}, 'hooks': {}, 'profiles': {}, 'skills': {'config': []}, 'agents': {'enabled': False}, 'apps': {'_default': {'enabled': False, 'destructive_enabled':False, 'open_world_enabled':False, 'default_tools_enabled':False}}, 'features': {k: False for k in ['apps','plugins','remote_plugin','shell_tool','unified_exec','multi_agent','hooks','memories','skill_mcp_dependency_install']}, 'web_search':'disabled', 'history':{'persistence':'none'}, 'cli_auth_credentials_store':'file', 'memories':{'generate_memories':False,'use_memories':False}, 'allow_login_shell':False, 'shell_environment_policy':{'inherit':'none','set':{}}, 'tools':{'view_image':False,'web_search':False}, 'developer_instructions':'', 'project_doc_fallback_filenames':[], 'project_doc_max_bytes':0}}
-    elif method == 'configRequirements/read': result = {'requirements': None}
-    elif method == 'account/read': result = {'account': None if logout_marker.exists() else {'type':'chatgpt','planType':'plus'}}
-    elif method == 'model/list': result = {'data': ([{'id':'gpt-5.6-sol','model':'gpt-5.6-sol','hidden':False}] if sol_visible else []), 'nextCursor':None}
-    elif method == 'account/logout':
-        logout_marker.write_text('logged out')
-        result = {}
-    else: result = {}
-    print(json.dumps({'id':ident,'result':result}), flush=True)
-    if method == 'account/logout': print(json.dumps({'method':'account/updated','params':{'authMode':None,'planType':None}}), flush=True)
-"#,
-        )
-        .unwrap();
-        let profile = directory.path().join("profile");
-        std::fs::create_dir(&profile).unwrap();
-        let auth = crate::providers::CodexAppServerAuth::with_test_app_server(
-            std::path::PathBuf::from("python3"),
-            vec![
-                script.to_string_lossy().into_owned(),
-                if sol_visible { "sol" } else { "no-sol" }.into(),
-            ],
-            profile,
-        );
-        let restores = Arc::new(Mutex::new(0));
-        (
-            BoundaryChatGptCeremony {
-                auth,
-                choices: choices.into_iter().collect(),
-                config_path: directory.path().join("config.toml"),
-                restores: Arc::clone(&restores),
-            },
-            restores,
-        )
-    }
 
     #[test]
     fn models_tab_describes_model_setup() {
@@ -7461,20 +6469,17 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn chooser_keeps_openai_api_and_chatgpt_subscription_visibly_distinct() {
+    fn chooser_offers_openai_api_without_external_binary_provider() {
         use ratatui::backend::TestBackend;
 
         let openai = CLOUD_PROVIDERS
             .iter()
             .find(|(id, ..)| *id == "openai")
             .unwrap();
-        let subscription = CLOUD_PROVIDERS
-            .iter()
-            .find(|(id, ..)| *id == "chatgpt_subscription")
-            .unwrap();
         assert_eq!(openai.1, "OpenAI API");
-        assert_eq!(subscription.1, "ChatGPT subscription (Codex)");
-        assert_ne!(subscription.1, "OpenAI API");
+        assert!(CLOUD_PROVIDERS
+            .iter()
+            .all(|(id, ..)| *id != "chatgpt_subscription"));
 
         let step = AddProviderStep::SelectAddType { selected: 0 };
         let backend = TestBackend::new(160, 50);
@@ -7496,11 +6501,8 @@ for line in sys.stdin:
             .unwrap();
         let rendered = test_buffer_text(terminal.backend().buffer());
         assert!(rendered.contains("OpenAI API"), "{rendered}");
-        assert!(
-            rendered.contains("ChatGPT subscription (Codex)"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("device sign-in"), "{rendered}");
+        assert!(!rendered.contains("ChatGPT subscription"), "{rendered}");
+        assert!(!rendered.contains("Codex"), "{rendered}");
         assert!(rendered.contains("platform.openai.com"), "{rendered}");
         assert!(!rendered.contains("GPT-4 (OpenAI)"), "{rendered}");
     }
@@ -9093,354 +8095,27 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn chatgpt_subscription_wizard_roundtrip_preserves_managed_reference() {
-        let original = ProviderEntry::ChatgptSubscription {
-            credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
-                .to_string(),
+    fn chooser_preserves_openai_api_key_and_hides_unsupported_subscription() {
+        assert!(CLOUD_PROVIDERS.iter().any(|(id, ..)| *id == "openai"));
+        assert!(!CLOUD_PROVIDERS
+            .iter()
+            .any(|(id, ..)| *id == "chatgpt_subscription"));
+    }
+
+    #[tokio::test]
+    async fn legacy_chatgpt_setup_fails_before_save() {
+        let mut result = build_setup_result(&WizardState::new(None)).unwrap();
+        result.providers = vec![ProviderEntry::LegacyChatgptSubscription {
+            credential_ref: "codex-app-server:managed".into(),
             model: Some("gpt-5.6-sol".into()),
-            name: Some("subscription-primary".into()),
-        };
-        let editable = model_config_from_provider(&original).unwrap();
-        let ModelConfig::Remote { persisted, .. } = editable else {
-            panic!("expected remote profile")
-        };
-        let rebuilt = provider_entry_from_remote_model(
-            "chatgpt_subscription",
-            "renamed",
-            "must-not-be-stored",
-            "gpt-5.6-sol",
-            persisted.as_ref(),
-        );
-        assert_eq!(rebuilt.api_key(), None);
-        assert!(matches!(
-            rebuilt,
-            ProviderEntry::ChatgptSubscription {
-                credential_ref,
-                model: Some(model),
-                name: Some(name),
-            } if credential_ref == crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
-                && model == "gpt-5.6-sol"
-                && name == "renamed"
-        ));
-    }
+            name: Some("legacy".into()),
+        }];
 
-    #[test]
-    fn chatgpt_setup_state_machine_covers_reuse_replace_fallback_and_cancel() {
-        assert_eq!(
-            ChatGptSetupState::SignedIn
-                .transition(ChatGptSetupAction::Reuse)
-                .unwrap(),
-            ChatGptSetupState::Ready
-        );
-        assert_eq!(
-            ChatGptSetupState::SignedIn
-                .transition(ChatGptSetupAction::Replace)
-                .unwrap()
-                .transition(ChatGptSetupAction::LoginSucceeded)
-                .unwrap(),
-            ChatGptSetupState::Ready
-        );
-        assert_eq!(
-            ChatGptSetupState::SignedOut
-                .transition(ChatGptSetupAction::Fallback)
-                .unwrap(),
-            ChatGptSetupState::Fallback
-        );
-        assert_eq!(
-            ChatGptSetupState::LoginPending
-                .transition(ChatGptSetupAction::Cancel)
-                .unwrap(),
-            ChatGptSetupState::Cancelled
-        );
-        assert!(ChatGptSetupState::SignedOut
-            .transition(ChatGptSetupAction::Reuse)
-            .is_err());
-    }
-
-    #[test]
-    fn chatgpt_fallback_requires_another_configured_provider() {
-        let chatgpt = ProviderEntry::ChatgptSubscription {
-            credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF.into(),
-            model: Some("gpt-5.6-sol".into()),
-            name: None,
-        };
-        let empty_remote = ProviderEntry::RemoteDaemon {
-            address: "  ".into(),
-            name: None,
-        };
-        let usable_remote = ProviderEntry::RemoteDaemon {
-            address: "http://127.0.0.1:11435".into(),
-            name: None,
-        };
-        assert!(configured_provider_is_usable(&chatgpt));
-        assert!(!configured_provider_is_usable(&empty_remote));
-        assert!(configured_provider_is_usable(&usable_remote));
-        assert!(![chatgpt]
-            .iter()
-            .filter(|provider| !matches!(provider, ProviderEntry::ChatgptSubscription { .. }))
-            .any(|provider| configured_provider_is_usable(provider)));
-        assert!(validation_recovery_choices(true)
-            .iter()
-            .any(|(_, action, _)| *action == ChatGptSetupAction::Fallback));
-        assert!(!validation_recovery_choices(false)
-            .iter()
-            .any(|(_, action, _)| *action == ChatGptSetupAction::Fallback));
-    }
-
-    #[test]
-    fn device_setup_events_cover_copy_open_cancel_and_resize() {
-        use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
-
-        let key = |code| {
-            Event::Key(KeyEvent {
-                code,
-                modifiers: KeyModifiers::NONE,
-                kind: KeyEventKind::Press,
-                state: KeyEventState::NONE,
-            })
-        };
-        assert_eq!(
-            device_ui_action(&key(KeyCode::Char('c'))),
-            DeviceUiAction::Copy
-        );
-        assert_eq!(
-            device_ui_action(&key(KeyCode::Char('O'))),
-            DeviceUiAction::Open
-        );
-        assert_eq!(device_ui_action(&key(KeyCode::Esc)), DeviceUiAction::Cancel);
-        assert_eq!(
-            device_ui_action(&Event::Resize(120, 40)),
-            DeviceUiAction::Redraw
-        );
-        assert!(open_verification_url("http://example.invalid")
-            .unwrap_err()
-            .to_string()
-            .contains("non-HTTPS"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_device_countdown_redraws_while_input_is_idle() {
-        let mut countdown = DeviceCountdown::new(Duration::from_secs(600));
-
-        countdown.tick().await;
-        let initial = countdown.remaining();
-        let initial_render = device_login_body("https://example.test", "CODE", "Pending", initial);
-
-        tokio::time::advance(Duration::from_secs(2)).await;
-        countdown.tick().await;
-        let updated = countdown.remaining();
-        let updated_render = device_login_body("https://example.test", "CODE", "Pending", updated);
-
-        assert!(updated <= initial.saturating_sub(Duration::from_secs(1)));
-        assert_ne!(initial_render, updated_render);
-    }
-
-    #[test]
-    fn test_successful_login_after_cancel_requires_explicit_acknowledgement_state() {
-        let state = state_after_device_login(
-            ChatGptSetupState::LoginPending,
-            crate::providers::codex_app_server::DeviceLoginOutcome::CompletedAfterCancel,
-        )
-        .unwrap();
-
-        assert_eq!(state, ChatGptSetupState::AuthenticatedAfterCancel);
-        assert!(state.transition(ChatGptSetupAction::Cancel).is_err());
-        assert!(state
-            .transition(ChatGptSetupAction::LoginSucceeded)
-            .is_err());
-        assert!(!should_logout_after_post_cancel_choice(
-            ChatGptSetupAction::Keep
-        ));
-        assert!(should_logout_after_post_cancel_choice(
-            ChatGptSetupAction::Logout
-        ));
-        assert!(should_logout_after_post_cancel_choice(
-            ChatGptSetupAction::Cancel
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_public_ceremony_validation_failure_saves_configured_fallback() {
-        let directory = tempfile::tempdir().unwrap();
-        let config_path = directory.path().join("config.toml");
-        let (ceremony, restores) = boundary_ceremony(
-            &directory,
-            [ChatGptSetupAction::Reuse, ChatGptSetupAction::Fallback],
-            false,
-        );
-        install_test_ceremony(ceremony);
-
-        let outcome =
-            validate_and_apply_for(SetupInvocation::Command, &chatgpt_ceremony_result(true))
-                .await
-                .unwrap();
-
-        assert_eq!(outcome, SetupApplyOutcome::Saved);
-        let saved = std::fs::read_to_string(config_path).unwrap();
-        assert!(saved.contains("grok"));
-        assert!(!saved.contains("chatgpt_subscription"));
-        assert_eq!(*restores.lock().unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_public_ceremony_post_cancel_requires_retain_or_logs_out() {
-        for (decision, expected_logouts) in [
-            (ChatGptSetupAction::Keep, 0),
-            (ChatGptSetupAction::Logout, 1),
-            (ChatGptSetupAction::Cancel, 1),
-        ] {
-            let observed = Arc::new(Mutex::new(CeremonyObservations::default()));
-            install_test_ceremony(MockChatGptCeremony {
-                signed_in: false,
-                choices: [ChatGptSetupAction::Login, decision].into_iter().collect(),
-                login_outcomes: [
-                    crate::providers::codex_app_server::DeviceLoginOutcome::CompletedAfterCancel,
-                ]
-                .into_iter()
-                .collect(),
-                validation_error: false,
-                choice_error_after: None,
-                choices_seen: 0,
-                observed: Arc::clone(&observed),
-            });
-
-            let outcome =
-                validate_and_apply_for(SetupInvocation::Command, &chatgpt_ceremony_result(false))
-                    .await
-                    .unwrap();
-
-            assert_eq!(outcome, SetupApplyOutcome::Cancelled);
-            let observed = observed.lock().unwrap();
-            assert_eq!(observed.logouts, expected_logouts, "{decision:?}");
-            assert_eq!(observed.restores, 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_public_ceremony_ambiguous_failure_and_existing_cancel_log_out() {
-        for (choices, validation_error, expect_error) in [
-            (
-                vec![ChatGptSetupAction::Reuse, ChatGptSetupAction::Cancel],
-                true,
-                true,
-            ),
-            (
-                vec![ChatGptSetupAction::Cancel, ChatGptSetupAction::Cancel],
-                false,
-                false,
-            ),
-        ] {
-            let observed = Arc::new(Mutex::new(CeremonyObservations::default()));
-            install_test_ceremony(MockChatGptCeremony {
-                signed_in: true,
-                choices: choices.into_iter().collect(),
-                login_outcomes: Default::default(),
-                validation_error,
-                choice_error_after: None,
-                choices_seen: 0,
-                observed: Arc::clone(&observed),
-            });
-
-            let outcome =
-                validate_and_apply_for(SetupInvocation::Command, &chatgpt_ceremony_result(false))
-                    .await;
-            assert_eq!(outcome.is_err(), expect_error);
-            let observed = observed.lock().unwrap();
-            assert_eq!(observed.logouts, 1);
-            assert_eq!(observed.restores, 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_existing_account_escape_logs_out_through_real_app_server_boundary() {
-        let directory = tempfile::tempdir().unwrap();
-        let (ceremony, restores) = boundary_ceremony(
-            &directory,
-            [ChatGptSetupAction::Cancel, ChatGptSetupAction::Cancel],
-            true,
-        );
-        install_test_ceremony(ceremony);
-
-        let outcome = validate_command_and_apply(&chatgpt_ceremony_result(false))
+        let error = validate_and_apply_for(SetupInvocation::Command, &result)
             .await
-            .unwrap();
-
-        assert_eq!(outcome, SetupApplyOutcome::Cancelled);
-        assert!(directory.path().join("profile/logged_out").is_file());
-        assert_eq!(*restores.lock().unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_acknowledgement_input_errors_logout_exactly_once() {
-        for (signed_in, choices, login_outcomes, validation_error) in [
-            (
-                false,
-                vec![ChatGptSetupAction::Login],
-                vec![crate::providers::codex_app_server::DeviceLoginOutcome::CompletedAfterCancel],
-                false,
-            ),
-            (true, vec![ChatGptSetupAction::Reuse], vec![], true),
-            (true, vec![ChatGptSetupAction::Cancel], vec![], false),
-        ] {
-            let observed = Arc::new(Mutex::new(CeremonyObservations::default()));
-            install_test_ceremony(MockChatGptCeremony {
-                signed_in,
-                choices: choices.into_iter().collect(),
-                login_outcomes: login_outcomes.into_iter().collect(),
-                validation_error,
-                choice_error_after: Some(1),
-                choices_seen: 0,
-                observed: Arc::clone(&observed),
-            });
-
-            let error = validate_command_and_apply(&chatgpt_ceremony_result(false))
-                .await
-                .unwrap_err();
-            assert!(error
-                .to_string()
-                .contains("setup acknowledgement input failed"));
-            let observed = observed.lock().unwrap();
-            assert_eq!(observed.logouts, 1);
-            assert_eq!(observed.restores, 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_first_run_command_and_repl_adapters_share_public_ceremony() {
-        for invocation in [
-            SetupInvocation::FirstRun,
-            SetupInvocation::Command,
-            SetupInvocation::Repl,
-        ] {
-            let directory = tempfile::tempdir().unwrap();
-            let config_path = directory.path().join("config.toml");
-            let (ceremony, restores) =
-                boundary_ceremony(&directory, [ChatGptSetupAction::Reuse], true);
-            install_test_ceremony(ceremony);
-            let mut result = chatgpt_ceremony_result(false);
-            result.coreml = CoreMlConfig {
-                compute_units: crate::config::CoreMlComputeUnits::CpuAndGpu,
-                profile_compute_plan: true,
-                enable_subgraphs: true,
-            };
-            let outcome = match invocation {
-                SetupInvocation::FirstRun => validate_first_run_and_apply(&result).await,
-                SetupInvocation::Command => validate_command_and_apply(&result).await,
-                SetupInvocation::Repl => validate_repl_and_apply(&result).await,
-            }
-            .unwrap();
-
-            assert_eq!(outcome, SetupApplyOutcome::Saved);
-            let saved = std::fs::read_to_string(config_path).unwrap();
-            assert!(saved.contains("chatgpt_subscription"), "{invocation:?}");
-            let reloaded = crate::config::load_config_from_path_with_paths(
-                &directory.path().join("config.toml"),
-                directory.path().join("metrics"),
-                None,
-            )
-            .unwrap();
-            assert_eq!(reloaded.backend.coreml, result.coreml, "{invocation:?}");
-            assert_eq!(*restores.lock().unwrap(), 1, "{invocation:?}");
-        }
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Legacy chatgpt_subscription profiles are unsupported"));
+        assert!(message.contains("finch setup") || message.contains("configure OpenAI Platform"));
     }
 }

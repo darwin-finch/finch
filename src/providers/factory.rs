@@ -5,7 +5,6 @@
 use anyhow::{bail, Context, Result};
 
 use super::claude::ClaudeProvider;
-use super::codex_app_server::CodexAppServerProvider;
 use super::gemini::GeminiProvider;
 use super::openai::OpenAIProvider;
 use super::LlmProvider;
@@ -77,14 +76,9 @@ impl ProviderGraph {
 /// (`create_local_generator`).
 pub fn create_provider_from_entry(entry: &ProviderEntry) -> Result<Box<dyn LlmProvider>> {
     match entry {
-        ProviderEntry::ChatgptSubscription {
-            credential_ref,
-            model,
-            ..
-        } => Ok(Box::new(CodexAppServerProvider::new(
-            credential_ref.clone(),
-            model.clone().unwrap_or_else(|| "gpt-5.6-sol".to_string()),
-        )?)),
+        ProviderEntry::LegacyChatgptSubscription { .. } => bail!(
+            "Legacy chatgpt_subscription profiles are unsupported because Finch no longer launches Codex app-server. Run `finch setup` and configure OpenAI Platform with an API key or another supported provider; subscription credentials are not API keys"
+        ),
         ProviderEntry::Claude {
             api_key,
             model,
@@ -250,11 +244,11 @@ where
     for (idx, entry) in cloud.into_iter().enumerate() {
         match create(entry) {
             Ok(provider) => providers.push((entry.profile_name(), provider)),
-            Err(error) if matches!(entry, ProviderEntry::ChatgptSubscription { .. }) => {
+            Err(error) if matches!(entry, ProviderEntry::LegacyChatgptSubscription { .. }) => {
                 tracing::warn!(
                     provider_index = idx + 1,
                     error = %error,
-                    "Skipping unusable ChatGPT subscription provider; configured fallbacks remain available"
+                    "Skipping unsupported legacy ChatGPT subscription provider; configured fallbacks remain available"
                 );
                 skipped_chatgpt.push(format!("provider #{}: {error}", idx + 1));
             }
@@ -537,26 +531,6 @@ mod tests {
         }
     }
 
-    fn install_schema_app_server(directory: &tempfile::TempDir, restricted: bool) {
-        let fake = directory.path().join("schema_app_server.py");
-        let script = if restricted {
-            r#"import json, pathlib, sys
-out = pathlib.Path(sys.argv[-1]) / 'v2'
-out.mkdir(parents=True)
-(out / 'ThreadStartParams.json').write_text('{}')
-schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandboxPolicy'}}, 'definitions': {'ReadOnlySandboxPolicy': {'properties': {'type': {'enum': ['readOnly']}, 'networkAccess': {'type': 'boolean'}, 'access': {'$ref': '#/definitions/ReadOnlyAccess'}}}, 'ReadOnlyAccess': {'properties': {'type': {'enum': ['restricted']}, 'readableRoots': {'type': 'array', 'items': {'type': 'string'}}, 'includePlatformDefaults': {'type': 'boolean'}}}}}
-(out / 'TurnStartParams.json').write_text(json.dumps(schema))
-"#
-        } else {
-            "import sys\n# No restricted schema output.\nsys.exit(0)\n"
-        };
-        std::fs::write(&fake, script).unwrap();
-        crate::providers::codex_app_server::install_test_provider_app_server(
-            std::path::PathBuf::from("python3"),
-            vec![fake.to_string_lossy().into_owned()],
-        );
-    }
-
     fn pentry(variant: ProviderEntry) -> ProviderEntry {
         variant
     }
@@ -577,6 +551,39 @@ schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandbo
         let provider = create_provider_from_teacher(&entry("openai", "test-key"));
         assert!(provider.is_ok());
         assert_eq!(provider.unwrap().name(), "openai");
+    }
+
+    #[test]
+    fn test_openai_platform_api_key_entry_remains_direct_and_unchanged() {
+        let provider = create_provider_from_entry(&ProviderEntry::Openai {
+            api_key: "sk-platform-test".into(),
+            model: Some("gpt-4o-mini".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("platform".into()),
+            reasoning_effort: None,
+        })
+        .unwrap();
+
+        assert_eq!(provider.name(), "openai");
+        assert_eq!(provider.default_model(), "gpt-4o-mini");
+    }
+
+    #[test]
+    fn test_legacy_subscription_never_accepts_platform_or_app_server_credentials() {
+        for credential_ref in ["", "codex-app-server:managed", "openai-platform:api-key"] {
+            let error = create_provider_from_entry(&ProviderEntry::LegacyChatgptSubscription {
+                credential_ref: credential_ref.into(),
+                model: Some("gpt-5.6-sol".into()),
+                name: None,
+            })
+            .err()
+            .expect("legacy subscription must be rejected");
+            let message = error.to_string();
+            assert!(message.contains("Legacy chatgpt_subscription profiles are unsupported"));
+            assert!(message.contains("subscription credentials are not API keys"));
+        }
     }
 
     #[test]
@@ -790,14 +797,12 @@ schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandbo
     }
 
     #[test]
-    fn test_unusable_chatgpt_schema_preserves_later_configured_grok_fallback() {
+    fn test_unsupported_legacy_chatgpt_preserves_later_configured_grok_fallback() {
         let directory = tempfile::tempdir().unwrap();
-        install_schema_app_server(&directory, false);
         let entries = vec![
-            ProviderEntry::ChatgptSubscription {
-                credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
-                    .into(),
-                model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.into()),
+            ProviderEntry::LegacyChatgptSubscription {
+                credential_ref: "codex-app-server:managed".into(),
+                model: Some("gpt-5.6-sol".into()),
                 name: Some("subscription".into()),
             },
             ProviderEntry::Grok {
@@ -827,13 +832,12 @@ schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandbo
     }
 
     #[test]
-    fn test_saved_chatgpt_only_config_constructs_shared_startup_provider() {
+    fn test_saved_legacy_chatgpt_only_config_fails_with_actionable_migration() {
         let directory = tempfile::tempdir().unwrap();
-        install_schema_app_server(&directory, true);
         let path = directory.path().join("config.toml");
-        Config::with_providers(vec![ProviderEntry::ChatgptSubscription {
-            credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF.into(),
-            model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.into()),
+        Config::with_providers(vec![ProviderEntry::LegacyChatgptSubscription {
+            credential_ref: "codex-app-server:managed".into(),
+            model: Some("gpt-5.6-sol".into()),
             name: Some("subscription".into()),
         }])
         .save_to(&path)
@@ -841,15 +845,13 @@ schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandbo
 
         let config = crate::config::load_config_from_path(&path).unwrap();
         assert!(config.teachers.is_empty());
-        let graph = create_provider_graph_from_config(&config).unwrap();
-        assert_eq!(graph.profiles().len(), 1);
-        assert_eq!(graph.profiles()[0].profile_name(), "subscription");
-        let default_provider = graph.default_provider();
-        assert!(Arc::ptr_eq(
-            &default_provider,
-            graph.profiles()[0].provider()
-        ));
-        assert_eq!(default_provider.name(), "chatgpt_subscription");
+        let error = create_provider_graph_from_config(&config)
+            .err()
+            .expect("legacy-only graph must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("Legacy chatgpt_subscription profiles are unsupported"));
+        assert!(message.contains("finch setup"));
+        assert!(message.contains("subscription credentials are not API keys"));
     }
 
     #[test]

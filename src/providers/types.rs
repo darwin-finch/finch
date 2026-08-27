@@ -185,7 +185,6 @@ pub enum WireProtocol {
     AnthropicMessages,
     OpenAiChatCompletions,
     GeminiGenerateContent,
-    CodexAppServer,
 }
 
 /// Known wire protocol and the evidence for that binding.

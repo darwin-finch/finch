@@ -2614,9 +2614,8 @@ impl EventLoop {
                                     .write_info("Setup wizard exited.".to_string());
                             }
                         }
-                        // The setup wizard and ChatGPT ceremony own terminal modes for their
-                        // complete lifetime. Reacquire the REPL only after every async setup
-                        // state is terminal, including cancellation and error recovery.
+                        // The setup wizard owns terminal modes for its complete lifetime.
+                        // Reacquire the REPL only after the async setup state is terminal.
                         {
                             let mut tui = self.tui_renderer.lock().await;
                             tui.resume().ok();

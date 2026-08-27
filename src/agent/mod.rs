@@ -520,38 +520,23 @@ mod tests {
     use crate::config::ProviderEntry;
 
     #[test]
-    fn test_saved_chatgpt_only_config_constructs_agent_client() {
+    fn test_saved_legacy_chatgpt_only_config_rejects_agent_startup() {
         let directory = tempfile::tempdir().unwrap();
-        let fake = directory.path().join("schema_app_server.py");
-        std::fs::write(
-            &fake,
-            r#"import json, pathlib, sys
-out = pathlib.Path(sys.argv[-1]) / 'v2'
-out.mkdir(parents=True)
-(out / 'ThreadStartParams.json').write_text('{}')
-schema = {'properties': {'sandboxPolicy': {'$ref': '#/definitions/ReadOnlySandboxPolicy'}}, 'definitions': {'ReadOnlySandboxPolicy': {'properties': {'type': {'enum': ['readOnly']}, 'networkAccess': {'type': 'boolean'}, 'access': {'$ref': '#/definitions/ReadOnlyAccess'}}}, 'ReadOnlyAccess': {'properties': {'type': {'enum': ['restricted']}, 'readableRoots': {'type': 'array', 'items': {'type': 'string'}}, 'includePlatformDefaults': {'type': 'boolean'}}}}}
-(out / 'TurnStartParams.json').write_text(json.dumps(schema))
-"#,
-        )
-        .unwrap();
-        crate::providers::codex_app_server::install_test_provider_app_server(
-            PathBuf::from("python3"),
-            vec![fake.to_string_lossy().into_owned()],
-        );
-
         let path = directory.path().join("config.toml");
-        Config::with_providers(vec![ProviderEntry::ChatgptSubscription {
-            credential_ref: crate::providers::codex_app_server::MANAGED_CODEX_CREDENTIAL_REF
-                .to_string(),
-            model: Some(crate::providers::codex_app_server::GPT_5_6_SOL.to_string()),
+        Config::with_providers(vec![ProviderEntry::LegacyChatgptSubscription {
+            credential_ref: "codex-app-server:managed".to_string(),
+            model: Some("gpt-5.6-sol".to_string()),
             name: Some("subscription".to_string()),
         }])
         .save_to(&path)
         .unwrap();
         let config = crate::config::load_config_from_path(&path).unwrap();
 
-        let client = create_client(&config).unwrap();
-        assert_eq!(client.provider_name(), "chatgpt_subscription");
-        assert_eq!(client.model_name(), "gpt-5.6-sol");
+        let error = create_client(&config)
+            .err()
+            .expect("legacy subscription must fail agent startup");
+        assert!(error
+            .to_string()
+            .contains("Legacy chatgpt_subscription profiles are unsupported"));
     }
 }
