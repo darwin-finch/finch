@@ -67,6 +67,57 @@ enum ConfirmationChoice {
 #[cfg(test)]
 mod disabled_training_tests {
     use super::*;
+    use crate::claude::ContentBlock;
+    use crate::providers::{LlmProvider, ProviderRequest, ProviderResponse, StreamChunk};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct HermeticFallbackProvider {
+        buffered_calls: Arc<AtomicUsize>,
+        streaming_calls: Arc<AtomicUsize>,
+        expected_query: &'static str,
+        response: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for HermeticFallbackProvider {
+        async fn send_message(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
+            self.buffered_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(
+                request
+                    .messages
+                    .iter()
+                    .any(|message| message.text_content() == self.expected_query),
+                "hermetic provider did not receive the fallback query"
+            );
+
+            Ok(ProviderResponse {
+                id: "hermetic-fallback-response".to_string(),
+                model: "hermetic-fallback-model".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: self.response.to_string(),
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                role: "assistant".to_string(),
+                provider: "hermetic-fallback".to_string(),
+            })
+        }
+
+        async fn send_message_stream(
+            &self,
+            _request: &ProviderRequest,
+        ) -> Result<tokio::sync::mpsc::Receiver<Result<StreamChunk>>> {
+            self.streaming_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("hermetic fallback regression must not use streaming")
+        }
+
+        fn name(&self) -> &str {
+            "hermetic-fallback"
+        }
+
+        fn default_model(&self) -> &str {
+            "hermetic-fallback-model"
+        }
+    }
 
     #[test]
     fn legacy_repl_has_no_automatic_training_queue_producer() {
@@ -93,46 +144,71 @@ mod disabled_training_tests {
         let conversations_before = std::fs::read(&legacy_conversations).unwrap();
         let training_before = std::fs::read(&legacy_training_queue).unwrap();
 
-        let mut upstream = mockito::Server::new_async().await;
-        let response = upstream
-            .mock("POST", "/v1/messages")
-            .with_status(200)
-            .with_body(
-                format!(
-                    r#"{{"id":"msg-1","type":"message","role":"assistant","content":[{{"type":"text","text":"{SENSITIVE_RESPONSE}"}}],"model":"claude-test","stop_reason":"end_turn"}}"#,
-                ),
-            )
-            .create_async()
-            .await;
+        let buffered_calls = Arc::new(AtomicUsize::new(0));
+        let streaming_calls = Arc::new(AtomicUsize::new(0));
+        let client = ClaudeClient::with_provider(Box::new(HermeticFallbackProvider {
+            buffered_calls: Arc::clone(&buffered_calls),
+            streaming_calls: Arc::clone(&streaming_calls),
+            expected_query: SENSITIVE_QUERY,
+            response: SENSITIVE_RESPONSE,
+        }));
+
+        // These values deliberately cannot authenticate or reach a provider. The
+        // fallback boundary must use the explicitly injected provider above,
+        // never reconstruct one from Config or ambient user credentials.
         let teacher = crate::config::TeacherEntry {
             provider: "claude".into(),
-            api_key: "sk-ant-test-key-for-fallback-boundary".into(),
-            model: Some("claude-test".into()),
-            base_url: Some(upstream.url()),
-            name: Some("fallback-test".into()),
+            api_key: "POISON_REAL_PROVIDER_CREDENTIAL_MUST_NOT_BE_READ".into(),
+            model: Some("poison-real-provider-model".into()),
+            base_url: Some("http://127.0.0.1:1/provider-must-not-be-reached".into()),
+            name: Some("poison-configured-provider".into()),
         };
-        let mut config = Config::new(vec![teacher]);
-        config.metrics_dir = temp.path().join("metrics");
-        config.tui_enabled = false;
-        config.features.streaming_enabled = false;
+        let provider = crate::config::ProviderEntry::from_teacher_entry(&teacher);
+        let mut features = crate::config::FeaturesConfig::default();
+        features.streaming_enabled = false;
         #[allow(deprecated)]
-        {
-            config.streaming_enabled = false;
-        }
-        config.memory.enabled = true;
-        config.memory.db_path = temp.path().join("canonical-memory.db");
-        config.memory.use_neural_embeddings = false;
-        config.memory.embedding_cache_dir = temp.path().join("embedding-cache");
+        let config = Config {
+            metrics_dir: temp.path().join("metrics"),
+            streaming_enabled: false,
+            tui_enabled: false,
+            constitution_path: None,
+            active_persona: "default".to_string(),
+            active_theme: "dark".to_string(),
+            huggingface_token: None,
+            backend: crate::config::BackendConfig::default(),
+            server: crate::config::ServerConfig::default(),
+            client: crate::config::ClientConfig::default(),
+            providers: vec![provider],
+            teachers: vec![teacher],
+            colors: crate::config::ColorScheme::default(),
+            features,
+            mcp_servers: HashMap::new(),
+            memory: crate::memory::MemoryConfig {
+                db_path: temp.path().join("canonical-memory.db"),
+                enabled: true,
+                max_context_items: 5,
+                checkpoint_interval_secs: 300,
+                use_neural_embeddings: false,
+                embedding_cache_dir: temp.path().join("embedding-cache"),
+            },
+            license: crate::config::LicenseConfig::default(),
+        };
         let metrics = MetricsLogger::new(config.metrics_dir.clone()).unwrap();
-        let client = ClaudeClient::new("sk-ant-unused-facade-key".into()).unwrap();
         let router = Router::new(crate::models::ThresholdRouter::default());
-        let mut repl = Repl::new(
+        let initialization = ReplInitialization {
+            models_dir: Some(temp.path().join("models")),
+            patterns_path: temp.path().join("tool-patterns.json"),
+            conversation_log_path: temp.path().join("unused-conversations.jsonl"),
+            active_persona: crate::config::Persona::load_builtin("default"),
+        };
+        let mut repl = Repl::new_with_initialization(
             config,
             client,
             router,
             metrics,
             None,
             "fallback-boundary".into(),
+            initialization,
         )
         .await;
         repl.conversation_logger = Arc::new(tokio::sync::Mutex::new(
@@ -142,7 +218,12 @@ mod disabled_training_tests {
         let actual = repl.process_query(SENSITIVE_QUERY).await.unwrap();
 
         assert_eq!(actual, SENSITIVE_RESPONSE);
-        response.assert_async().await;
+        assert_eq!(buffered_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(streaming_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            repl.teacher_session.read().await.provider_name(),
+            "hermetic-fallback"
+        );
 
         let metrics_path = config_metrics_path(temp.path());
         let metrics_jsonl = std::fs::read_to_string(&metrics_path).unwrap();
@@ -434,6 +515,30 @@ pub struct Repl {
     auto_compact_enabled: bool,
 }
 
+struct ReplInitialization {
+    models_dir: Option<PathBuf>,
+    patterns_path: PathBuf,
+    conversation_log_path: PathBuf,
+    active_persona: Result<crate::config::Persona>,
+}
+
+impl ReplInitialization {
+    fn from_user_environment(config: &Config) -> Self {
+        let home = dirs::home_dir();
+        Self {
+            models_dir: home.as_ref().map(|root| root.join(".finch/models")),
+            patterns_path: home
+                .as_ref()
+                .map(|root| root.join(".finch/tool_patterns.json"))
+                .unwrap_or_else(|| PathBuf::from(".finch/tool_patterns.json")),
+            conversation_log_path: home
+                .map(|root| root.join(".finch/conversations.jsonl"))
+                .unwrap_or_else(|| PathBuf::from(".finch/conversations.jsonl")),
+            active_persona: crate::config::Persona::load_by_name(&config.active_persona),
+        }
+    }
+}
+
 #[allow(dead_code)]
 impl Repl {
     pub async fn new(
@@ -444,6 +549,28 @@ impl Repl {
         daemon_client: Option<Arc<crate::client::DaemonClient>>,
         session_label: String,
     ) -> Self {
+        let initialization = ReplInitialization::from_user_environment(&config);
+        Self::new_with_initialization(
+            config,
+            claude_client,
+            router,
+            metrics_logger,
+            daemon_client,
+            session_label,
+            initialization,
+        )
+        .await
+    }
+
+    async fn new_with_initialization(
+        config: Config,
+        claude_client: ClaudeClient,
+        router: Router,
+        metrics_logger: MetricsLogger,
+        daemon_client: Option<Arc<crate::client::DaemonClient>>,
+        session_label: String,
+        initialization: ReplInitialization,
+    ) -> Self {
         // Detect if we're in interactive mode (stdout is a TTY)
         let is_interactive = io::stdout().is_terminal();
 
@@ -451,7 +578,7 @@ impl Repl {
         let daemon_mode = daemon_client.is_some();
 
         // Set up models directory
-        let models_dir = dirs::home_dir().map(|home| home.join(".finch").join("models"));
+        let models_dir = initialization.models_dir;
 
         // Load validator only (router is now in Router)
         let threshold_validator =
@@ -714,9 +841,7 @@ impl Repl {
         }
 
         // Determine patterns path
-        let patterns_path = dirs::home_dir()
-            .map(|home| home.join(".finch").join("tool_patterns.json"))
-            .unwrap_or_else(|| PathBuf::from(".finch/tool_patterns.json"));
+        let patterns_path = initialization.patterns_path;
 
         // Create tool executor
         let executor =
@@ -902,9 +1027,7 @@ impl Repl {
 
         // Legacy collector construction is side-effect free and persistence is
         // disabled. Keep the value only for API compatibility.
-        let log_path = dirs::home_dir()
-            .map(|home| home.join(".finch").join("conversations.jsonl"))
-            .unwrap_or_else(|| PathBuf::from(".finch/conversations.jsonl"));
+        let log_path = initialization.conversation_log_path;
         let conversation_logger = Arc::new(tokio::sync::Mutex::new(
             crate::logging::ConversationLogger::new(log_path).unwrap_or_else(|e| {
                 output_status!("⚠️  Failed to create conversation logger: {}", e);
@@ -913,7 +1036,7 @@ impl Repl {
         ));
 
         // Phase 2: Load active persona
-        let active_persona = match crate::config::Persona::load_by_name(&config.active_persona) {
+        let active_persona = match initialization.active_persona {
             Ok(persona) => Arc::new(RwLock::new(persona)),
             Err(e) => {
                 output_status!(
