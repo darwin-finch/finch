@@ -462,9 +462,10 @@ sentinel_pid=''
 ! rg -n 'pkill|killall|127\.0\.0\.1:[1-9][0-9]*|(^|[;&|[:space:]])kill[[:space:]]+-' \
   "$repo_root/docs/AUTOMATIC_TRAINING.md" "$repo_root/docs/DEVELOPMENT.md" "$repo_root/tests/README.md"
 
-# Scan the full executable/test closure. Only the supervisor's group creation,
-# the production ambient-daemon detach (which the isolated gate denies first),
-# and the deliberate outside-peer adversary may use an escape API.
+# Scan the full executable/test closure. Provider subprocesses may detach only
+# after `isolated_test_proof_if_present` proves that no supervisor authority is
+# active; a valid isolated proof keeps them in the supervisor-owned group and a
+# malformed claimed proof fails before spawn.
 escape_uses="$(
   phase=escape-api-allowlist
   cd "$repo_root"
@@ -477,6 +478,8 @@ expected_escape_uses="$(cat <<'EOF'
 src/bin/finch-test-supervisor.rs:if libc::setpgid(0, 0) == -1 {
 src/brain/mod.rs:.process_group(0)
 src/daemon/spawn.rs:.process_group(0)
+src/providers/codex_app_server.rs:nix::unistd::setsid().map_err(std::io::Error::other)?;
+src/providers/codex_app_server.rs:nix::unistd::setsid().map_err(std::io::Error::other)?;
 EOF
 )"
 [[ "$escape_uses" == "$expected_escape_uses" ]]

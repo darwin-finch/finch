@@ -521,7 +521,9 @@ impl AppServerCommand {
         process.args(&self.args);
         process.args(["generate-json-schema", "--out"]);
         process.arg(directory.path());
-        harden_std_process(&mut process, self.codex_home.as_deref());
+        if harden_std_process(&mut process, self.codex_home.as_deref()).is_err() {
+            return ProtocolCapabilities::default();
+        }
         let Ok(mut child) = process.spawn() else {
             return ProtocolCapabilities::default();
         };
@@ -750,7 +752,7 @@ fn run_version_bounded(
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .stdout(Stdio::piped());
-    configure_std_process_group(&mut process);
+    configure_std_process_group(&mut process)?;
     let mut child = process
         .spawn()
         .context("Could not start trusted Codex CLI")?;
@@ -792,18 +794,24 @@ fn inherited_process_environment(codex_home: Option<&Path>) -> Vec<(&'static str
     environment
 }
 
-fn harden_std_process(process: &mut std::process::Command, codex_home: Option<&Path>) {
+fn harden_std_process(
+    process: &mut std::process::Command,
+    codex_home: Option<&Path>,
+) -> Result<()> {
     process
         .env_clear()
         .envs(inherited_process_environment(codex_home))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    configure_std_process_group(process);
+    configure_std_process_group(process)
 }
 
 #[cfg(unix)]
-fn configure_std_process_group(process: &mut std::process::Command) {
+fn configure_std_process_group(process: &mut std::process::Command) -> Result<()> {
+    if !provider_process_group_detach_allowed()? {
+        return Ok(());
+    }
     use std::os::unix::process::CommandExt;
     unsafe {
         process.pre_exec(|| {
@@ -811,10 +819,17 @@ fn configure_std_process_group(process: &mut std::process::Command) {
             Ok(())
         });
     }
+    Ok(())
+}
+
+fn provider_process_group_detach_allowed() -> Result<bool> {
+    crate::brain::isolated_test_proof_if_present().map(|proof| proof.is_none())
 }
 
 #[cfg(not(unix))]
-fn configure_std_process_group(_process: &mut std::process::Command) {}
+fn configure_std_process_group(_process: &mut std::process::Command) -> Result<()> {
+    crate::brain::isolated_test_proof_if_present().map(|_| ())
+}
 
 #[cfg(unix)]
 fn kill_std_process_group(child: &mut std::process::Child) {
@@ -955,7 +970,7 @@ impl RpcClient {
         for (name, value) in inherited_process_environment(command.codex_home.as_deref()) {
             process.env(name, value);
         }
-        configure_tokio_process_group(&mut process);
+        configure_tokio_process_group(&mut process)?;
         let mut child = process
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1259,7 +1274,10 @@ fn verify_effective_requirements(result: &Value) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn configure_tokio_process_group(process: &mut Command) {
+fn configure_tokio_process_group(process: &mut Command) -> Result<()> {
+    if !provider_process_group_detach_allowed()? {
+        return Ok(());
+    }
     use std::os::unix::process::CommandExt;
     unsafe {
         process.as_std_mut().pre_exec(|| {
@@ -1267,10 +1285,13 @@ fn configure_tokio_process_group(process: &mut Command) {
             Ok(())
         });
     }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn configure_tokio_process_group(_process: &mut Command) {}
+fn configure_tokio_process_group(_process: &mut Command) -> Result<()> {
+    crate::brain::isolated_test_proof_if_present().map(|_| ())
+}
 
 #[cfg(unix)]
 fn kill_tokio_process_group(child: &mut Child) {
@@ -2649,6 +2670,18 @@ impl ProviderBackend for CodexAppServerProvider {
 mod tests {
     use super::*;
     use crate::claude::types::Message;
+
+    #[test]
+    fn provider_process_group_escape_matches_authenticated_isolation_authority() {
+        let isolated = crate::brain::isolated_test_proof_if_present()
+            .expect("a claimed test authority must validate")
+            .is_some();
+        assert_eq!(
+            provider_process_group_detach_allowed().unwrap(),
+            !isolated,
+            "provider children must remain in the supervisor-owned process group"
+        );
+    }
 
     fn mock_app_server(account_type: &str) -> (tempfile::TempDir, AppServerCommand) {
         mock_app_server_with_thread_event(account_type, "after")
