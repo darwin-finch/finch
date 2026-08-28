@@ -1055,7 +1055,8 @@ mod tests {
             catalog.models,
             vec!["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
         );
-        assert_eq!(STATIC_FALLBACK_AS_OF, "2026-08-26");
+        assert_eq!(STATIC_FALLBACK_AS_OF, "2026-08-27");
+        assert_eq!(static_fallback("zai"), vec!["glm-5.3-flash"]);
     }
 
     #[test]
