@@ -1,6 +1,7 @@
 //! Isolated integration tests for the Finch daemon binary.
 
 use anyhow::{Context, Result};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -32,7 +33,9 @@ impl TestDaemon {
             .await;
         let proof = finch::brain::isolated_test_proof()
             .context("daemon integration tests require supervisor authority")?;
+        let brain_address = proof.brain_address().to_owned();
         let daemon_address = proof.daemon_address().to_owned();
+        let socket_root = std::env::var("FINCH_TEST_SOCKET_ROOT").unwrap_or_default();
         let brain_password = proof.brain_password()?;
         let home = proof.home;
         let finch_dir = home.join(".finch");
@@ -46,7 +49,7 @@ impl TestDaemon {
             .arg(&daemon_address)
             .env("FINCH_TEST_BOUND_ADDR_FILE", &address_file)
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let child = command.spawn().context("spawn isolated Finch daemon")?;
         let mut child = OwnedChild(child);
 
@@ -56,7 +59,16 @@ impl TestDaemon {
                 break address.trim().to_owned();
             }
             if let Some(status) = child.0.try_wait()? {
-                anyhow::bail!("isolated daemon exited before binding: {status}");
+                let stderr = bounded_child_stderr(&mut child.0)
+                    .replace(home.to_string_lossy().as_ref(), "<isolated-home>")
+                    .replace(&socket_root, "<socket-root>")
+                    .replace(&brain_address, "<brain-address>")
+                    .replace(&daemon_address, "<daemon-address>")
+                    .replace(&brain_password, "<brain-password>")
+                    .replace(api_key, "<api-key>");
+                anyhow::bail!(
+                    "isolated daemon exited before binding: {status}; bounded stderr={stderr:?}"
+                );
             }
             if Instant::now() >= deadline {
                 anyhow::bail!("isolated daemon did not publish its ephemeral address");
@@ -81,6 +93,49 @@ impl TestDaemon {
     fn base_url(&self) -> String {
         format!("http://{}", self.address)
     }
+}
+
+#[cfg(unix)]
+fn bounded_child_stderr(child: &mut Child) -> String {
+    use std::os::fd::AsRawFd as _;
+
+    const LIMIT: usize = 64 * 1024;
+    let Some(mut stderr) = child.stderr.take() else {
+        return String::new();
+    };
+    let descriptor = stderr.as_raw_fd();
+    let flags = unsafe { nix::libc::fcntl(descriptor, nix::libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe {
+            nix::libc::fcntl(
+                descriptor,
+                nix::libc::F_SETFL,
+                flags | nix::libc::O_NONBLOCK,
+            );
+        }
+    }
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    while output.len() < LIMIT {
+        let remaining = LIMIT - output.len();
+        let chunk = remaining.min(buffer.len());
+        match stderr.read(&mut buffer[..chunk]) {
+            Ok(0) => break,
+            Ok(count) => output.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => return format!("<stderr read failed: {error}>"),
+        }
+    }
+    if output.len() == LIMIT {
+        output.extend_from_slice(b"<truncated>");
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+#[cfg(not(unix))]
+fn bounded_child_stderr(_child: &mut Child) -> String {
+    "<bounded daemon stderr capture requires Unix>".to_owned()
 }
 
 fn write_config(
