@@ -1076,11 +1076,6 @@ fn main() {
     {
         exit_fixture(run_child_stubborn_probe());
     }
-    if std::env::var("FINCH_TEST_HTTP_FIXTURE").as_deref() == Ok("1")
-        && std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref() == Ok("1")
-    {
-        exit_fixture(run_child_http_fixture());
-    }
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new("--verify-inherited-proof"))
         && std::env::args_os().nth(2).is_none()
@@ -1098,6 +1093,11 @@ fn main() {
             }
         };
         std::process::exit(status);
+    }
+    if std::env::var("FINCH_TEST_HTTP_FIXTURE").as_deref() == Ok("1")
+        && std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref() == Ok("1")
+    {
+        exit_fixture(run_child_http_fixture());
     }
     match run() {
         Ok(status) => std::process::exit(status),

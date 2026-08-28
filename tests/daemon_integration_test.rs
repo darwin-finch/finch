@@ -221,6 +221,7 @@ brain_password = {brain_password:?}
 
 async fn wait_for_health(address: &str) -> Result<()> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_millis(250))
         .build()?;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -251,7 +252,12 @@ fn run_query(home: &Path, query: &str) -> Result<std::process::Output> {
 #[ignore = "spawns the built daemon binary"]
 async fn test_daemon_spawn_and_health() -> Result<()> {
     let daemon = TestDaemon::start("sk-ant-isolated-health-test").await?;
-    let response: serde_json::Value = reqwest::get(format!("{}/health", daemon.base_url()))
+    let response: serde_json::Value = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()?
+        .get(format!("{}/health", daemon.base_url()))
+        .send()
         .await?
         .json()
         .await?;
