@@ -224,7 +224,7 @@ fn run_query(home: &Path, query: &str) -> Result<std::process::Output> {
 #[tokio::test]
 #[ignore = "spawns the built daemon binary"]
 async fn test_daemon_spawn_and_health() -> Result<()> {
-    let daemon = TestDaemon::start("isolated-health-test").await?;
+    let daemon = TestDaemon::start("sk-ant-isolated-health-test").await?;
     let response: serde_json::Value = reqwest::get(format!("{}/health", daemon.base_url()))
         .await?
         .json()
