@@ -636,8 +636,12 @@ mock_release_dir="$scratch/target/release"
 mock_finch="$mock_debug_dir/finch"
 mock_bind_log="$scratch/mock-bind.log"
 mkdir -p "$mock_debug_dir" "$mock_release_dir"
-cp "$supervisor" "$mock_finch"
-cp "$mock_finch" "$mock_release_dir/finch"
+# Keep the synthetic Finch entrypoint attached to the exact immutable
+# supervisor inode. Copying it into a fabricated target tree changes what
+# current_exe() is allowed to attest and correctly makes proof verification
+# fail when the copied executable has no pinned supervisor sibling.
+ln -s "$supervisor" "$mock_finch"
+ln -s "$supervisor" "$mock_release_dir/finch"
 FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
   FINCH_TEST_HTTP_FIXTURE=1 FINCH_BIN="$mock_finch" FINCH_MOCK_BIND_LOG="$mock_bind_log" \
   "$supervisor" "$repo_root/scripts/test_server.sh" >/dev/null
@@ -661,6 +665,8 @@ release_supervisor="$repo_root/target/release/finch-test-supervisor-pinned"
 [[ -x "$release_supervisor" ]] || release_supervisor="$repo_root/target/release/finch-test-supervisor"
 if [[ -x "$release_supervisor" ]]; then
   phase=real-wrapped-release-profile
+  rm "$mock_release_dir/finch"
+  ln -s "$release_supervisor" "$mock_release_dir/finch"
   FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
     FINCH_TEST_SUPERVISOR_BIN="$release_supervisor" FINCH_BIN="$mock_release_dir/finch" \
     FINCH_TEST_HTTP_FIXTURE=1 FINCH_MOCK_BIND_LOG="$mock_bind_log" "$release_supervisor" \
