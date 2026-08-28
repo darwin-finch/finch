@@ -11,6 +11,7 @@ struct TestDaemon {
     _serial: tokio::sync::OwnedMutexGuard<()>,
     home_path: PathBuf,
     address: String,
+    ipc_socket: PathBuf,
 }
 
 struct OwnedChild(Child);
@@ -117,6 +118,7 @@ impl TestDaemon {
             _serial: serial,
             home_path: home,
             address,
+            ipc_socket,
         })
     }
 }
@@ -333,7 +335,8 @@ async fn test_daemon_spawn_and_health() -> Result<()> {
     let daemon = TestDaemon::start("sk-ant-isolated-health-test").await?;
     let response = request_health(&daemon.address, Duration::from_secs(2))?;
     assert_eq!(response["status"], "healthy");
-    assert!(daemon.home_path.join(".finch/daemon.sock").exists());
+    assert!(daemon.ipc_socket.exists());
+    assert!(!daemon.home_path.join(".finch/daemon.sock").exists());
     Ok(())
 }
 
