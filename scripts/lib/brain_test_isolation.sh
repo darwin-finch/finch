@@ -130,7 +130,10 @@ brain_test_isolation_is_active() {
   esac
   library_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd -P)" || return 1
   case "$supervisor_executable" in
-    "$library_root/target/debug/finch-test-supervisor"|"$library_root/target/release/finch-test-supervisor")
+    "$library_root/target/debug/finch-test-supervisor"|\
+    "$library_root/target/debug/finch-test-supervisor-pinned"|\
+    "$library_root/target/release/finch-test-supervisor"|\
+    "$library_root/target/release/finch-test-supervisor-pinned")
       expected_supervisor="$supervisor_executable" ;;
     *) brain_isolation_proof_rejected supervisor-profile ;;
   esac

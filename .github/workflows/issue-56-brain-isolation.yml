@@ -86,6 +86,8 @@ jobs:
       run: |
         cargo build --bin finch-test-supervisor
         cargo build --release --bin finch-test-supervisor
+        install -m 0555 target/debug/finch-test-supervisor target/debug/finch-test-supervisor-pinned
+        install -m 0555 target/release/finch-test-supervisor target/release/finch-test-supervisor-pinned
 
     - name: Reject self-issued proof authority
       timeout-minutes: 15

@@ -10,7 +10,9 @@ if [[ "$#" -eq 0 ]]; then
 fi
 
 cd "$repo_root"
-supervisor="${FINCH_TEST_SUPERVISOR_BIN:-$repo_root/target/debug/finch-test-supervisor}"
+default_supervisor="$repo_root/target/debug/finch-test-supervisor-pinned"
+[[ -x "$default_supervisor" ]] || default_supervisor="$repo_root/target/debug/finch-test-supervisor"
+supervisor="${FINCH_TEST_SUPERVISOR_BIN:-$default_supervisor}"
 if [[ -z "${FINCH_TEST_TMP_PARENT:-}" ]]; then
   FINCH_TEST_TMP_PARENT="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
   export FINCH_TEST_TMP_PARENT

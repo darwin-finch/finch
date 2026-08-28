@@ -475,6 +475,15 @@ fn expected_supervisor_executable() -> anyhow::Result<std::path::PathBuf> {
             .parent()
             .ok_or_else(|| anyhow::anyhow!("test dependency directory has no parent"))?;
     }
+    let pinned_name = if cfg!(windows) {
+        "finch-test-supervisor-pinned.exe"
+    } else {
+        "finch-test-supervisor-pinned"
+    };
+    let pinned = directory.join(pinned_name);
+    if pinned.is_file() {
+        return Ok(pinned.canonicalize()?);
+    }
     let name = if cfg!(windows) {
         "finch-test-supervisor.exe"
     } else {

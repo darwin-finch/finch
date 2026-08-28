@@ -6,15 +6,28 @@ trap 'status=$?; echo "Brain isolation regression failed in phase: $phase (line 
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 source "$repo_root/scripts/lib/brain_test_isolation.sh"
-supervisor="${FINCH_TEST_SUPERVISOR_BIN:-$repo_root/target/debug/finch-test-supervisor}"
+default_supervisor="$repo_root/target/debug/finch-test-supervisor-pinned"
+[[ -x "$default_supervisor" ]] || default_supervisor="$repo_root/target/debug/finch-test-supervisor"
+supervisor="${FINCH_TEST_SUPERVISOR_BIN:-$default_supervisor}"
 [[ -x "$supervisor" ]] || { echo 'build finch-test-supervisor before running isolation regressions' >&2; exit 69; }
 
 scratch="$(mktemp -d "$(cd "${TMPDIR:-/tmp}" && pwd -P)/finch-brain-isolation-regression.XXXXXX")"
 sentinel_pid=''
 signaler_pid=''
+substitution_pid=''
+supervisor_backup=''
+substitution_restored=''
 cleanup_regression() {
   if [[ -n "$signaler_pid" ]]; then wait "$signaler_pid" 2>/dev/null || true; fi
   if [[ -n "$sentinel_pid" ]]; then printf '\n' >&7 2>/dev/null || true; wait "$sentinel_pid" 2>/dev/null || true; fi
+  if [[ -n "$supervisor_backup" && -e "$supervisor_backup" ]]; then
+    mv -f -- "$supervisor_backup" "$supervisor"
+  fi
+  if [[ -n "$substitution_restored" ]]; then : >"$substitution_restored"; fi
+  if [[ -n "$substitution_pid" ]]; then
+    kill "$substitution_pid" 2>/dev/null || true
+    wait "$substitution_pid" 2>/dev/null || true
+  fi
   exec 7>&- 2>/dev/null || true
   rm -rf -- "$scratch"
 }
@@ -76,6 +89,67 @@ phase=supervisor-canonicalizes-default-temp-parent
 env -u FINCH_TEST_TMP_PARENT FINCH_TEST_REAL_HOME="$fake_home" TMPDIR="$temp_parent/" \
   "$supervisor" true
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+# Cargo may relink its ordinary target/debug output while it builds a later
+# integration test. CI therefore runs from a separately staged executable
+# whose pathname Cargo does not own. Replacing that staged pathname while its
+# process is live must invalidate the inherited proof, and restoring the
+# original inode must leave the chosen artifact unchanged for later tests.
+case "$supervisor" in
+  "$repo_root"/target/debug/finch-test-supervisor-pinned|\
+  "$repo_root"/target/release/finch-test-supervisor-pinned)
+    phase=supervisor-substitution-rejected
+    substitution_ready="$scratch/substitution.ready"
+    substitution_continue="$scratch/substitution.continue"
+    substitution_rejected="$scratch/substitution.rejected"
+    substitution_restored="$scratch/substitution.restored"
+    supervisor_backup="$scratch/supervisor.original"
+    supervisor_identity="$(brain_isolation_file_identity "$supervisor")"
+    FINCH_SUBSTITUTION_READY="$substitution_ready" \
+    FINCH_SUBSTITUTION_CONTINUE="$substitution_continue" \
+    FINCH_SUBSTITUTION_REJECTED="$substitution_rejected" \
+    FINCH_SUBSTITUTION_RESTORED="$substitution_restored" \
+      run_isolated bash -c '
+        : >"$FINCH_SUBSTITUTION_READY"
+        for _ in {1..400}; do
+          [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]] && break
+          sleep 0.01
+        done
+        [[ -e "$FINCH_SUBSTITUTION_CONTINUE" ]]
+        if "$FINCH_TEST_SUPERVISOR_BIN" --verify-inherited-proof >/dev/null 2>&1; then
+          exit 1
+        fi
+        : >"$FINCH_SUBSTITUTION_REJECTED"
+        for _ in {1..400}; do
+          [[ -e "$FINCH_SUBSTITUTION_RESTORED" ]] && exit 0
+          sleep 0.01
+        done
+        exit 1
+      ' & substitution_pid=$!
+    for _ in {1..400}; do
+      [[ -e "$substitution_ready" ]] && break
+      sleep 0.01
+    done
+    test -e "$substitution_ready"
+    mv -- "$supervisor" "$supervisor_backup"
+    install -m 0555 "$supervisor_backup" "$supervisor"
+    test "$(brain_isolation_file_identity "$supervisor")" != "$supervisor_identity"
+    : >"$substitution_continue"
+    for _ in {1..400}; do
+      [[ -e "$substitution_rejected" ]] && break
+      sleep 0.01
+    done
+    test -e "$substitution_rejected"
+    mv -f -- "$supervisor_backup" "$supervisor"
+    supervisor_backup=''
+    test "$(brain_isolation_file_identity "$supervisor")" = "$supervisor_identity"
+    : >"$substitution_restored"
+    wait "$substitution_pid"
+    substitution_pid=''
+    substitution_restored=''
+    test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+    ;;
+esac
 
 # The public launcher applies the same canonical-default contract before it
 # delegates to the supervisor.
@@ -583,7 +657,8 @@ test "$profile_status" -eq 64
 # CI builds the release supervisor before this harness, making this a real
 # matched release-profile proof. Developer runs without that artifact retain
 # the debug and mismatch coverage above.
-release_supervisor="$repo_root/target/release/finch-test-supervisor"
+release_supervisor="$repo_root/target/release/finch-test-supervisor-pinned"
+[[ -x "$release_supervisor" ]] || release_supervisor="$repo_root/target/release/finch-test-supervisor"
 if [[ -x "$release_supervisor" ]]; then
   phase=real-wrapped-release-profile
   FINCH_TEST_REAL_HOME="$fake_home" FINCH_TEST_TMP_PARENT="$temp_parent" \
