@@ -1,7 +1,6 @@
 //! Isolated integration tests for the Finch daemon binary.
 
 use anyhow::{Context, Result};
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -42,6 +41,9 @@ impl TestDaemon {
         std::fs::create_dir_all(finch_dir.join("brains"))?;
         write_config(&home, &daemon_address, api_key, &brain_password)?;
         let address_file = finch_dir.join(format!("bound-{}.addr", uuid::Uuid::new_v4().simple()));
+        let stderr_path =
+            finch_dir.join(format!("daemon-{}.stderr", uuid::Uuid::new_v4().simple()));
+        let stderr_file = open_diagnostic_file(&stderr_path)?;
         let mut command = Command::new(env!("CARGO_BIN_EXE_finch"));
         command
             .arg("daemon")
@@ -49,7 +51,7 @@ impl TestDaemon {
             .arg(&daemon_address)
             .env("FINCH_TEST_BOUND_ADDR_FILE", &address_file)
             .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::from(stderr_file.try_clone()?));
         let child = command.spawn().context("spawn isolated Finch daemon")?;
         let mut child = OwnedChild(child);
 
@@ -59,7 +61,7 @@ impl TestDaemon {
                 break address.trim().to_owned();
             }
             if let Some(status) = child.0.try_wait()? {
-                let stderr = bounded_child_stderr(&mut child.0)
+                let stderr = bounded_child_stderr(&stderr_file)
                     .replace(home.to_string_lossy().as_ref(), "<isolated-home>")
                     .replace(&socket_root, "<socket-root>")
                     .replace(&brain_address, "<brain-address>")
@@ -96,45 +98,59 @@ impl TestDaemon {
 }
 
 #[cfg(unix)]
-fn bounded_child_stderr(child: &mut Child) -> String {
-    use std::os::fd::AsRawFd as _;
+fn open_diagnostic_file(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    Ok(std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?)
+}
+
+#[cfg(not(unix))]
+fn open_diagnostic_file(path: &Path) -> Result<std::fs::File> {
+    Ok(std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(path)?)
+}
+
+#[cfg(unix)]
+fn bounded_child_stderr(stderr: &std::fs::File) -> String {
+    use std::os::unix::fs::FileExt as _;
 
     const LIMIT: usize = 64 * 1024;
-    let Some(mut stderr) = child.stderr.take() else {
-        return String::new();
-    };
-    let descriptor = stderr.as_raw_fd();
-    let flags = unsafe { nix::libc::fcntl(descriptor, nix::libc::F_GETFL) };
-    if flags >= 0 {
-        unsafe {
-            nix::libc::fcntl(
-                descriptor,
-                nix::libc::F_SETFL,
-                flags | nix::libc::O_NONBLOCK,
-            );
-        }
-    }
-    let mut output = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    while output.len() < LIMIT {
-        let remaining = LIMIT - output.len();
-        let chunk = remaining.min(buffer.len());
-        match stderr.read(&mut buffer[..chunk]) {
-            Ok(0) => break,
-            Ok(count) => output.extend_from_slice(&buffer[..count]),
+    let length = stderr
+        .metadata()
+        .map(|metadata| metadata.len().min(LIMIT as u64) as usize)
+        .unwrap_or(0);
+    let mut output = vec![0_u8; length];
+    let mut offset = 0;
+    while offset < output.len() {
+        match stderr.read_at(&mut output[offset..], offset as u64) {
+            Ok(0) => {
+                output.truncate(offset);
+                break;
+            }
+            Ok(count) => offset += count,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(error) => return format!("<stderr read failed: {error}>"),
         }
     }
-    if output.len() == LIMIT {
+    if stderr
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() > LIMIT as u64)
+    {
         output.extend_from_slice(b"<truncated>");
     }
     String::from_utf8_lossy(&output).into_owned()
 }
 
 #[cfg(not(unix))]
-fn bounded_child_stderr(_child: &mut Child) -> String {
+fn bounded_child_stderr(_stderr: &std::fs::File) -> String {
     "<bounded daemon stderr capture requires Unix>".to_owned()
 }
 
