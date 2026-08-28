@@ -24,6 +24,8 @@ use crate::config::ReasoningEffort;
 
 const REQUEST_TIMEOUT_SECS: u64 = 60;
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const ZAI_MAX_IMAGE_BYTES: usize = 5_000_000;
+const ZAI_MAX_IMAGE_URL_BYTES: usize = 8 * 1024;
 const MAX_DECODED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
@@ -117,7 +119,27 @@ fn friendly_api_error(status: reqwest::StatusCode, body: &str) -> String {
     format!("API error {}{}: {}", status, hint, msg)
 }
 
-fn validate_image_source(source: &ImageSource) -> Result<OpenAIImageUrl> {
+fn validate_image_source(source: &ImageSource, rule: TransportRule) -> Result<OpenAIImageUrl> {
+    if rule == TransportRule::ZaiGlm53Flash && source.source_type == "url" {
+        if source.data.len() > ZAI_MAX_IMAGE_URL_BYTES {
+            anyhow::bail!("Z.ai image URL exceeded the 8 KiB limit");
+        }
+        let parsed =
+            reqwest::Url::parse(&source.data).context("Z.ai image URL was not an absolute URL")?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+        {
+            anyhow::bail!(
+                "Z.ai image URL must be an absolute HTTP(S) URL without credentials or a fragment"
+            );
+        }
+        return Ok(OpenAIImageUrl {
+            url: source.data.clone(),
+        });
+    }
     if source.source_type != "base64" {
         anyhow::bail!("OpenAI images must use a base64 source");
     }
@@ -126,20 +148,40 @@ fn validate_image_source(source: &ImageSource) -> Result<OpenAIImageUrl> {
         "image/jpeg" => validate_jpeg,
         _ => anyhow::bail!("OpenAI image media type is unsupported; expected PNG or JPEG"),
     };
-    let max_base64_bytes = MAX_IMAGE_BYTES.div_ceil(3).saturating_mul(4);
+    let image_limit = if rule == TransportRule::ZaiGlm53Flash {
+        ZAI_MAX_IMAGE_BYTES
+    } else {
+        MAX_IMAGE_BYTES
+    };
+    let max_base64_bytes = image_limit.div_ceil(3).saturating_mul(4);
     if source.data.len() > max_base64_bytes {
-        anyhow::bail!("OpenAI image exceeded the 8 MB encoded-image limit");
+        anyhow::bail!("provider image exceeded its encoded-image limit");
     }
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&source.data)
         .context("OpenAI image contained invalid base64")?;
-    if bytes.len() > MAX_IMAGE_BYTES {
+    if bytes.len() >= image_limit && rule == TransportRule::ZaiGlm53Flash {
+        anyhow::bail!("Z.ai image must be smaller than 5 MB");
+    }
+    if bytes.len() > image_limit {
         anyhow::bail!("OpenAI image exceeded the 8 MB encoded-image limit");
     }
     validator(&bytes)?;
     Ok(OpenAIImageUrl {
         url: format!("data:{};base64,{}", source.media_type, source.data),
     })
+}
+
+fn validate_zai_function_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        anyhow::bail!("Z.ai function name must match ^[a-zA-Z0-9_-]+$ and contain 1 to 64 bytes");
+    }
+    Ok(())
 }
 
 fn validate_png(bytes: &[u8]) -> Result<()> {
@@ -371,19 +413,28 @@ fn validate_strict_response_shape(value: &serde_json::Value, rule: TransportRule
     let root = value
         .as_object()
         .context("OpenAI response was not a JSON object")?;
-    let mut response_fields = vec![
-        "id",
-        "object",
-        "created",
-        "model",
-        "choices",
-        "usage",
-        "service_tier",
-        "system_fingerprint",
-    ];
-    if rule == TransportRule::ZaiGlm53Flash {
-        response_fields.extend(["request_id", "web_search"]);
-    }
+    let response_fields = match rule {
+        TransportRule::CanonicalGpt56ChatCompletions => vec![
+            "id",
+            "object",
+            "created",
+            "model",
+            "choices",
+            "usage",
+            "service_tier",
+            "system_fingerprint",
+        ],
+        TransportRule::ZaiGlm53Flash => vec![
+            "id",
+            "request_id",
+            "created",
+            "model",
+            "choices",
+            "usage",
+            "web_search",
+        ],
+        TransportRule::CompatibleChatCompletions => unreachable!("strict response rule"),
+    };
     reject_unknown_keys(root, &response_fields, "response")?;
     let choices = root
         .get("choices")
@@ -393,19 +444,21 @@ fn validate_strict_response_shape(value: &serde_json::Value, rule: TransportRule
         let choice = choice
             .as_object()
             .context("OpenAI response choice was not an object")?;
-        reject_unknown_keys(
-            choice,
-            &["index", "message", "finish_reason", "logprobs"],
-            "response choice",
-        )?;
+        let choice_fields: &[&str] = if rule == TransportRule::ZaiGlm53Flash {
+            &["index", "message", "finish_reason"]
+        } else {
+            &["index", "message", "finish_reason", "logprobs"]
+        };
+        reject_unknown_keys(choice, choice_fields, "response choice")?;
         let message = choice
             .get("message")
             .and_then(serde_json::Value::as_object)
             .context("OpenAI response choice omitted a valid message")?;
-        let mut message_fields = vec!["role", "content", "tool_calls", "refusal", "annotations"];
-        if rule.exposes_reasoning_content() {
-            message_fields.push("reasoning_content");
-        }
+        let message_fields = if rule == TransportRule::ZaiGlm53Flash {
+            vec!["role", "content", "tool_calls", "reasoning_content"]
+        } else {
+            vec!["role", "content", "tool_calls", "refusal", "annotations"]
+        };
         reject_unknown_keys(message, &message_fields, "response message")?;
         if message.get("refusal").is_some_and(|value| !value.is_null()) {
             anyhow::bail!("OpenAI response contained an unsupported refusal item");
@@ -430,6 +483,13 @@ fn validate_strict_response_shape(value: &serde_json::Value, rule: TransportRule
                     .and_then(serde_json::Value::as_object)
                     .context("OpenAI response tool call omitted a function object")?;
                 reject_unknown_keys(function, &["name", "arguments"], "tool function")?;
+                if rule == TransportRule::ZaiGlm53Flash {
+                    let name = function
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .context("Z.ai response tool call omitted a function name")?;
+                    validate_zai_function_name(name)?;
+                }
             }
         }
     }
@@ -470,19 +530,28 @@ fn validate_strict_chunk_shape(value: &serde_json::Value, rule: TransportRule) -
     let root = value
         .as_object()
         .context("OpenAI stream event was not a JSON object")?;
-    let mut event_fields = vec![
-        "id",
-        "object",
-        "created",
-        "model",
-        "system_fingerprint",
-        "service_tier",
-        "choices",
-        "usage",
-    ];
-    if rule == TransportRule::ZaiGlm53Flash {
-        event_fields.extend(["request_id", "web_search"]);
-    }
+    let event_fields = match rule {
+        TransportRule::CanonicalGpt56ChatCompletions => vec![
+            "id",
+            "object",
+            "created",
+            "model",
+            "system_fingerprint",
+            "service_tier",
+            "choices",
+            "usage",
+        ],
+        TransportRule::ZaiGlm53Flash => vec![
+            "id",
+            "request_id",
+            "created",
+            "model",
+            "choices",
+            "usage",
+            "web_search",
+        ],
+        TransportRule::CompatibleChatCompletions => unreachable!("strict stream rule"),
+    };
     reject_unknown_keys(root, &event_fields, "event")?;
     let choices = root
         .get("choices")
@@ -492,11 +561,12 @@ fn validate_strict_chunk_shape(value: &serde_json::Value, rule: TransportRule) -
         let choice = choice
             .as_object()
             .context("OpenAI stream choice was not an object")?;
-        reject_unknown_keys(
-            choice,
-            &["index", "delta", "finish_reason", "logprobs"],
-            "choice",
-        )?;
+        let choice_fields: &[&str] = if rule == TransportRule::ZaiGlm53Flash {
+            &["index", "delta", "finish_reason"]
+        } else {
+            &["index", "delta", "finish_reason", "logprobs"]
+        };
+        reject_unknown_keys(choice, choice_fields, "choice")?;
         let delta = choice
             .get("delta")
             .and_then(serde_json::Value::as_object)
@@ -524,6 +594,12 @@ fn validate_strict_chunk_shape(value: &serde_json::Value, rule: TransportRule) -
                         .as_object()
                         .context("OpenAI stream function delta was not an object")?;
                     reject_unknown_keys(function, &["name", "arguments"], "function delta")?;
+                    if rule == TransportRule::ZaiGlm53Flash {
+                        if let Some(name) = function.get("name").and_then(serde_json::Value::as_str)
+                        {
+                            validate_zai_function_name(name)?;
+                        }
+                    }
                 }
             }
         }
@@ -1276,21 +1352,25 @@ impl OpenAIProvider {
                         .content
                         .iter()
                         .filter_map(|b| match b {
-                            ContentBlock::ToolUse { id, name, input } => {
-                                let arguments = serde_json::to_string(input)
-                                    .unwrap_or_else(|_| "{}".to_string());
-                                Some(OpenAIRequestToolCall {
-                                    id: id.clone(),
-                                    tool_type: "function".to_string(),
-                                    function: OpenAIRequestFunction {
-                                        name: name.clone(),
-                                        arguments,
-                                    },
-                                })
-                            }
+                            ContentBlock::ToolUse { id, name, input } => Some((id, name, input)),
                             _ => None,
                         })
-                        .collect();
+                        .map(|(id, name, input)| {
+                            if rule == TransportRule::ZaiGlm53Flash {
+                                validate_zai_function_name(name)?;
+                            }
+                            let arguments = serde_json::to_string(input)
+                                .context("function-call arguments could not be serialized")?;
+                            Ok(OpenAIRequestToolCall {
+                                id: id.clone(),
+                                tool_type: "function".to_string(),
+                                function: OpenAIRequestFunction {
+                                    name: name.clone(),
+                                    arguments,
+                                },
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
                     if rule.is_strict() {
                         for call in &tool_calls {
                             if call.id.is_empty() || call.function.name.is_empty() {
@@ -1350,7 +1430,7 @@ impl OpenAIProvider {
                                 TransportRule::CanonicalGpt56ChatCompletions
                                 | TransportRule::ZaiGlm53Flash => {
                                     content_parts.push(OpenAIContentPart::ImageUrl {
-                                        image_url: validate_image_source(source)?,
+                                        image_url: validate_image_source(source, rule)?,
                                     });
                                 }
                                 TransportRule::CompatibleChatCompletions => {
@@ -1425,34 +1505,36 @@ impl OpenAIProvider {
         }
 
         // Convert tools to OpenAI format if present
-        let tools = request.tools.as_ref().map(|tool_defs| {
-            tool_defs
-                .iter()
-                .map(|tool| {
-                    // Convert ToolInputSchema to Value
-                    let parameters = match serde_json::to_value(&tool.input_schema) {
-                        Ok(value) => value,
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to convert tool schema for '{}': {}",
-                                tool.name,
-                                e
-                            );
-                            serde_json::json!({})
+        let tools = request
+            .tools
+            .as_ref()
+            .map(|tool_defs| {
+                if rule == TransportRule::ZaiGlm53Flash && tool_defs.len() > 128 {
+                    anyhow::bail!("Z.ai accepts at most 128 function definitions");
+                }
+                tool_defs
+                    .iter()
+                    .map(|tool| {
+                        if rule == TransportRule::ZaiGlm53Flash {
+                            validate_zai_function_name(&tool.name)?;
                         }
-                    };
-
-                    OpenAITool {
-                        tool_type: "function".to_string(),
-                        function: OpenAIFunction {
-                            name: tool.name.clone(),
-                            description: tool.description.clone(),
-                            parameters,
-                        },
-                    }
-                })
-                .collect()
-        });
+                        let parameters = serde_json::to_value(&tool.input_schema)
+                            .context("tool schema could not be serialized")?;
+                        if rule == TransportRule::ZaiGlm53Flash && !parameters.is_object() {
+                            anyhow::bail!("Z.ai function parameters must be a JSON Schema object");
+                        }
+                        Ok(OpenAITool {
+                            tool_type: "function".to_string(),
+                            function: OpenAIFunction {
+                                name: tool.name.clone(),
+                                description: tool.description.clone(),
+                                parameters,
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
 
         let openai_request = OpenAIRequest {
             model,
@@ -3186,19 +3268,23 @@ mod tests {
             media_type: "image/png".into(),
             data: base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_IMAGE_BYTES]),
         };
-        assert!(!validate_image_source(&exact_limit)
-            .unwrap_err()
-            .to_string()
-            .contains("8 MB"));
+        assert!(
+            !validate_image_source(&exact_limit, TransportRule::CanonicalGpt56ChatCompletions)
+                .unwrap_err()
+                .to_string()
+                .contains("8 MB")
+        );
         let over_limit = ImageSource {
             source_type: "base64".into(),
             media_type: "image/png".into(),
             data: base64::engine::general_purpose::STANDARD.encode(vec![0; MAX_IMAGE_BYTES + 1]),
         };
-        assert!(validate_image_source(&over_limit)
-            .unwrap_err()
-            .to_string()
-            .contains("8 MB"));
+        assert!(
+            validate_image_source(&over_limit, TransportRule::CanonicalGpt56ChatCompletions)
+                .unwrap_err()
+                .to_string()
+                .contains("8 MB")
+        );
         let mismatch = ProviderRequest::new(vec![crate::claude::Message::with_content(
             "user",
             vec![ContentBlock::tool_result(
@@ -4243,6 +4329,145 @@ mod tests {
         assert_eq!(wire["messages"][0]["role"], "user");
         assert_eq!(wire["messages"][0]["content"][0]["type"], "text");
         assert_eq!(wire["messages"][0]["content"][1]["type"], "image_url");
+    }
+
+    #[test]
+    fn zai_images_accept_safe_urls_and_enforce_the_documented_sub_5_mb_boundary() {
+        let provider = zai_test_provider("https://api.z.ai/api/paas/v4".into());
+        let url_request = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            "user",
+            vec![ContentBlock::image_url(
+                "https://images.example.test/screenshot.png?version=1",
+            )],
+        )])
+        .with_model("glm-5.3-flash");
+        let wire = serde_json::to_value(provider.to_openai_request(&url_request).unwrap()).unwrap();
+        assert_eq!(
+            wire["messages"][0]["content"][0]["image_url"]["url"],
+            "https://images.example.test/screenshot.png?version=1"
+        );
+
+        for invalid in [
+            "file:///tmp/private.png",
+            "https://user:secret@example.test/image.png",
+            "https://example.test/image.png#fragment",
+        ] {
+            let request = ProviderRequest::new(vec![crate::claude::Message::with_content(
+                "user",
+                vec![ContentBlock::image_url(invalid)],
+            )])
+            .with_model("glm-5.3-flash");
+            assert!(provider.to_openai_request(&request).is_err());
+        }
+
+        let exact_limit = ImageSource {
+            source_type: "base64".into(),
+            media_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(vec![0; ZAI_MAX_IMAGE_BYTES]),
+        };
+        assert!(
+            validate_image_source(&exact_limit, TransportRule::ZaiGlm53Flash)
+                .unwrap_err()
+                .to_string()
+                .contains("smaller than 5 MB")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zai_invalid_images_and_function_names_fail_before_http() {
+        use crate::tools::types::{ToolDefinition, ToolInputSchema};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = zai_test_provider(format!("http://{}", listener.local_addr().unwrap()));
+        let invalid_image = ProviderRequest::new(vec![crate::claude::Message::with_content(
+            "user",
+            vec![ContentBlock::image_url("file:///tmp/private.png")],
+        )])
+        .with_model("glm-5.3-flash");
+        assert!(provider.send_message_once(&invalid_image).await.is_err());
+
+        for name in ["bad name".to_string(), String::new(), "x".repeat(65)] {
+            let request = ProviderRequest::new(vec![crate::claude::Message::user("test")])
+                .with_model("glm-5.3-flash")
+                .with_tools(vec![ToolDefinition {
+                    name,
+                    description: "invalid name must not leave the process".into(),
+                    input_schema: ToolInputSchema::simple(vec![]),
+                }]);
+            assert!(provider.send_message_once(&request).await.is_err());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), listener.accept())
+                .await
+                .is_err(),
+            "invalid Z.ai request reached the HTTP transport"
+        );
+    }
+
+    #[test]
+    fn zai_response_and_stream_allowlists_reject_openai_only_fields() {
+        for extra in [
+            serde_json::json!({"service_tier": "default"}),
+            serde_json::json!({"system_fingerprint": "fp"}),
+        ] {
+            let mut wire = serde_json::json!({
+                "id": "zai-1", "request_id": "request-1", "created": 1,
+                "model": "glm-5.3-flash",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+            });
+            wire.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(validate_strict_response_shape(&wire, TransportRule::ZaiGlm53Flash).is_err());
+        }
+        for (location, field) in [
+            ("choice", "logprobs"),
+            ("message", "refusal"),
+            ("message", "annotations"),
+        ] {
+            let mut wire = serde_json::json!({
+                "id": "zai-1", "request_id": "request-1", "created": 1,
+                "model": "glm-5.3-flash",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+            });
+            let target = if location == "choice" {
+                wire["choices"][0].as_object_mut().unwrap()
+            } else {
+                wire["choices"][0]["message"].as_object_mut().unwrap()
+            };
+            target.insert(field.into(), serde_json::Value::Null);
+            assert!(validate_strict_response_shape(&wire, TransportRule::ZaiGlm53Flash).is_err());
+        }
+
+        let mut state = CanonicalStreamState::default();
+        let foreign = r#"{"id":"zai-1","model":"glm-5.3-flash","service_tier":"default","choices":[{"index":0,"delta":{"content":"no"},"finish_reason":null}]}"#;
+        assert!(strict_stream_data(&mut state, foreign, TransportRule::ZaiGlm53Flash).is_err());
+    }
+
+    #[test]
+    fn zai_stream_terminal_and_tool_name_failures_are_exact() {
+        let mut state = CanonicalStreamState::default();
+        let malformed =
+            strict_stream_data(&mut state, "not-json", TransportRule::ZaiGlm53Flash).unwrap_err();
+        assert!(malformed.to_string().contains("malformed JSON"));
+
+        let mut state = CanonicalStreamState::default();
+        let invalid_name = r#"{"id":"zai-1","model":"glm-5.3-flash","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"bad name","arguments":"{}"}}]},"finish_reason":null}]}"#;
+        assert!(
+            strict_stream_data(&mut state, invalid_name, TransportRule::ZaiGlm53Flash).is_err()
+        );
+
+        let mut state = CanonicalStreamState::default();
+        let terminal = r#"{"id":"zai-1","model":"glm-5.3-flash","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}"#;
+        strict_stream_data(&mut state, terminal, TransportRule::ZaiGlm53Flash).unwrap();
+        assert!(
+            strict_stream_data(&mut state, terminal, TransportRule::ZaiGlm53Flash)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate terminal")
+        );
+        mark_strict_done(&mut state, TransportRule::ZaiGlm53Flash).unwrap();
+        assert!(mark_strict_done(&mut state, TransportRule::ZaiGlm53Flash).is_err());
     }
 
     #[test]

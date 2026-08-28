@@ -77,6 +77,12 @@ const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
         "openai/gpt-oss-120b",
         "get key at console.groq.com",
     ),
+    (
+        "zai",
+        "Z.ai",
+        "glm-5.3-flash",
+        "enter the environment variable containing your Z.ai API key",
+    ),
 ];
 
 use crate::config::{CoreMlConfig, ExecutionTarget, ProviderEntry, TeacherEntry};
@@ -156,6 +162,73 @@ fn known_models_for(provider: &str) -> Vec<String> {
     model_catalog::static_fallback(provider)
 }
 
+fn default_credential_input(provider: &str) -> String {
+    if provider == "zai" {
+        "ZAI_API_KEY".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn zai_named_setup_entries(
+    profile_name: &str,
+    model: &str,
+    environment_variable: &str,
+) -> Result<(crate::config::ProviderCredential, ProviderEntry)> {
+    use crate::config::{
+        AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle,
+        CredentialProvider, EndpointFamily, ProviderCredential, ReasoningEffort,
+    };
+
+    let credential_name = format!("{}-credential", profile_name.trim());
+    let environment_variable = environment_variable.trim();
+    let valid_environment_variable = !environment_variable.is_empty()
+        && environment_variable
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| {
+                byte == b'_' || byte.is_ascii_uppercase() || (index > 0 && byte.is_ascii_digit())
+            });
+    if !valid_environment_variable {
+        anyhow::bail!(
+            "Z.ai setup requires an environment-variable name such as ZAI_API_KEY; secret values are not stored in config.toml"
+        );
+    }
+
+    let credential = ProviderCredential {
+        name: credential_name.clone(),
+        kind: CredentialKind::ApiKey,
+        provider: CredentialProvider::Zai,
+        issuer: "zai".into(),
+        audience: AudienceBinding::standard(EndpointFamily::ZaiApi),
+        tenant: None,
+        project: None,
+        account: None,
+        scopes: std::collections::BTreeSet::new(),
+        secret_ref: format!("env:{environment_variable}"),
+        lifecycle: CredentialLifecycle::default(),
+        revocation: Default::default(),
+    };
+    let profile = ProviderEntry::Credentialed {
+        provider: CredentialProvider::Zai,
+        credential: CredentialBinding {
+            credential_ref: credential_name,
+            audience: None,
+            tenant: None,
+            project: None,
+            account: None,
+            required_scopes: std::collections::BTreeSet::new(),
+        },
+        model: Some(model.to_string()),
+        base_url: None,
+        chat_path: None,
+        models_path: None,
+        name: Some(profile_name.to_string()),
+        reasoning_effort: Some(ReasoningEffort::Max),
+    };
+    Ok((credential, profile))
+}
+
 fn model_catalog_profile(
     provider: &str,
     profile_id: &str,
@@ -212,13 +285,14 @@ fn model_catalog_profile(
             models_path.as_deref().unwrap_or("/v1/models"),
             CatalogAuth::Bearer,
         ),
-        ("openai", persisted)
-            if !matches!(persisted, Some(ProviderEntry::Credentialed { .. })) => (
-            "https://api.openai.com",
-            "/v1/chat/completions",
-            "/v1/models",
-            CatalogAuth::Bearer,
-        ),
+        ("openai", persisted) if !matches!(persisted, Some(ProviderEntry::Credentialed { .. })) => {
+            (
+                "https://api.openai.com",
+                "/v1/chat/completions",
+                "/v1/models",
+                CatalogAuth::Bearer,
+            )
+        }
         (
             "openai" | "grok" | "mistral" | "groq" | "zai",
             Some(ProviderEntry::Credentialed {
@@ -229,10 +303,22 @@ fn model_catalog_profile(
             }),
         ) => {
             let (default_base, default_chat, default_models) = match provider {
-                "openai" => ("https://api.openai.com", "/v1/chat/completions", "/v1/models"),
+                "openai" => (
+                    "https://api.openai.com",
+                    "/v1/chat/completions",
+                    "/v1/models",
+                ),
                 "grok" => ("https://api.x.ai", "/v1/chat/completions", "/v1/models"),
-                "mistral" => ("https://api.mistral.ai", "/v1/chat/completions", "/v1/models"),
-                "groq" => ("https://api.groq.com/openai", "/v1/chat/completions", "/v1/models"),
+                "mistral" => (
+                    "https://api.mistral.ai",
+                    "/v1/chat/completions",
+                    "/v1/models",
+                ),
+                "groq" => (
+                    "https://api.groq.com/openai",
+                    "/v1/chat/completions",
+                    "/v1/models",
+                ),
                 "zai" => (
                     "https://api.z.ai/api/paas/v4",
                     "/chat/completions",
@@ -733,9 +819,9 @@ fn named_catalog_refresh_config(
                     model,
                     persisted.as_ref(),
                 )),
-                ModelConfig::Local { persisted, enabled, .. } if index == 0 || *enabled => {
-                    persisted.clone()
-                }
+                ModelConfig::Local {
+                    persisted, enabled, ..
+                } if index == 0 || *enabled => persisted.clone(),
                 _ => None,
             }
         })
@@ -1695,6 +1781,7 @@ fn handle_themes_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
 fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent) -> Result<bool> {
     let catalog_cache_dir = state.catalog_cache_dir.clone();
     let credentials = state.credentials.clone();
+    let mut credential_to_store = None;
     if let Some(SectionState::Models {
         primary_model,
         tool_models,
@@ -2236,7 +2323,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     provider_idx: selected,
                                     name: CLOUD_PROVIDERS[selected].0.to_string(),
                                     model: default_model,
-                                    api_key: String::new(),
+                                    api_key: default_credential_input(CLOUD_PROVIDERS[selected].0),
                                     focused_field: 3, // Start on API key field
                                     editing_idx: None,
                                 })
@@ -2299,7 +2386,7 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                     editing_idx,
                                 })
                             } else {
-                                let persisted = editing_idx
+                                let mut persisted = editing_idx
                                     .and_then(|index| {
                                         if index == 0 {
                                             match &*primary_model {
@@ -2319,14 +2406,45 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                                         }
                                     })
                                     .filter(|entry| entry.provider_type() == provider_id);
+                                let configured_name = if name.trim().is_empty() {
+                                    provider_id.to_string()
+                                } else {
+                                    name.trim().to_string()
+                                };
+                                if provider_id == "zai" && persisted.is_none() {
+                                    match zai_named_setup_entries(
+                                        &configured_name,
+                                        &resolved_model,
+                                        &api_key,
+                                    ) {
+                                        Ok((credential, profile)) => {
+                                            if credentials
+                                                .iter()
+                                                .any(|existing| existing.name == credential.name)
+                                            {
+                                                *catalog_error = Some(format!(
+                                                    "credential '{}' already exists; choose a unique profile name",
+                                                    credential.name
+                                                ));
+                                                return Ok(false);
+                                            }
+                                            credential_to_store = Some(credential);
+                                            persisted = Some(profile);
+                                        }
+                                        Err(error) => {
+                                            *catalog_error = Some(error.to_string());
+                                            return Ok(false);
+                                        }
+                                    }
+                                }
                                 let edited = ModelConfig::Remote {
                                     provider: provider_id.to_string(),
-                                    name: if name.trim().is_empty() {
-                                        provider_id.to_string()
+                                    name: configured_name,
+                                    api_key: if provider_id == "zai" {
+                                        String::new()
                                     } else {
-                                        name.trim().to_string()
+                                        api_key
                                     },
-                                    api_key,
                                     model: resolved_model,
                                     enabled: true,
                                     persisted,
@@ -2412,6 +2530,9 @@ fn handle_models_input(state: &mut WizardState, key: crossterm::event::KeyEvent)
                     *adding_provider = next_step;
                 }
                 _ => {}
+            }
+            if let Some(credential) = credential_to_store {
+                state.credentials.push(credential);
             }
             return Ok(false);
         }
@@ -4444,7 +4565,16 @@ fn render_configure_remote_overlay(
         make_row("Provider", &provider_value, focused_field == 0, false),
         make_row("Name", name, focused_field == 1, true),
         make_row("Model", model_display, focused_field == 2, true),
-        make_row("API Key", &key_display, focused_field == 3, true),
+        make_row(
+            if provider_id == "zai" {
+                "Key env"
+            } else {
+                "API Key"
+            },
+            &key_display,
+            focused_field == 3,
+            true,
+        ),
         Line::from(""),
         Line::from(Span::styled(
             "─".repeat(area.width as usize),
@@ -6530,7 +6660,11 @@ mod tests {
             &selected,
             vec![credential.clone()],
         );
-        assert!(config.validate().unwrap_err().to_string().contains("missing"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("missing"));
 
         let valid = named_catalog_refresh_config(&primary, &[], 0, &selected, vec![credential]);
         valid.validate().unwrap();
@@ -8369,6 +8503,40 @@ mod tests {
         assert!(!CLOUD_PROVIDERS
             .iter()
             .any(|(id, ..)| *id == "chatgpt_subscription"));
+    }
+
+    #[test]
+    fn zai_setup_creates_a_secret_free_named_profile_with_max_reasoning() {
+        use crate::config::{CredentialProvider, EndpointFamily, ProviderEntry, ReasoningEffort};
+
+        assert!(CLOUD_PROVIDERS.iter().any(|(id, ..)| *id == "zai"));
+        assert_eq!(default_credential_input("zai"), "ZAI_API_KEY");
+        let (credential, profile) =
+            zai_named_setup_entries("zai-flash", "glm-5.3-flash", "ZAI_API_KEY").unwrap();
+        assert_eq!(credential.provider, CredentialProvider::Zai);
+        assert_eq!(credential.audience.family, EndpointFamily::ZaiApi);
+        assert_eq!(credential.secret_ref, "env:ZAI_API_KEY");
+        assert!(matches!(
+            profile,
+            ProviderEntry::Credentialed {
+                provider: CredentialProvider::Zai,
+                model: Some(ref model),
+                reasoning_effort: Some(ReasoningEffort::Max),
+                ref credential,
+                ..
+            } if model == "glm-5.3-flash"
+                && credential.credential_ref == "zai-flash-credential"
+        ));
+        let encoded = toml::to_string(&(vec![credential], vec![profile])).unwrap();
+        assert!(encoded.contains("env:ZAI_API_KEY"));
+        assert!(!encoded.contains("api_key ="));
+    }
+
+    #[test]
+    fn zai_setup_rejects_secret_material_instead_of_persisting_it() {
+        for invalid in ["", "zai-key", "sk-secret-value", "ZAI API KEY", "9ZAI_KEY"] {
+            assert!(zai_named_setup_entries("zai", "glm-5.3-flash", invalid).is_err());
+        }
     }
 
     #[tokio::test]
