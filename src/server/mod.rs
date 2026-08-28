@@ -393,7 +393,7 @@ impl AgentServer {
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         let isolated_proof = crate::brain::isolated_test_proof_if_present()?;
         let addr: SocketAddr = self.config.bind_address.parse()?;
-        let listener = if let Some(proof) = isolated_proof {
+        let listener = if let Some(ref proof) = isolated_proof {
             anyhow::ensure!(
                 addr.to_string() == proof.daemon_address(),
                 "isolated daemon bind address does not match supervisor authority"
@@ -404,10 +404,15 @@ impl AgentServer {
         } else {
             tokio::net::TcpListener::bind(addr).await?
         };
-        self.serve_on_listener(listener).await
+        self.serve_on_listener(listener, isolated_proof.as_ref())
+            .await
     }
 
-    async fn serve_on_listener(self: Arc<Self>, listener: tokio::net::TcpListener) -> Result<()> {
+    async fn serve_on_listener(
+        self: Arc<Self>,
+        listener: tokio::net::TcpListener,
+        isolated_proof: Option<&crate::brain::IsolatedTestProof>,
+    ) -> Result<()> {
         let addr = listener.local_addr()?;
 
         // The daemon owns only due-time calculation and durable queueing.
@@ -508,7 +513,11 @@ impl AgentServer {
 
         // Start server — ConnectInfo requires into_make_service_with_connect_info
         // so handlers can read the peer's IP for auth logging.
-        publish_isolated_test_address(addr)?;
+        // Reuse the proof authenticated before the listener was registered
+        // with Tokio. On Darwin, revalidating here would run the sealed
+        // listener challenge through a sibling descriptor after kqueue
+        // registration and could consume the readiness edge before Axum polls.
+        publish_isolated_test_address(addr, isolated_proof)?;
         tracing::info!("Starting Finch agent server on {}", addr);
         let local_server = axum::serve(
             listener,
@@ -680,12 +689,16 @@ impl AgentServer {
     }
 }
 
-fn publish_isolated_test_address(bound_addr: SocketAddr) -> Result<()> {
+fn publish_isolated_test_address(
+    bound_addr: SocketAddr,
+    isolated_proof: Option<&crate::brain::IsolatedTestProof>,
+) -> Result<()> {
     let Some(path) = std::env::var_os("FINCH_TEST_BOUND_ADDR_FILE").map(std::path::PathBuf::from)
     else {
         return Ok(());
     };
-    let proof = crate::brain::isolated_test_proof()?;
+    let proof = isolated_proof
+        .ok_or_else(|| anyhow::anyhow!("test address publication requires supervisor authority"))?;
     let relative = path
         .strip_prefix(&proof.home)
         .map_err(|_| anyhow::anyhow!("test address file must be inside the isolated HOME"))?;
@@ -961,7 +974,7 @@ mod tests {
             let server = Arc::new(server);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
-            let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener));
+            let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener, None));
 
             submit_feedback_to_daemon(address, query).await;
             tokio::time::advance(tokio::time::Duration::from_secs(10 * 60)).await;
@@ -1014,7 +1027,7 @@ mod tests {
         let _subscriber_guard = tracing::subscriber::set_default(subscriber);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener));
+        let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener, None));
 
         let client = reqwest::Client::new();
         let mut response = None;
@@ -1105,7 +1118,7 @@ mod tests {
         let _subscriber_guard = tracing::subscriber::set_default(subscriber);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener));
+        let serving = tokio::spawn(Arc::clone(&server).serve_on_listener(listener, None));
 
         let client = reqwest::Client::new();
         let mut response = None;

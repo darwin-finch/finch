@@ -194,12 +194,6 @@ fn write_config(
 type = "claude"
 api_key = {api_key:?}
 
-[backend]
-# This production-boundary test exercises daemon isolation and HTTP serving,
-# not model bootstrap. Disable local model loading so CoreML/ONNX startup
-# cannot contend with the bounded health deadline on macOS runners.
-enabled = false
-
 [client]
 use_daemon = true
 daemon_address = {daemon_address:?}
