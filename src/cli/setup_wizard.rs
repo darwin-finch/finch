@@ -220,7 +220,7 @@ fn model_catalog_profile(
             CatalogAuth::Bearer,
         ),
         (
-            "openai" | "grok" | "mistral" | "groq",
+            "openai" | "grok" | "mistral" | "groq" | "zai",
             Some(ProviderEntry::Credentialed {
                 base_url,
                 chat_path,
@@ -233,6 +233,11 @@ fn model_catalog_profile(
                 "grok" => ("https://api.x.ai", "/v1/chat/completions", "/v1/models"),
                 "mistral" => ("https://api.mistral.ai", "/v1/chat/completions", "/v1/models"),
                 "groq" => ("https://api.groq.com/openai", "/v1/chat/completions", "/v1/models"),
+                "zai" => (
+                    "https://api.z.ai/api/paas/v4",
+                    "/chat/completions",
+                    "/models",
+                ),
                 _ => unreachable!("match pattern limits provider"),
             };
             (
@@ -524,6 +529,7 @@ fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
                 crate::config::CredentialProvider::GeminiAiStudio => "gemini",
                 crate::config::CredentialProvider::Mistral => "mistral",
                 crate::config::CredentialProvider::Groq => "groq",
+                crate::config::CredentialProvider::Zai => "zai",
                 _ => credential_provider.as_str(),
             }
             .to_string(),

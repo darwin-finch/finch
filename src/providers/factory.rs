@@ -345,19 +345,21 @@ fn create_provider_from_resolved_entry(
         CredentialProvider::OpenaiPlatform
         | CredentialProvider::Xai
         | CredentialProvider::Mistral
-        | CredentialProvider::Groq => {
-            let (default_base, default_model, provider_name) = match provider {
-                CredentialProvider::OpenaiPlatform => ("https://api.openai.com", "gpt-4o", "openai"),
-                CredentialProvider::Xai => ("https://api.x.ai", "grok-4.6", "grok"),
-                CredentialProvider::Mistral => ("https://api.mistral.ai", "mistral-large-2512", "mistral"),
-                CredentialProvider::Groq => ("https://api.groq.com/openai", "openai/gpt-oss-120b", "groq"),
+        | CredentialProvider::Groq
+        | CredentialProvider::Zai => {
+            let (default_base, default_chat, default_models, default_model, provider_name) = match provider {
+                CredentialProvider::OpenaiPlatform => ("https://api.openai.com", "/v1/chat/completions", "/v1/models", "gpt-4o", "openai"),
+                CredentialProvider::Xai => ("https://api.x.ai", "/v1/chat/completions", "/v1/models", "grok-4.6", "grok"),
+                CredentialProvider::Mistral => ("https://api.mistral.ai", "/v1/chat/completions", "/v1/models", "mistral-large-2512", "mistral"),
+                CredentialProvider::Groq => ("https://api.groq.com/openai", "/v1/chat/completions", "/v1/models", "openai/gpt-oss-120b", "groq"),
+                CredentialProvider::Zai => ("https://api.z.ai/api/paas/v4", "/chat/completions", "/models", "glm-5.3-flash", "zai"),
                 _ => unreachable!("outer match limits provider"),
             };
             let mut provider = OpenAIProvider::new_compatible(
                 secret,
                 base_url.clone().unwrap_or_else(|| default_base.to_string()),
-                chat_path.as_deref().unwrap_or("/v1/chat/completions"),
-                models_path.as_deref().unwrap_or("/v1/models"),
+                chat_path.as_deref().unwrap_or(default_chat),
+                models_path.as_deref().unwrap_or(default_models),
                 default_model.to_string(),
                 provider_name.to_string(),
             )?;
@@ -886,7 +888,8 @@ mod tests {
     use super::*;
     use crate::config::{
         AudienceBinding, CredentialBinding, CredentialKind, CredentialLifecycle,
-        CredentialProvider, EndpointFamily, ExecutionTarget, ProviderCredential, ResolvedSecret,
+        CredentialProvider, EndpointFamily, ExecutionTarget, ProviderCredential, ReasoningEffort,
+        ResolvedSecret,
     };
     use crate::config::{ProviderEntry, TeacherEntry};
     use crate::models::unified_loader::{InferenceProvider, ModelFamily, ModelSize};
@@ -989,6 +992,43 @@ mod tests {
             tenant: None,
             project: None,
             account: Some(account.into()),
+            scopes: BTreeSet::new(),
+            secret_ref: format!("test:{name}"),
+            lifecycle: CredentialLifecycle::default(),
+            revocation: Default::default(),
+        }
+    }
+
+    fn named_zai(profile_name: &str, credential_ref: &str) -> ProviderEntry {
+        ProviderEntry::Credentialed {
+            provider: CredentialProvider::Zai,
+            credential: CredentialBinding {
+                credential_ref: credential_ref.into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: BTreeSet::new(),
+            },
+            model: Some("glm-5.3-flash".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some(profile_name.into()),
+            reasoning_effort: Some(ReasoningEffort::Max),
+        }
+    }
+
+    fn named_zai_credential(name: &str) -> ProviderCredential {
+        ProviderCredential {
+            name: name.into(),
+            kind: CredentialKind::ApiKey,
+            provider: CredentialProvider::Zai,
+            issuer: "zai".into(),
+            audience: AudienceBinding::standard(EndpointFamily::ZaiApi),
+            tenant: None,
+            project: None,
+            account: None,
             scopes: BTreeSet::new(),
             secret_ref: format!("test:{name}"),
             lifecycle: CredentialLifecycle::default(),
@@ -1133,6 +1173,30 @@ mod tests {
         assert_eq!(graph.profiles()[1].profile_name(), "reasoning");
         let default = graph.default_provider();
         assert!(Arc::ptr_eq(&default, graph.profiles()[0].provider()));
+    }
+
+    #[test]
+    fn test_named_zai_profile_constructs_exact_model_and_rejects_cross_provider_binding() {
+        let config = Config::with_providers(vec![named_zai("zai-fast", "zai-work")])
+            .with_credentials(vec![named_zai_credential("zai-work")]);
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+        let graph = create_provider_graph_from_config_with_resolver(&config, &resolver).unwrap();
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(graph.profiles()[0].provider().name(), "zai");
+        assert_eq!(
+            graph.profiles()[0].provider().default_model(),
+            "glm-5.3-flash"
+        );
+
+        let wrong = Config::with_providers(vec![named_zai("zai-fast", "openai-work")])
+            .with_credentials(vec![named_openai_credential("openai-work", "account-1")]);
+        let resolver = CountingResolver {
+            calls: AtomicUsize::new(0),
+        };
+        assert!(create_provider_graph_from_config_with_resolver(&wrong, &resolver).is_err());
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

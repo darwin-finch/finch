@@ -75,6 +75,12 @@ and a subscription session cannot be sent to the Platform API. Finch currently
 supports the documented Platform API-key transport; it does not fabricate a
 ChatGPT device flow.
 
+Z.ai uses its own `provider = "zai"`, `issuer = "zai"`, and
+`family = "zai_api"` credential audience. See
+[`docs/ZAI_TRANSPORT.md`](../../docs/ZAI_TRANSPORT.md) for the GLM-5.3-Flash
+transport and named-credential example. Z.ai credentials cannot cross-bind to
+OpenAI Platform, xAI, or another compatible provider.
+
 For standard provider URLs, Finch normalizes scheme, host, and port and binds
 the credential to the provider's standard endpoint family. A custom base URL
 requires `family = "custom"` and its exact normalized origin in `endpoint`;

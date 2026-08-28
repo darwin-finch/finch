@@ -18,7 +18,7 @@ const MAX_MODEL_COUNT: usize = 4_096;
 const MAX_MODEL_ID_BYTES: usize = 512;
 
 /// Date on which Finch's bundled, deliberately incomplete model fallback was reviewed.
-pub const STATIC_FALLBACK_AS_OF: &str = "2026-08-26";
+pub const STATIC_FALLBACK_AS_OF: &str = "2026-08-27";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogAuth {
@@ -115,6 +115,7 @@ pub fn static_fallback(provider: &str) -> Vec<String> {
         "gemini" => &["gemini-2.5-flash"],
         "mistral" => &["mistral-large-2512"],
         "groq" => &["openai/gpt-oss-120b"],
+        "zai" => &["glm-5.3-flash"],
         _ => &[],
     };
     models.iter().map(|model| (*model).to_string()).collect()
@@ -290,6 +291,13 @@ pub async fn refresh_from_config(
             "/v1/models",
             CatalogAuth::Bearer,
             "groq",
+        ),
+        CredentialProvider::Zai => (
+            "https://api.z.ai/api/paas/v4",
+            "/chat/completions",
+            "/models",
+            CatalogAuth::Bearer,
+            "zai",
         ),
         _ => bail!(
             "provider profile '{profile_name}' does not have a supported named-credential catalogue transport"
