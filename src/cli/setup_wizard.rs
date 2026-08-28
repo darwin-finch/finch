@@ -8527,9 +8527,14 @@ mod tests {
             } if model == "glm-5.3-flash"
                 && credential.credential_ref == "zai-flash-credential"
         ));
-        let encoded = toml::to_string(&(vec![credential], vec![profile])).unwrap();
-        assert!(encoded.contains("env:ZAI_API_KEY"));
-        assert!(!encoded.contains("api_key ="));
+        // Exercise the same credential record shape persisted under
+        // `[[credentials]]`. TOML cannot represent a synthetic top-level
+        // tuple of arrays, and Finch never writes that shape.
+        let encoded_credential = toml::to_string(&credential).unwrap();
+        assert!(encoded_credential.contains("env:ZAI_API_KEY"));
+        assert!(!encoded_credential.contains("api_key ="));
+        let encoded_profile = serde_json::to_string(&profile).unwrap();
+        assert!(!encoded_profile.contains("ZAI_API_KEY"));
     }
 
     #[test]
