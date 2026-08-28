@@ -436,6 +436,9 @@ fn validate_strict_response_shape(value: &serde_json::Value, rule: TransportRule
         TransportRule::CompatibleChatCompletions => unreachable!("strict response rule"),
     };
     reject_unknown_keys(root, &response_fields, "response")?;
+    if rule == TransportRule::ZaiGlm53Flash {
+        validate_zai_usage_and_search(root)?;
+    }
     let choices = root
         .get("choices")
         .and_then(serde_json::Value::as_array)
@@ -491,6 +494,52 @@ fn validate_strict_response_shape(value: &serde_json::Value, rule: TransportRule
                     validate_zai_function_name(name)?;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_zai_usage_and_search(root: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    if let Some(usage) = root.get("usage") {
+        let usage = usage.as_object().context("Z.ai usage was not an object")?;
+        reject_unknown_keys(
+            usage,
+            &[
+                "prompt_tokens",
+                "completion_tokens",
+                "prompt_tokens_details",
+                "total_tokens",
+            ],
+            "usage",
+        )?;
+        if let Some(details) = usage.get("prompt_tokens_details") {
+            let details = details
+                .as_object()
+                .context("Z.ai prompt token details was not an object")?;
+            reject_unknown_keys(details, &["cached_tokens"], "prompt token details")?;
+        }
+    }
+    if let Some(search) = root.get("web_search") {
+        let search = search
+            .as_array()
+            .context("Z.ai web_search was not an array")?;
+        for item in search {
+            let item = item
+                .as_object()
+                .context("Z.ai web_search item was not an object")?;
+            reject_unknown_keys(
+                item,
+                &[
+                    "title",
+                    "content",
+                    "link",
+                    "media",
+                    "icon",
+                    "refer",
+                    "publish_date",
+                ],
+                "web search item",
+            )?;
         }
     }
     Ok(())
@@ -553,6 +602,9 @@ fn validate_strict_chunk_shape(value: &serde_json::Value, rule: TransportRule) -
         TransportRule::CompatibleChatCompletions => unreachable!("strict stream rule"),
     };
     reject_unknown_keys(root, &event_fields, "event")?;
+    if rule == TransportRule::ZaiGlm53Flash {
+        validate_zai_usage_and_search(root)?;
+    }
     let choices = root
         .get("choices")
         .and_then(serde_json::Value::as_array)
@@ -2535,6 +2587,35 @@ mod tests {
         (complete, errors)
     }
 
+    async fn zai_stream_outcome(body: String) -> (bool, Vec<String>) {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+        let provider = zai_test_provider(server.url());
+        let mut rx = provider
+            .send_message_stream_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("glm-5.3-flash"),
+            )
+            .await
+            .unwrap();
+        let mut complete = false;
+        let mut errors = Vec::new();
+        while let Some(item) = rx.recv().await {
+            match item {
+                Ok(StreamChunk::ContentBlockComplete(_)) => complete = true,
+                Err(error) => errors.push(error.to_string()),
+                _ => {}
+            }
+        }
+        (complete, errors)
+    }
+
     #[tokio::test]
     async fn canonical_gpt_5_6_posts_exact_current_chat_completions_json() {
         use crate::claude::types::{ContentBlock, Message};
@@ -4297,6 +4378,7 @@ mod tests {
     #[test]
     fn zai_glm_5_3_flash_serializes_its_exact_dialect() {
         use crate::claude::types::{ContentBlock, Message};
+        use crate::tools::types::{ToolDefinition, ToolInputSchema};
 
         let provider = zai_test_provider("https://api.z.ai/api/paas/v4".into());
         assert_eq!(
@@ -4329,6 +4411,37 @@ mod tests {
         assert_eq!(wire["messages"][0]["role"], "user");
         assert_eq!(wire["messages"][0]["content"][0]["type"], "text");
         assert_eq!(wire["messages"][0]["content"][1]["type"], "image_url");
+
+        let continuation = ProviderRequest::new(vec![
+            Message::with_content(
+                "assistant",
+                vec![ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "README.md"}),
+                }],
+            ),
+            Message::with_content(
+                "user",
+                vec![ContentBlock::tool_result(
+                    "call-1".into(),
+                    "contents".into(),
+                    None,
+                )],
+            ),
+        ])
+        .with_model("glm-5.3-flash")
+        .with_tools(vec![ToolDefinition {
+            name: "read_file".into(),
+            description: "Read one file".into(),
+            input_schema: ToolInputSchema::simple(vec![("path", "Path to read")]),
+        }]);
+        let wire =
+            serde_json::to_value(provider.to_openai_request(&continuation).unwrap()).unwrap();
+        assert_eq!(wire["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(wire["messages"][0]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(wire["messages"][1]["role"], "tool");
+        assert_eq!(wire["messages"][1]["tool_call_id"], "call-1");
     }
 
     #[test]
@@ -4470,6 +4583,94 @@ mod tests {
         assert!(mark_strict_done(&mut state, TransportRule::ZaiGlm53Flash).is_err());
     }
 
+    #[tokio::test]
+    async fn zai_stream_http_boundary_rejects_eof_unknown_fields_and_payload_overflow() {
+        let partial = "data: {\"id\":\"zai-1\",\"model\":\"glm-5.3-flash\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        let (complete, errors) = zai_stream_outcome(partial.into()).await;
+        assert!(!complete);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("EOF before [DONE]")));
+
+        let (complete, errors) = zai_stream_outcome("event: mystery\n\n".into()).await;
+        assert!(!complete);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unknown SSE field")));
+
+        let oversized_line = format!("data: {}\n", "a".repeat(MAX_SSE_LINE_BYTES));
+        let (complete, errors) = zai_stream_outcome(oversized_line).await;
+        assert!(!complete);
+        assert!(errors.iter().any(|error| error.contains("line exceeded")));
+
+        let oversized_total = format!(":{}\n", "a".repeat(900_000)).repeat(5);
+        let (complete, errors) = zai_stream_outcome(oversized_total).await;
+        assert!(!complete);
+        assert!(errors.iter().any(|error| error.contains("total limit")));
+    }
+
+    #[tokio::test]
+    async fn zai_timeout_and_receiver_drop_release_the_transport() {
+        let (url, closed) = stalling_http_server(false).await;
+        let mut provider = zai_test_provider(url);
+        provider.client = Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let error = provider
+            .send_message_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("glm-5.3-flash"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Failed to send request"));
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("timed-out Z.ai transport was not released")
+            .unwrap();
+
+        let (url, closed) = stalling_http_server(true).await;
+        let provider = zai_test_provider(url);
+        let receiver = provider
+            .send_message_stream_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user("hello")])
+                    .with_model("glm-5.3-flash"),
+            )
+            .await
+            .unwrap();
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("dropped Z.ai receiver did not release transport")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn zai_error_response_is_bounded_and_redacted() {
+        let secret = "ZAI_PROMPT_IMAGE_TOOL_SECRET";
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/chat/completions")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(format!(r#"{{"error":{{"message":"{secret}"}}}}"#))
+            .create_async()
+            .await;
+        let provider = zai_test_provider(server.url());
+        let error = provider
+            .send_message_once(
+                &ProviderRequest::new(vec![crate::claude::Message::user(secret)])
+                    .with_model("glm-5.3-flash"),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.len() < 256);
+        assert!(!error.contains(secret));
+        assert!(error.contains("redacted"));
+    }
+
     #[test]
     fn zai_glm_5_3_flash_reasoning_contract_is_exact_and_always_on() {
         let provider = OpenAIProvider::new_zai("key".into()).unwrap();
@@ -4507,7 +4708,7 @@ mod tests {
         let mut state = CanonicalStreamState::default();
         let chunks = strict_stream_data(
             &mut state,
-            r#"{"id":"zai-1","object":"chat.completion.chunk","model":"glm-5.3-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"private scratch"},"finish_reason":null}]}"#,
+            r#"{"id":"zai-1","model":"glm-5.3-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"private scratch"},"finish_reason":null}]}"#,
             TransportRule::ZaiGlm53Flash,
         )
         .unwrap();
@@ -4517,7 +4718,7 @@ mod tests {
         ));
         let chunks = strict_stream_data(
             &mut state,
-            r#"{"id":"zai-1","object":"chat.completion.chunk","model":"glm-5.3-flash","choices":[{"index":0,"delta":{"content":"visible"},"finish_reason":"stop"}]}"#,
+            r#"{"id":"zai-1","model":"glm-5.3-flash","choices":[{"index":0,"delta":{"content":"visible"},"finish_reason":"stop"}]}"#,
             TransportRule::ZaiGlm53Flash,
         )
         .unwrap();
