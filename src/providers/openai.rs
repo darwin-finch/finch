@@ -184,6 +184,26 @@ fn validate_zai_function_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_zai_tool_schema(schema: &crate::tools::types::ToolInputSchema) -> Result<()> {
+    if schema.schema_type != "object" {
+        anyhow::bail!("Z.ai function parameters must declare an object JSON Schema");
+    }
+    let properties = schema
+        .properties
+        .as_object()
+        .context("Z.ai function schema properties were not an object")?;
+    let mut required = std::collections::BTreeSet::new();
+    for name in &schema.required {
+        if !required.insert(name.as_str()) {
+            anyhow::bail!("Z.ai function schema contained a duplicate required property");
+        }
+        if !properties.contains_key(name) {
+            anyhow::bail!("Z.ai function schema required a property it did not define");
+        }
+    }
+    Ok(())
+}
+
 fn validate_png(bytes: &[u8]) -> Result<()> {
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         anyhow::bail!("OpenAI image bytes did not match the declared media type");
@@ -1326,11 +1346,13 @@ impl OpenAIProvider {
     }
 
     fn transport_rule(&self, model: &str) -> TransportRule {
+        // Z.ai is a first-class dialect, never a permissive OpenAI-compatible
+        // alias. Model validity is checked while constructing the request.
+        if self.provider_name == "zai" {
+            return TransportRule::ZaiGlm53Flash;
+        }
         if self.canonical_openai_endpoint && matches!(model, "gpt-5.6-sol" | "gpt-5.6") {
             return TransportRule::CanonicalGpt56ChatCompletions;
-        }
-        if self.canonical_zai_endpoint && model == "glm-5.3-flash" {
-            return TransportRule::ZaiGlm53Flash;
         }
         TransportRule::CompatibleChatCompletions
     }
@@ -1342,6 +1364,9 @@ impl OpenAIProvider {
         } else {
             request.model.clone()
         };
+        if self.provider_name == "zai" && model != "glm-5.3-flash" {
+            anyhow::bail!("Z.ai's strict Finch transport currently supports only glm-5.3-flash");
+        }
         let rule = self.transport_rule(&model);
 
         let mut messages: Vec<OpenAIMessage> = Vec::new();
@@ -1569,12 +1594,10 @@ impl OpenAIProvider {
                     .map(|tool| {
                         if rule == TransportRule::ZaiGlm53Flash {
                             validate_zai_function_name(&tool.name)?;
+                            validate_zai_tool_schema(&tool.input_schema)?;
                         }
                         let parameters = serde_json::to_value(&tool.input_schema)
                             .context("tool schema could not be serialized")?;
-                        if rule == TransportRule::ZaiGlm53Flash && !parameters.is_object() {
-                            anyhow::bail!("Z.ai function parameters must be a JSON Schema object");
-                        }
                         Ok(OpenAITool {
                             tool_type: "function".to_string(),
                             function: OpenAIFunction {
@@ -4487,7 +4510,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn zai_invalid_images_and_function_names_fail_before_http() {
+    async fn zai_invalid_images_tools_and_model_fail_before_http() {
         use crate::tools::types::{ToolDefinition, ToolInputSchema};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4509,6 +4532,55 @@ mod tests {
                 }]);
             assert!(provider.send_message_once(&request).await.is_err());
         }
+        for input_schema in [
+            ToolInputSchema {
+                schema_type: "banana".into(),
+                properties: serde_json::json!({}),
+                required: vec![],
+            },
+            ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!("not-an-object"),
+                required: vec![],
+            },
+            ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({"present": {"type": "string"}}),
+                required: vec!["missing".into()],
+            },
+            ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({"duplicate": {"type": "string"}}),
+                required: vec!["duplicate".into(), "duplicate".into()],
+            },
+        ] {
+            let request = ProviderRequest::new(vec![crate::claude::Message::user("test")])
+                .with_model("glm-5.3-flash")
+                .with_tools(vec![ToolDefinition {
+                    name: "valid_name".into(),
+                    description: "invalid schema must not leave the process".into(),
+                    input_schema,
+                }]);
+            assert!(provider.send_message_once(&request).await.is_err());
+        }
+        let wrong_model = ProviderRequest::new(vec![crate::claude::Message::user("test")])
+            .with_model("glm-undocumented");
+        assert!(provider.send_message_once(&wrong_model).await.is_err());
+
+        let custom_zai = OpenAIProvider::new_compatible(
+            "secret".into(),
+            "https://proxy.invalid".into(),
+            "/chat",
+            "/models",
+            "glm-5.3-flash".into(),
+            "zai".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            custom_zai.transport_rule("glm-5.3-flash"),
+            TransportRule::ZaiGlm53Flash,
+            "a provider identified as Z.ai must never downgrade to compatibility parsing"
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(1), listener.accept())
                 .await

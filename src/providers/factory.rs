@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::claude::ClaudeProvider;
+use super::endpoints::ProviderEndpoints;
 use super::gemini::GeminiProvider;
 use super::openai::OpenAIProvider;
 use super::{
@@ -15,7 +16,7 @@ use super::{
 };
 use crate::config::{
     Config, CredentialProvider, CredentialResolver, EnvironmentCredentialResolver, ProviderEntry,
-    ResolvedCredential, TeacherEntry,
+    ReasoningEffort, ResolvedCredential, TeacherEntry,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -345,14 +346,12 @@ fn create_provider_from_resolved_entry(
         CredentialProvider::OpenaiPlatform
         | CredentialProvider::Xai
         | CredentialProvider::Mistral
-        | CredentialProvider::Groq
-        | CredentialProvider::Zai => {
+        | CredentialProvider::Groq => {
             let (default_base, default_chat, default_models, default_model, provider_name) = match provider {
                 CredentialProvider::OpenaiPlatform => ("https://api.openai.com", "/v1/chat/completions", "/v1/models", "gpt-4o", "openai"),
                 CredentialProvider::Xai => ("https://api.x.ai", "/v1/chat/completions", "/v1/models", "grok-4.6", "grok"),
                 CredentialProvider::Mistral => ("https://api.mistral.ai", "/v1/chat/completions", "/v1/models", "mistral-large-2512", "mistral"),
                 CredentialProvider::Groq => ("https://api.groq.com/openai", "/v1/chat/completions", "/v1/models", "openai/gpt-oss-120b", "groq"),
-                CredentialProvider::Zai => ("https://api.z.ai/api/paas/v4", "/chat/completions", "/models", "glm-5.3-flash", "zai"),
                 _ => unreachable!("outer match limits provider"),
             };
             let mut provider = OpenAIProvider::new_compatible(
@@ -366,6 +365,15 @@ fn create_provider_from_resolved_entry(
             if let Some(model) = model {
                 provider = provider.with_model(model.clone());
             }
+            if let Some(effort) = reasoning_effort {
+                provider = provider.with_reasoning_effort(*effort);
+            }
+            Ok(Box::new(provider))
+        }
+        CredentialProvider::Zai => {
+            // Complete-graph preflight proves that any explicitly configured
+            // values resolve to this exact documented transport.
+            let mut provider = OpenAIProvider::new_zai(secret)?;
             if let Some(effort) = reasoning_effort {
                 provider = provider.with_reasoning_effort(*effort);
             }
@@ -433,9 +441,11 @@ fn resolve_named_credential(
 fn preflight_named_transport(entry: &ProviderEntry) -> Result<()> {
     let ProviderEntry::Credentialed {
         provider,
+        model,
         base_url,
         chat_path,
         models_path,
+        reasoning_effort,
         ..
     } = entry
     else {
@@ -452,6 +462,37 @@ fn preflight_named_transport(entry: &ProviderEntry) -> Result<()> {
             if base_url.is_some() || chat_path.is_some() || models_path.is_some() =>
         {
             bail!("Gemini AI Studio custom endpoints are not supported by this transport")
+        }
+        CredentialProvider::Zai => {
+            let endpoints = ProviderEndpoints::new(
+                base_url
+                    .as_deref()
+                    .unwrap_or("https://api.z.ai/api/paas/v4"),
+                chat_path.as_deref().unwrap_or("/chat/completions"),
+                models_path.as_deref().unwrap_or("/models"),
+            );
+            if endpoints.chat_url != "https://api.z.ai/api/paas/v4/chat/completions"
+                || endpoints.models_url != "https://api.z.ai/api/paas/v4/models"
+            {
+                bail!(
+                    "Z.ai profiles must use the documented https://api.z.ai/api/paas/v4 chat and model endpoints"
+                );
+            }
+            if model
+                .as_deref()
+                .is_some_and(|model| model != "glm-5.3-flash")
+            {
+                bail!("Z.ai's strict Finch transport currently supports only glm-5.3-flash");
+            }
+            if reasoning_effort.is_some_and(|effort| {
+                !matches!(
+                    effort,
+                    ReasoningEffort::Low | ReasoningEffort::High | ReasoningEffort::Max
+                )
+            }) {
+                bail!("Z.ai glm-5.3-flash reasoning effort must be low, high, or max");
+            }
+            Ok(())
         }
         _ => Ok(()),
     }
@@ -1197,6 +1238,35 @@ mod tests {
         };
         assert!(create_provider_graph_from_config_with_resolver(&wrong, &resolver).is_err());
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+
+        let mut custom_endpoint = named_zai("zai-fast", "zai-work");
+        if let ProviderEntry::Credentialed { base_url, .. } = &mut custom_endpoint {
+            *base_url = Some("https://proxy.invalid/api".into());
+        }
+        let mut wrong_model = named_zai("zai-fast", "zai-work");
+        if let ProviderEntry::Credentialed { model, .. } = &mut wrong_model {
+            *model = Some("glm-undocumented".into());
+        }
+        let mut wrong_effort = named_zai("zai-fast", "zai-work");
+        if let ProviderEntry::Credentialed {
+            reasoning_effort, ..
+        } = &mut wrong_effort
+        {
+            *reasoning_effort = Some(ReasoningEffort::Medium);
+        }
+        for invalid in [custom_endpoint, wrong_model, wrong_effort] {
+            let config = Config::with_providers(vec![invalid])
+                .with_credentials(vec![named_zai_credential("zai-work")]);
+            let resolver = CountingResolver {
+                calls: AtomicUsize::new(0),
+            };
+            assert!(create_provider_graph_from_config_with_resolver(&config, &resolver).is_err());
+            assert_eq!(
+                resolver.calls.load(Ordering::SeqCst),
+                0,
+                "invalid Z.ai metadata reached secret resolution"
+            );
+        }
     }
 
     #[tokio::test]
