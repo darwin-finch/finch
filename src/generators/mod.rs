@@ -8,6 +8,18 @@ use tokio::sync::mpsc;
 use crate::claude::{ContentBlock, Message};
 use crate::tools::types::ToolDefinition;
 
+pub(crate) const MAX_RESPONSE_MODEL_BYTES: usize = 256;
+
+pub(crate) fn validate_response_model(model: &str) -> Result<()> {
+    if model.is_empty()
+        || model.len() > MAX_RESPONSE_MODEL_BYTES
+        || !model.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        anyhow::bail!("Provider response model metadata was invalid");
+    }
+    Ok(())
+}
+
 // Re-export implementations
 pub mod claude;
 pub mod daemon_local;
@@ -131,6 +143,10 @@ pub struct ResponseMetadata {
 pub enum StreamChunk {
     TextDelta(String),                  // Incremental text
     ContentBlockComplete(ContentBlock), // Complete tool_use or text block
+    /// Provider-reported model that actually served the streaming response.
+    ResponseMetadata {
+        model: String,
+    },
     /// Usage metadata from message_start — carries the input token count
     /// reported by the API before any text arrives.
     Usage {
@@ -299,6 +315,39 @@ mod tests {
         match chunk {
             StreamChunk::Usage { input_tokens } => assert_eq!(input_tokens, 1024),
             _ => panic!("Expected Usage"),
+        }
+    }
+
+    #[test]
+    fn test_stream_chunk_response_metadata_preserves_actual_model() {
+        let chunk = StreamChunk::ResponseMetadata {
+            model: "gpt-5.6-sol-served".to_string(),
+        };
+        match chunk {
+            StreamChunk::ResponseMetadata { model } => {
+                assert_eq!(model, "gpt-5.6-sol-served");
+            }
+            _ => panic!("Expected ResponseMetadata"),
+        }
+    }
+
+    #[test]
+    fn test_response_model_metadata_is_bounded_and_log_safe() {
+        validate_response_model(&"m".repeat(MAX_RESPONSE_MODEL_BYTES)).unwrap();
+        let empty_error = validate_response_model("").unwrap_err().to_string();
+        assert_eq!(empty_error, "Provider response model metadata was invalid");
+        for model in [
+            format!(
+                "OVERSIZED_MODEL_SECRET{}",
+                "m".repeat(MAX_RESPONSE_MODEL_BYTES)
+            ),
+            "CONTROL_MODEL_SECRET\nINJECTED".to_string(),
+            "SPACE_MODEL_SECRET INJECTED".to_string(),
+            "UNICODE_MODEL_SECRET_mødël".to_string(),
+        ] {
+            let error = validate_response_model(&model).unwrap_err().to_string();
+            assert_eq!(error, "Provider response model metadata was invalid");
+            assert!(!error.contains(&model));
         }
     }
 

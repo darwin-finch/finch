@@ -72,7 +72,12 @@ struct StreamChunk {
     usageUpdate     @2 :UsageUpdate;
     done            @3 :Void;
     error           @4 :Text;
+    responseMetadata @5 :StreamResponseMetadata;
   }
+}
+
+struct StreamResponseMetadata {
+  model @0 :Text;
 }
 
 struct UsageUpdate {
