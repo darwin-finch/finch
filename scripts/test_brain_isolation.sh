@@ -706,7 +706,9 @@ escape_uses="$(
 expected_escape_uses="$(cat <<'EOF'
 src/bin/finch-test-supervisor.rs:if libc::setpgid(0, 0) == -1 {
 src/brain/mod.rs:.process_group(0)
+src/brain/mod.rs:if nix::libc::setpgid(0, 0) == -1 {
 src/daemon/spawn.rs:.process_group(0)
+tests/no_external_provider_binary_test.rs:.process_group(0);
 EOF
 )"
 [[ "$escape_uses" == "$expected_escape_uses" ]]

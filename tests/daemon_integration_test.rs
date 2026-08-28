@@ -1,6 +1,7 @@
 //! Isolated integration tests for the Finch daemon binary.
 
 use anyhow::{Context, Result};
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -50,6 +51,7 @@ impl TestDaemon {
             .arg("--bind")
             .arg(&daemon_address)
             .env("FINCH_TEST_BOUND_ADDR_FILE", &address_file)
+            .env("RUST_LOG", "finch=debug,tower_http=debug")
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file.try_clone()?));
         let child = command.spawn().context("spawn isolated Finch daemon")?;
@@ -91,7 +93,18 @@ impl TestDaemon {
                 &brain_password,
                 api_key,
             );
-            anyhow::bail!("{error}; bounded daemon stderr={stderr:?}");
+            let daemon_log = redact_daemon_diagnostic(
+                bounded_path_diagnostic(&finch_dir.join("daemon.log")),
+                &home,
+                &socket_root,
+                &brain_address,
+                &daemon_address,
+                &brain_password,
+                api_key,
+            );
+            anyhow::bail!(
+                "{error}; bounded daemon stderr={stderr:?}; bounded daemon log={daemon_log:?}"
+            );
         }
         write_config(&home, &address, api_key, &brain_password)?;
 
@@ -101,10 +114,6 @@ impl TestDaemon {
             home_path: home,
             address,
         })
-    }
-
-    fn base_url(&self) -> String {
-        format!("http://{}", self.address)
     }
 }
 
@@ -178,6 +187,33 @@ fn bounded_child_stderr(stderr: &std::fs::File) -> String {
     String::from_utf8_lossy(&output).into_owned()
 }
 
+#[cfg(unix)]
+fn bounded_path_diagnostic(path: &Path) -> String {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) => return format!("<daemon log unavailable: {error}>"),
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return format!("<daemon log metadata unavailable: {error}>"),
+    };
+    if !metadata.is_file() || metadata.uid() != unsafe { nix::libc::geteuid() } {
+        return "<daemon log is not an owner-controlled regular file>".to_owned();
+    }
+    bounded_child_stderr(&file)
+}
+
+#[cfg(not(unix))]
+fn bounded_path_diagnostic(_path: &Path) -> String {
+    "<bounded daemon log capture requires Unix>".to_owned()
+}
+
 #[cfg(not(unix))]
 fn bounded_child_stderr(_stderr: &std::fs::File) -> String {
     "<bounded daemon stderr capture requires Unix>".to_owned()
@@ -220,16 +256,11 @@ brain_password = {brain_password:?}
 }
 
 async fn wait_for_health(address: &str) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_millis(250))
-        .build()?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let last_result = match client.get(format!("http://{address}/health")).send().await {
-            Ok(response) if response.status().is_success() => return Ok(()),
-            Ok(response) => format!("last HTTP status was {}", response.status()),
-            Err(error) => format!("last request failed: {error}"),
+        let last_result = match request_health(address, Duration::from_millis(250)) {
+            Ok(_) => return Ok(()),
+            Err(error) => error.to_string(),
         };
         anyhow::ensure!(
             Instant::now() < deadline,
@@ -237,6 +268,33 @@ async fn wait_for_health(address: &str) -> Result<()> {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+fn request_health(address: &str, timeout: Duration) -> Result<serde_json::Value> {
+    let socket_address = address.parse()?;
+    let mut stream = std::net::TcpStream::connect_timeout(&socket_address, timeout)
+        .context("direct loopback health connect failed")?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    write!(
+        stream,
+        "GET /health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut response = Vec::new();
+    stream
+        .take(64 * 1024)
+        .read_to_end(&mut response)
+        .context("direct loopback health response failed")?;
+    let separator = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .context("direct loopback health response has no header terminator")?;
+    let (head, body) = response.split_at(separator + 4);
+    anyhow::ensure!(
+        head.starts_with(b"HTTP/1.1 200 "),
+        "direct loopback health status was not 200"
+    );
+    serde_json::from_slice(body).context("direct loopback health body was not JSON")
 }
 
 fn run_query(home: &Path, query: &str) -> Result<std::process::Output> {
@@ -252,15 +310,7 @@ fn run_query(home: &Path, query: &str) -> Result<std::process::Output> {
 #[ignore = "spawns the built daemon binary"]
 async fn test_daemon_spawn_and_health() -> Result<()> {
     let daemon = TestDaemon::start("sk-ant-isolated-health-test").await?;
-    let response: serde_json::Value = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(2))
-        .build()?
-        .get(format!("{}/health", daemon.base_url()))
-        .send()
-        .await?
-        .json()
-        .await?;
+    let response = request_health(&daemon.address, Duration::from_secs(2))?;
     assert_eq!(response["status"], "healthy");
     assert!(daemon.home_path.join(".finch/daemon.sock").exists());
     Ok(())
