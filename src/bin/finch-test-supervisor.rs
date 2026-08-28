@@ -987,7 +987,14 @@ fn read_http_fixture_request(
 }
 
 fn run_child_http_fixture() -> anyhow::Result<()> {
-    let expected = std::env::var("FINCH_TEST_DAEMON_ADDR")?;
+    let proof = finch::brain::isolated_test_proof()
+        .context("HTTP fixture requires authenticated supervisor authority")?;
+    let expected = std::env::var("FINCH_TEST_DAEMON_ADDR")
+        .context("HTTP fixture is missing the sealed daemon address")?;
+    anyhow::ensure!(
+        expected == proof.daemon_address(),
+        "HTTP fixture daemon address escaped supervisor authority"
+    );
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     anyhow::ensure!(
         arguments == ["daemon", "--bind", expected.as_str()],
@@ -1069,7 +1076,9 @@ fn main() {
     {
         exit_fixture(run_child_stubborn_probe());
     }
-    if std::env::var("FINCH_TEST_HTTP_FIXTURE").as_deref() == Ok("1") {
+    if std::env::var("FINCH_TEST_HTTP_FIXTURE").as_deref() == Ok("1")
+        && std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref() == Ok("1")
+    {
         exit_fixture(run_child_http_fixture());
     }
     if std::env::args_os().nth(1).as_deref()

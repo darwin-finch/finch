@@ -81,7 +81,18 @@ impl TestDaemon {
             address == daemon_address,
             "daemon published an address outside supervisor authority"
         );
-        wait_for_health(&address).await?;
+        if let Err(error) = wait_for_health(&address).await {
+            let stderr = redact_daemon_diagnostic(
+                bounded_child_stderr(&stderr_file),
+                &home,
+                &socket_root,
+                &brain_address,
+                &daemon_address,
+                &brain_password,
+                api_key,
+            );
+            anyhow::bail!("{error}; bounded daemon stderr={stderr:?}");
+        }
         write_config(&home, &address, api_key, &brain_password)?;
 
         Ok(Self {
@@ -95,6 +106,24 @@ impl TestDaemon {
     fn base_url(&self) -> String {
         format!("http://{}", self.address)
     }
+}
+
+fn redact_daemon_diagnostic(
+    diagnostic: String,
+    home: &Path,
+    socket_root: &str,
+    brain_address: &str,
+    daemon_address: &str,
+    brain_password: &str,
+    api_key: &str,
+) -> String {
+    diagnostic
+        .replace(home.to_string_lossy().as_ref(), "<isolated-home>")
+        .replace(socket_root, "<socket-root>")
+        .replace(brain_address, "<brain-address>")
+        .replace(daemon_address, "<daemon-address>")
+        .replace(brain_password, "<brain-password>")
+        .replace(api_key, "<api-key>")
 }
 
 #[cfg(unix)]
@@ -196,17 +225,14 @@ async fn wait_for_health(address: &str) -> Result<()> {
         .build()?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if client
-            .get(format!("http://{address}/health"))
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
-        {
-            return Ok(());
-        }
+        let last_result = match client.get(format!("http://{address}/health")).send().await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) => format!("last HTTP status was {}", response.status()),
+            Err(error) => format!("last request failed: {error}"),
+        };
         anyhow::ensure!(
             Instant::now() < deadline,
-            "isolated daemon health check timed out"
+            "isolated daemon health check timed out ({last_result})"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
