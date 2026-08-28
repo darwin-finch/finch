@@ -4354,8 +4354,7 @@ mod tests {
                 "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
                 "max_tokens": 77,
                 "reasoning_effort": "max",
-                "thinking": {"type": "enabled", "clear_thinking": true},
-                "stream": false
+                "thinking": {"type": "enabled", "clear_thinking": true}
             })))
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -4399,6 +4398,34 @@ mod tests {
     #[tokio::test]
     async fn zai_stream_uses_strict_parser_and_discards_reasoning_projection() {
         let mut server = mockito::Server::new_async().await;
+        let events = [
+            serde_json::json!({
+                "id": "zai-stream-1", "request_id": "request-1", "model": "glm-5.3-flash",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "private scratch"}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "zai-stream-1", "request_id": "request-1", "model": "glm-5.3-flash",
+                "choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0, "id": "call-1", "type": "function",
+                    "function": {"name": "read", "arguments": "{\"path\":\""}
+                }]}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "zai-stream-1", "request_id": "request-1", "model": "glm-5.3-flash",
+                "choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0, "function": {"arguments": "README.md\"}"}
+                }]}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "zai-stream-1", "request_id": "request-1", "model": "glm-5.3-flash",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+            }),
+        ];
+        let body = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>()
+            + "data: [DONE]\n\n";
         let mock = server
             .mock("POST", "/api/paas/v4/chat/completions")
             .match_header("authorization", "Bearer zai-test-secret")
@@ -4410,13 +4437,7 @@ mod tests {
             })))
             .with_status(200)
             .with_header("content-type", "text/event-stream")
-            .with_body(concat!(
-                "data: {\"id\":\"zai-stream-1\",\"request_id\":\"request-1\",\"model\":\"glm-5.3-flash\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"private scratch\"},\"finish_reason\":null}]}\n\n",
-                "data: {\"id\":\"zai-stream-1\",\"request_id\":\"request-1\",\"model\":\"glm-5.3-flash\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"\"}}]},\"finish_reason\":null}]}\n\n",
-                "data: {\"id\":\"zai-stream-1\",\"request_id\":\"request-1\",\"model\":\"glm-5.3-flash\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"README.md\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
-                "data: {\"id\":\"zai-stream-1\",\"request_id\":\"request-1\",\"model\":\"glm-5.3-flash\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
-                "data: [DONE]\n\n"
-            ))
+            .with_body(body)
             .create_async()
             .await;
         let provider = zai_test_provider(format!("{}/api/paas/v4", server.url()));
