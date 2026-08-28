@@ -2711,7 +2711,21 @@ pub async fn start_ipc_server(
     server: Arc<AgentServer>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    let path = crate::ipc::transport::sock_path();
+    // A supervised daemon must consume the short, private socket path sealed
+    // into its authenticated proof. This is validated before probing,
+    // unlinking, or creating any socket pathname.
+    let path = if let Some(proof) = crate::brain::isolated_test_proof_if_present()? {
+        let path = std::env::var_os("FINCH_TEST_IPC_SOCKET")
+            .map(std::path::PathBuf::from)
+            .context("supervised daemon is missing its sealed IPC socket path")?;
+        anyhow::ensure!(
+            path == proof.ipc_socket,
+            "supervised daemon IPC path is not parent-authorized"
+        );
+        path
+    } else {
+        crate::ipc::transport::sock_path()
+    };
 
     // Remove only a stale socket. Blind unlinking lets a second daemon replace
     // the pathname while the original listener continues serving through its

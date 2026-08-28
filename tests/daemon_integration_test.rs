@@ -36,6 +36,10 @@ impl TestDaemon {
         let brain_address = proof.brain_address().to_owned();
         let daemon_address = proof.daemon_address().to_owned();
         let socket_root = std::env::var("FINCH_TEST_SOCKET_ROOT").unwrap_or_default();
+        let ipc_socket = std::env::var_os("FINCH_TEST_IPC_SOCKET")
+            .map(PathBuf::from)
+            .context("daemon integration test requires its sealed IPC socket path")?;
+        require_bounded_unix_socket_path(&ipc_socket)?;
         let brain_password = proof.brain_password()?;
         let home = proof.home;
         let finch_dir = home.join(".finch");
@@ -115,6 +119,23 @@ impl TestDaemon {
             address,
         })
     }
+}
+
+#[cfg(unix)]
+fn require_bounded_unix_socket_path(path: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let address: nix::libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    anyhow::ensure!(
+        path.as_os_str().as_bytes().len() < address.sun_path.len(),
+        "sealed IPC socket path exceeds the platform sockaddr_un bound"
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn require_bounded_unix_socket_path(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn redact_daemon_diagnostic(
