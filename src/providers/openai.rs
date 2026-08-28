@@ -584,11 +584,18 @@ fn strict_stream_data(
             model: chunk.model.clone(),
         });
     }
-    let usage_seen_in_chunk = chunk.usage.is_some();
-    if let Some(usage) = chunk.usage {
-        if !chunk.choices.is_empty() {
-            anyhow::bail!("OpenAI stream attached usage to a choice chunk");
-        }
+    let usage = chunk.usage;
+    let usage_seen_in_chunk = usage.is_some();
+    if rule == TransportRule::CanonicalGpt56ChatCompletions
+        && usage_seen_in_chunk
+        && !chunk.choices.is_empty()
+    {
+        anyhow::bail!("OpenAI stream attached usage to a choice chunk");
+    }
+    if chunk.choices.is_empty() {
+        let Some(usage) = usage else {
+            anyhow::bail!("OpenAI stream chunk had neither a choice nor usage");
+        };
         if state.terminal_reason.is_none() {
             anyhow::bail!("OpenAI stream reported usage before terminal status");
         }
@@ -599,11 +606,6 @@ fn strict_stream_data(
         output.push(StreamChunk::Usage {
             input_tokens: usage.prompt_tokens,
         });
-    }
-    if chunk.choices.is_empty() {
-        if !usage_seen_in_chunk {
-            anyhow::bail!("OpenAI stream chunk had neither a choice nor usage");
-        }
         return Ok(output);
     }
     if chunk.choices.len() != 1 || chunk.choices[0].index != 0 {
@@ -689,6 +691,18 @@ fn strict_stream_data(
             anyhow::bail!("OpenAI stream sent duplicate terminal status");
         }
         validate_terminal_reason(rule, reason, !state.tool_calls.is_empty(), true)?;
+    }
+    if let Some(usage) = usage {
+        if state.terminal_reason.is_none() {
+            anyhow::bail!("OpenAI stream reported usage before terminal status");
+        }
+        if state.usage_seen {
+            anyhow::bail!("OpenAI stream reported duplicate usage");
+        }
+        state.usage_seen = true;
+        output.push(StreamChunk::Usage {
+            input_tokens: usage.prompt_tokens,
+        });
     }
     Ok(output)
 }
@@ -4418,7 +4432,8 @@ mod tests {
             }),
             serde_json::json!({
                 "id": "zai-stream-1", "request_id": "request-1", "model": "glm-5.3-flash",
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
             }),
         ];
         let body = events
@@ -4460,6 +4475,9 @@ mod tests {
             StreamChunk::ContentBlockComplete(ContentBlock::ToolUse { id, name, input })
                 if id == "call-1" && name == "read" && input["path"] == "README.md"
         )));
+        assert!(chunks
+            .iter()
+            .any(|chunk| matches!(chunk, StreamChunk::Usage { input_tokens: 3 })));
         mock.assert_async().await;
     }
 
