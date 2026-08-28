@@ -993,10 +993,10 @@ fn parse_nonstream_tool_arguments(
         },
         TransportRule::CompatibleChatCompletions => match arguments {
             serde_json::Value::String(encoded) => {
-                serde_json::from_str(&encoded).unwrap_or_else(|_| serde_json::json!({}))
+                Ok(serde_json::from_str(&encoded).unwrap_or_else(|_| serde_json::json!({})))
             }
-            serde_json::Value::Object(_) => arguments,
-            _ => serde_json::json!({}),
+            serde_json::Value::Object(_) => Ok(arguments),
+            _ => Ok(serde_json::json!({})),
         },
     }
 }
@@ -3712,6 +3712,7 @@ mod tests {
                         role: huge.clone(),
                         content: Some("x".into()),
                         tool_calls: None,
+                        reasoning_content: None,
                     },
                     finish_reason: Some("stop".into()),
                 }],
@@ -3727,6 +3728,7 @@ mod tests {
                         role: "assistant".into(),
                         content: Some("x".into()),
                         tool_calls: None,
+                        reasoning_content: None,
                     },
                     finish_reason: Some(huge.clone()),
                 }],
@@ -4248,14 +4250,17 @@ mod tests {
         let invalid = provider
             .clone()
             .with_reasoning_effort(ReasoningEffort::Medium);
-        assert!(crate::providers::validate_provider_request(
+        let error = match crate::providers::validate_provider_request(
             &invalid,
             &ProviderRequest::new(vec![]).with_model("glm-5.3-flash"),
             false,
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("allowed efforts: low, high, max"));
+        ) {
+            Ok(_) => panic!("medium reasoning must be rejected for GLM-5.3-Flash"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("allowed efforts: low, high, max"));
     }
 
     #[test]
