@@ -1,16 +1,16 @@
 name: Issue 105 OAuth
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   pull_request:
     branches: [main]
     paths:
-      - Cargo.toml
-      - src/lib.rs
-      - src/oauth/**
-      - src/providers/chatgpt_oauth.rs
-      - src/providers/mod.rs
-      - .github/workflows/issue-105-oauth.yml
+      - "Cargo.toml"
+      - "src/lib.rs"
+      - "src/oauth/**"
+      - "src/providers/chatgpt_oauth.rs"
+      - "src/providers/mod.rs"
+      - ".github/workflows/issue-105-oauth.yml"
 
 jobs:
   oauth:
