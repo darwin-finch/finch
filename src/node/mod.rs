@@ -185,14 +185,13 @@ impl IsolatedNodeTestState {
     }
 
     pub fn fifo_node_id_fixture(&self) -> anyhow::Result<()> {
-        use nix::sys::stat::Mode;
-        use nix::unistd::mkfifoat;
+        use nix::libc;
         use std::os::fd::AsRawFd as _;
-        mkfifoat(
-            Some(self.descriptor.as_raw_fd()),
-            "node_id",
-            Mode::from_bits_truncate(0o600),
-        )?;
+        let name = std::ffi::CString::new("node_id")?;
+        let result = unsafe { libc::mkfifoat(self.descriptor.as_raw_fd(), name.as_ptr(), 0o600) };
+        if result == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
         Ok(())
     }
 
