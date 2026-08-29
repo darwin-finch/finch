@@ -1391,8 +1391,17 @@ where
             Err(error) => {
                 let failures = compensate_chatgpt_setup(authenticator, &compensations);
                 let original = error.to_string();
-                let context = if failures.is_empty() {
-                    format!("ChatGPT login for named credential '{reference}' failed")
+                let context = if cancel.is_cancelled() && failures.is_empty() {
+                    format!(
+                        "ChatGPT login for named credential '{reference}' was cancelled; setup was not saved ({original})"
+                    )
+                } else if cancel.is_cancelled() {
+                    format!(
+                        "ChatGPT login for named credential '{reference}' was cancelled; setup was not saved ({original}); compensation conflicts for {} require local status review",
+                        failures.join(",")
+                    )
+                } else if failures.is_empty() {
+                    format!("ChatGPT login for named credential '{reference}' failed: {original}")
                 } else {
                     format!(
                         "ChatGPT login for named credential '{reference}' failed ({original}); compensation conflicts for {} require local status review",
@@ -1413,7 +1422,7 @@ where
         let failures = compensate_chatgpt_setup(authenticator, &compensations);
         let original = error.to_string();
         let context = if failures.is_empty() {
-            "Signed ChatGPT credential does not match the setup provider graph".to_string()
+            format!("Signed ChatGPT credential does not match the setup provider graph: {original}")
         } else {
             format!(
                 "Signed ChatGPT credential does not match the setup provider graph ({original}); compensation conflicts for {} require local status review",
@@ -6943,7 +6952,7 @@ mod tests {
     }
 
     #[test]
-    fn chooser_offers_openai_api_without_external_binary_provider() {
+    fn chooser_keeps_chatgpt_subscription_distinct_from_openai_platform() {
         use ratatui::backend::TestBackend;
 
         let openai = CLOUD_PROVIDERS
@@ -6951,6 +6960,12 @@ mod tests {
             .find(|(id, ..)| *id == "openai")
             .unwrap();
         assert_eq!(openai.1, "OpenAI API");
+        let chatgpt = CLOUD_PROVIDERS
+            .iter()
+            .find(|(id, ..)| *id == "chatgpt")
+            .unwrap();
+        assert_eq!(chatgpt.1, "ChatGPT subscription");
+        assert_eq!(chatgpt.2, "gpt-5.6-sol");
         assert!(CLOUD_PROVIDERS
             .iter()
             .all(|(id, ..)| *id != "chatgpt_subscription"));
@@ -6975,7 +6990,11 @@ mod tests {
             .unwrap();
         let rendered = test_buffer_text(terminal.backend().buffer());
         assert!(rendered.contains("OpenAI API"), "{rendered}");
-        assert!(!rendered.contains("ChatGPT subscription"), "{rendered}");
+        assert!(rendered.contains("ChatGPT subscription"), "{rendered}");
+        assert!(
+            rendered.contains("Finch-native device sign-in"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("Codex"), "{rendered}");
         assert!(rendered.contains("platform.openai.com"), "{rendered}");
         assert!(!rendered.contains("GPT-4 (OpenAI)"), "{rendered}");
@@ -8966,6 +8985,7 @@ mod tests {
             .unwrap_err()
             .to_string();
             assert!(error.contains("ChatGPT login for named credential 'chatgpt:work' failed"));
+            assert!(error.contains(terminal), "{error}");
             assert_eq!(
                 authenticator.calls.lock().unwrap().as_slice(),
                 ["chatgpt:work"]

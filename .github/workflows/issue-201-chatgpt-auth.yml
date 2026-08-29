@@ -9,6 +9,7 @@ on:
       - "src/oauth/**"
       - "src/config/**"
       - "src/providers/chatgpt_oauth.rs"
+      - "src/providers/model_catalog.rs"
       - "src/providers/openai_jwks.rs"
       - "src/cli/chatgpt_auth.rs"
       - "src/cli/setup_wizard.rs"
@@ -57,6 +58,12 @@ jobs:
         run: "cargo test --bin finch chatgpt_auth_cli_"
       - name: Shared setup auth regressions
         run: cargo test --lib cli::setup_wizard::tests::setup_
+      - name: ChatGPT chooser, catalogue, and cancellation regressions
+        run: |
+          cargo test --lib cli::setup_wizard::tests::test_known_models_for_returns_list_for_all_providers -- --exact
+          cargo test --lib cli::setup_wizard::tests::chooser_keeps_chatgpt_subscription_distinct_from_openai_platform -- --exact
+          cargo test --lib cli::setup_wizard::tests::cancelled_or_unusable_setup_never_returns_a_config_or_tries_another_account -- --exact
+          cargo test --lib providers::model_catalog::tests::chatgpt_subscription_fallback_is_pinned_and_separate_from_platform -- --exact
       - name: Setup entry-point reuse regression
         run: cargo test --lib cli::setup_wizard::tests::first_run_command_and_repl
       - name: Zero-process and zero-socket auth status regression

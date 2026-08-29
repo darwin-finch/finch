@@ -106,6 +106,9 @@ pub fn default_cache_dir() -> Result<PathBuf> {
 
 pub fn static_fallback(provider: &str) -> Vec<String> {
     let models: &[&str] = match provider {
+        // Subscription provenance is deliberately separate from the OpenAI
+        // Platform catalogue, even where a model slug overlaps.
+        "chatgpt" => &["gpt-5.6-sol"],
         "claude" => &["claude-sonnet-5"],
         // Keep this deliberately short. Authenticated discovery is authoritative;
         // this offline snapshot only offers the three general-purpose API tiers
@@ -1055,6 +1058,15 @@ mod tests {
         assert!(!static_fallback("claude")
             .iter()
             .any(|model| model == "claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn chatgpt_subscription_fallback_is_pinned_and_separate_from_platform() {
+        assert_eq!(static_fallback("chatgpt"), ["gpt-5.6-sol"]);
+        assert_eq!(
+            static_fallback("openai"),
+            ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+        );
     }
 
     #[test]
