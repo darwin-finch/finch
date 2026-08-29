@@ -3,20 +3,15 @@ src/brain/remote.rs
 src/brain/store.rs
 src/cli/commands.rs
 src/cli/messages/concrete.rs
-src/cli/output_manager.rs
-src/cli/repl.rs
-src/cli/repl_event/brain_handler.rs
-src/cli/repl_event/event_loop.rs
 src/cli/repl_event/plan_handler.rs
 src/cli/repl_event/query_processor.rs
 src/cli/repl_event/query_state.rs
 src/cli/repl_event/tool_execution.rs
-src/cli/tui/mod.rs
+src/cli/setup_wizard.rs
 src/coforth/interpreter.rs
 src/config/colors.rs
 src/config/persona.rs
 src/daemon/upgrade.rs
-src/evolution/mod.rs
 src/ipc/brain_codec.rs
 src/ipc/client.rs
 src/ipc/server.rs
@@ -54,4 +49,3 @@ src/vm/mod.rs
 src/vm/signature.rs
 src/vm/types.rs
 src/vm/verifier.rs
-tests/worker_integration_test.rs
