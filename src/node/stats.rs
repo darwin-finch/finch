@@ -122,9 +122,35 @@ impl WorkTracker {
 
     /// Load persisted statistics from an explicit Finch state directory.
     pub(crate) fn load_persisted_from_state_directory(
-        state_directory: &std::path::Path,
+        directory: &std::fs::File,
     ) -> Result<WorkStats> {
-        Self::load_persisted_from_path(&state_directory.join("work_stats.json"))
+        use nix::fcntl::{openat, OFlag};
+        use nix::sys::stat::{fstat, Mode, SFlag};
+        use std::io::Read as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let fd = match openat(
+            Some(directory.as_raw_fd()),
+            "work_stats.json",
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(nix::errno::Errno::ENOENT) => return Ok(WorkStats::new()),
+            Err(error) => return Err(error).context("Failed to open isolated work stats"),
+        };
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let stat = fstat(file.as_raw_fd())?;
+        anyhow::ensure!(
+            SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG) && stat.st_nlink == 1,
+            "isolated work stats must be one regular file"
+        );
+        let mut bytes = Vec::new();
+        file.take((1 << 20) + 1)
+            .read_to_end(&mut bytes)
+            .context("Failed to read isolated work stats")?;
+        anyhow::ensure!(bytes.len() <= 1 << 20, "isolated work stats are too large");
+        serde_json::from_slice(&bytes).context("Failed to parse isolated work stats")
     }
 
     fn load_persisted_from_path(path: &std::path::Path) -> Result<WorkStats> {

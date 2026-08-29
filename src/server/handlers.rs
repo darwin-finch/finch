@@ -3889,9 +3889,7 @@ pub async fn handle_node_info_from_state_directory(
     state: crate::node::IsolatedNodeTestState,
     has_teacher_api: bool,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    use crate::node::NodeInfo;
-
-    let info = NodeInfo::load_from_state_directory(has_teacher_api, state.path())?;
+    let info = state.load_node_info(has_teacher_api)?;
     Ok(Json(serde_json::to_value(&info)?))
 }
 
@@ -3910,7 +3908,7 @@ pub async fn handle_node_stats_from_state_directory(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::node::WorkTracker;
 
-    let stats = WorkTracker::load_persisted_from_state_directory(state.path())?;
+    let stats = WorkTracker::load_persisted_from_state_directory(state.descriptor())?;
     Ok(Json(serde_json::to_value(&stats)?))
 }
 

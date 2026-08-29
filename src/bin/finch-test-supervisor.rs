@@ -8,7 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixDatagram, UnixListener};
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt as _;
@@ -128,16 +128,8 @@ fn hash_manifest_stat(digest: &mut Sha256, relative: &Path, stat: &libc::stat) {
 fn hash_node_identity_times(digest: &mut Sha256, stat: &libc::stat) {
     digest.update(stat.st_mtime.to_ne_bytes());
     digest.update(stat.st_ctime.to_ne_bytes());
-    #[cfg(target_os = "linux")]
-    {
-        digest.update(stat.st_mtime_nsec.to_ne_bytes());
-        digest.update(stat.st_ctime_nsec.to_ne_bytes());
-    }
-    #[cfg(target_os = "macos")]
-    {
-        digest.update(stat.st_mtimespec.tv_nsec.to_ne_bytes());
-        digest.update(stat.st_ctimespec.tv_nsec.to_ne_bytes());
-    }
+    digest.update(stat.st_mtime_nsec.to_ne_bytes());
+    digest.update(stat.st_ctime_nsec.to_ne_bytes());
 }
 
 fn hash_manifest_directory(
@@ -332,21 +324,88 @@ fn manifest_digest(store: &Path, control_root: Option<&Path>) -> anyhow::Result<
     Ok(hex::encode(digest.finalize()))
 }
 
-fn node_identity_digest(home: &Path) -> anyhow::Result<String> {
-    use nix::fcntl::{open, openat, readlinkat, AtFlags, OFlag};
-    use nix::sys::stat::{fstat, fstatat, Mode, SFlag};
+struct RealNodeIdentityGuard {
+    home: File,
+    home_device: libc::dev_t,
+    home_inode: libc::ino_t,
+    finch: Option<File>,
+    finch_identity: Option<(libc::dev_t, libc::ino_t)>,
+}
 
-    let finch = home.join(".finch");
-    let fd = match open(
-        &finch,
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(nix::errno::Errno::ENOENT) => return Ok(hex::encode(Sha256::digest(b"missing"))),
-        Err(error) => return Err(error.into()),
+impl RealNodeIdentityGuard {
+    fn pin(home_path: &Path) -> anyhow::Result<Self> {
+        use nix::fcntl::{open, openat, OFlag};
+        use nix::sys::stat::{fstat, Mode};
+        let home_fd = open(
+            home_path,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        let home = unsafe { File::from_raw_fd(home_fd) };
+        let home_stat = fstat(home.as_raw_fd())?;
+        let finch = match openat(
+            Some(home.as_raw_fd()),
+            ".finch",
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => Some(unsafe { File::from_raw_fd(fd) }),
+            Err(nix::errno::Errno::ENOENT) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let finch_identity = finch
+            .as_ref()
+            .map(|directory| fstat(directory.as_raw_fd()))
+            .transpose()?
+            .map(|stat| (stat.st_dev, stat.st_ino));
+        Ok(Self {
+            home,
+            home_device: home_stat.st_dev,
+            home_inode: home_stat.st_ino,
+            finch,
+            finch_identity,
+        })
+    }
+
+    fn verify_pathnames(&self, home_path: &Path) -> anyhow::Result<()> {
+        use nix::fcntl::{open, AtFlags, OFlag};
+        use nix::sys::stat::{fstat, fstatat, Mode};
+        let reopened_fd = open(
+            home_path,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        let reopened = unsafe { File::from_raw_fd(reopened_fd) };
+        let home_stat = fstat(reopened.as_raw_fd())?;
+        anyhow::ensure!(
+            home_stat.st_dev == self.home_device && home_stat.st_ino == self.home_inode,
+            "real HOME identity changed"
+        );
+        let observed_finch = fstatat(
+            Some(self.home.as_raw_fd()),
+            ".finch",
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        );
+        match (self.finch_identity, observed_finch) {
+            (None, Err(nix::errno::Errno::ENOENT)) => Ok(()),
+            (Some(expected), Ok(stat))
+                if (stat.st_dev, stat.st_ino) == expected
+                    && nix::sys::stat::SFlag::from_bits_truncate(stat.st_mode)
+                        .contains(nix::sys::stat::SFlag::S_IFDIR) =>
+            {
+                Ok(())
+            }
+            _ => anyhow::bail!("real Finch state identity changed"),
+        }
+    }
+}
+
+fn node_identity_digest(finch: Option<&File>) -> anyhow::Result<String> {
+    use nix::fcntl::{openat, readlinkat, AtFlags, OFlag};
+    use nix::sys::stat::{fstat, fstatat, Mode, SFlag};
+    let Some(directory) = finch else {
+        return Ok(hex::encode(Sha256::digest(b"missing")));
     };
-    let directory = unsafe { File::from_raw_fd(fd) };
     let observed = match fstatat(
         Some(directory.as_raw_fd()),
         "node_id",
@@ -371,7 +430,7 @@ fn node_identity_digest(home: &Path) -> anyhow::Result<String> {
             OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
             Mode::empty(),
         )?;
-        let mut file = unsafe { File::from_raw_fd(fd) };
+        let file = unsafe { File::from_raw_fd(fd) };
         let opened = fstat(file.as_raw_fd())?;
         anyhow::ensure!(
             SFlag::from_bits_truncate(opened.st_mode).contains(SFlag::S_IFREG)
@@ -849,8 +908,9 @@ fn run() -> anyhow::Result<i32> {
         fs::create_dir_all(&directory)?;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
     }
+    let real_node_identity = RealNodeIdentityGuard::pin(&real_home)?;
     let before = manifest_digest(&real_store, Some(isolated.path()))?;
-    let node_identity_before = node_identity_digest(&real_home)?;
+    let node_identity_before = node_identity_digest(real_node_identity.finch.as_ref())?;
     let socket_parent = if Path::new("/private/tmp").is_dir() {
         Path::new("/private/tmp")
     } else {
@@ -989,8 +1049,22 @@ fn run() -> anyhow::Result<i32> {
     };
     // Once the group is proven quiescent, always take the parent-held after
     // snapshot before propagating an observation error or removing HOME.
-    let after = manifest_digest(&real_store, Some(isolated.path()))?;
-    let node_identity_after = node_identity_digest(&real_home)?;
+    let after_result = if std::env::var_os("FINCH_TEST_FORCE_MANIFEST_AFTER_ERROR").is_some() {
+        // Executable-level regression hook: prove that an independent node
+        // snapshot is still collected when the Brain snapshot itself fails.
+        Err(anyhow::anyhow!("forced manifest snapshot failure"))
+    } else {
+        manifest_digest(&real_store, Some(isolated.path()))
+    };
+    let node_identity_after_result = (|| {
+        real_node_identity.verify_pathnames(&real_home)?;
+        node_identity_digest(real_node_identity.finch.as_ref())
+    })();
+    if let Some(marker) = std::env::var_os("FINCH_TEST_NODE_AFTER_MARKER") {
+        fs::write(marker, b"observed\n")?;
+    }
+    let after = after_result?;
+    let node_identity_after = node_identity_after_result?;
     anyhow::ensure!(
         before == after,
         "real Brain store manifest changed (sha256={before} -> sha256={after})"

@@ -24,13 +24,23 @@ for test_file in tests/worker_integration_test.rs tests/load_test.rs; do
   }
 done
 
-grep -Fq 'node_identity_before = node_identity_digest(&real_home)' \
+grep -Fq 'real_node_identity = RealNodeIdentityGuard::pin(&real_home)' \
   src/bin/finch-test-supervisor.rs || {
-  echo 'supervisor must snapshot the caller real node_id before launch' >&2
+  echo 'supervisor must pin the caller real HOME and Finch state before launch' >&2
   exit 1
 }
-grep -Fq 'node_identity_after = node_identity_digest(&real_home)' \
+grep -Fq 'real_node_identity.verify_pathnames(&real_home)' \
   src/bin/finch-test-supervisor.rs || {
-  echo 'supervisor must snapshot the caller real node_id after cleanup' >&2
+  echo 'supervisor must revalidate caller HOME and Finch-state identities after cleanup' >&2
   exit 1
 }
+grep -Fq 'FINCH_TEST_FORCE_MANIFEST_AFTER_ERROR' \
+  src/bin/finch-test-supervisor.rs || {
+  echo 'supervisor must retain the deterministic dual-snapshot error regression hook' >&2
+  exit 1
+}
+
+if rg -q 'node-id\.lock' src/node; then
+  echo 'isolated node state must use its Arc-owned mutex, not a pathname lock' >&2
+  exit 1
+fi

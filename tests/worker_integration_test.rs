@@ -77,11 +77,6 @@ impl IsolatedNodeState {
         let state =
             finch::node::IsolatedNodeTestState::new().expect("create disposable node state parent");
         let user_node_id = user_node_id_path();
-        assert_ne!(
-            state.path(),
-            user_node_id.parent().unwrap(),
-            "isolated state must not alias the user Finch state"
-        );
         let user_before = snapshot_user_node_id(&user_node_id);
         Self {
             state,
@@ -179,7 +174,7 @@ async fn test_node_info_endpoint_format() {
         json["capabilities"].get("ram_gb").is_some(),
         "capabilities must have 'ram_gb' field; got: {json}"
     );
-    assert!(state.state.path().join("node_id").is_file());
+    assert!(state.state.node_id_exists().unwrap());
     state.assert_user_node_id_unchanged();
 }
 
@@ -321,24 +316,97 @@ async fn test_concurrent_foreign_requests() {
         identities.windows(2).all(|pair| pair[0] == pair[1]),
         "all concurrent requests must observe one stable isolated identity"
     );
-    assert!(state.state.path().join("node_id").is_file());
+    assert!(state.state.node_id_exists().unwrap());
     state.assert_user_node_id_unchanged();
 }
 
 #[tokio::test]
 async fn test_corrupt_isolated_node_identity_fails_without_user_mutation() {
     let state = IsolatedNodeState::new();
-    let isolated_node_id = state.state.path().join("node_id");
-    std::fs::write(&isolated_node_id, b"not valid node identity JSON").unwrap();
+    state
+        .state
+        .seed_node_id_fixture(b"not valid node identity JSON")
+        .unwrap();
 
     let response = oneshot_get(&state.state, "/v1/node/info").await;
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
-        std::fs::read(&isolated_node_id).unwrap(),
-        b"not valid node identity JSON",
+        state
+            .state
+            .node_id_fixture_equals(b"not valid node identity JSON")
+            .unwrap(),
+        true,
         "a corrupt isolated identity must fail closed instead of being replaced"
     );
+    state.assert_user_node_id_unchanged();
+}
+
+#[tokio::test]
+async fn test_node_identity_fifo_fails_without_blocking_or_external_mutation() {
+    let state = IsolatedNodeState::new();
+    state.state.fifo_node_id_fixture().unwrap();
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        oneshot_get(&state.state, "/v1/node/info"),
+    )
+    .await
+    .expect("nonregular node identity must fail without blocking");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    state.assert_user_node_id_unchanged();
+}
+
+#[tokio::test]
+async fn test_node_identity_symlinks_fail_before_external_mutation() {
+    for existing_target in [true, false] {
+        let state = IsolatedNodeState::new();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("external-node-id");
+        if existing_target {
+            std::fs::write(&target, b"keep external").unwrap();
+        }
+        state.state.symlink_node_id_fixture(&target).unwrap();
+
+        let response = oneshot_get(&state.state, "/v1/node/info").await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        if existing_target {
+            assert_eq!(std::fs::read(&target).unwrap(), b"keep external");
+        } else {
+            assert!(!target.exists());
+        }
+        state.assert_user_node_id_unchanged();
+    }
+}
+
+#[tokio::test]
+async fn test_node_identity_hardlink_fails_before_external_mutation() {
+    let state = IsolatedNodeState::new();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("external-node-id");
+    std::fs::write(&target, b"keep external").unwrap();
+    state.state.hardlink_node_id_fixture(&target).unwrap();
+
+    let response = oneshot_get(&state.state, "/v1/node/info").await;
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(std::fs::read(&target).unwrap(), b"keep external");
+    state.assert_user_node_id_unchanged();
+}
+
+#[tokio::test]
+async fn test_node_identity_root_swap_stays_on_pinned_directory() {
+    let state = IsolatedNodeState::new();
+    let swap = state.state.swap_root_fixture().unwrap();
+
+    let response = oneshot_get(&state.state, "/v1/node/info").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(swap.pinned_node_id_exists());
+    assert!(!swap.replacement_node_id_exists());
+    assert!(swap.external_sentinel_unchanged());
     state.assert_user_node_id_unchanged();
 }
 

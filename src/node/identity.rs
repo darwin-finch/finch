@@ -160,45 +160,66 @@ impl NodeIdentity {
     ///
     /// Callers that already own an isolated state root should use this method
     /// instead of temporarily changing `HOME`.
-    pub(crate) fn load_or_create_in(state_directory: &Path) -> Result<Self> {
-        std::fs::create_dir_all(state_directory)
-            .with_context(|| format!("Failed to create {}", state_directory.display()))?;
-        let lock_path = state_directory.join("node-id.lock");
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .with_context(|| format!("Failed to open {}", lock_path.display()))?;
-        lock.lock_exclusive()
-            .with_context(|| format!("Failed to lock {}", lock_path.display()))?;
+    pub(crate) fn load_or_create_in(directory: &std::fs::File) -> Result<Self> {
+        use nix::fcntl::{openat, OFlag};
+        use nix::sys::stat::{fstat, Mode, SFlag};
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
-        let path = state_directory.join("node_id");
-        let result = Self::load_or_create_at(&path);
-        FileExt::unlock(&lock)
-            .with_context(|| format!("Failed to unlock {}", lock_path.display()))?;
-        result
-    }
-
-    fn load_or_create_at(path: &Path) -> Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(raw) => {
-                return serde_json::from_str(&raw)
-                    .with_context(|| "Failed to parse node identity JSON");
+        match openat(
+            Some(directory.as_raw_fd()),
+            "node_id",
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => {
+                let file = unsafe { std::fs::File::from_raw_fd(fd) };
+                let stat = fstat(file.as_raw_fd())?;
+                anyhow::ensure!(
+                    SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG)
+                        && stat.st_nlink == 1,
+                    "isolated node identity must be one regular file"
+                );
+                let mut bytes = Vec::new();
+                file.take((1 << 20) + 1)
+                    .read_to_end(&mut bytes)
+                    .context("Failed to read isolated node identity")?;
+                anyhow::ensure!(
+                    bytes.len() <= 1 << 20,
+                    "isolated node identity is too large"
+                );
+                serde_json::from_slice(&bytes).context("Failed to parse node identity JSON")
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("Failed to read node identity from {}", path.display())
-                });
+            Err(nix::errno::Errno::ENOENT) => {
+                let identity = Self::generate()?;
+                let json = serde_json::to_vec_pretty(&identity)
+                    .context("Failed to serialize node identity")?;
+                let fd = openat(
+                    Some(directory.as_raw_fd()),
+                    "node_id",
+                    OFlag::O_WRONLY
+                        | OFlag::O_CREAT
+                        | OFlag::O_EXCL
+                        | OFlag::O_NOFOLLOW
+                        | OFlag::O_CLOEXEC,
+                    Mode::from_bits_truncate(0o600),
+                )?;
+                let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+                let stat = fstat(file.as_raw_fd())?;
+                anyhow::ensure!(
+                    SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFREG)
+                        && stat.st_nlink == 1,
+                    "new isolated node identity must be one regular file"
+                );
+                file.write_all(&json)
+                    .context("Failed to write isolated node identity")?;
+                file.sync_all()
+                    .context("Failed to sync isolated node identity")?;
+                tracing::info!(node_id = %identity.id, "Generated new isolated node identity");
+                Ok(identity)
             }
+            Err(error) => Err(error).context("Failed to open isolated node identity"),
         }
-
-        // First run — generate a new identity
-        let identity = Self::generate()?;
-        identity.save_at(path)?;
-        tracing::info!(node_id = %identity.id, "Generated new node identity");
-        Ok(identity)
     }
 
     fn generate() -> Result<Self> {
@@ -235,17 +256,6 @@ impl NodeIdentity {
         let json =
             serde_json::to_string_pretty(self).context("Failed to serialize node identity")?;
         std::fs::write(&path, json)
-            .with_context(|| format!("Failed to write node identity to {}", path.display()))?;
-        Ok(())
-    }
-
-    fn save_at(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).context("Failed to create ~/.finch directory")?;
-        }
-        let json =
-            serde_json::to_string_pretty(self).context("Failed to serialize node identity")?;
-        std::fs::write(path, json)
             .with_context(|| format!("Failed to write node identity to {}", path.display()))?;
         Ok(())
     }

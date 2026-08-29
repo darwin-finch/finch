@@ -410,13 +410,46 @@ printf 'keep me\n' >"$fake_home/.finch/brains/existing/events.jsonl"
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 phase=real-node-id-manifest-guard
-if FINCH_REAL_NODE_ID="$fake_home/.finch/node_id" \
-  run_isolated bash -c 'printf changed >"$FINCH_REAL_NODE_ID"'; then
+node_diagnostic="$scratch/node-manifest-diagnostic"
+node_status=0
+FINCH_REAL_NODE_ID="$fake_home/.finch/node_id" \
+  run_isolated bash -c 'printf changed >"$FINCH_REAL_NODE_ID"' \
+  2>"$node_diagnostic" || node_status=$?
+test "$node_status" -eq 70
+if rg -q 'real-home|node_id|keep node|FINCH_REAL_NODE_ID' "$node_diagnostic"; then
+  echo 'node identity manifest diagnostic disclosed protected details' >&2
   exit 1
-else
-  test "$?" -eq 70
 fi
 printf 'keep node\n' >"$fake_home/.finch/node_id"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+phase=combined-brain-and-node-after-snapshots
+node_after_marker="$scratch/node-after-observed"
+combined_status=0
+FINCH_REAL_NODE_ID="$fake_home/.finch/node_id" \
+FINCH_TEST_FORCE_MANIFEST_AFTER_ERROR=1 \
+FINCH_TEST_NODE_AFTER_MARKER="$node_after_marker" \
+  run_isolated bash -c '
+    printf changed >"$FINCH_REAL_NODE_ID"
+  ' >/dev/null 2>&1 || combined_status=$?
+test "$combined_status" -eq 70
+test -f "$node_after_marker"
+printf 'keep node\n' >"$fake_home/.finch/node_id"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+phase=real-node-id-ancestor-swap-rejected
+moved_real_home="$scratch/real-home-moved"
+ancestor_status=0
+FINCH_REAL_HOME_PATH="$fake_home" FINCH_MOVED_REAL_HOME="$moved_real_home" \
+  run_isolated bash -c '
+    mv "$FINCH_REAL_HOME_PATH" "$FINCH_MOVED_REAL_HOME"
+    mkdir -p "$FINCH_REAL_HOME_PATH/.finch/brains"
+    printf attacker >"$FINCH_REAL_HOME_PATH/.finch/node_id"
+  ' >/dev/null 2>&1 || ancestor_status=$?
+test "$ancestor_status" -eq 70
+test "$(cat "$moved_real_home/.finch/node_id")" = 'keep node'
+rm -rf -- "$fake_home"
+mv "$moved_real_home" "$fake_home"
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 phase=real-node-id-missing-stays-missing
