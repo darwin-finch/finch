@@ -563,8 +563,14 @@ where
             descriptor.allow_insecure_loopback,
         )?;
         let redirect = Url::parse(redirect_uri).context("OAuth redirect URI is invalid")?;
-        if redirect.scheme() != "http" || !redirect.host_str().is_some_and(is_loopback_host) {
-            bail!("OAuth browser callback must use an exact loopback HTTP redirect");
+        if redirect.scheme() != "http"
+            || !redirect.host_str().is_some_and(is_loopback_host)
+            || !redirect.username().is_empty()
+            || redirect.password().is_some()
+            || redirect.query().is_some()
+            || redirect.fragment().is_some()
+        {
+            bail!("OAuth browser callback must use an unambiguous loopback HTTP redirect");
         }
         let state = random_secret(32);
         let nonce = random_secret(32);
@@ -616,11 +622,20 @@ where
             || callback.host_str() != expected.host_str()
             || callback.port_or_known_default() != expected.port_or_known_default()
             || callback.path() != expected.path()
+            || !callback.username().is_empty()
+            || callback.password().is_some()
             || callback.fragment().is_some()
         {
             bail!("OAuth callback redirect does not match the pending authorization");
         }
         let params = callback.query_pairs().collect::<Vec<_>>();
+        if params.len() != 2
+            || params
+                .iter()
+                .any(|(key, _)| key != "state" && key != "code")
+        {
+            bail!("OAuth callback contains unexpected query parameters");
+        }
         let one = |name: &str| -> Result<String> {
             let values = params
                 .iter()

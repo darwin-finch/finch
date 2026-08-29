@@ -575,6 +575,41 @@ async fn browser_pkce_state_nonce_and_redirect_are_correlated_before_persistence
         .contains("nonce mismatch"));
     assert!(store.0.lock().unwrap().is_empty());
 
+    for hostile_redirect in [
+        "http://user@127.0.0.1:12345/callback",
+        "http://user:pass@127.0.0.1:12345/callback",
+        "http://127.0.0.1:12345/callback?fixed=value",
+        "http://127.0.0.1:12345/callback#fragment",
+    ] {
+        assert!(client
+            .begin_browser_authorization(hostile_redirect, Duration::from_secs(60))
+            .is_err());
+    }
+    for hostile_callback in ["userinfo", "extra", "fragment", "path"] {
+        let pending = client
+            .begin_browser_authorization("http://127.0.0.1:12345/callback", Duration::from_secs(60))
+            .unwrap();
+        let state = pending.state.clone();
+        let callback = match hostile_callback {
+            "userinfo" => {
+                format!("http://user@127.0.0.1:12345/callback?code=secret-code&state={state}")
+            }
+            "extra" => format!(
+                "http://127.0.0.1:12345/callback?code=secret-code&state={state}&extra=value"
+            ),
+            "fragment" => {
+                format!("http://127.0.0.1:12345/callback?code=secret-code&state={state}#fragment")
+            }
+            "path" => format!("http://127.0.0.1:12345/other?code=secret-code&state={state}"),
+            _ => unreachable!(),
+        };
+        assert!(client
+            .finish_browser_authorization("chatgpt:hostile", pending, &callback)
+            .await
+            .is_err());
+    }
+    assert_eq!(server.request_count("/alpha/token"), 1);
+
     let pending = client
         .begin_browser_authorization("http://127.0.0.1:12345/callback", Duration::from_secs(60))
         .unwrap();
@@ -596,6 +631,27 @@ async fn browser_pkce_state_nonce_and_redirect_are_correlated_before_persistence
         .await
         .unwrap();
     assert_eq!(store.0.lock().unwrap().len(), 1);
+
+    let pending = client
+        .begin_browser_authorization("http://[::1]:12345/callback", Duration::from_secs(60))
+        .unwrap();
+    let state = pending.state.clone();
+    let nonce = pending.nonce.clone();
+    server.push(
+        "/alpha/token",
+        StatusCode::OK,
+        json!({
+            "alpha_access": "ipv6-access",
+            "alpha_account": "account-one",
+            "refresh": "ipv6-refresh",
+            "nonce": nonce
+        }),
+    );
+    let callback = format!("http://[::1]:12345/callback?code=secret-code&state={state}");
+    client
+        .finish_browser_authorization("chatgpt:browser-ipv6", pending, &callback)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
