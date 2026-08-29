@@ -2679,6 +2679,75 @@ mod tests {
         assert_eq!(error.effect_journal, vec![expected_effect]);
     }
 
+    #[test]
+    fn supervised_ipc_listener_ancestor_swap_never_mutates_replacement_path() {
+        if std::env::var("FINCH_BRAIN_TEST_ISOLATED").as_deref() != Ok("1") {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let proof = crate::brain::isolated_test_proof().unwrap();
+            let prepared = super::prepare_ipc_listener().await.unwrap();
+            assert!(!prepared.remove_on_shutdown);
+
+            let store = crate::brain::store::BrainStore::with_root(
+                "box.local",
+                Some(proof.root.clone()),
+            );
+            let server = std::sync::Arc::new(
+                crate::server::AgentServer::for_brain_protocol_test(
+                    store,
+                    crate::brain::credential::BrainCredentialAuthority::ephemeral([92; 32]),
+                    "test-password".into(),
+                    &proof.home,
+                )
+                .unwrap(),
+            );
+
+            let moved = proof.socket_root.with_file_name(format!(
+                "{}.moved-{}",
+                proof
+                    .socket_root
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            let replacement = proof.home.join(".finch");
+            let sentinel = replacement.join("ipc-swap-sentinel");
+            let attacker_socket = replacement.join("daemon.sock");
+            std::fs::write(&sentinel, b"outside-must-not-change").unwrap();
+            std::fs::write(&attacker_socket, b"not-a-socket").unwrap();
+            std::fs::rename(&proof.socket_root, &moved).unwrap();
+            std::os::unix::fs::symlink(&replacement, &proof.socket_root).unwrap();
+
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            shutdown.cancel();
+            super::serve_ipc_listener(server, shutdown, prepared)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                std::fs::read(&sentinel).unwrap(),
+                b"outside-must-not-change"
+            );
+            assert_eq!(std::fs::read(&attacker_socket).unwrap(), b"not-a-socket");
+            assert!(std::fs::symlink_metadata(&attacker_socket)
+                .unwrap()
+                .file_type()
+                .is_file());
+
+            std::fs::remove_file(&proof.socket_root).unwrap();
+            std::fs::rename(&moved, &proof.socket_root).unwrap();
+            std::fs::remove_file(sentinel).unwrap();
+            std::fs::remove_file(attacker_socket).unwrap();
+        }));
+    }
+
     #[tokio::test]
     async fn eval_forth_uses_typed_signatures_and_runtime() {
         let (stack, output) = execute_typed_forth_ipc(
@@ -2711,10 +2780,21 @@ pub async fn start_ipc_server(
     server: Arc<AgentServer>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
+    let prepared = prepare_ipc_listener().await?;
+    serve_ipc_listener(server, shutdown, prepared).await
+}
+
+struct PreparedIpcListener {
+    path: std::path::PathBuf,
+    listener: UnixListener,
+    remove_on_shutdown: bool,
+}
+
+async fn prepare_ipc_listener() -> Result<PreparedIpcListener> {
     // A supervised daemon must consume the short, private socket path sealed
-    // into its authenticated proof. This is validated before probing,
-    // unlinking, or creating any socket pathname.
-    let path = if let Some(proof) = crate::brain::isolated_test_proof_if_present()? {
+    // into its authenticated proof. The supervisor already bound the listener;
+    // the child performs no pathname operation at startup or shutdown.
+    if let Some(proof) = crate::brain::isolated_test_proof_if_present()? {
         let path = std::env::var_os("FINCH_TEST_IPC_SOCKET")
             .map(std::path::PathBuf::from)
             .context("supervised daemon is missing its sealed IPC socket path")?;
@@ -2722,11 +2802,16 @@ pub async fn start_ipc_server(
             path == proof.ipc_socket,
             "supervised daemon IPC path is not parent-authorized"
         );
-        path
-    } else {
-        crate::ipc::transport::sock_path()
-    };
+        let listener = proof.duplicate_ipc_listener()?;
+        listener.set_nonblocking(true)?;
+        return Ok(PreparedIpcListener {
+            path,
+            listener: UnixListener::from_std(listener)?,
+            remove_on_shutdown: false,
+        });
+    }
 
+    let path = crate::ipc::transport::sock_path();
     // Remove only a stale socket. Blind unlinking lets a second daemon replace
     // the pathname while the original listener continues serving through its
     // open file descriptor.
@@ -2754,8 +2839,24 @@ pub async fn start_ipc_server(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-
     let listener = UnixListener::bind(&path)?;
+    Ok(PreparedIpcListener {
+        path,
+        listener,
+        remove_on_shutdown: true,
+    })
+}
+
+async fn serve_ipc_listener(
+    server: Arc<AgentServer>,
+    shutdown: tokio_util::sync::CancellationToken,
+    prepared: PreparedIpcListener,
+) -> Result<()> {
+    let PreparedIpcListener {
+        path,
+        listener,
+        remove_on_shutdown,
+    } = prepared;
     tracing::info!(path = %path.display(), "IPC server listening");
 
     let local = tokio::task::LocalSet::new();
@@ -2781,7 +2882,7 @@ pub async fn start_ipc_server(
             }
         })
         .await;
-    if path.exists() {
+    if remove_on_shutdown && path.exists() {
         std::fs::remove_file(&path)?;
     }
     Ok(())

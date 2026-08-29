@@ -9,7 +9,7 @@ use std::io::{self, Read, Write};
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::UnixDatagram;
+use std::os::unix::net::{UnixDatagram, UnixListener};
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -316,6 +316,7 @@ fn manifest_digest(store: &Path, control_root: Option<&Path>) -> anyhow::Result<
 fn create_proof(
     home: &Path,
     socket_root: &Path,
+    ipc_listener: &UnixListener,
     brain_address: &str,
     daemon_address: &str,
     password: &str,
@@ -353,6 +354,12 @@ fn create_proof(
         "{}:{}",
         socket_root_metadata.dev(),
         socket_root_metadata.ino()
+    )?;
+    let ipc_listener_stat = nix::sys::stat::fstat(ipc_listener.as_raw_fd())?;
+    writeln!(
+        contents,
+        "{}:{}",
+        ipc_listener_stat.st_dev, ipc_listener_stat.st_ino
     )?;
     writeln!(contents, "{}", std::process::id())?;
     let supervisor_executable = std::env::current_exe()?.canonicalize()?;
@@ -395,6 +402,7 @@ fn configure_supervised_child(
     auth_fd: RawFd,
     brain_fd: RawFd,
     daemon_fd: RawFd,
+    ipc_fd: RawFd,
 ) {
     unsafe {
         command.pre_exec(move || {
@@ -421,12 +429,14 @@ fn configure_supervised_child(
             // Cargo uses low-numbered descriptors for its GNU jobserver while
             // launching a test binary. Keep sealed backups above that range;
             // the test process restores and authenticates the specified
-            // FD10/FD11 production boundary before using either listener.
+            // FD10/FD11/FD12 production boundary before using any listener.
             for (source, target) in [
                 (brain_fd, 10),
                 (daemon_fd, 11),
+                (ipc_fd, 12),
                 (brain_fd, 110),
                 (daemon_fd, 111),
+                (ipc_fd, 112),
             ] {
                 if source != target && libc::dup2(source, target) == -1 {
                     return Err(io::Error::last_os_error());
@@ -767,6 +777,10 @@ fn run() -> anyhow::Result<i32> {
         .prefix("ft.")
         .tempdir_in(socket_parent)?;
     fs::set_permissions(socket_root.path(), fs::Permissions::from_mode(0o700))?;
+    // Bind the Unix listener while the supervisor still owns the verified
+    // directory. Supervised children inherit the open listener and therefore
+    // never resolve, unlink, create, or bind its pathname themselves.
+    let ipc_listener = UnixListener::bind(socket_root.path().join("daemon.sock"))?;
     let brain_listener = TcpListener::bind("127.0.0.1:0")?;
     let daemon_listener = TcpListener::bind("127.0.0.1:0")?;
     let brain_address = brain_listener.local_addr()?.to_string();
@@ -777,6 +791,7 @@ fn run() -> anyhow::Result<i32> {
     let (proof, token) = create_proof(
         isolated.path(),
         socket_root.path(),
+        &ipc_listener,
         &brain_address,
         &daemon_address,
         &password,
@@ -832,8 +847,10 @@ fn run() -> anyhow::Result<i32> {
         .env("FINCH_TEST_BRAIN_PASSWORD", &password)
         .env("FINCH_TEST_BRAIN_LISTENER_FD", "10")
         .env("FINCH_TEST_DAEMON_LISTENER_FD", "11")
+        .env("FINCH_TEST_IPC_LISTENER_FD", "12")
         .env("FINCH_TEST_BRAIN_LISTENER_BACKUP_FD", "110")
         .env("FINCH_TEST_DAEMON_LISTENER_BACKUP_FD", "111")
+        .env("FINCH_TEST_IPC_LISTENER_BACKUP_FD", "112")
         .env("FINCH_TEST_SUPERVISOR_PID", std::process::id().to_string())
         .env("FINCH_TEST_SUPERVISOR_BIN", std::env::current_exe()?);
     if std::env::var_os("CARGO_HOME").is_none() && real_home.join(".cargo").is_dir() {
@@ -858,12 +875,14 @@ fn run() -> anyhow::Result<i32> {
     let auth_child = duplicate_above_stdio(auth_child_socket.as_raw_fd())?;
     let brain_child = duplicate_above_stdio(brain_listener.as_raw_fd())?;
     let daemon_child = duplicate_above_stdio(daemon_listener.as_raw_fd())?;
+    let ipc_child = duplicate_above_stdio(ipc_listener.as_raw_fd())?;
     configure_supervised_child(
         &mut command,
         proof_child.as_raw_fd(),
         auth_child.as_raw_fd(),
         brain_child.as_raw_fd(),
         daemon_child.as_raw_fd(),
+        ipc_child.as_raw_fd(),
     );
     let mut group = OwnedProcessGroup::new(command.spawn()?);
     let observation = (|| -> anyhow::Result<()> {

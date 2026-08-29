@@ -21,6 +21,7 @@ pub struct IsolatedTestProof {
     pub(crate) ipc_socket: std::path::PathBuf,
     pub(crate) socket_root: std::path::PathBuf,
     pub(crate) socket_root_identity: (u64, u64),
+    pub(crate) ipc_listener_identity: (u64, u64),
     pub(crate) supervisor_pid: u32,
     pub(crate) password_digest: String,
 }
@@ -58,6 +59,67 @@ impl IsolatedTestProof {
     pub fn duplicate_daemon_listener(&self) -> anyhow::Result<std::net::TcpListener> {
         duplicate_validated_listener(11, &self.daemon_addr)
     }
+
+    #[cfg(unix)]
+    #[doc(hidden)]
+    pub fn duplicate_ipc_listener(&self) -> anyhow::Result<std::os::unix::net::UnixListener> {
+        duplicate_validated_ipc_listener(12, &self.ipc_socket, self.ipc_listener_identity)
+    }
+}
+
+fn parse_identity(identity: &str) -> anyhow::Result<(u64, u64)> {
+    use anyhow::Context as _;
+
+    let (device, inode) = identity
+        .split_once(':')
+        .context("wrapper proof has an invalid filesystem identity")?;
+    Ok((device.parse()?, inode.parse()?))
+}
+
+#[cfg(unix)]
+fn duplicate_validated_ipc_listener(
+    fd: i32,
+    expected: &std::path::Path,
+    expected_identity: (u64, u64),
+) -> anyhow::Result<std::os::unix::net::UnixListener> {
+    use std::os::fd::FromRawFd as _;
+
+    let socket_option = |name: i32| -> anyhow::Result<i32> {
+        let mut value = 0_i32;
+        let mut length = std::mem::size_of::<i32>() as nix::libc::socklen_t;
+        anyhow::ensure!(
+            unsafe {
+                nix::libc::getsockopt(
+                    fd,
+                    nix::libc::SOL_SOCKET,
+                    name,
+                    (&mut value as *mut i32).cast(),
+                    &mut length,
+                )
+            } == 0
+                && length as usize == std::mem::size_of::<i32>(),
+            "supervisor IPC descriptor socket option is unavailable"
+        );
+        Ok(value)
+    };
+    anyhow::ensure!(
+        socket_option(nix::libc::SO_TYPE)? == nix::libc::SOCK_STREAM
+            && socket_option(nix::libc::SO_ACCEPTCONN)? != 0,
+        "supervisor IPC descriptor is not a listening Unix stream socket"
+    );
+    let stat = nix::sys::stat::fstat(fd)?;
+    anyhow::ensure!(
+        (stat.st_dev as u64, stat.st_ino as u64) == expected_identity,
+        "supervisor IPC listener identity does not match sealed authority"
+    );
+    let duplicate = unsafe { nix::libc::dup(fd) };
+    anyhow::ensure!(duplicate >= 0, "supervisor IPC listener is unavailable");
+    let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(duplicate) };
+    anyhow::ensure!(
+        listener.local_addr()?.as_pathname() == Some(expected),
+        "supervisor IPC listener path does not match sealed authority"
+    );
+    Ok(listener)
 }
 
 #[cfg(unix)]
@@ -282,6 +344,34 @@ fn restore_supervisor_listener(
         "could not make restored supervisor listener inheritable"
     );
     drop(duplicate_validated_listener(target_fd, expected)?);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restore_supervisor_ipc_listener(
+    backup_fd: i32,
+    target_fd: i32,
+    expected: &std::path::Path,
+    expected_identity: (u64, u64),
+) -> anyhow::Result<()> {
+    drop(duplicate_validated_ipc_listener(
+        backup_fd,
+        expected,
+        expected_identity,
+    )?);
+    anyhow::ensure!(
+        unsafe { nix::libc::dup2(backup_fd, target_fd) } == target_fd,
+        "could not restore supervisor IPC listener descriptor"
+    );
+    anyhow::ensure!(
+        unsafe { nix::libc::fcntl(target_fd, nix::libc::F_SETFD, 0) } == 0,
+        "could not make restored supervisor IPC listener inheritable"
+    );
+    drop(duplicate_validated_ipc_listener(
+        target_fd,
+        expected,
+        expected_identity,
+    )?);
     Ok(())
 }
 
@@ -633,6 +723,9 @@ fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<
     let socket_root_identity = lines
         .next()
         .context("wrapper proof is missing its socket-root identity")?;
+    let ipc_listener_identity = lines
+        .next()
+        .context("wrapper proof is missing its IPC-listener identity")?;
     let supervisor_pid: u32 = lines
         .next()
         .context("wrapper proof is missing its supervisor identity")?
@@ -681,12 +774,20 @@ fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<
         anyhow::ensure!(
             std::env::var("FINCH_TEST_BRAIN_LISTENER_FD").as_deref() == Ok("10")
                 && std::env::var("FINCH_TEST_DAEMON_LISTENER_FD").as_deref() == Ok("11")
+                && std::env::var("FINCH_TEST_IPC_LISTENER_FD").as_deref() == Ok("12")
                 && std::env::var("FINCH_TEST_BRAIN_LISTENER_BACKUP_FD").as_deref() == Ok("110")
-                && std::env::var("FINCH_TEST_DAEMON_LISTENER_BACKUP_FD").as_deref() == Ok("111"),
-            "sealed TCP authority does not match supervisor-owned listeners"
+                && std::env::var("FINCH_TEST_DAEMON_LISTENER_BACKUP_FD").as_deref() == Ok("111")
+                && std::env::var("FINCH_TEST_IPC_LISTENER_BACKUP_FD").as_deref() == Ok("112"),
+            "sealed listener authority does not match supervisor-owned listeners"
         );
         restore_supervisor_listener(110, 10, &brain_addr)?;
         restore_supervisor_listener(111, 11, &daemon_addr)?;
+        restore_supervisor_ipc_listener(
+            112,
+            12,
+            &ipc_socket,
+            parse_identity(ipc_listener_identity)?,
+        )?;
     }
     anyhow::ensure!(
         std::env::var_os("HOME").as_deref() == Some(home.as_os_str())
@@ -747,12 +848,6 @@ fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<
             "wrapper proof socket-root identity changed"
         );
     }
-    let parse_identity = |identity: &str| -> anyhow::Result<(u64, u64)> {
-        let (device, inode) = identity
-            .split_once(':')
-            .context("wrapper proof has an invalid filesystem identity")?;
-        Ok((device.parse()?, inode.parse()?))
-    };
     let proof = IsolatedTestProof {
         home,
         root,
@@ -763,6 +858,7 @@ fn isolated_test_proof_with_encoded() -> anyhow::Result<(IsolatedTestProof, Vec<
         ipc_socket,
         socket_root,
         socket_root_identity: parse_identity(socket_root_identity)?,
+        ipc_listener_identity: parse_identity(ipc_listener_identity)?,
         supervisor_pid,
         password_digest: password_digest.to_owned(),
     };
@@ -1418,6 +1514,25 @@ mod isolation_tests {
                 assert!(isolated_test_proof().is_err());
                 return;
             }
+            if mode == "swapped-low-ipc-listener" {
+                assert_eq!(unsafe { nix::libc::dup2(11, 12) }, 12);
+                let repaired = isolated_test_proof().unwrap();
+                repaired.duplicate_ipc_listener().unwrap();
+                return;
+            }
+            if mode == "swapped-backup-ipc-listener" {
+                assert_eq!(unsafe { nix::libc::dup2(111, 112) }, 112);
+                assert!(isolated_test_proof().is_err());
+                return;
+            }
+            if mode == "wrong-ipc-listener-identity" {
+                let wrong = (
+                    valid.ipc_listener_identity.0,
+                    valid.ipc_listener_identity.1.wrapping_add(1),
+                );
+                assert!(duplicate_validated_ipc_listener(112, &valid.ipc_socket, wrong).is_err());
+                return;
+            }
             if mode == "rewrite-restore" {
                 #[cfg(target_os = "macos")]
                 {
@@ -1533,6 +1648,12 @@ mod isolation_tests {
                     valid.socket_root_identity.0, valid.socket_root_identity.1
                 )
                 .unwrap();
+                writeln!(
+                    forged,
+                    "{}:{}",
+                    valid.ipc_listener_identity.0, valid.ipc_listener_identity.1
+                )
+                .unwrap();
                 writeln!(forged, "{}", std::process::id()).unwrap();
                 writeln!(forged, "{}", executable.display()).unwrap();
                 writeln!(
@@ -1620,6 +1741,9 @@ mod isolation_tests {
             "writable",
             "swapped-low-listener",
             "swapped-backup-listener",
+            "swapped-low-ipc-listener",
+            "swapped-backup-ipc-listener",
+            "wrong-ipc-listener-identity",
             "rewrite-restore",
             "auth-key-replay",
             "missing-proof-backup",

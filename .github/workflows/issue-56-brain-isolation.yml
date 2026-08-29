@@ -6,12 +6,9 @@ on:
       - '.github/workflows/issue-56-brain-isolation.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - 'src/bin/finch-test-supervisor.rs'
-      - 'src/brain/**'
-      - 'src/daemon/**'
-      - 'src/ipc/**'
-      - 'src/main.rs'
-      - 'src/server/**'
+      - 'build.rs'
+      - 'schema/**'
+      - 'src/**'
       - 'scripts/**'
       - 'tests/**'
   push:
@@ -20,12 +17,9 @@ on:
       - '.github/workflows/issue-56-brain-isolation.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - 'src/bin/finch-test-supervisor.rs'
-      - 'src/brain/**'
-      - 'src/daemon/**'
-      - 'src/ipc/**'
-      - 'src/main.rs'
-      - 'src/server/**'
+      - 'build.rs'
+      - 'schema/**'
+      - 'src/**'
       - 'scripts/**'
       - 'tests/**'
   workflow_dispatch:
@@ -81,6 +75,10 @@ jobs:
       timeout-minutes: 25
       run: cargo check --lib --bins --tests
 
+    - name: Reject external provider binaries
+      timeout-minutes: 15
+      run: cargo test --test no_external_provider_binary_test -- --nocapture
+
     - name: Build isolation supervisor
       timeout-minutes: 40
       run: |
@@ -115,6 +113,7 @@ jobs:
       run: |
         ./scripts/test_brains.sh cargo test --lib supervised_http_fixture_rejects -- --nocapture
         ./scripts/test_brains.sh cargo test --lib server::tests::supervised_http_fixture_pins_state_root_across_ancestor_swap -- --exact --nocapture
+        ./scripts/test_brains.sh cargo test --lib ipc::server::tests::supervised_ipc_listener_ancestor_swap_never_mutates_replacement_path -- --exact --nocapture
 
     - name: Exercise real Brain and server paths behind the guard
       timeout-minutes: 25

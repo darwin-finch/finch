@@ -47,7 +47,8 @@ brain_isolation_proof_rejected() {
 
 brain_test_isolation_is_active() {
   local proof token home root home_identity root_identity brain_addr daemon_addr
-  local password_digest socket socket_root socket_root_identity supervisor_pid supervisor_executable supervisor_identity signature
+  local password_digest socket socket_root socket_root_identity ipc_listener_identity
+  local supervisor_pid supervisor_executable supervisor_identity signature
   local links proof_uid proof_mode proof_type actual_password_digest ancestor actual_supervisor_executable
   local library_root expected_supervisor
   [[ "${FINCH_BRAIN_TEST_ISOLATED:-}" == 1 ]] || brain_isolation_proof_rejected isolated-marker
@@ -70,12 +71,13 @@ brain_test_isolation_is_active() {
   socket="$(printf '%s\n' "$proof" | sed -n '9p')"
   socket_root="$(printf '%s\n' "$proof" | sed -n '10p')"
   socket_root_identity="$(printf '%s\n' "$proof" | sed -n '11p')"
-  supervisor_pid="$(printf '%s\n' "$proof" | sed -n '12p')"
-  supervisor_executable="$(printf '%s\n' "$proof" | sed -n '13p')"
-  supervisor_identity="$(printf '%s\n' "$proof" | sed -n '14p')"
-  signature="$(printf '%s\n' "$proof" | sed -n '15p')"
+  ipc_listener_identity="$(printf '%s\n' "$proof" | sed -n '12p')"
+  supervisor_pid="$(printf '%s\n' "$proof" | sed -n '13p')"
+  supervisor_executable="$(printf '%s\n' "$proof" | sed -n '14p')"
+  supervisor_identity="$(printf '%s\n' "$proof" | sed -n '15p')"
+  signature="$(printf '%s\n' "$proof" | sed -n '16p')"
   [[ "$signature" =~ ^[0-9a-f]{128}$ ]] || brain_isolation_proof_rejected signature-shape
-  [[ "$(printf '%s\n' "$proof" | sed -n '16p')" == '' ]] || brain_isolation_proof_rejected trailing-proof-fields
+  [[ "$(printf '%s\n' "$proof" | sed -n '17p')" == '' ]] || brain_isolation_proof_rejected trailing-proof-fields
   [[ "$token" == "${FINCH_BRAIN_TEST_TOKEN:-}" ]] || brain_isolation_proof_rejected token-binding
   [[ "$home" == "${HOME:-}" && "$home" == "${FINCH_BRAIN_TEST_HOME:-}" ]] || brain_isolation_proof_rejected home-binding
   [[ "$root" == "$home/.finch/brains" && "$root" == "${FINCH_BRAIN_TEST_ROOT:-}" ]] || brain_isolation_proof_rejected root-binding
@@ -88,13 +90,13 @@ brain_test_isolation_is_active() {
   [[ "$socket" == "${FINCH_TEST_IPC_SOCKET:-}" ]] || brain_isolation_proof_rejected socket-binding
   [[ "$socket_root" == "${FINCH_TEST_SOCKET_ROOT:-}" && "$socket" == "$socket_root/daemon.sock" ]] || brain_isolation_proof_rejected socket-root-binding
   [[ "$socket_root_identity" == "$(brain_isolation_file_identity "$socket_root")" ]] || brain_isolation_proof_rejected socket-root-identity
-  [[ "${FINCH_TEST_BRAIN_LISTENER_FD:-}" == 10 && "${FINCH_TEST_DAEMON_LISTENER_FD:-}" == 11 ]] || brain_isolation_proof_rejected listener-target-fds
-  [[ "${FINCH_TEST_BRAIN_LISTENER_BACKUP_FD:-}" == 110 && "${FINCH_TEST_DAEMON_LISTENER_BACKUP_FD:-}" == 111 ]] || brain_isolation_proof_rejected listener-backup-fds
-  # The trusted Rust verifier above restores and authenticates FD10/FD11 from
+  [[ "${FINCH_TEST_BRAIN_LISTENER_FD:-}" == 10 && "${FINCH_TEST_DAEMON_LISTENER_FD:-}" == 11 && "${FINCH_TEST_IPC_LISTENER_FD:-}" == 12 ]] || brain_isolation_proof_rejected listener-target-fds
+  [[ "${FINCH_TEST_BRAIN_LISTENER_BACKUP_FD:-}" == 110 && "${FINCH_TEST_DAEMON_LISTENER_BACKUP_FD:-}" == 111 && "${FINCH_TEST_IPC_LISTENER_BACKUP_FD:-}" == 112 ]] || brain_isolation_proof_rejected listener-backup-fds
+  # The trusted Rust verifier above restores and authenticates FD10/FD11/FD12 from
   # the sealed backups. Bash may use a low descriptor while reading a script,
   # so the parent shell independently checks the backups that production will
-  # restore instead of treating Bash's transient FD10/FD11 as authority.
-  perl -MSocket=SOL_SOCKET,SO_TYPE,SOCK_STREAM,sockaddr_in,inet_ntoa -e '
+  # restore instead of treating Bash's transient low descriptors as authority.
+  perl -MSocket=SOL_SOCKET,SO_TYPE,SO_ACCEPTCONN,SOCK_STREAM,sockaddr_in,inet_ntoa,unpack_sockaddr_un -e '
     sub verify_listener {
       my ($fd, $expected) = @_;
       open(my $socket, "<&$fd") or return 0;
@@ -105,8 +107,24 @@ brain_test_isolation_is_active() {
       my ($port, $address) = sockaddr_in($name);
       return inet_ntoa($address) . ":" . $port eq $expected;
     }
-    exit(verify_listener(110, $ARGV[0]) && verify_listener(111, $ARGV[1]) ? 0 : 1);
-  ' "$brain_addr" "$daemon_addr" || brain_isolation_proof_rejected listener-backup-authority
+    sub verify_ipc_listener {
+      my ($fd, $expected_path, $expected_identity) = @_;
+      open(my $socket, "<&$fd") or return 0;
+      my $type = getsockopt($socket, SOL_SOCKET, SO_TYPE);
+      my $accepting = getsockopt($socket, SOL_SOCKET, SO_ACCEPTCONN);
+      return 0 unless defined($type) && unpack("i", $type) == SOCK_STREAM;
+      return 0 unless defined($accepting) && unpack("i", $accepting) != 0;
+      my $name = getsockname($socket);
+      return 0 unless defined($name) && unpack_sockaddr_un($name) eq $expected_path;
+      my @stat = stat($socket);
+      return @stat && "$stat[0]:$stat[1]" eq $expected_identity;
+    }
+    exit(
+      verify_listener(110, $ARGV[0]) &&
+      verify_listener(111, $ARGV[1]) &&
+      verify_ipc_listener(112, $ARGV[2], $ARGV[3]) ? 0 : 1
+    );
+  ' "$brain_addr" "$daemon_addr" "$socket" "$ipc_listener_identity" || brain_isolation_proof_rejected listener-backup-authority
   perl -MFcntl=F_GETFL,O_ACCMODE,O_RDONLY -e '
     my $flags = fcntl(STDIN, F_GETFL, 0); exit 1 unless defined $flags;
     exit(($flags & O_ACCMODE) == O_RDONLY ? 0 : 1)
