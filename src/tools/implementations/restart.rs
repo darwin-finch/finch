@@ -219,6 +219,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
         let input = serde_json::json!({
@@ -242,6 +243,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
         let input = serde_json::json!({
@@ -266,6 +268,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
         let binary = std::env::current_exe().unwrap();

@@ -6,10 +6,15 @@ on:
       - ".github/workflows/issue-163-effect-audit.yml"
       - "schema/finch_ipc.capnp"
       - "src/brain/store.rs"
+      - "src/cli/repl_event/**"
       - "src/ipc/**"
       - "src/runtime/effect_log.rs"
+      - "src/runtime/mod.rs"
       - "src/server/brain_runner.rs"
       - "src/server/mod.rs"
+      - "src/tools/executor.rs"
+      - "src/tools/types.rs"
+      - "src/tools/implementations/program.rs"
   workflow_dispatch:
 
 permissions:

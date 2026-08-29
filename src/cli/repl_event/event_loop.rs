@@ -610,9 +610,55 @@ struct PendingNamedBrainTurn {
     /// Keep the correlation record until cancellation reaches a terminal VM
     /// boundary and all execute-once effects have been collected.
     cancellation_requested: bool,
+    /// Provider tool calls that have been published for this turn but have
+    /// not yet reached a result boundary. Cancellation retains the turn until
+    /// this set is empty so late physical outcomes can be audited without
+    /// publishing their ToolResult into conversation history.
+    active_tool_ids: std::collections::HashSet<String>,
     approval_audience: crate::brain::store::BrainApprovalAudience,
     approval_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::server::RunnerApprovalRequest>>,
+    /// Daemon-issued authority retained for the whole provider/tool loop.
+    /// Query metadata carries a clone to each submitted ProgramRun.
+    effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     restart: Option<crate::tools::implementations::restart::DeferredFrontendRestart>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedBrainToolResultDisposition {
+    Publish,
+    DiscardCancelled { quiesced: bool },
+}
+
+impl PendingNamedBrainTurn {
+    fn observe_tool_calls(&mut self, tool_uses: Vec<crate::tools::types::ToolUse>) {
+        for tool_use in tool_uses {
+            self.active_tool_ids.insert(tool_use.id.clone());
+            self.turn_events.push(crate::server::RunnerTurnEvent::Call {
+                tool_id: tool_use.id,
+                name: tool_use.name,
+                input: tool_use.input,
+            });
+        }
+    }
+
+    fn observe_tool_result(
+        &mut self,
+        tool_id: &str,
+        result: &anyhow::Result<String>,
+    ) -> NamedBrainToolResultDisposition {
+        if !self.cancellation_requested {
+            return NamedBrainToolResultDisposition::Publish;
+        }
+        self.active_tool_ids.remove(tool_id);
+        // Legacy effect receipts remain useful to the canonical turn commit,
+        // even when cancellation forbids publishing the provider ToolResult.
+        // The independent durable audit remains the execute-once authority.
+        self.effect_journal
+            .extend(runner_effect_records_from_tool_result(result));
+        NamedBrainToolResultDisposition::DiscardCancelled {
+            quiesced: self.active_tool_ids.is_empty(),
+        }
+    }
 }
 
 async fn resume_named_brain_program_boundaries(
@@ -1463,6 +1509,66 @@ async fn resume_deferred_proposal(
 #[cfg(test)]
 mod deferred_proposal_tests {
     use super::*;
+
+    fn test_pending_named_brain_turn() -> PendingNamedBrainTurn {
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        PendingNamedBrainTurn {
+            brain: "audit-test".into(),
+            run_id: crate::brain::store::RunId(uuid::Uuid::new_v4()),
+            response_tx,
+            turn_events: Vec::new(),
+            effect_journal: Vec::new(),
+            cancellation_requested: false,
+            active_tool_ids: std::collections::HashSet::new(),
+            approval_audience: crate::brain::store::BrainApprovalAudience {
+                brain_id: crate::brain::store::BrainId(uuid::Uuid::new_v4()),
+                brain: "audit-test".into(),
+                attachment_id: crate::brain::store::AttachmentId(uuid::Uuid::new_v4()),
+                subject: "runner".into(),
+                role: crate::brain::store::AttachmentRole::Runner,
+                environment_generation: 1,
+            },
+            approval_tx: None,
+            effect_audit: None,
+            restart: None,
+        }
+    }
+
+    #[test]
+    fn named_brain_effect_audit_cancellation_quiesces_without_late_tool_result() {
+        let mut turn = test_pending_named_brain_turn();
+        turn.observe_tool_calls(vec![
+            crate::tools::types::ToolUse {
+                id: "tool-a".into(),
+                name: "submit_program".into(),
+                input: serde_json::json!({"source": "secret-a"}),
+            },
+            crate::tools::types::ToolUse {
+                id: "tool-b".into(),
+                name: "submit_program".into(),
+                input: serde_json::json!({"source": "secret-b"}),
+            },
+        ]);
+        turn.cancellation_requested = true;
+
+        assert_eq!(
+            turn.observe_tool_result("tool-a", &Ok("late-a".into())),
+            NamedBrainToolResultDisposition::DiscardCancelled { quiesced: false }
+        );
+        assert_eq!(
+            turn.observe_tool_result("tool-b", &Ok("late-b".into())),
+            NamedBrainToolResultDisposition::DiscardCancelled { quiesced: true }
+        );
+        assert!(turn.active_tool_ids.is_empty());
+        assert_eq!(
+            turn.turn_events
+                .iter()
+                .filter(|event| matches!(event, crate::server::RunnerTurnEvent::Result { .. }))
+                .count(),
+            0,
+            "cancelled late results must not enter canonical Brain/provider history"
+        );
+    }
 
     #[tokio::test]
     async fn extracts_the_exact_suspended_proposal_handle() {
@@ -3829,6 +3935,22 @@ Rules:\n\
             }
 
             ReplEvent::QueryFailed { query_id, error } => {
+                if let Some(turn) = self.pending_named_brain_turns.get(&query_id) {
+                    if turn.cancellation_requested {
+                        // A cancelled provider may report its terminal error
+                        // before independently-running tools quiesce. Retain
+                        // the correlation record until every physical outcome
+                        // reaches the audit boundary, and never publish this
+                        // late provider error into Brain history.
+                        if turn.active_tool_ids.is_empty() {
+                            self.finish_named_brain_turn(query_id, String::new()).await;
+                            if *self.active_query_id.read().await == Some(query_id) {
+                                *self.active_query_id.write().await = None;
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
                 // DON'T remove streaming message here - fallback providers need it!
                 // The message will be removed on StreamingComplete or stays for final error display
 
@@ -3893,6 +4015,29 @@ Rules:\n\
                 tool_id,
                 mut result,
             } => {
+                let named_brain_disposition = self
+                    .pending_named_brain_turns
+                    .get_mut(&query_id)
+                    .map(|turn| turn.observe_tool_result(&tool_id, &result));
+                if let Some(NamedBrainToolResultDisposition::DiscardCancelled { quiesced }) =
+                    named_brain_disposition
+                {
+                    // The physical effect has its own durable audit outcome,
+                    // but a cancelled Brain turn must never publish a late
+                    // ToolResult or feed it into another provider round.
+                    if let Some((_name, _input, work_unit, row_idx)) =
+                        self.active_tool_uses.write().await.remove(&tool_id)
+                    {
+                        work_unit.fail_row(row_idx, "discarded after Brain cancellation");
+                    }
+                    if quiesced {
+                        self.finish_named_brain_turn(query_id, String::new()).await;
+                        if *self.active_query_id.read().await == Some(query_id) {
+                            *self.active_query_id.write().await = None;
+                        }
+                    }
+                    return Ok(());
+                }
                 if let Some(restart) =
                     crate::tools::implementations::restart::deferred_frontend_restart_from_tool_result(
                         &result,
@@ -3940,14 +4085,7 @@ Rules:\n\
                 tool_uses,
             } => {
                 if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
-                    turn.turn_events
-                        .extend(tool_uses.into_iter().map(|tool_use| {
-                            crate::server::RunnerTurnEvent::Call {
-                                tool_id: tool_use.id,
-                                name: tool_use.name,
-                                input: tool_use.input,
-                            }
-                        }));
+                    turn.observe_tool_calls(tool_uses);
                 }
             }
 
@@ -4045,6 +4183,22 @@ Rules:\n\
                 full_response,
             } => {
                 tracing::debug!("[EVENT_LOOP] Handling StreamingComplete event");
+
+                if let Some(turn) = self.pending_named_brain_turns.get(&query_id) {
+                    if turn.cancellation_requested {
+                        // Cancellation terminalizes only after the provider
+                        // and every launched tool have reached a quiescent
+                        // boundary. The provider's late prose is deliberately
+                        // excluded from conversation and Brain projections.
+                        if turn.active_tool_ids.is_empty() {
+                            self.finish_named_brain_turn(query_id, String::new()).await;
+                            if *self.active_query_id.read().await == Some(query_id) {
+                                *self.active_query_id.write().await = None;
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
 
                 // Check if this query is executing tools
                 // If so, the assistant message was already added with ToolUse blocks
@@ -4771,6 +4925,11 @@ Rules:\n\
                 },
             )
             .await;
+        if let Some(effect_audit) = request.effect_audit.clone() {
+            self.query_states
+                .bind_effect_audit(query_id, effect_audit)
+                .await;
+        }
         let run_unit = self
             .ensure_remote_brain_run_projection(
                 request.run_id,
@@ -4792,8 +4951,10 @@ Rules:\n\
                 turn_events: Vec::new(),
                 effect_journal: Vec::new(),
                 cancellation_requested: false,
+                active_tool_ids: std::collections::HashSet::new(),
                 approval_audience: request.approval_audience,
                 approval_tx: request.approval_tx,
+                effect_audit: request.effect_audit,
                 restart: None,
             },
         );
@@ -4923,9 +5084,15 @@ Rules:\n\
             turn_events,
             effect_journal,
             cancellation_requested,
+            effect_audit,
             restart,
             ..
         } = pending;
+        // Retain the opaque run-scoped capability until the provider and all
+        // launched tools have crossed their terminal boundary. Dropping it
+        // earlier would prevent an already-begun detached effect from filing
+        // its one authoritative late outcome.
+        drop(effect_audit);
         if cancellation_requested {
             let _ = response_tx.send(Err(crate::server::RunnerTurnError {
                 message: "named Brain run cancelled".into(),
@@ -6415,6 +6582,7 @@ Rules:\n\
         };
 
         if let Some(turn) = self.pending_named_brain_turns.get_mut(&query_id) {
+            turn.active_tool_ids.remove(&tool_id);
             turn.effect_journal
                 .extend(runner_effect_records_from_tool_result(&result));
             let (output, is_error) = match &result {

@@ -186,6 +186,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
         let result = tool.execute(input, &context).await.unwrap();

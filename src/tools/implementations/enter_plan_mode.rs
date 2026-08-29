@@ -116,6 +116,7 @@ mod tests {
             repl_mode: Some(repl_mode),
             plan_content: Some(plan_content),
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
 

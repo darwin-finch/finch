@@ -72,6 +72,7 @@ async fn execute_direct_wire_response(
     event_tx: mpsc::UnboundedSender<ReplEvent>,
     cancel: tokio_util::sync::CancellationToken,
     source: String,
+    effect_audit: Option<crate::server::RunnerEffectAuditControl>,
 ) -> anyhow::Result<crate::runtime::outcome::ExecutionOutcome> {
     let submission = direct_wire_submission(runtime, source)?;
     let projection = VmOutputProjection::new(output_manager, work_unit);
@@ -86,7 +87,7 @@ async fn execute_direct_wire_response(
         });
     });
     let outcome = runtime
-        .submit_with_deferred_program_effects(submission, sink)
+        .submit_tool_program(submission, None, Some(sink), true, effect_audit)
         .await?;
     let execution_id = outcome.execution_id;
     let mut resumed = Box::pin(resume_interactive_boundaries(runtime, event_tx, outcome));
@@ -295,6 +296,7 @@ async fn execute_wire_with_single_repair(
     messages: &[crate::claude::Message],
     source: String,
     metrics_logger: Option<&crate::metrics::MetricsLogger>,
+    effect_audit: Option<crate::server::RunnerEffectAuditControl>,
 ) -> WireExecution {
     let mut metric = crate::metrics::WireAdherenceMetric::first_pass(
         generator.name(),
@@ -318,6 +320,7 @@ async fn execute_wire_with_single_repair(
         event_tx.clone(),
         cancel.clone(),
         source.clone(),
+        effect_audit.clone(),
     )
     .await;
 
@@ -435,6 +438,7 @@ async fn execute_wire_with_single_repair(
         event_tx.clone(),
         cancel,
         repaired_source.clone(),
+        effect_audit,
     )
     .await
     {
@@ -691,6 +695,10 @@ pub(super) async fn dispatch_tool_uses(
         query_id,
         tool_uses: tool_uses.clone(),
     });
+    let effect_audit = query_states
+        .get_metadata(query_id)
+        .await
+        .and_then(|metadata| metadata.effect_audit);
     let current_mode = mode.read().await;
     for tool_use in tool_uses {
         // Loop detection: a second identical (tool, input) call for this query means
@@ -808,6 +816,7 @@ pub(super) async fn dispatch_tool_uses(
                 tool_use,
                 Arc::clone(work_unit),
                 row_idx,
+                effect_audit.clone(),
             );
         }
     }
@@ -1161,11 +1170,12 @@ pub(crate) async fn process_query_with_tools(
                 source_unit.set_program_source(wire_language.as_str());
                 source_unit.set_response(wire_source.clone());
                 source_unit.set_complete();
-                let cancel = query_states
-                    .get_metadata(query_id)
-                    .await
-                    .map(|metadata| metadata.cancellation_token)
+                let query_metadata = query_states.get_metadata(query_id).await;
+                let cancel = query_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.cancellation_token.clone())
                     .unwrap_or_default();
+                let effect_audit = query_metadata.and_then(|metadata| metadata.effect_audit);
                 let wire_execution = execute_wire_with_single_repair(
                     program_runtime.as_ref(),
                     Arc::clone(&output_manager),
@@ -1175,6 +1185,7 @@ pub(crate) async fn process_query_with_tools(
                     &messages,
                     wire_source.clone(),
                     wire_metrics_logger.as_deref(),
+                    effect_audit,
                 )
                 .await;
                 if query_states
@@ -1346,11 +1357,12 @@ pub(crate) async fn process_query_with_tools(
             source_unit.set_program_source(wire_language.as_str());
             source_unit.set_response(wire_source.clone());
             source_unit.set_complete();
-            let cancel = query_states
-                .get_metadata(query_id)
-                .await
-                .map(|metadata| metadata.cancellation_token)
+            let query_metadata = query_states.get_metadata(query_id).await;
+            let cancel = query_metadata
+                .as_ref()
+                .map(|metadata| metadata.cancellation_token.clone())
                 .unwrap_or_default();
+            let effect_audit = query_metadata.and_then(|metadata| metadata.effect_audit);
             let wire_execution = execute_wire_with_single_repair(
                 program_runtime.as_ref(),
                 Arc::clone(&output_manager),
@@ -1360,6 +1372,7 @@ pub(crate) async fn process_query_with_tools(
                 &messages,
                 wire_source.clone(),
                 wire_metrics_logger.as_deref(),
+                effect_audit,
             )
             .await;
             if query_states
@@ -2010,6 +2023,7 @@ mod tests {
             event_tx.clone(),
             tokio_util::sync::CancellationToken::new(),
             "(begin (say \"one\") (yield) (say \"two\") (yield) (say \"three\"))".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -2065,6 +2079,7 @@ mod tests {
             event_tx,
             cancel,
             "(begin (say \"before\") (yield) (say \"after\"))".to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -2086,6 +2101,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn named_brain_direct_wire_effect_audit_precedes_host_dispatch() {
+        let task_output = tempfile::tempdir().unwrap();
+        let runtime = crate::runtime::ProgramRuntime::new();
+        runtime.bind_task_output_root(task_output.path()).unwrap();
+        runtime
+            .grant_typed_capability(crate::vm::CapabilityRequirement::file(
+                crate::vm::FileOperation::Write,
+                crate::vm::FileSelector::parse("${task.output}/**").unwrap(),
+            ))
+            .unwrap();
+        let output = Arc::new(OutputManager::default());
+        output.disable_stdout();
+        let work_unit = output.start_work_unit("VM output");
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (audit_tx, mut audit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let effect_audit = crate::server::RunnerEffectAuditControl::new(audit_tx);
+        let rejection = tokio::spawn(async move {
+            let crate::server::RunnerEffectAuditControlRequest::Reserve { response_tx, .. } =
+                audit_rx.recv().await.expect("audit reservation request");
+            response_tx
+                .send(Err("direct wire audit rejected before host dispatch".into()))
+                .unwrap();
+        });
+        let outcome = execute_direct_wire_response(
+            &runtime,
+            output,
+            work_unit,
+            event_tx,
+            tokio_util::sync::CancellationToken::new(),
+            "s\" blocked.txt\" task-output-path s\" secret\" bytes task-output-file-write"
+                .to_string(),
+            Some(effect_audit),
+        )
+        .await
+        .unwrap();
+        rejection.await.unwrap();
+        assert_eq!(
+            outcome.status,
+            crate::runtime::outcome::ExecutionStatus::Failed
+        );
+        assert!(outcome
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("direct wire audit rejected")));
+        assert!(!task_output.path().join("blocked.txt").exists());
+    }
+
+    #[tokio::test]
     async fn interactive_wire_approval_resumes_the_exact_saved_program() {
         let runtime = crate::runtime::ProgramRuntime::new();
         let output = Arc::new(OutputManager::default());
@@ -2099,6 +2162,7 @@ mod tests {
             event_tx,
             tokio_util::sync::CancellationToken::new(),
             "(file-read (path \"Cargo.toml\"))".to_string(),
+            None,
         );
         tokio::pin!(execution);
         loop {
@@ -2229,6 +2293,7 @@ mod tests {
             &[crate::claude::Message::user("reply")],
             source.clone(),
             Some(&metrics),
+            None,
         )
         .await;
 

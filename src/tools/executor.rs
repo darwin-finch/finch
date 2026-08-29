@@ -394,6 +394,7 @@ impl ToolExecutor {
         repl_mode: Option<Arc<tokio::sync::RwLock<crate::cli::ReplMode>>>,
         plan_content: Option<Arc<tokio::sync::RwLock<Option<String>>>>,
         live_output: Option<crate::tools::types::LiveOutput>,
+        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     ) -> Result<ToolResult>
     where
         F: Fn() -> Result<()> + Send + Sync,
@@ -508,6 +509,7 @@ impl ToolExecutor {
             repl_mode,
             plan_content,
             live_output,
+            effect_audit,
             poset: None,
         };
 
@@ -597,6 +599,7 @@ impl ToolExecutor {
                     repl_mode.clone(),
                     plan_content.clone(),
                     None, // live_output
+                    None, // effect_audit
                 )
                 .await?;
             results.push(result);
@@ -853,6 +856,7 @@ mod tests {
                 None,
                 None,
                 None, // live_output
+                None, // effect_audit
             )
             .await
             .unwrap();
@@ -881,6 +885,7 @@ mod tests {
                 None,
                 None,
                 None, // live_output
+                None, // effect_audit
             )
             .await;
         assert!(result.is_err());
@@ -903,6 +908,7 @@ mod tests {
                 None,
                 None,
                 None, // live_output
+                None, // effect_audit
             )
             .await
             .unwrap();
@@ -928,6 +934,7 @@ mod tests {
                 None,
                 None,
                 None, // live_output
+                None, // effect_audit
             )
             .await
             .unwrap();

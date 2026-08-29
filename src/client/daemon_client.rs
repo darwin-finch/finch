@@ -453,7 +453,7 @@ impl DaemonClient {
 
                         let result = tool_executor
                             .execute_tool::<fn() -> Result<()>>(
-                                &tool_use, None, None, None, None, None, None, None, None,
+                                &tool_use, None, None, None, None, None, None, None, None, None,
                             )
                             .await?;
 

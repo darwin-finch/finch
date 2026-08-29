@@ -2878,6 +2878,33 @@ impl ProgramRuntime {
         .await
     }
 
+    /// Provider-native `submit_program` entry point. A named-Brain turn must
+    /// carry its daemon-issued audit capability through every tool round; the
+    /// tool cannot reconstruct that authority from Brain/run provenance.
+    pub(crate) async fn submit_tool_program(
+        &self,
+        submission: ProgramSubmission,
+        caller: Option<scheduler::AgentIdentity>,
+        effect_sink: Option<TypedEffectSink>,
+        defer_program_effects: bool,
+        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
+    ) -> Result<ExecutionOutcome> {
+        let deferred_host_effects = if defer_program_effects && caller.is_none() {
+            DeferredHostEffects::ProgramInvocations
+        } else {
+            DeferredHostEffects::None
+        };
+        self.submit_as_with_optional_typed_effect_sink(
+            submission,
+            caller,
+            effect_sink,
+            deferred_host_effects,
+            None,
+            effect_audit,
+        )
+        .await
+    }
+
     /// Submit with a portable host boundary for every awaited capability.
     /// The caller receives each request through `effect_sink` and resumes the
     /// exact `(execution_id, sequence)` later with [`VmResume`]. This is for

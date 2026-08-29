@@ -154,6 +154,7 @@ impl ToolExecutionCoordinator {
         tool_use: ToolUse,
         work_unit: Arc<WorkUnit>,
         row_idx: usize,
+        effect_audit: Option<crate::server::RunnerEffectAuditControl>,
     ) {
         let event_tx = self.event_tx.clone();
         let tool_executor = Arc::clone(&self.tool_executor);
@@ -301,6 +302,7 @@ impl ToolExecutionCoordinator {
                 Some(Arc::clone(&repl_mode)),
                 Some(Arc::clone(&plan_content)),
                 Some(Arc::clone(&live_output)),
+                effect_audit,
             );
             let result = match timeout_duration {
                 Some(timeout) => tokio::time::timeout(timeout, execute).await,

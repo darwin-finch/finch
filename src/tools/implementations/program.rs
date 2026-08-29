@@ -839,31 +839,25 @@ impl Tool for SubmitProgramTool {
             .live_output
             .as_ref()
             .is_some_and(|output| output.defer_program_effects());
-        let outcome = if let Some(live_output) = context.live_output.clone() {
+        let effect_sink = context.live_output.clone().map(|live_output| {
             // The coordinator binds this callback to the particular WorkUnit
             // which owns this tool use. It is deliberately constructed per
             // submission, never installed as a mutable global runtime sink.
             let effect_sink: TypedEffectSink = Arc::new(move |envelope| {
                 live_output.vm_effect_envelope(envelope);
             });
-            if defer_program_effects && self.caller.is_none() {
-                self.runtime
-                    .submit_with_deferred_program_effects(submission, effect_sink)
-                    .await?
-            } else {
-                self.runtime
-                    .submit_as_typed_only_with_typed_effect_sink(
-                        submission,
-                        self.caller.clone(),
-                        effect_sink,
-                    )
-                    .await?
-            }
-        } else {
-            self.runtime
-                .submit_as_typed_only(submission, self.caller.clone())
-                .await?
-        };
+            effect_sink
+        });
+        let outcome = self
+            .runtime
+            .submit_tool_program(
+                submission,
+                self.caller.clone(),
+                effect_sink,
+                defer_program_effects,
+                context.effect_audit.clone(),
+            )
+            .await?;
         Ok(serde_json::to_string(&outcome)?)
     }
 }
@@ -934,6 +928,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
         let definition = tool
@@ -965,6 +960,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
         let result: Value =
@@ -994,6 +990,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
         let result: Value = serde_json::from_str(
@@ -1024,6 +1021,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
         let result: Value = serde_json::from_str(
@@ -1060,6 +1058,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
 
@@ -1099,6 +1098,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
         let found: Value = serde_json::from_str(
@@ -1155,6 +1155,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
         let result: Value = serde_json::from_str(
@@ -1317,6 +1318,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
         let result = tool
@@ -1337,6 +1339,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn named_brain_submit_program_effect_audit_precedes_host_dispatch() {
+        let task_output = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(ProgramRuntime::new());
+        runtime.bind_task_output_root(task_output.path()).unwrap();
+        let requirement = crate::vm::CapabilityRequirement::file(
+            crate::vm::FileOperation::Write,
+            crate::vm::FileSelector::parse("${task.output}/**").unwrap(),
+        );
+        runtime.grant_typed_capability(requirement.clone()).unwrap();
+
+        let (audit_tx, mut audit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let effect_audit = crate::server::RunnerEffectAuditControl::new(audit_tx);
+        let rejection = tokio::spawn(async move {
+            let crate::server::RunnerEffectAuditControlRequest::Reserve {
+                effect,
+                response_tx,
+                ..
+            } = audit_rx.recv().await.expect("audit reservation request");
+            assert_eq!(
+                effect.requirement.capability,
+                crate::vm::CapabilityKind::FileWrite
+            );
+            response_tx
+                .send(Err("audit reserve rejected before host dispatch".into()))
+                .unwrap();
+        });
+        let tool = SubmitProgramTool::new(Arc::clone(&runtime));
+        let context = ToolContext {
+            conversation: None,
+            save_models: None,
+            batch_trainer: None,
+            local_generator: None,
+            tokenizer: None,
+            repl_mode: None,
+            plan_content: None,
+            live_output: None,
+            effect_audit: Some(effect_audit),
+            poset: None,
+        };
+        let result: Value = serde_json::from_str(
+            &tool
+                .execute(
+                    json!({
+                        "language": "forth",
+                        "source": "s\" blocked.txt\" task-output-path s\" secret\" bytes task-output-file-write",
+                        "intent": "prove audit precedes host write",
+                        "declared_capabilities": [requirement],
+                        "manifest_generation": runtime.manifest_generation(),
+                    }),
+                    &context,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        rejection.await.unwrap();
+        assert_eq!(result["status"], "failed");
+        assert!(result["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .as_str()
+                .is_some_and(|text| text.contains("audit reserve rejected"))));
+        assert!(!task_output.path().join("blocked.txt").exists());
+    }
+
+    #[tokio::test]
     async fn provider_tool_uses_the_compact_wire_language_discriminator() {
         let runtime = Arc::new(ProgramRuntime::new());
         let tool = SubmitProgramTool::new(runtime);
@@ -1349,6 +1419,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
 
@@ -1403,6 +1474,7 @@ mod tests {
             repl_mode: None,
             plan_content: None,
             live_output: None,
+            effect_audit: None,
             poset: None,
         };
 
@@ -1447,6 +1519,7 @@ mod tests {
                 let emitted = Arc::clone(&emitted);
                 Arc::new(move |text| emitted.lock().unwrap().push(text))
             }),
+            effect_audit: None,
             poset: None,
         };
 
