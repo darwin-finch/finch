@@ -43,7 +43,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Compile provider-neutral OAuth core on Windows
-        run: cargo check --lib
+        run: cargo check --manifest-path .github/issue-105-windows-probe/Cargo.toml
 
   macos-oauth:
     runs-on: macos-14
