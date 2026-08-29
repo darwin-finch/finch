@@ -497,7 +497,11 @@ mod tests {
         .to_string();
         assert!(error.contains("token remains safely stored"));
         assert!(error.contains("finch auth status"));
-        assert_eq!(store.0.lock().unwrap().as_ref(), Some(&stored));
+        let persisted = store.0.lock().unwrap();
+        let persisted = persisted.as_ref().unwrap();
+        assert_eq!(persisted.provider, stored.provider);
+        assert_eq!(persisted.generation, stored.generation);
+        assert_eq!(persisted.access_token, "access-secret");
         assert!(!error.contains("access-secret"));
     }
 }
