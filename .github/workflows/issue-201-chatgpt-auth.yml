@@ -59,6 +59,10 @@ jobs:
         run: cargo test --lib cli::setup_wizard::tests::setup_
       - name: Setup entry-point reuse regression
         run: cargo test --lib cli::setup_wizard::tests::first_run_command_and_repl
+      - name: Zero-process and zero-socket auth status regression
+        run: >-
+          cargo test --test no_external_provider_binary_test
+          test_hostile_codex_on_path_is_never_spawned_by_cli_boundaries
 
   windows-verifier-compile:
     runs-on: windows-2022

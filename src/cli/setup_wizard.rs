@@ -1389,10 +1389,17 @@ where
         {
             Ok(ensured) => ensured,
             Err(error) => {
-                compensate_chatgpt_setup(authenticator, &compensations)?;
-                return Err(error).with_context(|| {
+                let failures = compensate_chatgpt_setup(authenticator, &compensations);
+                let original = error.to_string();
+                let context = if failures.is_empty() {
                     format!("ChatGPT login for named credential '{reference}' failed")
-                });
+                } else {
+                    format!(
+                        "ChatGPT login for named credential '{reference}' failed ({original}); compensation conflicts for {} require local status review",
+                        failures.join(",")
+                    )
+                };
+                return Err(error).context(context);
             }
         };
         if let Some(compensation) = ensured.compensation {
@@ -1403,9 +1410,17 @@ where
     }
     let config = config_from_setup_result(result).with_credentials(credentials);
     if let Err(error) = config.validate() {
-        compensate_chatgpt_setup(authenticator, &compensations)?;
-        return Err(error)
-            .context("Signed ChatGPT credential does not match the setup provider graph");
+        let failures = compensate_chatgpt_setup(authenticator, &compensations);
+        let original = error.to_string();
+        let context = if failures.is_empty() {
+            "Signed ChatGPT credential does not match the setup provider graph".to_string()
+        } else {
+            format!(
+                "Signed ChatGPT credential does not match the setup provider graph ({original}); compensation conflicts for {} require local status review",
+                failures.join(",")
+            )
+        };
+        return Err(error).context(context);
     }
     Ok(config)
 }
@@ -1413,21 +1428,17 @@ where
 fn compensate_chatgpt_setup<A>(
     authenticator: &A,
     handles: &[crate::cli::chatgpt_auth::ChatGptCompensationHandle],
-) -> Result<()>
+) -> Vec<String>
 where
     A: crate::cli::chatgpt_auth::ChatGptCredentialAuthenticator,
 {
+    let mut failed = Vec::new();
     for handle in handles.iter().rev() {
-        authenticator
-            .compensate_with_tombstone(handle)
-            .with_context(|| {
-                format!(
-                    "ChatGPT setup failed and credential '{}' requires local recovery",
-                    handle.reference()
-                )
-            })?;
+        if authenticator.compensate_with_tombstone(handle).is_err() {
+            failed.push(handle.reference().to_string());
+        }
     }
-    Ok(())
+    failed
 }
 
 fn setup_cancellation() -> tokio_util::sync::CancellationToken {
@@ -8668,7 +8679,7 @@ mod tests {
     struct DurableSetupAuthenticator {
         root: std::path::PathBuf,
         fail_reference: Option<String>,
-        replace_before_compensation: bool,
+        replace_before_compensation: Option<String>,
     }
 
     #[cfg(unix)]
@@ -8713,7 +8724,7 @@ mod tests {
         ) -> Result<()> {
             use crate::oauth::OAuthCredentialStore;
             let store = self.store();
-            if self.replace_before_compensation {
+            if self.replace_before_compensation.as_deref() == Some(handle.reference()) {
                 let current = store
                     .load(handle.reference())?
                     .context("missing staged credential")?;
@@ -9020,7 +9031,7 @@ mod tests {
         let failing = DurableSetupAuthenticator {
             root: root.clone(),
             fail_reference: Some("chatgpt:b".into()),
-            replace_before_compensation: false,
+            replace_before_compensation: None,
         };
         assert!(prepare_chatgpt_setup_config(
             &result,
@@ -9043,7 +9054,7 @@ mod tests {
         let resumed = DurableSetupAuthenticator {
             root: root.clone(),
             fail_reference: None,
-            replace_before_compensation: false,
+            replace_before_compensation: None,
         };
         let config = prepare_chatgpt_setup_config(
             &result,
@@ -9071,13 +9082,17 @@ mod tests {
         let result = setup_result_with_profiles(vec![
             chatgpt_setup_profile("chatgpt:a", "account-a", "gpt-5.6-sol"),
             chatgpt_setup_profile("chatgpt:b", "account-b", "gpt-5.6-sol"),
+            chatgpt_setup_profile("chatgpt:c", "account-c", "gpt-5.6-sol"),
         ]);
-        let references =
-            std::collections::BTreeSet::from(["chatgpt:a".to_string(), "chatgpt:b".to_string()]);
+        let references = std::collections::BTreeSet::from([
+            "chatgpt:a".to_string(),
+            "chatgpt:b".to_string(),
+            "chatgpt:c".to_string(),
+        ]);
         let racing = DurableSetupAuthenticator {
             root: root.clone(),
-            fail_reference: Some("chatgpt:b".into()),
-            replace_before_compensation: true,
+            fail_reference: Some("chatgpt:c".into()),
+            replace_before_compensation: Some("chatgpt:b".into()),
         };
         let error = prepare_chatgpt_setup_config(
             &result,
@@ -9088,10 +9103,16 @@ mod tests {
         .await
         .unwrap_err()
         .to_string();
-        assert!(error.contains("requires local recovery"));
+        assert!(error.contains("named credential 'chatgpt:c' failed"));
+        assert!(error.contains("terminal second-account denial"));
+        assert!(error.contains("compensation conflicts for chatgpt:b"));
         let reopened = crate::oauth::file_store::FileOAuthCredentialStore::new(root);
-        let external = reopened.load("chatgpt:a").unwrap().unwrap();
+        let external = reopened.load("chatgpt:b").unwrap().unwrap();
         assert!(!external.revoked && !external.mutation_pending);
         assert_eq!(external.access_token, "external-replacement-sentinel");
+        let owned = reopened.load("chatgpt:a").unwrap().unwrap();
+        assert!(owned.revoked && !owned.mutation_pending);
+        assert!(owned.access_token.is_empty());
+        assert!(owned.refresh_token.is_none() && owned.id_token.is_none());
     }
 }

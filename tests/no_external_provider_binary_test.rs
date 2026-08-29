@@ -347,11 +347,15 @@ prefer_local = true
     base(&mut auth);
     auth.args(["auth", "status", "chatgpt"]);
     let auth = run_bounded(auth);
-    assert!(!auth.timed_out, "removed auth command did not terminate");
-    assert!(!auth.status.success());
-    assert_codex_was_not_executed(&marker, "removed auth command");
-    assert_no_connection(&provider_listener, "removed auth command");
-    assert_no_connection(&daemon_listener, "removed auth command");
+    assert!(!auth.timed_out, "local auth status did not terminate");
+    assert!(auth.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&auth.stdout).trim(),
+        "chatgpt credential=chatgpt:default status=signed_out"
+    );
+    assert_codex_was_not_executed(&marker, "local auth status");
+    assert_no_connection(&provider_listener, "local auth status");
+    assert_no_connection(&daemon_listener, "local auth status");
 
     let mut setup = Command::new(finch);
     base(&mut setup);
