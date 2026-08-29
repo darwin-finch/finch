@@ -33,7 +33,7 @@ jobs:
         run: brew install capnp
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
 
       - name: Run focused spawn regressions
         run: cargo test --lib tools::implementations::spawn::tests -- --nocapture

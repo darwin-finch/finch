@@ -14,10 +14,17 @@ fi
 
 expected_toolchain="1.98.0"
 toolchain_file="rust-toolchain.toml"
-authoritative_workflows=(
-  ".github/workflows/ci.yml"
-  ".github/workflows/release.yml"
-)
+authoritative_workflows=()
+while IFS= read -r workflow; do
+  if grep -Eq 'dtolnay/rust-toolchain@|(^|[[:space:]])cargo([[:space:]]|$)' "$workflow"; then
+    authoritative_workflows+=("$workflow")
+  fi
+done < <(git ls-files '.github/workflows/*.yml' '.github/workflows/*.yaml' | sort)
+
+if [[ ${#authoritative_workflows[@]} -eq 0 ]]; then
+  echo "no tracked Cargo workflows found to audit" >&2
+  exit 1
+fi
 
 declared_toolchain=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' "$toolchain_file")
 if [[ "$declared_toolchain" != "$expected_toolchain" ]]; then
