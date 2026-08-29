@@ -961,6 +961,54 @@ async fn device_response_cannot_substitute_user_verification_origin_or_persist()
 }
 
 #[tokio::test]
+async fn local_reauthentication_conflicts_fail_before_device_http_for_every_binding_field() {
+    let server = FakeServer::start().await;
+    for defect in [
+        "active", "dialect", "revision", "provider", "kind", "issuer", "audience", "client",
+        "scope", "pending",
+    ] {
+        let dialect = Arc::new(SyntheticDialect::new(&server.origin, "alpha"));
+        let mut record = dialect
+            .validate_tokens(
+                StatusCode::OK,
+                token_body("alpha", "account-one", "refresh-one"),
+                None,
+                &TokenValidationContext::Device,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        match defect {
+            "active" => {}
+            "dialect" => record.dialect_id = "foreign".into(),
+            "revision" => record.protocol_revision = "foreign".into(),
+            "provider" => record.provider = CredentialProvider::OpenaiPlatform,
+            "kind" => record.kind = CredentialKind::ApiKey,
+            "issuer" => record.issuer = "foreign".into(),
+            "audience" => {
+                record.audience = AudienceBinding::standard(EndpointFamily::OpenaiPlatform)
+            }
+            "client" => record.client_id = "foreign".into(),
+            "scope" => record.scopes.clear(),
+            "pending" => record.mutation_pending = true,
+            _ => unreachable!(),
+        }
+        let store = Arc::new(MemoryStore::default());
+        store
+            .0
+            .lock()
+            .unwrap()
+            .insert(format!("chatgpt:{defect}"), record);
+        let client = OAuthClient::new(dialect, store).unwrap();
+        assert!(client
+            .preflight_reauthentication(&format!("chatgpt:{defect}"))
+            .is_err());
+    }
+    assert_eq!(server.request_count("/alpha/device"), 0);
+    assert_eq!(server.request_count("/alpha/poll"), 0);
+}
+
+#[tokio::test]
 async fn browser_pkce_state_nonce_and_redirect_are_correlated_before_persistence() {
     let server = FakeServer::start().await;
     let store = Arc::new(MemoryStore::default());
@@ -1398,13 +1446,42 @@ async fn file_store_reopens_pending_revoke_and_recovers_durable_tombstone() {
     drop(recovery);
     drop(reopened);
 
-    let verified = file_store::FileOAuthCredentialStore::new(root)
-        .load("chatgpt:file")
-        .unwrap()
-        .unwrap();
+    let verified_store = Arc::new(file_store::FileOAuthCredentialStore::new(root));
+    let verified = verified_store.load("chatgpt:file").unwrap().unwrap();
     assert!(verified.revoked && !verified.mutation_pending);
     assert!(verified.access_token.is_empty() && verified.refresh_token.is_none());
     assert_eq!(server.request_count("/alpha/revoke"), 1);
+
+    server.push(
+        "/alpha/poll",
+        StatusCode::OK,
+        token_body("alpha", "account-one", "refresh-after-restart"),
+    );
+    let reauthenticated = OAuthClient::new(
+        Arc::new(SyntheticDialect::new(&server.origin, "alpha")),
+        verified_store.clone(),
+    )
+    .unwrap();
+    let pending = DeviceAuthorization::issued(
+        "device-secret".into(),
+        "ABCD-EFGH".into(),
+        "https://login.example/alpha/verify".into(),
+        None,
+        Duration::from_secs(2),
+        Duration::ZERO,
+    )
+    .unwrap();
+    reauthenticated
+        .finish_device_authorization("chatgpt:file", &pending, CancellationToken::new())
+        .await
+        .unwrap();
+    drop(reauthenticated);
+    let after_restart = verified_store.load("chatgpt:file").unwrap().unwrap();
+    assert!(!after_restart.revoked && !after_restart.mutation_pending);
+    assert_eq!(
+        after_restart.refresh_token.as_deref(),
+        Some("refresh-after-restart")
+    );
 }
 
 #[test]

@@ -44,13 +44,21 @@ pub enum ChatGptAuthState {
         expires_at: chrono::DateTime<Utc>,
         refreshable: bool,
     },
+    Expired {
+        expires_at: chrono::DateTime<Utc>,
+        refreshable: bool,
+    },
     SignedOut,
     RecoveryRequired,
 }
 
 /// Render one stable, secret-free status line for scripts and interactive use.
-pub fn render_status_line(status: &ChatGptAuthStatus) -> String {
-    match &status.state {
+pub fn render_status_line(status: &ChatGptAuthStatus) -> Result<String> {
+    crate::oauth::validate_reference(&status.credential_ref)?;
+    if let Some(account) = status.account.as_deref() {
+        validate_terminal_identifier(account, "ChatGPT account identifier")?;
+    }
+    Ok(match &status.state {
         ChatGptAuthState::Active {
             expires_at,
             refreshable,
@@ -61,15 +69,32 @@ pub fn render_status_line(status: &ChatGptAuthStatus) -> String {
             expires_at.to_rfc3339(),
             refreshable
         ),
+        ChatGptAuthState::Expired {
+            expires_at,
+            refreshable,
+        } => format!(
+            "chatgpt credential={} status=expired account={} expires_at={} refreshable={} action=login",
+            status.credential_ref,
+            status.account.as_deref().unwrap_or("unknown"),
+            expires_at.to_rfc3339(),
+            refreshable
+        ),
         ChatGptAuthState::SignedOut => format!(
             "chatgpt credential={} status=signed_out",
             status.credential_ref
         ),
         ChatGptAuthState::RecoveryRequired => format!(
-            "chatgpt credential={} status=recovery_required action=run_setup_to_reauthenticate",
+            "chatgpt credential={} status=recovery_required action=finch_auth_recover",
             status.credential_ref
         ),
+    })
+}
+
+fn validate_terminal_identifier(value: &str, label: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        bail!("{label} is unsafe for terminal output");
     }
+    Ok(())
 }
 
 /// User-selected presentation actions. Opening a browser is never implicit.
@@ -83,6 +108,17 @@ pub struct DeviceLoginPresentation {
 /// tests consume the same contract without exposing token records.
 #[async_trait]
 pub trait ChatGptCredentialAuthenticator: Send + Sync {
+    /// Whether a successful ensure would create a new durable account that
+    /// must be tombstoned if a later setup account fails.
+    fn needs_compensating_tombstone(&self, _reference: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Compensate a newly-issued account after a multi-account setup failure.
+    fn compensate_with_tombstone(&self, _reference: &str) -> Result<()> {
+        Ok(())
+    }
+
     async fn ensure_named_credential(
         &self,
         reference: &str,
@@ -125,9 +161,14 @@ impl ChatGptAuthService {
         )
     }
 
-    /// Read local status without refresh, HTTP, discovery, or provider construction.
+    /// Read local status without refresh, HTTP, or discovery. Existing records
+    /// are checked against the production dialect before projection.
     pub fn status(&self, reference: &str) -> Result<ChatGptAuthStatus> {
-        status_from_record(reference, self.store.load_existing(reference)?)
+        let record = self.store.load_existing(reference)?;
+        if let Some(record) = record.as_ref() {
+            self.client()?.validate_existing_binding(record)?;
+        }
+        status_from_record(reference, record)
     }
 
     /// Run the exact device lifecycle and return #174 metadata only after
@@ -151,33 +192,30 @@ impl ChatGptAuthService {
         presentation: DeviceLoginPresentation,
         cancel: CancellationToken,
     ) -> Result<ProviderCredential> {
+        let client = self.client()?;
         match self.store.load(reference)? {
-            Some(record)
-                if record.provider == CredentialProvider::ChatgptSubscription
-                    && !record.revoked
-                    && !record.mutation_pending
-                    && record.expires_at > Utc::now() =>
-            {
-                Ok(record.provider_credential(reference))
+            Some(record) => {
+                client.validate_existing_binding(&record)?;
+                if record.mutation_pending {
+                    bail!(
+                        "ChatGPT credential has an interrupted mutation; run `finch auth recover chatgpt --credential {reference}` before signing in again"
+                    );
+                }
+                if record.revoked {
+                    return login_device_with(&client, reference, presentation, cancel).await;
+                }
+                if record.expires_at > Utc::now() {
+                    client.validate_active_reuse(&record)?;
+                    return Ok(record.provider_credential(reference));
+                }
+                if record.refresh_token.is_some() {
+                    return client.refresh(reference, cancel).await;
+                }
+                bail!(
+                    "ChatGPT credential is expired and unrefreshable; log it out before explicit re-authentication"
+                )
             }
-            Some(record)
-                if record.provider == CredentialProvider::ChatgptSubscription
-                    && !record.revoked
-                    && !record.mutation_pending
-                    && record.refresh_token.is_some() =>
-            {
-                self.client()?.refresh(reference, cancel).await
-            }
-            Some(record) if record.provider != CredentialProvider::ChatgptSubscription => {
-                bail!("named credential belongs to a different provider")
-            }
-            Some(record) if record.mutation_pending => bail!(
-                "ChatGPT credential has an interrupted mutation; recover or revoke it before signing in again"
-            ),
-            Some(record) if !record.revoked => bail!(
-                "ChatGPT credential is expired and unrefreshable; revoke it before explicit re-authentication"
-            ),
-            _ => self.login(reference, presentation, cancel).await,
+            None => login_device_with(&client, reference, presentation, cancel).await,
         }
     }
 
@@ -193,10 +231,28 @@ impl ChatGptAuthService {
         }
         self.client()?.revoke(reference, cancel).await
     }
+
+    /// Resolve an interrupted refresh/revoke locally without contacting the
+    /// provider, retaining a durable tombstone for explicit reauthentication.
+    pub fn recover(&self, reference: &str) -> Result<ProviderCredential> {
+        self.client()?.recover_interrupted_as_revoked(reference)
+    }
 }
 
 #[async_trait]
 impl ChatGptCredentialAuthenticator for ChatGptAuthService {
+    fn needs_compensating_tombstone(&self, reference: &str) -> Result<bool> {
+        Ok(matches!(
+            self.status(reference)?.state,
+            ChatGptAuthState::SignedOut
+        ))
+    }
+
+    fn compensate_with_tombstone(&self, reference: &str) -> Result<()> {
+        self.client()?.tombstone_local(reference)?;
+        Ok(())
+    }
+
     async fn ensure_named_credential(
         &self,
         reference: &str,
@@ -220,6 +276,7 @@ where
     S: OAuthCredentialStore + 'static,
 {
     crate::oauth::validate_reference(reference)?;
+    client.preflight_reauthentication(reference)?;
     let pending = client
         .begin_device_authorization_cancellable(cancel.clone())
         .await
@@ -258,6 +315,7 @@ fn status_from_record(
 ) -> Result<ChatGptAuthStatus> {
     Ok(match record {
         Some(record) if record.provider == CredentialProvider::ChatgptSubscription => {
+            validate_terminal_identifier(&record.account, "ChatGPT account identifier")?;
             ChatGptAuthStatus {
                 credential_ref: reference.to_string(),
                 account: Some(record.account.clone()),
@@ -265,6 +323,11 @@ fn status_from_record(
                     ChatGptAuthState::RecoveryRequired
                 } else if record.revoked {
                     ChatGptAuthState::SignedOut
+                } else if record.expires_at <= Utc::now() {
+                    ChatGptAuthState::Expired {
+                        expires_at: record.expires_at,
+                        refreshable: record.refresh_token.is_some(),
+                    }
                 } else {
                     ChatGptAuthState::Active {
                         expires_at: record.expires_at,
@@ -379,12 +442,31 @@ where
 mod tests {
     use super::*;
     use crate::config::{AudienceBinding, CredentialKind, EndpointFamily};
+    use crate::providers::chatgpt_oauth::{OpenAiTokenVerifier, VerifiedOpenAiClaims};
     use chrono::{TimeDelta, Utc};
     use std::collections::BTreeSet;
     use std::sync::Mutex;
 
     #[derive(Default)]
     struct MemoryStore(Mutex<Option<OAuthTokenRecord>>);
+
+    struct UnreachableVerifier;
+
+    #[async_trait]
+    impl OpenAiTokenVerifier for UnreachableVerifier {
+        fn preflight(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn verify(
+            &self,
+            _id_token: Option<&str>,
+            _access_token: &str,
+            _cancel: &CancellationToken,
+        ) -> Result<VerifiedOpenAiClaims> {
+            bail!("token verifier must remain unreachable")
+        }
+    }
 
     impl OAuthCredentialStore for MemoryStore {
         fn load(&self, _reference: &str) -> Result<Option<OAuthTokenRecord>> {
@@ -463,24 +545,42 @@ mod tests {
         assert!(!rendered.contains("access-secret"));
         assert!(!rendered.contains("refresh-secret"));
         assert_eq!(
-            render_status_line(&status),
-            "chatgpt credential=chatgpt:work status=recovery_required action=run_setup_to_reauthenticate"
+            render_status_line(&status).unwrap(),
+            "chatgpt credential=chatgpt:work status=recovery_required action=finch_auth_recover"
         );
     }
 
     #[test]
     fn script_status_lines_distinguish_active_and_signed_out_without_secrets() {
         let active = status_from_record("chatgpt:work", Some(record())).unwrap();
-        let active_line = render_status_line(&active);
+        let active_line = render_status_line(&active).unwrap();
         assert!(active_line.starts_with(
             "chatgpt credential=chatgpt:work status=active account=acct-redacted expires_at="
         ));
         assert!(active_line.ends_with(" refreshable=true"));
         assert!(!active_line.contains("access-secret"));
         assert_eq!(
-            render_status_line(&status_from_record("chatgpt:work", None).unwrap()),
+            render_status_line(&status_from_record("chatgpt:work", None).unwrap()).unwrap(),
             "chatgpt credential=chatgpt:work status=signed_out"
         );
+
+        let mut expired = record();
+        expired.expires_at = Utc::now() - TimeDelta::minutes(1);
+        let expired = status_from_record("chatgpt:work", Some(expired)).unwrap();
+        assert!(matches!(expired.state, ChatGptAuthState::Expired { .. }));
+        assert!(render_status_line(&expired)
+            .unwrap()
+            .contains("status=expired"));
+
+        for hostile in [
+            "acct\nforged".to_string(),
+            "acct\u{1b}[31m".to_string(),
+            "x".repeat(257),
+        ] {
+            let mut record = record();
+            record.account = hostile;
+            assert!(status_from_record("chatgpt:work", Some(record)).is_err());
+        }
     }
 
     #[test]
@@ -503,5 +603,66 @@ mod tests {
         assert_eq!(persisted.generation, stored.generation);
         assert_eq!(persisted.access_token, "access-secret");
         assert!(!error.contains("access-secret"));
+    }
+
+    #[tokio::test]
+    async fn explicit_login_conflicts_fail_before_device_socket_or_store_mutation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        for defect in [
+            "active", "provider", "dialect", "revision", "kind", "issuer", "audience", "client",
+            "scope", "account", "pending",
+        ] {
+            let dialect = Arc::new(
+                OpenAiChatGptOAuthDialect::for_test(&origin, Arc::new(UnreachableVerifier))
+                    .unwrap(),
+            );
+            let descriptor = dialect.descriptor();
+            let mut hostile = record();
+            hostile.dialect_id = descriptor.dialect_id.clone();
+            hostile.protocol_revision = descriptor.protocol_revision.clone();
+            hostile.provider = descriptor.provider;
+            hostile.kind = descriptor.credential_kind;
+            hostile.issuer = descriptor.issuer.clone();
+            hostile.audience = descriptor.audience.clone();
+            hostile.client_id = descriptor.client_id.clone();
+            hostile.scopes = descriptor.scopes.clone();
+            match defect {
+                "active" => {}
+                "provider" => hostile.provider = CredentialProvider::OpenaiPlatform,
+                "dialect" => hostile.dialect_id = "foreign".into(),
+                "revision" => hostile.protocol_revision = "foreign".into(),
+                "kind" => hostile.kind = CredentialKind::ApiKey,
+                "issuer" => hostile.issuer = "foreign".into(),
+                "audience" => {
+                    hostile.audience = AudienceBinding::standard(EndpointFamily::OpenaiPlatform)
+                }
+                "client" => hostile.client_id = "foreign".into(),
+                "scope" => hostile.scopes.clear(),
+                "account" => hostile.account = "acct\nforged".into(),
+                "pending" => hostile.mutation_pending = true,
+                _ => unreachable!(),
+            }
+            let generation = hostile.generation.clone();
+            let store = Arc::new(MemoryStore(Mutex::new(Some(hostile))));
+            let client = OAuthClient::new(dialect, store.clone()).unwrap();
+            assert!(login_device_with(
+                &client,
+                "chatgpt:work",
+                DeviceLoginPresentation::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                store.0.lock().unwrap().as_ref().unwrap().generation,
+                generation
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
     }
 }

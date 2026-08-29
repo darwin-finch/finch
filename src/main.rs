@@ -212,6 +212,13 @@ enum AuthCommand {
         #[arg(long, default_value = "chatgpt:default", value_parser = parse_credential_reference)]
         credential: String,
     },
+    /// Recover an interrupted local mutation as a signed-out tombstone
+    Recover {
+        #[arg(default_value = "chatgpt", value_parser = ["chatgpt"])]
+        provider: String,
+        #[arg(long, default_value = "chatgpt:default", value_parser = parse_credential_reference)]
+        credential: String,
+    },
 }
 
 fn parse_credential_reference(value: &str) -> std::result::Result<String, String> {
@@ -2571,7 +2578,7 @@ async fn run_auth_command(command: AuthCommand) -> Result<()> {
             credential,
         } => {
             let status = service.status(&credential)?;
-            println!("{}", render_status_line(&status));
+            println!("{}", render_status_line(&status)?);
         }
         AuthCommand::Login {
             provider: _,
@@ -2605,6 +2612,15 @@ async fn run_auth_command(command: AuthCommand) -> Result<()> {
             let config = load_config()?;
             save_named_credential(config, metadata)?;
             println!("ChatGPT credential {credential} was revoked and signed out.");
+        }
+        AuthCommand::Recover {
+            provider: _,
+            credential,
+        } => {
+            let metadata = service.recover(&credential)?;
+            let config = load_config()?;
+            save_named_credential(config, metadata)?;
+            println!("Recovered ChatGPT credential {credential} as signed_out; run `finch auth login chatgpt --credential {credential}` to sign in again.");
         }
     }
     Ok(())
@@ -3228,6 +3244,22 @@ mod tests {
             Some(Command::Auth {
                 auth_command: AuthCommand::Logout { credential, .. }
             }) if credential == "chatgpt:default"
+        ));
+
+        let recover = Args::try_parse_from([
+            "finch",
+            "auth",
+            "recover",
+            "chatgpt",
+            "--credential",
+            "chatgpt:work",
+        ])
+        .unwrap();
+        assert!(matches!(
+            recover.command,
+            Some(Command::Auth {
+                auth_command: AuthCommand::Recover { credential, .. }
+            }) if credential == "chatgpt:work"
         ));
 
         for hostile in ["../codex", "chatgpt/work", "chatgpt work", ""] {

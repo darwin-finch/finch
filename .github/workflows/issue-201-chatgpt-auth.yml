@@ -33,7 +33,7 @@ jobs:
       - name: Install Cap'n Proto compiler (macOS)
         if: runner.os == 'macOS'
         run: brew install capnp
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -65,7 +65,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
       - name: Compile exact OAuth and OpenAI verifier sources on Windows
         run: cargo check --manifest-path .github/issue-201-windows-probe/Cargo.toml

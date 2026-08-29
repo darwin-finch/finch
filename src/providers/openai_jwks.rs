@@ -35,6 +35,7 @@ const DEFAULT_CACHE_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const MAX_CACHE_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CLOCK_SKEW_SECONDS: i64 = 60;
+const MAX_SIGNED_TOKEN_AGE_SECONDS: i64 = 24 * 60 * 60;
 
 /// Bounded, single-flight verifier for the exact pinned OpenAI issuer.
 pub struct OpenAiJwksVerifier {
@@ -340,14 +341,18 @@ impl OpenAiTokenVerifier for OpenAiJwksVerifier {
             "ChatGPT token response omitted the signed identity token required for account binding",
         )?;
         let identity = self.verify_compact(id_token, cancel).await?;
-        if !identity.audiences.contains(&self.client_id) {
+        if !identity.audiences.contains(&self.client_id)
+            || (identity.audiences.len() > 1
+                && identity.authorized_party.as_deref() != Some(self.client_id.as_str()))
+            || identity
+                .authorized_party
+                .as_deref()
+                .is_some_and(|party| party != self.client_id)
+        {
             bail!("OpenAI identity token audience does not match the pinned public client");
         }
         let access = self.verify_compact(access_token, cancel).await?;
-        if !access
-            .audiences
-            .contains(OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE)
-        {
+        if access.audiences != BTreeSet::from([OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE.to_string()]) {
             bail!("OpenAI access token audience does not match the pinned Codex service authority");
         }
         if identity.subject != access.subject {
@@ -360,6 +365,14 @@ impl OpenAiTokenVerifier for OpenAiJwksVerifier {
         let access_auth = access
             .auth
             .context("OpenAI access token omitted the namespaced ChatGPT account entitlement")?;
+        for (value, label) in [
+            (identity_auth.account_id.as_str(), "identity account"),
+            (access_auth.account_id.as_str(), "access account"),
+            (identity_auth.plan_type.as_str(), "identity plan"),
+            (access_auth.plan_type.as_str(), "access plan"),
+        ] {
+            validate_signed_public_claim(value, label)?;
+        }
         if identity_auth.account_id != access_auth.account_id
             || identity_auth.plan_type != access_auth.plan_type
             || identity_auth.account_is_fedramp != access_auth.account_is_fedramp
@@ -369,6 +382,7 @@ impl OpenAiTokenVerifier for OpenAiJwksVerifier {
         Ok(VerifiedOpenAiClaims {
             issuer: identity.issuer,
             audiences: identity.audiences,
+            authorized_party: identity.authorized_party,
             access_audiences: access.audiences,
             subject: identity.subject,
             account_id: identity_auth.account_id,
@@ -380,6 +394,13 @@ impl OpenAiTokenVerifier for OpenAiJwksVerifier {
             not_before: later_optional(identity.not_before, access.not_before),
         })
     }
+}
+
+fn validate_signed_public_claim(value: &str, label: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        bail!("OpenAI signed token {label} claim is invalid");
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -420,11 +441,12 @@ struct SignedClaims {
     audiences: BTreeSet<String>,
     #[serde(rename = "sub")]
     subject: String,
+    #[serde(rename = "azp", default)]
+    authorized_party: Option<String>,
     exp: i64,
     #[serde(default)]
     nbf: Option<i64>,
-    #[serde(default)]
-    iat: Option<i64>,
+    iat: i64,
     #[serde(default)]
     nonce: Option<String>,
     #[serde(default)]
@@ -461,21 +483,20 @@ impl SignedClaims {
                     .context("OpenAI signed token not-before time is invalid")
             })
             .transpose()?;
-        let issued_at = self
-            .iat
-            .map(|value| {
-                DateTime::from_timestamp(value, 0)
-                    .context("OpenAI signed token issued-at time is invalid")
-            })
-            .transpose()?;
-        if self.issuer.trim_end_matches('/') != expected_issuer
-            || self.subject.trim().is_empty()
+        let issued_at = DateTime::from_timestamp(self.iat, 0)
+            .context("OpenAI signed token issued-at time is invalid")?;
+        if self.issuer != expected_issuer
+            || self.subject.is_empty()
+            || self.subject.len() > 256
+            || self.subject.chars().any(char::is_control)
             || self.audiences.is_empty()
             || self.expires_at <= now - TimeDelta::seconds(CLOCK_SKEW_SECONDS)
+            || self.expires_at <= issued_at
             || self
                 .not_before
                 .is_some_and(|value| value > now + TimeDelta::seconds(CLOCK_SKEW_SECONDS))
-            || issued_at.is_some_and(|value| value > now + TimeDelta::seconds(CLOCK_SKEW_SECONDS))
+            || issued_at > now + TimeDelta::seconds(CLOCK_SKEW_SECONDS)
+            || issued_at < now - TimeDelta::seconds(MAX_SIGNED_TOKEN_AGE_SECONDS)
         {
             bail!("OpenAI signed token issuer, subject, audience, or lifetime is invalid");
         }
@@ -701,7 +722,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     const TEST_PRIVATE_KEY_DER: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCdAeQ874zqSDAW9XjZmHRYDQvVpFjAju0X3pKB1+42m2Amo28WbSErTp/dVlJtkX1rOfdTVcitvDLqPS9oBD5F+S78+oCyEHaJn89H/jK74si47+8ulnI25WMQNdQ3C5ADy/BpDVU+8wBOWIktGz7mJtOByfWCGSE72OKRQq+cpqYMlyn2D1bCTZoER6MoantQtPdqa40tvmLJig3Z9c2fDN7oqHyRF53EPtSa0OoRu6f2ayTngrwoLE+emVVl8dZHaOrJIaDTMVFux9T3lY4XOxszIWxztdIKyHe08hH8jqWqhJHa6weYmcB2cuTtZrTEAsQhF5wW9xODaSOMLhSNAgMBAAECggEAAda1VQ9bH51DzukGBspVxng0pMZdcbfax/ZH0fR06jfMmvc8BE+33Tl4/s8VfQoApYJSxquRA5PaJssbpIS0M/6UkcrfOfaeZMM12rp73p5rylqo+usxIDp0fAqdVx2wDJNVV+2bi3auELzRsnEIvgpDXNhAI0tnC7vg/2GAC/4U7l66SSX8BQdLbGDlZrq2IVpG29KckBUrsl+uyFJRhJ3EsmdOpjpAWv6882/0ea1Svi4Uy8kvEAF3Qwq2k+0UjOfJZls9MS1JSXpQQARvdeNv4QJmIjnCMo30naCKZmXIFVDrM1xUuVUURAGlu0rSv+qQzV7pJ2Pf3BvLj41pgQKBgQDMnMtDNf8DFndwuKDE0ZAF3dMyS34vqS33jqI7qj930ra0BOvECCgjqGpwIY7xmxYN1U6hZDy+5uFeGthhjpgJbQq0pWFUxob6Xw2dcuEu/D2K/Kqi9YhVq2ZZZ6nT3ddMvJmdXRA+KuoidcX+8dA//gJBnA5K9K/9Ds+XNmOXwQKBgQDEcGkeU+c+fIjLLTEy2jwRsh7n8ZMC5OHg9WaEomuBro4ZfNXi4lwvz7+6+LSTBSPgrJgaJ7hymgH5LwpLL1r5uGZyzFCKnkRz01I9aXVWfewhKIdquRXUU1MNQ2PrFiZtE5u7MctqT+YeuX3J0WASy+aWOGpfNZ06JqoAoNlPzQKBgG0MY4g+jtqmbqG0xHog9hEqWBTGB0p/b/AwJGaIJatGsfjfZofjkQDwEUoRmI1LikV1GaMKORXFFveAdzIHPSBI7Ru5yFXWOLnXTvpK75iK9oHMh2SyVybRYorjpK813DkZiwVDRBTd6krTWeK2Hbb9OVaeRT/NiL3l1t1QL2QBAoGBAIFlkrjZh//PRMShdkELJHp7nIQoyzAi2O+4dtlzq+F2vD/pzXJwrU0JSkC9RyV5Q1LiHidMduF2tUoRRHSWMxU/9Kw2De/hpTGuyAOQDiz1Ma/95IXWeZytbo3UEGNw6cr8GZ9Lg7T6AJnIkiV4+BIpojDd5KPmyzTc9ysGyV8ZAoGAfvFL5BicPTVwwB85n+PdGtl6mMjjHdDyS/O8B9BsESA1sbVJ48Os1NiUT+bjZktTWhjScUKCNCMzAop5RbzANwkdzb0rs8CrrFENYjncMjLnsLFlc/qL8FkpiCFeOxX05iy5kvxbm8nJOTspoCDzQywEKKZGSrx0+Z6vF4bkTWg=";
-    const TEST_MODULUS: &str = "nQHkPO-M6kgwFvV42Zh0WA0L1aRYwI7tF96SgdfuNptgJqNvFm0hK06f3VZSbZF9azn3U1XIrbwy6j0vaAQ-Rfku_PqAshB2iZ_PR_4yu-LIuO_vLpZyNuVjEDXUNwuQA8vwaQ1VPvMATliJLRs-5ibTgcn1ghkhO9jikUKvnKamDJcp9g9Wwk2aBEejKGp7ULT3amuNLb5iyYoN2fXNnwze6Kh8kRedxD7UmtDqEbun9msk54K8KCxPnplVZfHWR2jqySGg0zFRbsfU95WOFzsbMyFsc7XSCsh3tPIR_I6lqoSR2usHmJnAdnLk7Wa0xALEIRecFvcTg2kjjC4UjQs";
+    const TEST_MODULUS: &str = "nQHkPO-M6kgwFvV42Zh0WA0L1aRYwI7tF96SgdfuNptgJqNvFm0hK06f3VZSbZF9azn3U1XIrbwy6j0vaAQ-Rfku_PqAshB2iZ_PR_4yu-LIuO_vLpZyNuVjEDXUNwuQA8vwaQ1VPvMATliJLRs-5ibTgcn1ghkhO9jikUKvnKamDJcp9g9Wwk2aBEejKGp7ULT3amuNLb5iyYoN2fXNnwze6Kh8kRedxD7UmtDqEbun9msk54K8KCxPnplVZfHWR2jqySGg0zFRbsfU95WOFzsbMyFsc7XSCsh3tPIR_I6lqoSR2usHmJnAdnLk7Wa0xALEIRecFvcTg2kjjC4UjQ";
 
     #[derive(Clone)]
     struct FixtureState {
@@ -916,12 +937,18 @@ mod tests {
     async fn signed_claim_and_signature_hostile_matrix_fails_before_persistence() {
         for defect in [
             "issuer",
+            "trailing-issuer",
             "audience",
+            "multi-audience-without-azp",
+            "multi-audience-wrong-azp",
+            "access-audience-extra",
             "account",
             "scope",
             "nonce",
             "expired",
             "future",
+            "missing-iat",
+            "stale-iat",
             "signature",
         ] {
             let server = FixtureServer::start(vec![jwks("key-one")]).await;
@@ -939,7 +966,18 @@ mod tests {
             let mut expected_nonce = "nonce-123";
             match defect {
                 "issuer" => identity["iss"] = json!("https://evil.example"),
+                "trailing-issuer" => identity["iss"] = json!("https://auth.openai.com/"),
                 "audience" => identity["aud"] = json!("other-client"),
+                "multi-audience-without-azp" => {
+                    identity["aud"] = json!([OPENAI_PUBLIC_CLIENT_ID, "other-client"])
+                }
+                "multi-audience-wrong-azp" => {
+                    identity["aud"] = json!([OPENAI_PUBLIC_CLIENT_ID, "other-client"]);
+                    identity["azp"] = json!("other-client");
+                }
+                "access-audience-extra" => {
+                    access["aud"] = json!([OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE, "other-service"])
+                }
                 "account" => {
                     access["https://api.openai.com/auth"]["chatgpt_account_id"] = json!("acct-two")
                 }
@@ -947,6 +985,10 @@ mod tests {
                 "nonce" => expected_nonce = "other-nonce",
                 "expired" => identity["exp"] = json!(Utc::now().timestamp() - 120),
                 "future" => access["nbf"] = json!(Utc::now().timestamp() + 120),
+                "missing-iat" => {
+                    identity.as_object_mut().unwrap().remove("iat");
+                }
+                "stale-iat" => identity["iat"] = json!(Utc::now().timestamp() - 25 * 60 * 60),
                 "signature" => {}
                 _ => unreachable!(),
             }
@@ -975,6 +1017,26 @@ mod tests {
                 .to_string();
             assert!(!error.contains("refresh-secret"), "{defect}: {error}");
         }
+
+        let server = FixtureServer::start(vec![jwks("key-one")]).await;
+        let verifier = OpenAiJwksVerifier::for_test(
+            &server.origin,
+            REQUIRED_TOKEN_ISSUER,
+            OPENAI_PUBLIC_CLIENT_ID,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let (mut identity, access) = claims("acct-one", required_scopes());
+        identity["aud"] = json!([OPENAI_PUBLIC_CLIENT_ID, "other-client"]);
+        identity["azp"] = json!(OPENAI_PUBLIC_CLIENT_ID);
+        verifier
+            .verify(
+                Some(&signed("key-one", &identity)),
+                &signed("key-one", &access),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

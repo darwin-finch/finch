@@ -25,7 +25,9 @@ Production token verification is pinned to issuer `https://auth.openai.com`,
 the exact discovery and JWKS paths on that origin, RS256, RSA signing keys, and
 an unambiguous `kid`. Both the ID token and access token must have valid
 signatures and matching subject/account/plan claims. The ID-token audience is
-the pinned public client; the separately checked access-token audience for the
+the pinned public client; a multi-audience identity token additionally requires
+that exact client as `azp`. Issuer spelling is exact and every token requires a
+bounded signed `iat` preceding `exp`. The separately checked access-token audience for the
 pinned compatibility fixture is `https://api.openai.com/v1`. That JWT claim is
 authorization-server metadata only: Finch still sends the subscription token
 exclusively to the separately bound `chatgpt.com/backend-api/codex` service and
@@ -73,6 +75,9 @@ revocation and retains a local tombstone. Every command accepts
 profiles can reuse one account while distinct references keep accounts
 isolated. Interrupted refresh/revoke state is reported as
 `recovery_required`, never as signed out.
+Run `finch auth recover chatgpt --credential <name>` to convert an interrupted
+mutation into a local secret-cleared tombstone without HTTP, then use explicit
+login. Expired credentials are reported as `expired`, not `active`.
 
 First-run setup, `finch setup`, and `/setup` use one post-wizard device ceremony.
 The complete secret-free graph is validated before OAuth begins; cancellation,
@@ -80,6 +85,10 @@ denial, expiry, or an invalid sibling prevents config/persona save. The
 temporary account-unknown preflight record is never persisted. Only verified
 token metadata is written to `config.toml`; tokens remain in Finch's
 descriptor-anchored store.
+For multiple new accounts, setup records which successful issues require
+compensation. A later denial, cancellation, or invalid account locally
+tombstones every earlier new token before returning; restart can then resume
+the same named transaction without leaving an orphaned active credential.
 
 Browser PKCE remains disabled because the pinned browser protocol uses a
 Codex-only originator that Finch does not impersonate. Windows token persistence

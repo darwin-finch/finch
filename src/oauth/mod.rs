@@ -552,6 +552,23 @@ where
         Ok(pending)
     }
 
+    /// Reject any conflicting local record before a device authorization
+    /// request is allowed to leave the process. Only a missing record or an
+    /// exact, durable revoked tombstone may be replaced.
+    pub fn preflight_reauthentication(&self, reference: &str) -> Result<()> {
+        self.reauthentication_generation(reference).map(|_| ())
+    }
+
+    /// Validate a loaded record's complete immutable dialect authority.
+    pub(crate) fn validate_existing_binding(&self, record: &OAuthTokenRecord) -> Result<()> {
+        self.validate_record_binding(record)
+    }
+
+    /// Validate an active record before projecting it into public config.
+    pub(crate) fn validate_active_reuse(&self, record: &OAuthTokenRecord) -> Result<()> {
+        self.validate_record(record, None)
+    }
+
     /// Poll until terminal state, persist exactly one validated account, and
     /// return its #174 metadata.
     pub async fn finish_device_authorization(
@@ -857,6 +874,28 @@ where
         Ok(tombstone.provider_credential(reference))
     }
 
+    /// Locally tombstone an exact bound credential without transmitting it.
+    /// Setup uses this only as compensation for a newly-issued credential when
+    /// a later account in the same config transaction fails.
+    pub fn tombstone_local(&self, reference: &str) -> Result<ProviderCredential> {
+        validate_reference(reference)?;
+        let current = self
+            .store
+            .load(reference)?
+            .context("named OAuth credential is missing")?;
+        self.validate_record_binding(&current)?;
+        let mut tombstone = current.clone();
+        tombstone.access_token.clear();
+        tombstone.refresh_token = None;
+        tombstone.id_token = None;
+        tombstone.generation = random_secret(24);
+        tombstone.revoked = true;
+        tombstone.mutation_pending = false;
+        self.store
+            .compare_and_swap(reference, Some(&current.generation), &tombstone)?;
+        Ok(tombstone.provider_credential(reference))
+    }
+
     fn validate_record(
         &self,
         record: &OAuthTokenRecord,
@@ -867,6 +906,8 @@ where
             bail!("OAuth token binding does not match the selected provider dialect");
         }
         if record.account.trim().is_empty()
+            || record.account.len() > 256
+            || record.account.chars().any(char::is_control)
             || record.access_token.trim().is_empty()
             || record.generation.trim().is_empty()
             || record.expires_at <= Utc::now()
@@ -898,6 +939,8 @@ where
     fn validate_mutable_record(&self, record: &OAuthTokenRecord) -> Result<()> {
         self.validate_record_binding(record)?;
         if record.account.trim().is_empty()
+            || record.account.len() > 256
+            || record.account.chars().any(char::is_control)
             || record.access_token.trim().is_empty()
             || record.generation.trim().is_empty()
             || record.revoked

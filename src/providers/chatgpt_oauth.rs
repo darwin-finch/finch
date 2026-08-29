@@ -60,6 +60,7 @@ pub fn chatgpt_required_scopes() -> BTreeSet<String> {
 pub struct VerifiedOpenAiClaims {
     pub issuer: String,
     pub audiences: BTreeSet<String>,
+    pub authorized_party: Option<String>,
     pub access_audiences: BTreeSet<String>,
     pub subject: String,
     pub account_id: String,
@@ -339,18 +340,23 @@ where
         let now = Utc::now();
         if claims.issuer != REQUIRED_TOKEN_ISSUER
             || !claims.audiences.contains(&self.descriptor.client_id)
-            || !claims
-                .access_audiences
-                .contains(OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE)
-            || claims.subject.trim().is_empty()
-            || claims.account_id.trim().is_empty()
-            || claims.chatgpt_plan_type.trim().is_empty()
+            || (claims.audiences.len() > 1
+                && claims.authorized_party.as_deref() != Some(self.descriptor.client_id.as_str()))
+            || claims
+                .authorized_party
+                .as_deref()
+                .is_some_and(|party| party != self.descriptor.client_id)
+            || claims.access_audiences
+                != BTreeSet::from([OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE.to_string()])
             || !self.descriptor.scopes.is_subset(&claims.scopes)
             || claims.expires_at <= now
             || claims.not_before.is_some_and(|not_before| not_before > now)
         {
             bail!("ChatGPT token issuer, audience, account, scope, or lifetime validation failed");
         }
+        validate_public_claim(&claims.subject, "subject")?;
+        validate_public_claim(&claims.account_id, "account identifier")?;
+        validate_public_claim(&claims.chatgpt_plan_type, "plan type")?;
         match context {
             TokenValidationContext::Browser { expected_nonce, .. }
                 if claims.nonce.as_deref() != Some(expected_nonce.as_str()) =>
@@ -388,6 +394,13 @@ where
             mutation_pending: false,
         })
     }
+}
+
+fn validate_public_claim(value: &str, label: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+        bail!("ChatGPT signed {label} is invalid");
+    }
+    Ok(())
 }
 
 fn safe_oauth_error_code(body: &Value) -> &'static str {
@@ -581,6 +594,7 @@ mod tests {
         VerifiedOpenAiClaims {
             issuer: REQUIRED_TOKEN_ISSUER.into(),
             audiences: BTreeSet::from([OPENAI_PUBLIC_CLIENT_ID.into()]),
+            authorized_party: None,
             access_audiences: BTreeSet::from([OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE.into()]),
             subject: "subject-work".into(),
             account_id: "acct-work".into(),
@@ -776,8 +790,13 @@ mod tests {
         for defect in [
             "issuer",
             "audience",
+            "multi-audience",
+            "access-audience-extra",
             "scope",
             "account",
+            "account-control",
+            "account-length",
+            "plan-control",
             "nonce",
             "expired",
             "not_before",
@@ -793,10 +812,20 @@ mod tests {
                 match defect {
                     "issuer" => claims.issuer = "https://evil.example".into(),
                     "audience" => claims.audiences = BTreeSet::from(["other-client".into()]),
+                    "multi-audience" => {
+                        claims.audiences.insert("other-client".into());
+                        claims.authorized_party = None;
+                    }
+                    "access-audience-extra" => {
+                        claims.access_audiences.insert("other-service".into());
+                    }
                     "scope" => {
                         claims.scopes.remove("offline_access");
                     }
                     "account" => claims.account_id.clear(),
+                    "account-control" => claims.account_id = "acct\nforged".into(),
+                    "account-length" => claims.account_id = "x".repeat(257),
+                    "plan-control" => claims.chatgpt_plan_type = "plus\u{1b}[31m".into(),
                     "expired" => claims.expires_at = Utc::now() - TimeDelta::minutes(1),
                     "not_before" => {
                         claims.not_before = Some(Utc::now() + TimeDelta::minutes(5));
@@ -826,7 +855,10 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(
-                error.contains("validation failed") || error.contains("nonce mismatch"),
+                error.contains("validation failed")
+                    || error.contains("nonce mismatch")
+                    || error.contains("signed account")
+                    || error.contains("signed plan"),
                 "defect={defect} error={error}"
             );
             assert!(!error.contains("secret"));
