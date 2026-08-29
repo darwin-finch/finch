@@ -907,6 +907,7 @@ pub(crate) fn supervised_test_subprocess_command() -> std::process::Command {
     let auth_fd = unsafe { OwnedFd::from_raw_fd(auth_raw) };
     let brain_listener = proof.duplicate_brain_listener().unwrap();
     let daemon_listener = proof.duplicate_daemon_listener().unwrap();
+    let ipc_listener = proof.duplicate_ipc_listener().unwrap();
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     unsafe {
         command.pre_exec(move || {
@@ -916,8 +917,10 @@ pub(crate) fn supervised_test_subprocess_command() -> std::process::Command {
                 (auth_fd.as_raw_fd(), 109),
                 (brain_listener.as_raw_fd(), 10),
                 (daemon_listener.as_raw_fd(), 11),
+                (ipc_listener.as_raw_fd(), 12),
                 (brain_listener.as_raw_fd(), 110),
                 (daemon_listener.as_raw_fd(), 111),
+                (ipc_listener.as_raw_fd(), 112),
             ] {
                 if nix::libc::dup2(source, target) == -1 {
                     return Err(std::io::Error::last_os_error());
