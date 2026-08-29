@@ -1,0 +1,23 @@
+name: Issue 105 OAuth
+
+on:
+  workflow_dispatch:
+
+jobs:
+  oauth:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check focused formatting
+        run: cargo fmt --check -- src/oauth/mod.rs src/oauth/file_store.rs src/oauth/tests.rs src/providers/chatgpt_oauth.rs
+      - name: Compile library tests
+        run: cargo test --lib --no-run
+      - name: Provider-neutral OAuth regressions
+        run: cargo test --lib oauth::
+      - name: ChatGPT OAuth adapter regressions
+        run: cargo test --lib providers::chatgpt_oauth::
