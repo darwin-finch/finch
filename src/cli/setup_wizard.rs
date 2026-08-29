@@ -52,6 +52,12 @@ enum AddProviderStep {
 /// Cloud provider options shown in the add-provider overlay
 const CLOUD_PROVIDERS: &[(&str, &str, &str, &str)] = &[
     (
+        "chatgpt",
+        "ChatGPT subscription",
+        "gpt-5.6-sol",
+        "Finch-native device sign-in starts after the wizard; not an OpenAI API key",
+    ),
+    (
         "grok",
         "Grok (xAI)",
         "",
@@ -533,6 +539,7 @@ fn model_config_from_provider(provider: &ProviderEntry) -> Option<ModelConfig> {
             provider: match credential_provider {
                 crate::config::CredentialProvider::Anthropic => "claude",
                 crate::config::CredentialProvider::OpenaiPlatform => "openai",
+                crate::config::CredentialProvider::ChatgptSubscription => "chatgpt",
                 crate::config::CredentialProvider::Xai => "grok",
                 crate::config::CredentialProvider::GeminiAiStudio => "gemini",
                 crate::config::CredentialProvider::Mistral => "mistral",
@@ -700,6 +707,25 @@ fn provider_entry_from_remote_model(
         _ if provider.eq_ignore_ascii_case("finch") => ProviderEntry::RemoteDaemon {
             address: model.unwrap_or_default(),
             name,
+        },
+        _ if provider.eq_ignore_ascii_case("chatgpt") => ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::ChatgptSubscription,
+            credential: crate::config::CredentialBinding {
+                credential_ref: "chatgpt:default".into(),
+                audience: Some(crate::config::AudienceBinding::standard(
+                    crate::config::EndpointFamily::ChatgptSubscription,
+                )),
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: crate::providers::chatgpt_oauth::chatgpt_required_scopes(),
+            },
+            model,
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name,
+            reasoning_effort: None,
         },
         _ => ProviderEntry::from_teacher_entry(&TeacherEntry {
             provider: provider.to_string(),
@@ -1254,8 +1280,108 @@ pub async fn validate_and_apply_for(
             "Legacy chatgpt_subscription profiles are unsupported because Finch no longer launches Codex app-server. Remove that profile and configure OpenAI Platform with an API key or another supported provider"
         );
     }
-    apply_and_save(result)?;
+    let chatgpt_references = result
+        .providers
+        .iter()
+        .filter_map(|provider| match provider {
+            ProviderEntry::Credentialed {
+                provider: crate::config::CredentialProvider::ChatgptSubscription,
+                credential,
+                ..
+            } => Some(credential.credential_ref.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if chatgpt_references.is_empty() {
+        apply_and_save(result)?;
+        return Ok(SetupApplyOutcome::Saved);
+    }
+
+    let service = crate::cli::chatgpt_auth::ChatGptAuthService::production()?;
+    let config =
+        prepare_chatgpt_setup_config(result, &chatgpt_references, &service, setup_cancellation())
+            .await?;
+    config.save()?;
+    if let Some(prompt) = result.custom_system_prompt.as_deref() {
+        crate::config::Persona::save_system_prompt_override(&result.default_persona, prompt)?;
+    }
     Ok(SetupApplyOutcome::Saved)
+}
+
+async fn prepare_chatgpt_setup_config<A>(
+    result: &SetupResult,
+    chatgpt_references: &std::collections::BTreeSet<String>,
+    authenticator: &A,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<crate::config::Config>
+where
+    A: crate::cli::chatgpt_auth::ChatGptCredentialAuthenticator,
+{
+    // Prove the entire secret-free graph is structurally valid before opening
+    // an OAuth endpoint. Account identity remains deliberately unknown until a
+    // signed token is returned.
+    let mut preflight_credentials = result.credentials.clone();
+    for reference in &chatgpt_references {
+        if preflight_credentials
+            .iter()
+            .any(|credential| credential.name == *reference)
+        {
+            continue;
+        }
+        preflight_credentials.push(crate::config::ProviderCredential {
+            name: reference.clone(),
+            kind: crate::config::CredentialKind::OauthDevice,
+            provider: crate::config::CredentialProvider::ChatgptSubscription,
+            issuer: "openai-chatgpt".into(),
+            audience: crate::config::AudienceBinding::standard(
+                crate::config::EndpointFamily::ChatgptSubscription,
+            ),
+            tenant: None,
+            project: None,
+            account: None,
+            scopes: crate::providers::chatgpt_oauth::chatgpt_required_scopes(),
+            secret_ref: format!("oauth-store:{reference}"),
+            lifecycle: crate::config::CredentialLifecycle::Active {
+                expires_at: None,
+                refreshable: true,
+            },
+            revocation: Default::default(),
+        });
+    }
+    config_from_setup_result(result)
+        .with_credentials(preflight_credentials)
+        .validate()
+        .context("Setup provider graph is invalid; ChatGPT login was not started")?;
+
+    let mut credentials = result.credentials.clone();
+    for reference in chatgpt_references {
+        let credential = authenticator
+            .ensure_named_credential(
+                &reference,
+                crate::cli::chatgpt_auth::DeviceLoginPresentation::default(),
+                cancel.clone(),
+            )
+            .await
+            .with_context(|| format!("ChatGPT login for named credential '{reference}' failed"))?;
+        credentials.retain(|existing| existing.name != reference);
+        credentials.push(credential);
+    }
+    let config = config_from_setup_result(result).with_credentials(credentials);
+    config
+        .validate()
+        .context("Signed ChatGPT credential does not match the setup provider graph")?;
+    Ok(config)
+}
+
+fn setup_cancellation() -> tokio_util::sync::CancellationToken {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let signal = cancel.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            signal.cancel();
+        }
+    });
+    cancel
 }
 
 /// Apply setup through the shared ceremony without a specific UI entry-point label.
@@ -8375,8 +8501,9 @@ mod tests {
     }
 
     #[test]
-    fn chooser_preserves_openai_api_key_and_hides_unsupported_subscription() {
+    fn chooser_keeps_platform_api_key_distinct_from_native_chatgpt_subscription() {
         assert!(CLOUD_PROVIDERS.iter().any(|(id, ..)| *id == "openai"));
+        assert!(CLOUD_PROVIDERS.iter().any(|(id, ..)| *id == "chatgpt"));
         assert!(!CLOUD_PROVIDERS
             .iter()
             .any(|(id, ..)| *id == "chatgpt_subscription"));
@@ -8447,5 +8574,201 @@ mod tests {
         let serialized = toml::to_string(&saved.credentials()[0]).unwrap();
         assert!(serialized.contains("env:OPENAI_WORK_API_KEY"));
         assert!(!serialized.contains("sk-"));
+    }
+
+    #[derive(Default)]
+    struct FakeChatGptSetupAuthenticator {
+        calls: std::sync::Mutex<Vec<String>>,
+        fail: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::cli::chatgpt_auth::ChatGptCredentialAuthenticator for FakeChatGptSetupAuthenticator {
+        async fn ensure_named_credential(
+            &self,
+            reference: &str,
+            _presentation: crate::cli::chatgpt_auth::DeviceLoginPresentation,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<crate::config::ProviderCredential> {
+            self.calls.lock().unwrap().push(reference.to_string());
+            if cancel.is_cancelled() {
+                anyhow::bail!("ChatGPT setup login was cancelled");
+            }
+            if let Some(message) = self.fail.lock().unwrap().clone() {
+                anyhow::bail!(message);
+            }
+            Ok(chatgpt_setup_credential(
+                reference,
+                &format!("acct-{}", reference.rsplit(':').next().unwrap()),
+            ))
+        }
+    }
+
+    fn chatgpt_setup_credential(
+        reference: &str,
+        account: &str,
+    ) -> crate::config::ProviderCredential {
+        crate::config::ProviderCredential {
+            name: reference.into(),
+            kind: crate::config::CredentialKind::OauthDevice,
+            provider: crate::config::CredentialProvider::ChatgptSubscription,
+            issuer: "openai-chatgpt".into(),
+            audience: crate::config::AudienceBinding::standard(
+                crate::config::EndpointFamily::ChatgptSubscription,
+            ),
+            tenant: None,
+            project: None,
+            account: Some(account.into()),
+            scopes: crate::providers::chatgpt_oauth::chatgpt_required_scopes(),
+            secret_ref: format!("oauth-store:{reference}"),
+            lifecycle: crate::config::CredentialLifecycle::Active {
+                expires_at: Some(Utc::now() + chrono::TimeDelta::hours(1)),
+                refreshable: true,
+            },
+            revocation: Default::default(),
+        }
+    }
+
+    fn chatgpt_setup_profile(reference: &str, name: &str, model: &str) -> ProviderEntry {
+        ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::ChatgptSubscription,
+            credential: crate::config::CredentialBinding {
+                credential_ref: reference.into(),
+                audience: Some(crate::config::AudienceBinding::standard(
+                    crate::config::EndpointFamily::ChatgptSubscription,
+                )),
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: crate::providers::chatgpt_oauth::chatgpt_required_scopes(),
+            },
+            model: Some(model.into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some(name.into()),
+            reasoning_effort: None,
+        }
+    }
+
+    fn setup_result_with_profiles(profiles: Vec<ProviderEntry>) -> SetupResult {
+        build_setup_result(&WizardState::new(Some(
+            &crate::config::Config::with_providers(profiles),
+        )))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn first_run_command_and_repl_share_one_account_multi_model_setup_boundary() {
+        for invocation in [
+            SetupInvocation::FirstRun,
+            SetupInvocation::Command,
+            SetupInvocation::Repl,
+        ] {
+            let result = setup_result_with_profiles(vec![
+                chatgpt_setup_profile("chatgpt:work", "work-fast", "gpt-5.6-sol"),
+                chatgpt_setup_profile("chatgpt:work", "work-deep", "gpt-5.6-sol"),
+            ]);
+            let references = std::collections::BTreeSet::from(["chatgpt:work".to_string()]);
+            let authenticator = FakeChatGptSetupAuthenticator::default();
+            let config = prepare_chatgpt_setup_config(
+                &result,
+                &references,
+                &authenticator,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                authenticator.calls.lock().unwrap().as_slice(),
+                ["chatgpt:work"]
+            );
+            assert_eq!(config.providers.len(), 2, "{invocation:?}");
+            assert_eq!(config.credentials().len(), 1, "{invocation:?}");
+            config.validate().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_keeps_two_named_chatgpt_accounts_distinct_without_fallback() {
+        let result = setup_result_with_profiles(vec![
+            chatgpt_setup_profile("chatgpt:work", "work", "gpt-5.6-sol"),
+            chatgpt_setup_profile("chatgpt:personal", "personal", "gpt-5.6-sol"),
+        ]);
+        let references = std::collections::BTreeSet::from([
+            "chatgpt:personal".to_string(),
+            "chatgpt:work".to_string(),
+        ]);
+        let authenticator = FakeChatGptSetupAuthenticator::default();
+        let config = prepare_chatgpt_setup_config(
+            &result,
+            &references,
+            &authenticator,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(config.credentials().len(), 2);
+        assert_eq!(
+            config.credentials()[0].secret_ref,
+            "oauth-store:chatgpt:personal"
+        );
+        assert_eq!(
+            config.credentials()[1].secret_ref,
+            "oauth-store:chatgpt:work"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_or_unusable_setup_never_returns_a_config_or_tries_another_account() {
+        let result = setup_result_with_profiles(vec![chatgpt_setup_profile(
+            "chatgpt:work",
+            "work",
+            "gpt-5.6-sol",
+        )]);
+        let references = std::collections::BTreeSet::from(["chatgpt:work".to_string()]);
+        let authenticator = FakeChatGptSetupAuthenticator::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        assert!(
+            prepare_chatgpt_setup_config(&result, &references, &authenticator, cancel)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        assert_eq!(
+            authenticator.calls.lock().unwrap().as_slice(),
+            ["chatgpt:work"]
+        );
+
+        let mut unusable = result;
+        unusable.providers.push(ProviderEntry::Credentialed {
+            provider: crate::config::CredentialProvider::OpenaiPlatform,
+            credential: crate::config::CredentialBinding {
+                credential_ref: "missing-platform".into(),
+                audience: None,
+                tenant: None,
+                project: None,
+                account: None,
+                required_scopes: Default::default(),
+            },
+            model: Some("gpt-5.6-sol".into()),
+            base_url: None,
+            chat_path: None,
+            models_path: None,
+            name: Some("broken-platform".into()),
+            reasoning_effort: None,
+        });
+        let before = authenticator.calls.lock().unwrap().len();
+        assert!(prepare_chatgpt_setup_config(
+            &unusable,
+            &references,
+            &authenticator,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .is_err());
+        assert_eq!(authenticator.calls.lock().unwrap().len(), before);
     }
 }
