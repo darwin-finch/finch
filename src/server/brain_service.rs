@@ -982,13 +982,20 @@ impl BrainLifecycleService {
             }
         };
         drop(publication);
+        let transitioned = transitioned?;
+        // The runner has acknowledged cancellation and the terminal state is
+        // now durable. Release only the daemon-side dispatch wait for this
+        // run. `abort_run` does not revoke the runner lease or the detached
+        // owner of an already-begun host effect, so that owner can still
+        // publish its single authoritative late audit outcome.
+        self.runners.abort_run(&brain, run.run_id);
         if !matches!(
             run.status,
             BrainRunStatus::Running | BrainRunStatus::AwaitingApproval
         ) {
             self.store.prune_run_publication(&brain, run.run_id)?;
         }
-        transitioned
+        Ok(transitioned)
     }
 
     pub fn acquire_runner(
@@ -1844,6 +1851,113 @@ mod tests {
         assert!(service
             .schedule_initialization("shared", driver.attachment_id, driver_connection, 3_000,)
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn cancellation_aborts_dispatch_only_after_runner_ack_and_durable_terminalization() {
+        let service = service();
+        let driver = service
+            .attach("shared", "alice", AttachmentRole::Driver, None)
+            .unwrap();
+        let connection_id = driver.connection_id.unwrap();
+        let _watch = service
+            .watch("shared", driver.attachment_id, connection_id)
+            .unwrap();
+        let request = service
+            .store
+            .push(
+                "shared",
+                "alice",
+                BrainEventKind::Prompt {
+                    text: "hold one effect".into(),
+                },
+            )
+            .unwrap();
+        let run = service
+            .start_run_with_parent(
+                "shared",
+                "alice",
+                BrainRunKind::Interactive,
+                request.seq,
+                driver.attachment_id,
+                BrainRunStatus::Running,
+                None,
+            )
+            .unwrap();
+        let environment = service.store.environment().clone();
+        let lease = service
+            .acquire_runner("shared", "runner", &environment, None, 60_000)
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        service.runners.register("shared", lease.lease_id, tx);
+        let run_id = run.run_id;
+        let request_seq = run.request_seq;
+        let driver_id = driver.attachment_id;
+        let approval_audience = crate::brain::store::BrainApprovalAudience {
+            brain_id: service.store.snapshot("shared").unwrap().brain_id,
+            brain: "shared".into(),
+            attachment_id: driver_id,
+            subject: driver.subject.clone(),
+            role: driver.role,
+            environment_generation: environment.generation,
+        };
+
+        let dispatch = {
+            let runners = service.runners.clone();
+            tokio::spawn(async move {
+                runners
+                    .dispatch_turn(
+                        "shared",
+                        lease.lease_id,
+                        run_id,
+                        request_seq,
+                        "hold one effect".into(),
+                        Vec::new(),
+                        approval_audience,
+                        Some(connection_id),
+                    )
+                    .await
+            })
+        };
+        let crate::server::RunnerRequest::Turn(turn) = rx.recv().await.unwrap() else {
+            panic!("expected active turn dispatch")
+        };
+        let cancelling = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .cancel_run("shared", driver_id, connection_id, run_id)
+                    .await
+            })
+        };
+        let crate::server::RunnerRequest::Cancel(cancel) = rx.recv().await.unwrap() else {
+            panic!("expected exact runner cancellation")
+        };
+        assert_eq!(cancel.run_id, run_id);
+        tokio::task::yield_now().await;
+        assert!(
+            !dispatch.is_finished(),
+            "daemon dispatch aborted before the runner acknowledged cancellation"
+        );
+        assert!(
+            !cancelling.is_finished(),
+            "cancellation completed before the runner acknowledgement"
+        );
+        assert_eq!(
+            service.inspect_run("shared", run_id).unwrap().status,
+            BrainRunStatus::Running,
+            "cancellation became durable before the runner acknowledgement"
+        );
+
+        cancel.response_tx.send(Ok(true)).unwrap();
+        let cancelled = cancelling.await.unwrap().unwrap();
+        assert_eq!(cancelled.status, BrainRunStatus::Cancelled);
+        let dispatch_error = dispatch.await.unwrap().unwrap_err();
+        assert!(dispatch_error.to_string().contains("run cancelled"));
+        assert!(
+            turn.response_tx.is_closed(),
+            "terminal cancellation retained the daemon dispatch receiver"
+        );
     }
 
     #[tokio::test]
