@@ -359,7 +359,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `tests/live/impcpd.rs` — IMPCPD JSON schema contract (critique parses to `Vec<CritiqueItem>`,
     plan generates numbered steps, critique parity across all providers)
   - Keys resolved from env vars first (CI), then `~/.finch/config.toml` (local dev)
-  - Run: `FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_`
+  - Run: `./scripts/test_brains.sh env FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_`
 
 ### Changed
 - **IMPCPD plan loop** (`src/planning/loop_runner.rs`): alignment prompt now prepended to both

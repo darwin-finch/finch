@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/brain_test_isolation.sh
+source "$repo_root/scripts/lib/brain_test_isolation.sh"
+
+if [[ "$#" -eq 0 ]]; then
+  set -- cargo test --lib
+fi
+
+cd "$repo_root"
+default_supervisor="$repo_root/target/debug/finch-test-supervisor-pinned"
+[[ -x "$default_supervisor" ]] || default_supervisor="$repo_root/target/debug/finch-test-supervisor"
+supervisor="${FINCH_TEST_SUPERVISOR_BIN:-$default_supervisor}"
+if [[ -z "${FINCH_TEST_TMP_PARENT:-}" ]]; then
+  FINCH_TEST_TMP_PARENT="$(cd "${TMPDIR:-/tmp}" && pwd -P)"
+  export FINCH_TEST_TMP_PARENT
+fi
+if [[ -x "$supervisor" ]]; then
+  exec "$supervisor" "$@"
+fi
+exec cargo run --quiet --bin finch-test-supervisor -- "$@"

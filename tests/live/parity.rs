@@ -5,7 +5,7 @@
 // "swap to cheapest provider" goal: if a provider fails here, it cannot be
 // used as a drop-in replacement.
 //
-// Run: FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_parity
+// Run: ./scripts/test_brains.sh env FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_parity
 
 use finch::claude::Message;
 use finch::programs::{

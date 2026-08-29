@@ -3,7 +3,7 @@
 // Live tests verify structural contracts with real API calls. They are:
 // - Gated by FINCH_LIVE_TESTS=1 (never run in normal CI)
 // - Marked #[ignore] so `cargo test` skips them by default
-// - Run with: FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_
+// - Run with: ./scripts/test_brains.sh env FINCH_LIVE_TESTS=1 cargo test -- --include-ignored live_
 //
 // API keys are resolved from env vars first (CI), then ~/.finch/config.toml (local dev).
 //

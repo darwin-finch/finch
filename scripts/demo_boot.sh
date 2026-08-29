@@ -8,6 +8,10 @@
 
 set -euo pipefail
 
+script_path="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+source "$(dirname "$script_path")/lib/brain_test_isolation.sh"
+brain_test_isolation_reexec_launcher "$script_path" "$@"
+
 BOLD=$'\033[1m'
 DIM=$'\033[2m'
 CYAN=$'\033[36m'

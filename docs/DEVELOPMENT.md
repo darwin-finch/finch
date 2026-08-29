@@ -94,13 +94,13 @@ Binary at: `target/release/finch`
 ### Run Without Building
 
 ```bash
-cargo run
+./scripts/test_brains.sh cargo run
 ```
 
 With arguments:
 
 ```bash
-cargo run -- daemon --port 8080
+./scripts/test_server.sh
 ```
 
 ## Testing
@@ -108,32 +108,41 @@ cargo run -- daemon --port 8080
 ### Run All Tests
 
 ```bash
-cargo test
+./scripts/test_brains.sh cargo test
 ```
 
 ### Run Specific Test
 
 ```bash
-cargo test test_router_decision
+./scripts/test_brains.sh cargo test test_router_decision
 ```
 
 ### Run Tests with Output
 
 ```bash
-cargo test -- --nocapture
+./scripts/test_brains.sh cargo test -- --nocapture
 ```
 
 ### Integration Tests Only
 
 ```bash
-cargo test --test '*'
+./scripts/test_brains.sh cargo test --test '*'
 ```
 
 ### Run Tests in Watch Mode
 
 ```bash
-cargo watch -x test
+cargo watch -s './scripts/test_brains.sh cargo test'
 ```
+
+The Rust Brain test supervisor owns one OS process group for the runner and all
+of its test daemons. Launchers must not detach or signal PIDs themselves; they
+leave group termination, bounded escalation, quiescence, and reaping to the
+supervisor. Isolated tests disable daemon discovery, reuse, and auto-spawn.
+Supervised launchers and daemons must not enable job control or call `setsid`,
+`setpgid`, or `CommandExt::process_group`; the isolation self-test scans those
+production test paths for violations. Deliberately hostile same-UID code that
+evades that contract is outside this trusted-test boundary.
 
 ## Code Quality
 
@@ -190,14 +199,14 @@ git checkout -b feature/add-router-logic
 # 2. Make changes
 # ... edit src/router/mod.rs ...
 
-# 3. Auto-rebuild on save
-cargo watch -x 'run'
+# 3. Auto-run inside a disposable Finch HOME on save
+cargo watch -s './scripts/test_brains.sh cargo run'
 
 # 4. Write tests
 # ... edit tests/router_tests.rs ...
 
 # 5. Run tests
-cargo test
+./scripts/test_brains.sh cargo test
 
 # 6. Format and lint
 cargo fmt
@@ -220,13 +229,13 @@ Use `cargo-watch` for automatic rebuilds:
 cargo watch -x build
 
 # Rebuild and run
-cargo watch -x run
+cargo watch -s './scripts/test_brains.sh cargo run'
 
 # Rebuild and test
-cargo watch -x test
+cargo watch -s './scripts/test_brains.sh cargo test'
 
 # Run specific binary
-cargo watch -x 'run --bin finch'
+cargo watch -s './scripts/test_brains.sh cargo run --bin finch'
 ```
 
 ## Project Structure
@@ -417,13 +426,13 @@ mod tests {
 ### Enable Debug Logging
 
 ```bash
-RUST_LOG=debug cargo run
+RUST_LOG=debug ./scripts/test_brains.sh cargo run
 ```
 
 More granular:
 
 ```bash
-RUST_LOG=finch=debug,finch::router=trace cargo run
+RUST_LOG=finch=debug,finch::router=trace ./scripts/test_brains.sh cargo run
 ```
 
 ### Use Debugger
@@ -521,10 +530,10 @@ cargo outdated
 
 ```bash
 # Run example
-cargo run --example simple_query
+./scripts/test_brains.sh cargo run --example simple_query
 
 # With arguments
-cargo run --example simple_query -- "What is Rust?"
+./scripts/test_brains.sh cargo run --example simple_query -- "What is Rust?"
 ```
 
 ## Continuous Integration
@@ -545,7 +554,7 @@ jobs:
       - uses: actions/checkout@v3
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - run: cargo build --verbose
-      - run: cargo test --verbose
+      - run: ./scripts/test_brains.sh cargo test --verbose
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
 ```
@@ -619,11 +628,9 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 **Port already in use**:
 ```bash
-# Find process using port
+# Inspect the owner, then stop it through the service or supervisor that
+# launched it. Do not signal a PID copied from process-list output.
 lsof -i :8000
-
-# Kill process
-kill <PID>
 ```
 
 ## Getting Help
@@ -651,7 +658,7 @@ kill <PID>
 3. Make your changes
 4. Add tests
 5. Run `cargo fmt` and `cargo clippy`
-6. Ensure `cargo test` passes
+6. Ensure `./scripts/test_brains.sh cargo test` passes
 7. Commit with conventional commit messages
 8. Push to your fork
 9. Open a pull request
