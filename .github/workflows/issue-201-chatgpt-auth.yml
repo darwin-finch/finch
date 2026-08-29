@@ -63,6 +63,7 @@ jobs:
           cargo test --lib cli::setup_wizard::tests::test_known_models_for_returns_list_for_all_providers -- --exact
           cargo test --lib cli::setup_wizard::tests::chooser_keeps_chatgpt_subscription_distinct_from_openai_platform -- --exact
           cargo test --lib cli::setup_wizard::tests::chatgpt_configuration_has_no_api_key_input_buffer_or_render_path -- --exact
+          cargo test --lib cli::setup_wizard::tests::test_api_key_provider_starts_on_api_key_field -- --exact
           cargo test --lib cli::setup_wizard::tests::cancelled_or_unusable_setup_never_returns_a_config_or_tries_another_account -- --exact
           cargo test --lib cli::setup_wizard::tests::setup_final_validation_preserves_cause_and_compensates_every_owned_generation -- --exact
           cargo test --lib providers::model_catalog::tests::chatgpt_subscription_fallback_is_pinned_and_separate_from_platform -- --exact

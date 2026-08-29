@@ -8312,15 +8312,25 @@ mod tests {
     }
 
     #[test]
-    fn test_configure_remote_starts_on_api_key_field() {
-        let n_cloud = CLOUD_PROVIDERS.len();
-        // Opening from SelectAddType with first cloud entry
-        let mut state = state_with_step(AddProviderStep::SelectAddType { selected: 0 });
+    fn test_api_key_provider_starts_on_api_key_field() {
+        let grok_idx = CLOUD_PROVIDERS
+            .iter()
+            .position(|(id, ..)| *id == "grok")
+            .unwrap();
+        let mut state = state_with_step(AddProviderStep::SelectAddType { selected: grok_idx });
         handle_models_input(&mut state, key(KeyCode::Enter)).unwrap();
-        if let Some(AddProviderStep::ConfigureRemote { focused_field, .. }) = get_step(&state) {
+        if let Some(AddProviderStep::ConfigureRemote {
+            provider_idx,
+            api_key,
+            focused_field,
+            ..
+        }) = get_step(&state)
+        {
+            assert_eq!(*provider_idx, grok_idx);
+            assert_eq!(api_key.as_deref(), Some(""));
             assert_eq!(
                 *focused_field, 3,
-                "ConfigureRemote should open focused on API key field"
+                "API-key providers should open focused on the API key field"
             );
         } else {
             panic!(
@@ -8328,7 +8338,6 @@ mod tests {
                 get_step(&state).map(|s| format!("{:?}", s))
             );
         }
-        let _ = n_cloud; // suppress unused warning
     }
 
     #[test]
