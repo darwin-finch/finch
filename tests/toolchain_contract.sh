@@ -114,19 +114,40 @@ windows_contract=$(awk '
   in_job && /^  [[:alnum:]_-]+:$/ && $1 != "windows-format-contract:" { exit }
   in_job { print }
 ' "$ci_workflow")
-if [[ "$windows_contract" != *'runs-on: windows-2025'* ]] \
-  || [[ "$windows_contract" != *'dtolnay/rust-toolchain@1.98.0'* ]] \
-  || [[ "$windows_contract" != *'rustc 1.98.0'* ]] \
-  || [[ "$windows_contract" != *'rustfmt 1.9.0-'* ]] \
-  || [[ "$windows_contract" != *'cargo fmt --all -- --check'* ]]; then
+
+windows_contract_is_narrow() {
+  local contract="$1"
+  local cargo_lines
+  cargo_lines=$(grep -E '(^|[^[:alnum:]_])cargo([^[:alnum:]_]|$)' <<<"$contract" || true)
+
+  [[ "$contract" == *'runs-on: windows-2025'* ]] \
+    && [[ "$contract" == *'dtolnay/rust-toolchain@1.98.0'* ]] \
+    && [[ "$contract" == *'rustc 1.98.0'* ]] \
+    && [[ "$contract" == *'rustfmt 1.9.0-'* ]] \
+    && [[ "$cargo_lines" == '      run: cargo fmt --all -- --check' ]]
+}
+
+if ! windows_contract_is_narrow "$windows_contract"; then
   echo "$ci_workflow must keep a narrow Windows Rust 1.98/rustfmt contract job" >&2
   exit 1
 fi
 
-if grep -Eq 'cargo (build|check|clippy|run|test)' <<<"$windows_contract"; then
-  echo "$ci_workflow must not compile or run Finch in its Windows formatting contract" >&2
-  exit 1
-fi
+# Guard the allowlist itself against Cargo spellings that previously bypassed
+# the narrower verb blacklist. The Windows job is a formatting contract, not a
+# supported Finch build surface, so its sole Cargo command must remain exact.
+windows_contract_mutations=(
+  "${windows_contract/cargo fmt --all -- --check/cargo --locked build}"
+  "${windows_contract/cargo fmt --all -- --check/cargo +1.98.0 test}"
+  "${windows_contract/cargo fmt --all -- --check/cargo rustc}"
+  "${windows_contract/cargo fmt --all -- --check/cargo doc}"
+  "${windows_contract}"$'\n''      run: cargo check'
+)
+for mutation in "${windows_contract_mutations[@]}"; do
+  if windows_contract_is_narrow "$mutation"; then
+    echo "$ci_workflow Windows Cargo allowlist accepted a forbidden mutation" >&2
+    exit 1
+  fi
+done
 
 if awk '
   /matrix:/ { in_matrix = 1 }
