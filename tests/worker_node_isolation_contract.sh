@@ -43,6 +43,11 @@ grep -Fq 'FINCH_TEST_FORCE_MANIFEST_AFTER_ERROR' \
   echo 'supervisor must retain the deterministic dual-snapshot error regression hook' >&2
   exit 1
 }
+if rg -q 'fs::write\(marker|FINCH_TEST_NODE_AFTER_MARKER.*fs::write' \
+  src/bin/finch-test-supervisor.rs; then
+  echo 'node after-snapshot regression must not accept pathname write authority' >&2
+  exit 1
+fi
 
 if rg -q 'node-id\.lock' src/node; then
   echo 'isolated node state must use its Arc-owned mutex, not a pathname lock' >&2

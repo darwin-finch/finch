@@ -1007,6 +1007,9 @@ fn run() -> anyhow::Result<i32> {
         "FINCH_TEST_TMP_PARENT",
         "FINCH_TEST_PROCESS_REGISTRY",
         "FINCH_TEST_BOUND_ADDR_FILE",
+        "FINCH_TEST_FORCE_MANIFEST_AFTER_ERROR",
+        "FINCH_TEST_NODE_AFTER_MARKER",
+        "FINCH_TEST_REPORT_NODE_AFTER",
         "BRAIN_ADDR",
         "DAEMON_ADDR",
         "BRAIN_PASSWORD",
@@ -1060,8 +1063,8 @@ fn run() -> anyhow::Result<i32> {
         real_node_identity.verify_pathnames(&real_home)?;
         node_identity_digest(real_node_identity.finch.as_ref())
     })();
-    if let Some(marker) = std::env::var_os("FINCH_TEST_NODE_AFTER_MARKER") {
-        fs::write(marker, b"observed\n")?;
+    if std::env::var("FINCH_TEST_REPORT_NODE_AFTER").as_deref() == Ok("1") {
+        eprintln!("FINCH_TEST_NODE_AFTER_OBSERVED");
     }
     let after = after_result?;
     let node_identity_after = node_identity_after_result?;

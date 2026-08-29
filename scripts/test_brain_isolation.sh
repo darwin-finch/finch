@@ -424,17 +424,26 @@ printf 'keep node\n' >"$fake_home/.finch/node_id"
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 phase=combined-brain-and-node-after-snapshots
-node_after_marker="$scratch/node-after-observed"
+combined_diagnostic="$scratch/combined-after-diagnostic"
 combined_status=0
 FINCH_REAL_NODE_ID="$fake_home/.finch/node_id" \
 FINCH_TEST_FORCE_MANIFEST_AFTER_ERROR=1 \
-FINCH_TEST_NODE_AFTER_MARKER="$node_after_marker" \
+FINCH_TEST_REPORT_NODE_AFTER=1 \
   run_isolated bash -c '
     printf changed >"$FINCH_REAL_NODE_ID"
-  ' >/dev/null 2>&1 || combined_status=$?
+  ' >/dev/null 2>"$combined_diagnostic" || combined_status=$?
 test "$combined_status" -eq 70
-test -f "$node_after_marker"
+grep -Fxq 'FINCH_TEST_NODE_AFTER_OBSERVED' "$combined_diagnostic"
 printf 'keep node\n' >"$fake_home/.finch/node_id"
+test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
+
+phase=legacy-node-after-marker-has-no-path-authority
+external_marker_sentinel="$scratch/external-marker-sentinel"
+printf 'keep external marker\n' >"$external_marker_sentinel"
+FINCH_TEST_NODE_AFTER_MARKER="$fake_home/.finch/node_id" run_isolated true
+test "$(cat "$fake_home/.finch/node_id")" = 'keep node'
+FINCH_TEST_NODE_AFTER_MARKER="$external_marker_sentinel" run_isolated true
+test "$(cat "$external_marker_sentinel")" = 'keep external marker'
 test -z "$(find "$temp_parent" -mindepth 1 -print -quit)"
 
 phase=real-node-id-ancestor-swap-rejected
