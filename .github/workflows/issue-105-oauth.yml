@@ -10,6 +10,7 @@ on:
       - "src/oauth/**"
       - "src/providers/chatgpt_oauth.rs"
       - "src/providers/mod.rs"
+      - ".github/issue-105-windows-probe/**"
       - ".github/workflows/issue-105-oauth.yml"
 
 jobs:
@@ -38,8 +39,6 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - name: Install Cap'n Proto compiler
-        run: choco install capnproto --yes --no-progress
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Compile provider-neutral OAuth core on Windows
