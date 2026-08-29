@@ -1310,6 +1310,44 @@ async fn refresh_cancellation_before_replacement_persistence_keeps_recoverable_m
 }
 
 #[tokio::test]
+async fn local_compensation_is_generation_bound_and_never_tombstones_replacement() {
+    let server = FakeServer::start().await;
+    let dialect = Arc::new(SyntheticDialect::new(&server.origin, "alpha"));
+    let store = Arc::new(MemoryStore::default());
+    let original = dialect
+        .validate_tokens(
+            StatusCode::OK,
+            token_body("alpha", "account-one", "refresh-original"),
+            None,
+            &TokenValidationContext::Device,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let owned_generation = original.generation.clone();
+    store
+        .compare_and_swap("chatgpt:race", None, &original)
+        .unwrap();
+    let mut replacement = original.clone();
+    replacement.generation = "external-generation".into();
+    replacement.access_token = "external-access-sentinel".into();
+    store
+        .compare_and_swap("chatgpt:race", Some(&owned_generation), &replacement)
+        .unwrap();
+    let client = OAuthClient::new(dialect, store.clone()).unwrap();
+    assert!(client
+        .tombstone_local_generation("chatgpt:race", &owned_generation)
+        .unwrap_err()
+        .to_string()
+        .contains("generation changed"));
+    let current = &store.0.lock().unwrap()["chatgpt:race"];
+    assert_eq!(current.generation, "external-generation");
+    assert_eq!(current.access_token, "external-access-sentinel");
+    assert!(!current.revoked && !current.mutation_pending);
+    assert_eq!(server.request_count("/alpha/revoke"), 0);
+}
+
+#[tokio::test]
 async fn expired_refresh_revoke_crash_and_same_name_reauthentication_are_durable() {
     let server = FakeServer::start().await;
     let dialect = Arc::new(SyntheticDialect::new(&server.origin, "alpha"));

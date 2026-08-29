@@ -52,6 +52,45 @@ pub enum ChatGptAuthState {
     RecoveryRequired,
 }
 
+/// Opaque exact-generation authority for compensating one setup issuance.
+pub struct ChatGptCompensationHandle {
+    reference: String,
+    generation: String,
+}
+
+impl std::fmt::Debug for ChatGptCompensationHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChatGptCompensationHandle")
+            .field("reference", &self.reference)
+            .field("generation", &"[REDACTED GENERATION]")
+            .finish()
+    }
+}
+
+impl ChatGptCompensationHandle {
+    pub(crate) fn issued(reference: &str, generation: String) -> Self {
+        Self {
+            reference: reference.to_string(),
+            generation,
+        }
+    }
+
+    pub(crate) fn reference(&self) -> &str {
+        &self.reference
+    }
+
+    pub(crate) fn generation(&self) -> &str {
+        &self.generation
+    }
+}
+
+/// Metadata plus exact rollback authority from one ensure operation.
+pub struct EnsuredChatGptCredential {
+    pub credential: ProviderCredential,
+    pub compensation: Option<ChatGptCompensationHandle>,
+}
+
 /// Render one stable, secret-free status line for scripts and interactive use.
 pub fn render_status_line(status: &ChatGptAuthStatus) -> Result<String> {
     crate::oauth::validate_reference(&status.credential_ref)?;
@@ -108,14 +147,8 @@ pub struct DeviceLoginPresentation {
 /// tests consume the same contract without exposing token records.
 #[async_trait]
 pub trait ChatGptCredentialAuthenticator: Send + Sync {
-    /// Whether a successful ensure would create a new durable account that
-    /// must be tombstoned if a later setup account fails.
-    fn needs_compensating_tombstone(&self, _reference: &str) -> Result<bool> {
-        Ok(false)
-    }
-
     /// Compensate a newly-issued account after a multi-account setup failure.
-    fn compensate_with_tombstone(&self, _reference: &str) -> Result<()> {
+    fn compensate_with_tombstone(&self, _handle: &ChatGptCompensationHandle) -> Result<()> {
         Ok(())
     }
 
@@ -124,7 +157,7 @@ pub trait ChatGptCredentialAuthenticator: Send + Sync {
         reference: &str,
         presentation: DeviceLoginPresentation,
         cancel: CancellationToken,
-    ) -> Result<ProviderCredential>;
+    ) -> Result<EnsuredChatGptCredential>;
 }
 
 /// Production Finch-native ChatGPT authentication service.
@@ -191,7 +224,7 @@ impl ChatGptAuthService {
         reference: &str,
         presentation: DeviceLoginPresentation,
         cancel: CancellationToken,
-    ) -> Result<ProviderCredential> {
+    ) -> Result<EnsuredChatGptCredential> {
         let client = self.client()?;
         match self.store.load(reference)? {
             Some(record) => {
@@ -202,20 +235,27 @@ impl ChatGptAuthService {
                     );
                 }
                 if record.revoked {
-                    return login_device_with(&client, reference, presentation, cancel).await;
+                    return login_device_with_commit(&client, reference, presentation, cancel)
+                        .await;
                 }
                 if record.expires_at > Utc::now() {
                     client.validate_active_reuse(&record)?;
-                    return Ok(record.provider_credential(reference));
+                    return Ok(EnsuredChatGptCredential {
+                        credential: record.provider_credential(reference),
+                        compensation: None,
+                    });
                 }
                 if record.refresh_token.is_some() {
-                    return client.refresh(reference, cancel).await;
+                    return Ok(EnsuredChatGptCredential {
+                        credential: client.refresh(reference, cancel).await?,
+                        compensation: None,
+                    });
                 }
                 bail!(
                     "ChatGPT credential is expired and unrefreshable; log it out before explicit re-authentication"
                 )
             }
-            None => login_device_with(&client, reference, presentation, cancel).await,
+            None => login_device_with_commit(&client, reference, presentation, cancel).await,
         }
     }
 
@@ -241,15 +281,9 @@ impl ChatGptAuthService {
 
 #[async_trait]
 impl ChatGptCredentialAuthenticator for ChatGptAuthService {
-    fn needs_compensating_tombstone(&self, reference: &str) -> Result<bool> {
-        Ok(matches!(
-            self.status(reference)?.state,
-            ChatGptAuthState::SignedOut
-        ))
-    }
-
-    fn compensate_with_tombstone(&self, reference: &str) -> Result<()> {
-        self.client()?.tombstone_local(reference)?;
+    fn compensate_with_tombstone(&self, handle: &ChatGptCompensationHandle) -> Result<()> {
+        self.client()?
+            .tombstone_local_generation(handle.reference(), handle.generation())?;
         Ok(())
     }
 
@@ -258,19 +292,17 @@ impl ChatGptCredentialAuthenticator for ChatGptAuthService {
         reference: &str,
         presentation: DeviceLoginPresentation,
         cancel: CancellationToken,
-    ) -> Result<ProviderCredential> {
+    ) -> Result<EnsuredChatGptCredential> {
         ChatGptAuthService::ensure_named_credential(self, reference, presentation, cancel).await
     }
 }
 
-/// Shared device ceremony used by setup and scriptable login. Tests inject the
-/// same OAuth production boundary with deterministic dialect/server fixtures.
-pub async fn login_device_with<D, S>(
+async fn login_device_with_commit<D, S>(
     client: &OAuthClient<D, S>,
     reference: &str,
     presentation: DeviceLoginPresentation,
     cancel: CancellationToken,
-) -> Result<ProviderCredential>
+) -> Result<EnsuredChatGptCredential>
 where
     D: OAuthDialect + 'static,
     S: OAuthCredentialStore + 'static,
@@ -287,19 +319,44 @@ where
         pending.expires_in,
         presentation,
     )?;
-
     let countdown_cancel = cancel.child_token();
     let countdown = tokio::spawn(countdown_status(
         pending.expires_in,
         countdown_cancel.clone(),
     ));
     let result = client
-        .finish_device_authorization(reference, &pending, cancel)
+        .finish_device_authorization_commit(reference, &pending, cancel)
         .await
         .context("ChatGPT device login did not complete");
     countdown_cancel.cancel();
     let _ = countdown.await;
-    result
+    let commit = result?;
+    Ok(EnsuredChatGptCredential {
+        credential: commit.credential,
+        compensation: Some(ChatGptCompensationHandle::issued(
+            reference,
+            commit.generation,
+        )),
+    })
+}
+
+/// Shared device ceremony used by setup and scriptable login. Tests inject the
+/// same OAuth production boundary with deterministic dialect/server fixtures.
+pub async fn login_device_with<D, S>(
+    client: &OAuthClient<D, S>,
+    reference: &str,
+    presentation: DeviceLoginPresentation,
+    cancel: CancellationToken,
+) -> Result<ProviderCredential>
+where
+    D: OAuthDialect + 'static,
+    S: OAuthCredentialStore + 'static,
+{
+    Ok(
+        login_device_with_commit(client, reference, presentation, cancel)
+            .await?
+            .credential,
+    )
 }
 
 fn status_from_store(

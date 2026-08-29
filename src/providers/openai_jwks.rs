@@ -235,9 +235,7 @@ impl OpenAiJwksVerifier {
         reject_duplicate_json_fields(&discovery_bytes, "discovery document")?;
         let discovery: DiscoveryDocument = serde_json::from_slice(&discovery_bytes)
             .context("OpenAI discovery document is malformed")?;
-        if discovery.issuer.trim_end_matches('/') != self.issuer
-            || discovery.jwks_uri != self.jwks_url.as_str()
-        {
+        if discovery.issuer != self.issuer || discovery.jwks_uri != self.jwks_url.as_str() {
             bail!("OpenAI discovery document changed issuer or JWKS authority");
         }
 
@@ -727,6 +725,7 @@ mod tests {
     #[derive(Clone)]
     struct FixtureState {
         origin: String,
+        discovery_issuer_override: Arc<StdMutex<Option<String>>>,
         discovery_jwks_override: Arc<StdMutex<Option<String>>>,
         jwks: Arc<StdMutex<VecDeque<Value>>>,
         discovery_count: Arc<AtomicUsize>,
@@ -756,6 +755,7 @@ mod tests {
             let origin = format!("http://{}", listener.local_addr().unwrap());
             let state = FixtureState {
                 origin: origin.clone(),
+                discovery_issuer_override: Arc::new(StdMutex::new(None)),
                 discovery_jwks_override: Arc::new(StdMutex::new(None)),
                 jwks: Arc::new(StdMutex::new(jwks.into())),
                 discovery_count: Arc::new(AtomicUsize::new(0)),
@@ -783,8 +783,14 @@ mod tests {
             .unwrap()
             .clone()
             .unwrap_or_else(|| format!("{}{}", state.origin, JWKS_PATH));
+        let issuer = state
+            .discovery_issuer_override
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| REQUIRED_TOKEN_ISSUER.to_string());
         json_response(json!({
-            "issuer": REQUIRED_TOKEN_ISSUER,
+            "issuer": issuer,
             "jwks_uri": jwks_uri,
         }))
     }
@@ -1256,6 +1262,35 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_cannot_proxy_or_substitute_the_pinned_jwks_authority() {
+        let issuer_server = FixtureServer::start(vec![jwks("key-one")]).await;
+        *issuer_server
+            .state
+            .discovery_issuer_override
+            .lock()
+            .unwrap() = Some(format!("{REQUIRED_TOKEN_ISSUER}/"));
+        let issuer_verifier = OpenAiJwksVerifier::for_test(
+            &issuer_server.origin,
+            REQUIRED_TOKEN_ISSUER,
+            OPENAI_PUBLIC_CLIENT_ID,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let (identity, access) = claims("acct-one", required_scopes());
+        assert!(issuer_verifier
+            .verify(
+                Some(&signed("key-one", &identity)),
+                &signed("key-one", &access),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("changed issuer or JWKS authority"));
+        assert_eq!(
+            issuer_server.state.jwks_count.load(AtomicOrdering::SeqCst),
+            0
+        );
+
         let attacker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let attacker_url = format!("http://{}/jwks", attacker.local_addr().unwrap());
         let server = FixtureServer::start(vec![jwks("key-one")]).await;
@@ -1267,7 +1302,6 @@ mod tests {
             Duration::from_secs(1),
         )
         .unwrap();
-        let (identity, access) = claims("acct-one", required_scopes());
         assert!(verifier
             .verify(
                 Some(&signed("key-one", &identity)),

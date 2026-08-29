@@ -298,6 +298,13 @@ pub struct OAuthTokenRecord {
     pub mutation_pending: bool,
 }
 
+/// Generation-bound result of one successful credential CAS. Kept crate-local
+/// so setup compensation can never identify a record by name alone.
+pub(crate) struct OAuthCredentialCommit {
+    pub(crate) credential: ProviderCredential,
+    pub(crate) generation: String,
+}
+
 impl fmt::Debug for OAuthTokenRecord {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -577,6 +584,18 @@ where
         pending: &DeviceAuthorization,
         cancel: CancellationToken,
     ) -> Result<ProviderCredential> {
+        Ok(self
+            .finish_device_authorization_commit(reference, pending, cancel)
+            .await?
+            .credential)
+    }
+
+    pub(crate) async fn finish_device_authorization_commit(
+        &self,
+        reference: &str,
+        pending: &DeviceAuthorization,
+        cancel: CancellationToken,
+    ) -> Result<OAuthCredentialCommit> {
         validate_reference(reference)?;
         validate_device_authorization(pending, self.dialect.descriptor())?;
         pending.claim_completion()?;
@@ -631,7 +650,10 @@ where
             ensure_device_authorization_active(&cancel, deadline)?;
             self.store
                 .compare_and_swap(reference, replacement_generation.as_deref(), &tokens)?;
-            return Ok(tokens.provider_credential(reference));
+            return Ok(OAuthCredentialCommit {
+                credential: tokens.provider_credential(reference),
+                generation: tokens.generation.clone(),
+            });
         }
     }
 
@@ -877,13 +899,20 @@ where
     /// Locally tombstone an exact bound credential without transmitting it.
     /// Setup uses this only as compensation for a newly-issued credential when
     /// a later account in the same config transaction fails.
-    pub fn tombstone_local(&self, reference: &str) -> Result<ProviderCredential> {
+    pub fn tombstone_local_generation(
+        &self,
+        reference: &str,
+        expected_generation: &str,
+    ) -> Result<ProviderCredential> {
         validate_reference(reference)?;
         let current = self
             .store
             .load(reference)?
             .context("named OAuth credential is missing")?;
         self.validate_record_binding(&current)?;
+        if current.generation != expected_generation {
+            bail!("OAuth compensation generation changed; current credential was left untouched");
+        }
         let mut tombstone = current.clone();
         tombstone.access_token.clear();
         tombstone.refresh_token = None;

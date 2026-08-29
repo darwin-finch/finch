@@ -85,10 +85,11 @@ denial, expiry, or an invalid sibling prevents config/persona save. The
 temporary account-unknown preflight record is never persisted. Only verified
 token metadata is written to `config.toml`; tokens remain in Finch's
 descriptor-anchored store.
-For multiple new accounts, setup records which successful issues require
-compensation. A later denial, cancellation, or invalid account locally
-tombstones every earlier new token before returning; restart can then resume
-the same named transaction without leaving an orphaned active credential.
+For multiple new accounts, each successful issue returns an opaque
+generation-bound compensation handle from the same atomic store commit. A
+later denial, cancellation, or invalid account locally tombstones only those
+exact generations before returning; a concurrent replacement fails the CAS and
+is left untouched. Restart can then resume a safely tombstoned transaction.
 
 Browser PKCE remains disabled because the pinned browser protocol uses a
 Codex-only originator that Finch does not impersonate. Windows token persistence

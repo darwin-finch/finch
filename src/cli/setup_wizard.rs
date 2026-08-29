@@ -1379,15 +1379,7 @@ where
     let mut credentials = result.credentials.clone();
     let mut compensations = Vec::new();
     for reference in chatgpt_references {
-        let compensate = match authenticator.needs_compensating_tombstone(reference) {
-            Ok(compensate) => compensate,
-            Err(error) => {
-                compensate_chatgpt_setup(authenticator, &compensations)?;
-                return Err(error)
-                    .with_context(|| format!("Could not stage ChatGPT account '{reference}'"));
-            }
-        };
-        let credential = match authenticator
+        let ensured = match authenticator
             .ensure_named_credential(
                 &reference,
                 crate::cli::chatgpt_auth::DeviceLoginPresentation::default(),
@@ -1395,7 +1387,7 @@ where
             )
             .await
         {
-            Ok(credential) => credential,
+            Ok(ensured) => ensured,
             Err(error) => {
                 compensate_chatgpt_setup(authenticator, &compensations)?;
                 return Err(error).with_context(|| {
@@ -1403,11 +1395,11 @@ where
                 });
             }
         };
-        if compensate {
-            compensations.push(reference.clone());
+        if let Some(compensation) = ensured.compensation {
+            compensations.push(compensation);
         }
         credentials.retain(|existing| existing.name != *reference);
-        credentials.push(credential);
+        credentials.push(ensured.credential);
     }
     let config = config_from_setup_result(result).with_credentials(credentials);
     if let Err(error) = config.validate() {
@@ -1418,15 +1410,21 @@ where
     Ok(config)
 }
 
-fn compensate_chatgpt_setup<A>(authenticator: &A, references: &[String]) -> Result<()>
+fn compensate_chatgpt_setup<A>(
+    authenticator: &A,
+    handles: &[crate::cli::chatgpt_auth::ChatGptCompensationHandle],
+) -> Result<()>
 where
     A: crate::cli::chatgpt_auth::ChatGptCredentialAuthenticator,
 {
-    for reference in references.iter().rev() {
+    for handle in handles.iter().rev() {
         authenticator
-            .compensate_with_tombstone(reference)
+            .compensate_with_tombstone(handle)
             .with_context(|| {
-                format!("ChatGPT setup failed and credential '{reference}' requires local recovery")
+                format!(
+                    "ChatGPT setup failed and credential '{}' requires local recovery",
+                    handle.reference()
+                )
             })?;
     }
     Ok(())
@@ -8648,7 +8646,7 @@ mod tests {
             reference: &str,
             _presentation: crate::cli::chatgpt_auth::DeviceLoginPresentation,
             cancel: tokio_util::sync::CancellationToken,
-        ) -> Result<crate::config::ProviderCredential> {
+        ) -> Result<crate::cli::chatgpt_auth::EnsuredChatGptCredential> {
             self.calls.lock().unwrap().push(reference.to_string());
             if cancel.is_cancelled() {
                 anyhow::bail!("ChatGPT setup login was cancelled");
@@ -8656,10 +8654,13 @@ mod tests {
             if let Some(message) = self.fail.lock().unwrap().clone() {
                 anyhow::bail!(message);
             }
-            Ok(chatgpt_setup_credential(
-                reference,
-                &format!("acct-{}", reference.rsplit(':').next().unwrap()),
-            ))
+            Ok(crate::cli::chatgpt_auth::EnsuredChatGptCredential {
+                credential: chatgpt_setup_credential(
+                    reference,
+                    &format!("acct-{}", reference.rsplit(':').next().unwrap()),
+                ),
+                compensation: None,
+            })
         }
     }
 
@@ -8667,6 +8668,7 @@ mod tests {
     struct DurableSetupAuthenticator {
         root: std::path::PathBuf,
         fail_reference: Option<String>,
+        replace_before_compensation: bool,
     }
 
     #[cfg(unix)]
@@ -8705,20 +8707,27 @@ mod tests {
     #[cfg(unix)]
     #[async_trait::async_trait]
     impl crate::cli::chatgpt_auth::ChatGptCredentialAuthenticator for DurableSetupAuthenticator {
-        fn needs_compensating_tombstone(&self, reference: &str) -> Result<bool> {
-            use crate::oauth::OAuthCredentialStore;
-            Ok(self
-                .store()
-                .load(reference)?
-                .is_none_or(|record| record.revoked))
-        }
-
-        fn compensate_with_tombstone(&self, reference: &str) -> Result<()> {
+        fn compensate_with_tombstone(
+            &self,
+            handle: &crate::cli::chatgpt_auth::ChatGptCompensationHandle,
+        ) -> Result<()> {
             use crate::oauth::OAuthCredentialStore;
             let store = self.store();
+            if self.replace_before_compensation {
+                let current = store
+                    .load(handle.reference())?
+                    .context("missing staged credential")?;
+                let mut external = current.clone();
+                external.generation = uuid::Uuid::new_v4().to_string();
+                external.access_token = "external-replacement-sentinel".into();
+                store.compare_and_swap(handle.reference(), Some(&current.generation), &external)?;
+            }
             let current = store
-                .load(reference)?
+                .load(handle.reference())?
                 .context("missing staged credential")?;
+            if current.generation != handle.generation() {
+                anyhow::bail!("compensation generation changed; current record left untouched");
+            }
             let mut tombstone = current.clone();
             tombstone.access_token.clear();
             tombstone.refresh_token = None;
@@ -8726,7 +8735,7 @@ mod tests {
             tombstone.generation = uuid::Uuid::new_v4().to_string();
             tombstone.revoked = true;
             tombstone.mutation_pending = false;
-            store.compare_and_swap(reference, Some(&current.generation), &tombstone)
+            store.compare_and_swap(handle.reference(), Some(handle.generation()), &tombstone)
         }
 
         async fn ensure_named_credential(
@@ -8734,7 +8743,7 @@ mod tests {
             reference: &str,
             _presentation: crate::cli::chatgpt_auth::DeviceLoginPresentation,
             _cancel: tokio_util::sync::CancellationToken,
-        ) -> Result<crate::config::ProviderCredential> {
+        ) -> Result<crate::cli::chatgpt_auth::EnsuredChatGptCredential> {
             use crate::oauth::OAuthCredentialStore;
             if self.fail_reference.as_deref() == Some(reference) {
                 anyhow::bail!("terminal second-account denial");
@@ -8743,8 +8752,14 @@ mod tests {
             let existing = store.load(reference)?;
             let expected = existing.as_ref().map(|record| record.generation.as_str());
             let replacement = Self::token_record(reference);
+            let generation = replacement.generation.clone();
             store.compare_and_swap(reference, expected, &replacement)?;
-            Ok(replacement.provider_credential(reference))
+            Ok(crate::cli::chatgpt_auth::EnsuredChatGptCredential {
+                credential: replacement.provider_credential(reference),
+                compensation: Some(crate::cli::chatgpt_auth::ChatGptCompensationHandle::issued(
+                    reference, generation,
+                )),
+            })
         }
     }
 
@@ -9005,6 +9020,7 @@ mod tests {
         let failing = DurableSetupAuthenticator {
             root: root.clone(),
             fail_reference: Some("chatgpt:b".into()),
+            replace_before_compensation: false,
         };
         assert!(prepare_chatgpt_setup_config(
             &result,
@@ -9027,6 +9043,7 @@ mod tests {
         let resumed = DurableSetupAuthenticator {
             root: root.clone(),
             fail_reference: None,
+            replace_before_compensation: false,
         };
         let config = prepare_chatgpt_setup_config(
             &result,
@@ -9043,5 +9060,38 @@ mod tests {
             assert!(!record.revoked && !record.mutation_pending);
             assert!(record.access_token.starts_with("secret-access-"));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_compensation_generation_race_leaves_concurrent_replacement_untouched() {
+        use crate::oauth::OAuthCredentialStore;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("oauth");
+        let result = setup_result_with_profiles(vec![
+            chatgpt_setup_profile("chatgpt:a", "account-a", "gpt-5.6-sol"),
+            chatgpt_setup_profile("chatgpt:b", "account-b", "gpt-5.6-sol"),
+        ]);
+        let references =
+            std::collections::BTreeSet::from(["chatgpt:a".to_string(), "chatgpt:b".to_string()]);
+        let racing = DurableSetupAuthenticator {
+            root: root.clone(),
+            fail_reference: Some("chatgpt:b".into()),
+            replace_before_compensation: true,
+        };
+        let error = prepare_chatgpt_setup_config(
+            &result,
+            &references,
+            &racing,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("requires local recovery"));
+        let reopened = crate::oauth::file_store::FileOAuthCredentialStore::new(root);
+        let external = reopened.load("chatgpt:a").unwrap().unwrap();
+        assert!(!external.revoked && !external.mutation_pending);
+        assert_eq!(external.access_token, "external-replacement-sentinel");
     }
 }
