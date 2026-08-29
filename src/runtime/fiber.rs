@@ -229,7 +229,10 @@ impl CpuFiberScheduler {
 
     #[cfg(test)]
     pub(crate) fn retained_count(&self) -> usize {
-        self.fibers.lock().expect("CPU fiber registry lock poisoned").len()
+        self.fibers
+            .lock()
+            .expect("CPU fiber registry lock poisoned")
+            .len()
     }
 
     pub fn poll(&self, id: Uuid) -> Result<CpuFiberSnapshot> {

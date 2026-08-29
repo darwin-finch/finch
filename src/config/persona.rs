@@ -142,15 +142,15 @@ impl Persona {
         persona.behavior.system_prompt = system_prompt.to_string();
 
         fs::create_dir_all(personas_dir).with_context(|| {
-            format!("Failed to create persona directory {}", personas_dir.display())
+            format!(
+                "Failed to create persona directory {}",
+                personas_dir.display()
+            )
         })?;
         let encoded = toml::to_string_pretty(&persona).context("Failed to serialize persona")?;
         let temporary = path.with_extension("toml.tmp");
         fs::write(&temporary, encoded).with_context(|| {
-            format!(
-                "Failed to save persona override to {}",
-                temporary.display()
-            )
+            format!("Failed to save persona override to {}", temporary.display())
         })?;
         fs::rename(&temporary, &path)
             .with_context(|| format!("Failed to install persona override at {}", path.display()))?;
@@ -285,8 +285,8 @@ mod tests {
     #[test]
     fn test_user_persona_name_rejects_path_traversal() {
         let dir = tempfile::tempdir().unwrap();
-        let error = Persona::save_system_prompt_override_in(dir.path(), "../outside", "bad")
-            .unwrap_err();
+        let error =
+            Persona::save_system_prompt_override_in(dir.path(), "../outside", "bad").unwrap_err();
         assert!(error.to_string().contains("Invalid persona name"));
         assert!(!dir.path().parent().unwrap().join("outside.toml").exists());
     }

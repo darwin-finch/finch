@@ -282,7 +282,6 @@ impl Val {
             other => anyhow::bail!("expected list, got {}", other.type_name()),
         }
     }
-
 }
 
 impl PartialEq for Val {
@@ -381,5 +380,4 @@ mod tests {
         let back: Val = serde_json::from_str(&json).unwrap();
         assert_eq!(val, back);
     }
-
 }

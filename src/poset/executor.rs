@@ -248,19 +248,14 @@ mod tests {
     #[tokio::test]
     async fn reviewed_forth_node_runs_in_typed_runtime_with_predecessor_values() {
         assert_eq!(
-            run_compiled("forth", "2 *", &["21".into()])
-                .await
-                .unwrap(),
+            run_compiled("forth", "2 *", &["21".into()]).await.unwrap(),
             "42"
         );
     }
 
     #[tokio::test]
     async fn reviewed_lisp_node_runs_in_the_same_typed_runtime() {
-        assert_eq!(
-            run_compiled("lisp", "(+ 20 22)", &[]).await.unwrap(),
-            "42"
-        );
+        assert_eq!(run_compiled("lisp", "(+ 20 22)", &[]).await.unwrap(), "42");
     }
 
     #[tokio::test]

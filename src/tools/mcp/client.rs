@@ -129,9 +129,8 @@ impl McpClient {
                 });
             }
         }
-        descriptors.sort_by(|left, right| {
-            (&left.server, &left.tool).cmp(&(&right.server, &right.tool))
-        });
+        descriptors
+            .sort_by(|left, right| (&left.server, &left.tool).cmp(&(&right.server, &right.tool)));
         descriptors
     }
 

@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Cap'n Proto compiler
         run: sudo apt-get update && sudo apt-get install -y capnproto
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -39,7 +39,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
       - name: Compile provider-neutral OAuth core on Windows
         run: cargo check --manifest-path .github/issue-105-windows-probe/Cargo.toml
@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Cap'n Proto compiler
         run: brew install capnp
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2

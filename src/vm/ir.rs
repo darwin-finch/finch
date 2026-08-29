@@ -1,8 +1,8 @@
 use super::diagnostic::SourceOrigin;
 use super::effects::CapabilityRequirement;
+use super::interpreter::UiOperation;
 use super::signature::StackSignature;
 use super::types::{Type, TypedValue};
-use super::interpreter::UiOperation;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

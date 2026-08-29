@@ -12,7 +12,9 @@ pub(crate) struct TestSockPath(Option<PathBuf>);
 #[cfg(test)]
 impl Drop for TestSockPath {
     fn drop(&mut self) {
-        *TEST_SOCK_PATH.lock().expect("test socket path lock poisoned") = self.0.take();
+        *TEST_SOCK_PATH
+            .lock()
+            .expect("test socket path lock poisoned") = self.0.take();
     }
 }
 

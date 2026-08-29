@@ -39,8 +39,7 @@ impl MemorySystem {
         let path = authored_root.join(filename);
         write_program_source(&path, &definition.source)?;
 
-        let mut indexed =
-            ProgramDefinition::from_source_file(&path, &root, definition.scope)?;
+        let mut indexed = ProgramDefinition::from_source_file(&path, &root, definition.scope)?;
         indexed.documentation = definition.documentation;
         indexed.signature = definition.signature.or(indexed.signature);
         indexed.effect = definition.effect;

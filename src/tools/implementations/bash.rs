@@ -64,9 +64,8 @@ impl Tool for BashTool {
         // Clone the live output callback for the stdout reader
         let live_cb = context.live_output.clone();
 
-        let (stdout_buf, stderr_buf, exit_status) = tokio::time::timeout(
-            Duration::from_secs(30),
-            async {
+        let (stdout_buf, stderr_buf, exit_status) =
+            tokio::time::timeout(Duration::from_secs(30), async {
                 // Drain stderr in a background task so it doesn't block stdout reading.
                 let stderr_task = tokio::spawn(async move {
                     let mut buf = String::new();
@@ -92,10 +91,9 @@ impl Tool for BashTool {
                 let stderr_buf = stderr_task.await.unwrap_or_default();
                 let exit_status = child.wait().await?;
                 Ok::<_, anyhow::Error>((stdout_buf, stderr_buf, exit_status))
-            },
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("approved command timed out after 30 seconds"))??;
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("approved command timed out after 30 seconds"))??;
         let exit_code = exit_status.code().unwrap_or(-1);
 
         let mut result = stdout_buf;

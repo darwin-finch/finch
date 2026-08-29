@@ -7,9 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::brain::store::{
-    AttachmentId, ConnectionId, ProgramLanguage, RunId, RunnerLeaseId,
-};
+use crate::brain::store::{AttachmentId, ConnectionId, ProgramLanguage, RunId, RunnerLeaseId};
 
 #[derive(Debug)]
 pub enum RunnerRequest {
@@ -259,7 +257,11 @@ struct InflightRequest {
 
 impl Drop for InflightRequest {
     fn drop(&mut self) {
-        let mut inflight = self.broker.inflight.lock().expect("runner inflight lock poisoned");
+        let mut inflight = self
+            .broker
+            .inflight
+            .lock()
+            .expect("runner inflight lock poisoned");
         if let Some(requests) = inflight.get_mut(&self.key) {
             requests.remove(&self.id);
             if requests.is_empty() {
@@ -270,7 +272,11 @@ impl Drop for InflightRequest {
 }
 
 impl BrainRunnerBroker {
-    fn track_inflight(&self, brain: &str, run_id: RunId) -> (oneshot::Receiver<()>, InflightRequest) {
+    fn track_inflight(
+        &self,
+        brain: &str,
+        run_id: RunId,
+    ) -> (oneshot::Receiver<()>, InflightRequest) {
         let key = (brain.to_string(), run_id);
         let id = uuid::Uuid::new_v4();
         let (abort_tx, abort_rx) = oneshot::channel();
@@ -280,7 +286,14 @@ impl BrainRunnerBroker {
             .entry(key.clone())
             .or_default()
             .insert(id, abort_tx);
-        (abort_rx, InflightRequest { broker: self.clone(), key, id })
+        (
+            abort_rx,
+            InflightRequest {
+                broker: self.clone(),
+                key,
+                id,
+            },
+        )
     }
 
     /// Stop only daemon waits associated with one durable run. This never
@@ -328,7 +341,8 @@ impl BrainRunnerBroker {
     }
 
     pub(crate) fn fence_run_cancellation(&self, brain: &str, run_id: RunId) {
-        self.cancelled_before_dispatch.lock()
+        self.cancelled_before_dispatch
+            .lock()
             .expect("runner cancellation-fence lock poisoned")
             .insert((brain.to_string(), run_id));
     }
@@ -457,11 +471,7 @@ impl BrainRunnerBroker {
         attachment_id: AttachmentId,
         attachment_connection_id: ConnectionId,
     ) -> Result<()> {
-        let key = (
-            brain.to_string(),
-            attachment_id,
-            attachment_connection_id,
-        );
+        let key = (brain.to_string(), attachment_id, attachment_connection_id);
         let mut authority = self
             .connection_authority
             .lock()
@@ -488,11 +498,10 @@ impl BrainRunnerBroker {
             .connection_authority
             .lock()
             .expect("runner connection-authority lock poisoned");
-        if authority.attachments.get(&(
-            brain.to_string(),
-            attachment_id,
-            attachment_connection_id,
-        )) != Some(&connection_id)
+        if authority
+            .attachments
+            .get(&(brain.to_string(), attachment_id, attachment_connection_id))
+            != Some(&connection_id)
         {
             anyhow::bail!("Brain attachment is not owned by this IPC connection");
         }
@@ -506,11 +515,7 @@ impl BrainRunnerBroker {
         attachment_id: AttachmentId,
         attachment_connection_id: ConnectionId,
     ) {
-        let key = (
-            brain.to_string(),
-            attachment_id,
-            attachment_connection_id,
-        );
+        let key = (brain.to_string(), attachment_id, attachment_connection_id);
         let mut authority = self
             .connection_authority
             .lock()
@@ -556,15 +561,12 @@ impl BrainRunnerBroker {
         let attachments = authority
             .attachments
             .iter()
-            .filter_map(|((brain, attachment_id, attachment_connection_id), owner)| {
-                (*owner == connection_id).then(|| {
-                    (
-                        brain.clone(),
-                        *attachment_id,
-                        *attachment_connection_id,
-                    )
-                })
-            })
+            .filter_map(
+                |((brain, attachment_id, attachment_connection_id), owner)| {
+                    (*owner == connection_id)
+                        .then(|| (brain.clone(), *attachment_id, *attachment_connection_id))
+                },
+            )
             .collect();
         authority
             .identities
@@ -625,21 +627,30 @@ impl BrainRunnerBroker {
         let (response_tx, response_rx) = oneshot::channel();
         let (abort_rx, _inflight) = self.track_inflight(brain, run_id);
         {
-            let dispatch_fence = self.cancelled_before_dispatch.lock()
+            let dispatch_fence = self
+                .cancelled_before_dispatch
+                .lock()
                 .expect("runner cancellation-fence lock poisoned");
-            anyhow::ensure!(!dispatch_fence.contains(&(brain.to_string(), run_id)),
-                "named Brain run cancelled before runner dispatch");
-            registration.tx.send(RunnerRequest::Program(RunnerProgramRequest {
-                brain: brain.to_string(),
-                run_id,
-                request_seq,
-                language,
-                source,
-                interaction,
-                grant_ceiling,
-                control_tx: None,
-                response_tx,
-            })).map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
+            anyhow::ensure!(
+                !dispatch_fence.contains(&(brain.to_string(), run_id)),
+                "named Brain run cancelled before runner dispatch"
+            );
+            registration
+                .tx
+                .send(RunnerRequest::Program(RunnerProgramRequest {
+                    brain: brain.to_string(),
+                    run_id,
+                    request_seq,
+                    language,
+                    source,
+                    interaction,
+                    grant_ceiling,
+                    control_tx: None,
+                    response_tx,
+                }))
+                .map_err(|_| {
+                    anyhow::anyhow!("named Brain '{brain}' runner callback disconnected")
+                })?;
         }
         tokio::select! {
             response = response_rx => response
@@ -673,21 +684,30 @@ impl BrainRunnerBroker {
         let (response_tx, response_rx) = oneshot::channel();
         let (abort_rx, _inflight) = self.track_inflight(brain, run_id);
         {
-            let dispatch_fence = self.cancelled_before_dispatch.lock()
+            let dispatch_fence = self
+                .cancelled_before_dispatch
+                .lock()
                 .expect("runner cancellation-fence lock poisoned");
-            anyhow::ensure!(!dispatch_fence.contains(&(brain.to_string(), run_id)),
-                "named Brain run cancelled before runner dispatch");
-            registration.tx.send(RunnerRequest::Turn(RunnerTurnRequest {
-                brain: brain.to_string(),
-                run_id,
-                request_seq,
-                prompt,
-                context,
-                approval_audience,
-                approval_connection_id,
-                approval_tx: None,
-                response_tx,
-            })).map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
+            anyhow::ensure!(
+                !dispatch_fence.contains(&(brain.to_string(), run_id)),
+                "named Brain run cancelled before runner dispatch"
+            );
+            registration
+                .tx
+                .send(RunnerRequest::Turn(RunnerTurnRequest {
+                    brain: brain.to_string(),
+                    run_id,
+                    request_seq,
+                    prompt,
+                    context,
+                    approval_audience,
+                    approval_connection_id,
+                    approval_tx: None,
+                    response_tx,
+                }))
+                .map_err(|_| {
+                    anyhow::anyhow!("named Brain '{brain}' runner callback disconnected")
+                })?;
         }
         tokio::select! {
             response = response_rx => response
@@ -758,15 +778,17 @@ impl BrainRunnerBroker {
         let (response_tx, response_rx) = oneshot::channel();
         registration
             .tx
-            .send(RunnerRequest::ProjectMemory(RunnerMemoryProjectionRequest {
-                brain_id,
-                brain: brain.to_string(),
-                run_id,
-                request_seq,
-                prompt,
-                source,
-                response_tx,
-            }))
+            .send(RunnerRequest::ProjectMemory(
+                RunnerMemoryProjectionRequest {
+                    brain_id,
+                    brain: brain.to_string(),
+                    run_id,
+                    request_seq,
+                    prompt,
+                    source,
+                    response_tx,
+                },
+            ))
             .map_err(|_| anyhow::anyhow!("named Brain '{brain}' runner callback disconnected"))?;
         response_rx
             .await
@@ -827,12 +849,7 @@ mod tests {
         assert!(broker.has_registration("brain", lease_id));
 
         broker
-            .claim_connection_attachment(
-                owner,
-                "brain",
-                attachment_id,
-                attachment_connection_id,
-            )
+            .claim_connection_attachment(owner, "brain", attachment_id, attachment_connection_id)
             .unwrap();
         assert!(broker
             .require_connection_attachment(
@@ -846,11 +863,7 @@ mod tests {
         let disconnected = broker.disconnect_connection(owner);
         assert_eq!(
             disconnected,
-            vec![(
-                "brain".to_string(),
-                attachment_id,
-                attachment_connection_id,
-            )]
+            vec![("brain".to_string(), attachment_id, attachment_connection_id,)]
         );
         assert!(!broker.has_registration("brain", lease_id));
         assert!(broker
@@ -860,12 +873,7 @@ mod tests {
             .claim_connection_identity(intruder, "runner-a@box.local")
             .unwrap();
         assert!(broker
-            .require_connection_attachment(
-                owner,
-                "brain",
-                attachment_id,
-                attachment_connection_id,
-            )
+            .require_connection_attachment(owner, "brain", attachment_id, attachment_connection_id,)
             .is_err());
     }
 
@@ -883,10 +891,7 @@ mod tests {
             assert_eq!(request.request_seq, 7);
             assert_eq!(request.run_id, run_id);
             assert_eq!(request.source, "21 2 *");
-            assert_eq!(
-                request.interaction,
-                RunnerProgramInteraction::Interactive
-            );
+            assert_eq!(request.interaction, RunnerProgramInteraction::Interactive);
             assert!(request.grant_ceiling.is_none());
             let runtime = crate::runtime::ProgramRuntime::new();
             let checkpoint = runtime

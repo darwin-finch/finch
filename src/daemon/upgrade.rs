@@ -189,13 +189,7 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
     let snapshot = client.brain_snapshot(&brain).await?;
     client.brain_claim_runner_identity(&subject).await?;
     let lease = client
-        .brain_acquire_runner(
-            &brain,
-            &subject,
-            &snapshot.environment,
-            None,
-            30_000,
-        )
+        .brain_acquire_runner(&brain, &subject, &snapshot.environment, None, 30_000)
         .await?;
     let (runner_tx, mut runner_rx) = tokio::sync::mpsc::unbounded_channel();
     let runner = client
@@ -248,7 +242,10 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
     let crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(request) = request else {
         anyhow::bail!("fresh daemon delivered the wrong runner callback");
     };
-    anyhow::ensure!(request.brain == brain, "runner callback targeted the wrong Brain");
+    anyhow::ensure!(
+        request.brain == brain,
+        "runner callback targeted the wrong Brain"
+    );
     request
         .response_tx
         .send(Ok(crate::server::RunnerProgramResult {
@@ -274,7 +271,10 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
         .context("fresh daemon watch did not remain live after callback")?
         .context("fresh daemon watch closed after callback")??;
     anyhow::ensure!(
-        matches!(watched_event, crate::brain::store::BrainWireMessage::Event { .. }),
+        matches!(
+            watched_event,
+            crate::brain::store::BrainWireMessage::Event { .. }
+        ),
         "fresh daemon watch did not publish the callback-backed program"
     );
 
@@ -355,8 +355,14 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
     let crate::cli::repl_event::ReplEvent::NamedBrainProgramRequested(request) = request else {
         anyhow::bail!("restored callback delivered the wrong request");
     };
-    anyhow::ensure!(request.brain == brain, "restored callback targeted the home Brain");
-    anyhow::ensure!(request.brain != home_brain, "handoff target collapsed to session home");
+    anyhow::ensure!(
+        request.brain == brain,
+        "restored callback targeted the home Brain"
+    );
+    anyhow::ensure!(
+        request.brain != home_brain,
+        "handoff target collapsed to session home"
+    );
     request
         .response_tx
         .send(Ok(crate::server::RunnerProgramResult {
@@ -371,10 +377,13 @@ async fn verify_fresh_brain_bootstrap(client: &crate::ipc::IpcClient) -> Result<
         .context("restored handed-off submission did not complete")??
         .context("restored handed-off submission failed")?;
     anyhow::ensure!(
-        restored_outcome.result.as_ref().is_some_and(|event| matches!(
-            &event.kind,
-            crate::brain::store::BrainEventKind::Result { error: None, .. }
-        )),
+        restored_outcome
+            .result
+            .as_ref()
+            .is_some_and(|event| matches!(
+                &event.kind,
+                crate::brain::store::BrainEventKind::Result { error: None, .. }
+            )),
         "restored handed-off run was rejected"
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);

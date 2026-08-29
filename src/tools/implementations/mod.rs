@@ -96,8 +96,8 @@ pub use memory_tools::{CreateMemoryTool, InspectMemoryTool, ListRecentTool, Sear
 pub use vocabulary_tools::{InspectProgramTool, SearchVocabularyTool};
 
 pub use program::{
-    GetLanguageDefinitionTool, GetVmStateTool, InspectVmWordTool, InspectWordTool, SearchVmVocabularyTool,
-    SearchWordTool, SubmitProgramTool,
+    GetLanguageDefinitionTool, GetVmStateTool, InspectVmWordTool, InspectWordTool,
+    SearchVmVocabularyTool, SearchWordTool, SubmitProgramTool,
 };
 
 pub use agent::{AgentAwaitTool, AgentCancelTool, AgentPollTool, AgentSpawnTool};

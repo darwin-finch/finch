@@ -677,9 +677,8 @@ impl IpcClient {
             .map_err(map_runner_registration_error)?;
         let response = reply.get()?;
         let control: brain_runner_control::Client = response.get_control()?;
-        let (subagent_control, mut subagent_rx) = mpsc::unbounded_channel::<
-            crate::runtime::scheduler::AgentBrainControlRequest,
-        >();
+        let (subagent_control, mut subagent_rx) =
+            mpsc::unbounded_channel::<crate::runtime::scheduler::AgentBrainControlRequest>();
         tokio::task::spawn_local(async move {
             while let Some(request) = subagent_rx.recv().await {
                 match request {
@@ -716,9 +715,9 @@ impl IpcClient {
                             {
                                 let mut params = call.get();
                                 params.set_run_id(&run_id.0.to_string());
-                                params.set_status(
-                                    crate::ipc::brain_codec::run_status_to_capnp(status),
-                                );
+                                params.set_status(crate::ipc::brain_codec::run_status_to_capnp(
+                                    status,
+                                ));
                                 params.set_detail(&detail);
                             }
                             let reply = call.send().promise.await?;
@@ -848,9 +847,8 @@ impl brain_runner::Server for BrainRunnerImpl {
             Ok(control) => control,
             Err(error) => return Promise::err(error),
         };
-        let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<
-            crate::server::RunnerProgramControlRequest,
-        >();
+        let (control_tx, mut control_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::server::RunnerProgramControlRequest>();
         tokio::task::spawn_local(async move {
             while let Some(request) = control_rx.recv().await {
                 match request {
@@ -947,9 +945,7 @@ impl brain_runner::Server for BrainRunnerImpl {
                         let result = async {
                             let mut call = control.cancel_schedule_request();
                             call.get().set_schedule_id(&schedule_id.0.to_string());
-                            Ok::<_, capnp::Error>(
-                                call.send().promise.await?.get()?.get_cancelled(),
-                            )
+                            Ok::<_, capnp::Error>(call.send().promise.await?.get()?.get_cancelled())
                         }
                         .await
                         .map_err(|error| error.to_string());
@@ -1194,13 +1190,15 @@ impl brain_runner::Server for BrainRunnerImpl {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if self
             .event_tx
-            .send(crate::cli::repl_event::ReplEvent::NamedBrainRunCancelRequested(
-                crate::server::RunnerCancelRequest {
-                    brain,
-                    run_id,
-                    response_tx,
-                },
-            ))
+            .send(
+                crate::cli::repl_event::ReplEvent::NamedBrainRunCancelRequested(
+                    crate::server::RunnerCancelRequest {
+                        brain,
+                        run_id,
+                        response_tx,
+                    },
+                ),
+            )
             .is_err()
         {
             return Promise::err(capnp::Error::failed("frontend event loop stopped".into()));
@@ -1239,12 +1237,19 @@ impl brain_runner::Server for BrainRunnerImpl {
                 .map_err(anyhow::Error::new)
                 .and_then(|value| uuid::Uuid::parse_str(value).map_err(anyhow::Error::new))
         };
-        let brain_id = match request.get_brain_id().map_err(anyhow::Error::new).and_then(parse_uuid)
+        let brain_id = match request
+            .get_brain_id()
+            .map_err(anyhow::Error::new)
+            .and_then(parse_uuid)
         {
             Ok(value) => crate::brain::store::BrainId(value),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
-        let run_id = match request.get_run_id().map_err(anyhow::Error::new).and_then(parse_uuid) {
+        let run_id = match request
+            .get_run_id()
+            .map_err(anyhow::Error::new)
+            .and_then(parse_uuid)
+        {
             Ok(value) => crate::brain::store::RunId(value),
             Err(error) => return Promise::err(capnp::Error::failed(error.to_string())),
         };
@@ -1408,12 +1413,8 @@ fn attachment_role_to_capnp(
     role: crate::brain::store::AttachmentRole,
 ) -> finch_ipc_capnp::BrainAttachmentRole {
     match role {
-        crate::brain::store::AttachmentRole::Runner => {
-            finch_ipc_capnp::BrainAttachmentRole::Runner
-        }
-        crate::brain::store::AttachmentRole::Driver => {
-            finch_ipc_capnp::BrainAttachmentRole::Driver
-        }
+        crate::brain::store::AttachmentRole::Runner => finch_ipc_capnp::BrainAttachmentRole::Runner,
+        crate::brain::store::AttachmentRole::Driver => finch_ipc_capnp::BrainAttachmentRole::Driver,
         crate::brain::store::AttachmentRole::Consultant => {
             finch_ipc_capnp::BrainAttachmentRole::Consultant
         }
@@ -1516,9 +1517,7 @@ fn decode_stream_response_metadata(
     })
 }
 
-fn decode_unknown_stream_chunk(
-    _error: capnp::NotInSchema,
-) -> Option<anyhow::Result<StreamChunk>> {
+fn decode_unknown_stream_chunk(_error: capnp::NotInSchema) -> Option<anyhow::Result<StreamChunk>> {
     // Stream metadata is additive. Older clients ignore newer union members
     // while continuing to decode the text/tool/usage chunks they understand.
     None
@@ -1747,14 +1746,12 @@ mod tests {
             .get_root_as_reader::<finch_ipc_capnp::stream_chunk::Reader<'_>>()
             .unwrap();
         let model = match reader.which().unwrap() {
-            Which::ResponseMetadata(metadata) => match decode_stream_response_metadata(
-                metadata.unwrap(),
-            )
-            .unwrap()
-            {
-                StreamChunk::ResponseMetadata { model } => model,
-                _ => panic!("expected response metadata"),
-            },
+            Which::ResponseMetadata(metadata) => {
+                match decode_stream_response_metadata(metadata.unwrap()).unwrap() {
+                    StreamChunk::ResponseMetadata { model } => model,
+                    _ => panic!("expected response metadata"),
+                }
+            }
             _ => panic!("expected response metadata"),
         };
         assert_eq!(model, "gpt-5.6-sol-served");
@@ -1780,9 +1777,8 @@ mod tests {
     }
 
     struct BlockingBrainRunner {
-        started: std::cell::RefCell<
-            Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>,
-        >,
+        started:
+            std::cell::RefCell<Option<tokio::sync::oneshot::Sender<crate::brain::store::RunId>>>,
         cancellations: std::rc::Rc<
             std::cell::RefCell<
                 std::collections::HashMap<
@@ -1913,13 +1909,7 @@ mod tests {
             let subject = format!("smoke@localhost/frontend-{}", uuid::Uuid::new_v4());
             client.brain_claim_runner_identity(&subject).await.unwrap();
             let lease = client
-                .brain_acquire_runner(
-                    &brain,
-                    &subject,
-                    &snapshot.environment,
-                    None,
-                    30_000,
-                )
+                .brain_acquire_runner(&brain, &subject, &snapshot.environment, None, 30_000)
                 .await
                 .unwrap();
             let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2213,10 +2203,17 @@ mod tests {
             let outcome = submission.await.unwrap().unwrap();
             assert_eq!(outcome.run.unwrap().run_id, run_id);
             assert_eq!(
-                client.brain_inspect_run(&brain, run_id).await.unwrap().status,
+                client
+                    .brain_inspect_run(&brain, run_id)
+                    .await
+                    .unwrap()
+                    .status,
                 crate::brain::store::BrainRunStatus::Cancelled
             );
-            client.brain_release_runner(&brain, lease.lease_id).await.unwrap();
+            client
+                .brain_release_runner(&brain, lease.lease_id)
+                .await
+                .unwrap();
             client.brain_detach(&brain, &attachment).await.unwrap();
         }));
     }
@@ -2239,13 +2236,7 @@ mod tests {
             owner.brain_claim_runner_identity(subject).await.unwrap();
             assert!(intruder.brain_claim_runner_identity(subject).await.is_err());
             let lease = owner
-                .brain_acquire_runner(
-                    &brain,
-                    subject,
-                    &snapshot.environment,
-                    None,
-                    60_000,
-                )
+                .brain_acquire_runner(&brain, subject, &snapshot.environment, None, 60_000)
                 .await
                 .unwrap();
 
@@ -2298,14 +2289,12 @@ mod tests {
                 .await
                 .unwrap();
             let mut owner_watch = owner.brain_watch(&brain, &attachment).await.unwrap();
-            let initial = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                owner_watch.recv(),
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            let initial =
+                tokio::time::timeout(std::time::Duration::from_secs(2), owner_watch.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
             assert!(matches!(
                 initial,
                 crate::brain::store::BrainWireMessage::Snapshot { .. }
@@ -2327,13 +2316,11 @@ mod tests {
                 .is_err());
             assert!(intruder.brain_detach(&brain, &attachment).await.is_err());
             let mut forged_watch = intruder.brain_watch(&brain, &attachment).await.unwrap();
-            let watch_error = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                forged_watch.recv(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            let watch_error =
+                tokio::time::timeout(std::time::Duration::from_secs(2), forged_watch.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
             assert!(watch_error.is_err());
 
             let accepted = owner

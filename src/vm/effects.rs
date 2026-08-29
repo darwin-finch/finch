@@ -251,8 +251,7 @@ impl McpSelectorTemplate {
         &self,
         arguments: &[super::types::TypedValue],
     ) -> Result<(String, String), SelectorError> {
-        let Some(super::types::TypedValue::String(server)) =
-            arguments.get(self.server_argument)
+        let Some(super::types::TypedValue::String(server)) = arguments.get(self.server_argument)
         else {
             return Err(SelectorError::InvalidMcpTemplateArgument(
                 self.server_argument,
@@ -762,10 +761,7 @@ impl CapabilityRequirement {
                             .all(|server| server == grant_server)))
                     && (grant_tool == "*"
                         || (!template.allowed_tools.is_empty()
-                            && template
-                                .allowed_tools
-                                .iter()
-                                .all(|tool| tool == grant_tool)))
+                            && template.allowed_tools.iter().all(|tool| tool == grant_tool)))
             }
             (
                 ResourceSelector::McpTemplate { template: grant },

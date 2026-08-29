@@ -170,9 +170,8 @@ impl ToolExecutionCoordinator {
         // append to the owning generation WorkUnit instead. Neither route uses a
         // process-global "current output" target.
         let program = tool_use.name == "submit_program";
-        let vm_output = program.then(|| {
-            VmOutputProjection::new(Arc::clone(&output_manager), Arc::clone(&work_unit))
-        });
+        let vm_output = program
+            .then(|| VmOutputProjection::new(Arc::clone(&output_manager), Arc::clone(&work_unit)));
         let live_output: LiveOutput = Arc::new(WorkUnitPresentation {
             work_unit: Arc::clone(&work_unit),
             row_idx,
@@ -293,16 +292,16 @@ impl ToolExecutionCoordinator {
             let timeout_duration = tool_executor.lock().await.execution_timeout(&tool_use.name);
             let executor = tool_executor.lock().await;
             let execute = executor.execute_tool::<fn() -> anyhow::Result<()>>(
-                    &tool_use,
-                    Some(&conversation_snapshot),
-                    None, // save_fn (not needed in event loop)
-                    None, // router (for training)
-                    Some(Arc::clone(&local_generator)),
-                    Some(Arc::clone(&tokenizer)),
-                    Some(Arc::clone(&repl_mode)),
-                    Some(Arc::clone(&plan_content)),
-                    Some(Arc::clone(&live_output)),
-                );
+                &tool_use,
+                Some(&conversation_snapshot),
+                None, // save_fn (not needed in event loop)
+                None, // router (for training)
+                Some(Arc::clone(&local_generator)),
+                Some(Arc::clone(&tokenizer)),
+                Some(Arc::clone(&repl_mode)),
+                Some(Arc::clone(&plan_content)),
+                Some(Arc::clone(&live_output)),
+            );
             let result = match timeout_duration {
                 Some(timeout) => tokio::time::timeout(timeout, execute).await,
                 None => Ok(execute.await),

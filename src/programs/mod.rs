@@ -54,10 +54,7 @@ pub fn wire_diagnostic_code(diagnostic: &str) -> Option<String> {
 
 /// Classify a rejected provider submission for aggregate conformance metrics.
 /// This intentionally never stores the submitted source or diagnostic text.
-pub fn classify_wire_failure(
-    source: &str,
-    diagnostic: &str,
-) -> crate::metrics::WireFailureClass {
+pub fn classify_wire_failure(source: &str, diagnostic: &str) -> crate::metrics::WireFailureClass {
     use crate::metrics::WireFailureClass;
 
     let trimmed = source.trim_start();

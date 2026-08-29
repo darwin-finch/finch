@@ -212,13 +212,14 @@ fn model_catalog_profile(
             models_path.as_deref().unwrap_or("/v1/models"),
             CatalogAuth::Bearer,
         ),
-        ("openai", persisted)
-            if !matches!(persisted, Some(ProviderEntry::Credentialed { .. })) => (
-            "https://api.openai.com",
-            "/v1/chat/completions",
-            "/v1/models",
-            CatalogAuth::Bearer,
-        ),
+        ("openai", persisted) if !matches!(persisted, Some(ProviderEntry::Credentialed { .. })) => {
+            (
+                "https://api.openai.com",
+                "/v1/chat/completions",
+                "/v1/models",
+                CatalogAuth::Bearer,
+            )
+        }
         (
             "openai" | "grok" | "mistral" | "groq",
             Some(ProviderEntry::Credentialed {
@@ -229,10 +230,22 @@ fn model_catalog_profile(
             }),
         ) => {
             let (default_base, default_chat, default_models) = match provider {
-                "openai" => ("https://api.openai.com", "/v1/chat/completions", "/v1/models"),
+                "openai" => (
+                    "https://api.openai.com",
+                    "/v1/chat/completions",
+                    "/v1/models",
+                ),
                 "grok" => ("https://api.x.ai", "/v1/chat/completions", "/v1/models"),
-                "mistral" => ("https://api.mistral.ai", "/v1/chat/completions", "/v1/models"),
-                "groq" => ("https://api.groq.com/openai", "/v1/chat/completions", "/v1/models"),
+                "mistral" => (
+                    "https://api.mistral.ai",
+                    "/v1/chat/completions",
+                    "/v1/models",
+                ),
+                "groq" => (
+                    "https://api.groq.com/openai",
+                    "/v1/chat/completions",
+                    "/v1/models",
+                ),
                 _ => unreachable!("match pattern limits provider"),
             };
             (
@@ -727,9 +740,9 @@ fn named_catalog_refresh_config(
                     model,
                     persisted.as_ref(),
                 )),
-                ModelConfig::Local { persisted, enabled, .. } if index == 0 || *enabled => {
-                    persisted.clone()
-                }
+                ModelConfig::Local {
+                    persisted, enabled, ..
+                } if index == 0 || *enabled => persisted.clone(),
                 _ => None,
             }
         })
@@ -6524,7 +6537,11 @@ mod tests {
             &selected,
             vec![credential.clone()],
         );
-        assert!(config.validate().unwrap_err().to_string().contains("missing"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("missing"));
 
         let valid = named_catalog_refresh_config(&primary, &[], 0, &selected, vec![credential]);
         valid.validate().unwrap();

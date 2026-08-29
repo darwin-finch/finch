@@ -12,7 +12,9 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "record", rename_all = "snake_case")]
 enum EffectLogRecord {
-    Effect { envelope: VmEffectEnvelope },
+    Effect {
+        envelope: VmEffectEnvelope,
+    },
     Acknowledged {
         consumer: String,
         execution_id: Uuid,
@@ -34,8 +36,9 @@ impl VmEffectDeliveryLog {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create VM effect-log directory '{}'", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("create VM effect-log directory '{}'", parent.display())
+            })?;
         }
         let mut effects = BTreeMap::new();
         let mut acknowledgements = HashMap::new();
@@ -52,7 +55,11 @@ impl VmEffectDeliveryLog {
                     continue;
                 }
                 let record: EffectLogRecord = serde_json::from_str(&line).with_context(|| {
-                    format!("decode VM effect log '{}' line {}", path.display(), index + 1)
+                    format!(
+                        "decode VM effect log '{}' line {}",
+                        path.display(),
+                        index + 1
+                    )
                 })?;
                 apply_record(&mut effects, &mut acknowledgements, record)?;
             }
@@ -229,10 +236,16 @@ mod tests {
         }
 
         let log = VmEffectDeliveryLog::open(&path).unwrap();
-        assert_eq!(log.pending("client-a"), vec![effect(execution_id, 1, "two")]);
+        assert_eq!(
+            log.pending("client-a"),
+            vec![effect(execution_id, 1, "two")]
+        );
         assert_eq!(
             log.pending("client-b"),
-            vec![effect(execution_id, 0, "one"), effect(execution_id, 1, "two")]
+            vec![
+                effect(execution_id, 0, "one"),
+                effect(execution_id, 1, "two")
+            ]
         );
     }
 

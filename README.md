@@ -10,9 +10,11 @@ ready. See [Current limitations](#current-limitations) before relying on it.
 
 ## Quick start from source
 
-The most reliable way to try the current code is to build a clean checkout. Supported CI targets
-are Apple Silicon macOS and x86-64 Linux. Install the stable Rust toolchain, Git, and the Cap'n Proto
-compiler first.
+The most reliable way to try the current code is to build a clean checkout. Release artifacts and
+runtime CI target Apple Silicon macOS and x86-64 Linux. The primary Windows CI contract checks the
+pinned Rust 1.98.0 rustfmt result; narrowly scoped component probes may compile selected portable
+sources, but neither constitutes Windows Finch runtime support. Install Rustup, Git, and the Cap'n
+Proto compiler first; the checkout selects that pinned toolchain.
 
 macOS (Apple Silicon):
 
@@ -201,6 +203,9 @@ implemented behavior unless current source or tests say so.
 ## Development
 
 After installing the prerequisites from [Quick start from source](#quick-start-from-source):
+
+Source builds use the repository-pinned Rust 1.98.0 toolchain. See
+[`docs/RUST_TOOLCHAIN.md`](docs/RUST_TOOLCHAIN.md) for the tested-toolchain and MSRV policy.
 
 ```bash
 cargo fmt --all -- --check
