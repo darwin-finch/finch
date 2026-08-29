@@ -511,10 +511,7 @@ where
                 _ = tokio::time::sleep(interval) => {}
             }
             let request = self.dialect.device_poll_request(pending)?;
-            let response = tokio::select! {
-                _ = cancel.cancelled() => bail!("OAuth device authorization was cancelled"),
-                response = self.post_form(request) => response?,
-            };
+            let response = self.post_device_request(request, &cancel, deadline).await?;
             let tokens = match self.dialect.parse_device_poll(response.0, response.1)? {
                 DevicePoll::Pending => continue,
                 DevicePoll::SlowDown => {
@@ -533,7 +530,8 @@ where
                 )?,
                 DevicePoll::AuthorizationCode(grant) => {
                     let request = self.dialect.authorization_code_request(&grant)?;
-                    let (status, body) = self.post_form(request).await?;
+                    let (status, body) =
+                        self.post_device_request(request, &cancel, deadline).await?;
                     self.dialect.validate_tokens(
                         status,
                         body,
@@ -543,6 +541,7 @@ where
                 }
             };
             self.validate_record(&tokens, None)?;
+            ensure_device_authorization_active(&cancel, deadline)?;
             self.store
                 .compare_and_swap(reference, replacement_generation.as_deref(), &tokens)?;
             return Ok(tokens.provider_credential(reference));
@@ -846,6 +845,34 @@ where
         .await
         .context("OAuth request timed out")?
     }
+
+    async fn post_device_request(
+        &self,
+        request: OAuthHttpRequest,
+        cancel: &CancellationToken,
+        deadline: tokio::time::Instant,
+    ) -> Result<(StatusCode, Value)> {
+        ensure_device_authorization_active(cancel, deadline)?;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("OAuth device authorization was cancelled"),
+            _ = tokio::time::sleep_until(deadline) => bail!("OAuth device authorization expired"),
+            response = self.post_form(request) => response,
+        }
+    }
+}
+
+fn ensure_device_authorization_active(
+    cancel: &CancellationToken,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    if cancel.is_cancelled() {
+        bail!("OAuth device authorization was cancelled");
+    }
+    if tokio::time::Instant::now() >= deadline {
+        bail!("OAuth device authorization expired");
+    }
+    Ok(())
 }
 
 fn record_matches_descriptor(

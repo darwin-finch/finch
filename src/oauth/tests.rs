@@ -245,6 +245,13 @@ impl OAuthDialect for SyntheticDialect {
     }
 
     fn parse_device_poll(&self, status: StatusCode, body: Value) -> Result<DevicePoll> {
+        if let Some(code) = body.get("authorization_code").and_then(Value::as_str) {
+            return Ok(DevicePoll::AuthorizationCode(AuthorizationCodeGrant {
+                code: code.into(),
+                verifier: "device-verifier".into(),
+                redirect_uri: "http://127.0.0.1/device".into(),
+            }));
+        }
         if status.is_success() {
             return Ok(DevicePoll::Tokens(body));
         }
@@ -456,6 +463,61 @@ async fn device_denial_expiry_cancellation_and_timeout_are_terminal_without_pers
         .unwrap_err()
         .to_string()
         .contains("timed out"));
+    assert!(store.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn delayed_device_poll_and_code_exchange_cannot_persist_after_terminal_state() {
+    let server = FakeServer::start().await;
+    let dialect = Arc::new(SyntheticDialect::new(&server.origin, "alpha"));
+    let store = Arc::new(MemoryStore::default());
+    let client = OAuthClient::new(dialect, store.clone()).unwrap();
+    let mut pending = DeviceAuthorization {
+        device_code: "device-secret".into(),
+        user_code: "ABCD-EFGH".into(),
+        verification_uri: "https://login.example/alpha/verify".into(),
+        verification_uri_complete: None,
+        expires_in: Duration::from_millis(30),
+        interval: Duration::ZERO,
+    };
+    server.push_delayed(
+        "/alpha/poll",
+        StatusCode::OK,
+        token_body("alpha", "account-one", "refresh-one"),
+        Duration::from_millis(100),
+    );
+    assert!(client
+        .finish_device_authorization("chatgpt:expired", &pending, CancellationToken::new())
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("expired"));
+    assert!(store.0.lock().unwrap().is_empty());
+
+    server.push(
+        "/alpha/poll",
+        StatusCode::OK,
+        json!({"authorization_code": "code-secret"}),
+    );
+    server.push_delayed(
+        "/alpha/token",
+        StatusCode::OK,
+        token_body("alpha", "account-one", "refresh-two"),
+        Duration::from_millis(100),
+    );
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        trigger.cancel();
+    });
+    pending.expires_in = Duration::from_secs(2);
+    assert!(client
+        .finish_device_authorization("chatgpt:cancelled", &pending, cancel)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("cancelled"));
     assert!(store.0.lock().unwrap().is_empty());
 }
 
