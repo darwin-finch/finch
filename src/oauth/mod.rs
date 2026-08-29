@@ -28,6 +28,12 @@ use crate::config::{
 
 const MAX_AUTH_BODY_BYTES: usize = 64 * 1024;
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const RFC8628_DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const MIN_POLL_INTERVAL: Duration = RFC8628_DEFAULT_POLL_INTERVAL;
+// Deterministic fake-server tests retain the same clamp path without waiting
+// five wall-clock seconds between every scripted response.
+#[cfg(test)]
 const MIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(not(test))]
 const SLOW_DOWN_STEP: Duration = Duration::from_secs(5);
@@ -495,7 +501,7 @@ where
             );
         }
         let deadline = tokio::time::Instant::now() + pending.expires_in;
-        let mut interval = pending.interval.clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL);
+        let mut interval = bounded_poll_interval(pending.interval);
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => bail!("OAuth device authorization was cancelled"),
@@ -803,6 +809,10 @@ where
         .await
         .context("OAuth request timed out")?
     }
+}
+
+fn bounded_poll_interval(advertised: Duration) -> Duration {
+    advertised.clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL)
 }
 
 async fn read_bounded(response: reqwest::Response, maximum: usize) -> Result<Vec<u8>> {

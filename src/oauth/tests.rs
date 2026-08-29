@@ -108,6 +108,20 @@ impl Drop for FakeServer {
     }
 }
 
+#[test]
+fn zero_and_tiny_device_intervals_are_clamped_to_a_safe_floor() {
+    assert_eq!(RFC8628_DEFAULT_POLL_INTERVAL, Duration::from_secs(5));
+    assert_eq!(bounded_poll_interval(Duration::ZERO), MIN_POLL_INTERVAL);
+    assert_eq!(
+        bounded_poll_interval(Duration::from_nanos(1)),
+        MIN_POLL_INTERVAL
+    );
+    assert_eq!(
+        bounded_poll_interval(MAX_POLL_INTERVAL + Duration::from_secs(1)),
+        MAX_POLL_INTERVAL
+    );
+}
+
 async fn fake_handler(State(state): State<Arc<FakeState>>, request: Request) -> Response<Body> {
     let path = request.uri().path().to_string();
     let bytes = axum::body::to_bytes(request.into_body(), MAX_AUTH_BODY_BYTES + 1)
