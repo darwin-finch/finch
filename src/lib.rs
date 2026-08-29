@@ -80,7 +80,7 @@ pub mod generators; // Unified generator interface
 pub mod graph; // Execution graph — causal trace of query turns
 pub mod ipc; // Cap'n Proto IPC layer (CLI ↔ daemon over Unix socket)
 pub mod license;
-pub mod lisp; // Scheme-flavoured Lisp dialect with async SSH + crypto
+pub mod lisp; // Scheme-flavoured Lisp dialect and crypto primitives
 pub mod llms; // Generic LLM abstraction (Phase 1)
 pub mod local; // Local generation system
 pub mod logging; // Conversation logging for LoRA training
@@ -103,7 +103,6 @@ pub mod runtime; // Provider-neutral Forth/Lisp execution and capabilities
 pub mod samples; // Sample spreadsheet generator (finch samples)
 pub mod server; // HTTP daemon mode (Phase 1)
 pub mod service; // Service discovery (Phase 3)
-pub mod ssh; // SSH client (russh) — sessions referenced from Lisp
 pub mod tools; // Tool execution system
 pub mod training; // Batch training and checkpoints (Phase 2) // Offline Ed25519 commercial license key validation
 pub mod vm; // Typed stack IR, verifier, capabilities, and language contracts
