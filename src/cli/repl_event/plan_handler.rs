@@ -296,7 +296,10 @@ pub(crate) async fn handle_ask_user_question(
     event_tx: &mpsc::UnboundedSender<ReplEvent>,
 ) -> Option<Result<String>> {
     // Accept the canonical wire name and the dispatch-only legacy spelling.
-    if !matches!(tool_use.name.as_str(), "ask_user_question" | "AskUserQuestion") {
+    if !matches!(
+        tool_use.name.as_str(),
+        "ask_user_question" | "AskUserQuestion"
+    ) {
         return None;
     }
 

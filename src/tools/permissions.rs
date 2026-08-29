@@ -852,10 +852,7 @@ mod tests {
         let manager = PermissionManager::new();
         for effect in ["pure", "workspace_write", "destructive", "invented"] {
             assert!(matches!(
-                manager.check_tool_use(
-                    "submit_program",
-                    &serde_json::json!({"effect": effect})
-                ),
+                manager.check_tool_use("submit_program", &serde_json::json!({"effect": effect})),
                 PermissionCheck::Allow
             ));
         }

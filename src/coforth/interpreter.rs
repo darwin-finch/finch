@@ -518,9 +518,7 @@ fn builtin_effect(b: Builtin) -> Option<StackEffect> {
         | LeaveRegistry | RegisterBoot | RegistrySet => StackEffect::new(1, 0),
         // Misc
         StrLen | WordCount | SentenceCheck | WordDefined | IsPrime | Safe | ArgOk | FileSize
-        | GlobCount | ScanBytes | FileEntropy | StrToNum => {
-            StackEffect::new(1, 1)
-        }
+        | GlobCount | ScanBytes | FileEntropy | StrToNum => StackEffect::new(1, 1),
         StrSub => StackEffect::new(3, 1),
         NthLine => StackEffect::new(2, 1),
         SlashMod => StackEffect::new(2, 2),
@@ -14593,11 +14591,20 @@ mod channel_tests {
     fn builtin_effects_match_stack_transforming_words() {
         assert_eq!(builtin_effect(Builtin::Over), Some(StackEffect::new(2, 3)));
         assert_eq!(builtin_effect(Builtin::Tuck), Some(StackEffect::new(2, 3)));
-        assert_eq!(builtin_effect(Builtin::TwoOver), Some(StackEffect::new(4, 6)));
+        assert_eq!(
+            builtin_effect(Builtin::TwoOver),
+            Some(StackEffect::new(4, 6))
+        );
         assert_eq!(builtin_effect(Builtin::Store), Some(StackEffect::new(2, 0)));
-        assert_eq!(builtin_effect(Builtin::FileWrite), Some(StackEffect::new(2, 0)));
+        assert_eq!(
+            builtin_effect(Builtin::FileWrite),
+            Some(StackEffect::new(2, 0))
+        );
         assert_eq!(builtin_effect(Builtin::Cr), Some(StackEffect::new(0, 0)));
-        assert_eq!(builtin_effect(Builtin::PrintS), Some(StackEffect::new(0, 0)));
+        assert_eq!(
+            builtin_effect(Builtin::PrintS),
+            Some(StackEffect::new(0, 0))
+        );
     }
 
     #[test]
@@ -14636,10 +14643,7 @@ mod channel_tests {
     fn test_prove_effect_word_formats_correctly() {
         let out = Forth::run(r#"s" 2 3 +" prove-effect type"#).unwrap();
         let compact = out.split_whitespace().collect::<String>();
-        assert!(
-            compact == "(--a)",
-            "got: {out}"
-        );
+        assert!(compact == "(--a)", "got: {out}");
     }
 
     #[test]

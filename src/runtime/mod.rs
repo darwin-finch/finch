@@ -627,10 +627,7 @@ impl ProgramRuntime {
         Self::with_automation_in_workspace(enabled, workspace_root)
     }
 
-    pub(crate) fn with_automation_in_workspace(
-        enabled: bool,
-        workspace_root: PathBuf,
-    ) -> Self {
+    pub(crate) fn with_automation_in_workspace(enabled: bool, workspace_root: PathBuf) -> Self {
         let automation = Arc::new(AutomationBroker::new(enabled));
         let typed_runtime = TypedRuntime::new();
         let checkpoint = typed_runtime

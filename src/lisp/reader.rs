@@ -287,9 +287,7 @@ fn json_value_to_syntax(value: serde_json::Value) -> Val {
         serde_json::Value::Object(values) => Val::List(
             values
                 .into_iter()
-                .map(|(key, value)| {
-                    Val::List(vec![Val::Str(key), json_value_to_syntax(value)])
-                })
+                .map(|(key, value)| Val::List(vec![Val::Str(key), json_value_to_syntax(value)]))
                 .collect(),
         ),
     }
@@ -783,7 +781,10 @@ fn scan_form(source: &str, start: usize) -> Option<SyntaxForm> {
 
 fn scan_compact_braced_type(source: &str, start: usize) -> Option<usize> {
     let remainder = source.get(start..)?;
-    if !["record{", "variant{"].iter().any(|prefix| remainder.starts_with(prefix)) {
+    if !["record{", "variant{"]
+        .iter()
+        .any(|prefix| remainder.starts_with(prefix))
+    {
         return None;
     }
     let mut depth = 0usize;
@@ -1104,10 +1105,7 @@ mod tests {
             parse1("{\"name\": \"Ada\"}"),
             json_value_to_syntax(serde_json::json!({"name": "Ada"}))
         );
-        assert_eq!(
-            parse1("{}"),
-            json_value_to_syntax(serde_json::json!({}))
-        );
+        assert_eq!(parse1("{}"), json_value_to_syntax(serde_json::json!({})));
         let spanned = parse_str_spanned("{ :name \"Ada\" :age 37 }").unwrap();
         assert_eq!(spanned[0].children.len(), 3);
         assert_eq!(spanned[0].children[1].children.len(), 2);
@@ -1133,7 +1131,10 @@ mod tests {
         );
         let spanned = parse_str_spanned("(define (example) : result<int,string> (ok 1))")
             .expect("generic type annotation parses");
-        assert_eq!(spanned[0].children[3].value, Val::Symbol("result<int,string>".into()));
+        assert_eq!(
+            spanned[0].children[3].value,
+            Val::Symbol("result<int,string>".into())
+        );
     }
 
     #[test]
@@ -1230,8 +1231,14 @@ mod tests {
         );
 
         let spanned = parse_str_spanned(source).unwrap();
-        assert_eq!(&source[spanned[0].span.clone()], "record{name:string,meta:map<string,list<int>>}");
-        assert_eq!(&source[spanned[1].span.clone()], "variant{none|some(int)|metadata(record{name:string})}");
+        assert_eq!(
+            &source[spanned[0].span.clone()],
+            "record{name:string,meta:map<string,list<int>>}"
+        );
+        assert_eq!(
+            &source[spanned[1].span.clone()],
+            "variant{none|some(int)|metadata(record{name:string})}"
+        );
     }
 
     #[test]

@@ -724,8 +724,7 @@ mod tests {
 
             let output = String::from_utf8(control.output.lock().unwrap().clone()).unwrap();
             let child_started = !matches!(outcome, Outcome::LaunchError);
-            let child_left_screen =
-                !matches!(outcome, Outcome::LaunchError | Outcome::Signal);
+            let child_left_screen = !matches!(outcome, Outcome::LaunchError | Outcome::Signal);
             assert_eq!(
                 output.matches("\x1b[?1049h").count(),
                 1 + usize::from(child_started)
@@ -809,7 +808,10 @@ mod tests {
     #[test]
     fn empty_or_comment_only_proposal_is_rejected() {
         assert_eq!(parse_proposal_decision(""), ProposalDecision::Cancel);
-        assert_eq!(parse_proposal_decision("  \n\t\n"), ProposalDecision::Cancel);
+        assert_eq!(
+            parse_proposal_decision("  \n\t\n"),
+            ProposalDecision::Cancel
+        );
         assert_eq!(
             parse_proposal_decision(
                 "# Finch proposal: delete the source to reject\n# finch: action=execute\n"

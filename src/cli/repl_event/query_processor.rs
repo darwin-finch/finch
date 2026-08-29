@@ -443,8 +443,7 @@ async fn execute_wire_with_single_repair(
             metric.repaired_successfully = !outcome.output.is_empty();
             metric.terminal_failure = outcome.output.is_empty();
             if outcome.output.is_empty() {
-                metric.failure_class =
-                    Some(crate::metrics::WireFailureClass::MissingOutputEffect);
+                metric.failure_class = Some(crate::metrics::WireFailureClass::MissingOutputEffect);
             }
             record_wire_metric(metrics_logger, &metric);
             let _ = event_tx.send(ReplEvent::VmOutputComplete {
@@ -645,14 +644,7 @@ async fn persist_completed_turn_memory(
         crate::cli::status_bar::StatusLineType::MemoryContext,
         format!("🧠 recalled {memory_recall_count}"),
     );
-    refresh_context_strip(
-        memory_system,
-        session_label,
-        cwd,
-        status_bar,
-        context_lines,
-    )
-    .await;
+    refresh_context_strip(memory_system, session_label, cwd, status_bar, context_lines).await;
 }
 
 /// Dispatch a batch of tool uses for one query turn.
@@ -1538,10 +1530,9 @@ pub(crate) fn apply_sliding_window(
         .rev()
         .find(|message| {
             message.role == "user"
-                && message
-                    .content
-                    .iter()
-                    .any(|block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()))
+                && message.content.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()),
+                )
                 && !message
                     .content
                     .iter()
@@ -1701,7 +1692,10 @@ mod tests {
 
         assert_eq!(original.len(), 1, "canonical conversation was not mutated");
         assert_eq!(
-            request.iter().filter(|message| message.role == "system").count(),
+            request
+                .iter()
+                .filter(|message| message.role == "system")
+                .count(),
             1
         );
         let system = request[0].text_content();
@@ -1795,14 +1789,17 @@ mod tests {
             .write()
             .await
             .add_user_message("original prompt".into());
-        conversation.write().await.add_message(crate::claude::Message {
-            role: "user".into(),
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: "tool-1".into(),
-                content: "transient tool output".into(),
-                is_error: None,
-            }],
-        });
+        conversation
+            .write()
+            .await
+            .add_message(crate::claude::Message {
+                role: "user".into(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool-1".into(),
+                    content: "transient tool output".into(),
+                    is_error: None,
+                }],
+            });
         let query_states = QueryStateManager::new();
         let query_id = query_states
             .create_query(conversation.read().await.get_messages())
@@ -1841,7 +1838,9 @@ mod tests {
         let recent = memory.get_recent_conversations(10).await.unwrap();
         assert!(!recent.iter().any(|(_, text)| text == "original prompt"));
         assert!(!recent.iter().any(|(_, text)| text == "(say \"done\")"));
-        assert!(!recent.iter().any(|(_, text)| text == "transient tool output"));
+        assert!(!recent
+            .iter()
+            .any(|(_, text)| text == "transient tool output"));
     }
 
     struct SingleRepairGenerator {
@@ -2148,11 +2147,9 @@ mod tests {
                 crate::vm::FileSelector::parse("./**").unwrap(),
             ))
             .unwrap();
-        let submission = direct_wire_submission(
-            &runtime,
-            "(file-read (path \"Cargo.toml\"))".to_string(),
-        )
-        .unwrap();
+        let submission =
+            direct_wire_submission(&runtime, "(file-read (path \"Cargo.toml\"))".to_string())
+                .unwrap();
         let suspended = runtime
             .submit_typed_only_with_grant_ceiling(submission, crate::vm::EffectSet::pure())
             .await
@@ -2175,10 +2172,10 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(runtime.capability_ledger().unwrap().grants.grants.len(), 1);
-        assert!(denied.effect_journal.iter().any(|entry| matches!(
-            entry.state,
-            crate::vm::EffectJournalState::Denied { .. }
-        )));
+        assert!(denied
+            .effect_journal
+            .iter()
+            .any(|entry| matches!(entry.state, crate::vm::EffectJournalState::Denied { .. })));
     }
 
     #[test]

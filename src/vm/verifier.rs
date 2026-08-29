@@ -276,7 +276,11 @@ impl<'a> Verifier<'a> {
                 stack.truncate(start);
                 stack.push(Type::Record(fields.clone()));
             }
-            Instruction::MakeVariant { variants, tag, payload_type } => {
+            Instruction::MakeVariant {
+                variants,
+                tag,
+                payload_type,
+            } => {
                 let Some((_, expected_payload)) =
                     variants.iter().find(|(candidate, _)| candidate == tag)
                 else {
@@ -307,7 +311,11 @@ impl<'a> Verifier<'a> {
                 }
                 stack.push(Type::Variant(variants.clone()));
             }
-            Instruction::VariantGet { variants, tag, payload_type } => {
+            Instruction::VariantGet {
+                variants,
+                tag,
+                payload_type,
+            } => {
                 let found = stack.pop().ok_or_else(|| underflow(origin, 1, 0))?;
                 let expected = Type::Variant(variants.clone());
                 if found != expected {
@@ -614,12 +622,11 @@ impl<'a> Verifier<'a> {
                     ));
                 }
                 stack.push(Type::Resource("output-handle".into()));
-                *inferred_effects = inferred_effects.union(&EffectSet::from_requirement(
-                    CapabilityRequirement {
+                *inferred_effects =
+                    inferred_effects.union(&EffectSet::from_requirement(CapabilityRequirement {
                         capability: super::effects::CapabilityKind::SessionEmit,
                         selector: super::effects::ResourceSelector::None,
-                    },
-                ));
+                    }));
             }
             Instruction::UiEffect { input, output, .. } => {
                 let signature = StackSignature::pure(
@@ -627,12 +634,11 @@ impl<'a> Verifier<'a> {
                     StackRow::polymorphic("S", output.clone()),
                 );
                 apply_signature(&signature, stack, origin)?;
-                *inferred_effects = inferred_effects.union(&EffectSet::from_requirement(
-                    CapabilityRequirement {
+                *inferred_effects =
+                    inferred_effects.union(&EffectSet::from_requirement(CapabilityRequirement {
                         capability: super::effects::CapabilityKind::SessionEmit,
                         selector: super::effects::ResourceSelector::None,
-                    },
-                ));
+                    }));
             }
             Instruction::CapabilityRequest {
                 requirement,
@@ -761,8 +767,7 @@ impl<'a> Verifier<'a> {
                     ));
                 }
                 if let Some(suspension) = suspension {
-                    if *suspension.yield_type != Type::Unit
-                        || *suspension.resume_type != Type::Unit
+                    if *suspension.yield_type != Type::Unit || *suspension.resume_type != Type::Unit
                     {
                         return Err(VmDiagnostic::error(
                             "E-YIELD-003",
@@ -973,12 +978,13 @@ pub(crate) fn instantiate_signature_types(
         },
         effects: signature.effects.clone(),
         control: signature.control.clone(),
-        suspension: signature.suspension.as_ref().map(|suspension| {
-            SuspensionSignature {
+        suspension: signature
+            .suspension
+            .as_ref()
+            .map(|suspension| SuspensionSignature {
                 yield_type: Box::new(substitute(&suspension.yield_type, &substitutions)),
                 resume_type: Box::new(substitute(&suspension.resume_type, &substitutions)),
-            }
-        }),
+            }),
     })
 }
 
@@ -1022,10 +1028,7 @@ fn unify(
         | (Type::Stream(expected), Type::Stream(found)) => {
             unify(expected, found, substitutions, origin)
         }
-        (
-            Type::Fiber(expected_yield, expected_result),
-            Type::Fiber(found_yield, found_result),
-        ) => {
+        (Type::Fiber(expected_yield, expected_result), Type::Fiber(found_yield, found_result)) => {
             unify(expected_yield, found_yield, substitutions, origin)?;
             unify(expected_result, found_result, substitutions, origin)
         }

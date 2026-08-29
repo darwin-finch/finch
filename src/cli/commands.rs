@@ -34,7 +34,9 @@ pub enum Command {
     FeedbackMedium(Option<String>),   // 3x stored weight - improvements
     FeedbackGood(Option<String>),     // 1x stored weight - good examples
     // Local model testing
-    Local { query: String }, // Query local model directly (bypass routing)
+    Local {
+        query: String,
+    }, // Query local model directly (bypass routing)
     // MCP plugin management
     McpList,                  // List connected MCP servers
     McpTools(Option<String>), // List tools from specific server (or all if None)
@@ -53,29 +55,29 @@ pub enum Command {
     LicenseActivate(String), // /license activate <key>
     LicenseRemove,           // /license remove
     // Durable Brain sessions
-    Brains,                        // /brains — list named, detachable sessions
-    BrainRuns,                     // /brain runs — list runs in the attached Brain
-    BrainInitialize,               // /brain initialize — schedule reviewed initialization
-    BrainRunCancel(String),        // /brain cancel <run-id-prefix>
-    BrainSpeculate(String),        // /brain speculate <prompt>
-    BrainSay(String),              // /say <text> — relay without scheduling an LLM turn
-    BrainWho,                      // /who — list connected Brain participants
-    BrainWhois(String),            // /whois <subject> — inspect public Brain presence
-    BrainCreate(String),           // /brain create <name> (local daemon administration)
-    BrainArchive(String),          // /brain archive <name>
-    BrainAttach(String),           // /brain attach <name> (local IPC only)
+    Brains,                 // /brains — list named, detachable sessions
+    BrainRuns,              // /brain runs — list runs in the attached Brain
+    BrainInitialize,        // /brain initialize — schedule reviewed initialization
+    BrainRunCancel(String), // /brain cancel <run-id-prefix>
+    BrainSpeculate(String), // /brain speculate <prompt>
+    BrainSay(String),       // /say <text> — relay without scheduling an LLM turn
+    BrainWho,               // /who — list connected Brain participants
+    BrainWhois(String),     // /whois <subject> — inspect public Brain presence
+    BrainCreate(String),    // /brain create <name> (local daemon administration)
+    BrainArchive(String),   // /brain archive <name>
+    BrainAttach(String),    // /brain attach <name> (local IPC only)
     BrainJoin {
         target: String,
         invitation: String,
     }, // /brain join <name@machine[:port]> <invitation>
-    BrainJoinUsage,                  // incomplete /brain join
+    BrainJoinUsage,         // incomplete /brain join
     BrainInvite {
         role: String,
         ttl_minutes: Option<u64>,
     }, // /brain invite [role] [minutes]
-    BrainDetach,                   // /brain detach
-    BrainHandoff(String),          // /brain handoff <target-subject>
-    BrainHandoffIdentity,          // /brain handoff identity
+    BrainDetach,            // /brain detach
+    BrainHandoff(String),   // /brain handoff <target-subject>
+    BrainHandoffIdentity,   // /brain handoff identity
     BrainHandoffAccept(Option<String>), // /brain handoff accept [handoff-id]
     BrainHandoffCancel(Option<String>), // /brain handoff cancel [handoff-id]
     BrainPassword(Option<String>), // /brain password [new-password]
@@ -92,13 +94,13 @@ pub enum Command {
     StackView,         // /view             — switch panel to graph view (toggle)
     StackDemo,         // /demo             — seed an example language to play with
     // Special Forth vocabulary ops
-    StackChain(usize, usize),      // /chain W1 W2      — add edge W1 → W2
-    StackForget(usize),            // /forget W1        — remove word and AI descendants
-    StackDup(usize),               // /dup W1           — clone word as new entry
-    StackSwap(usize, usize),       // /swap W1 W2       — swap labels of two words
-    ForthEval(String),             // : word ... ; or /forth <expr> — execute in the typed VM
-    Setup,   // /setup — open the setup wizard (run 'finch setup' to reconfigure)
-    SelfFix,              // /self-fix     — diagnose, fix, verify, restart
+    StackChain(usize, usize), // /chain W1 W2      — add edge W1 → W2
+    StackForget(usize),       // /forget W1        — remove word and AI descendants
+    StackDup(usize),          // /dup W1           — clone word as new entry
+    StackSwap(usize, usize),  // /swap W1 W2       — swap labels of two words
+    ForthEval(String),        // : word ... ; or /forth <expr> — execute in the typed VM
+    Setup,                    // /setup — open the setup wizard (run 'finch setup' to reconfigure)
+    SelfFix,                  // /self-fix     — diagnose, fix, verify, restart
     // Diff proposal flow
     Accept(Option<String>), // /accept [diff-id-prefix] — accept most-recent (or matched) pending diff
     Reject(Option<String>), // /reject [reason]         — reject most-recent pending diff
@@ -892,9 +894,7 @@ pub fn format_metrics(metrics_logger: &MetricsLogger) -> Result<String> {
     }
     let mut grouped = std::collections::BTreeMap::<(String, String), WireCounts>::new();
     for metric in wire_metrics {
-        let counts = grouped
-            .entry((metric.provider, metric.model))
-            .or_default();
+        let counts = grouped.entry((metric.provider, metric.model)).or_default();
         counts.total += 1;
         counts.first_pass += usize::from(metric.first_pass_valid);
         counts.repaired += usize::from(metric.repaired_successfully);
@@ -1073,9 +1073,7 @@ mod tests {
 
         let status = format_training(None, None).unwrap();
         assert!(status.starts_with("Routing and Quality Statistics\n"));
-        assert!(status.contains(
-            "Model training: disabled (no supported native backend selected)"
-        ));
+        assert!(status.contains("Model training: disabled (no supported native backend selected)"));
         assert!(!status.contains("Training Statistics"));
     }
 
@@ -1178,7 +1176,10 @@ mod tests {
             "/whois <subject>",
             "/brain initialize",
         ] {
-            assert!(help.contains(supported), "supported command {supported} missing");
+            assert!(
+                help.contains(supported),
+                "supported command {supported} missing"
+            );
         }
     }
 
@@ -1242,7 +1243,10 @@ mod tests {
             Some(Command::Brains)
         ));
         assert!(matches!(Command::parse("/brain ls"), Some(Command::Brains)));
-        assert!(matches!(Command::parse("/brain runs"), Some(Command::BrainRuns)));
+        assert!(matches!(
+            Command::parse("/brain runs"),
+            Some(Command::BrainRuns)
+        ));
         assert!(matches!(
             Command::parse("/brain initialize"),
             Some(Command::BrainInitialize)

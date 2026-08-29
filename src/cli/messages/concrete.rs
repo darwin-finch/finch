@@ -30,7 +30,11 @@ fn color_to_ansi(color: &ColorSpec) -> String {
             "lightcyan" => Color::Cyan,
             _ => Color::Grey,
         },
-        ColorSpec::Rgb(r, g, b) => Color::Rgb { r: *r, g: *g, b: *b },
+        ColorSpec::Rgb(r, g, b) => Color::Rgb {
+            r: *r,
+            g: *g,
+            b: *b,
+        },
     };
     SetForegroundColor(color).to_string()
 }
@@ -1113,7 +1117,9 @@ mod tests {
         let prompt = BrainParticipantMessage::new("alice@box", "please inspect", true);
         let relay = BrainParticipantMessage::new("alice@box", "I agree", false);
 
-        assert!(prompt.format(&colors).contains("❯ alice@box: please inspect"));
+        assert!(prompt
+            .format(&colors)
+            .contains("❯ alice@box: please inspect"));
         assert!(relay.format(&colors).contains("◆ alice@box: I agree"));
         assert_eq!(
             prompt.background_style(&colors),

@@ -89,15 +89,11 @@ impl TodoJournalReceiver {
 
 pub fn todo_journal(
     projection: std::sync::Arc<tokio::sync::RwLock<TodoList>>,
-) -> (
-    TodoJournalWriter,
-    TodoJournalTarget,
-    TodoJournalReceiver,
-) {
+) -> (TodoJournalWriter, TodoJournalTarget, TodoJournalReceiver) {
     let (tx, rx) = mpsc::unbounded_channel::<TodoJournalRequest>();
-    let selected = Rc::new(RefCell::new(None::<
-        crate::brain::remote::AttachedBrainClient,
-    >));
+    let selected = Rc::new(RefCell::new(
+        None::<crate::brain::remote::AttachedBrainClient>,
+    ));
     (
         TodoJournalWriter { tx },
         TodoJournalTarget {
@@ -193,11 +189,7 @@ mod tests {
             let (writer, _target, receiver) = todo_journal(projection);
             receiver.spawn();
             assert!(!writer
-                .replace(vec![item(
-                    "1",
-                    TodoStatus::InProgress,
-                    TodoPriority::High,
-                )])
+                .replace(vec![item("1", TodoStatus::InProgress, TodoPriority::High,)])
                 .await
                 .unwrap());
         }));

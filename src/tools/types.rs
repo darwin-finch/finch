@@ -10,9 +10,9 @@ use crate::cli::ConversationHistory;
 use crate::cli::ReplMode;
 use crate::local::LocalGenerator;
 use crate::models::tokenizer::TextTokenizer;
+use crate::runtime::VmEffectEnvelope;
 use crate::training::batch_trainer::BatchTrainer;
 use crate::vm::VmSideEffect;
-use crate::runtime::VmEffectEnvelope;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 

@@ -830,7 +830,9 @@ mod tests {
         assert!(executor.execution_timeout("edit").is_none());
         assert!(executor.execution_timeout("write").is_none());
         assert_eq!(
-            executor.execution_timeout("mock").map(|duration| duration.as_secs()),
+            executor
+                .execution_timeout("mock")
+                .map(|duration| duration.as_secs()),
             Some(30)
         );
     }

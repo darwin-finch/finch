@@ -151,11 +151,7 @@ impl QueryStateManager {
             .and_then(|metadata| metadata.tool_work_unit.clone())
     }
 
-    pub async fn set_brain_output_work_unit(
-        &self,
-        query_id: Uuid,
-        unit: Option<Arc<WorkUnit>>,
-    ) {
+    pub async fn set_brain_output_work_unit(&self, query_id: Uuid, unit: Option<Arc<WorkUnit>>) {
         if let Some(metadata) = self.states.write().await.get_mut(&query_id) {
             metadata.brain_output_work_unit = unit;
         }
