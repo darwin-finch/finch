@@ -32,3 +32,15 @@ jobs:
         run: "cargo test --lib oauth::"
       - name: ChatGPT OAuth adapter regressions
         run: "cargo test --lib providers::chatgpt_oauth::"
+
+  windows-compile:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Cap'n Proto compiler
+        run: choco install capnproto --yes --no-progress
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile provider-neutral OAuth core on Windows
+        run: cargo check --lib

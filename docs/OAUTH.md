@@ -33,13 +33,14 @@ and synthetic dialects still exercise browser PKCE, state, and nonce.
 
 ## Persistence and #174 binding
 
-The file store walks from a trusted filesystem root using descriptor-relative
-`openat`/`mkdirat` operations with `O_NOFOLLOW`, validates every ancestor, and
-performs descriptor-relative atomic replacement plus directory `fsync`. Records
-are private, bounded, generation-checked, and retain revoked tombstones. A
-refresh writes `mutation_pending` before remote rotation; restart then fails
-closed until explicit recovery tombstones the record and the user signs in
-again.
+On Unix, the file store walks from a trusted filesystem root using
+descriptor-relative `openat`/`mkdirat` operations with `O_NOFOLLOW`, validates
+every ancestor, and performs descriptor-relative atomic replacement plus
+directory `fsync`. It deliberately fails closed on non-Unix platforms until an
+equivalent descriptor- or handle-anchored implementation exists. Records are
+private, bounded, generation-checked, and retain revoked tombstones. A refresh
+writes `mutation_pending` before remote rotation; restart then fails closed
+until explicit recovery tombstones the record and the user signs in again.
 
 Successful authorization projects only secret-free metadata into
 `ProviderCredential`: stable name, `oauth_device` or `oauth_browser_pkce`,

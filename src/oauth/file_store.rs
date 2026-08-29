@@ -1,4 +1,4 @@
-//! Crash-safe portable OAuth credential persistence.
+//! Crash-safe OAuth credential persistence for Unix platforms.
 
 use super::{validate_reference, OAuthCredentialStore, OAuthTokenRecord, MAX_AUTH_BODY_BYTES};
 use anyhow::{bail, Context, Result};
@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-/// Private 0700 directory containing atomic 0600 token records.
+/// Private 0700 directory containing atomic 0600 token records on Unix.
+///
+/// Operations fail closed on platforms where descriptor-anchored storage has
+/// not yet been implemented.
 #[derive(Debug, Clone)]
 pub struct FileOAuthCredentialStore {
     root: PathBuf,
@@ -91,9 +94,19 @@ fn is_not_found(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<std::io::Error>()
         .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
-        || error
-            .downcast_ref::<nix::errno::Errno>()
-            .is_some_and(|errno| *errno == nix::errno::Errno::ENOENT)
+        || is_platform_not_found(error)
+}
+
+#[cfg(unix)]
+fn is_platform_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<nix::errno::Errno>()
+        .is_some_and(|errno| *errno == nix::errno::Errno::ENOENT)
+}
+
+#[cfg(not(unix))]
+fn is_platform_not_found(_: &anyhow::Error) -> bool {
+    false
 }
 
 impl OAuthCredentialStore for FileOAuthCredentialStore {
@@ -302,7 +315,7 @@ mod secure_directory {
     use std::path::Path;
 
     pub(super) fn open_or_create_private_directory(_path: &Path) -> Result<File> {
-        bail!("portable OAuth credential persistence is not yet supported on this platform")
+        bail!("descriptor-anchored OAuth credential persistence is not yet supported on this platform")
     }
     pub(super) fn open_file_at(_: &File, _: &str, _: bool, _: bool) -> Result<File> {
         unreachable!()
