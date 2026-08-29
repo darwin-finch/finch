@@ -997,6 +997,10 @@ fn validate_endpoint(value: &str, allow_insecure_loopback: bool) -> Result<Url> 
 }
 
 fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
