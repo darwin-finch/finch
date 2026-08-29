@@ -15,6 +15,7 @@ pub mod types;
 
 // Provider implementations
 pub mod chatgpt_oauth;
+pub mod openai_jwks;
 pub mod claude;
 pub mod gemini;
 pub mod openai;

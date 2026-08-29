@@ -6,6 +6,7 @@
 //! fail-closed fence, not a claim of a stable third-party contract.
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{TimeDelta, Utc};
@@ -16,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::{AudienceBinding, CredentialKind, CredentialProvider, EndpointFamily};
@@ -29,13 +31,28 @@ pub const CHATGPT_OAUTH_PROTOCOL_REVISION: &str =
     "openai-codex-public-client@3e4707b34b16e139fcb7ad11ab8445993b62bba1";
 pub const CHATGPT_SUBSCRIPTION_SERVICE_REVISION: &str =
     "chatgpt-codex-service@3e4707b34b16e139fcb7ad11ab8445993b62bba1";
-const OPENAI_PUBLIC_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const OPENAI_AUTH_ORIGIN: &str = "https://auth.openai.com";
+pub(crate) const OPENAI_PUBLIC_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub(crate) const OPENAI_AUTH_ORIGIN: &str = "https://auth.openai.com";
 const CHATGPT_SERVICE_ORIGIN: &str = "https://chatgpt.com";
 pub const CHATGPT_SUBSCRIPTION_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-const REQUIRED_TOKEN_ISSUER: &str = "https://auth.openai.com";
+pub(crate) const REQUIRED_TOKEN_ISSUER: &str = "https://auth.openai.com";
+/// Access-token `aud` minted by the pinned Codex public-client revision. This
+/// is token authority metadata, not permission to send the token to that URL.
+pub(crate) const OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE: &str = "https://api.openai.com/v1";
 const CHATGPT_AUTH_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
 const DEVICE_LIFETIME: Duration = Duration::from_secs(15 * 60);
+
+/// Exact scopes for the pinned public-client compatibility revision.
+pub fn chatgpt_required_scopes() -> BTreeSet<String> {
+    BTreeSet::from([
+        "openid".into(),
+        "profile".into(),
+        "email".into(),
+        "offline_access".into(),
+        "api.connectors.read".into(),
+        "api.connectors.invoke".into(),
+    ])
+}
 
 /// Signature-verified provider claims. The adapter does not parse an
 /// unverified JWT payload and call it identity.
@@ -43,6 +60,7 @@ const DEVICE_LIFETIME: Duration = Duration::from_secs(15 * 60);
 pub struct VerifiedOpenAiClaims {
     pub issuer: String,
     pub audiences: BTreeSet<String>,
+    pub access_audiences: BTreeSet<String>,
     pub subject: String,
     pub account_id: String,
     /// Verified `https://api.openai.com/auth.chatgpt_plan_type` entitlement.
@@ -59,21 +77,33 @@ pub struct VerifiedOpenAiClaims {
 
 /// Injected JWS/JWKS verification boundary. Production enablement must supply
 /// an implementation pinned to the dialect's exact issuer and algorithms.
+#[async_trait]
 pub trait OpenAiTokenVerifier: Send + Sync {
     fn preflight(&self) -> Result<()>;
-    fn verify(&self, id_token: Option<&str>, access_token: &str) -> Result<VerifiedOpenAiClaims>;
+    async fn verify(
+        &self,
+        id_token: Option<&str>,
+        access_token: &str,
+        cancel: &CancellationToken,
+    ) -> Result<VerifiedOpenAiClaims>;
 }
 
 /// Fail-closed default until Finch's audited OpenAI JWKS verifier is wired.
 #[derive(Debug, Default)]
 pub struct OpenAiVerificationUnavailable;
 
+#[async_trait]
 impl OpenAiTokenVerifier for OpenAiVerificationUnavailable {
     fn preflight(&self) -> Result<()> {
         unavailable_verifier_error()
     }
 
-    fn verify(&self, _id_token: Option<&str>, _access_token: &str) -> Result<VerifiedOpenAiClaims> {
+    async fn verify(
+        &self,
+        _id_token: Option<&str>,
+        _access_token: &str,
+        _cancel: &CancellationToken,
+    ) -> Result<VerifiedOpenAiClaims> {
         unavailable_verifier_error()
     }
 }
@@ -89,11 +119,11 @@ pub struct OpenAiChatGptOAuthDialect<V> {
     auth_origin: String,
 }
 
-impl OpenAiChatGptOAuthDialect<OpenAiVerificationUnavailable> {
+impl OpenAiChatGptOAuthDialect<crate::providers::openai_jwks::OpenAiJwksVerifier> {
     pub fn production() -> Result<Self> {
         Self::new(
             OPENAI_AUTH_ORIGIN,
-            Arc::new(OpenAiVerificationUnavailable),
+            Arc::new(crate::providers::openai_jwks::OpenAiJwksVerifier::production()?),
             false,
         )
     }
@@ -117,14 +147,7 @@ where
             issuer: "openai-chatgpt".into(),
             audience: AudienceBinding::standard(EndpointFamily::ChatgptSubscription),
             client_id: OPENAI_PUBLIC_CLIENT_ID.into(),
-            scopes: BTreeSet::from([
-                "openid".into(),
-                "profile".into(),
-                "email".into(),
-                "offline_access".into(),
-                "api.connectors.read".into(),
-                "api.connectors.invoke".into(),
-            ]),
+            scopes: chatgpt_required_scopes(),
             device_authorization_endpoint: format!(
                 "{auth_origin}/api/accounts/deviceauth/usercode"
             ),
@@ -145,11 +168,12 @@ where
     }
 
     #[cfg(test)]
-    fn for_test(auth_origin: &str, verifier: Arc<V>) -> Result<Self> {
+    pub(crate) fn for_test(auth_origin: &str, verifier: Arc<V>) -> Result<Self> {
         Self::new(auth_origin, verifier, true)
     }
 }
 
+#[async_trait]
 impl<V> OAuthDialect for OpenAiChatGptOAuthDialect<V>
 where
     V: OpenAiTokenVerifier + 'static,
@@ -284,12 +308,13 @@ where
         })
     }
 
-    fn validate_tokens(
+    async fn validate_tokens(
         &self,
         status: StatusCode,
         body: Value,
         previous: Option<&OAuthTokenRecord>,
         context: &TokenValidationContext,
+        cancel: &CancellationToken,
     ) -> Result<OAuthTokenRecord> {
         if !status.is_success() {
             let code = safe_oauth_error_code(&body);
@@ -307,10 +332,16 @@ where
             .get("id_token")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let claims = self.verifier.verify(id_token.as_deref(), &access_token)?;
+        let claims = self
+            .verifier
+            .verify(id_token.as_deref(), &access_token, cancel)
+            .await?;
         let now = Utc::now();
         if claims.issuer != REQUIRED_TOKEN_ISSUER
             || !claims.audiences.contains(&self.descriptor.client_id)
+            || !claims
+                .access_audiences
+                .contains(OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE)
             || claims.subject.trim().is_empty()
             || claims.account_id.trim().is_empty()
             || claims.chatgpt_plan_type.trim().is_empty()
@@ -530,15 +561,17 @@ mod tests {
     #[derive(Clone)]
     struct FixedVerifier(VerifiedOpenAiClaims);
 
+    #[async_trait]
     impl OpenAiTokenVerifier for FixedVerifier {
         fn preflight(&self) -> Result<()> {
             Ok(())
         }
 
-        fn verify(
+        async fn verify(
             &self,
             _id_token: Option<&str>,
             _access_token: &str,
+            _cancel: &CancellationToken,
         ) -> Result<VerifiedOpenAiClaims> {
             Ok(self.0.clone())
         }
@@ -548,6 +581,7 @@ mod tests {
         VerifiedOpenAiClaims {
             issuer: REQUIRED_TOKEN_ISSUER.into(),
             audiences: BTreeSet::from([OPENAI_PUBLIC_CLIENT_ID.into()]),
+            access_audiences: BTreeSet::from([OPENAI_CODEX_ACCESS_TOKEN_AUDIENCE.into()]),
             subject: "subject-work".into(),
             account_id: "acct-work".into(),
             chatgpt_plan_type: "plus".into(),
@@ -655,8 +689,8 @@ mod tests {
         assert!(service.actual_model("gpt-5.6-sol", None, None).is_err());
     }
 
-    #[test]
-    fn public_client_risk_is_versioned_and_verification_fails_closed() {
+    #[tokio::test]
+    async fn public_client_risk_is_versioned_and_verification_is_exactly_pinned() {
         let dialect = OpenAiChatGptOAuthDialect::production().unwrap();
         assert!(dialect
             .descriptor()
@@ -673,26 +707,11 @@ mod tests {
         assert!(dialect.descriptor().browser_credential_kind.is_none());
         assert_eq!(dialect.descriptor().scopes.len(), 6);
         assert_eq!(CHATGPT_AUTH_CLAIM_NAMESPACE, "https://api.openai.com/auth");
-        let error = dialect
-            .validate_tokens(
-                StatusCode::OK,
-                json!({
-                    "access_token": "secret-access",
-                    "refresh_token": "secret-refresh",
-                    "id_token": "secret-id",
-                    "expires_in": 3600
-                }),
-                None,
-                &TokenValidationContext::Device,
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("verification is unavailable"));
-        assert!(!error.contains("secret-"));
+        assert!(dialect.preflight().is_ok());
     }
 
-    #[test]
-    fn openai_dialect_exact_device_pkce_and_token_fixture_is_strictly_bound() {
+    #[tokio::test]
+    async fn openai_dialect_exact_device_pkce_and_token_fixture_is_strictly_bound() {
         let dialect = OpenAiChatGptOAuthDialect::for_test(
             "http://127.0.0.1:12345",
             Arc::new(FixedVerifier(claims())),
@@ -741,7 +760,9 @@ mod tests {
                 }),
                 None,
                 &TokenValidationContext::Device,
+                &CancellationToken::new(),
             )
+            .await
             .unwrap();
         let metadata = tokens.provider_credential("chatgpt:work");
         assert_eq!(metadata.provider, CredentialProvider::ChatgptSubscription);
@@ -750,8 +771,8 @@ mod tests {
         assert!(!format!("{tokens:?}").contains("access-secret"));
     }
 
-    #[test]
-    fn openai_token_claim_mismatch_matrix_fails_before_record_creation() {
+    #[tokio::test]
+    async fn openai_token_claim_mismatch_matrix_fails_before_record_creation() {
         for defect in [
             "issuer",
             "audience",
@@ -799,7 +820,9 @@ mod tests {
                     }),
                     None,
                     &context,
+                    &CancellationToken::new(),
                 )
+                .await
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -810,8 +833,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hostile_token_error_and_unsigned_lifetime_never_leak_or_extend_authority() {
+    #[tokio::test]
+    async fn hostile_token_error_and_unsigned_lifetime_never_leak_or_extend_authority() {
         let dialect = OpenAiChatGptOAuthDialect::for_test(
             "http://127.0.0.1:12345",
             Arc::new(FixedVerifier(claims())),
@@ -824,7 +847,9 @@ mod tests {
                 json!({"error": marker}),
                 None,
                 &TokenValidationContext::Device,
+                &CancellationToken::new(),
             )
+            .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("unrecognized"));
@@ -848,7 +873,9 @@ mod tests {
                 }),
                 None,
                 &TokenValidationContext::Device,
+                &CancellationToken::new(),
             )
+            .await
             .unwrap();
         assert_eq!(record.expires_at, signed_expiry);
     }
