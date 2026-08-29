@@ -94,18 +94,23 @@ fn duplicate_validated_ipc_listener(
     let socket_option = |name: i32| -> anyhow::Result<i32> {
         let mut value = 0_i32;
         let mut length = std::mem::size_of::<i32>() as nix::libc::socklen_t;
+        let result = unsafe {
+            nix::libc::getsockopt(
+                fd,
+                nix::libc::SOL_SOCKET,
+                name,
+                (&mut value as *mut i32).cast(),
+                &mut length,
+            )
+        };
         anyhow::ensure!(
-            unsafe {
-                nix::libc::getsockopt(
-                    fd,
-                    nix::libc::SOL_SOCKET,
-                    name,
-                    (&mut value as *mut i32).cast(),
-                    &mut length,
-                )
-            } == 0
-                && length as usize == std::mem::size_of::<i32>(),
-            "supervisor IPC descriptor socket option is unavailable"
+            result == 0,
+            "supervisor IPC descriptor FD {fd} getsockopt({name}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        anyhow::ensure!(
+            length as usize == std::mem::size_of::<i32>(),
+            "supervisor IPC descriptor FD {fd} getsockopt({name}) returned length {length}"
         );
         Ok(value)
     };
