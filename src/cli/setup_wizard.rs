@@ -1777,6 +1777,8 @@ fn advance_catalog_refresh_if_done(state: &mut WizardState) {
         }
     });
     let provider_id = CLOUD_PROVIDERS[*provider_idx].0;
+    let current_zai_entry = (provider_id == "zai" && persisted.is_none())
+        .then(|| provider_entry_from_remote_model(provider_id, name, "", model, None));
     let Some(current_profile) = model_catalog_profile(
         provider_id,
         name,
@@ -1785,7 +1787,7 @@ fn advance_catalog_refresh_if_done(state: &mut WizardState) {
         } else {
             api_key.as_deref().unwrap_or("")
         },
-        persisted,
+        persisted.or(current_zai_entry.as_ref()),
     ) else {
         return;
     };
